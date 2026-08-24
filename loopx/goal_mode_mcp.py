@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -46,8 +48,29 @@ class GoalModeMCPControlPlane:
         return self.state().get("agent_id")
 
     def command_prefix(self) -> list[str]:
+        """Resolve the loopx CLI without depending on the launcher's PATH.
+
+        An MCP server is frequently started by a GUI or by a host that does not
+        source a login shell, so ``which`` can miss a user-local install. The
+        previous fallback -- ``sys.executable -m loopx.cli`` -- cannot help in
+        the case that actually needs it: when the server is hosted in its own
+        virtualenv, ``sys.executable`` is that venv's interpreter and LoopX is
+        not installed there, so the fallback raises ``No module named 'loopx'``.
+
+        Prefer an explicit override, then PATH, then the conventional user-local
+        location, and only then the in-process module fallback -- which is now
+        genuinely reachable, because by that point this module was importable.
+        """
+        override = os.environ.get("LOOPX_BIN")
+        if override and Path(override).exists():
+            return [override]
         executable = shutil.which("loopx")
-        return [executable] if executable else [sys.executable, "-m", "loopx.cli"]
+        if executable:
+            return [executable]
+        user_local = Path.home() / ".local" / "bin" / "loopx"
+        if user_local.exists():
+            return [str(user_local)]
+        return [sys.executable, "-m", "loopx.cli"]
 
     @staticmethod
     def _runtime_profile_flag_is_unsupported(
@@ -132,7 +155,17 @@ class GoalModeMCPControlPlane:
         return self.run_cli(args, legacy_args=legacy_args)
 
     def list_todos(self) -> str:
-        return self.should_run()
+        """List the goal's todos.
+
+        This previously delegated to ``should_run``, which returns the quota
+        decision rather than a todo list. That made the tool unable to report
+        ``todo_id`` at all -- so ``claim_task``/``complete_task``, which require
+        one, had no way to discover it through MCP.
+        """
+        goal_id, _ = self.context()
+        if not goal_id:
+            return self.no_goal_message()
+        return self.run_cli(["--format", "json", "todo", "list", "--goal-id", goal_id])
 
     def claim_task(self, todo_id: str, agent_id: str) -> str:
         goal_id, _ = self.context()
