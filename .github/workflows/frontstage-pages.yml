@@ -138,7 +138,7 @@ jobs:
         run: npm run export:frontstage-share -- --base /loopx/ --out-dir ../../../output/frontstage-pages
 
       - name: Fetch complete GitHub stargazer history
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.repository == 'huangruiteng/loopx'
         env:
           # Since July 2026, GitHub limits stargazer listing to repository
           # admins/collaborators and rejects fine-grained PATs even with
@@ -152,7 +152,7 @@ jobs:
             "$RUNNER_TEMP/loopx-stargazers-count"
 
       - name: Generate verified public star history
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.repository == 'huangruiteng/loopx'
         run: |
           python3 scripts/render-star-history.py \
             --repo "$GITHUB_REPOSITORY" \
@@ -161,7 +161,7 @@ jobs:
             --output output/frontstage-pages/site/site-assets/star-history.svg
 
       - name: Verify star history freshness
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.repository == 'huangruiteng/loopx'
         run: |
           python3 - <<'PY'
           import datetime as dt
@@ -192,19 +192,19 @@ jobs:
         run: python3 examples/dev-book-publication-smoke.py --site-dir output/frontstage-pages/site/docs/book
 
       - name: Configure Pages
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.repository == 'huangruiteng/loopx'
         uses: actions/configure-pages@v6
         with:
           enablement: true
 
       - name: Upload Pages artifact
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.repository == 'huangruiteng/loopx'
         uses: actions/upload-pages-artifact@v5
         with:
           path: output/frontstage-pages/site
 
   deploy:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.repository == 'huangruiteng/loopx'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
