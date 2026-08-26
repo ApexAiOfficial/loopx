@@ -105,7 +105,7 @@ jobs:
           if-no-files-found: ignore
 
   smoke-fleet-health:
-    if: always()
+    if: always() && github.repository == 'huangruiteng/loopx'
     needs: full-public-smokes
     runs-on: ubuntu-latest
     timeout-minutes: 10
