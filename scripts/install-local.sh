@@ -18,6 +18,8 @@ Common environment variables:
   LOOPX_INSTALL_SKILL=0            Skip packaged workflow skills.
   LOOPX_SKILLS_DIR=/path           Install workflow skills into this host-native root.
   LOOPX_SKILL_DEDUPE_OTHER_ROOT=1  Retire managed LoopX skill copies from the alternate well-known root.
+  LOOPX_SKILL_BACKUP_DIR=/path     Keep replaced or retired skill copies that were edited or unrecorded here
+                                   (default: .loopx-skill-backups beside the skills root).
   LOOPX_ENTRY_HOST_SURFACE=...     Bind generated $loopx to an exact host (ark-managed-agent).
   LOOPX_INSTALL_SLASH_COMMANDS=0   Skip Codex and Claude command skills.
   LOOPX_INSTALL_OPENCODE=0         Install the OpenCode goal bridge surface.
@@ -303,7 +305,7 @@ install_workflow_skills() {
   local skills_source="$1"
   local source_root="$2"
   local entry_cli_bin="$3"
-  local skill_source skill_name skill_scope_file skill_target skill_tmp entry_status
+  local skill_source skill_name skill_scope_file skill_target skill_tmp entry_status retired_to
   local -a installed_skill_ids=()
   skill_line="- skill: skipped"
   if [[ "$install_skill" == "0" || ! -d "$skills_source" ]]; then
@@ -349,7 +351,39 @@ install_workflow_skills() {
       rm -rf "$skill_tmp"
       return 1
     fi
-    rm -rf "$skill_target"
+    if [[ -e "$skill_target" || -L "$skill_target" ]]; then
+      # Delete the previous copy only if it is unchanged install output;
+      # anything edited or unrecorded is moved to the skill backup root.
+      if ! retired_to="$(
+        LOOPX_RETIRE_TARGET="$skill_target" \
+          LOOPX_RETIRE_SKILLS_DIR="$skills_dir" \
+          PYTHONSAFEPATH=1 \
+          PYTHONPATH="$source_root${PYTHONPATH:+:$PYTHONPATH}" \
+          "${LOOPX_PYTHON:-python3}" - <<'PY'
+import os
+from pathlib import Path
+
+from loopx.skill_install_readback import recorded_skill_hashes, retire_skill_dir
+
+target = Path(os.environ["LOOPX_RETIRE_TARGET"])
+skills_dir = Path(os.environ["LOOPX_RETIRE_SKILLS_DIR"])
+outcome = retire_skill_dir(
+    target,
+    skills_dir=skills_dir,
+    recorded_hash=recorded_skill_hashes(skills_dir).get(target.name),
+    reason="replaced by scripts/install-local.sh",
+)
+if outcome["action"] == "backed_up":
+    print(outcome["backup"])
+PY
+      )"; then
+        rm -rf "$skill_tmp"
+        return 1
+      fi
+      if [[ -n "$retired_to" ]]; then
+        skill_line="${skill_line}- previous $skill_name kept (modified or unrecorded): $retired_to"$'\n'
+      fi
+    fi
     mv "$skill_tmp" "$skill_target"
     installed_skill_ids+=("$skill_name")
     skill_line="${skill_line}- skill: $skill_target"$'\n'
@@ -410,7 +444,12 @@ if os.environ.get("LOOPX_SKILL_DEDUPE_OTHER_ROOT") == "1":
         skills_dir=Path(os.environ["LOOPX_SKILL_INSTALL_DIR"]),
         execute=True,
     )
-    print(f"skill dedupe: {dedupe['reason']}")
+    # stdout carries only the entry status the caller compares; report on stderr.
+    print(
+        f"skill dedupe: {dedupe['reason']} (retired={len(dedupe['retired'])}, "
+        f"kept={len(dedupe['backed_up'])}, skipped={len(dedupe['skipped'])})",
+        file=sys.stderr,
+    )
 print(status)
 PY
     )"; then
