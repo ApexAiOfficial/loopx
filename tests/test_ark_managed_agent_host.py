@@ -369,6 +369,34 @@ def test_retire_duplicate_managed_skills_removes_only_loopx_managed_copies(
     assert (codex_skills / "loopx-project").exists()
 
 
+def test_retire_duplicate_finds_a_marker_entry_skill_without_readback(
+    tmp_path: Path,
+) -> None:
+    codex_skills = tmp_path / ".codex" / "skills"
+    agents_skills = tmp_path / ".agents" / "skills"
+    _materialize_workflow_skills(codex_skills)
+    stale_entry = agents_skills / "loopx" / "SKILL.md"
+    stale_entry.parent.mkdir(parents=True)
+    stale_entry.write_text(
+        "<!-- loopx-managed-slash-command:v1 command=/loopx surface=Codex-skills -->\n",
+        encoding="utf-8",
+    )
+    unrelated = agents_skills / "loopx-notes" / "SKILL.md"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("# my own notes\n", encoding="utf-8")
+
+    applied = retire_duplicate_managed_skills(
+        codex_skills,
+        alternate_root=agents_skills,
+        execute=True,
+    )
+
+    assert applied["retired"] == ["loopx"]
+    assert "loopx" in applied["backed_up"]
+    assert applied["skipped"] == ["loopx-notes"]
+    assert unrelated.is_file()
+
+
 def test_retire_duplicate_checks_recorded_hash_of_marker_carrying_copies(
     tmp_path: Path,
 ) -> None:
