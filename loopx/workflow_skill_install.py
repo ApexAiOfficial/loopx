@@ -20,6 +20,8 @@ from .skill_install_readback import (
     SKILL_INSTALL_READBACK_FILENAME,
     hash_skill_tree,
     inspect_skill_install_readback,
+    recorded_skill_hashes,
+    retire_skill_dir,
     write_skill_install_readback,
 )
 from .slash_command_install import materialize_loopx_entry_skill
@@ -112,7 +114,9 @@ def _exclusive_install_lock(skills_dir: Path) -> Iterator[None]:
         yield
 
 
-def _install_one_skill(source: Path, target: Path) -> str:
+def _install_one_skill(
+    source: Path, target: Path, recorded_hash: str | None = None
+) -> str:
     if target.is_dir() and hash_skill_tree(source) == hash_skill_tree(target):
         return "unchanged"
 
@@ -136,7 +140,15 @@ def _install_one_skill(source: Path, target: Path) -> str:
         if temporary.exists():
             shutil.rmtree(temporary)
         if backup and backup.exists():
-            shutil.rmtree(backup)
+            # The replaced copy is deleted only if it is still the recorded
+            # install output; local edits are moved to the backup root.
+            retire_skill_dir(
+                backup,
+                skills_dir=target.parent,
+                recorded_hash=recorded_hash,
+                reason="replaced by workflow skill install",
+                name=target.name,
+            )
     return "updated" if backup else "created"
 
 
@@ -292,10 +304,12 @@ def workflow_skill_install(
 
     installed: dict[str, str] = {}
     with _exclusive_install_lock(target_root):
+        recorded = recorded_skill_hashes(target_root)
         for skill_id in PACKAGED_HOST_SKILL_IDS:
             installed[skill_id] = _install_one_skill(
                 Path(source["skills_root"]) / skill_id,
                 target_root / skill_id,
+                recorded.get(skill_id),
             )
         entry = materialize_loopx_entry_skill(
             skills_dir=target_root,
