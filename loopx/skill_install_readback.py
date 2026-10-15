@@ -150,10 +150,16 @@ def retire_duplicate_managed_skills(
     if managed_ids:
         candidate_dirs.extend(alternate / skill_id for skill_id in managed_ids)
     if alternate.is_dir():
+        # Without a readback the generated ``loopx`` entry skill is only
+        # recognisable by its marker, like the command facades.
         candidate_dirs.extend(
             path
             for path in sorted(
-                [*alternate.glob("loopx-*"), *alternate.glob("loop-global-*")]
+                [
+                    alternate / "loopx",
+                    *alternate.glob("loopx-*"),
+                    *alternate.glob("loop-global-*"),
+                ]
             )
             if path.is_dir() and path not in candidate_dirs
         )
