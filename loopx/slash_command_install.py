@@ -12,6 +12,7 @@ from .opencode_goal_mode import plugin_source, runtime_source
 from .pi_goal_mode import extension_source as pi_extension_source
 from .pi_goal_mode import runtime_source as pi_runtime_source
 from .slash_commands import build_slash_command_catalog
+from .skill_install_readback import workflow_owned_skill_ids
 
 SCHEMA_VERSION = "loopx_slash_command_install_v0"
 MANAGED_MARKER_PREFIX = "<!-- loopx-managed-slash-command:v1"
@@ -407,27 +408,6 @@ def _target_status(path: Path, content: str, *, execute: bool) -> str:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
     return "created" if execute else "would_create"
-
-
-def _workflow_owned_skill_ids(skill_dir: Path) -> set[str]:
-    """Skill ids that a LoopX workflow-skill install in ``skill_dir`` recorded as its own.
-
-    The workflow-skill install materializes the ``loopx`` entry skill with the exact CLI
-    path (and, when requested, an exact host surface) and records its hash. A
-    slash-command install into the same root must not overwrite that file with its
-    generic rendering, or the recorded hash would no longer describe the installed tree.
-    """
-
-    from .skill_install_readback import SKILL_INSTALL_OWNERS, SKILL_INSTALL_READBACK_FILENAME
-
-    try:
-        manifest = json.loads((skill_dir / SKILL_INSTALL_READBACK_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return set()
-    if not isinstance(manifest, dict) or manifest.get("owner") not in SKILL_INSTALL_OWNERS:
-        return set()
-    ids = manifest.get("materialized_skill_ids")
-    return {str(item) for item in ids} if isinstance(ids, list) else set()
 
 
 def _retire_managed_file(path: Path, *, execute: bool) -> str | None:
@@ -902,28 +882,18 @@ def install_slash_commands(
                 )
 
         skill_dir = codex_root / "skills"
-        workflow_owned = _workflow_owned_skill_ids(skill_dir)
+        workflow_owned = workflow_owned_skill_ids(skill_dir)
         for spec in specs:
             skill_path = skill_dir / str(spec["name"]) / "SKILL.md"
             metadata_path = skill_path.parent / "agents" / "openai.yaml"
             owned_by_workflow = str(spec["name"]) in workflow_owned
-            if uninstall and owned_by_workflow:
-                # The workflow-skill install owns this tree; its own uninstall removes it.
-                for mechanism, path in (
-                    ("codex_explicit_skills", skill_path),
-                    ("codex_skill_openai_metadata", metadata_path),
-                ):
-                    installed.append(
-                        {
-                            "surface": "codex",
-                            "host_surfaces": ["codex-cli", "codex-ide-plugin", "codex-app", "codex-app-ssh"],
-                            "mechanism": mechanism,
-                            "command": spec["command"],
-                            "path": str(path),
-                            "status": "managed_by_workflow_skills",
-                            "invoke_as": [f"${spec['name']}", "/skills"],
-                        }
-                    )
+            if uninstall and owned_by_workflow:  # its workflow-skill install removes it
+                installed.extend(
+                    {"surface": "codex", "host_surfaces": ["codex-cli", "codex-ide-plugin", "codex-app", "codex-app-ssh"],
+                     "mechanism": mechanism, "command": spec["command"], "path": str(path),
+                     "status": "managed_by_workflow_skills", "invoke_as": [f"${spec['name']}", "/skills"]}
+                    for mechanism, path in (("codex_explicit_skills", skill_path), ("codex_skill_openai_metadata", metadata_path))
+                )
                 continue
             if uninstall:
                 skill_status = _retire_status(skill_path, execute=execute)
@@ -951,7 +921,7 @@ def install_slash_commands(
                     }
                 )
                 continue
-            if owned_by_workflow:
+            if owned_by_workflow:  # the workflow-skill install is the authoritative writer
                 skill_status = "managed_by_workflow_skills"
             else:
                 skill_content = _command_skill_content(spec, surface="codex-skills")

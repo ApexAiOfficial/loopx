@@ -251,6 +251,25 @@ def recorded_skill_hashes(skills_dir: Path) -> dict[str, str]:
     }
 
 
+def workflow_owned_skill_ids(skills_dir: Path) -> set[str]:
+    """Skill ids a LoopX workflow-skill install in ``skills_dir`` recorded as its own.
+
+    That install materializes the ``loopx`` entry skill with the exact CLI path (and
+    host surface) and records its hash, so other LoopX writers must leave those trees.
+    """
+
+    try:
+        manifest = json.loads(
+            (Path(skills_dir) / SKILL_INSTALL_READBACK_FILENAME).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(manifest, dict) or manifest.get("owner") not in SKILL_INSTALL_OWNERS:
+        return set()
+    ids = manifest.get("materialized_skill_ids")
+    return {str(item) for item in ids} if isinstance(ids, list) else set()
+
+
 def retire_skill_dir(
     path: Path,
     *,
