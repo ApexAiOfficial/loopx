@@ -85,3 +85,31 @@ def test_backup_root_can_be_overridden(tmp_path: Path, monkeypatch: pytest.Monke
     outcome = retire_skill_dir(path, skills_dir=skills_dir, recorded_hash=None, reason="test")
 
     assert Path(outcome["backup"]).is_relative_to(tmp_path / "kept")
+
+
+def test_a_readback_not_written_by_loopx_vouches_for_nothing(tmp_path: Path) -> None:
+    from loopx.skill_install_readback import (
+        SKILL_INSTALL_READBACK_FILENAME,
+        recorded_skill_hashes,
+    )
+
+    skills_dir = tmp_path / "skills"
+    path = _skill(skills_dir)
+    (skills_dir / SKILL_INSTALL_READBACK_FILENAME).write_text(
+        json.dumps(
+            {
+                "owner": "someone-else",
+                "skills": {"items": {"loopx-project": {"sha256": hash_skill_tree(path)["sha256"]}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert recorded_skill_hashes(skills_dir) == {}
+    outcome = retire_skill_dir(
+        path,
+        skills_dir=skills_dir,
+        recorded_hash=recorded_skill_hashes(skills_dir).get("loopx-project"),
+        reason="test",
+    )
+    assert outcome["action"] == "backed_up"

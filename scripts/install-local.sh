@@ -62,6 +62,7 @@ if [[ "${LOOPX_SKILLS_DIR+x}" == "x" ]]; then
 fi
 skills_dir="${LOOPX_SKILLS_DIR:-$codex_home/skills}"
 entry_host_surface="${LOOPX_ENTRY_HOST_SURFACE:-}"
+workflow_skill_ids=()
 if [[ -n "$entry_host_surface" && "$entry_host_surface" != "ark-managed-agent" ]]; then
   echo "loopx installer error: unsupported LOOPX_ENTRY_HOST_SURFACE: $entry_host_surface" >&2
   exit 2
@@ -305,7 +306,7 @@ install_workflow_skills() {
   local skills_source="$1"
   local source_root="$2"
   local entry_cli_bin="$3"
-  local skill_source skill_name skill_scope_file skill_target skill_tmp entry_status retired_to
+  local skill_source skill_name skill_scope_file skill_target skill_tmp retired_to
   local -a installed_skill_ids=()
   skill_line="- skill: skipped"
   if [[ "$install_skill" == "0" || ! -d "$skills_source" ]]; then
@@ -389,11 +390,23 @@ PY
     skill_line="${skill_line}- skill: $skill_target"$'\n'
   done < <(find "$skills_source" -mindepth 1 -maxdepth 1 -type d -print | sort)
 
-  if [[ "${#installed_skill_ids[@]}" -gt 0 ]]; then
+  # The skills root stays locked until finalize_workflow_skills records the readback.
+  workflow_skill_ids=("${installed_skill_ids[@]}")
+}
+
+# Second half of the workflow-skill install. It runs after every other step that writes
+# into the skills root (in the Codex root the slash-command step also writes loopx/), so
+# the loopx entry skill materialized here -- exact CLI path and host surface -- is the
+# authoritative final writer, and the integrity readback describes the installed tree.
+finalize_workflow_skills() {
+  local source_root="$1"
+  local entry_cli_bin="$2"
+  local entry_status
+  if [[ "${#workflow_skill_ids[@]}" -gt 0 ]]; then
     if ! entry_status="$(
       LOOPX_SKILL_INSTALL_DIR="$skills_dir" \
         LOOPX_SKILL_INSTALL_SOURCE_ROOT="$source_root" \
-        LOOPX_SKILL_INSTALL_IDS="$(printf '%s\n' "${installed_skill_ids[@]}")" \
+        LOOPX_SKILL_INSTALL_IDS="$(printf '%s\n' "${workflow_skill_ids[@]}")" \
         LOOPX_SKILL_INSTALLED_AT="$installed_at" \
         LOOPX_SKILL_ENTRY_CLI_BIN="$entry_cli_bin" \
         LOOPX_SKILL_ENTRY_HOST_SURFACE="$entry_host_surface" \
@@ -463,10 +476,13 @@ PY
     fi
     skill_line="${skill_line}- skill readback: $skills_dir/.loopx-skill-install.json"$'\n'
   fi
-  skill_line="${skill_line%$'\n'}"
-  rm -rf "$skill_install_lock"
-  skill_install_lock_owned=0
-  skill_install_lock=""
+  if [[ "$skill_install_lock_owned" == "1" ]]; then
+    skill_line="${skill_line%$'\n'}"
+    rm -rf "$skill_install_lock"
+    skill_install_lock_owned=0
+    skill_install_lock=""
+  fi
+  workflow_skill_ids=()
 }
 
 preflight_workflow_skills() {
@@ -678,6 +694,7 @@ if [[ "$promote_default" == "0" ]]; then
   skill_line="- skill: unchanged (set LOOPX_SKILLS_DIR to install canary workflow skills)"
   if [[ "$skills_dir_explicit" == "1" ]]; then
     install_workflow_skills "$repo_root/skills" "$repo_root" "$bin_dir/loopx-canary"
+    finalize_workflow_skills "$repo_root" "$bin_dir/loopx-canary"
   fi
   cat <<EOF
 loopx checkout installed as canary only
@@ -850,6 +867,8 @@ PY
     slash_line="- slash commands: install attempted; run manually: loopx slash-commands --install"
   fi
 fi
+
+finalize_workflow_skills "$release_dir" "$bin_dir/loopx"
 
 # loopx Claude Code adapter: OPT-IN, OFF by default — the normal loopx install
 # does not install MCP, hooks, or settings. The lightweight slash-command
