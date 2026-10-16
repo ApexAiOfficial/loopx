@@ -92,6 +92,25 @@ def test_uninstall_preserves_locally_modified_skill(tmp_path: Path) -> None:
     assert (skills_dir / SKILL_INSTALL_READBACK_FILENAME).is_file()
 
 
+def test_reinstall_moves_a_locally_modified_skill_to_the_backup_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LOOPX_SKILL_BACKUP_DIR", raising=False)
+    skills_dir = tmp_path / "skills"
+    assert workflow_skill_install(skills_dir=skills_dir, execute=True)["ok"] is True
+    modified = skills_dir / "loopx-project" / "SKILL.md"
+    modified.write_text(modified.read_text(encoding="utf-8") + "\nlocal edit\n", encoding="utf-8")
+
+    reinstalled = workflow_skill_install(skills_dir=skills_dir, execute=True)
+
+    assert reinstalled["ok"] is True
+    assert reinstalled["installed"]["loopx-project"] == "updated"
+    assert "local edit" not in modified.read_text(encoding="utf-8")
+    kept = list((tmp_path / ".loopx-skill-backups").glob("*/*/loopx-project/SKILL.md"))
+    assert len(kept) == 1
+    assert "local edit" in kept[0].read_text(encoding="utf-8")
+
+
 class _ByteRangeLockBackend:
     """Stand-in for ``msvcrt`` so the Windows lock branch runs on any host."""
 
