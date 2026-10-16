@@ -34,6 +34,8 @@ SKILL_INSTALL_PROFILES = {
     ),
 }
 LOOPX_MANAGED_SLASH_COMMAND_MARKER = "<!-- loopx-managed-slash-command:v1"
+SKILL_BACKUP_DIR_ENV = "LOOPX_SKILL_BACKUP_DIR"
+SKILL_BACKUP_DIRNAME = ".loopx-skill-backups"
 PACKAGED_HOST_SKILL_IDS = [
     "loopx-project",
     "loopx-pr-program",
@@ -96,8 +98,10 @@ def retire_duplicate_managed_skills(
     left an older managed copy in the other well-known root. That makes hosts
     that discover both roots load duplicate LoopX skills. This helper retires
     only copies that the alternate root's own readback records as LoopX-managed
-    (or command facades carrying the managed marker), so user-modified files
-    are never deleted.
+    (or command facades carrying the managed marker). A copy whose recorded hash
+    no longer matches is skipped; a copy with no recorded hash is moved to
+    ``skill_backup_root`` rather than deleted (see ``retire_skill_dir``), so
+    user-modified files are never lost.
     """
 
     target = Path(skills_dir).expanduser().resolve()
@@ -109,6 +113,7 @@ def retire_duplicate_managed_skills(
     retired: list[str] = []
     would_retire: list[str] = []
     skipped: list[str] = []
+    backed_up: dict[str, str] = {}
     if alternate is None or not alternate.is_dir():
         return {
             "ok": True,
@@ -118,6 +123,7 @@ def retire_duplicate_managed_skills(
             "retired": retired,
             "would_retire": would_retire,
             "skipped": skipped,
+            "backed_up": backed_up,
             "reason": "no alternate LoopX skills root configured",
         }
 
@@ -144,10 +150,16 @@ def retire_duplicate_managed_skills(
     if managed_ids:
         candidate_dirs.extend(alternate / skill_id for skill_id in managed_ids)
     if alternate.is_dir():
+        # Without a readback the generated ``loopx`` entry skill is only
+        # recognisable by its marker, like the command facades.
         candidate_dirs.extend(
             path
             for path in sorted(
-                [*alternate.glob("loopx-*"), *alternate.glob("loop-global-*")]
+                [
+                    alternate / "loopx",
+                    *alternate.glob("loopx-*"),
+                    *alternate.glob("loop-global-*"),
+                ]
             )
             if path.is_dir() and path not in candidate_dirs
         )
@@ -162,14 +174,23 @@ def retire_duplicate_managed_skills(
             skipped.append(skill_id)
             continue
         recorded_hash = recorded_hashes.get(skill_id)
-        if managed and recorded_hash and not marker_managed:
+        # A recorded hash is checked whatever made the copy look managed: a
+        # marker in SKILL.md says nothing about edits to the rest of the tree.
+        if recorded_hash:
             tree = hash_skill_tree(candidate)
             if not tree.get("available") or tree.get("sha256") != recorded_hash:
                 skipped.append(skill_id)
                 continue
         if execute:
-            shutil.rmtree(candidate)
+            outcome = retire_skill_dir(
+                candidate,
+                skills_dir=alternate,
+                recorded_hash=recorded_hash,
+                reason=f"duplicate of {target / skill_id}",
+            )
             retired.append(skill_id)
+            if outcome["action"] == "backed_up":
+                backed_up[skill_id] = outcome["backup"]
         else:
             would_retire.append(skill_id)
 
@@ -181,8 +202,95 @@ def retire_duplicate_managed_skills(
         "retired": retired,
         "would_retire": would_retire,
         "skipped": skipped,
+        "backed_up": backed_up,
         "reason": "retired alternate LoopX-managed copies" if execute else "dry-run",
     }
+
+
+def skill_backup_root(skills_dir: Path) -> Path:
+    """Where replaced or retired skill copies are kept instead of being deleted.
+
+    Defaults to a sibling of the skills root (``~/.agents/.loopx-skill-backups``
+    for ``~/.agents/skills``), outside every host's skill discovery path;
+    ``LOOPX_SKILL_BACKUP_DIR`` overrides it.
+    """
+
+    configured = str(os.environ.get(SKILL_BACKUP_DIR_ENV) or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path(skills_dir).expanduser().parent / SKILL_BACKUP_DIRNAME
+
+
+def recorded_skill_hashes(skills_dir: Path) -> dict[str, str]:
+    """Content hashes the root's own install readback recorded, by skill id."""
+
+    try:
+        manifest = json.loads(
+            (Path(skills_dir) / SKILL_INSTALL_READBACK_FILENAME).read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, json.JSONDecodeError):
+        return {}
+    skills = manifest.get("skills") if isinstance(manifest, dict) else None
+    items = skills.get("items") if isinstance(skills, dict) else None
+    if not isinstance(items, dict):
+        return {}
+    return {
+        str(skill_id): item["sha256"]
+        for skill_id, item in items.items()
+        if isinstance(item, dict) and isinstance(item.get("sha256"), str)
+    }
+
+
+def retire_skill_dir(
+    path: Path,
+    *,
+    skills_dir: Path,
+    recorded_hash: str | None,
+    reason: str,
+    name: str | None = None,
+) -> dict[str, Any]:
+    """Take a skill directory out of a skills root without losing user content.
+
+    A copy whose content still matches the hash recorded at install time is
+    regenerable LoopX output and is deleted. Anything else -- edited after
+    install, never recorded, or a symlink -- is moved under
+    ``skill_backup_root(skills_dir)`` with a note of where it came from, so it
+    can be restored.
+    """
+
+    path = Path(path)
+    if recorded_hash and not path.is_symlink():
+        tree = hash_skill_tree(path)
+        if tree.get("available") and tree.get("sha256") == recorded_hash:
+            shutil.rmtree(path)
+            return {"action": "deleted_pristine", "path": str(path)}
+    root = Path(skills_dir).expanduser()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    label = f"{root.parent.name.lstrip('.') or 'root'}-{root.name}"
+    base_name = name or path.name
+    destination = skill_backup_root(root) / f"{stamp}-{os.getpid()}" / label / base_name
+    counter = 1
+    while destination.exists() or destination.is_symlink():
+        counter += 1
+        destination = destination.with_name(f"{base_name}.{counter}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(path), str(destination))
+    destination.with_name(destination.name + ".loopx-retired.json").write_text(
+        json.dumps(
+            {
+                "original_path": str(root / base_name),
+                "reason": reason,
+                "retired_at": stamp,
+                "recorded_sha256": recorded_hash,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return {"action": "backed_up", "path": str(path), "backup": str(destination)}
 
 
 def _sha256_file(path: Path) -> str:
