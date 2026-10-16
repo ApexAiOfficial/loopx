@@ -12,6 +12,7 @@ from .opencode_goal_mode import plugin_source, runtime_source
 from .pi_goal_mode import extension_source as pi_extension_source
 from .pi_goal_mode import runtime_source as pi_runtime_source
 from .slash_commands import build_slash_command_catalog
+from .skill_install_readback import workflow_owned_skill_ids
 
 SCHEMA_VERSION = "loopx_slash_command_install_v0"
 MANAGED_MARKER_PREFIX = "<!-- loopx-managed-slash-command:v1"
@@ -881,9 +882,19 @@ def install_slash_commands(
                 )
 
         skill_dir = codex_root / "skills"
+        workflow_owned = workflow_owned_skill_ids(skill_dir)
         for spec in specs:
             skill_path = skill_dir / str(spec["name"]) / "SKILL.md"
             metadata_path = skill_path.parent / "agents" / "openai.yaml"
+            owned_by_workflow = str(spec["name"]) in workflow_owned
+            if uninstall and owned_by_workflow:  # its workflow-skill install removes it
+                installed.extend(
+                    {"surface": "codex", "host_surfaces": ["codex-cli", "codex-ide-plugin", "codex-app", "codex-app-ssh"],
+                     "mechanism": mechanism, "command": spec["command"], "path": str(path),
+                     "status": "managed_by_workflow_skills", "invoke_as": [f"${spec['name']}", "/skills"]}
+                    for mechanism, path in (("codex_explicit_skills", skill_path), ("codex_skill_openai_metadata", metadata_path))
+                )
+                continue
             if uninstall:
                 skill_status = _retire_status(skill_path, execute=execute)
                 installed.append(
@@ -910,8 +921,11 @@ def install_slash_commands(
                     }
                 )
                 continue
-            skill_content = _command_skill_content(spec, surface="codex-skills")
-            skill_status = _target_status(skill_path, skill_content, execute=execute)
+            if owned_by_workflow:  # the workflow-skill install is the authoritative writer
+                skill_status = "managed_by_workflow_skills"
+            else:
+                skill_content = _command_skill_content(spec, surface="codex-skills")
+                skill_status = _target_status(skill_path, skill_content, execute=execute)
             installed.append(
                 {
                     "surface": "codex",

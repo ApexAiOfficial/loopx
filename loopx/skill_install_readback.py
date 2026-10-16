@@ -134,6 +134,8 @@ def retire_duplicate_managed_skills(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         manifest = None
+    if isinstance(manifest, dict) and manifest.get("owner") not in SKILL_INSTALL_OWNERS:
+        manifest = None  # not written by a LoopX installer: vouches for nothing
     if isinstance(manifest, dict):
         raw_ids = manifest.get("materialized_skill_ids")
         if isinstance(raw_ids, list):
@@ -222,7 +224,11 @@ def skill_backup_root(skills_dir: Path) -> Path:
 
 
 def recorded_skill_hashes(skills_dir: Path) -> dict[str, str]:
-    """Content hashes the root's own install readback recorded, by skill id."""
+    """Content hashes LoopX's own installer recorded in this root's readback, by skill id.
+
+    A copy matching one of these is reproducible install output (it can be rebuilt from
+    the recorded source revision), which is what ``retire_skill_dir`` may delete.
+    """
 
     try:
         manifest = json.loads(
@@ -232,7 +238,9 @@ def recorded_skill_hashes(skills_dir: Path) -> dict[str, str]:
         )
     except (OSError, json.JSONDecodeError):
         return {}
-    skills = manifest.get("skills") if isinstance(manifest, dict) else None
+    if not isinstance(manifest, dict) or manifest.get("owner") not in SKILL_INSTALL_OWNERS:
+        return {}
+    skills = manifest.get("skills")
     items = skills.get("items") if isinstance(skills, dict) else None
     if not isinstance(items, dict):
         return {}
@@ -241,6 +249,25 @@ def recorded_skill_hashes(skills_dir: Path) -> dict[str, str]:
         for skill_id, item in items.items()
         if isinstance(item, dict) and isinstance(item.get("sha256"), str)
     }
+
+
+def workflow_owned_skill_ids(skills_dir: Path) -> set[str]:
+    """Skill ids a LoopX workflow-skill install in ``skills_dir`` recorded as its own.
+
+    That install materializes the ``loopx`` entry skill with the exact CLI path (and
+    host surface) and records its hash, so other LoopX writers must leave those trees.
+    """
+
+    try:
+        manifest = json.loads(
+            (Path(skills_dir) / SKILL_INSTALL_READBACK_FILENAME).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(manifest, dict) or manifest.get("owner") not in SKILL_INSTALL_OWNERS:
+        return set()
+    ids = manifest.get("materialized_skill_ids")
+    return {str(item) for item in ids} if isinstance(ids, list) else set()
 
 
 def retire_skill_dir(
