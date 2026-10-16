@@ -16,6 +16,8 @@ from .release_manifest import write_release_manifest
 from .skill_install_readback import (
     PACKAGED_HOST_SKILL_IDS,
     SKILL_INSTALL_READBACK_FILENAME,
+    recorded_skill_hashes,
+    retire_skill_dir,
     write_skill_install_readback,
 )
 from .slash_command_install import install_slash_commands, materialize_loopx_entry_skill
@@ -224,11 +226,17 @@ def _restore_paths(snapshots: Sequence[tuple[Path, Path | None]]) -> None:
 def _install_skills(release_root: Path, skills_dir: Path, installed_at: str) -> list[str]:
     skills_dir.mkdir(parents=True, exist_ok=True)
     installed_ids: list[str] = []
+    recorded = recorded_skill_hashes(skills_dir)
     for skill_id in PACKAGED_HOST_SKILL_IDS:
         source = release_root / "skills" / skill_id
         target = skills_dir / skill_id
-        if target.exists():
-            shutil.rmtree(target)
+        if target.exists() or target.is_symlink():
+            retire_skill_dir(
+                target,
+                skills_dir=skills_dir,
+                recorded_hash=recorded.get(skill_id),
+                reason="replaced by Windows install",
+            )
         shutil.copytree(source, target)
         installed_ids.append(skill_id)
     entry = materialize_loopx_entry_skill(
