@@ -174,12 +174,20 @@ loopx quota scheduler-ack-current \
   --goal-id <goal-id> \
   --agent-id <agent-id> \
   --surface codex_app \
-  --state-key scheduler_hint.codex_app.stateful_backoff \
+  --state-key scheduler_hint.app_automation.stateful_backoff \
   --reset-token <proposal-reset-token> \
   --identity-signature <proposal-identity-signature> \
   --applied-rrule 'FREQ=MINUTELY;INTERVAL=30' \
   --execute
 ```
+
+这段命令展示稳定的 public shape。持续运行的 host 应原样执行当前
+`ack_hint.cli_args`，不要自行拼参数。生成的命令还带有内部
+`--scheduler-host-facts-chunk` 与 `--turn-instance-id`。前者封装有版本且有大小上限的
+proposal/host facts，后者绑定产生该 hint 的 `quota should-run` receipt。Unix、Windows
+和 wheel console launcher 只有同时看到这两项绑定，才会把精确 ACK/failure command
+直接交给 native TypeScript transaction。手工输入且没有 receipt binding 的命令继续走
+Python compatibility path。
 
 ACK 绑定：
 
@@ -189,6 +197,7 @@ ACK 绑定：
 - scheduler state key；
 - proposal reset token 与 identity signature；
 - 实际 applied RRULE。
+- 生成这条 follow-up command 的 heartbeat Turn receipt。
 
 这样下一轮能够区分：
 
@@ -199,7 +208,29 @@ host update applied
 CLI acknowledged exact applied state
 ```
 
-Scheduler ACK 本身不构成 delivery，不 spend。
+### 兼容投影不能改变状态权威 / Compatibility preserves state authority
+
+新决策统一使用 `app_automation` 携带调度建议和宿主行动。旧捕获仍可读取其中的
+`codex_app`。读取优先采用 common state。仅有旧 Codex state 时，保留 TS 验证过的
+`state_key`，并将同一个键贯穿 backoff、host facts 与 ACK/failure 命令。
+写回前须校验状态归属及 CAS 摘要，否则可能把已推进的档位写入错误的状态键。
+
+New decisions use `app_automation` for the cadence proposal and Host actions.
+Saved captures can still carry `codex_app`. Reads prefer common state. A
+legacy-only Codex installation retains the TS-validated state key through
+backoff, Host facts, and ACK/failure commands. Before writing, validate the
+state scope and CAS digest to keep the recorded progression in its original
+state.
+
+兼容 Python API 与手工 Codex CLI 未显式传 `state_key` 时，从当前 packet 取得实际键；
+显式键仍须匹配，不得静默改写。Trae 仍只接受 common key。这不是隐式迁移：不能把
+旧状态的非零档位当作空 common state 的首次 ACK，也不能放松 TS 的 reset/CAS 校验。
+
+When Python compatibility APIs or manual Codex CLI calls omit `state_key`, they
+use the current packet's key. Explicit keys must still match; Trae remains
+common-key-only. This is not an implicit migration: a nonzero legacy stage must
+not become a first ACK into missing common state, and TS reset/CAS checks remain
+unchanged.
 
 ### Proposal、Host Effect 与 Durable Receipt
 
@@ -211,7 +242,7 @@ O: host 更新 automation，并 readback observed RRULE
 R: LoopX 持久化 ACK，证明 O 对应 P
 ```
 
-`O.target_matches=true` 只说明宿主当前值正确，不等于 `R.persisted=true`。如果 adapter
+`O.target_matches=true` 只说明宿主当前值正确。如果 adapter
 先更新 RRULE，再重新计算一份已经显示 settled 的 hint，原 proposal 的 ACK obligation
 可能被跳过。完整资格测试必须保留 P 的 `state_key`、`reset_token`、
 `identity_signature` 和 target RRULE，按以下顺序验证：
@@ -326,15 +357,15 @@ Host 只有在 CLI 派生 `terminal_no_followup` 时才应自动停止。它至�
 open todo count == 0
 ```
 
-只是必要条件之一，不是充分条件。
+只是必要条件之一。
 
-`terminal_no_followup` 是 LoopX 自己派生的 runtime closure，不是用户自定义 status，也不应由 host 根据自然语言猜测。
+`terminal_no_followup` 是 LoopX 自己派生的 runtime closure。
 
 ## 原生 Codex Goal 与 LoopX Host Surface
 
 ### 原生 Goal 的持久边界
 
-Codex 原生 Goal 不是“在 prompt 前写 `/goal`”的文本约定。自动化 surface 通过
+自动化 surface 通过
 `thread/goal/set` 把 objective、status 与可选 token budget 绑定到 thread，通过
 `thread/goal/get` 读回，再用 `turn/start` 继续执行。只有普通 prompt 的 slash 前缀、
 外部 polling loop 或 `codex exec` 成功，都不能单独证明 native Goal 已激活。
@@ -490,32 +521,39 @@ base_identity_keys = [
 
 只要工作身份发生 material 变化，backoff progression 就应 reset。否则“等待同一个外部结果的第 5 次 poll”和“刚切换到新 runnable todo 的第一次执行”会错误共享慢 cadence。
 
-### 3. ACK 同时校验 Proposal Identity 与 Host 回报
+### 3. 原生 Follow-up 同时校验 Turn、Proposal 与 Host 回报
 
-`scheduler/ack.py` 中的 `build_scheduler_ack_plan` 逐层比对 state identity：
+`scheduler/heartbeat_followup_cli.ts` 先解码有大小上限的 hint packet，再核对 command、
+goal、agent、operation、state key、proposal identity 与 host readback。随后
+`scheduler/heartbeat_followup.ts::evaluateSchedulerHeartbeatFollowup` 检查 receipt 是否仍是
+当前 goal/agent 的最新 Turn。缺失 receipt 或已经出现更新 Turn 时，transaction 在写
+scheduler state 前停止。
 
-```python
-if not agent_id:
-    return {"ok": False, "reason": "... requires --agent-id"}
-if not stateful_backoff:
-    return {"ok": False, "reason": "... no ... stateful scheduler packet"}
-if stateful_backoff.get("state_key") != state_key:
-    return {"ok": False, "reason": "--state-key does not match ..."}
-if reset_token and reset_token != stateful_backoff.get("reset_token"):
-    return {"ok": False, "reason": "--reset-token does not match ..."}
-if identity_signature and identity_signature != stateful_backoff.get("identity_signature"):
-    return {"ok": False, "reason": "--identity-signature does not match ..."}
-
-if not apply_needed and not ack_needed:
-    return {"ok": True, "already_applied": True, ...}
-if not applied_rrule:
-    return {"ok": False, "reason": "... requires --applied-rrule ..."}
+```typescript
+if (request.require_heartbeat_receipt) {
+  const status = await heartbeatReceiptStatus(
+    request.runtime_root,
+    String(facts.goal_id),
+    String(facts.agent_id),
+    String(request.turn_instance_id),
+  );
+  if (status !== "fresh") return receiptFailure(request, status);
+}
+const commit = await evaluateSchedulerHeartbeatHostFacts({
+  ...facts,
+  runtime_root: request.runtime_root,
+});
 ```
 
-这些检查拒绝把任意 host 值写成当前 proposal 的 receipt。端到端测试还必须把 apply 前
-生成的 token 原样带过 host effect；若只在 effect 后重新读取当前 hint，测试仍可能漏掉
-ACK obligation 丢失。ACK 不是 delivery，所以不 spend；但没有 durable ACK，下一轮也
-不能把“建议值”或“当前 host 恰好匹配”当成已结算状态。
+这组检查拒绝把任意 host 值或过期 Turn 写成当前 proposal 的 receipt。TypeScript 在同一
+进程内完成 ACK/host-failure validation、failure-cache transition、replay/CAS、atomic
+write 和兼容旧合同的 JSON/Markdown projection。持续运行的路径没有 Python 到 Node 的
+第二次 request/response。Python adapter 没有 scheduler 决策权，只给显式 in-process
+caller 与 unbound manual command 保留兼容入口。
+
+端到端测试仍需把 apply 前生成的 hint 原样带过 host effect。若 effect 后重新读取一份
+hint，测试仍可能漏掉 ACK obligation 丢失。缺少
+durable ACK 时，下一轮不能把 proposal 或碰巧相同的 host 值当成已结算状态。
 
 ### 4. Monitor writeback 用 result hash 区分观察与推进
 
@@ -583,9 +621,9 @@ return record_quota_monitor_poll_for_decision(
 )
 ```
 
-Execution context 不是渲染选项，而是 decision input。若 CLI 入口识别出 Codex App，
+Execution context 是 decision input。若 CLI 入口识别出 Codex App，
 但 wrapper 只把 context 传给 `before`，`after` 会误以为自己处在未知 host，返回
-`repair_scheduler_execution_context`。这不是 monitor 产生了新阻塞，而是调用链丢失
+`repair_scheduler_execution_context`。这是调用链丢失
 了 authority context。
 
 对应回归应同时证明：
@@ -601,7 +639,7 @@ App tick
   -> heartbeat prompt 要求先 quota should-run
   -> quota 返回 interaction_contract + scheduler_hint
   -> 若 apply_needed: host 更新 RRULE
-  -> host 用 scheduler-ack-current 写回实际 RRULE
+  -> host 原样执行 hint 中 receipt-bound scheduler-ack-current 写回实际 RRULE
   -> 若 agent.must_attempt: 执行 bounded work
   -> refresh-state 写回 outcome
   -> validation 通过后 spend 一次
@@ -612,7 +650,8 @@ App tick
 ### 断点建议
 
 - `scheduler_hint.py:457`：观察非法 execution context 如何 fail closed；
-- `scheduler/ack.py:120`：依次改错 state key、reset token、identity signature；
+- `scheduler/heartbeat_followup_cli.ts`：依次改错 facts packet、Turn、state key、reset token、identity signature；
+- `scheduler/heartbeat_followup.ts`：观察 missing/stale receipt 如何在 state mutation 前停止；
 - `write_monitor_poll_todo_state:98`：比较 hash 相同、hash 变化、显式 material change；
 - `record_quota_monitor_poll`：确认 before/after 收到同一个 scheduler context；
 - host adapter：确认只有 host 层真正调用 automation update。
@@ -664,7 +703,7 @@ App tick
 
 ### 把 launcher 称为 supervisor agent
 
-Auto Research 的 tmux launcher 只是 host launcher，不是拥有 todo 决策权的 leader agent。可选 peer supervisor 是另一套 proposal-only overlay。
+Auto Research 的 tmux launcher 只是 host launcher。可选 peer supervisor 是另一套 proposal-only overlay。
 
 ## 课后检查
 

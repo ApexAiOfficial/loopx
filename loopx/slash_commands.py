@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
+
 
 from .presentation.markdown import (
     markdown_code,
@@ -68,12 +69,17 @@ def build_slash_command_catalog(
                 "host_loop_activation_catalog": f"{cli_bin} agent-onboard --list-agent-types",
                 "host_loop_activation_by_agent_type": {
                     "codex-app": "create/update Codex App heartbeat automation from heartbeat-prompt task_body",
+                    "trae_app": "create/update Trae App heartbeat automation from heartbeat-prompt task_body",
                     "codex-cli": "set visible Codex CLI TUI `/goal <task_body>`",
                     "claude-code": "arm LoopX with `/loopx <task>`, then run native `/loop`",
                     "opencode": "call `loopx_goal_activate`",
                     "pi": "call `loopx_goal_activate`",
                     "gemini-cli": "drive the loop from the agent's own turns; enter every turn through quota should-run",
                     "cursor-agent": "drive the loop from the agent's own turns; enter every turn through quota should-run",
+                    "zcode": "drive the loop from the agent's turns; enter through quota should-run",
+                    "agy": "native /goal + schedule wakes; quota entry advisory",
+                    "antigravity-app": "schedule timer + sidecar heartbeat",
+                    "kiro-cli": "native /goal loop; quota entry advisory",
                     "manual": "wire an external scheduler or run quota/status manually",
                     "other-agent": "use the custom host loop driver declared by `loopx agent-onboard`",
                 },
@@ -122,7 +128,7 @@ def build_slash_command_catalog(
         _command(
             command="/loopx-pr-review",
             scope="repo",
-            intent="Run pr-review, execute each exact-head review plan, then render verified evidence through the five-block template.",
+            intent="Run pr-review; execute actionable rows and read back null-action rows.",
             mutation_policy="read_only; does not comment, approve, merge, or spend quota",
             cli_reference=f"{cli_bin} pr-review [--repo owner/repo] [--state open|merged|all] [--since ISO]",
             agent_contract={
@@ -140,18 +146,14 @@ def build_slash_command_catalog(
                     "agent_response_contract.explanation_depth_contract",
                     "review_groups.unmerged",
                     "review_groups.merged",
-                    "pull_requests[].review_plan",
-                    "pull_requests[].review_template",
-                    "pull_requests[].evidence_commands",
+                    "agent_response_contract.required_packet_fields_to_preserve",
                     "agent_response_contract.required_final_sections",
                 ],
                 "required_packet_fields_to_preserve": [
                     "agent_response_contract",
                     "result_completeness",
                     "review_groups",
-                    "pull_requests[].review_plan",
-                    "pull_requests[].review_template",
-                    "pull_requests[].evidence_commands",
+                    "pull_requests",
                 ],
                 "final_answer_contract": {
                     "table_only_response_allowed": False,
@@ -239,7 +241,7 @@ def render_slash_command_catalog_markdown(payload: dict[str, Any]) -> str:
         intent = str(item.get("intent") or "")
         if legacy:
             intent += " Legacy aliases: " + ", ".join(f"`{alias}`" for alias in legacy) + "."
-        agent_contract = item.get("agent_contract") if isinstance(item.get("agent_contract"), dict) else {}
+        agent_contract = cast(dict[str, Any], item.get("agent_contract")) if isinstance(item.get("agent_contract"), dict) else {}
         if agent_contract.get("must_run_cli_first"):
             intent += " Agent contract: run the CLI reference first; do not rebuild the queue manually."
         if agent_contract.get("host_loop_activation_required_after_todo_writeback"):

@@ -16,6 +16,9 @@ rename or remove them.
 
 ## At a Glance
 
+**Illustrated release guide:** <Verified companion Feishu document URL, owned
+by the maintainer's personal user account.>
+
 <One outcome-led headline for the release, e.g. "更安全、更会收口、更容易被
 运营看见" / "Security hardening, semantic replan closeout, and a clearer
 operator surface." Keep this readable in 15 seconds.>
@@ -26,8 +29,8 @@ operator surface." Keep this readable in 15 seconds.>
 command. Full commands live in `## Install / Update` below.>
 
 ```bash
-loopx update --check       # 已是最新则无需操作
-loopx update --execute     # 升级到 vX.Y.Z
+loopx update check         # 只读检查安装 owner 与新版本
+loopx update apply         # 由当前安装 owner 升级到 vX.Y.Z
 loopx --version && loopx doctor
 ```
 
@@ -149,7 +152,7 @@ opt-in surface, replace the no-change declaration with one entry per surface:
 
 **Authority boundary:** <Writes, merges, providers, privacy, or host powers not granted.>
 
-**Docs:** https://github.com/huangruiteng/loopx/blob/vX.Y.Z/<canonical-doc>
+**Docs:** https://github.com/loopx-project/loopx/blob/vX.Y.Z/<canonical-doc>
 
 ```bash
 <activation-command>
@@ -169,16 +172,19 @@ loopx slash-commands --install
 loopx doctor
 ```
 
-Archive-fallback users should preview and execute their archive update
-explicitly:
+All existing installs use explicit update intent; the command preserves the
+active pip, pipx, or archive owner:
 
 ```bash
-loopx update --check --ref stable
-loopx update --execute --ref stable
+loopx update check
+loopx update plan
+loopx update apply
 loopx doctor
 ```
 
 ## 中文摘要
+
+**图文发布指南：**<维护者个人飞书账号名下、已核验内容与图片的配套文档链接。>
 
 <把 `At a Glance` 的标题、升级、Highlights、Replan 修复与贡献者以中文镜像到
 本段开头，再进入详细分组。可以更短，但不能弱化。>
@@ -250,4 +256,4 @@ Apache-2.0 不限制商业使用；显式专利框架服务于未来企业与生
 - <Exact-commit checks that passed, including failures or skips without
   overclaiming hosted, live-model, benchmark, or long-horizon evidence.>
 
-Compare: https://github.com/huangruiteng/loopx/compare/vPREVIOUS...vX.Y.Z
+Compare: https://github.com/loopx-project/loopx/compare/vPREVIOUS...vX.Y.Z

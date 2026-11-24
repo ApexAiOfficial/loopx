@@ -1,15 +1,26 @@
 from __future__ import annotations
 
-import shlex
+import json
+import os
 import re
+import shlex
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
-from .planner import REPO_ROOT, build_catalog_canary_plan, flatten_catalog_canary_checks
+from ..extensions.process_runtime import remove_owned_tree, terminate_process_tree
+from .planner import (
+    REPO_ROOT,
+    build_catalog_canary_plan,
+    flatten_catalog_canary_checks,
+    resolve_canary_catalog_path,
+)
 from .smoke_profiles import list_smoke_suite_profiles, resolve_smoke_suite_profiles
 
 
@@ -27,8 +38,9 @@ EXPLICIT_GROUPED_SMOKES = {
     "canary-promotion-readiness-smoke.py",
     "dashboard-demo-readiness-smoke.py",
 }
+MAINTAINABILITY_RATCHET_SCRIPT = "examples/control_plane/control-plane-maintainability-ratchet-smoke.py"
 GIT_REQUIRED_SCRIPTS = {
-    "control-plane-maintainability-ratchet-smoke.py": (
+    Path(MAINTAINABILITY_RATCHET_SCRIPT).name: (
         "requires git ls-files so untracked local artifacts do not enter the report"
     ),
     "repository-hygiene-smoke.py": (
@@ -81,8 +93,9 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
-def normalize_canary_command(command: str) -> dict[str, Any]:
+def normalize_canary_command(command: str, repo_root: Path | None = None) -> dict[str, Any]:
     """Parse a planner command into a shell-free, repository-local argv."""
+    repo_root = (repo_root or REPO_ROOT).resolve()
 
     try:
         parts = shlex.split(command)
@@ -109,9 +122,9 @@ def normalize_canary_command(command: str) -> dict[str, Any]:
         }
 
     interpreter = parts[0]
-    script = (REPO_ROOT / parts[1]).resolve()
-    examples_root = (REPO_ROOT / "examples").resolve()
-    if not _is_relative_to(script, examples_root):
+    script = (repo_root / parts[1]).resolve()
+    examples_root = (repo_root / "examples").resolve()
+    if not _is_relative_to(script, examples_root) or not _is_relative_to(script, repo_root):
         return {
             "ok": False,
             "command": command,
@@ -135,50 +148,75 @@ def normalize_canary_command(command: str) -> dict[str, Any]:
         for arg in NO_WRITE_ARGS_BY_SCRIPT.get(script.name, [])
         if arg not in argv
     ]
+    relative_script = script.relative_to(repo_root).as_posix()
+    if relative_script == MAINTAINABILITY_RATCHET_SCRIPT and len(parts) == 2:
+        injected_args.append("--format=json")
     if injected_args:
         argv.extend(injected_args)
     return {
         "ok": True,
         "command": command,
         "argv": argv,
-        "display_argv": _display_argv(argv),
+        "display_argv": _display_argv(argv, repo_root=repo_root),
         "injected_args": injected_args,
-        "script": str(script.relative_to(REPO_ROOT)),
+        "script": relative_script,
     }
 
 
-def _display_argv(argv: list[str]) -> list[str]:
+def _display_argv(argv: list[str], repo_root: Path | None = None) -> list[str]:
+    repo_root = (repo_root or REPO_ROOT).resolve()
     displayed = list(argv)
     if displayed and Path(displayed[0]).resolve() == Path(sys.executable).resolve():
         displayed[0] = "python3"
     for index, value in enumerate(displayed[1:], start=1):
         path = Path(value)
-        if path.is_absolute() and _is_relative_to(path.resolve(), REPO_ROOT.resolve()):
-            displayed[index] = str(path.resolve().relative_to(REPO_ROOT.resolve()))
+        if path.is_absolute() and _is_relative_to(path.resolve(), repo_root.resolve()):
+            displayed[index] = path.resolve().relative_to(repo_root.resolve()).as_posix()
     return displayed
 
 
-def _tracked_change_paths() -> tuple[bool, list[str], str]:
-    git_ok, git_detail = _git_worktree_probe(REPO_ROOT)
+def _display_git_path(path: bytes | str) -> str:
+    """Render a Git pathname without collapsing undecodable bytes."""
+
+    if isinstance(path, str):
+        return path
+    try:
+        return path.decode("utf-8")
+    except UnicodeDecodeError:
+        return repr(path)
+
+
+def _display_git_paths(paths: Sequence[bytes | str]) -> list[str]:
+    return [_display_git_path(path) for path in paths]
+
+
+def _tracked_change_paths(repo_root: Path | None = None) -> tuple[bool, list[bytes], str]:
+    repo_root = (repo_root or REPO_ROOT).resolve()
+    git_ok, git_detail = _git_worktree_probe(repo_root)
     if not git_ok:
         return False, [], git_detail
 
-    paths: set[str] = set()
+    paths: set[bytes] = set()
     stderr_parts: list[str] = []
     ok = True
-    for args in (["diff", "--name-only"], ["diff", "--name-only", "--cached"]):
+    for args in (
+        ["diff", "--name-only", "-z"],
+        ["diff", "--name-only", "-z", "--cached"],
+    ):
         completed = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), *args],
+            ["git", "-C", str(repo_root), *args],
             check=False,
-            text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
         if completed.returncode != 0:
             ok = False
-            stderr_parts.append(f"git_diff_failed: {completed.stderr[-400:]}")
+            stderr_parts.append(
+                "git_diff_failed: "
+                + completed.stderr.decode("utf-8", "replace")[-400:]
+            )
             continue
-        paths.update(line.strip() for line in completed.stdout.splitlines() if line.strip())
+        paths.update(record for record in completed.stdout.split(b"\0") if record)
     return ok, sorted(paths), "\n".join(part for part in stderr_parts if part)
 
 
@@ -186,7 +224,7 @@ def _git_worktree_probe(root: Path) -> tuple[bool, str]:
     worktree_probe = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
         check=False,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -200,12 +238,13 @@ def _git_worktree_probe(root: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def _git_required_skip(normalized: dict[str, Any]) -> dict[str, Any] | None:
+def _git_required_skip(normalized: dict[str, Any], repo_root: Path | None = None) -> dict[str, Any] | None:
+    repo_root = (repo_root or REPO_ROOT).resolve()
     script_name = Path(str(normalized.get("script") or "")).name
     reason = GIT_REQUIRED_SCRIPTS.get(script_name)
     if not reason:
         return None
-    git_ok, git_detail = _git_worktree_probe(REPO_ROOT)
+    git_ok, git_detail = _git_worktree_probe(repo_root)
     if git_ok:
         return None
     return {
@@ -218,30 +257,176 @@ def _git_required_skip(normalized: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _serial_smoke_reason(check: dict[str, Any]) -> str:
+def _serial_smoke_reason(check: dict[str, Any], repo_root: Path | None = None) -> str:
+    repo_root = (repo_root or REPO_ROOT).resolve()
     normalized = check.get("normalized")
     if not isinstance(normalized, dict):
-        normalized = normalize_canary_command(str(check.get("command") or ""))
+        normalized = normalize_canary_command(str(check.get("command") or ""), repo_root=repo_root)
     script_name = Path(str(normalized.get("script") or "")).name
     return SERIAL_SMOKE_SCRIPTS.get(script_name, "")
 
 
-def _restore_tracked_paths(paths: list[str]) -> dict[str, Any]:
+def _restore_tracked_paths(
+    paths: list[bytes],
+    repo_root: Path | None = None,
+    *,
+    expected_paths: list[bytes] | None = None,
+) -> dict[str, Any]:
+    repo_root = (repo_root or REPO_ROOT).resolve()
+    expected_paths = list(expected_paths or [])
     if not paths:
-        return {"ok": True, "restored_paths": []}
+        readback_ok, remaining, readback_stderr = _tracked_change_paths(repo_root=repo_root)
+        verified = readback_ok and set(remaining) == set(expected_paths)
+        result = {
+            "ok": verified,
+            "returncode": 0,
+            "restored_paths": [],
+            "remaining_paths": _display_git_paths(remaining),
+            "git_readback_ok": readback_ok,
+            "verified_by_git": verified,
+        }
+        if readback_stderr:
+            result["git_readback_stderr_tail"] = readback_stderr[-800:]
+        if not readback_ok:
+            result["reason"] = "the tracked state could not be read back"
+        elif not verified:
+            result["reason"] = "the tracked state did not match the baseline"
+        return result
+    if os.name == "nt":
+        try:
+            command_paths = [path.decode("utf-8") for path in paths]
+        except UnicodeDecodeError:
+            return {
+                "ok": False,
+                "restored_paths": [],
+                "remaining_paths": _display_git_paths(paths),
+                "git_readback_ok": False,
+                "verified_by_git": False,
+                "reason": "non-UTF-8 path cannot be addressed on Windows",
+            }
+        command: list[str] | list[bytes] = [
+            "git",
+            "-C",
+            os.fspath(repo_root),
+            "restore",
+            "--staged",
+            "--worktree",
+            "--",
+            *command_paths,
+        ]
+    else:
+        command = [
+            b"git",
+            b"-C",
+            os.fsencode(str(repo_root)),
+            b"restore",
+            b"--staged",
+            b"--worktree",
+            b"--",
+            *paths,
+        ]
     completed = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "restore", "--staged", "--worktree", "--", *paths],
+        command,
         check=False,
-        text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    return {
-        "ok": completed.returncode == 0,
+    readback_ok, remaining, readback_stderr = _tracked_change_paths(repo_root=repo_root)
+    verified = readback_ok and set(remaining) == set(expected_paths)
+    result = {
+        "ok": completed.returncode == 0 and verified,
         "returncode": completed.returncode,
-        "restored_paths": paths if completed.returncode == 0 else [],
-        "stderr_tail": completed.stderr[-800:],
+        "restored_paths": _display_git_paths(paths) if verified else [],
+        "remaining_paths": _display_git_paths(remaining),
+        "git_readback_ok": readback_ok,
+        "verified_by_git": verified,
+        "stderr_tail": completed.stderr.decode("utf-8", "replace")[-800:],
     }
+    if readback_stderr:
+        result["git_readback_stderr_tail"] = readback_stderr[-800:]
+    if completed.returncode != 0:
+        result["reason"] = "git restore failed"
+    elif not readback_ok:
+        result["reason"] = "git restore completed but the tracked state could not be read back"
+    elif not verified:
+        result["reason"] = "git restore completed but the tracked state did not match the baseline"
+    return result
+
+
+def _retire_fixture_runtimes(root: Path, *, timeout: float = 15) -> None:
+    """Stop all source revisions in this newly created private smoke root."""
+    from ..control_plane.effect_runtime import _read_info, _stop_effect_runtime
+
+    deadline = time.monotonic() + timeout
+    for namespace in sorted(root.glob("loopx-effect-runtime-*")):
+        if namespace.is_symlink() or not namespace.is_dir():
+            continue
+        for path in sorted(namespace.glob("runtime-*.json")):
+            # Never follow fixture links into an unrelated runtime namespace.
+            if path.is_symlink() or not path.is_file():
+                continue
+            # The namespace can contain a temporary base checkout's revision.
+            # Read and validate one snapshot before retirement removes it.
+            info = _read_info(path, fingerprint=None)
+            if info is None:
+                continue
+            if path.name != f"runtime-{info['fingerprint'][:16]}.json":
+                raise RuntimeError(f"invalid managed runtime fingerprint: {path.name}")
+            remaining = (deadline - time.monotonic()) / 2
+            if remaining <= 0:
+                raise RuntimeError("managed runtime cleanup deadline exceeded")
+            result = _stop_effect_runtime(
+                path, info, timeout=min(5, remaining), wait_for_process_exit=True,
+            )
+            if result["status"] != "stopped":
+                raise RuntimeError(f"managed runtime still exiting: {path.name}")
+
+
+def _remove_fixture_root(root: Path) -> None:
+    """Stop every managed runtime in an owned smoke root, then remove the root.
+
+    The root belongs to one check and holds host fixtures, git object stores
+    included, so removal tolerates the read-only attributes a host leaves behind.
+    A failure still raises, and the caller retains the tree for diagnosis.
+    """
+    _retire_fixture_runtimes(root)
+    remove_owned_tree(root)
+
+
+def check_output_tail(output: str | bytes | None) -> str:
+    limit = 800
+    if isinstance(output, bytes):
+        # TimeoutExpired can carry bytes even when the process uses text mode.
+        # UTF-8 needs at most four bytes for each character in the tail.
+        output = output[-4 * limit :].decode("utf-8", errors="replace")
+    return (output or "")[-limit:]
+
+
+def _record_maintainability_report(
+    result: dict[str, Any], stdout: str, *, completed_failure: bool,
+) -> None:
+    from .maintainability_ratchet import (
+        MAINTAINABILITY_REPORT_SCHEMA_VERSION,
+        completed_maintainability_failure_paths,
+        render_control_plane_maintainability_report,
+    )
+
+    try:
+        report = json.loads(stdout)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(report, dict) or report.get("schema_version") != MAINTAINABILITY_REPORT_SCHEMA_VERSION:
+        return
+
+    if "--format=json" in result["normalized"]["injected_args"]:
+        try:
+            result["stdout_tail"] = check_output_tail(render_control_plane_maintainability_report(report))
+        except (AttributeError, TypeError, ValueError):
+            return
+    if completed_failure:
+        paths = completed_maintainability_failure_paths(report)
+        if paths:
+            result["maintainability_failure_paths"] = paths
 
 
 def _run_check(
@@ -250,30 +435,81 @@ def _run_check(
     timeout_seconds: float,
     check_index: int | None = None,
     check_count: int | None = None,
+    repo_root: Path | None = None,
+    cli_output_base_ref: str | None = None,
 ) -> dict[str, Any]:
-    normalized = normalize_canary_command(str(check.get("command") or ""))
+    repo_root = (repo_root or REPO_ROOT).resolve()
+    normalized = normalize_canary_command(str(check.get("command") or ""), repo_root=repo_root)
     result = {**check, "normalized": normalized}
+    result.pop("maintainability_failure_paths", None)
     if check_index is not None and check_count is not None:
         result.update({"check_index": check_index, "check_count": check_count})
     if not normalized.get("ok"):
         result.update({"status": "skipped", "ok": False, "reason": normalized.get("reason")})
         return result
-    git_required_skip = _git_required_skip(normalized)
+    git_required_skip = _git_required_skip(normalized, repo_root=repo_root)
     if git_required_skip:
         result.update(git_required_skip)
         return result
 
     started = time.monotonic()
+    launch_error: OSError | None = None
+    cleanup_error: str | None = None
+    root = Path(tempfile.mkdtemp(prefix="loopx-smoke-"))
     try:
-        completed = subprocess.run(
-            normalized["argv"],
-            cwd=REPO_ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout_seconds,
-            check=False,
-        )
+        try:
+            home = root / "home"
+            home.mkdir()
+            env = {**os.environ, "LOOPX_USAGE_PING": "0", "HOME": str(home),
+                   "CODEX_HOME": str(home / ".codex")}
+            if (
+                cli_output_base_ref is not None
+                and normalized["script"] == "examples/control_plane/cli-output-budget-regression-smoke.py"
+            ):
+                # Match CI's two-ref handoff so the child uses the selected
+                # base's merge-base with HEAD, even for non-main targets.
+                env["LOOPX_CLI_OUTPUT_BASE_REF"] = cli_output_base_ref
+                env["LOOPX_CLI_OUTPUT_MAIN_REF"] = cli_output_base_ref
+            for name in ("LOOPX_RUNTIME_ROOT", "LOOPX_REGISTRY"):
+                env.pop(name, None)
+            for name in ("TMPDIR", "TEMP", "TMP"):
+                env[name] = str(root)
+            for name, directory in (
+                ("XDG_CONFIG_HOME", ".config"), ("XDG_DATA_HOME", ".local/share"),
+                ("XDG_STATE_HOME", ".local/state"), ("XDG_CACHE_HOME", ".cache"),
+                ("OPENCODE_CONFIG_DIR", ".config/opencode"),
+            ):
+                env[name] = str(home / directory)
+            try:
+                process = subprocess.Popen(
+                    normalized["argv"], cwd=repo_root, env=env,
+                    text=True, encoding="utf-8", errors="replace",
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    start_new_session=os.name == "posix",
+                )
+            except OSError as exc:
+                launch_error = exc
+            else:
+                with process:
+                    try:
+                        stdout, stderr = process.communicate(timeout=timeout_seconds)
+                    except BaseException:
+                        # Deadline/cancellation must stop the owned children
+                        # before deleting their fixture, even after leader exit.
+                        # Reuse OS transport; keep the caller's existing budget.
+                        terminate_process_tree(process, grace_seconds=0)
+                        raise
+                    completed = subprocess.CompletedProcess(
+                        normalized["argv"], process.returncode, stdout, stderr,
+                    )
+        finally:
+            try:
+                _remove_fixture_root(root)
+            except (OSError, RuntimeError, ValueError) as error:
+                # Retain the owned namespace if shutdown cannot be proved.
+                # Do not mask the check with unconditional second deletion.
+                cleanup_error = f"fixture cleanup failed; retained {root}: {error}"
+
     except subprocess.TimeoutExpired as exc:
         result.update(
             {
@@ -281,22 +517,43 @@ def _run_check(
                 "ok": False,
                 "returncode": None,
                 "duration_seconds": round(time.monotonic() - started, 3),
-                "stdout_tail": (exc.stdout or "")[-800:] if isinstance(exc.stdout, str) else "",
-                "stderr_tail": (exc.stderr or "")[-800:] if isinstance(exc.stderr, str) else "",
+                "stdout_tail": check_output_tail(exc.stdout),
+                "stderr_tail": check_output_tail(exc.stderr),
             }
+        )
+        if cleanup_error:
+            result["reason"] = cleanup_error
+        return result
+
+    if launch_error is not None:
+        reason = f"could not start smoke check: {launch_error}"
+        result.update(
+            status="failed", ok=False, returncode=None,
+            duration_seconds=round(time.monotonic() - started, 3),
+            stdout_tail="", stderr_tail="",
+            reason=f"{reason}; {cleanup_error}" if cleanup_error else reason,
         )
         return result
 
     result.update(
         {
-            "status": "passed" if completed.returncode == 0 else "failed",
-            "ok": completed.returncode == 0,
+            "status": "passed" if completed.returncode == 0 and not cleanup_error else "failed",
+            "ok": completed.returncode == 0 and not cleanup_error,
             "returncode": completed.returncode,
             "duration_seconds": round(time.monotonic() - started, 3),
-            "stdout_tail": completed.stdout[-800:],
-            "stderr_tail": completed.stderr[-800:],
+            "stdout_tail": check_output_tail(completed.stdout),
+            "stderr_tail": check_output_tail(completed.stderr),
         }
     )
+    if cleanup_error:
+        result["reason"] = cleanup_error
+    if (
+        normalized["script"] == MAINTAINABILITY_RATCHET_SCRIPT
+        and normalized["argv"][2:] in (["--format=json"], ["--format", "json"])
+    ):
+        _record_maintainability_report(
+            result, completed.stdout, completed_failure=completed.returncode == 1 and not cleanup_error
+        )
     return result
 
 
@@ -304,32 +561,37 @@ def run_canary_smoke_check(
     check: dict[str, Any],
     *,
     timeout_seconds: float = 120.0,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     """Execute one normalized canary smoke-suite check through the runner contract."""
+    repo_root = (repo_root or REPO_ROOT).resolve()
 
-    return _run_check(check, timeout_seconds=max(1.0, timeout_seconds))
-
-
-def _smoke_script_relative(script: Path) -> str:
-    return script.relative_to(REPO_ROOT).as_posix()
+    return _run_check(check, timeout_seconds=max(1.0, timeout_seconds), repo_root=repo_root)
 
 
-def _smoke_script_filter_keys(script: Path) -> set[str]:
-    examples_root = REPO_ROOT / "examples"
+def _smoke_script_relative(script: Path, repo_root: Path | None = None) -> str:
+    repo_root = (repo_root or REPO_ROOT).resolve()
+    return script.relative_to(repo_root).as_posix()
+
+
+def _smoke_script_filter_keys(script: Path, repo_root: Path | None = None) -> set[str]:
+    repo_root = (repo_root or REPO_ROOT).resolve()
+    examples_root = repo_root / "examples"
     return {
         script.name,
-        _smoke_script_relative(script),
+        _smoke_script_relative(script, repo_root=repo_root),
         script.relative_to(examples_root).as_posix(),
     }
 
 
-def _smoke_script_check(script: Path, *, source: str = "suite") -> dict[str, Any]:
+def _smoke_script_check(script: Path, *, source: str = "suite", repo_root: Path | None = None) -> dict[str, Any]:
+    repo_root = (repo_root or REPO_ROOT).resolve()
     return {
         "source": source,
         "profile_id": "smoke-suite",
         "profile_title": "Smoke suite",
         "tier": "default",
-        "command": f"python3 {_smoke_script_relative(script)}",
+        "command": f"python3 {_smoke_script_relative(script, repo_root=repo_root)}",
         "reason": "tracked public smoke script",
     }
 
@@ -348,10 +610,11 @@ def _normalize_script_filter(script: str) -> str:
     return path.name if path.suffix else value
 
 
-def _matches_modules(script: Path, modules: list[str]) -> bool:
+def _matches_modules(script: Path, modules: list[str], repo_root: Path | None = None) -> bool:
+    repo_root = (repo_root or REPO_ROOT).resolve()
     if not modules:
         return True
-    examples_relative = script.relative_to(REPO_ROOT / "examples").as_posix().lower()
+    examples_relative = script.relative_to(repo_root / "examples").as_posix().lower()
     haystack = f"{script.name.lower()} {examples_relative}"
     stem_tokens = {
         token for token in re.split(r"[-_./]+", examples_relative.removesuffix(script.suffix)) if token
@@ -382,14 +645,18 @@ def _discover_smoke_suite_checks(
     modules: list[str] | None = None,
     exclude_modules: list[str] | None = None,
     scripts: list[str] | None = None,
+    repo_root: Path | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    repo_root = (repo_root or REPO_ROOT).resolve()
     normalized_suite = suite if suite in SMOKE_SUITE_CHOICES else "default-public"
     modules = list(modules or [])
     exclude_modules = list(exclude_modules or [])
     requested_scripts = {
         script for script in (_normalize_script_filter(item) for item in (scripts or [])) if script
     }
-    all_scripts = sorted(path for path in (REPO_ROOT / "examples").rglob("*-smoke.py") if path.is_file())
+    if not (repo_root / "examples").is_dir():
+        raise ValueError("canary examples are missing; run from a complete source checkout")
+    all_scripts = sorted(path for path in (repo_root / "examples").rglob("*-smoke.py") if path.is_file())
     if normalized_suite == "default-public":
         all_scripts = [
             script for script in all_scripts
@@ -398,12 +665,12 @@ def _discover_smoke_suite_checks(
     selected: list[Path] = []
     missing_scripts = set(requested_scripts)
     for script in all_scripts:
-        script_filter_keys = _smoke_script_filter_keys(script)
+        script_filter_keys = _smoke_script_filter_keys(script, repo_root=repo_root)
         if requested_scripts and requested_scripts.isdisjoint(script_filter_keys):
             continue
-        if not _matches_modules(script, modules):
+        if not _matches_modules(script, modules, repo_root=repo_root):
             continue
-        if exclude_modules and _matches_modules(script, exclude_modules):
+        if exclude_modules and _matches_modules(script, exclude_modules, repo_root=repo_root):
             missing_scripts.difference_update(script_filter_keys)
             continue
         selected.append(script)
@@ -416,7 +683,7 @@ def _discover_smoke_suite_checks(
         }
         for script in sorted(missing_scripts)
     ]
-    return [_smoke_script_check(script) for script in selected], warnings
+    return [_smoke_script_check(script, repo_root=repo_root) for script in selected], warnings
 
 
 def _dedupe_checks(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -444,10 +711,12 @@ def _progress_check_started(
     index: int,
     total: int,
     check: dict[str, Any],
+    repo_root: Path | None = None,
 ) -> None:
+    repo_root = (repo_root or REPO_ROOT).resolve()
     if not progress_callback:
         return
-    normalized_check = normalize_canary_command(str(check.get("command") or ""))
+    normalized_check = normalize_canary_command(str(check.get("command") or ""), repo_root=repo_root)
     progress_callback(
         {
             "schema_version": "canary_smoke_suite_progress_v0",
@@ -506,6 +775,8 @@ def build_canary_smoke_suite_run(
     allow_tracked_side_effects: bool = False,
     parallel_jobs: int = 1,
     progress_callback: ProgressCallback | None = None,
+    repo_root: Path | None = None,
+    cli_output_base_ref: str | None = None,
 ) -> dict[str, Any]:
     """Build and optionally execute a continue-on-failure smoke suite.
 
@@ -513,6 +784,7 @@ def build_canary_smoke_suite_run(
     commands plus catalog-plan checks. It gives maintainers a full regression
     sweep without hiding the smaller profile/module loops used while developing.
     """
+    repo_root = (repo_root or REPO_ROOT).resolve()
 
     modules = list(modules or [])
     exclude_modules = list(exclude_modules or [])
@@ -554,12 +826,13 @@ def build_canary_smoke_suite_run(
             modules=modules,
             exclude_modules=exclude_modules,
             scripts=scripts,
+            repo_root=repo_root,
         )
         selected.extend(suite_checks)
         warnings.extend(suite_warnings)
     if catalog_selector_requested or normalized_suite == "catalog-plan":
         plan = build_catalog_canary_plan(
-            catalog_path=catalog_path,
+            catalog_path=resolve_canary_catalog_path(catalog_path, repo_root=repo_root),
             changed_files=changed_files,
             surfaces=surfaces,
             families=families,
@@ -584,7 +857,7 @@ def build_canary_smoke_suite_run(
     if limit and limit > 0:
         selected = selected[:limit]
     normalized = [
-        {**check, "normalized": normalize_canary_command(str(check.get("command") or ""))}
+        {**check, "normalized": normalize_canary_command(str(check.get("command") or ""), repo_root=repo_root)}
         for check in selected
     ]
 
@@ -604,7 +877,15 @@ def build_canary_smoke_suite_run(
         "auto_restored": False,
     }
     if execute:
-        git_ok, tracked_before, git_stderr = _tracked_change_paths()
+        run_check = partial(
+            _run_check,
+            timeout_seconds=max(1.0, timeout_seconds),
+            check_count=len(selected),
+            repo_root=repo_root,
+        )
+        if cli_output_base_ref is not None:
+            run_check = partial(run_check, cli_output_base_ref=cli_output_base_ref)
+        git_ok, tracked_before, git_stderr = _tracked_change_paths(repo_root=repo_root)
         clean_start = git_ok and not tracked_before
         if allow_tracked_side_effects:
             enforcement_reason = "tracked_side_effects_explicitly_allowed"
@@ -616,7 +897,7 @@ def build_canary_smoke_suite_run(
             {
                 "git_status_ok": git_ok,
                 "clean_start": clean_start,
-                "tracked_before": tracked_before,
+                "tracked_before": _display_git_paths(tracked_before),
                 "enforced": bool(git_ok and not allow_tracked_side_effects),
                 "enforcement_reason": enforcement_reason,
             }
@@ -626,7 +907,7 @@ def build_canary_smoke_suite_run(
         serial_indexes = {
             index
             for index, check in enumerate(selected, start=1)
-            if _serial_smoke_reason(check)
+            if _serial_smoke_reason(check, repo_root=repo_root)
         }
         serial_check_count = len(serial_indexes)
         parallel_check_count = len(selected) - serial_check_count
@@ -639,26 +920,26 @@ def build_canary_smoke_suite_run(
                     index=index,
                     total=len(selected),
                     check=check,
+                    repo_root=repo_root,
                 )
-                result = _run_check(
-                    check,
-                    timeout_seconds=max(1.0, timeout_seconds),
-                    check_index=index,
-                    check_count=len(selected),
-                )
+                result = run_check(check, check_index=index)
                 if side_effect_guard["enforced"]:
-                    after_ok, tracked_after, after_stderr = _tracked_change_paths()
+                    after_ok, tracked_after, after_stderr = _tracked_change_paths(repo_root=repo_root)
                     side_effects = sorted(set(tracked_after) - set(tracked_before))
                     if side_effects:
                         result.update(
                             {
                                 "ok": False,
                                 "status": "failed_tracked_side_effect",
-                                "tracked_side_effects": side_effects,
+                                "tracked_side_effects": _display_git_paths(side_effects),
                             }
                         )
                         if clean_start:
-                            restore = _restore_tracked_paths(side_effects)
+                            restore = _restore_tracked_paths(
+                                side_effects,
+                                repo_root=repo_root,
+                                expected_paths=tracked_before,
+                            )
                             result["tracked_side_effect_restore"] = restore
                             side_effect_guard["auto_restored"] = (
                                 bool(side_effect_guard.get("auto_restored"))
@@ -687,14 +968,9 @@ def build_canary_smoke_suite_run(
                         index=index,
                         total=len(selected),
                         check=check,
+                        repo_root=repo_root,
                     )
-                    future = executor.submit(
-                        _run_check,
-                        check,
-                        timeout_seconds=max(1.0, timeout_seconds),
-                        check_index=index,
-                        check_count=len(selected),
-                    )
+                    future = executor.submit(run_check, check, check_index=index)
                     futures[future] = (index, check)
                 for future in as_completed(futures):
                     index, check = futures[future]
@@ -726,15 +1002,11 @@ def build_canary_smoke_suite_run(
                     index=index,
                     total=len(selected),
                     check=check,
+                    repo_root=repo_root,
                 )
-                result = _run_check(
-                    check,
-                    timeout_seconds=max(1.0, timeout_seconds),
-                    check_index=index,
-                    check_count=len(selected),
-                )
+                result = run_check(check, check_index=index)
                 result["serial_execution_required"] = True
-                result["serial_execution_reason"] = _serial_smoke_reason(check)
+                result["serial_execution_reason"] = _serial_smoke_reason(check, repo_root=repo_root)
                 indexed_results[index] = result
                 _progress_check_finished(
                     progress_callback,
@@ -744,13 +1016,13 @@ def build_canary_smoke_suite_run(
                 )
             results = [indexed_results[index] for index in sorted(indexed_results)]
         if side_effect_guard["enforced"]:
-            final_ok, tracked_after, final_stderr = _tracked_change_paths()
+            final_ok, tracked_after, final_stderr = _tracked_change_paths(repo_root=repo_root)
             side_effects = sorted(set(tracked_after) - set(tracked_before))
             side_effect_guard.update(
                 {
                     "git_status_final_ok": final_ok,
-                    "tracked_after": tracked_after,
-                    "tracked_side_effects": side_effects,
+                    "tracked_after": _display_git_paths(tracked_after),
+                    "tracked_side_effects": _display_git_paths(side_effects),
                 }
             )
             if final_stderr:
@@ -764,10 +1036,14 @@ def build_canary_smoke_suite_run(
                         "parallel smoke-suite run produced tracked side effects; "
                         "rerun with --jobs 1 to attribute the script precisely"
                     ),
-                    "tracked_side_effects": side_effects,
+                    "tracked_side_effects": _display_git_paths(side_effects),
                 }
                 if clean_start:
-                    restore = _restore_tracked_paths(side_effects)
+                    restore = _restore_tracked_paths(
+                        side_effects,
+                        repo_root=repo_root,
+                        expected_paths=tracked_before,
+                    )
                     guard_failure["tracked_side_effect_restore"] = restore
                     side_effect_guard["auto_restored"] = (
                         bool(side_effect_guard.get("auto_restored")) or bool(restore.get("ok"))
@@ -793,7 +1069,7 @@ def build_canary_smoke_suite_run(
         "ok": ok,
         "schema_version": CANARY_SMOKE_SUITE_RUN_SCHEMA_VERSION,
         "suite": normalized_suite,
-        "repo_root": str(REPO_ROOT),
+        "repo_root": str(repo_root),
         "dry_run": not execute,
         "executes_checks": execute,
         "writes_evidence": bool(allow_tracked_side_effects),
@@ -870,9 +1146,11 @@ def build_catalog_canary_run(
     check_limit: int = 3,
     execute: bool = True,
     timeout_seconds: float = 120.0,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
+    repo_root = (repo_root or REPO_ROOT).resolve()
     plan = build_catalog_canary_plan(
-        catalog_path=catalog_path,
+        catalog_path=resolve_canary_catalog_path(catalog_path, repo_root=repo_root),
         changed_files=changed_files,
         surfaces=surfaces,
         families=families,
@@ -884,13 +1162,13 @@ def build_catalog_canary_run(
     planned = flatten_catalog_canary_checks(plan)
     selected = planned[: max(0, check_limit)]
     normalized = [
-        {**check, "normalized": normalize_canary_command(str(check.get("command") or ""))}
+        {**check, "normalized": normalize_canary_command(str(check.get("command") or ""), repo_root=repo_root)}
         for check in selected
     ]
     results = []
     if execute:
         results = [
-            _run_check(check, timeout_seconds=max(1.0, timeout_seconds))
+            _run_check(check, timeout_seconds=max(1.0, timeout_seconds), repo_root=repo_root)
             for check in selected
         ]
 
@@ -955,7 +1233,8 @@ def render_catalog_canary_run_markdown(payload: dict[str, Any]) -> str:
     for check in payload.get("selected_checks", []):
         if not isinstance(check, dict):
             continue
-        normalized = check.get("normalized") if isinstance(check.get("normalized"), dict) else {}
+        normalized_value = check.get('normalized')
+        normalized = normalized_value if isinstance(normalized_value, dict) else {}
         command = " ".join(str(part) for part in normalized.get("display_argv") or [])
         status = check.get("status") or ("ready" if normalized.get("ok") else "skipped")
         lines.extend(
@@ -986,7 +1265,8 @@ def render_catalog_canary_run_markdown(payload: dict[str, Any]) -> str:
 def render_canary_smoke_suite_run_markdown(payload: dict[str, Any]) -> str:
     mode = "execute" if payload.get("executes_checks") else "preview"
     guard = payload.get("side_effect_guard")
-    guard = guard if isinstance(guard, dict) else {}
+    guard_value = guard
+    guard = guard_value if isinstance(guard_value, dict) else {}
     lines = [
         "# Canary Smoke Suite",
         "",
@@ -1023,7 +1303,8 @@ def render_canary_smoke_suite_run_markdown(payload: dict[str, Any]) -> str:
     for check in payload.get("selected_checks", []):
         if not isinstance(check, dict):
             continue
-        normalized = check.get("normalized") if isinstance(check.get("normalized"), dict) else {}
+        normalized_value = check.get('normalized')
+        normalized = normalized_value if isinstance(normalized_value, dict) else {}
         command = " ".join(str(part) for part in normalized.get("display_argv") or [])
         status = check.get("status") or ("ready" if normalized.get("ok") else "skipped")
         title = check.get("profile_title") or check.get("profile_id") or "smoke"
@@ -1047,6 +1328,8 @@ def render_canary_smoke_suite_run_markdown(payload: dict[str, Any]) -> str:
             )
         if check.get("returncode") is not None:
             lines.append(f"- returncode: `{check.get('returncode')}`")
+        elif status == "failed" and check.get("reason"):
+            lines.append(f"- reason: {check['reason']}")
         if check.get("duration_seconds") is not None:
             lines.append(f"- duration_seconds: `{check.get('duration_seconds')}`")
         if check.get("skip_reason"):
@@ -1054,7 +1337,7 @@ def render_canary_smoke_suite_run_markdown(payload: dict[str, Any]) -> str:
         if check.get("tracked_side_effects"):
             lines.append(
                 "- tracked_side_effects: `"
-                + ", ".join(str(path) for path in check.get("tracked_side_effects") or [])
+                + ", ".join(_display_git_paths(check.get("tracked_side_effects") or []))
                 + "`"
             )
         restore = check.get("tracked_side_effect_restore")

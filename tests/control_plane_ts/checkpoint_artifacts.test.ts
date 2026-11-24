@@ -1,0 +1,524 @@
+import assert from "node:assert/strict";
+import {createHash} from "node:crypto";
+import fs from "node:fs/promises";
+import {syncBuiltinESMExports} from "node:module";
+import test from "node:test";
+import {chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile} from "node:fs/promises";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
+import {checkpointArtifacts} from "../../loopx/control_plane/runtime/checkpoint_artifacts.ts";
+import {EffectRuntimeConflictError, EffectRuntimeRequestError} from "../../loopx/control_plane/effect_runtime_errors.ts";
+import {sqliteAuthorityRuntime} from "../../loopx/control_plane/coordination/sqlite_runtime.ts";
+
+async function fixture(t: test.TestContext) {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "checkpoint-artifacts-")));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  await mkdir(join(root, "code"));
+  await mkdir(join(root, "code/empty"));
+  await writeFile(join(root, "code/solution.sh"), "#!/bin/sh\nexit 0\n");
+  await chmod(join(root, "code/solution.sh"), 0o755);
+  await writeFile(join(root, "conversation"), "native cursor fixture\n");
+  const components = [{id: "code", source_path: join(root, "code")}, {id: "conversation", source_path: join(root, "conversation")}];
+  const probe = await checkpointArtifacts({action: "probe", components});
+  const request = {action: "capture", components, expected_source_sha256: probe.source_sha256,
+    destination: join(root, "captured"), point_metadata: {cursor: "completed-native-turn", effects: "historical only"}};
+  return {root, request};
+}
+
+test("capture, verify and inert materialization preserve executable code and empty directories", async t => {
+  const {root, request} = await fixture(t);
+  const captured = await checkpointArtifacts(request);
+  assert.equal(captured.integrity_verified, true);
+  assert.equal(captured.source_stability_verified, true);
+  assert.equal(captured.research_point_qualified, false);
+  assert.equal(captured.execution_authority_granted, false);
+  assert.equal(captured.privacy_certified, false);
+  const restored = await checkpointArtifacts({action: "materialize", root: request.destination,
+    expected_sha256: captured.sha256, destination: join(root, "restored")});
+  assert.equal(restored.activation_performed, false);
+  assert.equal(await readFile(join(root, "restored/components/code/solution.sh"), "utf8"), "#!/bin/sh\nexit 0\n");
+  assert.deepEqual(await readdir(join(root, "restored/components/code/empty")), []);
+  assert.deepEqual(await readFile(join(root, "restored/checkpoint.json")), await readFile(join(root, "captured/checkpoint.json")));
+  await assert.rejects(checkpointArtifacts({action: "materialize", root: request.destination,
+    expected_sha256: captured.sha256, destination: join(root, "restored")}), {
+    name: "EffectRuntimeConflictError", code: "state_conflict", message: "checkpoint destination already exists",
+  });
+});
+
+test("a read-only participant's copied mode survives the durability flush and materialization", async t => {
+  const {root, request} = await fixture(t);
+  await chmod(join(root, "code/solution.sh"), 0o444);
+  const components = request.components;
+  const probe = await checkpointArtifacts({action: "probe", components});
+  const captured = await checkpointArtifacts({...request, components, expected_source_sha256: probe.source_sha256});
+  assert.equal(captured.integrity_verified, true);
+  const copied = join(root, "captured/components/code/solution.sh");
+  assert.equal((await stat(copied)).mode & 0o777, 0o444);
+  await checkpointArtifacts({action: "materialize", root: request.destination, expected_sha256: captured.sha256,
+    destination: join(root, "restored")});
+  const restored = join(root, "restored/components/code/solution.sh");
+  assert.equal(await readFile(restored, "utf8"), "#!/bin/sh\nexit 0\n");
+  assert.equal((await stat(restored)).mode & 0o777, 0o444);
+});
+
+test("nested inventories retain depth-first sibling order and every byte and mode", async t => {
+  const {root, request} = await fixture(t);
+  const source = join(root, "tree");
+  await mkdir(source, {mode: 0o700});
+  await mkdir(join(source, "a"), {mode: 0o700});
+  await mkdir(join(source, "a/b"), {mode: 0o700});
+  const leaves = ["a/b/deep", "a/b-", "a/b.txt", "a-", "a.txt",
+    ...Array.from({length: 64}, (_, i) => `z${String(i).padStart(2, "0")}`)];
+  for (const [i, name] of [...leaves].reverse().entries()) {
+    await writeFile(join(source, name), `evidence:${name}\n`, {mode: i % 2 ? 0o600 : 0o400});
+  }
+  // The filesystem owns its supported permission bits (Windows exposes a
+  // different subset). Observe those independently before calling capture.
+  const modes = new Map<string, number>();
+  for (const name of ["", "a", "a/b", ...leaves]) modes.set(name, (await stat(join(source, name))).mode & 0o777);
+  const file = (name: string) => ({path: name, kind: "file", mode: modes.get(name)!,
+    size: Buffer.byteLength(`evidence:${name}\n`), sha256: createHash("sha256").update(`evidence:${name}\n`).digest("hex")});
+  const directory = (name: string) => ({path: name, kind: "directory", mode: modes.get(name)!});
+  // Flat string sorting would put a- before a/b; completion order is also
+  // irrelevant. This is the existing manifest's depth-first traversal contract.
+  const expected = [directory(""), directory("a"), directory("a/b"), ...leaves.map(file)];
+  const components = [{id: "tree", source_path: source}];
+  const probe = await checkpointArtifacts({action: "probe", components});
+  assert.deepEqual(probe.source_witness, {tree: expected});
+  const captured = await checkpointArtifacts({...request, components, expected_source_sha256: probe.source_sha256});
+  const manifest = JSON.parse(await readFile(join(request.destination, "checkpoint.json"), "utf8"));
+  assert.deepEqual(manifest.source_witness, {tree: expected});
+  assert.deepEqual(manifest.artifact_witness, {tree: expected});
+  const restored = join(root, "restored");
+  await checkpointArtifacts({action: "materialize", root: request.destination,
+    expected_sha256: captured.sha256, destination: restored});
+  for (const name of leaves) {
+    const copy = join(restored, "components/tree", name);
+    assert.equal(await readFile(copy, "utf8"), `evidence:${name}\n`);
+    assert.equal((await stat(copy)).mode & 0o777, file(name).mode);
+  }
+});
+
+test("changed source, duplicate identities and overlapping sources publish no unit", async t => {
+  const {root, request} = await fixture(t);
+  await writeFile(join(root, "conversation"), "new native cursor");
+  await assert.rejects(checkpointArtifacts(request), /source moved/);
+  await assert.rejects(checkpointArtifacts({...request, components: [...request.components, request.components[0]]}), /duplicated/);
+  await assert.rejects(checkpointArtifacts({action: "probe", components: [request.components[0], {id: "nested", source_path: join(root, "code/empty")}]}), /overlap/);
+  assert.deepEqual((await readdir(root)).sort(), ["code", "conversation"]);
+});
+
+test("copied bytes reject ABA source movement even when the final source matches the probe", async t => {
+  const {root, request} = await fixture(t), original = fs.copyFile;
+  const source = join(root, "code/solution.sh"), bytes = await readFile(source);
+  const copy = t.mock.method(fs, "copyFile", async (...args: Parameters<typeof fs.copyFile>) => {
+    if (args[0] !== source) return original(...args);
+    await writeFile(source, "unreviewed intermediate bytes\n");
+    try {await original(...args);}
+    finally {await writeFile(source, bytes);}
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(checkpointArtifacts(request), /copied bytes do not match/);
+    assert.deepEqual(await readFile(source), bytes);
+    assert.deepEqual((await readdir(root)).sort(), ["code", "conversation"]);
+  } finally {copy.mock.restore(); syncBuiltinESMExports();}
+});
+
+test("a failed copy drains started member IO before removing the unpublished staging tree", async t => {
+  const {root, request} = await fixture(t), original = fs.copyFile;
+  for (let i = 0; i < 24; i++) await writeFile(join(root, "code", `member-${i}`), `retained evidence ${i}`);
+  const probe = await checkpointArtifacts({action: "probe", components: request.components});
+  let active = 0, peak = 0, calls = 0;
+  const copy = t.mock.method(fs, "copyFile", async (...args: Parameters<typeof fs.copyFile>) => {
+    active++; peak = Math.max(peak, active);
+    const first = calls++ === 0;
+    try {
+      // Controlled storage latency lets sibling copies overlap the injected
+      // failure. It is a cleanup invariant, not a performance threshold.
+      await new Promise(resolve => setTimeout(resolve, first ? 30 : 80));
+      if (first) throw new Error("injected member copy failure");
+      await original(...args);
+    } finally {active--;}
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(checkpointArtifacts({...request, expected_source_sha256: probe.source_sha256}), /injected member copy failure/);
+    assert.equal(active, 0, "no member IO may outlive staging cleanup");
+    assert.ok(peak <= 8, "member IO must remain bounded");
+    assert.deepEqual((await readdir(root)).sort(), ["code", "conversation"]);
+  } finally {copy.mock.restore(); syncBuiltinESMExports();}
+});
+
+test("missing, changed and extra artifact members or foreign expected digest reject", async t => {
+  const {root, request} = await fixture(t), captured = await checkpointArtifacts(request);
+  const verify = {action: "verify", root: request.destination, expected_sha256: captured.sha256};
+  await assert.rejects(checkpointArtifacts({...verify, expected_sha256: "foreign"}), /digest/);
+  await writeFile(join(root, "captured/components/conversation"), "tampered");
+  await assert.rejects(checkpointArtifacts(verify), /artifact members/);
+  await writeFile(join(root, "captured/components/conversation"), "native cursor fixture\n");
+  await writeFile(join(root, "captured/foreign"), "unreviewed member");
+  await assert.rejects(checkpointArtifacts(verify), /unexpected members/);
+  await rm(join(root, "captured/foreign"));
+  await rm(join(root, "captured/components/conversation"));
+  await assert.rejects(checkpointArtifacts(verify), /ENOENT/);
+  await assert.rejects(checkpointArtifacts({action: "materialize", root: request.destination,
+    expected_sha256: captured.sha256, destination: join(root, "must-not-exist")}));
+  assert.ok(!(await readdir(root)).includes("must-not-exist"));
+});
+
+test("expired or invalid capture windows publish no unit and leave the source intact", async t => {
+  const {root, request} = await fixture(t);
+  const bytes = await readFile(join(root, "conversation"));
+  await assert.rejects(checkpointArtifacts({...request, deadline_epoch_ms: Date.now() - 1}), /window has closed/);
+  await assert.rejects(checkpointArtifacts({...request, deadline_epoch_ms: Number.NaN}), /finite/);
+  await assert.rejects(checkpointArtifacts({...request, execution_authority_granted: true}), /fields are invalid/);
+  assert.deepEqual(await readFile(join(root, "conversation")), bytes);
+  assert.deepEqual((await readdir(root)).sort(), ["code", "conversation"]);
+});
+
+test("concurrent capture reserves one destination and cannot replace an existing unit", async t => {
+  const {root, request} = await fixture(t);
+  const results = await Promise.allSettled([checkpointArtifacts(request), checkpointArtifacts(request)]);
+  assert.equal(results.filter(r => r.status === "fulfilled").length, 1);
+  const rejected = results.find(result => result.status === "rejected");
+  assert.ok(rejected?.reason instanceof EffectRuntimeConflictError, rejected?.reason);
+  assert.equal(rejected.reason.code, "state_conflict");
+  assert.deepEqual((await readdir(root)).sort(), ["captured", "code", "conversation"]);
+  const bytes = await readFile(join(root, "captured/checkpoint.json"));
+  await assert.rejects(checkpointArtifacts(request), /already exists/);
+  assert.deepEqual(await readFile(join(root, "captured/checkpoint.json")), bytes);
+});
+
+test("symlink sources, nested links and redirected destinations reject without publication", async t => {
+  const {root, request} = await fixture(t);
+  await symlink(join(root, "code"), join(root, "alias"), process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(checkpointArtifacts({action: "probe", components: [{id: "code", source_path: join(root, "alias")}]}), /symlink/);
+  // File symlink creation needs Developer Mode or admin on Windows; the
+  // junction cases still cover redirected sources and destinations.
+  if (process.platform !== "win32") {
+    await symlink(join(root, "conversation"), join(root, "code/link"));
+    await assert.rejects(checkpointArtifacts(request), /symlink/);
+  }
+  await assert.rejects(checkpointArtifacts({...request, destination: join(root, "alias/capture")}), /symlink/);
+});
+
+test("SQLite uses the existing committed WAL snapshot owner and materializes verbatim", async t => {
+  const {root, request} = await fixture(t);
+  await mkdir(join(root, "state"));
+  const {driver} = sqliteAuthorityRuntime();
+  const writer = new driver.DatabaseSync(join(root, "state/authority.sqlite"));
+  try {
+    writer.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE evidence(value TEXT); INSERT INTO evidence VALUES('retained negative result')");
+    await writeFile(join(root, "state/notes-wal"), "ordinary retained note");
+    const components = [...request.components, {id: "state", source_path: join(root, "state")}];
+    const probe = await checkpointArtifacts({action: "probe", components});
+    const captured = await checkpointArtifacts({...request, components, expected_source_sha256: probe.source_sha256});
+    assert.deepEqual((await readdir(join(root, "captured/components/state"))).sort(), ["authority.sqlite", "notes-wal"]);
+    await writeFile(join(root, "captured/components/state/authority.sqlite-shm"), "foreign index");
+    await assert.rejects(checkpointArtifacts({action: "verify", root: request.destination,
+      expected_sha256: captured.sha256}), /artifact members/);
+    await rm(join(root, "captured/components/state/authority.sqlite-shm"));
+    await checkpointArtifacts({action: "materialize", root: request.destination,
+      expected_sha256: captured.sha256, destination: join(root, "restored")});
+    assert.deepEqual(await readFile(join(root, "restored/components/state/authority.sqlite")), await readFile(join(root, "captured/components/state/authority.sqlite")));
+    const copy = new driver.DatabaseSync(join(root, "restored/components/state/authority.sqlite"), {readOnly: true});
+    try {assert.equal(copy.prepare("SELECT value FROM evidence").get()?.value, "retained negative result");}
+    finally {copy.close();}
+  } finally {writer.close();}
+});
+
+test("a committed WAL change after the probe invalidates capture, including a standalone database component", async t => {
+  const {root, request} = await fixture(t);
+  const path = join(root, "authority.sqlite"), {driver} = sqliteAuthorityRuntime();
+  const writer = new driver.DatabaseSync(path);
+  try {
+    writer.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE evidence(value TEXT)");
+    const components = [{id: "state", source_path: path}];
+    const probe = await checkpointArtifacts({action: "probe", components});
+    writer.exec("INSERT INTO evidence VALUES('new committed evidence')");
+    await assert.rejects(checkpointArtifacts({...request, components, expected_source_sha256: probe.source_sha256}), /source moved/);
+    assert.ok(!(await readdir(root)).includes("captured"));
+    const stable = await checkpointArtifacts({action: "probe", components});
+    await checkpointArtifacts({...request, components, expected_source_sha256: stable.source_sha256});
+    const copy = new driver.DatabaseSync(join(root, "captured/components/state"), {readOnly: true});
+    try {assert.equal(copy.prepare("SELECT value FROM evidence").get()?.value, "new committed evidence");}
+    finally {copy.close();}
+  } finally {writer.close();}
+});
+
+test("read-only snapshot housekeeping on a closed WAL database is not source movement", async t => {
+  const {root, request} = await fixture(t), {driver} = sqliteAuthorityRuntime();
+  await mkdir(join(root, "state"));
+  const path = join(root, "state/authority.sqlite"), writer = new driver.DatabaseSync(path);
+  writer.exec("PRAGMA journal_mode=WAL; CREATE TABLE evidence(value TEXT); INSERT INTO evidence VALUES('retained')");
+  writer.close();
+  assert.deepEqual(await readdir(join(root, "state")), ["authority.sqlite"]);
+  const components = [{id: "state", source_path: join(root, "state")}];
+  const probe = await checkpointArtifacts({action: "probe", components});
+  const captured = await checkpointArtifacts({...request, components, expected_source_sha256: probe.source_sha256});
+  assert.equal(captured.source_stability_verified, true);
+  const after = await checkpointArtifacts({action: "probe", components});
+  assert.equal(after.source_sha256, probe.source_sha256);
+  assert.deepEqual(await readdir(join(root, "captured/components/state")), ["authority.sqlite"]);
+  const changed = new driver.DatabaseSync(path);
+  try {
+    changed.exec("INSERT INTO evidence VALUES('new committed data')");
+    await assert.rejects(checkpointArtifacts({...request, components, destination: join(root, "must-not-exist"),
+      expected_source_sha256: probe.source_sha256}), /source moved/);
+  } finally {changed.close();}
+  const copy = new driver.DatabaseSync(join(root, "captured/components/state/authority.sqlite"), {readOnly: true});
+  try {assert.equal(copy.prepare("SELECT COUNT(*) AS n FROM evidence").get()?.n, 1);}
+  finally {copy.close();}
+});
+
+test("an explicitly selected sidecar remains a byte artifact rather than disappearing from its witness", async t => {
+  const {root, request} = await fixture(t), {driver} = sqliteAuthorityRuntime();
+  const path = join(root, "authority.sqlite"), writer = new driver.DatabaseSync(path);
+  try {
+    writer.exec("PRAGMA journal_mode=WAL; CREATE TABLE evidence(value TEXT)");
+    const components = [{id: "explicit_index", source_path: path + "-shm"}];
+    const probe = await checkpointArtifacts({action: "probe", components});
+    assert.equal((probe.source_witness as Record<string, unknown[]>).explicit_index.length, 1);
+    const captured = await checkpointArtifacts({...request, components, expected_source_sha256: probe.source_sha256});
+    assert.equal(captured.integrity_verified, true);
+    assert.deepEqual(await readFile(join(root, "captured/components/explicit_index")), await readFile(path + "-shm"));
+  } finally {writer.close();}
+});
+
+test("replan capture selection requires the original admitted identity and grants no execution", async () => {
+  const id = "replan-0123456789abcdef", turn = "fixture-turn";
+  const identity = {goal_id: "fixture-goal", agent_id: "fixture-agent", turn_instance_id: turn,
+    replan_obligation_id: id, binding_kind: "autonomous_replan", binding_id: id,
+    effect_id: `fixture-goal:fixture-agent:autonomous_replan:${id}:${turn}`};
+  const quota = {ok: true, goal_id: "fixture-goal", effective_action: "autonomous_replan_required",
+    replan_action_packet: {schema_version: "replan_action_packet_v0", decision: "replan_required", obligation_id: id},
+    heartbeat_receipt: {status: "committed", turn_instance_id: turn, settlement_identity: identity}};
+  const request = {action: "select_replan", quota, goal_id: "fixture-goal", agent_id: "fixture-agent", turn_instance_id: turn};
+  const selected = await checkpointArtifacts(request);
+  assert.equal(selected.capture, true);
+  assert.equal(selected.obligation_id, id);
+  assert.equal(selected.execution_authority_granted, false);
+  const todoBound = await checkpointArtifacts({...request, quota: {...quota, heartbeat_receipt: {
+    ...quota.heartbeat_receipt, semantic_replan_obligation_id: id, settlement_identity: {
+      goal_id: "fixture-goal", agent_id: "fixture-agent", turn_instance_id: turn, todo_id: "todo_existing",
+      effect_id: `fixture-goal:fixture-agent:todo_existing:${turn}`}}}});
+  assert.equal(todoBound.capture, true);
+  assert.equal(todoBound.settlement_effect_id, `fixture-goal:fixture-agent:todo_existing:${turn}`);
+  const ordinary = await checkpointArtifacts({...request, quota: {...quota, effective_action: "normal_run"}});
+  assert.equal(ordinary.capture, false);
+  await assert.rejects(checkpointArtifacts({...request, turn_instance_id: "another-turn"}), /admitted identity/);
+  await assert.rejects(checkpointArtifacts({...request, agent_id: "another-agent"}), /admitted identity/);
+  await assert.rejects(checkpointArtifacts({...request, quota: {...quota, replan_action_packet:
+    {...quota.replan_action_packet, obligation_id: "replan-fedcba9876543210"}}}), /admitted identity/);
+  for (const closeout_required of [false, true]) {
+    await assert.rejects(checkpointArtifacts({...request, quota: {...quota, heartbeat_receipt:
+      {...quota.heartbeat_receipt, closeout_required,
+        settlement_identity: {...identity, todo_id: "todo_conflict"}}}}), /admitted identity/);
+  }
+  await assert.rejects(checkpointArtifacts({...request, quota: {...quota, ok: false}}), /matching current/);
+});
+
+test("receipt-owned replan settlement returns to its original writer without admitting capture", async () => {
+  const id = "replan-0123456789abcdef", turn = "fixture-turn";
+  const identity = {goal_id: "fixture-goal", agent_id: "fixture-agent", turn_instance_id: turn,
+    replan_obligation_id: id, binding_kind: "autonomous_replan", binding_id: id,
+    effect_id: `fixture-goal:fixture-agent:autonomous_replan:${id}:${turn}`};
+  const quota = {ok: true, goal_id: "fixture-goal", effective_action: "autonomous_replan_required",
+    replan_action_packet: {schema_version: "replan_action_packet_v0", decision: "settlement_pending",
+      obligation_id: id, settlement_only: true},
+    heartbeat_receipt: {status: "replayed", turn_instance_id: turn, semantic_replan_obligation_id: id,
+      settlement_identity: identity}};
+  const request = {action: "select_replan", quota, goal_id: "fixture-goal", agent_id: "fixture-agent", turn_instance_id: turn};
+  for (const decision of ["settlement_pending", "successor_transition_recorded", "vision_outcome_checkpoint_required"]) {
+    const before = structuredClone(quota);
+    assert.deepEqual(await checkpointArtifacts({...request, quota: {...quota,
+      replan_action_packet: {...quota.replan_action_packet, decision}}}), {
+      capture: false, reason: "turn_closeout_pending", execution_authority_granted: false,
+    });
+    assert.deepEqual(quota, before);
+  }
+  for (const [field, value] of Object.entries({goal_id: "foreign", agent_id: "foreign",
+    turn_instance_id: "foreign", effect_id: "foreign", todo_id: "todo_conflict"})) {
+    await assert.rejects(checkpointArtifacts({...request, quota: {...quota, heartbeat_receipt: {
+      ...quota.heartbeat_receipt, settlement_identity: {...identity, [field]: value}}}}), /admitted identity/);
+  }
+  await assert.rejects(checkpointArtifacts({...request, quota: {...quota, heartbeat_receipt: {
+    ...quota.heartbeat_receipt, settlement_identity: undefined, settlement_binding_owed: true}}}));
+  await assert.rejects(checkpointArtifacts({...request, quota: {...quota, replan_action_packet: {
+    ...quota.replan_action_packet, obligation_id: "replan-fedcba9876543210"}}}), /admitted identity/);
+  await assert.rejects(checkpointArtifacts({...request, quota: {...quota, replan_action_packet: {
+    ...quota.replan_action_packet, settlement_only: false}}}), /admitted identity/);
+  assert.equal((await checkpointArtifacts({...request, quota: {...quota, replan_action_packet: {
+    ...quota.replan_action_packet, decision: "replan_required", settlement_only: false}}})).capture, true);
+});
+
+test("a bound selection with explicit closeout is released; binding alone preserves the replan", async () => {
+  // "upgraded" records the binding, not work completion. Only the explicit
+  // closeout fact makes this a pending closeout instead of the original replan.
+  const id = "replan-0123456789abcdef", turn = "fixture-turn";
+  const identity = {goal_id: "fixture-goal", agent_id: "fixture-agent", turn_instance_id: turn,
+    todo_id: "todo_selected", effect_id: `fixture-goal:fixture-agent:todo_selected:${turn}`};
+  const quota = {ok: true, goal_id: "fixture-goal", effective_action: "autonomous_replan_required",
+    replan_action_packet: {schema_version: "replan_action_packet_v0", decision: "replan_required", obligation_id: id},
+    heartbeat_receipt: {status: "upgraded", turn_instance_id: turn, event_id: "fixture-event",
+      closeout_required: true, semantic_replan_obligation_id: id, settlement_identity: identity}};
+  const request = {action: "select_replan", quota, goal_id: "fixture-goal", agent_id: "fixture-agent", turn_instance_id: turn};
+  assert.deepEqual(await checkpointArtifacts(request), {
+    capture: false, reason: "turn_closeout_pending", execution_authority_granted: false,
+  });
+  const {closeout_required: _closeout, ...boundReceipt} = quota.heartbeat_receipt;
+  assert.deepEqual(await checkpointArtifacts({...request, quota: {...quota,
+    heartbeat_receipt: boundReceipt}}), {
+    capture: true, obligation_id: id, settlement_effect_id: identity.effect_id,
+    execution_authority_granted: false,
+  });
+  // Statuses outside the durable receipt views stay refused, now as a typed
+  // request rejection whose reason survives the runtime boundary.
+  for (const status of ["pending", "failed", "uncommitted"]) {
+    await assert.rejects(checkpointArtifacts({...request, quota: {...quota, heartbeat_receipt: {
+      ...quota.heartbeat_receipt, status}}}),
+    (error: unknown) => error instanceof EffectRuntimeRequestError && /admitted identity/.test(error.message));
+  }
+  await assert.rejects(checkpointArtifacts({...request, quota: {...quota, heartbeat_receipt: {
+    ...quota.heartbeat_receipt, settlement_identity: {...identity, turn_instance_id: "another-turn"}}}}),
+  (error: unknown) => error instanceof EffectRuntimeRequestError);
+});
+
+test("committed semantic replan can capture before work selection without inventing settlement authority", async () => {
+  const id = "replan-0123456789abcdef", turn = "fixture-turn";
+  const quota = {ok: true, goal_id: "fixture-goal", effective_action: "autonomous_replan_required",
+    agent_identity: {agent_id: "fixture-agent", registered: true},
+    replan_action_packet: {schema_version: "replan_action_packet_v0", decision: "replan_required", obligation_id: id},
+    heartbeat_receipt: {status: "committed", turn_instance_id: turn, event_id: "fixture-event",
+      semantic_replan_obligation_id: id, settlement_binding_owed: true}};
+  const request = {action: "select_replan", quota, goal_id: "fixture-goal", agent_id: "fixture-agent", turn_instance_id: turn};
+  const before = structuredClone(quota);
+  assert.deepEqual(await checkpointArtifacts(request), {
+    capture: true, obligation_id: id, execution_authority_granted: false,
+  });
+  assert.deepEqual(quota, before);
+  for (const receipt of [
+    {...quota.heartbeat_receipt, status: "pending"},
+    {...quota.heartbeat_receipt, settlement_binding_owed: false},
+    {...quota.heartbeat_receipt, semantic_replan_obligation_id: "replan-fedcba9876543210"},
+    {...quota.heartbeat_receipt, turn_instance_id: "another-turn"},
+    {...quota.heartbeat_receipt, settlement_identity: null},
+  ]) await assert.rejects(checkpointArtifacts({...request, quota: {...quota, heartbeat_receipt: receipt}}));
+  await assert.rejects(checkpointArtifacts({...request, agent_id: "another-agent"}));
+  await assert.rejects(checkpointArtifacts({...request, quota: {...quota,
+    agent_identity: {...quota.agent_identity, registered: false}}}));
+});
+
+function elfHeader(eType: number, littleEndian = true): Buffer {
+  const buf = Buffer.alloc(64);
+  buf[0] = 0x7f; buf[1] = 0x45; buf[2] = 0x4c; buf[3] = 0x46;
+  buf[4] = 2; // ELFCLASS64
+  buf[5] = littleEndian ? 1 : 2;
+  if (littleEndian) buf.writeUInt16LE(eType, 16);
+  else buf.writeUInt16BE(eType, 16);
+  return buf;
+}
+
+function machoHeader(filetype: number, littleEndian = true): Buffer {
+  const buf = Buffer.alloc(32);
+  if (littleEndian) {
+    buf.writeUInt32BE(0xcffaedfe, 0); // MH_CIGAM_64
+    buf.writeUInt32LE(filetype, 12);
+  } else {
+    buf.writeUInt32BE(0xfeedfacf, 0); // MH_MAGIC_64
+    buf.writeUInt32BE(filetype, 12);
+  }
+  return buf;
+}
+
+test("component_exclusions skips ephemeral research outputs in probe and capture without weakening verify", async t => {
+  const {root, request} = await fixture(t);
+  const research = join(root, "research");
+  await mkdir(join(research, "target/release"), {recursive: true});
+  await mkdir(join(research, ".cargo-target/debug"), {recursive: true});
+  await mkdir(join(research, "core"), {recursive: true});
+  await mkdir(join(research, "topic"), {recursive: true});
+  await mkdir(join(research, "bin"), {recursive: true});
+  await mkdir(join(research, "nested"), {recursive: true});
+  await writeFile(join(research, "dump.raw.gz"), "ephemeral");
+  await writeFile(join(research, "core.4242"), elfHeader(4)); // ELF ET_CORE
+  await writeFile(join(research, "nested/core.9001"), machoHeader(4)); // Mach-O MH_CORE
+  await writeFile(join(research, "core/analysis.md"), "# real research notes\n");
+  await writeFile(join(research, "topic/core"), "ordinary text notes\n");
+  await writeFile(join(research, "bin/core"), elfHeader(2)); // ELF ET_EXEC (not ET_CORE)
+  await writeFile(join(research, "target/release/bin"), "compiled");
+  await writeFile(join(research, ".cargo-target/debug/lib.rlib"), "compiled");
+  await writeFile(join(research, "candidate.py"), "score = 1\n");
+
+  const components = [...request.components, {id: "benchmark_research", source_path: research}];
+  const exclusions = {benchmark_research: ["*.raw.gz", "core-dump:elf-macho", "target/", ".cargo-target/"]};
+  const probe = await checkpointArtifacts({action: "probe", components, component_exclusions: exclusions});
+  const names = (probe.source_witness as Record<string, Array<{path: string}>>).benchmark_research.map(m => m.path);
+  assert.deepEqual(names, [
+    "",
+    "bin",
+    "bin/core",
+    "candidate.py",
+    "core",
+    "core/analysis.md",
+    "nested",
+    "topic",
+    "topic/core",
+  ]);
+
+  const captured = await checkpointArtifacts({
+    ...request,
+    components,
+    expected_source_sha256: probe.source_sha256,
+    component_exclusions: exclusions,
+  });
+  assert.equal(captured.integrity_verified, true);
+  assert.deepEqual(
+    (await readdir(join(root, "captured/components/benchmark_research"))).sort(),
+    ["bin", "candidate.py", "core", "nested", "topic"],
+  );
+  const restored = await checkpointArtifacts({
+    action: "materialize",
+    root: request.destination,
+    expected_sha256: captured.sha256,
+    destination: join(root, "restored"),
+  });
+  assert.equal(restored.integrity_verified, true);
+  assert.equal(
+    await readFile(join(root, "restored/components/benchmark_research/core/analysis.md"), "utf8"),
+    "# real research notes\n",
+  );
+  assert.equal(
+    await readFile(join(root, "restored/components/benchmark_research/topic/core"), "utf8"),
+    "ordinary text notes\n",
+  );
+  assert.deepEqual(
+    await readFile(join(root, "restored/components/benchmark_research/bin/core")),
+    elfHeader(2),
+  );
+
+  // Even a direct bare "core" exclusion must preserve core/ dirs and non-dump topic/core files,
+  // excluding only a confirmed ELF/Mach-O dump named "core".
+  await writeFile(join(research, "nested/core"), elfHeader(4, false)); // ELF ET_CORE (big-endian)
+  const bareProbe = await checkpointArtifacts({
+    action: "probe",
+    components,
+    component_exclusions: {benchmark_research: ["core"]},
+  });
+  const bareNames = (bareProbe.source_witness as Record<string, Array<{path: string}>>).benchmark_research.map(m => m.path);
+  assert.ok(bareNames.includes("core/analysis.md"));
+  assert.ok(bareNames.includes("topic/core"));
+  assert.ok(bareNames.includes("bin/core"));
+  assert.ok(!bareNames.includes("nested/core"));
+
+  await assert.rejects(
+    checkpointArtifacts({action: "verify", root: request.destination, expected_sha256: captured.sha256,
+      component_exclusions: exclusions} as never),
+    /invalid/,
+  );
+  await assert.rejects(
+    checkpointArtifacts({action: "probe", components, component_exclusions: {unknown_component: ["core"]}}),
+    /unknown component/,
+  );
+});

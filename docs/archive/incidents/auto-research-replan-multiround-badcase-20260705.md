@@ -1,5 +1,8 @@
 # Auto-Research Replan And Multi-Round Demo Bad Case
 
+> Historical incident: the tmux auto-research demo has been retired. Commands and
+> code references below describe the original incident, not current entrypoints.
+
 Date: 2026-07-05
 
 Audience: LoopX auto-research owners, quota/status maintainers, todo/replan
@@ -77,7 +80,7 @@ different agent.
 ## Why It Looked Like Single-Round Research
 
 The implementation already corrected one earlier fake path: real research
-actions in `loopx/capabilities/auto_research/worker_runtime.py` now return a
+actions in `demo/auto_research/worker_runtime.py` now return a
 manual-research-required result instead of silently fabricating research
 outputs. That is the right authenticity boundary.
 
@@ -92,7 +95,7 @@ visible research pass happened. It should not imply multi-round improvement.
 
 The KNN demo can be real: the generated workspace supplies a baseline solution,
 editable scope, protected scope, and eval commands through
-`loopx/capabilities/auto_research/knn_demo_workspace.py`. The question text does
+`demo/auto_research/knn_demo_workspace.py`. The question text does
 not need to carry the baseline when the preset creates that contract. The bad
 case is not that KNN lacks a baseline; it is that the visible flow did not make
 successive, role-authored research and improvement obvious enough, and the

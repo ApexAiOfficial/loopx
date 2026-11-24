@@ -9,7 +9,8 @@ import sys
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_PATH = Path(__file__).resolve()
+REPO_ROOT = SCRIPT_PATH.parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 LEGACY_IMPORT = "loopx.projections"
@@ -32,7 +33,7 @@ LEGACY_ROOT_MODULES = {
 }
 LEGACY_CAPABILITY_PACKAGES = {
     "loopx/capabilities/cross_runtime/": "loopx.control_plane.handoff.cross_runtime_impl_review",
-    "loopx/capabilities/multi_agent/": "loopx.control_plane.agents.multi_agent",
+    "loopx/capabilities/multi_agent/": None,
     "loopx/capabilities/review_batch/": "loopx.control_plane.handoff.review_batch",
 }
 CANONICAL_MODULES = {
@@ -158,10 +159,11 @@ def assert_rehomed_capability_packages_stay_in_bounded_contexts() -> None:
             "legacy_module": legacy_module,
             "canonical_module": canonical_module,
         }
-        assert importlib.util.find_spec(canonical_module) is not None, {
-            "reason": "canonical bounded-context import must be available",
-            "canonical_module": canonical_module,
-        }
+        if canonical_module is not None:
+            assert importlib.util.find_spec(canonical_module) is not None, {
+                "reason": "canonical bounded-context import must be available",
+                "canonical_module": canonical_module,
+            }
 
 
 def assert_moved_root_imports_are_not_shimmed() -> None:
@@ -182,7 +184,7 @@ def assert_moved_root_imports_are_not_shimmed() -> None:
 def assert_repo_local_imports_use_bounded_contexts() -> None:
     offenders: list[str] = []
     for path in tracked_text_files():
-        if path == Path(__file__).resolve():
+        if path == SCRIPT_PATH:
             continue
         text = path.read_text(encoding="utf-8")
         if LEGACY_IMPORT in text:
@@ -197,7 +199,7 @@ def assert_repo_local_imports_use_bounded_contexts() -> None:
 def assert_repo_local_imports_avoid_legacy_status_paths() -> None:
     offenders: list[str] = []
     for path in tracked_text_files():
-        if path == Path(__file__).resolve():
+        if path == SCRIPT_PATH:
             continue
         text = path.read_text(encoding="utf-8")
         for legacy in LEGACY_STATUS_IMPORTS:

@@ -1,0 +1,316 @@
+/** Admission for Todo edits; terminal completion retains its own lease proof.
+ * Grants may cross a claim owner;
+ * exclusions, bindings and execution lineage remain independent restrictions. */
+import {retiredHandoffModeRejection, HANDOFF_MODE_RETIRED_REASON} from "./handoff_mode_policy.ts";
+import {leaseRepositoryRejection, ownerAdministrativeRepositoryRejection} from "../work_items/task_lease_repository.ts";
+import {isExploreReferenceAppend} from "../todos/field_update.ts";
+import {isInactiveUserCompletionTarget} from "../todos/user_completion.ts";
+import {decisionScopeRelation} from "../todos/decision_scope.ts";
+import {todoDoneResumeTargetId} from "../todos/resume_condition.ts";
+import {acceptanceRestoration} from "./todo_acceptance_restoration.ts";
+import {monitorMutationRejection} from "./todo_monitor_cycle.ts";
+import type {JsonObject} from "../effect_program.ts";
+import type {CoordinationTodoUpdateInput} from "./todo_update_intent.ts";
+import {TODO_WORK_REQUIREMENT_FIELDS} from "../todos/work_requirements.ts";
+import {TODO_OWNERSHIP_INTENT_FIELDS} from "../todos/authoring_scope.ts";
+import {evaluateCoordinationTodoMutationDecision,
+  COORDINATION_TODO_MUTATION_DECISION_REQUEST_SCHEMA} from "./todo_lifecycle_decision.ts";
+import {decodeTaskLeaseProof, evaluateCanonicalTaskLeaseProof, todoUpdateLeaseRecovery, leasedTodoEditRejection, isBoundUserActionMetadataUpdate, isSoftClaimReleasedCopyUpdate, isOwnerAdministrativeCopyUpdate} from "./task_lease_proof.ts";
+import {deferredReopenRejection, isDeferredReopen, isOwnerDeferral} from "./todo_deferred_lifecycle.ts";
+import {blockedLifecycleRejection, isBlockedLifecycleTransition} from "./todo_blocked_lifecycle.ts";
+import {isOwnerWorkRequirementsRevision, workRequirementsRevisionRejection} from "./todo_work_requirements_lifecycle.ts";
+import {indexCoordinationProjection} from "./coordination_projection.ts";
+import {canonicalTaskLease} from "./task_lease_state.ts";
+import {leaseIsActive} from "../work_items/task_lease_acquire.ts";
+
+interface TodoUpdateRejection {code: string; reason: string; handoff_mode?: string; recovery?: JsonObject}
+const reject = (code: string, reason: string): TodoUpdateRejection => ({code, reason});
+
+export function todoUpdateAdmissionRejection(
+  head: JsonObject, todo: JsonObject, leases: ReadonlyMap<string, JsonObject>,
+  input: CoordinationTodoUpdateInput, kind: "planning" | "user_completion" = "planning",
+): TodoUpdateRejection | null {
+  if (input.expected_role !== null && todo.role !== input.expected_role) {
+    return reject("todo_role_mismatch", "Todo does not have the requested role");
+  }
+  if (todo.archive_state !== "active") {
+    return reject("todo_archived", "Todo update requires an active Todo");
+  }
+  if (input.monitor_observation !== undefined) {
+    return monitorMutationRejection({goal_id: input.goal_id, todo,
+      todos: indexCoordinationProjection(head, input.goal_id).todos,
+      lease: leases.get(input.todo_id), handoff_mode: head.handoff_mode,
+      actor_agent_id: input.actor_agent_id, registered_agents: input.registered_agents,
+      operation: todo.status === "done" && input.planning_intent?.status === "open" ? "reactivate" : "observe",
+      proof: decodeTaskLeaseProof(input.lease_idempotency_key == null && input.lease_expected_version == null ? null :
+        {idempotency_key: input.lease_idempotency_key, expected_version: input.lease_expected_version}), now: input.now});
+  }
+  const evidenceOnly = isExploreReferenceAppend(input.planning_intent ?? {})
+    && Object.keys(input.patch).length === 0 && input.clear_fields.length === 0;
+  if (todo.status === "done" && kind === "planning" && !evidenceOnly) {
+    return reject("unsupported_todo_update_target",
+      "native metadata update cannot complete a Todo; use the terminal lifecycle command");
+  }
+  const lease = leases.get(input.todo_id);
+  const mode = head.handoff_mode === undefined ? "legacy" : head.handoff_mode;
+  if (typeof mode !== "string" || !["legacy", "soft_claim", "hard_lease"].includes(mode)) {
+    return reject("invalid_handoff_mode", "canonical handoff mode is invalid");
+  }
+  const retired = retiredHandoffModeRejection(mode);
+  if (retired !== null) return {...reject(retired, HANDOFF_MODE_RETIRED_REASON), handoff_mode: mode};
+  const intent = input.planning_intent ?? {};
+  const hasProof = input.lease_idempotency_key != null || input.lease_expected_version != null;
+  const withRecovery = (refusal: {code: string; reason: string} | null): TodoUpdateRejection | null =>
+    refusal === null ? null : {...refusal, handoff_mode: mode, recovery: todoUpdateLeaseRecovery(head, input, mode)};
+  const ownershipMutation = ["claimed_by", "clear_claim", "excluded_agents", "bound_agent",
+    "goal_bound", "blocks_agent", "clear_blocks_agent", "global_gate", "clear_global_gate"]
+    .some(field => Object.hasOwn(intent, field));
+  if (kind === "user_completion" && (lease !== undefined || mode === "hard_lease") && ownershipMutation) {
+    return reject("update_lease_ownership_transition_unsupported",
+      "Ownership/exclusion edits require a lease lifecycle transaction; complete before changing the execution grant");
+  }
+  const authorityDecision = evaluateCoordinationTodoMutationDecision({
+    schema_version: COORDINATION_TODO_MUTATION_DECISION_REQUEST_SCHEMA,
+    command: "update", handoff_mode: mode, registered_agents: input.registered_agents,
+    lifecycle_grants: input.lifecycle_grants ?? [],
+    // A reassign-only grant cannot authorize a bundled copy/planning edit.
+    authority_action: Object.keys(input.patch).length === 0 && input.clear_fields.length === 0 &&
+      Object.keys(intent).every(field => field === "claimed_by" || field === "clear_claim") &&
+      (intent.claimed_by !== undefined || intent.clear_claim === true) ? "reassign" : "update",
+    authority_reason: input.authority_reason ?? null,
+    actor_agent_id: input.actor_agent_id,
+    requested_claimed_by: intent.claimed_by ?? null,
+    clear_claim: intent.clear_claim === true,
+    ownership_mutation: ownershipMutation,
+    todo: {
+      ...todo, role: todo.role, status: todo.status,
+      excluded_agents: todo.excluded_agents ?? [],
+      required_decision_scopes: todo.required_decision_scopes ?? [],
+    },
+  });
+  if (authorityDecision.outcome !== "apply") {
+    const decisionCode = String(authorityDecision.code ?? "mutation_rejected");
+    const code = decisionCode === "claim_owner_mismatch"
+      ? "update_owner_mismatch" : decisionCode;
+    // Keep the public owner-mismatch diagnostic stable while other shared
+    // admission failures use a provider-neutral explanation.
+    const reason = code === "update_owner_mismatch"
+      ? "Todo update cannot edit another claim owner's work"
+      : "Todo update is outside the actor's registered owner/binding scope";
+    return {...reject(code, reason), handoff_mode: mode,
+      recovery: {action: "reconcile_lease_owner", reason,
+        todo_status: todo.status, claimed_by: todo.claimed_by ?? null,
+        execution_authority_granted: false,
+        inspect: {command: "loopx todo list", cli_args: ["todo", "list", "--goal-id", input.goal_id, "--todo-id", input.todo_id]}}};
+  }
+  // Promotion deliberately preserves legacy claims without inventing leases.
+  // An explicitly granted controller must be able to repair planning state on
+  // that unleased claim; otherwise a stale blocked/deferred status can never
+  // become eligible enough for the real owner to acquire its first lease.
+  // Once any lease lineage exists, the ordinary holder/CAS fence still wins.
+  const delegatedUnleasedOverride =
+    authorityDecision.authority_mode === "delegated_orchestration_override" &&
+    mode === "hard_lease" && lease === undefined &&
+    input.lease_idempotency_key == null && input.lease_expected_version == null;
+  // Preserve the single-agent compatibility path only for genuinely
+  // unowned work.
+
+  if (input.registered_agents.length === 0 && input.actor_agent_id !== null) {
+    return reject("actor_not_registered", "Todo update requires a registered actor");
+  }
+  if (input.actor_agent_id === null && (todo.claimed_by !== undefined ||
+      todo.bound_agent !== undefined || todo.blocks_agent !== undefined)) {
+    return reject("actor_required", "owned or bound Todo updates require an actor");
+  }
+  // A retained lease, even expired/released, has execution lineage. Ownership
+  // and exclusions must not change beneath it through a metadata operation.
+  if ((lease !== undefined || mode === "hard_lease") && TODO_OWNERSHIP_INTENT_FIELDS.some(field =>
+    Object.hasOwn(input.planning_intent ?? {}, field))) {
+    return reject("update_lease_ownership_transition_unsupported",
+      "Ownership/exclusion edits require a lease lifecycle transaction; metadata update cannot rewrite an execution grant");
+  }
+  // Completion has its own terminal lease proof and atomic release. It still
+  // cannot rewrite an execution grant's ownership or work requirements.
+  if (kind === "user_completion") {
+    if (lease !== undefined && TODO_WORK_REQUIREMENT_FIELDS.some(field => Object.hasOwn(intent, field))) {
+      return reject("update_lease_requirements_transition_unsupported", "Complete leased work before changing its requirements");
+    }
+    return null;
+  }
+  if (mode === "hard_lease" && isOwnerWorkRequirementsRevision(todo, input)) {
+    try {
+      // Supplied proof pins one live generation. Never turn stale/partial proof
+      // into a proof-free administrative request by looking up another lease.
+      if (hasProof) {
+        const fence = evaluateCanonicalTaskLeaseProof({todo, lease, handoff_mode: mode,
+          registered_agents: input.registered_agents, actor_agent_id: input.actor_agent_id,
+          lease_idempotency_key: input.lease_idempotency_key ?? null,
+          lease_expected_version: input.lease_expected_version ?? null, now: input.now});
+        if (fence.outcome !== "apply") return withRecovery(reject(String(fence.code),
+          "Explicit execution proof is stale or unavailable; inspect this Todo before retrying"));
+      }
+      return withRecovery(workRequirementsRevisionRejection(todo, input, lease));
+    } catch (error) {
+      return reject("invalid_coordination_projection", error instanceof Error ? error.message : "invalid retained lease");
+    }
+  }
+  if (mode === "hard_lease" && isBlockedLifecycleTransition(input, todo)) {
+    try {
+      // Proof, if supplied, is an explicit generation constraint. Never replace
+      // a stale/partial proof with a convenient current holder read.
+      if (hasProof) {
+        const fence = evaluateCanonicalTaskLeaseProof({todo, lease, handoff_mode: mode,
+          registered_agents: input.registered_agents, actor_agent_id: input.actor_agent_id,
+          lease_idempotency_key: input.lease_idempotency_key ?? null,
+          lease_expected_version: input.lease_expected_version ?? null, now: input.now});
+        if (fence.outcome !== "apply") return withRecovery(reject(String(fence.code), "Explicit execution proof is stale or unavailable; inspect this Todo before retrying"));
+      }
+      if (lease !== undefined) {
+        const repository = ownerAdministrativeRepositoryRejection(todo,
+          canonicalTaskLease(lease, input.goal_id, input.todo_id), input.actor_agent_id);
+        if (repository !== null) return withRecovery(reject(repository, "Lifecycle change must preserve the execution repository"));
+      }
+      return withRecovery(blockedLifecycleRejection({goal_id: input.goal_id, todo_id: input.todo_id,
+        actor_agent_id: input.actor_agent_id, registered_agents: input.registered_agents,
+        lease, lease_idempotency_key: input.lease_idempotency_key ?? null,
+        lease_expected_version: input.lease_expected_version ?? null, now: input.now,
+        allow_current_holder: todo.status === "open", proof_validated: hasProof}));
+    } catch (error) {
+      return reject("invalid_coordination_projection",
+        error instanceof Error ? error.message : "invalid retained lease facts");
+    }
+  }
+  if ((mode === "hard_lease" || lease !== undefined) && isDeferredReopen(input, todo)) {
+    try {
+      return withRecovery(deferredReopenRejection({goal_id: input.goal_id, todo_id: input.todo_id,
+        actor_agent_id: input.actor_agent_id, registered_agents: input.registered_agents,
+        lease, lease_idempotency_key: input.lease_idempotency_key ?? null,
+        lease_expected_version: input.lease_expected_version ?? null, now: input.now}));
+    } catch (error) {
+      return reject("invalid_coordination_projection",
+        error instanceof Error ? error.message : "invalid retained lease facts");
+    }
+  }
+  // Current-head preparation and provider CAS replace the artificial acquire /
+  // edit / release dance for administrative work. No execution grant is made.
+  // Existing explicit-proof callers keep their strict generation semantics.
+  if (mode === "hard_lease" && !hasProof &&
+      (isOwnerAdministrativeCopyUpdate(todo, input) || isOwnerDeferral(input, todo))) {
+    try {
+      if (lease !== undefined) {
+        const current = canonicalTaskLease(lease, input.goal_id, input.todo_id);
+        leaseIsActive(current, input.now); // Validate the retained clock as well.
+        const repository = ownerAdministrativeRepositoryRejection(todo, current, input.actor_agent_id);
+        if (repository !== null) return withRecovery(reject(repository, "Administrative edit must preserve the execution repository"));
+        if (current.owner !== input.actor_agent_id) return withRecovery(reject("lease_owner_mismatch",
+          "This Todo retains another holder's execution; reconcile that holder before editing"));
+      }
+      return null;
+    } catch (error) {
+      return reject("invalid_coordination_projection", error instanceof Error ? error.message : "invalid retained lease");
+    }
+  }
+  // A completed owner's evidence association is metadata, not renewed work.
+  // Keep the retained execution key/version under the provider transaction CAS;
+  // no active, expired, foreign or missing lease receives this exception.
+  if (evidenceOnly && todo.status === "done" && lease?.status === "released" &&
+      todo.claimed_by === input.actor_agent_id && lease.owner === input.actor_agent_id &&
+      typeof input.lease_idempotency_key === "string" &&
+      lease.idempotency_key === input.lease_idempotency_key &&
+      typeof input.lease_expected_version === "number" &&
+      lease.version === input.lease_expected_version) {
+    const repositoryRejection = leaseRepositoryRejection(todo, lease);
+    return repositoryRejection === null ? null : reject(repositoryRejection, "Evidence association must retain the completed work repository");
+  }
+  // An initial gate link is planning, not execution or an owner decision.
+  const boundUserGateLink = todo.role === "user" && todo.task_class === "user_gate" &&
+    todo.status === "open" && todo.claimed_by == null && todo.unblocks_todo_id == null &&
+    input.actor_agent_id !== null && todo.bound_agent === input.actor_agent_id &&
+    todo.blocks_agent === input.actor_agent_id &&
+    typeof intent.unblocks_todo_id === "string" && intent.unblocks_todo_id.length > 0 &&
+    Object.keys(input.patch).every(field => field === "note") &&
+    input.clear_fields.every(field => field === "note") &&
+    Object.keys(intent).every(field => ["unblocks_todo_id", "evidence", "reason"].includes(field));
+  // User planning uses an administrative provider-CAS edit. Retained released
+  // history is not an execution grant; active/expired history needs exact
+  // release first. Explicit or partial proof never grants this exception.
+  const boundUserActionMetadata = isBoundUserActionMetadataUpdate(todo, input);
+  if ((boundUserActionMetadata || boundUserGateLink) && (lease === undefined || lease.status === "released") &&
+      input.lease_idempotency_key == null && input.lease_expected_version == null) {
+    try {
+      if (lease !== undefined) canonicalTaskLease(lease, input.goal_id, input.todo_id);
+      if (boundUserGateLink) {
+        const target = indexCoordinationProjection(head, input.goal_id).todos.get(intent.unblocks_todo_id as string);
+        if (target?.role !== "agent" || target.claimed_by !== todo.blocks_agent ||
+            target.archive_state !== "active" || isInactiveUserCompletionTarget(target)) {
+          return reject("user_gate_link_target_invalid",
+            "Initial gate link requires an active, open or blocked Agent Todo in this Goal claimed by the gate's bound/blocked agent");
+        }
+        // The link must describe one decision: a scoped gate takes only a target
+        // awaiting that scope; an unscoped dependency gate takes only a target
+        // awaiting no scoped decision. Absence of a match is not a dependency.
+        const relation = decisionScopeRelation(todo, target);
+        const awaitsScopedDecision = Array.isArray(target.required_decision_scopes) && target.required_decision_scopes.length > 0;
+        if (relation === null ? awaitsScopedDecision : relation.state !== "gate_covers_action") {
+          return reject("user_gate_link_target_invalid",
+            "Initial gate link requires a target whose required decision scopes are covered by this gate's decision scope, or neither side to declare one");
+        }
+        // A target that declares any resume condition other than completion of this
+        // exact gate (another Todo, a Monitor change, a time or a capacity) waits for
+        // that; approving this gate cannot satisfy it, so it cannot take the first link.
+        const declared = typeof target.resume_when === "string" ? target.resume_when.trim() : "";
+        const waitsForThisGate = todoDoneResumeTargetId(declared) === input.todo_id;
+        if (declared && !waitsForThisGate) {
+          return reject("user_gate_link_target_invalid",
+            "Initial gate link requires a target that declares no resume condition other than this gate");
+        }
+      }
+    } catch (error) {
+      return reject("invalid_coordination_projection",
+        error instanceof Error ? error.message : "invalid retained lease facts");
+    }
+    return null;
+  }
+  // Policy migration retains released execution history. It must not force a
+  // soft-claim owner to acquire a lease that this mode forbids. Explicit proof,
+  // including partial proof, still goes through the current execution fence.
+  if (mode === "soft_claim" && input.lease_idempotency_key == null &&
+      input.lease_expected_version == null) {
+    try {
+      if (isSoftClaimReleasedCopyUpdate(todo, lease, input)) return null;
+    } catch (error) {
+      return reject("invalid_coordination_projection",
+        error instanceof Error ? error.message : "invalid retained lease facts");
+    }
+  }
+  if (!delegatedUnleasedOverride && (lease !== undefined || mode === "hard_lease" ||
+      input.lease_idempotency_key != null || input.lease_expected_version != null)) {
+    try {
+      const fence = evaluateCanonicalTaskLeaseProof({todo, lease, handoff_mode: mode,
+        registered_agents: input.registered_agents, actor_agent_id: input.actor_agent_id,
+        lease_idempotency_key: input.lease_idempotency_key ?? null,
+        lease_expected_version: input.lease_expected_version ?? null, now: input.now});
+      if (fence.outcome !== "apply") {
+        const restoration = acceptanceRestoration(head, todo, lease, input);
+        if (restoration?.kind === "exact_restoration") return null;
+        if (restoration?.kind === "unavailable") {
+          return reject("goal_acceptance_restoration_unavailable", restoration.reason);
+        }
+        return {...reject(String(fence.code), fence.code === "todo_not_executable"
+          ? "User actions cannot consume execution proof; release retained execution before a bound administrative copy edit"
+          : "Todo update requires the current active lease execution proof"),
+          handoff_mode: mode, recovery: todoUpdateLeaseRecovery(head, input, mode)};
+      }
+      if (lease !== undefined && todo.claimed_by !== input.actor_agent_id && !boundUserActionMetadata) {
+        return reject("update_owner_mismatch", "Leased Todo update requires the current claim owner");
+      }
+      if (lease !== undefined) {
+        return isOwnerDeferral(input, todo) ? null : withRecovery(leasedTodoEditRejection(todo, input.planning_intent ?? {}));
+      }
+    } catch (error) {
+      return reject("invalid_coordination_projection",
+        error instanceof Error ? error.message : "invalid lease facts");
+    }
+  }
+  return null;
+}

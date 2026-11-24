@@ -1,0 +1,346 @@
+# Todo work counts and bounded display
+
+Todo lists, status and quota summaries carry `work_counts` with schema
+`todo_work_counts_v0`. Counts are computed before display limits; quota
+recomputes them **after** the existing Agent scope and resume selection.
+The contract is read-only. A count never grants a claim, lease, capability,
+validation exemption or execution permission.
+
+```sh
+loopx --format json todo list --goal-id example --role agent --limit 1 --thin
+loopx --format json status --goal-id example
+loopx --format json quota should-run --goal-id example --agent-id agent-a
+```
+
+The first command returns one Todo while its role summary retains the matched
+source's counts. A filtered list describes its filtered source. This is not a
+new provider setting: legacy inputs and promoted File/SQLite inputs share the
+same typed summary owner. PostgreSQL uses the same provider-neutral records;
+service deployment and whole-Goal promotion remain separately qualified.
+
+The list's `projection_envelope` also separates source coverage from display.
+Its `included_count` covers all query matches; `shown_count` counts the final
+ordinary, hot, limited, thin or exact view. Display truncation alone does not
+raise `incomplete_coverage`; see the [envelope contract](contracts/projection-envelope-contract.md).
+
+| Field | Meaning |
+| --- | --- |
+| `open` | Nonterminal source rows, including blocked work; it is not executable work |
+| `advancement` | Observed actionable advancement rows; acceptance-denied and unsatisfied resume rows do not qualify |
+| `monitor` | Observed actionable Monitor rows, including future/expired observation context; due/schedule-gap fields retain their existing separate meanings |
+| `hidden` | Declared source rows not available for classification, not rows hidden by UI pagination |
+| `complete` | Whether the available source covers the declared scope; false counts are lower bounds for classified task kinds |
+| `agent_id` | Agent execution scope, or null for an unscoped/role summary |
+
+The observed row count is derived as `open - hidden`; the payload does not
+repeat it as a second value that could drift.
+
+`complete=false` survives repeated quota projection, even when the surviving
+subset fits on one screen. It cannot certify “Monitor-only work remains.”
+Legacy display-only inputs are deduplicated by Todo identity; contradictory
+fragments cannot certify completeness. A missing task is never guessed to be
+advancement work. Invalid count envelopes and differently scoped count reuse
+fail explicitly.
+
+Goal frontier reads the same `work_counts`, rather than counting its bounded
+`executable_backlog_items` again. Its `normalized_progress` retains
+`agent_counts_complete` and `agent_unclassified_open_count`, so an incomplete
+source cannot become an exact total when the display is compacted.
+
+`deferred_work_counts` carries `ready`, `blocked`, `unknown`, `complete` and
+`ready_by_agent` from the same typed source before display limits. Goal frontier
+uses these facts for `deferred_successors`; twelve ready successors do not become
+eight ready and four blocked. Missing evaluations and unseen rows are unknown;
+an undeclared source total has `unknown=null`. The reported ready/blocked counts
+are lower bounds while `complete=false`. Current capability re-evaluation
+replaces prior readiness for observed rows and cannot certify unseen rows.
+
+The TypeScript `todos/summary_lanes.ts` owner returns indexes into the one input
+array instead of repeating full Todo bodies for each lane. The native read owner
+normalizes canonical fields/timestamps and materializes the selected records.
+Python retains the legacy source codecs.
+One observation time governs Monitor due and expiry classification within the
+batch. Source order, completed/deferred conventions and claimant visibility
+remain compatible; `done_count` still includes deferred rows as required by its
+existing summary contract.
+
+Intentional corrections: 21 executable Todos no longer become 8 because the
+backlog display limit is 8; a compact quota payload no longer turns that count
+into 2. Unknown hidden rows are not classified. Public canonical `todo list`
+also retains the acceptance guard from the same read revision, so held work
+cannot appear executable there while status says it is held. Acceptance-off
+reads keep their existing selection behavior.
+
+Markdown stays a permanent display. These reads do not rewrite stale/missing
+Markdown, create receipts or mutate canonical records. The additive count
+field is not persisted in Todo authority. Older readers can ignore it, but
+retain their old undercount behavior; rollback does not require data migration.
+T1/T2 caller closure, D1 projection recovery, D2 capacity/elapsed soak and D3
+fenced whole-Goal cutover remain separate work.
+
+## Agent-addressed reads
+
+`todo list --agent-id` now composes selection in the same typed summary batch,
+sharing scope rules with quota. For User gates, explicit `global_gate` wins,
+then `blocks_agent`, then the retained `claimed_by` fallback. User actions use
+`bound_agent` first and retained `claimed_by` second. Unscoped records remain
+visible. Gate addressing is independent of executor exclusion: an Agent cannot
+ignore an explicitly addressed human gate because another Agent owns it.
+Agent work still filters by claim and exclusions. A visible row grants no
+mutation or execution permission; quota retains its additional eligibility rules.
+
+This intentionally removes other-Agent, claim-only User records from scoped
+lists; the old Python list rule ignored their claim while quota honored it.
+Unfiltered Goal views retain those records. There is no feature flag or provider
+default change. Existing frontend/Lark manager views use the unfiltered Core
+read and continue to show the whole Goal; no new configuration editor is needed.
+
+Resume and succession are evaluated on the complete source before selection.
+The typed batch filters rows without renumbering their original source indexes,
+then builds lanes/counts, and only then applies display limits. Status/identity
+filters do not recompute dependencies from their smaller view. The `todo.read` transaction composes source evaluation, selection, counts,
+frontier identity, handoff context and result construction through the existing
+TypeScript owners. Canonical provider IO runs in that transaction; Markdown
+source codecs and material IO remain explicit Python adapters. Filtering reuses
+validated full-source evidence, never dependencies inferred from a small view.
+The old `todo.summary.project` transport and Python ordinal materializer are
+retired. Large source/result transport preserves complete decisions and refuses
+changed continuations; display limits still disclose shown and available counts.
+
+Native summary composition passes row objects and succession records directly.
+Its obsolete request-version and column codecs, plus the unused summary handoff
+carrier, are removed. Semantic validation remains with the existing owners.
+The separate handoff-context interface and public read/summary outputs retain
+their contracts.
+
+Route-continuation visibility also uses the existing typed quota planning batch.
+It shares the normal claim/exclusion rule; eligibility, first-identity deduplication,
+sorting and counts precede the display cap. Disabled candidates do not hide later
+eligible copies. Historical unclaimed visibility may include excluded records,
+but the current-Agent lane excludes them and the execution consumer rechecks
+eligibility. A route hint never grants execution or clears a handoff gate.
+Python retains legacy field decoding and display formatting. There is no new
+RPC, persisted field, provider default or forced migration; supported old planning
+requests and legacy/File/SQLite records retain their behavior.
+
+Handoff visibility uses the same batch and gate snapshot. `excluded_agents`
+addresses the review lane for these gates, independently of ordinary execution
+claims; exclusion still denies execution. Full-source counts precede display
+limits, while projected source order, duplicates and historical display states
+are retained. Only `cleared_without_successor` contributes to that named gap
+count; no-follow-up, superseded and deferred states are distinct. An explicitly
+empty projected gate list suppresses legacy reconstruction. Python retains the
+legacy renderer and downstream execution checks, with no separate handoff lane
+decision or repeated gate reconstruction for route visibility.
+
+重规划候选的展示也复用既有 TS quota planning 批处理与 claim/exclusion 规则。
+资格、首个有效身份去重、排序和计数先于展示裁剪；显式关闭的副本不遮挡后续有效
+副本。历史 unclaimed 展示可包含被排除的记录，current-Agent 分组会排除它们，
+执行方仍重新校验资格。建议不授予执行权限或清除 handoff 阻塞。Python 保留旧字段
+解码和展示；不新增 RPC、持久字段、provider 默认值或强制迁移。
+
+handoff 展示也使用同一批次与 gate 快照。此处 `excluded_agents` 定向其复核分组，
+执行仍受排除限制；它不按普通工作 claim 授予资格。完整计数先于裁剪，保留来源顺序、
+重复行和历史展示状态；仅 `cleared_without_successor` 计入对应后继缺口，不能混同
+no-follow-up、superseded 或 deferred。显式空 gate 投影不重建旧来源。Python 保留旧
+格式展示和下游执行检查，删除独立 handoff 分组判断及 route 展示的重复 gate 重建。
+
+## 中文说明
+
+`work_counts` 由完整来源计算，随后才裁剪展示。Agent quota 先按原有归属、排除、
+能力与作用域规则筛选，再重新计数，不能沿用整个 Goal 的数量。`open` 包含 blocked
+任务；`advancement` 才是已观察到的可执行推进任务。Monitor 是否到期仍使用独立字段。
+
+`hidden` 表示未取得、无法分类的来源行，不是界面折叠的行数。`complete=false` 时，
+已分类数量只是下界，重复投影也不能把未知变成完整，更不能据此声称“只剩 Monitor”。
+旧摘要按 Todo 身份去重，矛盾片段不能证明完整；缺失任务不再被猜成 advancement。
+
+Goal frontier 复用同一 `work_counts`，不再对截断后的 `executable_backlog_items`
+重新计数；`normalized_progress.agent_counts_complete` 与
+`agent_unclassified_open_count` 保留完整性和未分类数量。`deferred_work_counts`
+在展示裁剪前提供 ready、blocked、unknown、complete 和 ready_by_agent，
+后继投影不再把 12 个已就绪任务误报为 8 个就绪、4 个受阻。未取得的行或缺失的
+ready 求值保持 unknown，来源总数未声明时 unknown 为 null；complete=false 时
+ready/blocked 只是下界。能力变化只重新求值已取得的行，不能证明未取得行的状态。
+
+TS 统一批量 lane 分类与计数，Python 保留旧格式解码、时间适配和展示。返回数组位置
+索引减少同一任务在多个 lane 的重复传输；一个批次使用同一观察时刻。排序、延期与
+完成计数约定、claim 展示保留。canonical `todo list` 同时修复了漏传同版本 acceptance
+限制的问题，验收受阻的任务仍可见，但不会被列为可执行。
+
+这不改变 provider 默认值，不授予执行权限，不写回 Markdown 或 canonical 状态。
+新增计数字段不进入持久化 Todo；回滚无需数据迁移。默认切换、存量迁移、D1–D3 和旧
+Python writer 退出仍有各自的验收条件，不能按本 PR 合并数量推定完成。
+
+Agent 定向列表现与 quota 共用 TS 范围规则：User gate 按 global_gate → blocks_agent →
+旧 claimed_by 依次判定，User action 按 bound_agent → 旧 claimed_by 判定。无作用域的
+旧记录仍可见；显式人类 gate 不会被执行者 claim/exclusion 消除。Agent 工作仍按
+claim/exclusion 筛选，可见不代表获准执行。
+
+这是有意纠正：旧列表忽略仅声明 claimed_by 的 User 记录，导致其他 Agent 的工作混入
+当前列表。未筛选的整 Goal 视图仍显示这些记录。依赖和 succession 先在完整来源求值，
+TS 再筛选并保留原数组位置，最后生成 lanes、计数和有界展示；筛选后的数组位置不是原
+来源位置。无需新增 capability、配置、前端或 Lark 编辑入口，不增加一次筛选 RPC。
+
+## Summary chronology and source completeness
+
+The same TS projection now supplies `recent_completed_advancement_items`,
+claimant-balanced display lanes, orchestration candidate positions and closure
+proofs to legacy and canonical consumers. Display budgets are unchanged;
+`items` limits never change full-source counts. Full-source resume/succession
+evaluation still precedes filtering, and returned positions refer to the original
+array, not a newly numbered subset. Python retains public field allowlists,
+warning text, privacy redaction and Markdown parsing/rendering.
+
+Agent summaries compute their existing `advancement_frontier_revision_index`
+inside this same projection, after source selection and before display caps.
+The shared frontier owner retains the v0 serialization/hash, excluded-agent
+lanes, owned-work ACK identity and commitment counts. Missing or contradictory
+codec facts fail the read; no separate index RPC repairs the result. The
+single-caller Python attachment is retired. Direct frontier calls used by replan
+and successor causality remain, as do Markdown writers for supported unmigrated
+Goals, backup/receipt recovery and Host IO. Internal summary request v3 composes
+the existing owners; v1/v2 callers and public summary/index schemas remain
+compatible. This is a source-read retirement slice, not SQLite-default or full
+writer-retirement qualification. Roll back the matching Python/TS distribution
+together; no persisted data migration is involved.
+
+Agent summary 在同一 TS 批次中生成既有 `advancement_frontier_revision_index`：先筛选
+完整来源，再生成索引，最后应用展示上限。沿用 frontier owner 的 v0 序列化/哈希、
+排除 Agent 的 lane、已拥有工作对应的 ACK 身份和承诺计数。缺失或矛盾的 codec 事实会
+明确拒绝读取，不会补调另一个索引 RPC。删除仅有一个调用方的 Python attachment；
+replan 和 successor 因果核验仍使用的直接 frontier 入口、未迁移 Goal 的 Markdown
+writer、备份/原回执恢复及 Host IO 继续保留。内部 summary 请求升级为 v3，保留
+v1/v2 调用兼容和公共 summary/index schema。本批只完成来源读取边界的退役，不代表
+SQLite 默认或全部 writer 退役已验收；回退时一起回退匹配的 Python/TS 分发，无需迁移
+持久化数据。
+
+**Intentional read behavior changes:** recent completions are ordered by the
+actual `completed_at` instant, preserving timezone offsets and microseconds.
+Later `updated_at` edits no longer make an old completion recent. Missing or
+invalid completion times remain in completed-work counts/history but do not
+claim a place in the recent-completion lane. Equal instants retain reverse
+source-coordinate order and stable ties. Succession warnings keep their
+last-change ordering, now comparing instants rather than timestamp strings;
+unknown instants follow known ones without discarding the warning.
+
+A source already marked partial cannot regain `source_proof` or
+`terminal_closure_proof` simply because a later selection matches all visible
+rows. Query scope and source completeness are independent conditions. These
+proofs remain read-only observations, not permission to settle a Goal.
+
+Route-replan facts now participate in the same full-source succession evidence.
+Changing a typed route flag or a historical handoff label after evaluation
+rejects filtered readback; it cannot reuse the old evidence to change a closure
+obligation. An explicit boolean, including `false`, takes precedence. The
+historical “stale handoff closeout” prose hint remains a bounded compatibility
+advisory in the TS succession owner, never gate clearance, successor evidence
+or execution permission. Supported old writers and their migration readers
+remain intact; retiring this Python decision does not force a Goal upgrade.
+
+Quota validates retained closure witnesses through the existing
+`todo.quota_planning.project` batch, alongside selection and resume planning.
+The TS succession owner now validates the source and terminal proofs as well as
+producing them; Python transports compact source facts and materializes fields.
+The internal request is versioned to v2; v0/v1 readers retain their wire behavior.
+No extra RPC, provider setting or persisted schema is added.
+
+**Closure read correction:** boolean, null, string, fractional and negative
+counts cannot certify terminal closure. Equal malformed Monitor counts are
+invalid evidence, not proof that the two counts agree. Invalid evidence clears
+the derived no-followup intent instead of suppressing quota work. Genuine empty
+sources, complete proofs with bounded displays and watch-only Monitor closure
+remain supported. This does not itself complete or settle a Goal.
+
+This changes status, Todo-list and quota summary readback for both legacy and
+promoted Goals without a flag. Existing frontend and Lark views consume these
+Core projections; no new setting or frontend asset is required. No provider,
+lease, registry or display writer is added. Rollback requires the matching
+Python/TS package but no data migration. Full L5 consumer acceptance, projection
+freshness, SQLite D2 and default/cutover gates remain separate.
+
+### 中文补充
+
+摘要的计数、展示上限、领取者之间的展示分配、编排候选位置及收尾证明，现由一个 TS
+批次决定；删除 Python 的重复汇总分支和仅为旧内部调用保留的 claim 分配 helper。
+Python 继续负责旧数据解码、公开字段筛选、隐私处理与文本展示。
+
+这是有意的读取语义修复：最近完成列表按 `completed_at` 的真实时刻排序，保留时区和
+微秒，不再把较晚编辑误作较晚完成。缺失／非法时间仍计入已完成总数和历史，但不进入
+最近完成列表。后继缺口警告仍按最后更新时间排序，未知时间靠后，不丢弃警告。
+已有 partial 来源不会因为再次筛选命中所有可见行，就重新获得整个来源的收尾证明。
+route-replan 的类型化标记及旧 handoff 文本提示现在绑定同一份完整来源证据；求值后
+修改这些事实，筛选读取会拒绝旧证据。显式 `false` 优先于旧提示，提示仍只是重规划
+建议，不能解除 gate、证明后继或授予执行权。此次只退役 Python 重复决策，不删除
+仍有调用方的旧 writer／迁移 reader，也不强制升级既有 Goal。
+
+quota 在原有 `todo.quota_planning.project` 批次中同时验证来源／收尾证明，不再由
+Python 独立判断。TS succession owner 负责生成和验证；Python 只传紧凑事实并还原展示。
+内部请求升级为 v2，保留 v0/v1 兼容。布尔、null、字符串、小数和负数不能充当计数，
+两个非法 Monitor 计数相同也不构成证明；非法证明不再产生 no-followup 停止意图。
+合法空来源、有界展示保留的完整来源证明及 watch-only Monitor 收尾保持原行为。
+没有新增 RPC、设置或持久化格式，这条读取规则本身不能完成或结算 Goal。
+
+覆盖 legacy 与 canonical 的 status、Todo 查询和 quota 摘要；展示预算保持原值。
+没有新增设置、权限或 writer，不改变 provider 默认值，也不宣称完成整 Goal 迁移。
+
+## Frontier deadlines before gate display limits
+
+Quota's existing typed planning batch now selects future deadlines from the
+complete addressed gate lane and Monitor lane before rendering limits. The
+public `frontier_deadline` shape stays `todo_frontier_deadline_v0`; expiry,
+UTC offsets, microseconds, deduplication and first equal-time source are retained.
+A gate shown later by priority can own the earliest transition: hiding it after
+three displayed gates must not postpone the scheduler's recheck. Other-Agent
+gates remain excluded by the existing scope rule.
+
+This intentionally corrects quota and scheduler readback for legacy and
+canonical File/SQLite records carrying future gate timestamps. It adds no RPC,
+setting, persisted field, provider default or migration requirement. Frontend
+and Lark views retain the same Core display fields and limits. Matching package
+rollback restores the previous discovery behavior without changing stored data.
+
+The batch uses the same explicit observation instant for v3 Monitor due/gap
+selection and frontier discovery; conflicting clock facts fail closed. Supported
+v0/v1/v2 requests retain their original untimed shape. The downstream scheduler
+retains its current-time validation of projected deadlines. Raw/stale-summary Python
+compatibility, bounded resume/handoff lanes and the live App wait qualification
+remain separate retirement work. A projected deadline never grants gate
+clearance, execution or Goal closure.
+
+quota 在既有 TS planning 批次中，先对完整且已按 Agent 范围筛选的 gate／Monitor
+来源计算未来截止点，再裁剪展示。后列 gate 不再因三项展示上限丢失最早唤醒；其他
+Agent 的 gate 仍被原有范围规则排除。保留时间偏移、微秒、过期、去重与同刻稳定顺序，
+公开 deadline 格式、展示预算、provider 默认与既有数据不变，不增加 RPC 或迁移要求。
+下游仍按当前时刻校验投影；旧／过期摘要的 Python 兼容逻辑、有界 resume/handoff
+来源和实际 App 等待态验收继续保留，不能据此宣称全部退役或 Goal 收尾。
+
+## Due Monitor selection before display limits
+
+Timed quota planning selects already-due Monitors by claim bucket, profile rank
+and priority, then earliest due instant, then display index with stable ties.
+Eligibility and capability checks precede this order; future, expired, blocked,
+excluded and other-Agent work cannot gain execution through an older timestamp.
+Watch-only and ordinary due lanes retain the same ordering within their subsets.
+General Todo display and advancement order are unchanged.
+
+This intentionally replaces index-first selection among equally ranked due
+Monitors. A frequently recurring low-index task can no longer hide an older due
+task behind quota's one-row display cap. Legacy, File and SQLite source records
+use the timed planning adapter; old untimed planning wire requests retain their
+previous order. There is no new setting, RPC, stored field or provider migration.
+
+An exact Monitor poll still settles only its bound Turn. Replaying that Turn
+does not select another Monitor, spend quota or advance an unobserved deadline.
+A newly admitted Turn can select the next eligible task. This corrects selection
+starvation, not host capacity: it does not shorten an owner's cadence floor or
+guarantee every periodic duty fits into one wake. Hosts must use their existing
+fresh-Turn admission contract; this change does not authorize a same-wake loop.
+Frontend and Lark retain the existing Core fields and display limits.
+
+到期 Monitor 先通过归属、排除、能力与可执行检查，再按 claim 分组、profile、
+优先级排序；同等级中按最早到期时刻、展示 index 和稳定次序选择，最后裁剪展示。
+这有意替代同等级的 index 优先：高频前列任务不能一直挤占较早到期的任务。
+普通 Todo 展示、推进任务顺序、持久数据和宿主周期不变。旧 Turn 的成功观察仍只
+结算自身，重放不得选择其它 Monitor、重复扣额或推进未观察的周期；下一合法 Turn
+才能选择下一项。消除选择饥饿不等于满足全部周期容量，也不授权同次唤醒自行循环。

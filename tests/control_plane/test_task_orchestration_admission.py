@@ -27,7 +27,7 @@ def _peer_management(*agent_ids: str) -> dict[str, Any]:
 def _todo(
     todo_id: str,
     *,
-    task_domain: str = "code",
+    task_domain: str | None = "code",
     action_kind: str = "inspect",
     task_repository: str | None = None,
     required_capabilities: list[str] | None = None,
@@ -41,9 +41,10 @@ def _todo(
         "task_class": "advancement_task",
         "priority": "P0",
         "text": f"Advance {todo_id}",
-        "task_domain": task_domain,
         "action_kind": action_kind,
     }
+    if task_domain is not None:
+        item["task_domain"] = task_domain
     if required_capabilities:
         item["required_capabilities"] = required_capabilities
     if required_write_scopes:
@@ -97,12 +98,32 @@ def test_admission_requires_observed_spawn_capability() -> None:
     assert contract is None
 
 
+def test_admission_without_domain_filter_accepts_tagged_and_untagged_lanes() -> None:
+    contract = _contract(
+        [
+            _todo("todo_primary", task_domain=None),
+            _todo("todo_untagged", task_domain=None),
+            _todo("todo_docs", task_domain="docs"),
+        ],
+        available_capabilities=["subagent_spawn"],
+        allowed_domains=[],
+    )
+
+    assert contract is not None
+    assert [lane["todo_id"] for lane in contract["eligible_child_lanes"]] == [
+        "todo_untagged",
+        "todo_docs",
+    ]
+    assert contract["blocked_lanes"] == []
+
+
 def test_admission_emits_complete_child_brief_and_typed_block_reasons() -> None:
     contract = _contract(
         [
             _todo("todo_primary"),
             _todo("todo_child", required_capabilities=["network"]),
             _todo("todo_wrong_domain", task_domain="docs"),
+            _todo("todo_untagged", task_domain=None),
             _todo("todo_waiting", resume_ready=False),
         ],
         available_capabilities=["subagent_spawn", "network"],
@@ -127,14 +148,12 @@ def test_admission_emits_complete_child_brief_and_typed_block_reasons() -> None:
             "allowed": ["fresh"],
         },
         "expected_output": "public_safe_evidence",
-        "child_decision": "continue",
         "execution_policy": {
             "timeout": "bounded_by_host_turn",
             "cancel": "task_coordinator_or_host_timeout",
         },
-        "validation_policy": (
-            "run todo-scoped validation when applicable and report commands/results"
-        ),
+        "child_guard_policy": "prevention_first_v0",
+        "validation_policy": "child reports evidence; parent runs declared todo gate",
         "acceptance": [
             "report completed scope and evidence",
             "report validation result and residual risk",
@@ -168,8 +187,45 @@ def test_admission_emits_complete_child_brief_and_typed_block_reasons() -> None:
     }
     assert blocked == {
         "todo_wrong_domain": ["task_domain_not_allowed"],
+        "todo_untagged": ["task_domain_not_allowed"],
         "todo_waiting": ["dependency_not_ready"],
     }
+
+
+def test_admission_exposes_context_fork_only_as_explicit_host_capability() -> None:
+    contract = _contract(
+        [
+            _todo("todo_primary"),
+            _todo("todo_child"),
+        ],
+        available_capabilities=["subagent_spawn", "subagent_context_fork"],
+    )
+
+    assert contract is not None
+    assert contract["child_brief_defaults"]["context_policy"] == {
+        "selection_owner": "task_coordinator",
+        "default": "fresh",
+        "allowed": ["fresh", "forked_snapshot"],
+    }
+
+
+def test_admission_keeps_declared_validation_with_registered_parent() -> None:
+    validation_child = _todo("todo_child")
+    validation_child["completion_validation_required"] = True
+    contract = _contract(
+        [
+            _todo("todo_primary"),
+            validation_child,
+        ],
+        available_capabilities=["subagent_spawn"],
+    )
+
+    assert contract is not None
+    child_brief = contract["eligible_child_lanes"][0]["child_brief"]
+    assert child_brief["validation_declared"] is True
+    assert child_brief["validation_label"] is None
+    assert "validation_command" not in child_brief
+    assert "validation_command_argv" not in child_brief
 
 
 def test_admission_serializes_overlapping_write_scopes() -> None:
@@ -196,16 +252,90 @@ def test_admission_serializes_overlapping_write_scopes() -> None:
 
     assert contract is not None
     assert [lane["todo_id"] for lane in contract["eligible_child_lanes"]] == [
-        "todo_independent"
+        "todo_conflict",
+        "todo_independent",
     ]
-    assert contract["blocked_lanes"] == [
-        {
-            "todo_id": "todo_conflict",
-            "task_domain": "code",
-            "reason_codes": ["write_scope_conflict"],
-            "conflicts_with_todo_id": "todo_primary",
-        }
+    assert contract["blocked_lanes"] == []
+
+
+def _scope_contract(
+    items: list[dict[str, Any]],
+    *,
+    goal_write_scope: list[str],
+) -> dict[str, Any] | None:
+    summary = {"items": items}
+    contract, _work_lane = apply_task_orchestration_contract(
+        fallback_work_lane_contract={"lane": "advancement_task"},
+        goal_boundary={
+            "write_scope": goal_write_scope,
+            "orchestration": {
+                "mode": "multi_subagent",
+                "spawn_allowed": True,
+                "max_children": 2,
+            },
+        },
+        agent_identity={
+            "agent_id": AGENT_ID,
+            "registered_agents": [AGENT_ID],
+        },
+        agent_todo_summary=summary,
+        raw_agent_todo_summary=summary,
+        raw_user_todo_summary={"items": []},
+        available_capabilities=["subagent_spawn"],
+    )
+    return contract
+
+
+def test_admission_serializes_case_alias_write_scopes() -> None:
+    contract = _scope_contract(
+        [
+            _todo("todo_primary", action_kind="implement", required_write_scopes=["src/Main.ts"]),
+            _todo("todo_case_alias", action_kind="implement", required_write_scopes=["src/main.ts"]),
+            _todo("todo_independent", action_kind="implement", required_write_scopes=["src/other.ts"]),
+        ],
+        goal_write_scope=["src/**"],
+    )
+
+    assert contract is not None
+    assert [lane["todo_id"] for lane in contract["eligible_child_lanes"]] == [
+        "todo_case_alias",
+        "todo_independent",
     ]
+    assert contract["blocked_lanes"] == []
+
+
+def test_admission_keeps_scheduling_subtree_containment_without_a_trailing_slash() -> None:
+    contract = _scope_contract(
+        [
+            _todo("todo_primary", action_kind="implement", required_write_scopes=["src"]),
+            _todo("todo_below", action_kind="implement", required_write_scopes=["src/a.ts"]),
+            _todo("todo_independent", action_kind="implement", required_write_scopes=["tests/a.py"]),
+        ],
+        goal_write_scope=["src", "src/**", "tests/**"],
+    )
+
+    assert contract is not None
+    assert [lane["todo_id"] for lane in contract["eligible_child_lanes"]] == [
+        "todo_below",
+        "todo_independent",
+    ]
+    assert contract["blocked_lanes"] == []
+
+
+def test_admission_leaves_sibling_files_independent() -> None:
+    contract = _scope_contract(
+        [
+            _todo("todo_primary", action_kind="implement", required_write_scopes=["src/a.ts"]),
+            _todo("todo_sibling", action_kind="implement", required_write_scopes=["src/b.ts"]),
+        ],
+        goal_write_scope=["src/**"],
+    )
+
+    assert contract is not None
+    assert [lane["todo_id"] for lane in contract["eligible_child_lanes"]] == [
+        "todo_sibling"
+    ]
+    assert contract["blocked_lanes"] == []
 
 
 def test_admission_serializes_implicit_and_explicit_goal_repository_scopes() -> None:
@@ -254,16 +384,10 @@ def test_admission_serializes_implicit_and_explicit_goal_repository_scopes() -> 
 
     assert contract is not None
     assert [lane["todo_id"] for lane in contract["eligible_child_lanes"]] == [
-        "todo_independent"
+        "todo_same_repository",
+        "todo_independent",
     ]
-    assert contract["blocked_lanes"] == [
-        {
-            "todo_id": "todo_same_repository",
-            "task_domain": "code",
-            "reason_codes": ["write_scope_conflict"],
-            "conflicts_with_todo_id": "todo_primary",
-        }
-    ]
+    assert contract["blocked_lanes"] == []
 
 
 def test_admission_fails_closed_when_configured_domains_are_all_invalid() -> None:
@@ -768,3 +892,54 @@ def test_admission_requires_scope_for_unknown_child_action() -> None:
             "reason_codes": ["write_scope_missing"],
         }
     ]
+
+
+def test_peer_inventory_does_not_confuse_first_display_row_with_binding() -> None:
+    old = {**_todo("todo_old"), "claimed_by": "worker"}
+    current = {**_todo("todo_current"), "claimed_by": "worker"}
+    kwargs = dict(
+        fallback_work_lane_contract={"lane": "advancement_task"},
+        goal_boundary={"peer_task_coordination": {"enabled": True, "coordinator_agent_id": AGENT_ID}},
+        agent_identity={"agent_id": AGENT_ID, "registered_agents": [AGENT_ID, "worker"]},
+        agent_todo_summary={"items": [old]},
+        raw_agent_todo_summary={"items": [old]},
+        available_capabilities=[],
+        agent_management_projection=_peer_management("worker"),
+    )
+    # The canonical source replaces the stale display, not merely its ordering.
+    contract, lane = apply_task_orchestration_contract(**kwargs, agent_todo_source_items=[current])
+    assert [r["todo_id"] for r in contract["blocked_peer_lanes"]] == ["todo_current"]
+    assert contract["execution_scope"] == "peer_agent_activation"
+    assert contract["task_selection"] == "canonical_claimed_candidates"
+    assert lane == {"lane": "advancement_task"}
+    assert apply_task_orchestration_contract(**kwargs, agent_todo_source_items=[])[0] is None
+    # Multiple genuinely open tasks are retained; neither becomes an implicit binding.
+    a, _ = apply_task_orchestration_contract(**kwargs, agent_todo_source_items=[old, current])
+    b, _ = apply_task_orchestration_contract(**kwargs, agent_todo_source_items=[current, old])
+    assert a == b
+    assert len(a["blocked_peer_lanes"]) == 2
+
+
+def test_blocked_peer_activation_does_not_hide_admitted_native_children() -> None:
+    items = [{**_todo("todo_one"), "claimed_by": AGENT_ID},
+             {**_todo("todo_two"), "claimed_by": AGENT_ID},
+             {**_todo("todo_peer", resume_ready=False), "claimed_by": "worker"}]
+    summary = {"items": items}
+    contract, lane = apply_task_orchestration_contract(
+        fallback_work_lane_contract={"lane": "advancement_task"},
+        goal_boundary={
+            "write_scope": ["loopx/**"],
+            "peer_task_coordination": {"enabled": True, "coordinator_agent_id": AGENT_ID},
+            "orchestration": {"mode": "multi_subagent", "spawn_allowed": True, "max_children": 2},
+        },
+        agent_identity={"agent_id": AGENT_ID, "registered_agents": [AGENT_ID, "worker"]},
+        agent_todo_summary=summary, raw_agent_todo_summary=summary,
+        agent_todo_source_items=items, available_capabilities=["subagent_spawn"],
+        agent_management_projection=_peer_management("worker"),
+    )
+    assert contract["mode"] == "adaptive"
+    assert lane["must_attempt_work"] is True
+    peer = contract["peer_activation_diagnostic"]
+    assert peer["execution_state"] == "blocked"
+    assert peer["activation_allowed"] is False
+    assert peer["blocked_peer_lanes"][0]["reason_codes"] == ["peer_agent_activation_unavailable", "peer_lane_not_resume_ready"]

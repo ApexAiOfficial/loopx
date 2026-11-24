@@ -6,7 +6,67 @@ quota control plane. The full decision is built first. CLI-only projection then
 retains action authority on the hot path and moves repeated diagnostic detail
 behind explicit `--include-detail` selectors.
 
+## Captured Initial Navigation
+
+The TypeScript context owner also bounds `quota context-read --initial-read`.
+For the current four-field supporting-address index, the first view retains
+the original source identity, unconfirmed coverage, read-before-dependent-work
+obligation and complete source instructions. Its pointer array stays unchanged
+in the same immutable capture. Read the full list with the original reader
+reference and `--select /context_details/unread_context_index/pointers` when
+needed. Older, malformed or extended index layouts remain inline in full.
+Goal and Task text, acceptance, permissions, stops and settlement are unchanged.
+This changes the starting view, not the complete capture or explicit reads.
+Include later index reads and their extra calls when comparing total cost;
+fewer initial bytes alone do not establish retention, comprehension or benefit.
+
+TypeScript 上下文 owner 同时约束 `quota context-read --initial-read`。
+对现行四字段补读地址索引，初读保留原始来源身份、覆盖尚未确认的状态、依赖工作前
+必须补读的义务及完整来源指引。地址数组原样保存在同一不可变 capture 中；需要完整
+清单时，沿原 reader reference 读取
+`--select /context_details/unread_context_index/pointers`。
+旧格式、格式不符或增加未知字段的索引仍完整内联。目标、任务正文、验收、权限、
+停止和结算不变；改变的只是起始视图，不是完整 capture 或显式读取。总成本比较须计入
+后续索引补读及额外调用；初读字节减少本身不证明保留、理解或收益。
+
+A prepared native turn with a matching settlement receipt can open a large
+batch of suggested outcomes with their IDs, objectives, revisions, and exact
+addresses. This applies when the complete suggested bodies exceed the native
+first-read window and every suggested outcome has a verified supporting
+address. Instead of claiming complete requirements inline, the opening
+identifies those omitted outcome parent paths (the parent of each `/id` pointer)
+and requires selecting every applicable complete outcome from the current
+recovery capture before dependent work. A small batch retains its complete
+opening bodies. Explicit initial reads and saved selection references retain
+their own read plans.
+
+原生 Turn 准备就绪后，若结算回执匹配、建议验收项的完整正文超过首读窗口，且各项
+都有核验过的支撑地址，首读先提供各项目标、ID、版本和精确地址。该首读不再声称
+已保留完整要求，而是标明省略的验收父路径（各 `/id` 指针的父路径），并要求在
+依赖工作前沿当前恢复 capture 读取适用验收项的完整正文。小批量仍在首读展开完整
+正文。显式初读和已保存的选择引用沿各自的读取计划运行。
+
 ## Ownership Boundary
+
+Successful JSON `refresh-state` output keeps the complete `explore_result` once.
+When a successful Explore hook's ingestion intent contains exactly the same
+attachment, its display payload uses `attachment_ref: "$.explore_result"` within
+that response. Other intent fields, delivery results, settlement identity and
+receipts remain intact. Numeric spellings participate in equality, so adjacent
+large integers cannot be mistaken for identical inputs. Failed/pending delivery,
+conflicts, unknown schemas and existing references stay inline. If optional
+display transport fails, the complete original response is printed. Markdown,
+persisted intents and exact replay inputs are unchanged; no capture or additional
+model read is required. This reduces repeated output, not semantic/backend work,
+and does not establish lower fees or better model outcomes.
+
+成功的 JSON `refresh-state` 输出完整保留一份 `explore_result`。Explore hook
+成功交付、且 ingestion intent 的附件与其完全相同时，仅显示副本替换为同一响应内的
+`attachment_ref: "$.explore_result"`；其他输入、交付结果、结算身份和回执保持原样。
+相等判断保留原始数值表示，避免将相邻大整数误判为相同。失败、待重试、内容冲突、
+未知 schema 和已有引用保持内联；可选显示传输失败则打印原完整结果。Markdown、
+持久化 intent 和精确重放输入不变，无需新增 capture 或模型补读。这只减少重复输出，
+不减少语义／后端工作，也不证明费用或模型效果改善。
 
 The quota control plane owns decision, precedence, scheduler, interaction,
 selected-todo, and user-action semantics. `cli_projection.py` owns only the
@@ -16,7 +76,8 @@ decision owner or recompute any route.
 The default projection retains:
 
 - `decision`, `should_run`, `effective_action`, and `recommended_action`;
-- selected todo, bounded `action_portfolio`, and execution obligation;
+- selected todo, bounded `action_portfolio`, read-only `planning_horizon`, and
+  execution obligation;
 - interaction mode, user channel, and executable agent/CLI actions;
 - scheduler action and autonomous-replan authority;
 - the compact vision decision, trigger kinds, required reads, and judge result;
@@ -34,11 +95,109 @@ only while a v0/v1 baseline migrates to v2, remains a review signal, and still
 fails above 1,280 characters/bytes, 36 lines, or 896 compact characters. Once
 v2 is the baseline, the ordinary hot-path growth limits apply again.
 
+`quota_planning_horizon_v0` is likewise action-bearing context rather than
+diagnostic noise. The compact path preserves its bounded Todo chain, typed
+relations, attention ids, completeness counters, and cold-path refs unchanged.
+Its `turn_envelope_action_dimensions_v3` migration receives one JSON-only
+allowance of 3,200 characters/bytes, 84 lines, or 2,800 compact characters.
+That allowance applies only to `none -> quota_planning_horizon_v0` together
+with v0/v1/v2 action coverage moving to v3. Once v3 is the baseline, ordinary
+growth limits resume. The horizon remains read-only and never replaces
+`selected_todo` or explicit action-portfolio selection.
+
+The hot-path horizon and `--include-detail agent-todos` share the same
+TypeScript-owned `todo_planning_inventory_v0`; they are not aliases. The former
+actively discloses at most five strategic items. The latter adds the larger
+`todo_planning_inventory_detail_v0` lens, including planning state, claim state,
+typed relations, and completeness, while referring to the existing Todo
+summary for repeated item details. A concrete `todo list --goal-id ... --role
+agent --status open --agent-id ...` command remains the complete source read.
+Inventory overflow must become explicit incompleteness, not a quota failure or
+an unbounded default packet.
+
+The additive `none -> todo_planning_inventory_detail_v0` migration has a
+JSON-only allowance of 1,280 characters/bytes, 36 lines, and 1,024 compact
+characters. It applies only when the probe observes that exact schema change on
+the explicit detail variants. Unknown schemas and larger growth fail closed;
+once v0 is in the base, ordinary cold-path limits resume.
+
 Repeated vision audits use `$.vision_continuation_audit` as the canonical
 projection. Candidate lists and peer action lists retain counts and point to
 `--include-detail agent-todos`. The complete vision audit is available through
 `--include-detail vision`; `--include-detail all` restores every supported
 detail section.
+
+Complete Turn output may also share the narrower
+`interaction_contract.cli_channel.vision_continuation_audit` when its entire
+value equals the CLI view of the root audit. The wire reference uses
+`projection_ref: "$.vision_continuation_audit"` and
+`projection_view: "cli_channel"`. A different channel obligation stays inline.
+The native first read and digest-pinned `quota context-read --select` and
+`--list` resolve the CLI view at its original address, including nested
+obligations such as `required_before_closeout`. An explicit empty pointer
+returns the signed source object. The capture and its digest bind subsequent
+reads and their native section observations.
+
+Complete Turn 也可以共享与根审核的 CLI 视图完全相同的
+`interaction_contract.cli_channel.vision_continuation_audit`。传输引用包含
+`projection_ref: "$.vision_continuation_audit"` 和
+`projection_view: "cli_channel"`。通道义务有差异时保留原文。
+原生首读和绑定捕获摘要的 `quota context-read --select`、`--list` 都在原地址
+还原 CLI 视图，支持读取 `required_before_closeout` 等子字段。显式选择空指针会返回
+带签名的源对象。后续读取及其原生区段观察均以原捕获及其摘要为准。
+
+When a bounded next-action label still carries the complete Task again in
+`agent_lane_next_action.title`, the default view may replace that exact duplicate
+with `title_ref`. The reference resolves to `text` or `title` in the single
+current selected-Todo source under this response's `work_context.sources`.
+The typed work-context owner must have verified the full current requirements;
+incomplete, failed, ambiguous, mismatched or differing sources retain the title.
+The full requirements, source metadata, controls and original capture remain
+intact. `--include-detail agent-todos` retains the title inline. This ordinary
+CLI serialization applies with differential delivery off as well as on; it
+neither enables native tracing nor changes the default-off transport switch.
+
+下一动作的有界摘要可能在 `agent_lane_next_action.title` 中重复携带完整任务。
+默认视图仅将与当前包内唯一、完整、已核验 Todo 源精确相同的副本替换为
+`title_ref`，指向 `work_context.sources` 中的 `text` 或 `title`。
+来源缺失、不完整、失败、歧义、身份不符或内容不同时保留原标题；完整要求、来源、
+控制字段和原始捕获均保留。`--include-detail agent-todos` 保留内联标题。
+这是普通 CLI 序列化去重，差分开关关闭和开启时均适用，不会开启原生追踪或改变默认关闭。
+
+Exact Task-title and Explore-guidance sharing now use the existing TypeScript
+context owner; the Python quota projection delegates both operations in one
+coarse transport call, preserving each explicit detail selector. With both
+selectors enabled, or no context source carrier, it needs no sharing call. Current
+quota and Turn entrypoints retain their schemas. Explore guidance shares only
+identical inline durable-writeback instructions within the same response, and
+stays inline when the reference would be larger. Before relocating context,
+Turn and staged replan readers restore that guidance from its settlement owner.
+Dangling, chained, conflicting or incorrectly typed references reject rather
+than silently losing instructions. Settlement commands, identities and original
+source content remain unchanged. This shared-owner prerequisite does not qualify
+the proposed complete-contract cutover or claim an end-to-end efficiency gain.
+
+精确任务标题与 Explore 指引共享复用既有 TypeScript 上下文 owner，Python quota
+投影通过一次粗粒度调用委托这两项操作，分别保留显式 detail 选择；两项 detail
+均启用或不存在上下文源载体时无需共享调用。当前 quota 与 Turn 入口保持各自
+schema。Explore 仅共享本响应
+内与 durable-writeback 指引完全相同的正文；引用更大时保留内联。Turn 与分阶段
+replan reader 在移动上下文前，从原结算 owner 恢复指引。悬空、链式、冲突或类型
+错误的引用会被拒绝，不静默丢失指令。结算命令、身份与原始源内容保持不变。
+这一共享 owner 前置不代表完整契约切换已通过验收，也不声称端到端效率提升。
+
+When a replan action carries a complete `vision_authoring` schema, the default
+`quota should-run` packet now retains it, alongside its executable writeback
+summary (`required_fields`, accepted path outcomes, and rule). Only when the
+durable-writeback step already contains an identical schema does the replan action
+replace its duplicate with `vision_authoring_ref`, an exact path within the same
+response. Missing or different authoring stays inline. This replaces the former
+`vision_authoring_detail_ref` cold read; diagnostic vision audits remain optional
+detail. Progress-only replan does not gain a Vision input requirement.
+`--include-detail vision` retains full explicit detail. `turn plan` preserves the
+complete schema because it must author the exact input its validator accepts.
+The crowded quota and Turn budgets account for that fixed contract without
+relaxing Todo-count growth or the small and multi-Agent ceilings.
 
 ## Qualification Contract
 
@@ -51,7 +210,12 @@ Model qualification is one-arm and actual-default. The shipped
 not the unprojected in-memory decision, to the Doubao actor. Its independent
 source oracle must still observe the expected selected todo, user gate,
 execution obligation, scheduler route, and vision/replan behavior on every
-repeat. A dedicated compaction-regression scenario must exceed the JSON hot-path
+repeat. The planning-horizon scenario additionally starts from fixed typed
+facts, validates the complete strategic relation chain independently of the
+producer, and requires bounded model readback of the horizon before selected
+work. Removing the horizon, breaking a middle relation, or drifting both the
+producer and compact packet fails before provider spend. A dedicated
+compaction-regression scenario must exceed the JSON hot-path
 budget before projection, fit within the budget afterward, preserve the exact
 source-derived semantic contract, and preserve the model's route. Two additional
 over-budget scenarios repeat clean selected-work and blocking-gate contracts

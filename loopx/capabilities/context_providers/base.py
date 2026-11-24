@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Protocol, Sequence
+from typing import Mapping, Protocol, Sequence
 
 
 CONTEXT_PROVIDER_RETRIEVAL_SCHEMA_VERSION = "context_provider_retrieval_v0"
@@ -72,6 +72,41 @@ class ContextProviderRetrieval:
     provider_version: str | None = None
     latency_ms: int = 0
     requested_limit: int = 0
+    provider_readiness: Mapping[str, object] | None = None
+    visibility: str = "public"
+    target_scope_kind: str = "provider_defined"
+    actor_binding_verified: bool = False
+    provider_preflight_performed: bool = False
+
+    def public_results(self) -> list[dict[str, object]]:
+        return [
+            {
+                "provider_ref": opaque_provider_ref(
+                    provider=self.provider,
+                    namespace=self.namespace,
+                    resource_ref=item.resource_ref,
+                ),
+                "summary": item.summary,
+                "score": item.score,
+            }
+            for item in self.items
+        ]
+
+    def transient_results(
+        self,
+        *,
+        content_trust: str,
+        content_may_instruct: bool,
+    ) -> list[dict[str, object]]:
+        return [
+            public
+            | {
+                "content": item.content,
+                "content_trust": content_trust,
+                "content_may_instruct": content_may_instruct,
+            }
+            for public, item in zip(self.public_results(), self.items, strict=True)
+        ]
 
     def public_packet(self) -> dict[str, object]:
         return {
@@ -79,7 +114,10 @@ class ContextProviderRetrieval:
             "ok": self.status == "completed",
             "provider": self.provider,
             "namespace": self.namespace,
-            "visibility": "public",
+            "visibility": self.visibility,
+            "target_scope_kind": self.target_scope_kind,
+            "actor_binding_verified": self.actor_binding_verified,
+            "provider_preflight_performed": self.provider_preflight_performed,
             "status": self.status,
             "reason_code": self.reason_code,
             "provider_version": self.provider_version,
@@ -89,18 +127,7 @@ class ContextProviderRetrieval:
             "read_performed": self.read_performed,
             "requested_limit": self.requested_limit,
             "result_count": len(self.items),
-            "results": [
-                {
-                    "provider_ref": opaque_provider_ref(
-                        provider=self.provider,
-                        namespace=self.namespace,
-                        resource_ref=item.resource_ref,
-                    ),
-                    "summary": item.summary,
-                    "score": item.score,
-                }
-                for item in self.items
-            ],
+            "results": self.public_results(),
             "telemetry": {
                 "latency_ms": max(0, self.latency_ms),
                 "result_cap_applied": len(self.items) >= self.requested_limit > 0,
@@ -129,14 +156,27 @@ class ContextProviderSync:
     pending_count: int = 0
     reconciliation_performed: bool = False
     retry_disposition: str = "no_retry"
+    visibility: str = "public"
+    target_scope_kind: str = "provider_defined"
+    write_strategy: str = "provider_defined"
+    actor_binding_verified: bool = False
+    provider_preflight_performed: bool = False
+    target_access_preflight_verified: bool = False
+    writability_verified: bool = False
 
     def public_packet(self) -> dict[str, object]:
         return {
             "schema_version": CONTEXT_PROVIDER_SYNC_SCHEMA_VERSION,
-            "ok": self.status in {"completed", "planned", "committed_pending"},
+            "ok": self.status in {"completed", "preflight_ready"},
             "provider": self.provider,
             "namespace": self.namespace,
-            "visibility": "public",
+            "visibility": self.visibility,
+            "target_scope_kind": self.target_scope_kind,
+            "write_strategy": self.write_strategy,
+            "actor_binding_verified": self.actor_binding_verified,
+            "provider_preflight_performed": self.provider_preflight_performed,
+            "target_access_preflight_verified": (self.target_access_preflight_verified),
+            "writability_verified": self.writability_verified,
             "status": self.status,
             "reason_code": self.reason_code,
             "provider_version": self.provider_version,

@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 from ...boundary_authority import checkpointed_boundary_authority_summary
+from ...orchestration import compact_orchestration_policy
+from ..presentation.goal_metadata import goal_parent_fields
 from .run_context_retention import (
     compact_goal_semantic_history,
     latest_runs_with_agent_context,
@@ -63,6 +65,8 @@ def build_run_history(
     compact_run: RunCompactor,
     quota_status: QuotaStatus,
     display_limit: int | None = None,
+    recent_run_limit: int | None = None,
+    include_goal_subagent_configuration: bool = False,
 ) -> dict[str, Any]:
     display_limit = None if display_limit is None else max(0, display_limit)
     goals: list[dict[str, Any]] = []
@@ -89,8 +93,12 @@ def build_run_history(
         goals.append(
             {
                 "id": goal.get("id"),
+                **goal_parent_fields(goal),
                 "activation_state": goal.get("activation_state") or "active",
+                "registry_goal_digest": goal.get("registry_goal_digest"),
+                "host_worker_observations": goal.get("host_worker_observations"),
                 "display_name": goal.get("display_name"),
+                "goal_objective": goal.get("goal_objective"),
                 "domain": goal.get("domain"),
                 "status": goal.get("status"),
                 "lifecycle_phase": lifecycle_fields["lifecycle_phase"],
@@ -107,6 +115,7 @@ def build_run_history(
                 "next_probe": goal.get("next_probe"),
                 "authority_registry": goal.get("authority_registry"),
                 "quota": quota_status(goal) if goal.get("registry_member") else None,
+                "index_digest": goal.get("index_digest"),
                 "index_exists": goal.get("index_exists"),
                 "raw_index_records": goal.get("raw_index_records"),
                 "unique_runs": goal.get("unique_runs"),
@@ -115,6 +124,12 @@ def build_run_history(
                 "latest_runs": latest_runs,
             }
         )
+        if include_goal_subagent_configuration:
+            goals[-1]["spawn_policy"] = (
+                compact_orchestration_policy(goal.get("spawn_policy"))
+                if isinstance(goal.get("spawn_policy"), dict)
+                else None
+            )
         if semantic_history is not None:
             goals[-1]["semantic_history"] = semantic_history
 
@@ -123,8 +138,9 @@ def build_run_history(
         for run in history.get("runs") or []
         if isinstance(run, dict)
     ]
-    if display_limit is not None:
-        recent_runs = recent_runs[:display_limit]
+    recent_limit = recent_run_limit if recent_run_limit is not None else display_limit
+    if recent_limit is not None:
+        recent_runs = recent_runs[: max(0, recent_limit)]
     return {
         "available": True,
         "goal_count": history.get("goal_count"),

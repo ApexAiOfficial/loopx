@@ -82,25 +82,13 @@ typed data boundaries.
 LoopX should keep two product surfaces separate even when they share the
 same React app, visual tokens, and small components.
 
-The **public showcase frontstage** is the homepage-style surface. It should be
-catalog-driven, polished, animated, and concise. Its data source is
-`docs/showcases/showcase-catalog.json` plus generated public-safe fixtures. It
-must not read live registry state, local status exports, internal project
-labels, raw task ids, raw benchmark material, screenshots from private tools,
-or machine-specific paths. This surface can be more aggressive visually because
-its job is to help new users feel the product value quickly.
-
-The **real control-plane frontstage** is the user/operator workspace. It should
-be denser, calmer, and more conservative: goal header, quota guard, user todo
-lane, agent todo lane, claims, gates, artifacts, source warnings, and run
-timeline. It may read live status only from relative or loopback URLs and stays
-read-only until a separate local write capability is explicitly enabled. This
-surface should optimize for correctness, scanability, and repeat use.
-
-Do not blur these surfaces for convenience. A hosted or copied public link
-should land in showcase mode. A live ops link should require an explicit
-`mode=ops` route and a safe local status source. Shared UI primitives are fine;
-shared live data defaults are not.
+The public homepage and case directory own product explanation and evidence
+navigation. They use the showcase catalog and reviewed public assets, never
+live registry state or status URLs. Personal Workspace owns operator Goals,
+Tasks, Chat, outputs, reports and local actions through existing capability
+gates. The old Frontstage boards are retired; bookmark redirects preserve
+access to the current owners. See the
+[surface strategy](../surfaces/frontstage-two-surface-strategy.md).
 
 ## Why This Stack
 
@@ -177,19 +165,9 @@ stack and renders a real screen from `examples/status.example.json`:
 Keep `examples/render-status-dashboard.py` as a low-friction fallback for
 environments that cannot build the React app.
 
-The first product-path `/frontstage` slice now exists in `apps/presentation/dashboard`: it
-renders `attention_queue.items[].goal_channel_projection` as a read-only
-channel board that makes a single goal feel like a managed workspace lane. It
-shows the decision frame, quota guard, user todo lane, agent todo lane, active
-claims, open gates, compact timeline, source warnings, URL-backed
-selection/filter/search, and truth contract. This route is where Multica-style
-agent-board density belongs; the existing Python/HTML renderer should stay a
-no-build diagnostic fallback. The next slices should be quality work: visual
-acceptance, richer public-safe fixtures, and operator onboarding details rather
-than another base renderer.
-The durable interaction baseline is tracked in
-`docs/product/surfaces/frontstage-dashboard-interaction-baseline.md`, including the
-showcase/homepage versus ops/control-plane split.
+The operator product is now Personal Workspace. New workflow and observability
+work belongs there. The Python/HTML renderer remains a no-build diagnostic
+fallback; the removed Frontstage boards must not become a second product UI.
 
 ## Sources Checked
 

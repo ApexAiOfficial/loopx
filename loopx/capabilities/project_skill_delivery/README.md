@@ -32,7 +32,9 @@ loopx project-skill install \
 | Surface | Project target |
 | --- | --- |
 | `codex` | `.agents/skills/<skill-id>/` |
+| `antigravity` | `.agent/skills/<skill-id>/` |
 | `claude-code` | `.claude/skills/<skill-id>/` |
+| `kiro-cli` | `.kiro/skills/<skill-id>/` |
 | `opencode` | `.opencode/skills/<skill-id>/` |
 | `pi` | `.pi/skills/<skill-id>/` |
 
@@ -72,6 +74,12 @@ earlier targets if a later replacement fails. The implementation copies the
 whole skill directory instead of linking `SKILL.md`, so supporting scripts,
 references, and host metadata remain complete.
 
+Python distributions bundle the canonical `loopx-material` and
+`loopx-change-quality` sources, scope markers and host display metadata
+alongside the global workflows. Bundling a project skill does not add it to the
+global host catalog or activate its capability. Project install, readback and
+uninstall use the same release-owned sources in a wheel or source checkout.
+
 ## Authority Boundary
 
 Project skill delivery controls discoverability, not domain authority. A
@@ -82,3 +90,28 @@ capability still declares its own activation and mutation contract.
 `loopx-material` is the first consumer: the skill can be visible in a project
 while Material Lifecycle remains default-off for every goal that has not
 explicitly activated it.
+
+## Default Discovery And Explicit Project Copies
+
+The marker declares default discovery. `project` keeps the source in the
+versioned release and skips global installation. `global` keeps a reusable
+workflow globally discoverable and also permits an explicitly requested project
+copy. Missing or unknown markers are rejected by project delivery; an unmarked
+source is not implicitly eligible.
+
+The seven packaged workflows (`loopx-project`, `loopx-self-repair`,
+`loopx-pr-review`, `loopx-pr-program`, `loopx-doc-registry`,
+`loopx-benchmark`, and `loopx-performance-diagnosis`) declare `global`. Connection, repair, review, and shared
+workflow instructions must be available before a project installs a local
+copy. Their existing task, project, and permission checks still apply.
+`loopx-material` and `loopx-change-quality` remain `project` workflows.
+
+`skills/loopx-pr-merge` is deliberately unmarked. The merge-decision workflow is
+repo-kept: a host adopts it by reading the repository copy, and it has no global
+or project delivery path, so the default install cannot add it to a machine that
+never merges LoopX pull requests.
+
+Prefer the global copy for ordinary use. Install a project copy for an isolated
+host profile or an intentional project override; this operation never removes
+or rewrites a global skill. Hosts may discover both copies, so do not install a
+second copy merely to make an already visible workflow available.

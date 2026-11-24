@@ -21,13 +21,39 @@ from .benchmark_experiment_board import (
     handle_benchmark_experiment_board_command,
     register_benchmark_experiment_board_commands,
 )
+from .benchmark_rebalance import (
+    BENCHMARK_REBALANCE_COMMANDS,
+    handle_benchmark_rebalance_command,
+    register_benchmark_rebalance_commands,
+)
+from .benchmark_continuation import (
+    BENCHMARK_CONTINUATION_COMMANDS,
+    handle_benchmark_continuation_command,
+    register_benchmark_continuation_commands,
+)
+from .benchmark_study import (
+    handle_benchmark_study_command,
+    register_benchmark_study_commands,
+)
+from .benchmark_token_capacity import (
+    BENCHMARK_TOKEN_CAPACITY_COMMANDS,
+    handle_benchmark_token_capacity_command,
+    register_benchmark_token_capacity_commands,
+)
+
+from .benchmark_trajectory import (
+    handle_benchmark_trajectory_command,
+    register_benchmark_trajectory_commands,
+)
 
 AddSubcommandFormat = Callable[[argparse.ArgumentParser], None]
 OutputFormat = Callable[..., str]
 PrintPayload = Callable[..., None]
 
 BENCHMARK_PROJECT_COMMANDS = (
-    BENCHMARK_CONCURRENCY_COMMANDS | BENCHMARK_EXPERIMENT_BOARD_COMMANDS
+    BENCHMARK_CONCURRENCY_COMMANDS
+    | BENCHMARK_EXPERIMENT_BOARD_COMMANDS
+    | BENCHMARK_TOKEN_CAPACITY_COMMANDS
 )
 
 
@@ -68,12 +94,20 @@ def _resolve_benchmark_project(
             project_override=requested,
         )
         return project
+    if args.benchmark_command == "terminal-reconcile":
+        raise ValueError("managed terminal reconciliation requires a registered Goal")
     return requested
 
 
 def _benchmark_project_parser(args: argparse.Namespace) -> argparse.ArgumentParser:
+    if args.benchmark_command in BENCHMARK_CONTINUATION_COMMANDS:
+        return args.benchmark_continuation_parser
+    if args.benchmark_command in BENCHMARK_REBALANCE_COMMANDS:
+        return args.benchmark_rebalance_parser
     if args.benchmark_command in BENCHMARK_CONCURRENCY_COMMANDS:
         return args.benchmark_concurrency_parser
+    if args.benchmark_command in BENCHMARK_TOKEN_CAPACITY_COMMANDS:
+        return args.benchmark_token_capacity_parser
     return args.benchmark_experiment_board_parser
 
 
@@ -90,11 +124,18 @@ def register_benchmark_command_group(
         required=True,
     )
     register_benchmark_boundary_commands(benchmark_sub, add_subcommand_format)
+    register_benchmark_continuation_commands(benchmark_sub, add_subcommand_format)
     register_benchmark_concurrency_commands(benchmark_sub, add_subcommand_format)
+    register_benchmark_token_capacity_commands(
+        benchmark_sub, add_subcommand_format
+    )
+    register_benchmark_rebalance_commands(benchmark_sub, add_subcommand_format)
     register_benchmark_experiment_board_commands(
         benchmark_sub,
         add_subcommand_format,
     )
+    register_benchmark_study_commands(benchmark_sub, add_subcommand_format)
+    register_benchmark_trajectory_commands(benchmark_sub, add_subcommand_format)
 
 
 def handle_benchmark_command(
@@ -106,6 +147,25 @@ def handle_benchmark_command(
 ) -> int | None:
     if args.command != "benchmark":
         return None
+    handled = handle_benchmark_trajectory_command(
+        args, registry_path=registry_path, print_payload=print_payload, output_format=output_format,
+    )
+    if handled is not None:
+        return handled
+    handled = handle_benchmark_continuation_command(
+        args,
+        print_payload=print_payload,
+        output_format=output_format,
+    )
+    if handled is not None:
+        return handled
+    handled = handle_benchmark_rebalance_command(
+        args,
+        print_payload=print_payload,
+        output_format=output_format,
+    )
+    if handled is not None:
+        return handled
     try:
         project = _resolve_benchmark_project(args, registry_path=registry_path)
     except (OSError, UnicodeError, ValueError) as exc:
@@ -117,7 +177,22 @@ def handle_benchmark_command(
     )
     if handled is not None:
         return handled
+    handled = handle_benchmark_study_command(
+        args,
+        print_payload=print_payload,
+        output_format=output_format,
+    )
+    if handled is not None:
+        return handled
     handled = handle_benchmark_concurrency_command(
+        args,
+        project=project,
+        print_payload=print_payload,
+        output_format=output_format,
+    )
+    if handled is not None:
+        return handled
+    handled = handle_benchmark_token_capacity_command(
         args,
         project=project,
         print_payload=print_payload,

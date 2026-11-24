@@ -1,6 +1,7 @@
 # RFC: Human Attention Wishlist v0
 
-- Status: Draft, under maintainer review
+- Status: Accepted
+- Supersedes / closes: none
 - Proposed by: LoopX maintainers
 - Date: 2026-08-14
 - Scope: a typed, non-blocking human-attention subtype plus a bounded agent
@@ -58,8 +59,9 @@ The current seams do not compose into that outcome:
   non-notifying optional-human template;
 - an open `user_action` can enter the user notification channel even when it is
   non-blocking;
-- `todo suggest` creates a read-only candidate queue that requires later
-  promotion, while `todo capture-followups` writes only agent work;
+- the retired `todo suggest` command only emitted an advisory prompt; the
+  retired `todo capture-followups` command wrote only agent work. Neither
+  provided a durable human-wish route;
 - the compact turn envelope carries required execution and writeback actions,
   but no signed optional sidecar hint.
 
@@ -168,10 +170,11 @@ It must:
   `duplicate_updated` result;
 - perform no quota spend and claim no delivery progress by itself.
 
-The exact command name is open to implementation review. The behavior above is
-the contract; extending `todo capture-followups` is acceptable only if it keeps
-agent follow-up and human-wish routing explicit and cannot silently change the
-role or task class.
+The exact command shape is open to implementation review. The behavior above
+is the contract. The retired `todo capture-followups` batch command is not an
+extension point; a future implementation must use a typed wish-specific helper
+or an explicit canonical `todo add` option that cannot silently change role or
+task class.
 
 ## 5. Skill and Heartbeat Generation Rule
 
@@ -367,11 +370,11 @@ ownership, and lifecycle are already those of a non-blocking user action.
 Rejected. Current interaction behavior can notify every visible user action,
 and substring or prose classification would make routing authority ambiguous.
 
-### Keep wishes only in `todo suggest`
+### Keep wishes only in an advisory suggestion
 
-Rejected. The suggestion surface is intentionally read-only and requires later
-promotion, so it cannot preserve a small opportunity discovered as a normal
-turn side effect.
+Rejected. An advisory proposal requires later promotion, so it cannot preserve
+a small opportunity discovered as a normal turn side effect. Retiring the
+standalone suggestion command does not close this lifecycle gap.
 
 ### Write every opportunity as an agent todo
 
@@ -392,7 +395,6 @@ Only after the first slice produces real usage evidence should LoopX consider:
 - a user preference or digest policy for wishlist visibility;
 - accept/decline convenience commands and atomic agent-todo promotion;
 - value/acceptance metrics based on typed lifecycle events;
-- teaching `todo suggest` to return separate agent candidates and human wishes;
 - external projection sinks that render the existing wishlist lane.
 
 These are not required for v0 and must not delay the non-blocking authoring
@@ -400,8 +402,8 @@ contract.
 
 ## 14. Open Questions
 
-1. Should the helper be `todo capture-wishes`, or should the existing
-   `capture-followups` command accept an explicit destination kind?
+1. Should the helper be `todo capture-wishes`, or should canonical `todo add`
+   accept an explicit human-attention kind?
 2. Should v0 cap active wishes per agent, per goal, or both?
 3. Should piggyback delivery be part of the initial slice, or should the first
    implementation expose wishes only through status/review packets?

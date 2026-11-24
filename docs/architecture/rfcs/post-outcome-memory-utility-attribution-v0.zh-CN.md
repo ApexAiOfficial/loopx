@@ -1,8 +1,9 @@
 # RFC：结果后记忆效用归因 v0
 
-- 状态：草案，等待 maintainer review
+- 状态：已接受；Stage 1 与 Stage 2 已实现，Stage 3+ 仍为提案
+- 替代 / 关闭：无
 - 日期：2026-08-15
-- 跟踪 issue：[#3214](https://github.com/huangruiteng/loopx/issues/3214)
+- 跟踪 issue：[#3214](https://github.com/huangruiteng/loopx/issues/3214)、[#3824](https://github.com/huangruiteng/loopx/issues/3824)
 - 决策边界：LoopX 如何在工作结果可验证之后，把结果归因到此前召回的记忆，并产出有界的效用投影
 - 能力所有者：现有 `reward_memory`
 - Provider 边界：可选 evaluator provider 与 context-provider adapter，包括 OpenViking
@@ -165,7 +166,11 @@ Evaluator 在运维层面可以共享，但每条 observation 与 projection 都
 
 ## 6. Deterministic reducer
 
-Reducer 只接受 schema 合法、scope 匹配且不重复的 observation。对每个合格 memory 或 set，维护：
+Utility attribution Stage 2 已在
+`loopx.capabilities.reward_memory.utility_reducer` 中实现，并通过
+`loopx reward-memory utility-project` 暴露。Reducer 只接受 schema 合法且 scope
+匹配的 observation，输出版本化、只读的 `memory_utility_projection_v0`。对每个
+合格 memory 或 set，维护：
 
 - 有界 utility estimate；
 - positive、negative、neutral 与 unknown support count；
@@ -174,15 +179,37 @@ Reducer 只接受 schema 合法、scope 匹配且不重复的 observation。对�
 - 最近接受的 observation id 与 reducer version；
 - quarantine 或 review proposal，而不是隐式删除。
 
-具体统计更新方法由后续实现阶段决定，但必须满足：
+v0 使用有界、按 evidence tier 分层的归约，不宣称是 learned value function：
+
+- `owner_correction` > `controlled_replay` > `deterministic_effect` >
+  `evaluator_inference` > `insufficient`；
+- 最高 evidence tier 决定 effective direction；该 tier 的 `unknown` 会阻断较弱的
+  有方向证据，否则只有最高强度的有方向证据贡献 effective label 与 utility estimate，
+  较弱 observation 仍保留在 support 与 history 中；
+- 同一 tier 的方向冲突归为 `unknown`，并产生 review proposal；
+- `item`、`set` 与 `none` subject 分开维护，set-level credit 不复制到每条记忆。
+- 冲突 delivery 排除在 subject state 之外，并在 rejection 记录上产生
+  `quarantine_proposed` proposal，但不授予任何修改权限。
+
+实现满足以下不变量：
 
 - 单次 observation 不能让 utility 越过配置边界；
 - 重复的弱推断不能淹没更强的 correction 或 replay；
 - `unknown` 可以提高 lineage coverage，但不改变 utility 方向；
-- 时间衰减降低 confidence，不抹掉历史 evidence；
+- 历史 evidence 只追加不覆盖；未来如需时间衰减，必须引入单独版本化的 reducer 合同；
 - scope mismatch 对 observation fail-closed，主 lane 仍然 fail-open；
 - 重放相同 observation 是 no-op；
 - reducer version 变化必须显式且可复现。
+
+Projection 还包含有界的 accepted/duplicate/conflicting/rejected 计数、label 与
+evidence-tier support 计数、最近接受的 observation identity/time、有界的
+public-safe history 以及 review proposal。相同 `observation_id` 下、具有相同
+semantic fingerprint 的重试只计一次；仅 `created_at` 不同不会增加 support。
+Duplicate 计数只统计相同 fingerprint 的额外 delivery；conflicting delivery
+单独计数，而 rejected 计数覆盖冲突 identity 的全部 delivery。同一 identity
+下的不同 payload 会被排除在 effective state 之外。Scope、snapshot、malformed
+observation 或 reducer identity 不匹配时，返回没有 subjects 的 fail-closed
+rejected packet；主工作流仍保持 fail-open。
 
 未来如果让 utility 参与召回排序，语义相关性必须仍是 anchor。一种允许的形态是：
 
@@ -255,7 +282,46 @@ Stage 3 增加 OpenViking readback；只有 provider 协议真实存在时，才
 
 Stage 4 先做有界 pilot、held-out 或 counterfactual evaluation，再考虑让排序影响 default-on。
 
+### 9.1 评审学习试点：先沉淀仓库经验，再证明效用
+
+以 [PR #5944](https://github.com/loopx-project/loopx/pull/5944)作为第一条
+[仓库持有的判断对照与经验](../../../loopx/capabilities/pr_review_queue/experiences/README.zh-CN.md)。
+先前机器评审覆盖恢复的技术设计，后续维护者指引下的模型评审要求明确第一个有用的
+恢复 Goal、更早的打包交互和恢复后有用结果。分别保留口径、actor 来源、API target
+commit、正文声明的 head、证据和未解决的结果。口径与 source head 差异意味着
+这不是受控实验，也不能自动生成金标准标签。
+
+试点第一阶段把公共蒸馏证据存入 Git，复用现有
+`procedural_experience_contract_v0`。`pull-request-review` 持有来源与只读文件
+adapter；`reward_memory` 保留资格化、recall 和 TypeScript 上下文投递判断。
+self-repair 指向同一个案例并修复原有工作流，不新建 store、共享 decision owner、
+utility 分数或 provider 写入。
+
+已注册 Agent 须具备资格化的 Reward Memory enablement、自动 recall 和明确的
+`pull_request_review.review` surface。可执行 PR packet 才可投递最多三条仓库匹配、
+精确回读的经验；历史 verdict 标签不进入检索输入。关闭、其他 surface、未资格化
+和无关仓库调用保持原行为；损坏或变化中的来源 fail-open。内置公共建议只扩展此
+opt-in caller 边界，不改变 provider ranking、配置、行动权限或 exact-head 选工。
+
+本阶段验收是版本化案例、合格经验、真实来源回读与生产 CLI 的 JSON/Markdown 投递，
+加关闭等价和失败对照。上下文投递不证明语义采用或评审质量变好。
+在现有 `problem_context` 判断中，用当前 head 证据说明采用、拒绝或不适用。
+
+下一阶段在 held-out 案例上固定共同的评审口径、产物 revision、模型和预算，比较
+baseline/experience 两组，包含合理内部前置阶段与误阻断对照。保留分歧，衡量每份
+被接受评审的可行动发现、错误 blocker、评审成本与人工注意力。
+维护者纠正是证据，不是无条件 reward。只有验证后的采用与工作结果 lineage 才能进入
+现有 utility observation/reducer；原案例没有该 lineage，效用仍未证明。
+此试点不关闭 Stage 3/4 排序资格或通用评审质量资格。
+
 ## 10. 验证标准
+
+Agent binding 前置能力复用现有 Reward Memory 配置 owner：可选的精确 Agent 覆盖保留
+legacy/shared 路由与全部 sibling，禁用或非法覆盖失败关闭。配置、runtime 准入、同 Turn
+receipt 复用及 pending outcome 对账共享 binding 身份；有界重试先选择当前路由再应用
+上限，保留其他路由的不确定 journal。provider 可写性与精确读回仍是必需条件。
+Goal 设置旅程复用相同 preview/apply owner，并区分已提交配置和失败读回。这只验证
+配置与生命周期，不代表 Stage 3/4 效用或排序资格。
 
 Focused fixture 必须证明：
 
@@ -329,9 +395,12 @@ v0 拒绝。成本过高，而且 replay 本身可能偏离原始 policy state�
 
 ## 14. 与现有协议的关系
 
-- [Reward Memory Architecture v0](../../../loopx/capabilities/reward_memory/README.md) 仍是稳定的 recall、application 与 lifecycle owner；本 RFC 只提议增加后续 attribution seam，并修复 Stage 5 语义。
+- [Reward Memory Architecture v0](../../../loopx/capabilities/reward_memory/README.md) 仍是稳定的 recall、application 与 lifecycle owner；本 RFC 定义 post-outcome attribution seam，其中 Stage 1 observation 合同与 Stage 2 只读 reducer 已实现，后续 provider effect 仍为提案。
 - [Peer Supervisor v0](../../reference/protocols/peer-supervisor-v0.md) 提供 equal-peer、public-safe、proposal-only 的 authority 边界。
 - [Agent IM, LoopX, and OpenViking collaboration v0](agent-im-openviking-collaboration-v0.md) 保持 LoopX 对 goal、authority 与 evidence 负责，OpenViking 对 context 与 recall 负责。
 - [Human Attention Wishlist v0](human-attention-wishlist-v0.md) 仍然是对可选人类增量帮助的 non-blocking request。只有当人类输入确实有增量价值时，utility uncertainty 才成为 wish；它不会自动变成 gate。
 
-在实现与稳定 reference contract 更新前，本 RFC 只是提案，不改变运行时行为。
+Stage 1 observation 合同与 Stage 2 reducer/projection 已有稳定 reference contract 和
+focused validation。它们保持只读，不改变默认 retrieval、ranking、provider state、
+authority 或主工作流。OpenViking writeback、ranking influence 与 qualification 仍属于
+后续 Stage 3/4，需要单独的版本化合同与 review。

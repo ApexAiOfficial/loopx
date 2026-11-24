@@ -1,0 +1,912 @@
+"""Registration and dispatch for the `project refresh-state` command.
+
+Refs GH-C06. This group was carved out of `project_lifecycle.py`, which was
+close to the 1000-line default module budget in
+`examples/cli-command-module-size-ownership-command-modularization-smoke.py`.
+`refresh-state` is one command and one rule group: its parser flags and its
+dispatch branch move together, so the public invocation is unchanged.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+
+from ..capabilities.explore.activation import (
+    sync_explore_graph_after_material_refresh,
+)
+from ..control_plane.agents.capability_gate import (
+    runtime_capabilities_for_cli_projection,
+)
+from ..control_plane.capability_hooks import PostWritebackHookRegistration
+from ..control_plane.effect_runtime import effect_runtime_request_scope
+from ..control_plane.goals.goal_vision_policy import (
+    GOAL_VISION_ADVANCEMENT_POLICY_CHOICES,
+)
+from ..control_plane.quota.settlement import (
+    attach_settlement_progress,
+    read_heartbeat_settlement,
+    settlement_result_payload,
+)
+from ..control_plane.work_items.delivery_batch_scale import (
+    DELIVERY_BATCH_SCALE_INPUT_CHOICES,
+)
+from ..control_plane.work_items.delivery_outcome import DELIVERY_OUTCOME_CHOICES
+from ..control_plane.work_items.progress_observation import ProgressResultClass
+from ..control_plane.work_items.semantic_replan_writeback import (
+    ReplanWritebackRejected,
+    project_replan_writeback_rejection,
+)
+from ..file_lock import lock_timeout_error_fields
+from ..history import load_registry
+from ..paths import resolve_runtime_root
+from ..state_refresh import (
+    DEFAULT_REFRESH_ACTION,
+    DEFAULT_REFRESH_CLASSIFICATION,
+    PROGRESS_SCOPE_CHOICES,
+    REPAIR_DELTA_KIND_CHOICES,
+    refresh_state_run,
+    render_state_refresh_markdown,
+)
+from .post_writeback import (
+    PostWritebackProjectionBuilder,
+    dispatch_committed_cli_post_writeback_hooks,
+)
+from .project_lifecycle_checkpoint_context import (
+    configure_checkpoint_context_parser,
+    handle_checkpoint_context_command,
+)
+from .project_lifecycle_inputs import (
+    parse_refresh_state_inputs,
+)
+from .project_lifecycle_sinks import (
+    apply_external_sink_postcondition,
+    lark_explore_graph_syncer,
+    sync_goal_channel_notifications_after_refresh,
+)
+from .quota_reward_memory import (
+    attach_reward_memory_ingest_after_spend,
+    reward_memory_candidate_details,
+    stage_reward_memory_outcome_candidate,
+)
+from ..control_plane.quota.cli_projection import compact_refresh_state_cli_payload
+from .refresh_settlement import settle_requested_refresh
+from .refresh_recovery import attach_refresh_settlement_recovery
+
+
+def register_refresh_state_command(
+    subparsers: argparse._SubParsersAction,
+    add_subcommand_format: Callable[[argparse.ArgumentParser], None],
+) -> None:
+    context_parser = subparsers.add_parser(
+        "checkpoint-context", help="Recover a missing checkpoint after a committed Turn writeback.",
+        description=(
+            "Recovery only: requires the original committed refresh-state writeback. "
+            "For the first writeback, supply the vision with refresh-state directly. "
+            "Use this command only when recovery requests a fresh checkpoint context; "
+            "reuse the original Turn identity."
+        ),
+    )
+    configure_checkpoint_context_parser(context_parser, add_subcommand_format)
+    refresh_state_parser = subparsers.add_parser(
+        "refresh-state",
+        help="Append a read-only run from active goal state after state-only updates.",
+    )
+    add_subcommand_format(refresh_state_parser)
+    refresh_state_parser.add_argument(
+        "--goal-outcome-update-json",
+        help=(
+            "Inline JSON object or file path (@path supported) for an optional changed "
+            "outcome/Agent review envelope (operation_id, expected_provider_revision, "
+            "refinement). Apply once before normal writeback; unchanged work needs no "
+            "update. Independent checks remain separate."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--goal-id",
+        required=True,
+        help="Goal id whose active state should be refreshed.",
+    )
+    refresh_state_parser.add_argument("--project", help="Project root. Defaults to the registry goal repo.")
+    refresh_state_parser.add_argument(
+        "--state-file",
+        help="Active goal state path. Defaults to the registry goal state_file.",
+    )
+    refresh_state_parser.add_argument(
+        "--classification",
+        default=DEFAULT_REFRESH_CLASSIFICATION,
+        help=f"Refresh run classification. Defaults to {DEFAULT_REFRESH_CLASSIFICATION}.",
+    )
+    refresh_state_parser.add_argument(
+        "--recommended-action",
+        help=(
+            "Local-control next action. Private project refs are allowed; "
+            f"inline secrets are rejected. Defaults to: {DEFAULT_REFRESH_ACTION}"
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--next-action",
+        help=(
+            "Record a next step bound to this agent's selected advancement Todo in "
+            "the existing recommendation receipt; at most 1200 characters after "
+            "trimming. Keep detailed evidence in artifacts and summarize the next step. "
+            "Does not overwrite Markdown "
+            "Next Action, select another task, or grant execution authority."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--next-action-basis",
+        help=(
+            "Current agent's Next Action basis from status --agent-id or the quota "
+            "agent_lane_next_action. Rejects a stale task or same-agent step. "
+            "Without it, the command uses a fresh invocation read."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--delivery-batch-scale",
+        choices=DELIVERY_BATCH_SCALE_INPUT_CHOICES,
+        help=(
+            "Explicit delivery scale for this refresh run; missing scale stays unknown. "
+            "Choose the canonical scale explicitly; historical single_segment/"
+            "bounded_segment values remain readable but are not valid for new writes."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--delivery-outcome",
+        choices=DELIVERY_OUTCOME_CHOICES,
+        help="Optional explicit outcome-floor signal for this refresh run.",
+    )
+    refresh_state_parser.add_argument(
+        "--delivery-boundary",
+        choices=("in_flight_continuation", "semantic_closeout"),
+        help=(
+            "Typed semantic boundary for vision checkpointing. Defaults to "
+            "semantic_closeout; in_flight_continuation is valid only for an "
+            "open agent-bound Todo reporting outcome_progress. A within-Todo "
+            "--next-action is allowed; Todo completion, durable shared Next Action "
+            "updates and --autonomous-replan-recorded require semantic_closeout "
+            "with its vision checkpoint. Choose the boundary from the actual work."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--delivery-workspace-path",
+        help=(
+            "Local git worktree that produced this accountable delivery. Use when "
+            "refresh-state must run from a separate registry checkout; the local "
+            "path is validated but is not persisted."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--todo-id",
+        help=(
+            "Selected Todo from the original turn-scoped quota guard. Requires "
+            "--turn-instance-id and an accountable delivery outcome."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--replan-obligation-id",
+        help=(
+            "Autonomous replan obligation from the original turn-scoped quota "
+            "guard. Requires --turn-instance-id and an accountable delivery "
+            "outcome; cannot be combined with --todo-id."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--turn-instance-id",
+        help=(
+            "Stable quota guard turn id for settlement writeback. Reuse the same "
+            "value on retries."
+        ),
+    )
+    refresh_state_parser.add_argument("--goal-instance-id", help=argparse.SUPPRESS)
+    refresh_state_parser.add_argument("--task-lease-idempotency-key", help=argparse.SUPPRESS)
+    refresh_state_parser.add_argument("--task-lease-expected-version", type=int, help=argparse.SUPPRESS)
+    refresh_state_parser.add_argument("--execution-loss-closeout", action="store_true",
+        help="Close an original prepared Turn after its execution generation is lost, without debit.")
+    refresh_state_parser.add_argument("--completion-todo-id", help=argparse.SUPPRESS)
+    refresh_state_parser.add_argument("--completion-turn-key", help=argparse.SUPPRESS)
+    refresh_state_parser.add_argument(
+        "--autonomous-replan-recorded",
+        action="store_true",
+        help=(
+            "Mark this refresh as the explicit autonomous replan ACK. "
+            "Use only after the agent has performed and written back the bounded replan slice. "
+            "Requires --delivery-boundary semantic_closeout (the default); do not "
+            "add this ACK to an ordinary in_flight_continuation."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--progress-result-class",
+        choices=[item.value for item in ProgressResultClass],
+        help=(
+            "Typed result for this bounded work slice. Semantics come only from "
+            "this enum and stable identifiers, never from classification prose."
+        ),
+    )
+    refresh_state_parser.add_argument("--progress-surface-id")
+    refresh_state_parser.add_argument("--progress-work-item-id", help="Explicit typed observation source; settlement keeps its own Todo or obligation binding.")
+    refresh_state_parser.add_argument("--progress-hypothesis-id")
+    refresh_state_parser.add_argument("--progress-probe-kind")
+    refresh_state_parser.add_argument("--progress-blocker-id")
+    refresh_state_parser.add_argument("--progress-coverage-scope-id")
+    refresh_state_parser.add_argument(
+        "--progress-evidence-id",
+        dest="progress_evidence_ids",
+        action="append",
+        help=(
+            "Opaque public-safe evidence identifier, 1-128 characters; start with an "
+            "ASCII letter or digit, then use letters, digits, '.', '_', ':', '/', '-'. "
+            "For example evidence:validation-1, not a leading-dot file path. "
+            "Repeat for additional evidence; this identifier does not upload a file."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--progress-coverage-complete",
+        action="store_true",
+        default=None,
+    )
+    refresh_state_parser.add_argument(
+        "--explore-result-json",
+        help="Inline JSON object or file path (@path supported) for an explicit explore_result_attachment_v0; ingest and link after committed work writeback.",
+    )
+    refresh_state_parser.add_argument(
+        "--reward-memory-reflection-json",
+        help=(
+            "Optional compact turn_reward_memory_reflection_v1 JSON for a "
+            "Todo-bound accountable Codex App refresh. LoopX stages it privately, "
+            "requires the Todo's caller-declared validator to attest the exact "
+            "reflection and evidence, and performs no provider write until the "
+            "matching quota spend is read back."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--repair-delta-kind",
+        dest="repair_delta_kinds",
+        choices=REPAIR_DELTA_KIND_CHOICES,
+        action="append",
+        help=(
+            "Machine-visible frontier changed by this repair/replan ACK. Repeat for "
+            "multiple deltas. Without a delta, --autonomous-replan-recorded is stored "
+            "as replan_noop/repair_noop and does not clear the obligation."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--agent-vision-json",
+        help=(
+            "Inline JSON object or file path (@path supported) for a complete generated "
+            "goal_vision_replan_contract_v0 update. The CLI enforces budgets; any "
+            "autonomous replan that changes durable mainline fields requires goal_path_delta_v0."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--vision-state",
+        help=(
+            "Optional lower snake_case lifecycle state for an inline "
+            "goal_vision_replan_contract_v0 patch. Closure aliases such as "
+            "satisfied and vision_satisfied normalize to vision_closed; "
+            "custom states remain open until explicitly closed."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--vision-summary",
+        help=(
+            "Inline bounded vision_summary for a field-level patch merged into the "
+            "current agent's latest active vision."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--vision-role-scope",
+        help="Inline bounded role_scope for the current agent's vision patch.",
+    )
+    refresh_state_parser.add_argument(
+        "--vision-acceptance",
+        help="Inline bounded acceptance_summary for the current agent's vision patch.",
+    )
+    refresh_state_parser.add_argument(
+        "--vision-advancement-policy",
+        choices=GOAL_VISION_ADVANCEMENT_POLICY_CHOICES,
+        help=(
+            "Whether open acceptance needs advancement only as needed or must "
+            "keep a runnable advancement frontier until the vision closes."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--vision-replan-trigger",
+        help="Inline bounded replan_trigger_summary that quota can project as an acceptance gap.",
+    )
+    refresh_state_parser.add_argument(
+        "--vision-dreaming-policy",
+        help="Inline bounded dreaming_policy for the current agent's vision patch.",
+    )
+    refresh_state_parser.add_argument(
+        "--vision-last-patch",
+        help="Inline bounded last_patch_summary for the current agent's vision patch.",
+    )
+    refresh_state_parser.add_argument(
+        "--vision-todo-delta",
+        action="append",
+        help=(
+            "Compact todo delta for an inline vision patch, at most 80 characters "
+            "per item. Repeat for multiple deltas; only the first 8 are retained. "
+            "The whole vision packet must also fit its shared text budget."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--vision-unchanged-reason",
+        help=(
+            "Compact reason why a required vision checkpoint is intentionally unchanged."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--checkpoint-read-context", metavar="READ_CONTEXT_ID",
+        help="Echo the fresh checkpoint-context receipt when supplementing a missing checkpoint on the original Turn.",
+    )
+    refresh_state_parser.add_argument(
+        "--agent-id",
+        help=(
+            "Registered agent id for agent-lane state refreshes. When set, the "
+            "refresh is visible in run history but does not replace goal-level status."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--available-capability",
+        dest="available_capabilities",
+        action="append",
+        help=(
+            "Preserve one observed public-safe runtime capability from the scoped "
+            "quota decision. Repeatable; this context does not grant authority or "
+            "change refresh-state write scope."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--agent-lane",
+        help="Public-safe lane label for --agent-id scoped refreshes, such as productization_frontstage.",
+    )
+    refresh_state_parser.add_argument(
+        "--progress-scope",
+        choices=PROGRESS_SCOPE_CHOICES,
+        help=(
+            "Progress report scope; --agent-id defaults to agent_lane. A confirmed "
+            "registered peer may update its selected task step without changing "
+            "that scope; report scope does not grant shared task authority."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--usage-codex-session",
+        help=(
+            "Path to the local Codex session rollout JSONL that produced this "
+            "run. Only aggregate token_count totals, the model id, and event "
+            "timestamps are read; prompts, completions, and tool output never "
+            "enter run history. The session must be bound explicitly; when the "
+            "rollout is unknown, omit the flag and usage stays unknown. Cannot "
+            "be combined with --usage-json."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--usage-json",
+        help=(
+            "Inline JSON object with a provider-neutral per-run usage "
+            "measurement: input_tokens, output_tokens, provider, model, "
+            "source_snapshot_id, plus optional cache_tokens/cost_usd/"
+            "duration_ms. Must be strict JSON; malformed, negative, or "
+            "non-finite usage fails the refresh closed. Cannot be combined "
+            "with --usage-codex-session."
+        ),
+    )
+    refresh_state_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the refresh payload without appending.",
+    )
+    refresh_state_parser.add_argument(
+        "--settle-turn", action="store_true",
+        help="After verified writeback, execute the owed quota step once for this exact Turn; replay never creates another debit.",
+    )
+    refresh_state_parser.add_argument(
+        "--settlement-receipt", action="store_true",
+        help="With --settle-turn, retain successful supporting snapshots in an immutable result and print controls plus exact receipts.",
+    )
+    refresh_state_parser.add_argument(
+        "--no-global-sync",
+        action="store_true",
+        help="Do not refresh the shared global registry after writing the state run.",
+    )
+    delivery_flags = refresh_state_parser.add_mutually_exclusive_group()
+    delivery_flags.add_argument(
+        "--suppress-external-sinks",
+        action="store_true",
+        help=(
+            "Keep enabled local projections active but suppress configured external "
+            "sink writes for this refresh. Turn-bound retries require an explicit resume acknowledgement."
+        ),
+    )
+
+    delivery_flags.add_argument(
+        "--resume-external-sinks", metavar="RESUME_KEY",
+        help="Acknowledge the current pause returned by a Turn-bound refresh recovery. Does not grant provider permissions.",
+    )
+
+
+@effect_runtime_request_scope()
+def handle_refresh_state_command(
+    args: argparse.Namespace,
+    *,
+    registry_path: Path,
+    print_payload: Callable[
+        [dict[str, object], str, Callable[[dict[str, object]], str]], None
+    ],
+    output_format: Callable[[argparse.Namespace], str],
+    append_cli_rollout_event: Callable[..., dict[str, object]],
+    post_writeback_hooks: Sequence[PostWritebackHookRegistration] | None = None,
+    post_writeback_projection_builder: PostWritebackProjectionBuilder | None = None,
+) -> int | None:
+    if args.command == "checkpoint-context":
+        return handle_checkpoint_context_command(
+            args,
+            registry_path=registry_path,
+            print_payload=print_payload,
+            output_format=output_format,
+        )
+    if args.command != "refresh-state":
+        return None
+    fmt = output_format(args)
+    if args.execution_loss_closeout:
+        from ..control_plane.goals.first_party_host_admission import capture_first_party_host_goal_ref
+        from ..control_plane.goals.goal_ref_validation import exact_goal_ref
+        from ..control_plane.quota.execution_preparation import commit_execution_loss_closeout
+        from .project_lifecycle_inputs import inline_progress_observation
+
+        try:
+            ref = (exact_goal_ref(args.goal_id, args.goal_instance_id) if args.goal_instance_id
+                   else capture_first_party_host_goal_ref(registry_path=registry_path, goal_id=args.goal_id))
+            # The launcher override only controls how subsequent commands are rendered.
+            requested_effects = vars(args).copy()
+            requested_effects.pop("control_cli_bin", None)
+            payload = commit_execution_loss_closeout(
+                registry_path=registry_path, runtime_root_override=args.runtime_root,
+                goal_id=args.goal_id, agent_id=args.agent_id or "", todo_id=args.todo_id or "",
+                turn_instance_id=args.turn_instance_id or "", goal_ref=ref,
+                requested_proof={"idempotency_key": args.task_lease_idempotency_key,
+                                 "expected_version": args.task_lease_expected_version},
+                progress_observation=inline_progress_observation(args),
+                delivery_outcome=args.delivery_outcome, delivery_boundary=args.delivery_boundary,
+                requested_effects=requested_effects, dry_run=args.dry_run,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            code = getattr(exc, "code", None)
+            payload = {"ok": False, "goal_id": args.goal_id, "appended": False, "error": str(exc),
+                       **({"error_code": code} if isinstance(code, str) else {}), **lock_timeout_error_fields(exc)}
+        print_payload(payload, fmt, render_state_refresh_markdown)
+        return 0 if payload["ok"] is True else 1
+    agent_vision_packet: dict[str, object] | None = None
+    progress_observation: dict[str, object] | None = None
+    merge_agent_vision_patch = False
+    goal_ref: dict[str, str] | None = None
+    outcome_update = None
+    outcome_update_result = None
+    goal_acceptance_preview = None
+    task_lease_proof = None
+    try:
+        key = getattr(args, "task_lease_idempotency_key", None)
+        version = getattr(args, "task_lease_expected_version", None)
+        if key is not None or version is not None:
+            if key is None or not key or version is None or version < 1:
+                raise ValueError("First writeback requires the task lease key and positive version together.")
+            task_lease_proof = {"idempotency_key": key, "expected_version": version}
+        inputs = parse_refresh_state_inputs(args, fmt=fmt, registry_path=registry_path)
+        outcome_update = inputs.outcome_update
+        agent_vision_packet = inputs.agent_vision_packet
+        merge_agent_vision_patch = inputs.merge_agent_vision_patch
+        explore_result = inputs.explore_result
+        progress_observation = inputs.progress_observation
+        reward_memory_reflection_json = inputs.reward_memory_reflection_json
+        usage_measurement = inputs.usage_measurement
+        goal_ref = inputs.goal_ref
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "registry": str(registry_path),
+            "runtime_root": args.runtime_root,
+            "goal_id": args.goal_id,
+            "classification": args.classification,
+            "appended": False,
+            "dry_run": bool(args.dry_run),
+            "error": str(exc),
+            **({"error_code": exc.code, **getattr(exc, "payload", {})} if isinstance(getattr(exc, "code", None), str) else {}),
+            **lock_timeout_error_fields(exc),
+        }
+        print_payload(payload, fmt, render_state_refresh_markdown)
+        return 1
+    try:
+        if getattr(args, "resume_external_sinks", None) and not getattr(args, "turn_instance_id", None):
+            raise ValueError("--resume-external-sinks requires the original --turn-instance-id")
+        if outcome_update is not None:
+            from ..control_plane.goals.acceptance import refine_goal_outcome, public_goal_acceptance
+            refinement_result = refine_goal_outcome(
+                registry_path=registry_path, runtime_root=args.runtime_root, goal_id=args.goal_id,
+                agent_id=args.agent_id, execute=not args.dry_run, **outcome_update,
+                **({"reviewed_work_update": {"todo_id": args.todo_id,
+                    "append_explore_result_node_refs": [explore_result["node_id"]]}}
+                   if explore_result is not None and any(key in outcome_update["refinement"] for key in ("review", "review_patch")) else {}))
+            outcome_update_result = public_goal_acceptance(refinement_result, include_contract=False)
+            if args.dry_run:
+                # Preview the same ordered composition as execution: the typed
+                # refinement owner supplies the prospective acceptance facts.
+                goal_acceptance_preview = refinement_result["goal_acceptance_contract"]
+        payload = refresh_state_run(
+            external_delivery={"suppress": bool(args.suppress_external_sinks),
+                               "resume_key": getattr(args, "resume_external_sinks", None)},
+            registry_path=registry_path,
+            runtime_root_override=args.runtime_root,
+            goal_id=args.goal_id,
+            project=Path(args.project).expanduser() if args.project else None,
+            state_file=Path(args.state_file).expanduser() if args.state_file else None,
+            classification=args.classification,
+            recommended_action=args.recommended_action,
+            next_action=args.next_action,
+            next_action_basis=getattr(args, "next_action_basis", None),
+            delivery_batch_scale=args.delivery_batch_scale,
+            delivery_outcome=args.delivery_outcome,
+            delivery_boundary=getattr(args, "delivery_boundary", None),
+            delivery_workspace_path=(
+                Path(args.delivery_workspace_path).expanduser()
+                if args.delivery_workspace_path
+                else None
+            ),
+            todo_id=getattr(args, "todo_id", None),
+            turn_instance_id=getattr(args, "turn_instance_id", None),
+            replan_obligation_id=getattr(
+                args, "replan_obligation_id", None
+            ),
+            completion_todo_id=getattr(args, "completion_todo_id", None),
+            completion_turn_key=getattr(args, "completion_turn_key", None),
+            agent_id=args.agent_id,
+            agent_lane=args.agent_lane,
+            progress_scope=args.progress_scope,
+            autonomous_replan_recorded=bool(args.autonomous_replan_recorded),
+            repair_delta_kinds=args.repair_delta_kinds,
+            agent_vision_packet=agent_vision_packet,
+            merge_agent_vision_patch=merge_agent_vision_patch,
+            vision_unchanged_reason=args.vision_unchanged_reason,
+            checkpoint_read_context_id=getattr(args, "checkpoint_read_context", None),
+            progress_observation=progress_observation,
+            explore_result=explore_result,
+            usage_measurement=usage_measurement,
+            usage_codex_session=(
+                Path(args.usage_codex_session).expanduser()
+                if getattr(args, "usage_codex_session", None)
+                else None
+            ),
+            dry_run=bool(args.dry_run),
+            sync_global=not bool(args.no_global_sync),
+            goal_ref=goal_ref,
+            task_lease_proof=task_lease_proof,
+            allow_same_generation_lease_renewal=(
+                getattr(args, "settle_turn", False)
+                and task_lease_proof is not None
+                and bool(getattr(args, "todo_id", None))
+                and bool(getattr(args, "turn_instance_id", None))
+            ),
+            **({"goal_acceptance_preview": goal_acceptance_preview}
+               if goal_acceptance_preview is not None else {}),
+        )
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "registry": str(registry_path),
+            "runtime_root": args.runtime_root,
+            "goal_id": args.goal_id,
+            "classification": args.classification,
+            "appended": False,
+            "dry_run": bool(args.dry_run),
+            "error": str(exc),
+            **({"error_code": exc.code, **getattr(exc, "payload", {})} if isinstance(getattr(exc, "code", None), str) else {}),
+            **lock_timeout_error_fields(exc),
+        }
+        attach_refresh_settlement_recovery(payload, args, registry_path, goal_ref)
+        if isinstance(exc, ReplanWritebackRejected):
+            transition = project_replan_writeback_rejection(
+                exc,
+                goal_id=args.goal_id,
+                agent_id=args.agent_id,
+                runtime_root=args.runtime_root,
+            )
+            recovery = transition.get("context_recovery")
+            if fmt == "json" and os.name == "posix" and isinstance(recovery, dict):
+                from .context_machine import capture_context_recovery
+
+                reference = capture_context_recovery(recovery,
+                    runtime_root=resolve_runtime_root(load_registry(registry_path), args.runtime_root))
+                transition["context_recovery"] = {
+                    "received_context_id": recovery["received_context_id"],
+                    "current_context_id": recovery["replan_context"]["context_id"],
+                    "instruction": recovery["instruction"], **reference,
+                }
+            settlement_recovery = payload.get("settlement_recovery")
+            if isinstance(settlement_recovery, dict) and transition["host_action"] == "write_typed_semantic_delta":
+                transition["host_action"] = "read_current_replan_context"
+                transition["next_cli_actions"] = settlement_recovery["next_cli_actions"]
+            payload["replan_transition"] = transition
+            if transition["next_cli_actions"]:
+                payload["error"] += " Required transition: " + "; ".join(
+                    transition["next_cli_actions"]
+                )
+    if outcome_update_result is not None:
+        # This native effect precedes the ordinary writeback. Retain its receipt
+        # even if later settlement fails; replay the identical operation once.
+        payload["goal_outcome_update"] = outcome_update_result
+    projected_capabilities = runtime_capabilities_for_cli_projection(
+        args.available_capabilities
+    )
+    if projected_capabilities:
+        payload["available_capabilities"] = projected_capabilities
+    payload.setdefault(
+        "external_sink_delivery_authorized",
+        not bool(args.suppress_external_sinks or getattr(args, "turn_instance_id", None)),
+    )
+    material_refresh_ready = bool(
+        payload.get("ok")
+        and (
+            payload.get("appended")
+            or payload.get("idempotent_replay")
+        )
+        and not payload.get("dry_run")
+    )
+    if material_refresh_ready and args.available_capabilities and args.agent_id:
+        from ..control_plane.agents.capability_memory import (
+            record_verified_agent_capability_observation,
+        )
+
+        record_verified_agent_capability_observation(
+            registry_path=registry_path,
+            runtime_root=resolve_runtime_root(
+                load_registry(registry_path),
+                args.runtime_root,
+                registry_path=registry_path,
+            ),
+            goal_id=args.goal_id,
+            agent_id=str(args.agent_id),
+            available=args.available_capabilities,
+            preserve_unavailable=False,
+        )
+    if material_refresh_ready and reward_memory_reflection_json:
+        validation_workspace_text = str(
+            getattr(args, "delivery_workspace_path", None)
+            or getattr(args, "project", None)
+            or payload.get("project")
+            or ""
+        ).strip()
+        stage_reward_memory_outcome_candidate(
+            payload,
+            registry_path=registry_path,
+            runtime_root=resolve_runtime_root(
+                load_registry(registry_path), args.runtime_root
+            ),
+            goal_id=args.goal_id,
+            agent_id=str(args.agent_id),
+            todo_id=str(args.todo_id),
+            turn_instance_id=str(args.turn_instance_id),
+            reflection_json=reward_memory_reflection_json,
+            validation_workspace=Path(validation_workspace_text),
+        )
+    settlement_receipt_repair = bool(
+        payload.get("ok")
+        and payload.get("receipt_repair_required")
+        and getattr(args, "turn_instance_id", None)
+        and (
+            getattr(args, "todo_id", None)
+            or getattr(args, "replan_obligation_id", None)
+        )
+    )
+    if (material_refresh_ready or settlement_receipt_repair) and payload.get("explore_result") is not None:
+        from ..capabilities.explore.result_writeback import deliver_result_attachment
+
+        # Receipt repair carries the verified original Run, without appending
+        # it again. Both receipt writers must finish its requested delivery
+        # before recording proof that the original writeback can be settled.
+        # Preserve replay semantics when the original receipt is missing;
+        # disabling guidance must not turn its committed capture into new work.
+        delivery = deliver_result_attachment(
+            payload={**payload, "appended": True,
+                     "idempotent_replay": bool(payload.get("idempotent_replay") or settlement_receipt_repair)},
+            registry_path=registry_path,
+            runtime_root=Path(payload["runtime_root"]),
+            goal_id=args.goal_id, agent_id=args.agent_id,
+            todo_id=args.todo_id, turn_instance_id=args.turn_instance_id,
+        )
+        payload["explore_result_delivery"] = delivery
+        if not delivery["ok"]:
+            payload["ok"] = False
+            payload["error"] = "Primary writeback committed; replay this exact refresh to retry Explore result delivery"
+            material_refresh_ready = False
+            settlement_receipt_repair = False
+    if material_refresh_ready or settlement_receipt_repair:
+        append_cli_rollout_event(
+            payload,
+            registry_path=registry_path,
+            runtime_root_arg=args.runtime_root,
+            event_kind="refresh_state",
+            goal_ref=goal_ref,
+            agent_id=args.agent_id,
+            todo_id=getattr(args, "todo_id", None),
+            run_id=getattr(args, "turn_instance_id", None),
+            status=(
+                "receipt_repaired"
+                if settlement_receipt_repair
+                else "appended"
+            ),
+            summary=(
+                "refresh-state appended compact control-plane state with "
+                f"classification={payload.get('classification')}"
+            ),
+            details={
+                "command": "refresh-state",
+                "progress_scope": payload.get("progress_scope") or "",
+                "agent_lane": payload.get("agent_lane") or "",
+                "autonomous_replan_recorded": bool(
+                    payload.get("autonomous_replan_recorded")
+                ),
+                "global_sync_wrote": bool(
+                    isinstance(payload.get("global_sync"), dict)
+                    and payload["global_sync"].get("wrote")
+                ),
+                "settlement_effect_id": (
+                    payload.get("settlement_identity", {}).get("effect_id")
+                    if isinstance(payload.get("settlement_identity"), dict)
+                    else None
+                ),
+                "replan_obligation_id": getattr(
+                    args, "replan_obligation_id", None
+                )
+                or "",
+                **reward_memory_candidate_details(payload),
+            },
+            idempotency_fields=(
+                [
+                    "goal_id",
+                    "event_kind",
+                    "agent_id",
+                    *(
+                        ["todo_id"]
+                        if getattr(args, "todo_id", None)
+                        else []
+                    ),
+                    "run_id",
+                    *(["goal_ref"] if goal_ref is not None else []),
+                ]
+                if getattr(args, "turn_instance_id", None)
+                else None
+            ),
+        )
+        if getattr(args, "turn_instance_id", None) and (
+            getattr(args, "todo_id", None)
+            or getattr(args, "replan_obligation_id", None)
+        ):
+            runtime_root = resolve_runtime_root(
+                load_registry(registry_path),
+                args.runtime_root,
+            )
+            settlement_readback = read_heartbeat_settlement(
+                runtime_root,
+                goal_id=args.goal_id,
+                agent_id=args.agent_id,
+                todo_id=getattr(args, "todo_id", None),
+                turn_instance_id=getattr(args, "turn_instance_id", None),
+                replan_obligation_id=getattr(
+                    args, "replan_obligation_id", None
+                ),
+                # The write may be addressed through the retained Todo while
+                # quota should-run bound this Turn to its semantic replan.
+                # Read back the immutable guard identity instead of treating
+                # that supported command shape as a second binding.
+                resolve_original_binding=True,
+                registry_path=registry_path,
+                goal_ref=goal_ref,
+            )
+            if settlement_readback is None:
+                raise RuntimeError(
+                    "exact settlement readback unexpectedly returned not-found"
+                )
+            # A combined retry may already be settled, with no owed child to
+            # dispatch. Retain its complete receipts from the same typed read.
+            settlement_result = (
+                settlement_readback.settlement
+                if getattr(args, "settle_turn", False) and settlement_readback.spend.failure is None
+                else settlement_readback.delivery
+            )
+            attach_settlement_progress(
+                payload, settlement_readback, registry_path=registry_path, runtime_root=runtime_root,
+                goal_ref=goal_ref,
+            )
+            payload["settlement_result"] = settlement_result_payload(
+                settlement_result
+            )
+            if settlement_result.failure is not None:
+                payload["ok"] = False
+                payload["receipt_repair_required"] = True
+                payload["error"] = settlement_result.failure.reason
+            elif settlement_receipt_repair:
+                payload["receipt_repair_required"] = False
+                payload["receipt_repaired"] = True
+            candidate = payload.get("reward_memory_outcome_candidate")
+            if (material_refresh_ready and isinstance(candidate, Mapping)
+                    and candidate.get("validation_bound") is True):
+                # A late reflection may recover after spend already committed.
+                # Reuse the settlement read after recording the refresh event.
+                attach_reward_memory_ingest_after_spend(
+                    payload, execute=True, registry_path=registry_path,
+                    runtime_root=runtime_root, readback=settlement_readback,
+                )
+        if material_refresh_ready and post_writeback_hooks:
+            settlement_identity = (
+                payload.get("settlement_identity")
+                if isinstance(payload.get("settlement_identity"), Mapping)
+                else {}
+            )
+            payload["post_writeback_hooks"] = (
+                dispatch_committed_cli_post_writeback_hooks(
+                    payload=payload,
+                    registry_path=registry_path,
+                    runtime_root_arg=args.runtime_root,
+                    goal_id=args.goal_id,
+                    event_kind="refresh_state",
+                    identity={
+                        "agent_id": str(args.agent_id or ""),
+                        "todo_id": str(getattr(args, "todo_id", None) or ""),
+                        "turn_instance_id": str(
+                            getattr(args, "turn_instance_id", None) or ""
+                        ),
+                        "effect_id": str(
+                            settlement_identity.get("effect_id") or ""
+                        ),
+                    },
+                    state_version=str(payload.get("generated_at") or ""),
+                    committed_at=str(payload.get("generated_at") or ""),
+                    hooks=post_writeback_hooks,
+                    projection_builder=post_writeback_projection_builder,
+                )
+            )
+        if not material_refresh_ready:
+            settle_requested_refresh(payload, args, registry_path, goal_ref)
+            attach_refresh_settlement_recovery(payload, args, registry_path, goal_ref)
+            print_payload(compact_refresh_state_cli_payload(payload) if fmt == "json" else payload, fmt, render_state_refresh_markdown)
+            return 0 if payload.get("ok") else 1
+        graph_sync = sync_explore_graph_after_material_refresh(
+            registry_path=registry_path,
+            goal_id=args.goal_id,
+            runtime_root_override=args.runtime_root,
+            agent_id=args.agent_id,
+            project=Path(args.project).expanduser() if args.project else None,
+            state_file=Path(args.state_file).expanduser() if args.state_file else None,
+            external_sink_delivery_authorized=payload["external_sink_delivery_authorized"] is True,
+            syncer=lark_explore_graph_syncer(
+                args.runtime_root,
+                registry_path=registry_path,
+            ),
+        )
+        payload["explore_graph_sync"] = graph_sync
+        apply_external_sink_postcondition(
+            payload,
+            sink_result=graph_sync,
+            warning=(
+                "enabled Explore Graph delivery postcondition is unsatisfied; "
+                "the unchanged sink digest keeps it retryable"
+            ),
+            error=(
+                "enabled Explore Graph sync/readback failed after the material "
+                "refresh; retry it before delivery"
+            ),
+        )
+        sync_goal_channel_notifications_after_refresh(
+            payload,
+            registry_path=registry_path,
+            runtime_root_arg=args.runtime_root,
+            goal_id=args.goal_id,
+            agent_id=args.agent_id,
+        )
+    settle_requested_refresh(payload, args, registry_path, goal_ref)
+    attach_refresh_settlement_recovery(payload, args, registry_path, goal_ref)
+    print_payload(compact_refresh_state_cli_payload(payload) if fmt == "json" else payload, fmt, render_state_refresh_markdown)
+    return 0 if payload.get("ok") else 1

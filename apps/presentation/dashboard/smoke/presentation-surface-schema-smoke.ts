@@ -1,9 +1,11 @@
+import { goalAcceptanceObservationSchema } from "../src/data/goal-acceptance-observation.js";
 import {
   exampleStatusPayload,
   parseStatusPayload,
   parsePresentationSurfaceCollectionResponse,
   presentationSurfaceCollectionSchema,
   presentationSurfaceSchema,
+  todoItemSchema,
   withGoalActivationState,
 } from "../src/data/status.js";
 import {
@@ -21,6 +23,48 @@ function assert(condition: boolean, message: string) {
 
 const PAYLOAD_SHA256 =
   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+const revisedTodo = todoItemSchema.parse({
+  index: 0,
+  text: "Verify the replacement validator",
+  done: false,
+  todo_id: "todo_validator_revision",
+  role: "agent",
+  completion_validation_required: true,
+  completion_validation_sha256: PAYLOAD_SHA256,
+  completion_validation_revision: 1,
+  completion_validation_revision_history: [{
+    revision: 1,
+    previous_declaration_sha256: "1".repeat(64),
+    declaration_sha256: PAYLOAD_SHA256,
+    actor_agent_id: "agent-a",
+    revised_at: "2026-09-20T00:00:00Z",
+  }],
+});
+assert(
+  revisedTodo.completion_validation_revision_history.at(-1)?.actor_agent_id ===
+    "agent-a",
+  "Todo validator revision readback must survive status parsing",
+);
+const firstBoundTodo = todoItemSchema.parse({
+  ...revisedTodo,
+  completion_validation_revision_history: [{
+    schema_version: "loopx_todo_completion_validation_revision_receipt_v1",
+    revision: 1,
+    operation_id: "first-bind",
+    previous_declaration_sha256: null,
+    previous_validation_authority: {},
+    declaration_sha256: PAYLOAD_SHA256,
+    actor_agent_id: "agent-a",
+    revised_at: "2026-09-27T00:00:00Z",
+  }],
+});
+assert(
+  firstBoundTodo.completion_validation_revision_history[0]?.previous_declaration_sha256 === null &&
+    firstBoundTodo.completion_validation_revision_history[0]?.schema_version ===
+      "loopx_todo_completion_validation_revision_receipt_v1",
+  "First validator binding must preserve explicit absence and its versioned receipt in status readback",
+);
 
 function detailRef() {
   return {
@@ -287,6 +331,14 @@ async function verifyProjectionFetchContract() {
     }
     assert(mismatchRejected, "projection identity mismatch must fail closed");
 
+    let wrongGoalRejected = false;
+    try {
+      await fetchPresentationProjection("http://127.0.0.1:8765/extension-projection", {
+        ...matchingSurface, goal_id: "another-goal",
+      });
+    } catch (error) {wrongGoalRejected = String(error).includes("does not match");}
+    assert(wrongGoalRejected, "matching revision/hash must not authorize another Goal’s result");
+
     let publicHostRejected = false;
     requestedUrl = "";
     try {
@@ -330,3 +382,14 @@ verifyProjectionFetchContract()
     console.error(error);
     throw error;
   });
+
+// This bounded observation must not claim the distinct full lifecycle RFC id.
+const acceptanceObservation = {
+  schema_version: "goal_acceptance_observation_projection_v0",
+  goal_id: "synthetic-goal", read_only: true, acceptance_assessed: false,
+  coverage: "partial", missing_sources: [], truncated: false,
+  historical_progress: [], acceptance_gaps: [], guards: [],
+  next_action: null, next_action_source: null,
+};
+assert(goalAcceptanceObservationSchema.safeParse(acceptanceObservation).success, "acceptance observation v0 must parse");
+assert(!goalAcceptanceObservationSchema.safeParse({ ...acceptanceObservation, schema_version: "goal_artifact_lifecycle_projection_v0" }).success, "full lifecycle v0 is a distinct contract, not an observation alias");

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -23,6 +24,8 @@ from loopx.chat_actions import ChatActionService  # noqa: E402
 from loopx.chat_server import ChatHTTPServer, ChatRequestHandler  # noqa: E402
 from loopx.chat_store import ChatSessionStore  # noqa: E402
 from loopx.history import collect_history  # noqa: E402
+from loopx.control_plane.testing.canary_harness import import_fixture_authority  # noqa: E402
+from loopx.control_plane.coordination.local_authority import read_canonical_todos_if_promoted  # noqa: E402
 
 
 def preview_request(
@@ -78,13 +81,14 @@ def request_json(
     *,
     method: str = "GET",
     body: dict[str, object] | None = None,
-    origin: str = "http://127.0.0.1:5173",
+    origin: str | None = None,
 ) -> tuple[int, dict[str, object]]:
+    parsed_url = urllib.parse.urlsplit(url)
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8") if body is not None else None,
         method=method,
-        headers={"Content-Type": "application/json", "Origin": origin},
+        headers={"Content-Type": "application/json", "Origin": origin if origin is not None else f"{parsed_url.scheme}://{parsed_url.netloc}"},
     )
     try:
         with urllib.request.urlopen(request, timeout=4) as response:
@@ -101,25 +105,43 @@ class FakeRuntimeController:
 
     def open_session(self, **kwargs: object) -> tuple[dict[str, object], bool]:
         self.opened_sessions.append(dict(kwargs))
-        existing = self.chat_store.latest_session(
+        managed_agent = kwargs.get("managed_agent_id")
+        channel = f"agent.{managed_agent}" if managed_agent is not None else str(kwargs["channel_id"])
+        session_id = kwargs.get("session_id")
+        existing = self.chat_store.load_session(str(session_id)) if session_id is not None else self.chat_store.latest_session(
             goal_id=str(kwargs["goal_id"]),
             agent_id=str(kwargs["agent_id"]),
-            channel_id=str(kwargs["channel_id"]),
+            channel_id=channel,
         )
         if existing is not None:
             return existing, True
         session = self.chat_store.create_session(
             goal_id=str(kwargs["goal_id"]),
+            goal_instance_id=kwargs.get("goal_instance_id"),
+            **({"session_id": str(session_id)} if session_id is not None else {}),
+            **({"managed_agent_id": str(managed_agent), "managed_workspace_path": str(Path(str(kwargs["work_dir"])).resolve())}
+               if managed_agent is not None else {}),
             agent_id=str(kwargs["agent_id"]),
             adapter_kind="fake",
             upstream_thread_id="thread-goal-create",
-            channel_id=str(kwargs["channel_id"]),
+            upstream_mode="chat" if kwargs["agent_id"] == "codex" else "default",
+            channel_id=channel,
         )
         return session, False
 
     def submit_turn(self, **kwargs: object) -> tuple[dict[str, object], bool]:
         self.submissions.append(dict(kwargs))
-        return ({"turn_id": "turn-correction-1", "status": "queued"}, True)
+        session_id = str(kwargs["session_id"])
+        turn, created = self.chat_store.create_turn(session_id,
+            client_turn_id=str(kwargs["client_turn_id"]), message=str(kwargs["message"]))
+        if created:
+            # The synchronous fake finishes its ordinary reply through the real
+            # Chat completion owner; it never accepts a Goal or Task outcome.
+            self.chat_store.update_turn(session_id, str(turn["turn_id"]),
+                status="completing", started_at=turn["created_at"], completed_at=turn["created_at"],
+                upstream_turn_id=f"synthetic-{turn['turn_id']}", response={"message": "Synthetic ordinary reply."})
+            turn = self.chat_store.finalize_managed_turn_completion(session_id, str(turn["turn_id"]))
+        return turn, created
 
     def capabilities(self) -> list[dict[str, object]]:
         return [
@@ -192,6 +214,7 @@ def write_registry_fixture(root: Path) -> tuple[Path, Path]:
         + "\n",
         encoding="utf-8",
     )
+    import_fixture_authority(registry, "goal-one")
     return registry, state
 
 
@@ -364,7 +387,8 @@ def assert_http_action_api(root: Path) -> None:
         )
         assert code == 202, correction_applied
         assert correction_applied["proposal"]["status"] == "applied", correction_applied
-        assert correction_applied["turn"]["turn_id"] == "turn-correction-1", correction_applied
+        original_correction = chat_store.turn_for_client(session["session_id"], str(runtime_controller.submissions[1]["client_turn_id"]))
+        assert correction_applied["turn"]["turn_id"] == original_correction["turn_id"], correction_applied
         assert runtime_controller.submissions[1]["session_id"] == session["session_id"]
 
         goal_proposal = previews["goal.create"]
@@ -393,7 +417,8 @@ def assert_http_action_api(root: Path) -> None:
         )
         assert history_after_goal["goals"][0]["display_name"] == "New Goal", history_after_goal
         assert new_goal["coordination"]["registered_agents"] == ["codex"], new_goal
-        new_state = state_path.parent.parent / "new-goal" / "ACTIVE_GOAL_STATE.md"
+        assert new_goal["state_file"] == ".loopx/goals/new-goal/ACTIVE_GOAL_STATE.md", new_goal
+        new_state = registry_path.parent.parent / new_goal["state_file"]
         assert new_state.exists(), new_state
         new_state_text = new_state.read_text(encoding="utf-8")
         assert new_state_text.count("Verify the new Goal projection") == 1
@@ -960,16 +985,37 @@ def assert_http_action_api(root: Path) -> None:
             )
             assert code == 201, transition_preview
 
-        for index, (action_kind, params) in enumerate(
+        # A decision outcome is only valid on a User gate; the canonical owner
+        # rejects it before any proposal is stored.
+        before_wrong_role = read_canonical_todos_if_promoted(runtime_root=runtime_root, goal_id="goal-one")
+        before_wrong_role_display = state_path.read_bytes()
+        code, misdirected_decision = request_json(
+            f"{base_url}/api/actions/preview",
+            method="POST",
+            body={
+                "action_kind": "gate.resolve",
+                "summary": "Approve an Agent Todo",
+                "normalized_parameters": {"goal_id": "goal-one", "todo_id": current_todo_id, "decision": "approve"},
+                "context": {"kind": "goal", "goal_id": "goal-one"},
+                "idempotency_key": "http-misdirected-decision",
+            },
+        )
+        assert code == 400, misdirected_decision
+        assert misdirected_decision["error_code"] == "invalid_action_preview", misdirected_decision
+        assert misdirected_decision["error"] == "Todo does not have the requested role", misdirected_decision
+        assert not any(proposal.get("idempotency_key") == "http-misdirected-decision"
+                       for proposal in service.store.list())
+        assert state_path.read_bytes() == before_wrong_role_display
+        assert read_canonical_todos_if_promoted(runtime_root=runtime_root, goal_id="goal-one") == before_wrong_role
+
+        for index, (action_kind, params, gate_kind) in enumerate(
             [
-                ("goal.update", {"goal_id": "goal-one", "objective": "A revised objective"}),
-                (
-                    "gate.resolve",
-                    {"goal_id": "goal-one", "todo_id": current_todo_id, "decision": "approve"},
-                ),
+                ("goal.update", {"goal_id": "goal-one", "objective": "A revised objective"},
+                 "canonical_authority_required"),
                 (
                     "gate.resolve",
                     {"goal_id": "goal-one", "todo_id": current_todo_id, "decision": "defer"},
+                    "decision_outcome_required",
                 ),
             ]
         ):
@@ -991,11 +1037,11 @@ def assert_http_action_api(root: Path) -> None:
                 body={},
             )
             assert code == 409, protected_gate
-            assert protected_gate["gate"]["kind"] == "canonical_authority_required", protected_gate
+            assert protected_gate["gate"]["kind"] == gate_kind, protected_gate
 
         persisted_payload = action_store.path.read_text(encoding="utf-8")
         assert str(root) not in persisted_payload, persisted_payload
-        assert str(project := registry_path.parent.parent) not in persisted_payload, persisted_payload
+        assert str(registry_path.parent.parent) not in persisted_payload, persisted_payload
 
         cancellable_code, cancellable = request_json(
             f"{base_url}/api/actions/preview",

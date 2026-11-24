@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from .core import (
+    TRIGGER_DECISION_SCHEMA,
     _boolean,
     _digest,
     _integer,
@@ -19,7 +20,6 @@ from .core import (
 
 
 TRIGGER_REQUEST_SCHEMA = "periodic_report_trigger_request_v0"
-TRIGGER_DECISION_SCHEMA = "periodic_report_trigger_decision_v0"
 
 _REPORTABLE_KINDS = {
     "bounded_segment_milestone",
@@ -94,7 +94,7 @@ def _normalize_policy(raw: object) -> dict[str, Any]:
             enabled.append(kind)
     if not enabled:
         raise ValueError("trigger_policy.enabled_kinds must not be empty")
-    return {
+    normalized: dict[str, Any] = {
         "enabled_kinds": sorted(enabled),
         "minimum_interval_seconds": _integer(
             policy.get("minimum_interval_seconds", 0),
@@ -102,6 +102,54 @@ def _normalize_policy(raw: object) -> dict[str, Any]:
             maximum=31 * 24 * 60 * 60,
         ),
     }
+    if policy.get("aggregation") is not None:
+        aggregation = _object(policy.get("aggregation"), "trigger_policy.aggregation")
+        _reject_unknown_facts(
+            aggregation,
+            allowed={
+                "promote_replan",
+                "stage_completion_required",
+                "todo_completed_threshold",
+                "window_seconds",
+            },
+            label="trigger_policy.aggregation",
+        )
+        threshold = aggregation.get("todo_completed_threshold")
+        promote_replan = _boolean(
+            aggregation.get("promote_replan", False),
+            "trigger_policy.aggregation.promote_replan",
+        )
+        normalized_aggregation: dict[str, Any] = {
+            "window_seconds": _integer(
+                aggregation.get("window_seconds", 7 * 24 * 60 * 60),
+                "trigger_policy.aggregation.window_seconds",
+                minimum=1,
+                maximum=31 * 24 * 60 * 60,
+            ),
+            "promote_replan": promote_replan,
+            "stage_completion_required": _boolean(
+                aggregation.get("stage_completion_required", True),
+                "trigger_policy.aggregation.stage_completion_required",
+            ),
+        }
+        if threshold is not None:
+            normalized_aggregation["todo_completed_threshold"] = _integer(
+                threshold,
+                "trigger_policy.aggregation.todo_completed_threshold",
+                minimum=1,
+                maximum=64,
+            )
+        if (
+            threshold is None
+            and not promote_replan
+            and not normalized_aggregation["stage_completion_required"]
+        ):
+            raise ValueError(
+                "trigger_policy.aggregation must require a stage completion, "
+                "enable a todo threshold, or enable replan promotion"
+            )
+        normalized["aggregation"] = normalized_aggregation
+    return normalized
 
 
 def normalize_periodic_report_trigger_policy(raw: object) -> dict[str, Any]:
@@ -159,6 +207,15 @@ def _materiality(kind: str, facts: Mapping[str, Any], label: str) -> tuple[bool,
                 "remaining_todo_count",
                 "segment_ref",
                 "transition",
+                "acceptance",
+                "completed_at",
+                "completion_receipt_ref",
+                "stage_identity",
+                "closed_vision_revision",
+                "frontier_identity",
+                "stage_transition",
+                "outcome_checkpoint_satisfied",
+                "status",
             },
             label=label,
         )
@@ -182,7 +239,58 @@ def _materiality(kind: str, facts: Mapping[str, Any], label: str) -> tuple[bool,
             return False, "segment_checkpoint_only"
         if not durable_writeback:
             return False, "segment_writeback_pending"
-        return True, "bounded_segment_advanced"
+        required_stage_facts = {
+            "acceptance",
+            "completed_at",
+            "completion_receipt_ref",
+            "stage_identity",
+            "closed_vision_revision",
+            "frontier_identity",
+            "stage_transition",
+            "outcome_checkpoint_satisfied",
+            "status",
+        }
+        if not required_stage_facts.issubset(facts):
+            return False, "stage_completion_not_proven"
+        status = _token(facts.get("status"), f"{label}.status")
+        acceptance = _token(facts.get("acceptance"), f"{label}.acceptance")
+        stage_transition = _token(
+            facts.get("stage_transition"), f"{label}.stage_transition"
+        )
+        _timestamp(facts.get("completed_at"), f"{label}.completed_at")
+        _token(facts.get("stage_identity"), f"{label}.stage_identity")
+        _text(
+            facts.get("closed_vision_revision"),
+            f"{label}.closed_vision_revision",
+            maximum=128,
+        )
+        _text(
+            facts.get("frontier_identity"),
+            f"{label}.frontier_identity",
+            maximum=256,
+        )
+        _text(
+            facts.get("completion_receipt_ref"),
+            f"{label}.completion_receipt_ref",
+            maximum=256,
+        )
+        outcome_checkpoint_satisfied = _boolean(
+            facts.get("outcome_checkpoint_satisfied"),
+            f"{label}.outcome_checkpoint_satisfied",
+        )
+        material = (
+            transition == "segment_completed"
+            and status == "completed"
+            and acceptance == "validated"
+            and stage_transition
+            in {"goal_terminal", "successor_frontier_settled"}
+            and outcome_checkpoint_satisfied
+        )
+        return material, (
+            "authoritative_stage_completed"
+            if material
+            else "stage_completion_not_proven"
+        )
     if kind == "vision_closed":
         _reject_unknown_facts(
             facts,

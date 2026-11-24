@@ -1,0 +1,388 @@
+"""Exact Task reading, from native CLI through the real loopback HTTP owner."""
+
+import json
+from pathlib import Path
+import subprocess
+import sys
+import threading
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+import pytest
+
+from loopx.chat_server import ChatHTTPServer, ChatRequestHandler
+from loopx.control_plane.coordination.local_authority import read_canonical_todos_if_promoted
+from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_http_open_wait_preserves_scoped_monitor_and_successor(tmp_path, monkeypatch, provider):
+    from http.client import HTTPConnection
+    from loopx.chat_actions import ChatActionService
+    from loopx.chat_action_store import ChatActionStore
+    from tests.control_plane.canonical_authority_fixture import isolate_sqlite_runtime
+    from tests.control_plane.test_todo_external_wait import (
+        AGENT_ID, GOAL_ID, WAITING_ID, MONITOR_ID, FALLBACK_ID, _write_fixture,
+    )
+    from loopx.todos import update_goal_todo
+
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    registry, runtime, _ = _write_fixture(tmp_path, provider=provider)
+    update_goal_todo(registry_path=registry, goal_id=GOAL_ID, todo_id=WAITING_ID,
+                     successor_todo_ids=[FALLBACK_ID], agent_id=AGENT_ID)
+    original = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID)
+    server = ChatHTTPServer(("127.0.0.1", 0), ChatRequestHandler)
+    server.registry_path, server.runtime_root_override, server.verbose = registry, str(runtime), False
+    server.action_service = ChatActionService(store=ChatActionStore(runtime / "chat/actions"),
+        registry_path=registry, runtime_root_override=str(runtime))
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    connection = HTTPConnection(*server.server_address, timeout=30)
+
+    def post(path, body):
+        connection.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+
+    scope = f"monitor_changed:{MONITOR_ID}@suite:case-b/run-2"
+    parameters = {"goal_id": GOAL_ID, "todo_id": WAITING_ID, "agent_id": AGENT_ID,
+                  "operation": "edit", "status": "open", "resume_when": scope}
+    request = {"action_kind": "todo.update", "summary": "Wait for the selected Monitor scope",
+               "normalized_parameters": parameters, "context": {}, "idempotency_key": "scoped-open-wait"}
+    try:
+        code, preview = post("/api/actions/preview", request)
+        assert code == 201, preview
+        proposal_id = preview["proposal"]["proposal_id"]
+        assert read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID) == original
+        code, result = post(f"/api/actions/{proposal_id}/apply", {})
+        assert code == 200 and result["proposal"]["status"] == "applied", result
+        saved = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID)
+        waiting = next(item for item in saved["todos"] if item["todo_id"] == WAITING_ID)
+        assert waiting["status"] == "open" and waiting["resume_when"] == scope
+        assert waiting["successor_todo_ids"] == [FALLBACK_ID]
+        assert post(f"/api/actions/{proposal_id}/apply", {}) == (code, result)
+        rejected, _ = post("/api/actions/preview", {**request, "idempotency_key": "invalid-deferred-wait",
+            "normalized_parameters": {**parameters, "operation": "defer"}})
+        assert rejected == 400
+        assert read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID) == saved
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        worker.join()
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("global_directory", [False, True])
+def test_task_detail_follows_goal_source_instead_of_chat_storage(tmp_path, monkeypatch, provider, global_directory):
+    monkeypatch.syspath_prepend(str(Path(__file__).parent / "control_plane"))
+    from canonical_authority_fixture import initialize_canonical_authority, isolate_sqlite_runtime
+
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    source = project / ".loopx" / "registry.json"
+    source.parent.mkdir(parents=True)
+    runtime, chat = project / ".loopx" / "runtime", tmp_path / "chat"
+    text = "[P1] Keep every original requirement. " + "正文🙂 " * 240 + "Final acceptance must survive."
+    goal = {"id": "reading-goal", "repo": str(project), "state_file": "state.md",
+            "coordination": {"registered_agents": ["agent-a"]}}
+    registration = {"common_runtime_root": ".loopx/runtime", "goals": [goal]}
+    source.write_text(json.dumps(registration))
+
+    def seed(root, body):
+        state = root / "state.md"
+        root.mkdir(parents=True, exist_ok=True)
+        state.write_text("# Synthetic Goal\n\n## Agent Todo\n\n## Completed Work Archive\n")
+        records = [{"schema_version": "todo_item_v0", "todo_id": todo_id, "index": index + 1,
+            "role": "agent", "status": "done" if archived else "open", "done": archived,
+            "archive_state": "archive" if archived else "active", "text": body,
+            "source_section": "Completed Work Archive" if archived else "Agent Todo",
+            "claimed_by": "agent-a", "task_class": "advancement_task", "priority": "P1"}
+            for index, (todo_id, archived) in enumerate([("todo_current", False), ("todo_retained", True)])]
+        initialize_canonical_authority(root, "reading-goal", build_todo_runtime_shadow_projection(
+            goal_id="reading-goal", todos=records, handoff_mode="soft_claim"), state_path=state, provider=provider)
+        state.unlink()
+        return read_canonical_todos_if_promoted(runtime_root=root, goal_id="reading-goal")
+
+    before = seed(runtime, text)
+    decoy = seed(chat, "Unrelated Chat storage has the same Goal and Task ids.")
+    registry = source
+    if global_directory:
+        registry = tmp_path / "registry.global.json"
+        registry.write_text(json.dumps({"registry_role": "global-local", "common_runtime_root": str(chat),
+            "goals": [{**goal, "source_registry": str(source)}]}))
+    server = ChatHTTPServer(("127.0.0.1", 0), ChatRequestHandler)
+    server.registry_path, server.runtime_root_override, server.verbose = registry, str(chat), False
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{server.server_port}/api/chat/todo/detail?goal_id=reading-goal&todo_id="
+
+    def read(todo_id="todo_current"):
+        with urlopen(base + todo_id, timeout=30) as response:
+            return json.load(response)
+
+    try:
+        for todo_id in ("todo_current", "todo_retained"):
+            detail = read(todo_id)
+            assert detail["text"] == text
+            assert detail["review_basis"]["provider_revision"] == before["provider_revision"]
+            assert detail["archive_state"] == ("archive" if todo_id == "todo_retained" else "active")
+        with pytest.raises(HTTPError) as missing:
+            read("todo_missing")
+        assert missing.value.code == 404
+
+        # A source registration change takes effect on the next read, without
+        # restarting Chat or substituting its still-valid decoy authority.
+        replacement = tmp_path / "replacement"
+        replacement_before = seed(replacement, text + " Preserve the revised source.")
+        registration["common_runtime_root"] = str(replacement)
+        source.write_text(json.dumps(registration))
+        assert read()["text"] == text + " Preserve the revised source."
+        for failure in ("missing", "unreadable", "wrong_goal"):
+            source.unlink()
+            if failure == "unreadable":
+                source.mkdir()
+            elif failure == "wrong_goal":
+                source.write_text(json.dumps({**registration, "goals": []}))
+            with pytest.raises(HTTPError) as unavailable:
+                read()
+            assert unavailable.value.code in {400, 503}
+            error = json.load(unavailable.value)
+            assert not error["ok"] and "text" not in error and "review_basis" not in error
+            assert str(tmp_path) not in json.dumps(error)
+            if source.is_dir():
+                source.rmdir()
+            source.write_text(json.dumps(registration))
+            assert read()["text"] == text + " Preserve the revised source."
+        assert read_canonical_todos_if_promoted(runtime_root=runtime, goal_id="reading-goal") == before
+        assert read_canonical_todos_if_promoted(runtime_root=chat, goal_id="reading-goal") == decoy
+        assert read_canonical_todos_if_promoted(runtime_root=replacement, goal_id="reading-goal") == replacement_before
+        assert not any((root / "state.md").exists() for root in (runtime, chat, replacement))
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_exact_task_cli_http_preserve_full_current_and_retained_request(tmp_path, monkeypatch, provider):
+    monkeypatch.syspath_prepend(str(Path(__file__).parent / "control_plane"))
+    from canonical_authority_fixture import initialize_canonical_authority, isolate_sqlite_runtime
+
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    tail = " FINAL_ACCEPTANCE: read every requirement and preserve the original opener."
+    text = "Inspect the complete current requirements. " + "A" * 880 + tail
+    records = [{
+        "schema_version": "todo_item_v0", "todo_id": todo_id, "index": index + 1,
+        "role": "agent", "status": "done" if archived else "open", "done": archived,
+        "archive_state": "archive" if archived else "active", "text": text,
+        "source_section": "Completed Work Archive" if archived else "Agent Todo",
+        "claimed_by": "agent-a", "task_class": "advancement_task", "priority": "P0",
+    } for index, (todo_id, archived) in enumerate([("todo_current", False), ("todo_retained", True)])]
+    state, runtime, registry = tmp_path / "state.md", tmp_path / "runtime", tmp_path / "registry.json"
+    state.write_text("# Synthetic Goal\n\n## User Todo / Owner Review Reading Queue\n\n## Agent Todo\n\n## Completed Work Archive\n")
+    projection = build_todo_runtime_shadow_projection(goal_id="reading-goal", todos=records, handoff_mode="soft_claim")
+    initialize_canonical_authority(runtime, "reading-goal", projection, state_path=state, provider=provider)
+    # The authoritative reader must work without a stale display file.
+    state.unlink()
+    registry.write_text(json.dumps({"common_runtime_root": str(runtime), "goals": [
+        {"id": "reading-goal", "repo": str(tmp_path), "state_file": "state.md",
+         "coordination": {"registered_agents": ["agent-a"], "agent_model": "peer_v1"}}]}))
+    before = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id="reading-goal")
+
+    def cli(*args, expected_code=0):
+        process = subprocess.run([sys.executable, "-c", "from loopx.cli import main; raise SystemExit(main())",
+            "--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+            "todo", "list", "--goal-id", "reading-goal", *args], capture_output=True, text=True, timeout=60)
+        assert process.returncode == expected_code, process.stdout + process.stderr
+        return json.loads(process.stdout)
+
+    hot = cli()
+    assert len(hot["todos"]) == 1 and len(hot["todos"][0]["text"]) == 500
+    assert tail not in hot["todos"][0]["text"]
+    for todo_id in ("todo_current", "todo_retained"):
+        exact = cli("--todo-id", todo_id)
+        assert exact["matched"] and exact["todo"]["text"] == text
+        assert tail in exact["todo"]["text"]
+        rejected = cli("--todo-id", todo_id, "--thin", expected_code=1)
+        assert rejected["ok"] is False
+        assert "Exact Todo reads return full requirements" in rejected["error"]
+        assert "remove --thin" in rejected["error"]
+        assert "FINAL_ACCEPTANCE" not in rejected["error"]
+
+    server = ChatHTTPServer(("127.0.0.1", 0), ChatRequestHandler)
+    server.registry_path, server.runtime_root_override, server.verbose = registry, str(runtime), False
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{server.server_port}/api/chat/todo/detail"
+    try:
+        for todo_id, archived in [("todo_current", False), ("todo_retained", True)]:
+            with urlopen(f"{base}?goal_id=reading-goal&todo_id={todo_id}") as response:
+                detail = json.load(response)
+            assert detail["goal_id"] == "reading-goal" and detail["todo_id"] == todo_id
+            assert detail["text"] == text and detail["archive_state"] == ("archive" if archived else "active")
+            assert "state_file" not in detail and "required_capabilities" not in detail and "authority_read" not in detail
+            assert detail["review_basis"]["provider_revision"] == before["provider_revision"]
+        for query, expected in [("goal_id=other-goal&todo_id=todo_current", 400),
+                                ("goal_id=reading-goal&todo_id=todo_missing", 404),
+                                ("goal_id=reading-goal&todo_id=../state.md", 400),
+                                ("goal_id=reading-goal&todo_id=todo_current&todo_id=todo_retained", 400)]:
+            with pytest.raises(HTTPError) as failure:
+                urlopen(f"{base}?{query}")
+            assert failure.value.code == expected
+        with pytest.raises(HTTPError) as denied:
+            urlopen(Request(f"{base}?goal_id=reading-goal&todo_id=todo_current", headers={"Origin": "https://unrelated.example"}))
+        assert denied.value.code == 403
+        saved = registry.with_suffix(".saved")
+        registry.rename(saved)
+        with pytest.raises(HTTPError) as unavailable:
+            urlopen(f"{base}?goal_id=reading-goal&todo_id=todo_current")
+        assert unavailable.value.code == 503
+        saved.rename(registry)
+        with urlopen(f"{base}?goal_id=reading-goal&todo_id=todo_current") as response:
+            assert json.load(response)["text"] == text
+        after = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id="reading-goal")
+        assert after["provider_revision"] == before["provider_revision"] and after["todos"] == before["todos"]
+        assert not state.exists()
+
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_explicit_task_read_with_conflicting_defaults(tmp_path, monkeypatch, capsys, provider):
+    from loopx import paths
+    from loopx.cli import main
+    from tests.control_plane.canonical_authority_fixture import (
+        isolate_sqlite_runtime,
+        promoted_create_fixture,
+    )
+
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    defaults = (tmp_path / "current", tmp_path / "legacy")
+    for root in defaults:
+        root.mkdir()
+        (root / "machine.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(paths, "DEFAULT_RUNTIME_ROOT", defaults[0])
+    monkeypatch.setattr(paths, "LEGACY_RUNTIME_ROOT", defaults[1])
+
+    registry, runtime, state = promoted_create_fixture(tmp_path, provider=provider)
+    registration = json.loads(registry.read_text(encoding="utf-8"))
+    del registration["common_runtime_root"]
+    registry.write_text(json.dumps(registration), encoding="utf-8")
+    initial_state = state.read_bytes()
+
+    def cli(*args, explicit=True):
+        override = ["--runtime-root", str(runtime)] if explicit else []
+        code = main(["--registry", str(registry), *override, "--format", "json",
+                     "todo", *args, "--goal-id", "goal-a"])
+        return code, json.loads(capsys.readouterr().out)
+
+    body = "[P1] Read the committed task when both machine roots contain state."
+    code, created = cli("add", "--role", "agent", "--text", body)
+    assert code == 0 and created["ok"], created
+    todo_id = created["todo_id"]
+    assert created["projection_delivery"] == "pending"
+    assert created["projection_outbox"]["retry_business_mutation"] is False
+    canonical = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id="goal-a")
+
+    code, refused = cli("list", "--todo-id", todo_id, explicit=False)
+    assert code == 1 and not refused["ok"]
+    assert "Both default LoopX runtime roots contain state" in refused["error"]
+
+    code, listed = cli("list", "--todo-id", todo_id)
+    assert code == 0 and listed["todo"]["text"] == body, listed
+    assert listed["authority_read"]["provider_revision"] == canonical["provider_revision"]
+
+    with ChatHTTPServer(("127.0.0.1", 0), ChatRequestHandler) as server:
+        server.registry_path, server.runtime_root_override, server.verbose = registry, str(runtime), False
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        url = (f"http://127.0.0.1:{server.server_port}/api/chat/todo/detail"
+               f"?goal_id=goal-a&todo_id={todo_id}")
+        try:
+            with urlopen(url, timeout=30) as response:
+                detail = json.load(response)
+            assert detail["todo_id"] == todo_id and detail["text"] == body
+            assert detail["review_basis"]["provider_revision"] == canonical["provider_revision"]
+        finally:
+            server.shutdown()
+            worker.join()
+
+    assert read_canonical_todos_if_promoted(runtime_root=runtime, goal_id="goal-a") == canonical
+    assert state.read_bytes() == initial_state
+    for root in defaults:
+        assert list(root.iterdir()) == [root / "machine.json"]
+        assert (root / "machine.json").read_text(encoding="utf-8") == "{}"
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_source_bound_requirements_use_real_canonical_writer(tmp_path, monkeypatch, provider):
+    monkeypatch.syspath_prepend(str(Path(__file__).parent / "control_plane"))
+    from canonical_authority_fixture import promoted_create_fixture, isolate_sqlite_runtime
+    from loopx.chat_action_store import ChatActionStore
+    from loopx.chat_actions import ChatActionService
+    from loopx.todos import add_goal_todo
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    registry, runtime, state = promoted_create_fixture(tmp_path, provider=provider, goal_id="reading-goal")
+    tail = " FINAL_ACCEPTANCE: preserve every original requirement."
+    text = "[P1] Complete current requirements. " + "A" * 900 + tail
+    todo_id = add_goal_todo(registry_path=registry, goal_id="reading-goal", role="agent",
+        text=text, claimed_by="agent-a", agent_id="agent-a", task_class="advancement_task")["todo_id"]
+    before = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id="reading-goal")
+    server = ChatHTTPServer(("127.0.0.1", 0), ChatRequestHandler)
+    server.action_service = ChatActionService(store=ChatActionStore(runtime / "chat/actions"), registry_path=registry, runtime_root_override=str(runtime))
+    server.registry_path, server.runtime_root_override, server.verbose = registry, str(runtime), False
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{server.server_port}/api/chat/todo/detail"
+    try:
+        # The source read, not the bounded list, supplies both text and CAS.
+        with urlopen(f"{base}?goal_id=reading-goal&todo_id={todo_id}") as response:
+            detail = json.load(response)
+        updated_text = text + " Preserve this additional acceptance requirement."
+        service = server.action_service
+        request = {"action_kind": "todo.update", "summary": "Save task requirements",
+            "context": {"kind": "todo", "goal_id": "reading-goal", "todo_id": todo_id},
+            "idempotency_key": "save-requirements", "normalized_parameters": {
+                "goal_id": "reading-goal", "todo_id": todo_id, "agent_id": "agent-a",
+                "operation": "edit", "text": updated_text, "review_basis": detail["review_basis"]}}
+        proposal = service.preview(request)
+        assert read_canonical_todos_if_promoted(runtime_root=runtime, goal_id="reading-goal")["provider_revision"] == before["provider_revision"]
+        applied = service.apply(proposal["proposal_id"])["proposal"]
+        assert applied["status"] == "applied", json.dumps(applied, ensure_ascii=False)
+        with urlopen(f"{base}?goal_id=reading-goal&todo_id={todo_id}") as response:
+            saved = json.load(response)
+        assert saved["text"] == updated_text and tail in saved["text"]
+        assert service.apply(proposal["proposal_id"])["proposal"] == applied
+        assert read_canonical_todos_if_promoted(runtime_root=runtime, goal_id="reading-goal")["provider_revision"] == saved["review_basis"]["provider_revision"]
+        with pytest.raises(ValueError, match="changed"):
+            service.preview({**request, "idempotency_key": "stale-source"})
+        with pytest.raises(ValueError, match="complete current source basis"):
+            service.preview({**request, "idempotency_key": "partial-basis",
+                "normalized_parameters": {**request["normalized_parameters"], "review_basis": {"provider_revision": "unknown"}}})
+        with pytest.raises(ValueError, match="bounded visible text"):
+            service.preview({**request, "idempotency_key": "old-quick-edit-bound",
+                "normalized_parameters": {key: value for key, value in request["normalized_parameters"].items() if key != "review_basis"}})
+        with pytest.raises(ValueError, match="bounded visible text"):
+            service.preview({**request, "idempotency_key": "no-source-truncation",
+                "normalized_parameters": {**request["normalized_parameters"],
+                    "review_basis": saved["review_basis"], "text": "A" * 8001}})
+        current_request = {**request, "idempotency_key": "intervening-writer",
+            "normalized_parameters": {**request["normalized_parameters"], "text": updated_text + " A new intent.",
+                "review_basis": saved["review_basis"]}}
+        pending = service.preview(current_request)
+        from loopx.todos import update_goal_todo
+        update_goal_todo(registry_path=registry, goal_id="reading-goal", todo_id=todo_id,
+            agent_id="agent-a", note="Independent progress")
+        assert service.apply(pending["proposal_id"])["proposal"]["status"] == "stale"
+        assert service.apply(proposal["proposal_id"])["proposal"] == applied
+
+        with urlopen(f"{base}?goal_id=reading-goal&todo_id={todo_id}") as response:
+            assert json.load(response)["text"] == updated_text
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()

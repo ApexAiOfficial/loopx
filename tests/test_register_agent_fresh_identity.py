@@ -104,3 +104,29 @@ def test_require_new_registration_is_atomic_under_concurrency(
         "codex-existing",
         "codex-fresh",
     ]
+
+
+def test_registration_does_not_invent_a_codex_app_host(
+    tmp_path: Path,
+) -> None:
+    runtime_root, _, _ = _fixture(tmp_path)
+
+    result = registry_admin.register_agent_via_source_registry(
+        runtime_root_arg=str(runtime_root),
+        goal_id=GOAL_ID,
+        agent_ids=["trae-fresh"],
+        require_new=True,
+        execute=False,
+    )
+
+    assert result["host_loop_activation"] == {
+        "schema_version": "loopx_host_loop_activation_v0",
+        "host_surface": "unresolved",
+        "status": "selection_required",
+        "activated": False,
+        "recommended_action": (
+            "run `loopx agent-onboard --list-agent-types`, then rerun onboarding "
+            "with the exact agent type; do not claim setup complete until the "
+            "host-specific activation is proven or a concrete host-tool gate is reported"
+        ),
+    }

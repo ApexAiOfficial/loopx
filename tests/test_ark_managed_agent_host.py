@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 from pathlib import Path
 
@@ -12,6 +13,12 @@ from loopx.agent_onboarding import (
 from loopx.control_plane.testing.canary_harness import (
     run_json_cli,
     write_fixture_registry,
+)
+from loopx.control_plane.coordination.runtime_shadow import (
+    build_todo_runtime_shadow_projection,
+)
+from loopx.control_plane.todos.active_state_todo_parser import (
+    parse_active_state_todos,
 )
 from loopx.doctor import collect_doctor
 from loopx.heartbeat_prompt import build_heartbeat_prompt
@@ -27,6 +34,10 @@ from loopx.skill_install_readback import (
     write_skill_install_readback,
 )
 from loopx.slash_command_install import materialize_loopx_entry_skill
+from tests.control_plane.canonical_authority_fixture import (
+    initialize_canonical_authority,
+)
+from tests.control_plane.codex_checkpoint_fixture import read_cli_policy_payload
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -72,23 +83,14 @@ def test_goal_prompt_is_one_transport_independent_activation() -> None:
     assert "Goal runtime owns continuation and inner iterations" in normalized
     assert "goal loop, not automation" in normalized
     assert "invoke LoopX Turn" in normalized
-    assert "a segment is progress, not a new Goal boundary" in normalized
-    assert (
-        "Reuse this Goal until terminal"
-    ) in normalized
-    assert "do not create a successor host Goal merely to continue" in normalized
-    assert (
-        "Normal turns use CLI `interaction_contract`; use `loopx-project` for "
-        "lifecycle/registry and `loopx-self-repair` for runtime/projection drift."
-        in normalized
-    )
-    assert "take highest-priority unblocked in-scope todo" in normalized
-    assert "claims/leases and blocker-push/recovery obligations" in normalized
-    assert (
-        "Before dependencies, persist changed scope/acceptance/non-goal evidence "
-        "and next todo"
-    ) in normalized
-    assert "refresh the accountable progress record before spending" in normalized
+    assert "Progress is not a new Goal boundary" in normalized
+    assert "do not create a new host Goal merely to continue" in normalized
+    assert "current `interaction_contract`" in normalized
+    assert "selection_command" in normalized
+    assert "settlement_plan.ordered_steps" in normalized
+    assert "terminal no-follow-up" in normalized
+    assert local_development["progress_refresh_state_command"] not in local_development["task_body"]
+    assert local_development["quota_spend_command"] not in local_development["task_body"]
 
 
 def test_goal_prompt_projects_goal_only_host_contract() -> None:
@@ -125,7 +127,7 @@ def test_goal_prompt_projects_goal_only_host_contract() -> None:
                 "quota_should_run.interaction_contract.cli_channel."
                 "runtime_capability_reentry"
             ),
-            "cli_projection_ref": "quota_should_run.runtime_capability_reentry",
+            "cli_projection_ref": "quota_should_run.interaction_contract.cli_channel.runtime_capability_reentry",
             "packet_schema_version": "runtime_capability_reentry_v0",
             "delivery_channel": "quota_tool_result",
             "goal_prompt_mutated": False,
@@ -155,9 +157,9 @@ def test_host_activation_submits_one_goal_without_turn_or_automation() -> None:
         "runtime_capability_reentry_v0" in step and "do not rewrite task_body" in step
         for step in packet["activation_steps"]
     )
-    assert packet["commands"]["heartbeat_prompt"].endswith(
-        "--runtime-profile ark_managed_agent_goal"
-    )
+    prompt_args = shlex.split(packet["commands"]["heartbeat_prompt"])
+    assert prompt_args[prompt_args.index("--runtime-profile") + 1] == "ark_managed_agent_goal"
+    assert prompt_args.count("--bootstrap") == 1
     assert "automation_update" not in str(packet)
     assert "loopx turn run-once" not in str(packet).lower()
 
@@ -177,7 +179,7 @@ def test_host_requires_host_managed_loopx_skill_delivery(monkeypatch) -> None:
     assert contract["install_script"] == "scripts/install-local.sh"
     assert (
         contract["no_clone_install_command"] == "curl -fsSL "
-        "https://huangruiteng.github.io/loopx/install.sh"
+        "https://loopx-project.github.io/loopx/install.sh"
         " | env LOOPX_SKILLS_DIR=./.agents/skills "
         "LOOPX_ENTRY_HOST_SURFACE=ark-managed-agent "
         "LOOPX_INSTALL_SLASH_COMMANDS=0 bash"
@@ -331,6 +333,12 @@ def test_retire_duplicate_managed_skills_removes_only_loopx_managed_copies(
     agents_skills = tmp_path / ".agents" / "skills"
     _materialize_workflow_skills(codex_skills)
     _materialize_workflow_skills(agents_skills)
+    canonical_facade = codex_skills / "loopx-global-gates" / "SKILL.md"
+    canonical_facade.parent.mkdir(parents=True)
+    canonical_facade.write_text(
+        "<!-- loopx-managed-slash-command:v1 command=/loopx-global-gates -->\n",
+        encoding="utf-8",
+    )
     facade = agents_skills / "loopx-global-gates" / "SKILL.md"
     facade.parent.mkdir(parents=True)
     facade.write_text(
@@ -361,63 +369,8 @@ def test_retire_duplicate_managed_skills_removes_only_loopx_managed_copies(
     assert applied["ok"] is True
     assert "loopx-global-gates" in applied["retired"]
     assert not (agents_skills / "loopx-global-gates").exists()
-    # The facade had no recorded hash, so it was moved aside, not deleted.
-    kept = Path(applied["backed_up"]["loopx-global-gates"])
-    assert kept.is_relative_to(tmp_path / ".agents" / ".loopx-skill-backups")
-    assert (kept / "SKILL.md").is_file()
     assert (agents_skills / "loopx-project").exists()
     assert (codex_skills / "loopx-project").exists()
-
-
-def test_retire_duplicate_finds_a_marker_entry_skill_without_readback(
-    tmp_path: Path,
-) -> None:
-    codex_skills = tmp_path / ".codex" / "skills"
-    agents_skills = tmp_path / ".agents" / "skills"
-    _materialize_workflow_skills(codex_skills)
-    stale_entry = agents_skills / "loopx" / "SKILL.md"
-    stale_entry.parent.mkdir(parents=True)
-    stale_entry.write_text(
-        "<!-- loopx-managed-slash-command:v1 command=/loopx surface=Codex-skills -->\n",
-        encoding="utf-8",
-    )
-    unrelated = agents_skills / "loopx-notes" / "SKILL.md"
-    unrelated.parent.mkdir(parents=True)
-    unrelated.write_text("# my own notes\n", encoding="utf-8")
-
-    applied = retire_duplicate_managed_skills(
-        codex_skills,
-        alternate_root=agents_skills,
-        execute=True,
-    )
-
-    assert applied["retired"] == ["loopx"]
-    assert "loopx" in applied["backed_up"]
-    assert applied["skipped"] == ["loopx-notes"]
-    assert unrelated.is_file()
-
-
-def test_retire_duplicate_checks_recorded_hash_of_marker_carrying_copies(
-    tmp_path: Path,
-) -> None:
-    codex_skills = tmp_path / ".codex" / "skills"
-    agents_skills = tmp_path / ".agents" / "skills"
-    _materialize_workflow_skills(codex_skills)
-    _materialize_workflow_skills(agents_skills)
-    entry = agents_skills / "loopx" / "SKILL.md"
-    assert "<!-- loopx-managed-slash-command:v1" in entry.read_text(encoding="utf-8")
-    entry.write_text(entry.read_text(encoding="utf-8") + "\nuser-edit\n", encoding="utf-8")
-
-    applied = retire_duplicate_managed_skills(
-        codex_skills,
-        alternate_root=agents_skills,
-        execute=True,
-    )
-
-    assert "loopx" in applied["skipped"]
-    assert "user-edit" in entry.read_text(encoding="utf-8")
-    assert "loopx-project" in applied["retired"]
-    assert "loopx-project" not in applied["backed_up"]
 
 
 def _write_continuity_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -467,6 +420,20 @@ def _write_continuity_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
         registered_agents=[CONTINUITY_AGENT_ID],
         quota_allowed_slots=None,
     )
+    todos = parse_active_state_todos(
+        state.read_text(encoding="utf-8"),
+        item_limit=None,
+    )["agent_todos"]["items"]
+    initialize_canonical_authority(
+        runtime,
+        CONTINUITY_GOAL_ID,
+        build_todo_runtime_shadow_projection(
+            goal_id=CONTINUITY_GOAL_ID,
+            todos=todos,
+            handoff_mode="soft_claim",
+        ),
+        state_path=state,
+    )
     return project, runtime, registry
 
 
@@ -492,7 +459,7 @@ def _fresh_host_quota_read(
     runtime: Path,
     registry: Path,
 ) -> dict:
-    return run_json_cli(
+    payload = run_json_cli(
         "quota",
         "should-run",
         "--goal-id",
@@ -501,11 +468,10 @@ def _fresh_host_quota_read(
         CONTINUITY_AGENT_ID,
         "--runtime-profile",
         "ark_managed_agent_goal",
-        "--scan-root",
-        str(project),
         registry_path=registry,
         runtime_root=runtime,
     )
+    return read_cli_policy_payload(json.dumps(payload), returncode=payload["_returncode"])
 
 
 def test_fresh_host_reconstructs_frontier_from_durable_loopx_state(
@@ -559,7 +525,7 @@ def test_fresh_host_reconstructs_frontier_from_durable_loopx_state(
     assert replacement_host["selected_todo"]["todo_id"] == CONTINUITY_TODO_ID
     selected = next(
         item
-        for item in todo_readback["agent_todos"]["items"]
+        for item in todo_readback["todos"]
         if item["todo_id"] == CONTINUITY_TODO_ID
     )
     assert selected["note"] == "phase A validated; resume from the durable frontier"

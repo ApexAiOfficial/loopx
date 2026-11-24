@@ -1,0 +1,399 @@
+"""Path-free App transport for the existing typed local-provider migration owner."""
+from __future__ import annotations
+
+import hashlib
+from contextlib import ExitStack
+import json
+import os
+import re
+import stat
+from pathlib import Path
+from typing import Any, TYPE_CHECKING, cast
+from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
+
+from ..control_plane.effect_runtime import effect_runtime_result
+from ..control_plane.coordination.local_authority_shadow_projection import source_effect_runtime_result
+from ..file_lock import exclusive_cross_runtime_file_lock, exclusive_file_lock, write_json_atomic
+
+CHAT_GOAL_STORAGE_PATH = "/api/chat/goal-storage"
+
+
+def _token(body: dict[str, Any], name: str, length: int) -> str:
+    value = body.get(name)
+    if not isinstance(value, str) or not re.fullmatch(rf"[a-f0-9]{{{length}}}", value):
+        raise ValueError(f"invalid {name}")
+    return value
+
+
+class GoalStorageRequestMixin:
+    server: Any
+    path: str
+
+    if TYPE_CHECKING:
+        def _registry_and_goal(self, goal_id: str) -> tuple[dict[str, Any], dict[str, Any]]: ...
+        def _send_json(self, payload: dict[str, Any], *, status: int = 200) -> None: ...
+        def _send_error(self, message: str, *, status: int, error_code: str) -> None: ...
+        def _read_json(self) -> dict[str, Any]: ...
+
+    def _storage_preview_path(self, goal_id: str) -> Path:
+        # Editor intent belongs to this registry/Goal/runtime, not a transient
+        # browser origin. It contains only the existing opaque carrier; the
+        # typed migration owners still validate the immutable plan and effects.
+        scope = json.dumps([str(Path(self.server.registry_path).resolve()), goal_id])
+        directory = Path(self.server.runtime_root).resolve() / "chat" / "storage-previews"
+        if directory.parent.is_symlink() or directory.is_symlink():
+            raise OSError("unsafe storage preview directory")
+        return directory / f"{hashlib.sha256(scope.encode()).hexdigest()}.json"
+
+    @staticmethod
+    def _storage_carrier(body: dict[str, Any], goal_id: str) -> dict[str, str]:
+        key = "operation_id" if "operation_id" in body else "preview_id"
+        if set(body) != {"goal_id", key, "plan_sha256"} or body["goal_id"] != goal_id:
+            raise ValueError("invalid storage preview carrier")
+        return {"goal_id": goal_id, key: _token(body, key, 32),
+                "plan_sha256": _token(body, "plan_sha256", 64)}
+
+    def _storage_preview_read(self, path: Path, goal_id: str) -> tuple[bool, dict[str, str] | None]:
+        try:
+            observed = path.lstat()
+        except FileNotFoundError:
+            return False, None  # Pre-upgrade browser-only previews remain recoverable.
+        if not stat.S_ISREG(observed.st_mode) or observed.st_size > 4096:
+            raise OSError("invalid saved storage preview")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, encoding="utf-8") as source:
+            opened = os.fstat(source.fileno())
+            if (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino):
+                raise OSError("storage preview changed during read")
+            try:
+                payload = json.loads(source.read(4097))
+            except (UnicodeError, ValueError) as error:
+                raise OSError("invalid saved storage preview") from error
+        if not isinstance(payload, dict) or set(payload) != {"carrier"}:
+            raise OSError("invalid saved storage preview")
+        carrier = payload["carrier"]
+        if carrier is not None:
+            if not isinstance(carrier, dict):
+                raise OSError("invalid saved storage preview")
+            try:
+                carrier = self._storage_carrier(carrier, goal_id)
+            except (KeyError, TypeError, ValueError) as error:
+                raise OSError("invalid saved storage preview") from error
+        return True, carrier
+
+    @staticmethod
+    def _storage_preview_write(path: Path, carrier: dict[str, str] | None) -> None:
+        # Null is an explicit dismissal, distinct from a pre-upgrade missing
+        # file: an old tab must not resurrect dismissed intent on its next read.
+        write_json_atomic(path, {"carrier": carrier}, mode=0o600,
+                          directory_mode=0o700, fsync_directory=True)
+
+    def _storage_changed_preview(self, goal_id: str) -> None:
+        self._storage_send({"ok": False, "status": "rejected",
+            "authority_changed": False, "execution_authority_granted": False,
+            "reason_code": "goal_storage_preview_changed"}, goal_id)
+
+    def _storage_owner(self, goal_id: str, **fields: Any) -> dict[str, Any]:
+        self._registry_and_goal(goal_id)
+        return cast(dict[str, Any], effect_runtime_result(
+            "coordination.authority_archive.manage",
+            {"schema_version": "loopx_authority_archive_admin_request_v0",
+             "runtime_root": str(self.server.runtime_root.resolve()),
+             "goal_id": goal_id, **fields}, timeout=300.0, retry_safe=False,
+        ))
+
+    def _storage_send(self, result: dict[str, Any], goal_id: str, preview_id: str | None = None) -> None:
+        # The typed owner decides and verifies. Transport never returns local
+        # filenames, exception prose, full plans, projections or raw archives.
+        payload = {key: result[key] for key in (
+            "ok", "status", "authority_changed", "execution_authority_granted",
+            "plan_sha256", "reviewed_source", "target_provider", "selected_provider",
+            "current", "recovery", "reason_code",
+            "operation_id", "source_inventory", "target_handoff_mode",
+            "legacy_writer_fenced", "coordination_source_backup_verified", "complete_goal_backup_verified",
+            "cold_source",
+            "pending_preview",
+        ) if key in result}
+        payload["goal_id"] = goal_id
+        if preview_id is not None:
+            payload["preview_id"] = preview_id
+        self._send_json(payload, status=200 if result.get("ok") else 409)
+
+    def _storage_source_registry(
+        self, goal_id: str, registry: dict[str, Any], goal: dict[str, Any], root: Path,
+        *, registry_path: Path | None = None,
+    ) -> Path:
+        invoked = registry_path if registry_path is not None else Path(self.server.registry_path).resolve()
+        if not goal.get("source_registry"):
+            return invoked
+
+        from ..control_plane.runtime.runtime_projection_route import resolve_goal_source_runtime_route
+
+        route = resolve_goal_source_runtime_route(
+            registry_path=invoked, registry=registry, goal_id=goal_id,
+        )
+        # A Chat runtime can be bound directly to the source behind a global
+        # index. Keep the host's runtime scope and existing same-root plans.
+        if (route["routed_to_source_registry"]
+                and route["invoked_runtime_root"] != str(root)
+                and route["source_runtime_root"] == str(root)):
+            return Path(route["source_registry"])
+        return invoked
+
+    def _storage_cold_snapshot(
+        self, goal_id: str, registry: dict[str, Any], goal: dict[str, Any],
+        root: Path, source_registry: Path,
+    ) -> tuple[Path, dict[str, object], dict[str, object]]:
+        from ..control_plane.coordination.authority_source_capture import build_runtime_shadow_source_snapshot
+        from ..control_plane.goals.state_resolution import resolve_goal_state
+        from ..registry import find_registry_goal, load_registry
+
+        if source_registry != Path(self.server.registry_path).resolve():
+            registry = load_registry(source_registry)
+            selected_goal = find_registry_goal(registry, goal_id)
+            if selected_goal is None:
+                raise ValueError("registered Goal source changed")
+            goal = selected_goal
+        _, project, state = resolve_goal_state(
+            registry=registry, goal_id=goal_id, project_override=None, state_file_override=None,
+        )
+        if project is None:
+            raise ValueError("registered project is required")
+        projection, snapshot = build_runtime_shadow_source_snapshot(
+            goal=goal, runtime_root=root, state_path=state, registry_path=source_registry,
+            include_all_archived_todos=True,
+        )
+        return project, projection, snapshot
+
+    def _storage_inspect(self) -> None:
+        try:
+            query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            if set(query) != {"goal_id"} or len(query["goal_id"]) != 1:
+                raise ValueError("goal_id is required exactly once")
+            goal_id = query["goal_id"][0]
+            registry, goal = self._registry_and_goal(goal_id)
+        except (KeyError, TypeError, ValueError):
+            self._send_error("Choose a registered Goal.", status=400, error_code="invalid_goal_storage_request")
+            return
+        try:
+            result = self._storage_owner(goal_id, action="migration-readback")
+            current = result.get("current")
+            if result.get("ok") and isinstance(current, dict) and current.get("canonical") is False:
+                root = self.server.runtime_root.resolve()
+                source_registry = self._storage_source_registry(goal_id, registry, goal, root)
+                _, projection, snapshot = self._storage_cold_snapshot(
+                    goal_id, registry, goal, root, source_registry,
+                )
+                result = source_effect_runtime_result("coordination.source.inspect_storage", {
+                    "schema_version": "loopx_cold_source_inspection_request_v0",
+                    "runtime_root": str(root),
+                    "goal_id": goal_id, "projection": projection, "source_snapshot": snapshot,
+                })
+            _, saved = self._storage_preview_read(self._storage_preview_path(goal_id), goal_id)
+            result["pending_preview"] = saved
+            self._storage_send(result, goal_id)
+        except Exception:  # noqa: BLE001 - local provider errors stay private.
+            self._send_error("Current storage unavailable.", status=503, error_code="goal_storage_unavailable")
+
+    def _storage_update(self, *, action: str) -> None:
+        try:
+            body = self._read_json()
+            preview = action == "plan-migration"
+            allowed = {"goal_id", "provider"} if preview else {"goal_id", "preview_id", "plan_sha256"}
+            if set(body) != allowed or not isinstance(body.get("goal_id"), str):
+                raise ValueError("invalid storage request")
+            goal_id = body["goal_id"]
+            self._registry_and_goal(goal_id)
+            preview_id = uuid4().hex if preview else _token(body, "preview_id", 32)
+            directory = self.server.runtime_root / "chat" / "storage-migrations"
+            if preview:
+                directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fields: dict[str, Any] = {"action": action, "plan": str(directory / f"{preview_id}.json")}
+            if preview:
+                fields["provider"] = body["provider"]
+            else:
+                fields["plan_sha256"] = _token(body, "plan_sha256", 64)
+                if action == "migrate":
+                    fields["execute"] = True
+            path = self._storage_preview_path(goal_id)
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with exclusive_file_lock(path):
+                if action == "migration-readback":
+                    # An explicit historical read must survive an unavailable
+                    # current editor record; it cannot replace or clear it.
+                    known, saved = os.path.lexists(path), None
+                else:
+                    known, saved = self._storage_preview_read(path, goal_id)
+                carrier = None if preview else self._storage_carrier(body, goal_id)
+                if action == "migrate":
+                    if known and saved != carrier:
+                        self._storage_changed_preview(goal_id)
+                        return
+                    if not known:
+                        # Retain a valid old browser-only handle before an
+                        # apply whose response or process may be lost.
+                        verified = self._storage_owner(goal_id, action="migration-readback",
+                            plan=fields["plan"], plan_sha256=fields["plan_sha256"])
+                        if not verified.get("ok"):
+                            self._storage_send(verified, goal_id, preview_id)
+                            return
+                        self._storage_preview_write(path, carrier)
+                result = self._storage_owner(goal_id, **fields)
+                if result.get("ok") and (preview or not known):
+                    carrier = {"goal_id": goal_id, "preview_id": preview_id,
+                               "plan_sha256": _token(result, "plan_sha256", 64)}
+                    self._storage_preview_write(path, carrier)
+                    result["pending_preview"] = carrier
+                if result.get("ok") and action == "migrate":
+                    # A committed result survives an independent read failure.
+                    readback = self._storage_owner(goal_id, action="migration-readback", plan=fields["plan"], plan_sha256=fields["plan_sha256"])
+                    result.update({key: readback[key] for key in ("current", "recovery", "reviewed_source", "target_provider") if key in readback})
+            self._storage_send(result, goal_id, preview_id)
+        except (KeyError, TypeError, ValueError):
+            self._send_error("Invalid Goal storage request.", status=400, error_code="invalid_goal_storage_request")
+        except Exception:  # noqa: BLE001 - preserve the original carrier on ambiguity.
+            self._send_error("Result unavailable. Read or retry the original preview.", status=503, error_code="goal_storage_unavailable")
+
+    def _storage_discard(self) -> None:
+        try:
+            body = self._read_json()
+            goal_id = body.get("goal_id")
+            if not isinstance(goal_id, str):
+                raise ValueError("goal_id is required")
+            self._registry_and_goal(goal_id)
+            carrier = self._storage_carrier(body, goal_id)
+        except (KeyError, TypeError, ValueError):
+            self._send_error("Invalid Goal storage request.", status=400, error_code="invalid_goal_storage_request")
+            return
+        try:
+            path = self._storage_preview_path(goal_id)
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with exclusive_file_lock(path):
+                known, saved = self._storage_preview_read(path, goal_id)
+                if known and saved is not None and saved != carrier:
+                    self._storage_changed_preview(goal_id)
+                    return
+                if not known:
+                    # A legacy local handle may be dismissed, but an arbitrary
+                    # token must not create a persistent dismissal marker.
+                    if "preview_id" in carrier:
+                        result = self._storage_owner(goal_id, action="migration-readback",
+                            plan=str(self.server.runtime_root / "chat" / "storage-migrations" /
+                                     f"{carrier['preview_id']}.json"), plan_sha256=carrier["plan_sha256"])
+                    else:
+                        result = source_effect_runtime_result("coordination.cold_source.import", {
+                            "schema_version": "loopx_cold_source_import_request_v0", "action": "readback",
+                            "runtime_root": str(self.server.runtime_root.resolve()), "goal_id": goal_id,
+                            "operation_id": carrier["operation_id"], "expected_plan_sha256": carrier["plan_sha256"],
+                        })
+                    if not result.get("ok"):
+                        self._storage_send(result, goal_id)
+                        return
+                self._storage_preview_write(path, None)
+            self._storage_send({"ok": True, "status": "discarded", "authority_changed": False,
+                "execution_authority_granted": False, "pending_preview": None}, goal_id)
+        except Exception:  # noqa: BLE001 - never turn an unavailable journal into empty intent.
+            self._send_error("Saved preview unavailable. Reload or restore its local record.",
+                             status=503, error_code="goal_storage_unavailable")
+
+    def _storage_import(self, *, action: str) -> None:
+        """Adapt registered source/backup IO; the shared TS owner owns cutover.
+
+        No caller filenames, overrides or client-side source summaries enter
+        the owner. Readback is read-only, including after an interrupted apply.
+        """
+        try:
+            body = self._read_json()
+            allowed = ({"goal_id", "provider", "handoff_mode"} if action == "prepare" else
+                {"goal_id", "operation_id", "plan_sha256", "writers_stopped"} if action == "apply" else
+                {"goal_id", "operation_id", "plan_sha256"})
+            if set(body) != allowed or not isinstance(body.get("goal_id"), str):
+                raise ValueError("invalid import request")
+            goal_id = body["goal_id"]
+            registry, goal = self._registry_and_goal(goal_id)
+            operation = uuid4().hex if action == "prepare" else _token(body, "operation_id", 32)
+            root = self.server.runtime_root.resolve()
+            request: dict[str, Any] = {"schema_version": "loopx_cold_source_import_request_v0",
+                "action": action, "runtime_root": str(root), "goal_id": goal_id, "operation_id": operation}
+            if action == "prepare":
+                from ..control_plane.coordination.cold_source_backup import create_cold_source_backup
+
+                registry_path = self._storage_source_registry(goal_id, registry, goal, root)
+                project, projection, snapshot = self._storage_cold_snapshot(
+                    goal_id, registry, goal, root, registry_path,
+                )
+                source_paths = [
+                    Path(snapshot["state_path"]), Path(snapshot["registry_source"]["path"]),
+                    *(Path(item["path"]) for item in snapshot["evidence_files"]),
+                    root / "goals" / goal_id / "task-leases",
+                ]
+                request.update(projection=projection, source_snapshot=snapshot,
+                    target_provider=body["provider"], target_handoff_mode=body["handoff_mode"],
+                    source_backup=create_cold_source_backup(project=project, runtime_root=root,
+                        registry_path=registry_path, goal_id=goal_id, operation_id=operation,
+                        source_paths=source_paths))
+            else:
+                request["expected_plan_sha256"] = _token(body, "plan_sha256", 64)
+                if action == "apply":
+                    request["writers_stopped"] = body["writers_stopped"]
+            path = self._storage_preview_path(goal_id)
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with exclusive_file_lock(path), ExitStack() as source_lock:
+                if action == "apply":
+                    from ..registry import find_registry_goal, load_registry
+
+                    invoked = Path(self.server.registry_path).resolve()
+                    source_lock.enter_context(exclusive_cross_runtime_file_lock(
+                        invoked, operation="cold_source_import",
+                    ))
+                    # A global index selects the source but is not in the
+                    # typed cutover's source locks. Re-read its mapping under
+                    # the registry writer's lock and retain it through Apply.
+                    registry = load_registry(invoked)
+                    current_goal = find_registry_goal(registry, goal_id)
+                    if current_goal is None:
+                        raise ValueError("registered Goal source changed")
+                    selected = self._storage_source_registry(
+                        goal_id, registry, current_goal, root, registry_path=invoked,
+                    )
+                    request["expected_source_registry"] = str(selected)
+                    if selected == invoked:
+                        # The typed owner locks this same file and verifies
+                        # its immutable plan witness before fencing. Do not
+                        # hold a second process's lock across that call.
+                        source_lock.close()
+                if action == "readback":
+                    known, saved = os.path.lexists(path), None
+                else:
+                    known, saved = self._storage_preview_read(path, goal_id)
+                carrier = {"goal_id": goal_id, "operation_id": operation,
+                           "plan_sha256": request.get("expected_plan_sha256", "")}
+                if action == "apply":
+                    if known and saved != carrier:
+                        self._storage_changed_preview(goal_id)
+                        return
+                    if not known:
+                        verified = source_effect_runtime_result("coordination.cold_source.import",
+                            {key: value for key, value in {**request, "action": "readback"}.items()
+                             if key != "writers_stopped"}, timeout=300.0, retry_safe=False)
+                        if not verified.get("ok"):
+                            self._storage_send(verified, goal_id)
+                            return
+                        self._storage_preview_write(path, carrier)
+                result = source_effect_runtime_result("coordination.cold_source.import", request,
+                    timeout=300.0, retry_safe=False)
+                if result.get("ok") and (action == "prepare" or not known):
+                    carrier["plan_sha256"] = _token(result, "plan_sha256", 64)
+                    self._storage_preview_write(path, carrier)
+                    result["pending_preview"] = carrier
+            # Read the current store independently. Original intent/receipt
+            # success never certifies a later provider or hides a read failure.
+            observed = self._storage_owner(goal_id, action="migration-readback")
+            result["current"] = observed.get("current") if observed.get("ok") else None
+            self._storage_send(result, goal_id)
+        except (KeyError, TypeError, ValueError):
+            self._send_error("Invalid Goal import request.", status=400, error_code="invalid_goal_storage_request")
+        except Exception:  # noqa: BLE001 - preserve the original carrier and private IO errors.
+            self._send_error("Import result unavailable. Keep and read the original preview.",
+                status=503, error_code="goal_storage_unavailable")

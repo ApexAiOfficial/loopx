@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ import pytest
 from loopx.control_plane.quota.slot_accounting import (
     build_quota_slot_preview_for_decision,
     build_quota_slot_spend_event,
+    record_quota_slot_spend_from_preview,
 )
 from loopx.quota import spend_quota_slot
 from loopx.rollout_event_log import rollout_event_log_path
@@ -33,6 +35,19 @@ SAFE_BYPASS_CASES = (
         id="outcome-floor-recovery",
     ),
 )
+
+
+def test_ledger_readback_legacy_exports_preserve_owner_identity() -> None:
+    from loopx.control_plane.quota import ledger_readback, slot_accounting
+
+    for name in (
+        "QUOTA_SLOT_SPENT_CLASSIFICATION",
+        "QUOTA_SLOT_VOIDED_CLASSIFICATION",
+        "load_quota_event_from_run",
+        "quota_slot_contribution",
+        "net_quota_slot_spend",
+    ):
+        assert getattr(slot_accounting, name) is getattr(ledger_readback, name), name
 
 
 def _write_run_index(runtime: Path, records: list[dict[str, Any]]) -> None:
@@ -105,6 +120,36 @@ def _poll(
     return payload
 
 
+@pytest.mark.parametrize("reason", ["额度已用尽", "quota limit reached", "budget exhausted"])
+def test_admission_refusal_transports_its_action_independently_of_prose(tmp_path: Path, reason: str) -> None:
+    preview = _preview(tmp_path, before_overrides={
+        "state": "throttled", "effective_action": "throttled_skip", "reason": reason,
+    })
+    assert preview["ok"] is False and preview["appended"] is False
+    assert preview["quota_rejection_action"] == "throttled_skip"
+    assert preview["reason"] == reason
+
+
+def test_invalid_decision_cannot_supply_a_quota_rejection_action(tmp_path: Path) -> None:
+    preview = _preview(tmp_path, before_overrides={"ok": False, "effective_action": "throttled_skip"})
+    assert preview["ok"] is False
+    assert preview["quota_rejection_action"] is None
+
+
+def test_binding_refusal_does_not_borrow_an_incidental_throttled_action(tmp_path: Path) -> None:
+    preview = build_quota_slot_preview_for_decision(
+        {}, goal_id=GOAL_ID, source="adapter", todo_id="todo_requested",
+        before={"ok": True, "should_run": False, "effective_action": "throttled_skip",
+                "selected_todo": {"todo_id": "todo_other"}},
+        after_decision=lambda _: pytest.fail("a rejected spend must not project success"),
+        quota_status_builder=lambda **_: pytest.fail("a rejected spend must not change quota"),
+        self_repair_spend_actions=frozenset(),
+    )
+    assert preview["ok"] is False
+    assert "quota_rejection_action" not in preview
+    assert "binding mismatch" in preview["reason"]
+
+
 def _spent(generated_at: str, *, agent_id: str | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "generated_at": generated_at,
@@ -122,6 +167,8 @@ def _run(
     classification: str,
     agent_id: str | None = None,
     delivery_outcome: str | None = None,
+    todo_id: str | None = None,
+    progress_observation: dict[str, Any] | None = None,
     refresh_state: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -133,6 +180,10 @@ def _run(
         payload["agent_id"] = agent_id
     if delivery_outcome:
         payload["delivery_outcome"] = delivery_outcome
+    if todo_id:
+        payload["todo_id"] = todo_id
+    if progress_observation:
+        payload["progress_observation"] = progress_observation
     if refresh_state:
         payload.update(
             {
@@ -144,7 +195,23 @@ def _run(
     return payload
 
 
-def test_unchanged_monitor_poll_is_not_accountable_delivery(tmp_path: Path) -> None:
+def _blocked_gap(evidence_ids: object) -> dict[str, Any]:
+    return _run(
+        "2026-01-01T00:01:00+00:00",
+        classification="blocked_writeback",
+        delivery_outcome="outcome_gap",
+        todo_id="todo_exact",
+        progress_observation={
+            "schema_version": "typed_progress_observation_v0",
+            "result_class": "blocked",
+            "work_item_id": "todo_exact",
+            "blocker_id": "blocker:runtime-boundary",
+            "evidence_ids": evidence_ids,
+        },
+    )
+
+
+def test_unchanged_monitor_poll_is_not_turn_settlement(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
     _write_run_index(runtime, [_poll("2026-01-01T00:00:00+00:00", material=False)])
 
@@ -152,7 +219,7 @@ def test_unchanged_monitor_poll_is_not_accountable_delivery(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize("before_overrides", SAFE_BYPASS_CASES)
-def test_safe_bypass_rejects_no_accountable_writeback(
+def test_safe_bypass_rejects_missing_turn_settlement(
     tmp_path: Path,
     before_overrides: dict[str, Any],
 ) -> None:
@@ -161,9 +228,48 @@ def test_safe_bypass_rejects_no_accountable_writeback(
     preview = _preview(runtime, before_overrides=before_overrides)
 
     assert preview["ok"] is False
-    assert "requires a latest unspent accountable delivery writeback" in preview[
-        "reason"
-    ]
+    assert "requires a latest unspent Turn settlement writeback" in preview["reason"]
+
+
+def test_safe_bypass_accepts_typed_blocker_settlement_without_progress(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    _write_run_index(
+        runtime,
+        [_blocked_gap(["evidence:runtime-boundary"])],
+    )
+
+    preview = _preview(
+        runtime,
+        before_overrides={"state": "operator_gate", "safe_bypass_allowed": True},
+    )
+
+    assert preview["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "evidence_ids",
+    [
+        "evidence:runtime-boundary",
+        {"evidence:runtime-boundary": True},
+        ["evidence:runtime-boundary", "invalid evidence id"],
+    ],
+)
+def test_safe_bypass_rejects_malformed_blocker_evidence(
+    tmp_path: Path,
+    evidence_ids: object,
+) -> None:
+    runtime = tmp_path / "runtime"
+    _write_run_index(runtime, [_blocked_gap(evidence_ids)])
+
+    preview = _preview(
+        runtime,
+        before_overrides={"state": "operator_gate", "safe_bypass_allowed": True},
+    )
+
+    assert preview["ok"] is False
+    assert "requires a latest unspent Turn settlement writeback" in preview["reason"]
 
 
 @pytest.mark.parametrize("before_overrides", SAFE_BYPASS_CASES)
@@ -212,6 +318,77 @@ def test_safe_bypass_consumes_accountable_writeback_once_across_neutral_refresh(
     assert _preview(runtime, before_overrides=before_overrides)["ok"] is False
 
 
+def test_alias_safe_bypass_ignores_exact_delivery(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    exact_delivery = {
+        **_run(
+            "2026-01-01T00:01:00+00:00",
+            classification="validated_fallback",
+            delivery_outcome="outcome_progress",
+        ),
+        "goal_ref": {
+            "goal_id": GOAL_ID,
+            "goal_instance_id": "ginst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+    }
+    _write_run_index(runtime, [exact_delivery])
+
+    preview = _preview(
+        runtime,
+        before_overrides={"state": "operator_gate", "safe_bypass_allowed": True},
+    )
+
+    assert preview["ok"] is False
+    assert "requires a latest unspent Turn settlement writeback" in preview["reason"]
+
+
+def test_alias_safe_bypass_ignores_exact_spend_and_commits_once(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    legacy_delivery = _run(
+        "2026-01-01T00:01:00+00:00",
+        classification="validated_fallback",
+        delivery_outcome="outcome_progress",
+    )
+    exact_spend = {
+        **_spent("2026-01-01T00:02:00+00:00"),
+        "goal_ref": {
+            "goal_id": GOAL_ID,
+            "goal_instance_id": "ginst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+    }
+    _write_run_index(runtime, [legacy_delivery, exact_spend])
+    before_overrides = {
+        "state": "operator_gate",
+        "safe_bypass_allowed": True,
+    }
+
+    preview = _preview(runtime, before_overrides=before_overrides)
+
+    assert preview["ok"] is True
+    assert preview["delivery_run_classification"] == "validated_fallback"
+    index_path = runtime / "goals" / GOAL_ID / "runs" / "index.jsonl"
+    preview["expected_index_digest"] = (
+        f"sha256:{hashlib.sha256(index_path.read_bytes()).hexdigest()}"
+    )
+    committed = record_quota_slot_spend_from_preview(
+        preview,
+        {"runtime_root": str(runtime)},
+        goal_id=GOAL_ID,
+        execute=True,
+    )
+    assert committed["ok"] is True
+    assert committed["appended"] is True
+    rows = [
+        json.loads(line)
+        for line in index_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[-1]["classification"] == "quota_slot_spent"
+    assert "goal_ref" not in rows[-1]
+    assert _preview(runtime, before_overrides=before_overrides)["ok"] is False
+
+
 def test_material_monitor_poll_builds_attributed_spend_event(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
     material_poll = _poll(
@@ -225,6 +402,14 @@ def test_material_monitor_poll_builds_attributed_spend_event(tmp_path: Path) -> 
 
     assert preview["ok"] is True
     assert preview["delivery_completion_spend"] is True
+    assert preview["accounting_projection"] == {
+        "schema_version": "quota_slot_accounting_projection_v0",
+        "settlement_event_semantics": "append_only",
+        "spent_slots_semantics": "rolling_window_aggregate",
+        "before_after_semantics": "same_status_payload_projection",
+        "window_hours": 24,
+    }
+    assert "does not replay or undo" in preview["rolling_window_note"]
     assert preview["delivery_run_classification"] == "quota_monitor_poll"
     assert preview["delivery_run_generated_at"] == material_poll["generated_at"]
     assert preview["delivery_run_agent_id"] == AGENT_A
@@ -601,6 +786,79 @@ def test_heartbeat_spend_requires_todo_binding(tmp_path: Path) -> None:
     assert "requires --todo-id todo_selected_binding" in preview["reason"]
 
 
+def test_visible_goal_spend_fails_typed_without_turn_binding(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    before = _normal_run_before(todo_id="todo_selected_binding")
+
+    preview = build_quota_slot_preview_for_decision(
+        _normal_run_status(runtime),
+        goal_id=GOAL_ID,
+        before=before,
+        after_decision=lambda _: before,
+        quota_status_builder=lambda goal, **_: goal["quota"],
+        self_repair_spend_actions=frozenset(),
+        agent_id=AGENT_A,
+        source="visible-goal",
+    )
+
+    assert preview["ok"] is False
+    assert preview["appended"] is False
+    assert preview["delivery_workspace_causality"] is None
+    assert preview["settlement_result"]["failure"] == {
+        "kind": "identity_mismatch",
+        "step_kind": "validation",
+        "reason": (
+            "visible Goal settlement requires exactly one todo_id or "
+            "replan_obligation_id binding"
+        ),
+        "details": {
+            "source": "visible-goal",
+            "selected_todo_id": "todo_selected_binding",
+            "requested_todo_id": None,
+            "requested_replan_obligation_id": None,
+            "turn_instance_id": None,
+        },
+    }
+
+
+def test_visible_goal_turn_scoped_spend_preserves_settlement_identity(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    todo_id = "todo_visible_goal_delivery"
+    turn_instance_id = "guided-start:visible-goal-delivery"
+    effect_id = _write_typed_settlement_fixture(
+        runtime,
+        todo_id=todo_id,
+        turn_instance_id=turn_instance_id,
+        workspace_requirement="not_required",
+    )
+    before = _normal_run_before(todo_id=todo_id)
+
+    preview = build_quota_slot_preview_for_decision(
+        _normal_run_status(runtime),
+        goal_id=GOAL_ID,
+        before=before,
+        after_decision=lambda _: {
+            **before,
+            "quota": {**before["quota"], "spent_slots": 1},
+        },
+        quota_status_builder=lambda goal, **_: goal["quota"],
+        self_repair_spend_actions=frozenset(),
+        agent_id=AGENT_A,
+        todo_id=todo_id,
+        turn_instance_id=turn_instance_id,
+        source="visible-goal",
+    )
+
+    assert preview["ok"] is True, preview
+    assert preview["todo_id"] == todo_id
+    assert preview["turn_instance_id"] == turn_instance_id
+    assert preview["settlement_identity"]["effect_id"] == effect_id
+    assert preview["delivery_workspace_causality"]["todo_id"] == todo_id
+    assert preview["delivery_workspace_causality"]["requirement"] == "not_required"
+
+
 def test_heartbeat_spend_rejects_mismatched_todo_binding(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
     before = _normal_run_before(todo_id="todo_selected_binding")
@@ -733,6 +991,62 @@ def test_current_unknown_workspace_causality_fails_closed_without_snapshot(
     assert preview["delivery_workspace_validated"] is False
 
 
+def test_unknown_workspace_causality_reloads_repaired_todo_contract(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    original_todo_id = "todo_repaired_delivery"
+    turn_instance_id = "turn-repaired-delivery"
+    _write_typed_settlement_fixture(
+        runtime,
+        todo_id=original_todo_id,
+        turn_instance_id=turn_instance_id,
+        workspace_requirement="unknown",
+    )
+    before = _normal_run_before(todo_id="todo_new_successor")
+    status = _normal_run_status(runtime)
+    status["attention_queue"]["items"][0]["project_asset"] = {
+        "agent_todos": {
+            "items": [
+                {
+                    "todo_id": original_todo_id,
+                    "task_repository": "git:github.com/example/loopx",
+                    "required_write_scopes": ["loopx/**"],
+                }
+            ]
+        }
+    }
+
+    preview = build_quota_slot_preview_for_decision(
+        status,
+        goal_id=GOAL_ID,
+        before=before,
+        after_decision=lambda _: {
+            **before,
+            "quota": {**before["quota"], "spent_slots": 1},
+        },
+        quota_status_builder=lambda goal, **_: goal["quota"],
+        self_repair_spend_actions=frozenset(),
+        agent_id=AGENT_A,
+        todo_id=original_todo_id,
+        turn_instance_id=turn_instance_id,
+        source="heartbeat",
+    )
+
+    assert preview["ok"] is False
+    assert "requires a valid delivery workspace snapshot" in preview["reason"]
+    assert preview["delivery_workspace_causality"] == {
+        "schema_version": "delivery_workspace_causality_v0",
+        "todo_id": original_todo_id,
+        "requirement": "required",
+        "source": "current_todo_contract_repair",
+        "reason": "declared_repository_or_write_contract",
+    }
+    assert preview["delivery_workspace_resolution"]["decision"] == (
+        "require_snapshot"
+    )
+
+
 def test_implicit_heartbeat_identity_fails_closed_on_persisted_effect_drift(
     tmp_path: Path,
 ) -> None:
@@ -800,6 +1114,75 @@ def test_implicit_heartbeat_spend_replays_exactly_once_after_frontier_moves(
     assert replay["appended"] is False
     assert replay["idempotent_replay"] is True
     assert replay["turn_instance_id"] == turn_instance_id
+
+
+@pytest.mark.parametrize(
+    "agent_id",
+    [pytest.param(None, id="missing-agent"), pytest.param(AGENT_B, id="other-agent")],
+)
+def test_effect_ref_replay_requires_same_agent_identity(
+    tmp_path: Path,
+    agent_id: str | None,
+) -> None:
+    runtime = tmp_path / "runtime"
+    effect_ref = "provider-effect-replay-1"
+    _write_run_index(
+        runtime,
+        [
+            {
+                **_run(
+                    "2026-01-01T00:01:00+00:00",
+                    classification="quota_slot_spent",
+                    agent_id=AGENT_A,
+                ),
+                "effect_ref": effect_ref,
+            }
+        ],
+    )
+
+    replay = spend_quota_slot(
+        {"runtime_root": str(runtime)},
+        goal_id=GOAL_ID,
+        execute=True,
+        agent_id=agent_id,
+        effect_ref=effect_ref,
+    )
+
+    assert replay["ok"] is False, replay
+    assert replay["appended"] is False
+    assert replay.get("idempotent_replay") is not True
+    assert replay["reason"] == "effect_ref replay requires the same valid agent identity"
+
+
+def test_effect_ref_replay_accepts_same_agent_identity(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    effect_ref = "provider-effect-replay-2"
+    _write_run_index(
+        runtime,
+        [
+            {
+                **_run(
+                    "2026-01-01T00:01:00+00:00",
+                    classification="quota_slot_spent",
+                    agent_id=AGENT_A,
+                ),
+                "effect_ref": effect_ref,
+            }
+        ],
+    )
+
+    replay = spend_quota_slot(
+        {"runtime_root": str(runtime)},
+        goal_id=GOAL_ID,
+        execute=True,
+        agent_id=AGENT_A,
+        effect_ref=effect_ref,
+    )
+
+    assert replay["ok"] is True, replay
+    assert replay["appended"] is False
+    assert replay["idempotent_replay"] is True
+    assert replay["agent_id"] == AGENT_A
 
 
 def test_turn_scoped_spend_keeps_original_todo_across_successor_reselection(

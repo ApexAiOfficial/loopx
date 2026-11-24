@@ -1,0 +1,204 @@
+# Manager runtime profile v0
+
+- **RFC status:** Accepted
+  [capable-manager-semantic-handoff-v0](capable-manager-semantic-handoff-v0.md))
+- **Supersedes / closes:** none
+
+> Language note: the
+> [Chinese version](./manager-runtime-profile-v0.zh-CN.md)
+> and this English version are semantic mirrors. A difference between them is
+> a defect.
+
+### Problem
+
+The original LoopX manager was a restricted planning conversation. It could read scoped,
+structured Goal context but could not use the host's filesystem, shell, Git, web access, or
+configured connectors. That former installation default also turns ordinary work
+already authorized by the owner into delegation, waiting, or manual context transfer.
+
+Removing a prompt sentence is insufficient. The host sandbox, prompt, managed workspace
+instructions, persistent configuration, and Session readback must describe the same effective
+mode; otherwise the UI can claim an enabled profile while an old upstream thread remains
+read-only.
+
+### Contract
+
+`manager_runtime_profile_v0` is the machine-level host-tool policy. The private owner manager
+ships with host tools; an explicit machine choice overrides that default. The Codex steward
+ships with `gpt-6.1-sol` and `xhigh`; machine and service overrides retain their precedence.
+These defaults do not change ordinary Goal Chat models or grant other Agents tools:
+
+- An explicit `restricted` choice keeps scoped LoopX reads and the Codex sandbox is
+  `read-only`.
+- The default `trusted_owner` lets the Codex manager use normal host filesystem, shell, Git, web, and
+  configured-connector tools. Its Codex sandbox is `danger-full-access`.
+  Ordinary authorized requests now execute in the current conversation using the relevant
+  project's instructions and skills, verifying file edits by readback and durable LoopX
+  state changes by their existing typed receipts. A similar registered
+  responsibility alone no longer forces an inbox handoff. Explicitly assigned owners,
+  established Goal work and tasks needing another Agent's context or execution grant still
+  use delegation. An absent worker binding neither grants worker launch nor removes the
+  manager's own host grant. Completed local work creates no replacement Goal or Todo.
+- `trusted_owner` is not ambient authority. The current request and existing standing grants
+  still bound the work. Protected merge, release, deploy, delete, and payment operations retain
+  their typed contracts. Provider permission, audience, and durable LoopX state ownership do
+  not change.
+- Codex and the local Antigravity Language Server support `trusted_owner`. Antigravity uses
+  its signed-in host's existing tool permissions and native approvals; LoopX never automatically
+  accepts those approvals. A waiting interaction returns an actionable gate. Other endpoints
+  fail with an actionable typed error instead of pretending to provide the selected profile.
+- Antigravity's `restricted` Chat is text-only: each invocation explicitly disables native tool
+  calling and uses the read-only planner mode rather than inheriting a previous invocation's
+  tool configuration. This is a provider tool restriction, not a Codex or operating-system
+  sandbox. Trusted-owner remains limited to the existing verified owner audience. Governed
+  Task execution, workspace filesystem grants and native managed steward identity preparation
+  retain their existing Codex owner; selecting Antigravity does not widen those contracts.
+  Registered Argon and Carbon tiers must be offered by the local account and match the
+  `reasoning_effort` (`low`, `medium`, or `high`). Model discovery reads the same
+  account metadata without opening a cascade; an unavailable catalog is an explicit error,
+  not a static list of supposedly available models. Antigravity's default remains Argon;
+  operators who want another offered tier (such as Carbon `gemini-4-carbon-high`) for an
+  endpoint on a specific machine configure it explicitly via top-level `executor_model` or
+  optional per-endpoint `endpoint_models` entries on `steward_executor_machine_defaults_v1`.
+  Ordered `eligible_endpoints` and bidirectional flexible failover between `codex` and
+  `antigravity` route exhausted Codex stewards onto the configured fallback endpoint (and back
+  to Codex once restored) with model-isolated reasoning effort and native steward monitor/report
+  parity on the qualified fallback Session.
+  A missing original cascade fails resume without silently starting a replacement. Stop waits
+  for the native cascade to become idle; timeout or partial output is not successful completion.
+  During execution, native `IDLE` alone is not completion: it can appear between input, tool
+  and planner steps. LoopX keeps observing the original invocation without resending input;
+  completion requires a final answer with the normal stop marker and all covered current
+  steps to be done, matching native result recovery's completion requirement.
+  Transient idle does not extend the existing no-progress or hard deadline. Permission gates,
+  native errors, unverified stop reasons and another input retain their existing refusal paths.
+  Read-only polling transport loss does not resend the input or reset its idle/hard deadline.
+  Native retry/error steps remain owned by the running cascade; only a settled terminal error
+  fails the adapter, with its structured native cause retained. Host heartbeat and bounded
+  Stop-hook recovery use the separate [Antigravity host procedure](../../../skills/loopx-project/references/heartbeat-hosts.md#antigravity-app).
+  These source boundaries do not establish upstream network repair or sustained long-run reliability.
+- Antigravity manager inputs place the complete original user message before the frozen Core
+  evidence, encoding that message as a JSON string so whitespace and quoted transport markers
+  remain exact. Original-result recovery recognizes both this framing and historical
+  evidence-first inputs, with the same source, input-time, prompt-hash and native terminal
+  checks.
+- A trusted-owner Antigravity manager can read supporting delivery histories progressively
+  through the existing private capture/JSON Pointer CLI. Current Goal, Todo, attention,
+  permission and source-quality fields, including unknown fields, stay inline. Only a known
+  `recent_delivery_history.deliveries` payload is deferred: its window, coverage and source
+  metadata remain visible, with `status=not_read` and an executable read reference. The
+  complete originally supplied Core snapshot remains recoverable. For example,
+  `/goals/0/recent_delivery_history` addresses the first Goal's captured history; use its
+  emitted selection command, or the index command when the address is unknown. This is a
+  frozen snapshot reader, not the Codex-only live `loopx_manager_read` tool or a delta baseline.
+  Before relying on that history, read the required section through its final page. Context
+  loss recovers from the same capture without resending the request or repeating effects.
+- The manager selects history delivery automatically according to its authorized reader.
+  Existing explicit `context_delivery.antigravity_mode=off` preferences and the host environment
+  `LOOPX_CONTEXT_DELIVERY=off` retain complete inline history.
+  Restricted/text-only hosts, invalid settings and unavailable private capture IO also retain
+  that input; no host permission or approval is changed. These references preserve only the
+  already-authorized snapshot, not fresh observation or action authority. Capture files stay
+  private in the Chat store, outside the selected project's checkout. RPC and real CLI
+  fixtures qualify input, recovery and refusal behavior; actual model reads, installed host
+  limits, full costs and long-horizon benefit remain separate qualifications. Codex delta
+  activation and native-hook continuity are unchanged.
+- `trusted_owner` applies to the local private owner-manager and a native private steward
+  binding freshly verified by the existing Core conversation owner. That owner checks the
+  App, owner principal, private source, current resource grant and frozen Session identity.
+  The audience proof alone grants no tools: the effective machine policy still applies,
+  including an explicit restricted choice.
+  Other external audiences, including Lark groups and workspace-only resources, remain
+  `restricted`. Project assistants retain their separate workspace grant.
+
+Configuration reuses the existing capability workbench and its
+`preview -> apply -> readback` transaction. There is no second configuration source. Missing
+configuration uses `trusted_owner` for the private owner; invalid configuration falls back to
+`restricted` and projects `configuration_invalid` plus a repair action.
+
+### Session consistency
+
+Each manager Session records the profile, sandbox, standing grant, tool classes, configuration
+revision, and status used to start its upstream thread. A change to the effective manager
+namespace closes the old upstream thread and starts a new one with visible history, preventing
+stale sandbox or prompt state. Changes to unrelated machine capabilities do not rotate a healthy
+manager. A healthy legacy Session already equivalent to an explicit restricted policy is backfilled
+without an unnecessary restart.
+
+When this existing migration starts a fresh Antigravity thread, its first input carries
+the complete supplied visible user/assistant history as JSON data. Earlier constraints,
+message order and significant whitespace survive; a fixed last-16-message window cannot
+replace that history. Subsequent Turns and a successful native resume do not replay it.
+The original Chat store, Session, source permissions and native tool approvals remain the
+owners; this does not transfer history between distinct Sessions, and loading history
+alone dispatches no work. Full migration input can grow. Source/RPC qualification does not establish a
+real model's adoption, token savings or a net cost improvement.
+
+Dashboard shows both machine configuration and current Session readback. CLI/managed Turn,
+Dashboard, and Lark all use the same manager runtime controller. Lark remains an entry point and
+projection of that Session; it does not own a separate profile or permission state. Native
+owner-private bindings reuse Core's fresh audience/resource verification before starting or
+reusing a host; no channel-name inference, persisted proof or manager-specific ACL replaces it.
+A revoked binding or changed App/owner stops admission.
+
+Saving machine defaults does not move an existing steward to another executor endpoint.
+The original private conversation's model menu offers **Apply to this conversation** for
+the saved preferred/pinned executor, model and reasoning effort. Its preview opens no
+native thread. Apply requires an idle Session with no active or reserved queued work,
+registered worker, parked native work or answer-review route. It prepares the selected
+host without dispatching a model Turn, after closing the old idle transport and capturing
+the complete visible history. When only the Codex model or reasoning effort changes
+and the current working checkpoint is available, apply reuses the model-resume path
+to verify and continue the same native thread without reinjecting history. If that
+checkpoint fails verification, apply stops before closing the original transport.
+An executor migration restores the visible history on the new native thread.
+Only provider-observed model and effort can be committed to the same Session.
+The source binding remains unchanged;
+Core verifies its live owner, source and resource grant again, and subsequent inputs use
+the explicitly accepted Session allocation with retained original native provenance.
+
+The Session store checks the original identity, selected binding, saved configuration,
+queue and captured transcript again under its publication locks. A changed source,
+revoked owner, new queued input, returned message or unconfirmed host setting rejects
+publication and closes the unpublished transport. Canonical history and queued work
+remain available for recovery. After a lost response, read the actual Session first:
+an already applied allocation needs no second preparation. The menu displays that actual
+executor/model readback; saving defaults, preparing a host, executing a model Turn and
+installing the changed service remain distinct observations. Other conversations,
+ordinary model settings and flexible quota recovery retain their existing owners.
+
+This slice implements only the private-owner M1 journey in
+[capable-manager-semantic-handoff-v0](capable-manager-semantic-handoff-v0.md), targeting A1–A3/A12.
+It does not implement the M2 collaboration request, the M3 outbox, or treat manager Session fields
+as work, request, or delivery authority.
+
+### Implementation and successor
+
+`43d362532` introduced the machine profile. Native private steward bindings now carry a fresh
+Core owner-audience proof into that existing profile at open, resume and authorization-scope
+refresh. The private owner installation default is `trusted_owner`. Selecting DSH does not make
+that endpoint support the capable profile; its existing actionable refusal remains. Source/RPC
+tests do not certify installed live-model work or desktop notification
+delivery. Follow [roadmap](loopx-overall-roadmap-v0.md) R2 for those remaining qualifications.
+
+### Acceptance
+
+1. A default private owner installation starts `trusted_owner`, `gpt-6.1-sol` and `xhigh`.
+   Explicit `restricted` and invalid-configuration fallback remain read-only; other audiences
+   do not inherit the default tools.
+2. Machine configuration preview/apply/readback persists `trusted_owner`.
+3. A new Codex manager thread sends `danger-full-access` to app-server, and its Turn prompt and
+   managed `AGENTS.md` no longer contain the read-only restriction.
+4. A profile change rotates the upstream thread while preserving the LoopX Session and visible
+   history.
+5. An unrelated machine-configuration change does not rotate the thread.
+6. Codex and Antigravity support the verified private owner's `trusted_owner` profile while
+   retaining their native permission and approval boundaries. An unsupported endpoint fails
+   closed and recommends a supported executor or restoring `restricted`.
+7. Desktop and mobile Dashboard show the effective profile; invalid configuration shows its
+   fallback state.
+8. An external audience without an existing scoped grant remains `read-only` and exposes the
+   effective downgrade accurately.
+9. A verified native private steward uses the effective machine policy, preserves its Session
+   and history across profile changes/restarts, and rechecks binding/provider identity before
+   healthy-host reuse. Other Apps, groups and workspace-only resources do not inherit it.

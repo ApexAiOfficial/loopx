@@ -13,7 +13,7 @@ from loopx.capabilities.benchmark_toolkit.native_codex_profile import (
     compact_native_codex_profile_receipt,
     inspect_native_codex_profile,
     install_native_codex_profile,
-    native_codex_app_server_environment,
+    native_codex_app_server_shell_policy_args,
     native_codex_profile_environment,
     render_native_codex_goal_prompt,
 )
@@ -84,51 +84,49 @@ def test_compact_profile_receipt_excludes_local_paths() -> None:
     assert "/private" not in rendered
 
 
-def test_app_server_environment_explicitly_admits_only_provider_value(
-    tmp_path: Path,
-) -> None:
+def test_profile_environment_excludes_ambient_provider_values(tmp_path: Path) -> None:
     profile = _fake_profile(tmp_path)
     base_env = {
         "PATH": "/usr/bin:/bin",
         "CODEX_GOAL_API_KEY": "provider-value",
         "UNRELATED_PRIVATE_VALUE": "must-not-pass",
     }
-    original_base_env = dict(base_env)
-
     profile_env = native_codex_profile_environment(profile, base_env=base_env)
-    app_server_env = native_codex_app_server_environment(
-        profile,
-        provider_env_key="CODEX_GOAL_API_KEY",
-        base_env=base_env,
-    )
 
     assert "CODEX_GOAL_API_KEY" not in profile_env
     assert "UNRELATED_PRIVATE_VALUE" not in profile_env
-    assert app_server_env["CODEX_GOAL_API_KEY"] == "provider-value"
-    assert "UNRELATED_PRIVATE_VALUE" not in app_server_env
-    assert app_server_env["CODEX_HOME"] == str(profile.codex_home)
-    assert base_env == original_base_env
+    assert profile_env["CODEX_HOME"] == str(profile.codex_home)
 
 
-def test_app_server_environment_rejects_invalid_or_missing_provider_key(
-    tmp_path: Path,
+def test_native_codex_app_server_shell_policy_is_explicit_and_fail_closed() -> None:
+    args = native_codex_app_server_shell_policy_args(
+        excluded_env_keys=("SECOND_PROVIDER_KEY", "PRIMARY_PROVIDER_KEY"),
+    )
+    assert args == (
+        "-c",
+        'shell_environment_policy.inherit="core"',
+        "-c",
+        "shell_environment_policy.ignore_default_excludes=false",
+        "-c",
+        (
+            'shell_environment_policy.include_only=["HOME", "LANG", "LC_ALL", '
+            '"LC_CTYPE", "LOGNAME", "PATH", "SHELL", "SSL_CERT_DIR", '
+            '"SSL_CERT_FILE", "TERM", "TMPDIR", "TZ", "USER"]'
+        ),
+        "-c",
+        'shell_environment_policy.exclude=["PRIMARY_PROVIDER_KEY", "SECOND_PROVIDER_KEY"]',
+        "-c",
+        'shell_environment_policy.set.LOOPX_USAGE_PING="0"',
+    )
+
+
+@pytest.mark.parametrize("excluded_env_key", ("", "invalid-key", "WITH SPACE"))
+def test_native_codex_app_server_shell_policy_rejects_unsafe_keys(
+    excluded_env_key: str,
 ) -> None:
-    profile = _fake_profile(tmp_path)
-
-    with pytest.raises(ValueError, match="provider_env_key"):
-        native_codex_app_server_environment(
-            profile,
-            provider_env_key="invalid-key",
-            base_env={"invalid-key": "value"},
-        )
-    with pytest.raises(
-        NativeCodexProfileError,
-        match="provider_environment_value_missing:CODEX_GOAL_API_KEY",
-    ):
-        native_codex_app_server_environment(
-            profile,
-            provider_env_key="CODEX_GOAL_API_KEY",
-            base_env={"PATH": "/usr/bin:/bin"},
+    with pytest.raises(ValueError, match="excluded_env_keys"):
+        native_codex_app_server_shell_policy_args(
+            excluded_env_keys=(excluded_env_key,),
         )
 
 

@@ -17,12 +17,16 @@ NOISE_TERMS = (
     "loopear",
 )
 
+# Both repository addresses are strong: the project moved to `loopx-project` and
+# archived pages, release notes and citations still name the pre-transfer one.
 STRONG_TERMS = (
     "huangruiteng",
     "loop engineering",
     "agent control plane",
     "local-first agent",
     "github.com/huangruiteng/loopx",
+    "loopx-project",
+    "github.com/loopx-project/loopx",
     "loopx project",
     "loopx repo",
 )

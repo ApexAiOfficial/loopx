@@ -7,10 +7,10 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from ..control_plane.projects.registry_codec import mutate_project_registry
 from ..control_plane.runtime.public_safety import validate_public_safe_value
-from ..file_lock import exclusive_file_lock
 from ..history import load_registry
-from ..registry import atomic_write_json, find_registry_goal
+from ..registry import find_registry_goal
 from .manifest import EXTERNAL_CAPABILITY_PROFILE_SCHEMA_VERSION
 from .runtime import (
     execute_extension_runtime_binding,
@@ -398,10 +398,10 @@ def bind_external_capability_to_goal(
         return receipt, {**goal, "external_capability_bindings": merged}
 
     if execute:
-        with exclusive_file_lock(path, operation="bind_external_capability_to_goal"):
-            if not path.is_file():
-                raise ValueError(f"LoopX registry does not exist: {path}")
-            registry = load_registry(path)
+        if not path.is_file():
+            raise ValueError(f"LoopX registry does not exist: {path}")
+
+        def reduce(registry: dict[str, Any]) -> dict[str, Any]:
             receipt, updated_goal = prepare(registry)
             if not receipt["changed"]:
                 return receipt
@@ -415,9 +415,14 @@ def bind_external_capability_to_goal(
                 else item
                 for item in goals
             ]
-            atomic_write_json(path, registry, preserve_mode=True)
             receipt["written"] = True
             return receipt
+
+        return mutate_project_registry(
+            path,
+            operation="bind_external_capability_to_goal",
+            reducer=reduce,
+        )
 
     if not path.is_file():
         raise ValueError(f"LoopX registry does not exist: {path}")

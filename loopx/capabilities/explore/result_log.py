@@ -18,9 +18,10 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from ...file_lock import exclusive_file_lock
+from ...control_plane.runtime.time import chronology_key
 
 
 EXPLORE_RESULT_EVENT_SCHEMA_VERSION = "loopx_explore_result_event_v0"
@@ -78,7 +79,12 @@ FINDING_STATUSES = {
 }
 
 TITLE_LIMIT = 200
-SUMMARY_LIMIT = 1200
+# A writeback finding includes its revision, applicability, observation and
+# complete route decision. Bound display separately without clipping that scope.
+SUMMARY_LIMIT = 2000
+# Persisted source compatibility includes the historical compactor's
+# two-character ellipsis overflow; it is independent of the writer budget.
+PERSISTED_TEXT_LIMIT = 2002
 REF_LIMIT = 240
 MAX_EVIDENCE_REFS = 16
 MAX_TAGS = 8
@@ -140,7 +146,18 @@ def _compact_text(value: Any, *, limit: int, field: str) -> str:
     return text[: max(0, limit - 1)].rstrip() + "..."
 
 
-def _safe_public_ref(value: Any, *, field: str) -> str:
+def _persisted_text(value: Any, *, field: str) -> str:
+    """Validate stored source text without applying a current writer's budget."""
+    text = _compact_text(value, limit=PERSISTED_TEXT_LIMIT, field=field)
+    if len(text) > PERSISTED_TEXT_LIMIT or text != str(value or ""):
+        raise ValueError(
+            f"{field} must be canonical text within {PERSISTED_TEXT_LIMIT} characters"
+        )
+    return text
+
+
+def validate_explore_public_ref(value: Any, *, field: str) -> str:
+    """Canonicalize a reference using the Explore reader/writer privacy boundary."""
     text = _compact_text(value, limit=REF_LIMIT, field=field)
     if not text:
         raise ValueError(f"{field} is empty")
@@ -159,7 +176,7 @@ def _safe_public_ref(value: Any, *, field: str) -> str:
 def _safe_public_refs(values: Sequence[Any] | None, *, field: str, max_items: int) -> list[str]:
     refs: list[str] = []
     for index, value in enumerate(values or []):
-        refs.append(_safe_public_ref(value, field=f"{field}[{index}]"))
+        refs.append(validate_explore_public_ref(value, field=f"{field}[{index}]"))
     return refs[:max_items]
 
 
@@ -182,7 +199,10 @@ def _safe_goal_id(value: Any) -> str:
 def _safe_confidence(value: Any) -> float | None:
     if value is None:
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("confidence must be a number") from exc
     if not 0.0 <= number <= 1.0:
         raise ValueError("confidence must be between 0 and 1")
     return round(number, 3)
@@ -218,7 +238,7 @@ def _choice(value: Any, *, choices: set[str], default: str, field: str) -> str:
 def build_explore_node_event(
     *,
     goal_id: str,
-    title: str,
+    title: object,
     node_id: str | None = None,
     node_kind: str | None = None,
     status: str | None = None,
@@ -231,6 +251,7 @@ def build_explore_node_event(
     tags: Sequence[str] | None = None,
     supersedes: str | None = None,
     recorded_at: str | None = None,
+    research_observation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     safe_goal_id = _safe_goal_id(goal_id)
     safe_title = _compact_text(title, limit=TITLE_LIMIT, field="title")
@@ -263,6 +284,12 @@ def build_explore_node_event(
         event["blocked_reason"] = safe_blocked_reason
     if parent_id:
         event["parent_id"] = _safe_result_id(parent_id, field="parent_id")
+    if research_observation is not None:
+        from .research_evidence import normalize_research_observation
+        observation = normalize_research_observation(research_observation)
+        if observation["explore_node_id"] != event["result_id"]:
+            raise ValueError("research observation belongs to a different node")
+        event["research_observation"] = observation
     event["event_id"] = _event_id(event)
     return event
 
@@ -270,9 +297,9 @@ def build_explore_node_event(
 def build_explore_edge_event(
     *,
     goal_id: str,
-    from_node: str,
-    to_node: str,
-    edge_type: str,
+    from_node: object,
+    to_node: object,
+    edge_type: object,
     summary: str | None = None,
     confidence: float | None = None,
     agent_id: str | None = None,
@@ -311,7 +338,7 @@ def build_explore_edge_event(
 def build_explore_finding_event(
     *,
     goal_id: str,
-    title: str,
+    title: object,
     finding_id: str | None = None,
     node_id: str | None = None,
     status: str | None = None,
@@ -323,6 +350,11 @@ def build_explore_finding_event(
     tags: Sequence[str] | None = None,
     supersedes: str | None = None,
     recorded_at: str | None = None,
+    execution_observation: Mapping[str, Any] | None = None,
+    measurements: Sequence[Mapping[str, Any]] | None = None,
+    work_yardstick: Mapping[str, Any] | None = None,
+    work_binding: Mapping[str, Any] | None = None,
+    _check_execution_measurements: bool = True,
 ) -> dict[str, Any]:
     safe_goal_id = _safe_goal_id(goal_id)
     safe_title = _compact_text(title, limit=TITLE_LIMIT, field="title")
@@ -353,6 +385,47 @@ def build_explore_finding_event(
     safe_confidence = _safe_confidence(confidence)
     if safe_confidence is not None:
         event["confidence"] = safe_confidence
+    if execution_observation is not None:
+        from .execution_observation import normalize_execution_observation
+
+        observed = normalize_execution_observation(execution_observation)
+        if any(ref not in event.get("evidence_refs", []) for ref in observed["evidence_refs"]):
+            raise ValueError("execution evidence must be included in the finding's evidence_refs")
+        event["execution_observation"] = observed
+    if measurements is not None:
+        from .measurements import normalize_measurements
+
+        if not node_id:
+            raise ValueError("measurements require an explicit node")
+        measured = normalize_measurements(
+            measurements, **({"execution_observation": event.get("execution_observation")}
+                if _check_execution_measurements else {}),
+        )
+        if any(item["evidence_ref"] not in event.get("evidence_refs", []) for item in measured):
+            raise ValueError("measurement evidence must be included in the finding's evidence_refs")
+        event["measurements"] = measured
+    if work_yardstick is not None:
+        from ...control_plane.work_items.yardstick_decision import normalize_work_yardstick_capture
+        event["work_yardstick"] = normalize_work_yardstick_capture(
+            work_yardstick, goal_id=safe_goal_id, agent_id=str(agent_id or ""),
+            evidence_refs=event.get("evidence_refs", []),
+        )
+    if work_binding is not None:
+        if (not isinstance(work_binding, Mapping)
+                or set(work_binding) != {"goal_id", "agent_id", "todo_id", "turn_instance_id"}
+                or work_binding["goal_id"] != safe_goal_id
+                or work_binding["agent_id"] != event.get("agent_id")
+                or not work_binding["agent_id"] or not node_id):
+            raise ValueError("Explore work binding must match the finding's Goal, Agent and question")
+        binding = {
+            key: validate_explore_public_ref(value, field=f"work_binding.{key}")
+            for key, value in work_binding.items()
+        }
+        if (binding != work_binding
+                or not _safe_result_id(binding["todo_id"], field="work_binding.todo_id").startswith("todo_")
+                or ("work_yardstick" in event and event["work_yardstick"]["binding"] != binding)):
+            raise ValueError("Explore finding requires a canonical work binding")
+        event["work_binding"] = binding
     event["event_id"] = _event_id(event)
     return event
 
@@ -361,7 +434,7 @@ def _base_event(
     *,
     goal_id: str,
     event_kind: str,
-    title: str,
+    title: object,
     summary: str | None,
     agent_id: str | None,
     run_id: str | None,
@@ -384,7 +457,7 @@ def _base_event(
     if agent_id:
         event["agent_id"] = _compact_text(agent_id, limit=80, field="agent_id")
     if run_id:
-        event["run_id"] = _safe_public_ref(run_id, field="run_id")
+        event["run_id"] = validate_explore_public_ref(run_id, field="run_id")
     refs = _safe_public_refs(evidence_refs, field="evidence_refs", max_items=MAX_EVIDENCE_REFS)
     if refs:
         event["evidence_refs"] = refs
@@ -409,7 +482,10 @@ def validate_explore_result_event(
 
     Event builders are the schema authority. Rebuilding the event catches
     unknown fields, invalid ids, unsafe text, forged boundary flags, and stale
-    event ids without maintaining a second field-level validator.
+    event ids. Persisted text has its own bounded compatibility budget: it is
+    validated and restored before hashing, never clipped to the writer default.
+    This structural read validation preserves older attribution contradictions;
+    writers reject new contradictions, and current views exclude their numbers.
     """
 
     payload = dict(event)
@@ -424,26 +500,33 @@ def validate_explore_result_event(
     if payload.get("boundary") != PUBLIC_BOUNDARY:
         raise ValueError("explore result event must declare the public-safe boundary")
 
-    common = {
+    summary = _persisted_text(payload.get("summary"), field="summary")
+    common: dict[str, Any] = {
         "goal_id": goal_id,
-        "summary": payload.get("summary"),
+        "summary": None,
         "agent_id": payload.get("agent_id"),
         "run_id": payload.get("run_id"),
         "recorded_at": payload.get("recorded_at"),
     }
     if event_kind == EVENT_KIND_NODE:
+        blocked_reason = _persisted_text(
+            payload.get("blocked_reason"), field="blocked_reason"
+        )
         rebuilt = build_explore_node_event(
             **common,
             title=payload.get("title"),
             node_id=payload.get("result_id"),
             node_kind=payload.get("node_kind"),
             status=payload.get("status"),
-            blocked_reason=payload.get("blocked_reason"),
+            blocked_reason=blocked_reason[:SUMMARY_LIMIT],
             parent_id=payload.get("parent_id"),
             evidence_refs=payload.get("evidence_refs"),
             tags=payload.get("tags"),
             supersedes=payload.get("supersedes"),
+            research_observation=payload.get("research_observation"),
         )
+        if blocked_reason:
+            rebuilt["blocked_reason"] = blocked_reason
     elif event_kind == EVENT_KIND_EDGE:
         rebuilt = build_explore_edge_event(
             **common,
@@ -463,17 +546,40 @@ def validate_explore_result_event(
             evidence_refs=payload.get("evidence_refs"),
             tags=payload.get("tags"),
             supersedes=payload.get("supersedes"),
+            execution_observation=payload.get("execution_observation"),
+            measurements=payload.get("measurements"),
+            work_yardstick=payload.get("work_yardstick"),
+            work_binding=payload.get("work_binding"),
+            # Canonical history predates the stricter new-write rule. Keep
+            # original bytes/identities auditable; current views qualify the
+            # folded result separately, and append rechecks new writes below.
+            _check_execution_measurements=False,
         )
+    if summary:
+        rebuilt["summary"] = summary
+    rebuilt["event_id"] = _event_id(rebuilt)
     if payload != rebuilt:
         raise ValueError("explore result event is not canonical or contains unknown fields")
     return rebuilt
 
 
+def validate_explore_result_event_attribution(event: Mapping[str, Any]) -> None:
+    """Check typed measurement attribution after canonical event validation."""
+    if "measurements" in event:
+        from .measurements import normalize_measurements
+
+        normalize_measurements(event["measurements"], execution_observation=event.get("execution_observation"))
+
+
 def append_explore_result_event(path: Path, event: Mapping[str, Any]) -> dict[str, Any]:
     validated = validate_explore_result_event(event)
+    validate_explore_result_event_attribution(validated)
     log_path = path.expanduser()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with exclusive_file_lock(log_path):
+        if validated.get("research_observation"):
+            from .research_evidence import validate_research_append
+            validate_research_append(load_explore_result_events_strict(log_path, goal_id=str(validated["goal_id"])), validated)
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(validated, ensure_ascii=False, sort_keys=True) + "\n")
     return {
@@ -486,15 +592,92 @@ def append_explore_result_event(path: Path, event: Mapping[str, Any]) -> dict[st
     }
 
 
+def rebase_explore_knowledge_events(
+    events: Sequence[Mapping[str, Any]], *, source_goal_id: str,
+    destination_goal_id: str, source_ref: str,
+) -> list[dict[str, Any]]:
+    """Transport verified knowledge to a distinct Goal without execution grants.
+
+    The caller owns source verification and current destination authorization.
+    Keep stable knowledge identities, full scope, attribution and timestamps;
+    bind each new event to its source event in the existing opaque run reference.
+    Operational research observations and work bindings stay in the source
+    archive. Rebasing them would manufacture destination execution evidence.
+    """
+    source, destination = _safe_goal_id(source_goal_id), _safe_goal_id(destination_goal_id)
+    if source == destination:
+        raise ValueError("knowledge replay requires distinct source and destination Goals")
+    result: dict[str, dict[str, Any]] = {}
+    for raw in events:
+        event = validate_explore_result_event(raw, expected_goal_id=source)
+        event = {**event, "goal_id": destination, "run_id": source_ref + ":" + event["event_id"]}
+        event.pop("research_observation", None)
+        event.pop("work_binding", None)
+        event.pop("work_yardstick", None)
+        if event["event_kind"] == EVENT_KIND_EDGE:
+            event["result_id"] = _derived_result_id("edge", destination, event["from_node"],
+                                                    event["edge_type"], event["to_node"])
+        event["event_id"] = _event_id(event)
+        event = validate_explore_result_event(event, expected_goal_id=destination)
+        result[event["event_id"]] = event
+    return list(result.values())
+
+
 def append_explore_result_events(
     path: Path,
     events: Sequence[Mapping[str, Any]],
     *,
     expected_goal_id: str,
+    create_only_node_ids: Sequence[str] = (),
+    require_ordered_prefix: bool = False,
+    expected_event_ids: Sequence[str] | None = None,
+    before_commit: Callable[[], object] | None = None,
 ) -> dict[str, Any]:
-    """Append a validated batch once by event id under the result-log lock."""
+    """Append a validated batch once by event id under the result-log lock.
 
+    A historical replay can require this exact batch as the initial prefix.
+    Recovery may finish that prefix or reuse it before newer current evidence;
+    it cannot weave old revisions into a different or incomplete current graph.
+    Ordinary callers retain their existing append semantics.
+    """
+
+    if type(require_ordered_prefix) is not bool:
+        raise ValueError("require_ordered_prefix must be an explicit boolean")
+    if require_ordered_prefix and create_only_node_ids:
+        raise ValueError("ordered prefix replay cannot skip existing node revisions")
     validated = [validate_explore_result_event(event, expected_goal_id=expected_goal_id) for event in events]
+    # Ordered replay restores an audited historical prefix, not new evidence.
+    # Its old contradictions remain visible only as archival facts/diagnostics.
+    if not require_ordered_prefix:
+        for event in validated:
+            validate_explore_result_event_attribution(event)
+    return _append_validated_explore_result_events(
+        path, validated, expected_goal_id=expected_goal_id,
+        create_only_node_ids=create_only_node_ids,
+        require_ordered_prefix=require_ordered_prefix,
+        expected_event_ids=expected_event_ids,
+        before_commit=before_commit,
+    )
+
+
+def _append_validated_explore_result_events(
+    path: Path,
+    validated: Sequence[dict[str, Any]],
+    *,
+    expected_goal_id: str,
+    create_only_node_ids: Sequence[str] = (),
+    require_ordered_prefix: bool = False,
+    expected_event_ids: Sequence[str] | None = None,
+    before_commit: Callable[[], object] | None = None,
+) -> dict[str, Any]:
+    """Shared file effect after the owning caller qualifies the events.
+
+    Ordinary writes validate new attribution above. Source reconciliation
+    preflights the same attribution after checking its registered baseline and
+    missing result ids, then binds execution to the exact canonical snapshot.
+    This internal seam adds no public validation switch or historical-prefix
+    claim.
+    """
     requested_ids = [str(event["event_id"]) for event in validated]
     if len(requested_ids) != len(set(requested_ids)):
         raise ValueError("Explore result event batch contains duplicate event ids")
@@ -505,17 +688,48 @@ def append_explore_result_events(
     reused = 0
     with exclusive_file_lock(log_path):
         existing_by_id: dict[str, dict[str, Any]] = {}
-        if log_path.exists():
-            for line in log_path.read_text(encoding="utf-8").splitlines():
+        if require_ordered_prefix:
+            raw = log_path.read_bytes() if log_path.exists() else b""
+            if raw and not raw.endswith(b"\n"):
+                raise ValueError("Explore result prefix has an incomplete tail")
+            current_events = load_explore_result_events_strict(log_path, goal_id=expected_goal_id)
+            if current_events[:len(validated)] != validated[:len(current_events)]:
+                raise ValueError("Explore result history differs from the required initial prefix")
+            existing_by_id = {str(row["event_id"]): row for row in current_events}
+        elif expected_event_ids is not None:
+            existing_by_id = {
+                str(row["event_id"]): row for row in
+                load_explore_result_events_strict(log_path, goal_id=expected_goal_id)
+            }
+        elif log_path.exists():
+            for line in log_path.read_text(encoding="utf-8").split("\n"):
                 try:
                     current = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 if isinstance(current, dict) and current.get("event_id"):
                     existing_by_id[str(current["event_id"])] = current
+        current_nodes = {
+            str(row["result_id"]): row for row in existing_by_id.values()
+            if row.get("event_kind") == EVENT_KIND_NODE
+        }
+        # Optional stateful result evolution must not overwrite a concurrent
+        # owner update or admit a relation against a stale graph. Exact replay
+        # remains read-only, including after later valid graph changes.
+        if (expected_event_ids is not None
+                and list(existing_by_id) != list(expected_event_ids)
+                and not all(existing_by_id.get(str(row["event_id"])) == row for row in validated)):
+            raise ValueError("Explore graph changed before question evolution; retry the committed writeback")
         pending: list[dict[str, Any]] = []
         for event in validated:
             event_id = str(event["event_id"])
+            if event.get("event_kind") == EVENT_KIND_NODE and event["result_id"] in create_only_node_ids:
+                node = current_nodes.get(event["result_id"])
+                if node is not None:
+                    if any(node.get(key) != event.get(key) for key in ("node_kind", "title", "summary")):
+                        raise ValueError("Explore question identity conflicts with its existing scope")
+                    reused += 1
+                    continue
             existing = existing_by_id.get(event_id)
             if existing is None:
                 pending.append(event)
@@ -524,8 +738,20 @@ def append_explore_result_events(
                 raise ValueError(f"conflicting Explore result event id: {event_id}")
             reused += 1
         if pending:
+            if any(event.get("research_observation") for event in pending):
+                from .research_evidence import validate_research_append
+                current_events = load_explore_result_events_strict(log_path, goal_id=expected_goal_id)
+                proposal = build_explore_result_projection([*current_events, *pending], goal_id=expected_goal_id)
+                for event in pending:
+                    validate_research_append(current_events, event, proposal=proposal)
+                    current_events.append(event)
+            payload = "".join(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n" for event in pending)
+            # The owning caller may require final authority admission after
+            # the lock wait and CAS. The log never decides that authority.
+            if before_commit is not None:
+                before_commit()
             with log_path.open("a", encoding="utf-8") as handle:
-                handle.write("".join(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n" for event in pending))
+                handle.write(payload)
             appended = len(pending)
     return {
         "ok": True,
@@ -546,7 +772,7 @@ def load_explore_result_events(
     if not log_path.exists():
         return []
     events: list[dict[str, Any]] = []
-    for line in log_path.read_text(encoding="utf-8").splitlines():
+    for line in log_path.read_text(encoding="utf-8").split("\n"):
         stripped = line.strip()
         if not stripped:
             continue
@@ -579,7 +805,7 @@ def load_explore_result_events_strict(
     if not log_path.exists():
         return []
     events: list[dict[str, Any]] = []
-    for line_number, line in enumerate(log_path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_number, line in enumerate(log_path.read_text(encoding="utf-8").split("\n"), start=1):
         stripped = line.strip()
         if not stripped:
             continue
@@ -596,11 +822,27 @@ def load_explore_result_events_strict(
     return events
 
 
+def explore_history_rows(events: Sequence[Mapping[str, Any]], *, goal_id: str | None = None) -> list[dict[str, Any]]:
+    """Shared read projection: preserve history without exposing arbitrary payloads."""
+    if goal_id is not None:
+        events = [validate_explore_result_event(event, expected_goal_id=goal_id) for event in events]
+    fields = (
+        "schema_version", "event_id", "goal_id", "event_kind", "result_id",
+        "recorded_at", "title", "summary", "status", "node_kind",
+        "blocked_reason", "parent_id", "node_id", "from_node", "to_node",
+        "edge_type", "agent_id", "run_id", "evidence_refs", "supersedes", "confidence", "execution_observation", "measurements", "work_yardstick", "work_binding",
+    )
+    from ...control_plane.work_items.yardstick_decision import project_work_yardstick_presentations
+
+    return project_work_yardstick_presentations(
+        [{key: event[key] for key in fields if key in event} for event in events], goal_id=goal_id)
+
+
 def _fold_by_result_id(
     events: Sequence[Mapping[str, Any]], *, event_kind: str
 ) -> list[dict[str, Any]]:
     folded: dict[str, dict[str, Any]] = {}
-    for event in events:
+    for recorded_order, event in enumerate(events):
         if event.get("event_kind") != event_kind:
             continue
         result_id = str(event.get("result_id") or "")
@@ -608,6 +850,7 @@ def _fold_by_result_id(
             continue
         prior = folded.get(result_id)
         view = dict(event)
+        view["_recorded_order"] = recorded_order
         view["first_recorded_at"] = (
             prior["first_recorded_at"] if prior else str(event.get("recorded_at") or "")
         )
@@ -619,6 +862,7 @@ def _fold_by_result_id(
 
 def _node_view(event: Mapping[str, Any], *, finding_count: int) -> dict[str, Any]:
     return {
+        **({"research_observation": dict(event["research_observation"])} if event.get("research_observation") else {}),
         "node_id": str(event.get("result_id") or ""),
         "title": str(event.get("title") or ""),
         "node_kind": str(event.get("node_kind") or NODE_KIND_AREA),
@@ -689,8 +933,26 @@ def _materialized_parent_edges(
     return derived
 
 
-def _finding_view(event: Mapping[str, Any]) -> dict[str, Any]:
+def _finding_view(
+    event: Mapping[str, Any], *, include_internal_order: bool = False
+) -> dict[str, Any]:
+    measured: dict[str, Any] = {}
+    if "measurements" in event:
+        try:
+            validate_explore_result_event_attribution(event)
+        except ValueError as error:
+            # Quarantine contradictory historical quantities in the current
+            # view, not the append-only history. Runtime failure propagates.
+            measured["measurement_error"] = str(error)
+        else:
+            measured["measurements"] = event["measurements"]
     return {
+        **({"work_binding": event["work_binding"]} if "work_binding" in event else {}),
+        **({"work_yardstick": event["work_yardstick"]} if "work_yardstick" in event else {}),
+        **({"execution_observation": event["execution_observation"]} if "execution_observation" in event else {}),
+        **({"recorded_order": event["_recorded_order"]} if include_internal_order
+            or "measurements" in event or "work_yardstick" in event else {}),
+        **measured,
         "finding_id": str(event.get("result_id") or ""),
         "finding": str(event.get("title") or ""),
         "summary": str(event.get("summary") or ""),
@@ -742,7 +1004,7 @@ def _build_tree(
 
     def branch(node_id: str, *, depth: int, seen: frozenset[str]) -> dict[str, Any]:
         node = node_by_id[node_id]
-        view = {
+        view: dict[str, Any] = {
             "node_id": node_id,
             "title": str(node.get("title") or ""),
             "status": str(node.get("status") or NODE_STATUS_OPEN),
@@ -773,8 +1035,9 @@ def _mermaid_label(text: str) -> str:
     return cleaned[:60].strip() or "untitled"
 
 
-def _mermaid_id(node_id: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_]", "_", str(node_id))
+def explore_mermaid_node_id(node_id: str) -> str:
+    """Encode identity losslessly, outside Mermaid keywords and layout IDs."""
+    return "n_" + str(node_id).encode("utf-8").hex()
 
 
 def build_explore_mermaid(
@@ -789,7 +1052,7 @@ def build_explore_mermaid(
     shown = list(nodes)[:node_limit]
     shown_ids = {str(node.get("node_id")) for node in shown}
     for node in shown:
-        node_id = _mermaid_id(str(node.get("node_id")))
+        node_id = explore_mermaid_node_id(str(node.get("node_id")))
         status = str(node.get("status") or NODE_STATUS_OPEN)
         marker = {"blocked": " (BLOCKED)", "resolved": " (done)", "dead_end": " (dead end)"}.get(
             status, ""
@@ -802,7 +1065,7 @@ def build_explore_mermaid(
         if from_node not in shown_ids or to_node not in shown_ids:
             continue
         label = _mermaid_label(str(edge.get("edge_type") or ""))
-        lines.append(f"    {_mermaid_id(from_node)} -->|{label}| {_mermaid_id(to_node)}")
+        lines.append(f"    {explore_mermaid_node_id(from_node)} -->|{label}| {explore_mermaid_node_id(to_node)}")
     if len(nodes) > node_limit:
         lines.append(f"    %% {len(nodes) - node_limit} more nodes omitted")
     lines.extend(
@@ -912,11 +1175,16 @@ def build_explore_result_projection(
     goal_id: str,
     finding_limit: int = DEFAULT_FINDING_LIMIT,
     mermaid_node_limit: int = DEFAULT_MERMAID_NODE_LIMIT,
+    include_internal_finding_order: bool = False,
 ) -> dict[str, Any]:
     """Fold result events into the bounded projection display sinks render."""
 
     safe_goal_id = _safe_goal_id(goal_id)
-    scoped = [event for event in events if str(event.get("goal_id") or "") == safe_goal_id]
+    scoped = [
+        validate_explore_result_event(event, expected_goal_id=safe_goal_id)
+        if event.get("research_observation") else event
+        for event in events if str(event.get("goal_id") or "") == safe_goal_id
+    ]
 
     folded_findings = _fold_by_result_id(scoped, event_kind=EVENT_KIND_FINDING)
     finding_counts: dict[str, int] = {}
@@ -929,18 +1197,23 @@ def build_explore_result_projection(
         _node_view(event, finding_count=finding_counts.get(str(event.get("result_id")), 0))
         for event in sorted(
             _fold_by_result_id(scoped, event_kind=EVENT_KIND_NODE),
-            key=lambda item: str(item.get("first_recorded_at") or ""),
+            key=lambda item: chronology_key(item.get("first_recorded_at")),
         )
     ]
     edges = [
         _edge_view(event) for event in _fold_by_result_id(scoped, event_kind=EVENT_KIND_EDGE)
     ]
     edges = [*edges, *_materialized_parent_edges(nodes, edges)]
-    findings = sorted(
-        (_finding_view(event) for event in folded_findings),
-        key=lambda item: item["last_updated_at"],
+    # Whole-second source clocks can tie. Folding retains creation order, so
+    # break equal chronology keys with the existing latest-append ordinal
+    # before bounding any consumer; do not rewrite the stored evidence clock.
+    findings = [_finding_view(
+        event, include_internal_order=include_internal_finding_order,
+    ) for event in sorted(
+        folded_findings,
+        key=lambda item: (chronology_key(item["last_updated_at"]), item["_recorded_order"]),
         reverse=True,
-    )
+    )]
 
     nodes_by_status: dict[str, int] = {status: 0 for status in sorted(NODE_STATUSES)}
     for node in nodes:
@@ -950,7 +1223,7 @@ def build_explore_result_projection(
         findings_by_status[finding["status"]] = findings_by_status.get(finding["status"], 0) + 1
 
     parents = _parent_map(nodes, edges)
-    return {
+    projection = {
         "ok": True,
         "schema_version": EXPLORE_RESULT_PROJECTION_VERSION,
         "goal_id": safe_goal_id,
@@ -972,3 +1245,16 @@ def build_explore_result_projection(
         "mermaid": build_explore_mermaid(nodes, edges, node_limit=max(1, mermaid_node_limit)),
         "boundary": dict(PUBLIC_BOUNDARY),
     }
+    research_events = [event for event in scoped if event.get("research_observation")]
+    if research_events:
+        from .research_evidence import project_research_frontier
+        frontier = project_research_frontier(projection, candidate_sources=[
+            {"node_id": event["result_id"], "research_observation": event["research_observation"]}
+            for event in research_events
+        ])
+        summaries = {item["node_id"]: item["summary"] for item in frontier.pop("node_summaries")}
+        for node in nodes:
+            if node["node_id"] in summaries:
+                node["research_summary"] = summaries[node["node_id"]]
+        projection["research_frontier"] = frontier
+    return projection

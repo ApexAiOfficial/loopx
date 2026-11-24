@@ -11,11 +11,17 @@ install.py. No global config, no OS sandbox. The run loop is native `/loop`.
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+from loopx.control_plane.projects.registry_codec import (
+    ProjectRegistryProtocolError,
+    add_project_registry_backend,
+    load_project_registry,
+    require_runtime_compatible_project_registry,
+)
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
@@ -66,13 +72,17 @@ def main():
             reg = proj / ".goal-harness" / "registry.json"
     if reg.exists():
         try:
-            data = json.loads(reg.read_text(encoding="utf-8"))
-            data.setdefault("agent_backends", [])
-            if "claude" not in data["agent_backends"]:
-                data["agent_backends"].append("claude")
+            payload = load_project_registry(reg)
+            require_runtime_compatible_project_registry(
+                payload,
+                operation="Claude Goal adapter",
+            )
             print(f"[registry] mark agent_backends += claude  ({reg})")
             if not dry:
-                reg.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                add_project_registry_backend(reg, "claude")
+        except ProjectRegistryProtocolError as e:
+            print(f"[registry] FAILED: {e}")
+            sys.exit(1)
         except Exception as e:
             print("  (registry annotate skipped:", e, ")")
     else:

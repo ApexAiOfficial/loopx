@@ -29,21 +29,11 @@ def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def assert_failure_payload(payload: dict) -> None:
+    assert set(payload) == {"schema_version", "ok", "goal_id", "error"}, payload
+    assert payload["schema_version"] == "heartbeat_agent_input_v1", payload
     assert payload["ok"] is False, payload
     assert payload["goal_id"] == GOAL_ID, payload
     assert "--agent-scope requires --agent-id" in payload["error"], payload
-    assert payload["active_state"] == str(ACTIVE_STATE), payload
-    assert payload["active_state_source"] == "explicit", payload
-    assert payload["resolved_active_state"] == str(ACTIVE_STATE), payload
-    assert payload["compact"] is False, payload
-    assert payload["brief"] is False, payload
-    assert payload["thin"] is True, payload
-    assert "full" not in payload, payload
-    assert payload["cli_bin"] == "loopx", payload
-    assert payload["agent_id"] is None, payload
-    assert payload["agent_scopes"] == [SCOPE], payload
-    assert payload["expanded_prompt_command"].endswith(f"--agent-scope '{SCOPE}'"), payload
-    assert payload["task_body"] is None, payload
 
 
 def main() -> int:
@@ -83,9 +73,8 @@ def main() -> int:
     assert "Copy this task body into a Codex App heartbeat automation." not in markdown, markdown
     assert "````text\n\n````" not in markdown, markdown
     assert f"- goal_id: `{GOAL_ID}`" in markdown, markdown
-    assert f"- active_state: `{ACTIVE_STATE}`" in markdown, markdown
+    assert f"- active_state = resolved_active_state: `{ACTIVE_STATE}`" in markdown, markdown
     assert "- active_state_source: `explicit`" in markdown, markdown
-    assert f"- resolved_active_state: `{ACTIVE_STATE}`" in markdown, markdown
     assert f"- agent_scopes: `['{SCOPE}']`" in markdown, markdown
     assert "- thin: `True`" in markdown, markdown
     assert "- full:" not in markdown, markdown
@@ -125,7 +114,7 @@ def main() -> int:
         invalid_scope_payload
     )
     assert invalid_scope_payload["agent_id"] == AGENT_ID, invalid_scope_payload
-    assert invalid_scope_payload["agent_scopes"] == [INVALID_SCOPE], invalid_scope_payload
+    assert "agent_scopes" not in invalid_scope_payload, invalid_scope_payload
 
     print("heartbeat-prompt-error-smoke ok")
     return 0

@@ -3,15 +3,25 @@
 The short notification rule used to read "DONT_NOTIFY=quiet", which agents can
 misread as "do nothing". The rule must qualify DONT_NOTIFY as an output-level
 signal only and keep `execution_obligation.must_attempt_work` as the authority
-for whether a bounded slice must run.
+for whether work must run. Compact wording must preserve the repair action,
+not just diagnose a missing user action, without turning repair into a prompt.
 """
 
 from __future__ import annotations
 
-from loopx.control_plane.heartbeat.rules import HEARTBEAT_NOTIFICATION_RULE_SHORT
+import re
+
+from loopx.control_plane.heartbeat.rules import (
+    HEARTBEAT_NOTIFICATION_RULE_SHORT,
+)
 from loopx.control_plane.heartbeat.task_body import (
+    render_ark_managed_agent_goal_task_body,
     render_brief_heartbeat_task_body,
+    render_compact_heartbeat_task_body,
+    render_heartbeat_task_body,
     render_thin_heartbeat_task_body,
+    render_traex_visible_goal_task_body,
+    render_visible_goal_task_body,
 )
 from loopx.control_plane.scheduler.execution_context import (
     GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
@@ -21,11 +31,16 @@ from loopx.control_plane.testing.quota_fixtures import (
     quota_todo_item,
     quota_todo_summary,
 )
+from loopx.heartbeat_prompt import build_heartbeat_prompt
 from loopx.quota import build_quota_should_run
 
 
 GOAL_ID = "heartbeat-notify-obligation-fixture"
 AGENT_ID = "codex-notify-agent"
+LANGUAGE_POLICY = (
+    "Language=user; fallback=English; mix only if asked/scoped-bilingual."
+)
+LANGUAGE_POLICY_THIN = "Lang=user; default=en; mix=asked/scoped."
 
 
 def test_short_rule_qualifies_dont_notify_as_output_only() -> None:
@@ -36,6 +51,15 @@ def test_short_rule_qualifies_dont_notify_as_output_only() -> None:
     assert "DONT_NOTIFY=quiet." not in rule
     assert "heartbeat_recommendation.agent_must_attempt" in rule
     assert "execution_obligation.must_attempt_work" in rule
+
+
+def test_shared_rule_keeps_projection_repair_and_quiet_boundary() -> None:
+    rule = HEARTBEAT_NOTIFICATION_RULE_SHORT
+    assert "Missing NOTIFY action: user Todo unprojected" in rule
+    assert "repair LoopX state projection" in rule
+    assert "under DONT_NOTIFY repair internally" in rule
+    assert "true=work+writeback" in rule
+    assert "only false permits no-op" in rule
 
 
 def test_rendered_task_bodies_keep_execution_obligation_authority() -> None:
@@ -59,11 +83,167 @@ def test_rendered_task_bodies_keep_execution_obligation_authority() -> None:
     )
     for renderer in (render_thin_heartbeat_task_body, render_brief_heartbeat_task_body):
         body = renderer(**kwargs)
-        assert "agent_must_attempt" in body
+        assert "heartbeat_recommendation.agent_must_attempt" in body
         assert "execution_obligation.must_attempt_work" in body
         assert "OUTPUT only" in body
+        assert "repair LoopX state projection" in body
+        assert "under DONT_NOTIFY repair internally" in body
         # A bare "DONT_NOTIFY=quiet" no-op mapping must never appear in the prompt.
         assert "DONT_NOTIFY=quiet." not in body
+        assert "After committed writeback: same-turn checkpoint-context" in body
+        assert "Missing vision: same-turn checkpoint-context" not in body
+
+
+def test_codex_app_quiet_completion_is_host_control_not_chat(tmp_path) -> None:
+    variants = [{mode: True} for mode in ("full", "compact", "brief", "thin")]
+    variants.append({
+        "thin": True, "decision_output_root": tmp_path, "turn_instance_id": "fixture-quiet-turn",
+    })
+    for variant in variants:
+        body = build_heartbeat_prompt(
+            goal_id="quiet-completion-fixture", agent_id="worker-a",
+            registered_agents=["worker-a"], runtime_profile="codex_app_heartbeat",
+            **variant,
+        )["task_body"]
+        assert "DONT_NOTIFY: no chat text" in body, variant
+        assert "required host quiet result in full" in body, variant
+        assert "response with the skip reason" not in body, variant
+
+
+def test_all_heartbeat_modes_scope_no_spend_to_observation() -> None:
+    # Build the shipped payload, including the short/default worker entrypoint.
+    # An unchanged artifact may still accompany a validated route elimination;
+    # it must not unconditionally instruct admitted work to skip settlement.
+    for mode in ("full", "compact", "brief", "thin"):
+        payload = build_heartbeat_prompt(
+            goal_id="fixture-goal", agent_id="worker-a", **{mode: True},
+        )
+        body = payload["task_body"]
+        assert "Exact monitor settlement=no refresh/spend; auxiliary poll: continue work." in body
+        assert "Admitted work: settlement_plan" in body
+        assert "settlement_plan even if artifacts unchanged" in body
+        assert "no-change=surface_only/no spend" not in body
+        assert "After committed writeback: same-turn checkpoint-context" in body
+
+
+def test_todo_closeout_does_not_invent_successors_or_skip_turn_settlement(tmp_path) -> None:
+    # A completed Todo and an external wait are distinct from Goal termination.
+    # The captured thin prompt also defers to the admitted current plan.
+    variants = [{mode: True} for mode in ("full", "compact", "brief", "thin")]
+    variants.append({"thin": True, "decision_output_root": tmp_path,
+                     "turn_instance_id": "fixture-closeout-turn"})
+    for variant in variants:
+        body = build_heartbeat_prompt(
+            goal_id="closeout-fixture", agent_id="worker-a",
+            registered_agents=["worker-a"], runtime_profile="codex_app_heartbeat",
+            **variant,
+        )["task_body"]
+        assert "Todo done" in body and ("settle the Turn" in body or "≠" in body)
+        assert "no invented successor" in body
+        assert "settlement_plan" in body
+        assert "projected monitor/continuation" in body
+        assert "No useful independent work before an evidenced due time" in body
+        assert "--status deferred --resume-when resume_at:" in body
+        assert "settle original Turn, then yield to host scheduler" in body
+        assert "Fresh admission on resume" in body
+        assert "No spend for waiting alone" in body
+        assert "continue only admitted work" in body.lower() or "admitted P1/P2" in body
+        for stale in ("Done -> successor first", "Done->successor",
+                      "open + monitor_changed + successor", "wait->monitor+successor/work",
+                      "no-follow-up completion", "Wait=open"):
+            assert stale not in body
+
+
+def test_generic_task_bodies_follow_user_language_without_forcing_chinese() -> None:
+    kwargs = dict(
+        goal_id="fixture-goal",
+        active_state="active",
+        cli_preflight="",
+        pr_review_pre_quota_command="",
+        quota_guard_command="loopx quota should-run",
+        quota_spend_command="loopx quota spend-slot",
+        refresh_state_command="loopx refresh-state",
+        progress_refresh_state_command="loopx refresh-state --classification delivery",
+        material_queue_rule="",
+        permission_rule="",
+        cli_bin="loopx",
+        agent_scope_instruction="",
+        expanded_prompt_command="loopx heartbeat-prompt",
+        compact_prompt_command="loopx heartbeat-prompt --compact",
+        brief_prompt_command="loopx heartbeat-prompt --brief",
+        thin_prompt_command="loopx heartbeat-prompt --thin",
+    )
+    renderers = (
+        render_heartbeat_task_body,
+        render_compact_heartbeat_task_body,
+        render_brief_heartbeat_task_body,
+        render_thin_heartbeat_task_body,
+        render_visible_goal_task_body,
+        render_traex_visible_goal_task_body,
+        render_ark_managed_agent_goal_task_body,
+    )
+
+    for renderer in renderers:
+        body = renderer(**kwargs)
+        expected_policy = (
+            LANGUAGE_POLICY_THIN
+            if renderer in (
+                render_brief_heartbeat_task_body,
+                render_thin_heartbeat_task_body,
+                render_visible_goal_task_body,
+                render_traex_visible_goal_task_body,
+                render_ark_managed_agent_goal_task_body,
+            )
+            else LANGUAGE_POLICY
+        )
+        assert expected_policy in body, renderer.__name__
+        assert "Chinese action" not in body, renderer.__name__
+        assert "concrete Chinese" not in body, renderer.__name__
+        assert re.search(r"[\u3400-\u9fff]", body) is None, renderer.__name__
+
+
+def test_language_policy_preserves_blocker_and_native_goal_continuation() -> None:
+    kwargs = dict(
+        goal_id="fixture-goal",
+        active_state="active",
+        cli_preflight="",
+        pr_review_pre_quota_command="",
+        quota_guard_command="loopx quota should-run",
+        quota_spend_command="loopx quota spend-slot",
+        refresh_state_command="loopx refresh-state",
+        progress_refresh_state_command="loopx refresh-state --classification delivery",
+        material_queue_rule="",
+        permission_rule="",
+        cli_bin="loopx",
+        agent_scope_instruction="",
+        expanded_prompt_command="loopx heartbeat-prompt",
+        compact_prompt_command="loopx heartbeat-prompt --compact",
+        brief_prompt_command="loopx heartbeat-prompt --brief",
+        thin_prompt_command="loopx heartbeat-prompt --thin",
+    )
+    compact = render_compact_heartbeat_task_body(**kwargs)
+    assert "Goal-owned blocker: stop its path" in compact
+    assert "blocker-push in the user's language" in compact
+    assert "Dependency/sibling todos: record; continue audit" in compact
+    assert "must_attempt_work=true` requires work even with" in compact
+
+    brief = " ".join(render_brief_heartbeat_task_body(**kwargs).split())
+    assert "settlement_plan.ordered_steps" in brief
+    assert "preserve exact identities/effect ids and actual outcomes" in brief
+    assert "Other waits: projected monitor/continuation" in brief
+    assert "continue only admitted work" in brief.lower()
+    assert "No spend for waiting alone" in brief
+    assert "Finish Goal only on terminal no-follow-up" in brief
+
+    for renderer in (
+        render_visible_goal_task_body,
+        render_traex_visible_goal_task_body,
+        render_ark_managed_agent_goal_task_body,
+    ):
+        body = renderer(**kwargs)
+        assert "After settlement recheck quota" in body, renderer.__name__
+        assert "should_run=false` + terminal no-follow-up" in body, renderer.__name__
+        assert "else next action/wait" in body, renderer.__name__
 
 
 def test_heartbeat_recommendation_mirrors_execution_obligation_in_replan() -> None:
@@ -122,3 +302,13 @@ def test_heartbeat_recommendation_mirrors_execution_obligation_in_replan() -> No
     assert heartbeat["agent_must_attempt"] is bool(
         obligation.get("must_attempt_work")
     )
+
+
+def test_scheduler_guidance_does_not_freeze_bootstrap_cadence() -> None:
+    from loopx.control_plane.heartbeat.rules import (
+        SCHEDULER_HINT_APPLICATION_RULE, SCHEDULER_HINT_COMPACT_RULE, SCHEDULER_HINT_THIN_RULE,
+    )
+
+    for rule in (SCHEDULER_HINT_APPLICATION_RULE, SCHEDULER_HINT_COMPACT_RULE, SCHEDULER_HINT_THIN_RULE):
+        assert "floor" in rule and "backoff" in rule
+        assert "automation_update" in rule and "ack" in rule

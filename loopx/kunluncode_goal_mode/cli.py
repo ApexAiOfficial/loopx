@@ -12,7 +12,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from loopx.file_lock import exclusive_file_lock
+from loopx.control_plane.projects.registry_codec import (
+    load_project_registry,
+    mutate_project_registry,
+    require_runtime_compatible_project_registry,
+)
 from loopx.goal_mode_context import registered_agent_ids
 from loopx.kunluncode_goal_mode import DEFAULT_AGENT_ID, MCP_SERVER_NAME
 from loopx.kunluncode_goal_mode.app_server import build_app_server_command
@@ -22,10 +26,19 @@ from loopx.kunluncode_goal_mode.runtime import (
     read_runtime_state,
     run_native_goal,
 )
-from loopx.registry import atomic_write_json
 
 
-MCP_REQUIREMENT = "mcp==1.28.1"
+# Single source for the adapter's `mcp` pin. It is an exact pin:
+# loopx/goal_mode_mcp.py imports `mcp.server.fastmcp`, which the MCP SDK 2.x
+# line no longer ships, and the pin is a deliberate security pin (892faa2c9
+# "fix(security): upgrade the MCP SDK pin"). It belongs to the KunlunCode
+# adapter venv only; loopx/claude_goal_mode/scripts/install.py provisions its
+# own venv and spells the same dependency as a range ("mcp<2"). The two are
+# separate packaging boundaries, so they are not required to agree on a
+# spelling. Bump MCP_SDK_VERSION alone; the probe and the user-facing message
+# below derive from it.
+MCP_SDK_VERSION = "1.28.1"
+MCP_REQUIREMENT = f"mcp=={MCP_SDK_VERSION}"
 MCP_SCRIPT = Path(__file__).with_name("server.py").resolve()
 DEFAULT_MCP_VENV = (
     Path.home() / ".local" / "share" / "loopx" / "kunluncode-mcp" / ".venv"
@@ -42,7 +55,7 @@ def _run(
         command,
         cwd=str(cwd) if cwd else None,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=timeout,
     )
 
@@ -65,7 +78,7 @@ def _compatible_python(value: str | Path) -> bool:
                 "from importlib.metadata import version; "
                 "from mcp.server.fastmcp import FastMCP; "
                 "import loopx.kunluncode_goal_mode.server; "
-                "assert version('mcp') == '1.28.1'"
+                f"assert version('mcp') == '{MCP_SDK_VERSION}'"
             ),
         ],
         timeout=30,
@@ -192,7 +205,8 @@ def install_mcp(*, python: str | None, dry_run: bool, replace: bool) -> str:
         selected_python = provision_mcp_python(dry_run=dry_run)
     if not dry_run and not _compatible_python(selected_python):
         raise RuntimeError(
-            f"{selected_python} must import LoopX and mcp==1.28.1; use uv to sync the adapter environment"
+            f"{selected_python} must import LoopX and {MCP_REQUIREMENT}; "
+            "use uv to sync the adapter environment"
         )
     existing = next(
         (
@@ -279,8 +293,7 @@ def _registry_path(project: Path) -> Path:
 
 
 def _annotate_registry(registry: Path, *, goal_id: str, agent_id: str) -> None:
-    with exclusive_file_lock(registry, operation="kunluncode_registry_annotate"):
-        payload = json.loads(registry.read_text(encoding="utf-8"))
+    def reduce(payload: dict[str, Any]) -> None:
         goals = payload.get("goals") or []
         if not any(
             str(goal.get("id") or "") == goal_id
@@ -291,12 +304,21 @@ def _annotate_registry(registry: Path, *, goal_id: str, agent_id: str) -> None:
         backends = payload.setdefault("agent_backends", [])
         if "kunluncode" not in backends:
             backends.append("kunluncode")
-        atomic_write_json(registry, payload, preserve_mode=True)
+
+    mutate_project_registry(
+        registry,
+        operation="kunluncode_registry_annotate",
+        reducer=reduce,
+    )
     write_binding(registry.parent.parent, goal_id=goal_id, agent_id=agent_id)
 
 
 def _registered_agents_for_goal(registry: Path, goal_id: str) -> list[str]:
-    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload = load_project_registry(registry)
+    require_runtime_compatible_project_registry(
+        payload,
+        operation="KunlunCode Goal adapter",
+    )
     goal = next(
         (
             item
@@ -335,7 +357,6 @@ def _bootstrap_if_needed(
         objective,
         "--state-file",
         f".loopx/goals/{goal_id}/ACTIVE_GOAL_STATE.md",
-        "--no-onboarding-scan",
         "--no-global-sync",
     ]
     if dry_run:

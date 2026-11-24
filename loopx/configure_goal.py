@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shlex
 import shutil
 from collections.abc import Mapping
@@ -9,41 +10,31 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .agent_registry import normalize_registered_agents, registered_agent_ids_for_goal
 from .boundary_authority import (
     build_checkpointed_boundary_authority_entry,
     checkpointed_boundary_authority_summary,
 )
-from .agent_registry import normalize_registered_agents
-from .capabilities.change_quality.policy import (
-    CHANGE_QUALITY_POLICY_SCHEMA_VERSION,
-    change_quality_goal_policy_summary,
+from .capabilities.pr_review_queue import goal_configuration as pr_review_config
+from .capabilities.change_quality import goal_configuration as change_quality_config
+from .capabilities.progress_review import goal_configuration as progress_review_config
+from .capabilities.goal_capability_organization import goal_configuration as improvement_config
+from .capabilities.change_quality.policy import change_quality_goal_policy_summary
+from .capabilities.machine_configuration.builtins import (
+    builtin_machine_inheritable_goal_overrides,
+)
+from .capabilities.periodic_report import goal_configuration as periodic_report_config
+from .capabilities.reward_memory.configuration import (
+    apply_reward_memory_goal_configuration,
+    plan_reward_memory_goal_configuration,
+    reward_memory_goal_configuration_summary,
+    reward_memory_preflight_markdown_lines,
+)
+from .configuration_catalog import (
+    DEFAULT_MULTI_SUBAGENT_MAX_CHILDREN,
+    build_goal_configuration_catalog,
 )
 from .control_plane import compact_control_plane_policy, control_plane_policy_summary
-from .configuration_catalog import build_goal_configuration_catalog
-from .explore_graph import compact_explore_graph_policy
-from .orchestration import (
-    DEFAULT_ORCHESTRATION_MODE,
-    EXPLORE_HARNESS_PROFILES,
-    MULTI_SUBAGENT_ORCHESTRATION_MODE,
-    compact_orchestration_policy,
-    compact_peer_task_coordination_policy,
-    orchestration_policy_summary,
-)
-from .quota import goal_quota_config
-from .registry import atomic_write_json, read_json, registry_goals
-from .control_plane.reward_memory import (
-    reward_memory_goal_policy,
-    reward_memory_goal_policy_summary,
-)
-from .control_plane.todos.contract import normalize_todo_claimed_by
-from .control_plane.todos.mutation_authority import (
-    normalize_todo_lifecycle_authority,
-)
-from .execution_profile import (
-    compact_execution_profile,
-    execution_profile_with_turn_granularity,
-    normalize_turn_granularity,
-)
 from .control_plane.agents.legacy_migration import (
     completed_peer_agent_runtime_migration,
     legacy_agent_hierarchy_present,
@@ -52,13 +43,40 @@ from .control_plane.agents.legacy_migration import (
     peer_agent_runtime_migration_id,
 )
 from .control_plane.agents.profile import normalize_agent_profile
-from .control_plane.agents.work_mode import normalize_agent_work_modes
 from .control_plane.agents.runtime_model import (
     AgentRuntimeModel,
     agent_runtime_model_for_goal,
 )
 from .control_plane.agents.supervisor import normalize_peer_supervisor
-
+from .control_plane.agents.work_mode import normalize_agent_work_modes
+from .control_plane.coordination import configuration as shadow
+from .control_plane.coordination.configuration import normalize_goal_write_scope
+from .control_plane.operator_inbox_binding import local_private_config_digest
+from .control_plane.projects.registry_codec import (
+    ProjectRegistryTransaction,
+    load_project_registry,
+    project_registry_transaction,
+    require_runtime_compatible_project_registry,
+)
+from .control_plane.todos.contract import normalize_todo_claimed_by
+from .control_plane.todos.mutation_authority import (
+    normalize_todo_lifecycle_authority,
+)
+from .execution_profile import (
+    apply_goal_execution_profile_change,
+    compact_execution_profile,
+)
+from .explore_graph import compact_explore_graph_policy, explore_configuration, plan_explore_configuration
+from .orchestration import (
+    EXPLORE_HARNESS_PROFILES,
+    MULTI_SUBAGENT_ORCHESTRATION_MODE,
+    compact_orchestration_policy,
+    compact_peer_task_coordination_policy,
+    orchestration_policy_summary,
+    update_spawn_execution_policy,
+)
+from .quota import goal_quota_config
+from .registry import registry_goals
 
 WAITING_ON_CHOICES = (
     "codex",
@@ -68,7 +86,6 @@ WAITING_ON_CHOICES = (
 )
 
 MULTI_SUBAGENT_FEATURE_CHOICES = ("off", "enabled")
-DEFAULT_MULTI_SUBAGENT_MAX_CHILDREN = 2
 AGENT_MODEL_CHOICES = tuple(model.value for model in AgentRuntimeModel)
 
 
@@ -121,8 +138,13 @@ def _lark_event_inbox_config_summary(goal: dict[str, Any]) -> dict[str, Any]:
     return {
         "enabled": inbox.get("enabled") is True or bool(enabled_agent_inboxes),
         "config_pointer_registered": bool(inbox.get("config_path"))
-        or any(bool(value.get("config_path")) for value in enabled_agent_inboxes.values()),
+        or any(
+            bool(value.get("config_path")) for value in enabled_agent_inboxes.values()
+        ),
         "agent_scoped_count": len(enabled_agent_inboxes),
+        "agent_scoped_bound_count": sum(
+            bool(value.get("config_digest")) for value in enabled_agent_inboxes.values()
+        ),
     }
 
 
@@ -152,8 +174,7 @@ def _local_private_config_path(
         or path.suffix != ".json"
     ):
         raise ValueError(
-            f"{label} must be a repo-relative JSON path "
-            "under .loopx/config/"
+            f"{label} must be a repo-relative JSON path under .loopx/config/"
         )
     return path.as_posix()
 
@@ -165,25 +186,25 @@ def _now_iso() -> str:
 def _positive_number(value: float | None, *, field: str) -> float | None:
     if value is None:
         return None
-    if value <= 0:
-        raise ValueError(f"{field} must be greater than 0")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{field} must be a finite number greater than 0")
     return float(value)
 
 
 def _non_negative_number(value: float | None, *, field: str) -> float | None:
     if value is None:
         return None
-    if value < 0:
-        raise ValueError(f"{field} must be greater than or equal to 0")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{field} must be a finite number greater than or equal to 0")
     return float(value)
 
 
 def _non_negative_int(value: int | None, *, field: str) -> int | None:
     if value is None:
         return None
-    if value < 0:
-        raise ValueError(f"{field} must be greater than or equal to 0")
-    return int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
 
 
 def _clean_domains(values: list[str] | None) -> list[str] | None:
@@ -209,33 +230,23 @@ def _clean_registered_agents(values: list[str] | None) -> list[str] | None:
                 continue
             agent = normalize_todo_claimed_by(raw_agent)
             if not agent:
-                raise ValueError("registered agents must be public-safe tokens such as codex-main-control")
+                raise ValueError(
+                    "registered agents must be public-safe tokens such as codex-main-control"
+                )
             if agent not in agents:
                 agents.append(agent)
     return agents
-
-
-def _clean_write_scope(values: list[str] | None) -> list[str] | None:
-    if values is None:
-        return None
-    scopes: list[str] = []
-    for value in values:
-        for part in str(value).split(","):
-            scope = part.strip()
-            if scope and scope not in scopes:
-                scopes.append(scope)
-    return scopes
 
 
 def _settings_summary(goal: dict[str, Any]) -> dict[str, Any]:
     quota = goal_quota_config(goal)
     control_plane = compact_control_plane_policy(goal.get("control_plane"))
     orchestration = compact_orchestration_policy(goal.get("spawn_policy"))
-    coordination = goal.get("coordination") if isinstance(goal.get("coordination"), dict) else {}
-    agent_model = agent_runtime_model_for_goal(goal)
-    registered_agents = normalize_registered_agents(
-        coordination.get("registered_agents")
+    coordination = (
+        goal.get("coordination") if isinstance(goal.get("coordination"), dict) else {}
     )
+    agent_model = agent_runtime_model_for_goal(goal)
+    registered_agents = registered_agent_ids_for_goal(goal)
     summary = {
         "execution_profile": compact_execution_profile(goal.get("execution_profile")),
         "quota": {
@@ -243,18 +254,28 @@ def _settings_summary(goal: dict[str, Any]) -> dict[str, Any]:
             "window_hours": quota.get("window_hours"),
         },
         "control_plane": control_plane,
-        "issue_fix_reviewer_notification": _reviewer_notification_config_summary(
-            goal
-        ),
+        "periodic_report": periodic_report_config.configuration_summary(goal),
+        "issue_fix_reviewer_notification": _reviewer_notification_config_summary(goal),
         "lark_event_inbox": _lark_event_inbox_config_summary(goal),
         "lark_kanban_heartbeat_sync": _lark_kanban_heartbeat_config_summary(goal),
-        "reward_memory": reward_memory_goal_policy_summary(goal),
+        "reward_memory": reward_memory_goal_configuration_summary(goal),
+        "pull_request_review": pr_review_config.configuration_summary(goal),
         "change_quality_qualification": change_quality_goal_policy_summary(goal),
-        "explore_graph": compact_explore_graph_policy(goal.get("explore_graph")),
+        "progress_review": progress_review_config.configuration_summary(goal),
+        "goal_capability_organization": improvement_config.configuration_summary(goal),
+        "explore_graph": compact_explore_graph_policy(goal.get("explore_graph"), orchestration.get("explore_harness")),
         "orchestration": orchestration,
         "waiting_on": goal.get("waiting_on"),
-        "write_scope": _clean_write_scope(coordination.get("write_scope") or []) or [],
-        "checkpointed_boundary_authority": checkpointed_boundary_authority_summary(coordination),
+        "write_scope": normalize_goal_write_scope(
+            coordination.get("write_scope") or [],
+            goal_repo=goal.get("repo"),
+        )
+        or [],
+        **shadow.coordination_shadow_summaries(goal),
+        "checkpointed_boundary_authority": checkpointed_boundary_authority_summary(
+            coordination,
+            goal_repo=goal.get("repo"),
+        ),
         "registered_agents": registered_agents,
         "peer_task_coordination": deepcopy(
             compact_peer_task_coordination_policy(coordination)
@@ -419,22 +440,51 @@ def configure_goal(
     quota_compute: float | None = None,
     quota_window_hours: float | None = None,
     execution_turn_granularity: str | None = None,
+    execution_replan_after_todos: int | None = None,
+    execution_replan_after_turns: int | None = None,
+    execution_planning_horizon_goal: bool | None = None,
+    clear_execution_planning_horizon_goal: bool = False,
+    execution_yardstick_enabled: bool | None = None,
+    clear_execution_yardstick_enabled: bool = False,
+    clear_execution_replan_after_turns: bool = False,
+    clear_execution_replan_after_todos: bool = False,
     self_repair_enabled: bool | None = None,
     self_repair_health: bool | None = None,
     self_repair_waiting_projection: bool | None = None,
+    periodic_report_configuration: Mapping[str, Any] | None = None, clear_periodic_report_configuration: bool = False,
+    pull_request_review_configuration: Mapping[str, Any] | None = None,
+    pull_request_review_agent_orders: Mapping[str, str | None] | None = None,
+    clear_pull_request_review_configuration: bool = False,
     change_quality_enabled: bool | None = None,
     change_quality_safe_fix: bool | None = None,
     change_quality_strict_receipt: bool | None = None,
+    clear_change_quality_configuration: bool = False,
+    progress_review_mode: str | None = None,
+    progress_review_signal: str | None = None,
+    progress_review_drift_threshold: int | None = None,
+    progress_review_contract_revision: str | None = None,
+    clear_progress_review_configuration: bool = False,
+    capability_improvement_configuration: Mapping[str, Any] | None = None,
+    clear_capability_improvement_configuration: bool = False,
     multi_subagent_feature: str | None = None,
     orchestration_mode: str | None = None,
     spawn_allowed: bool | None = None,
     max_children: int | None = None,
+    subagent_model: str | None = None,
+    subagent_reasoning_effort: str | None = None,
+    clear_subagent_model_config: bool = False,
+    subagent_execution_config: str | None = None,
+    clear_subagent_execution_config: bool = False,
     allowed_domains: list[str] | None = None,
     clear_allowed_domains: bool = False,
     explore_harness_enabled: bool | None = None,
     explore_harness_profile: str | None = None,
     clear_explore_harness_profile: bool = False,
+    explore_composition_mode: str | None = None,
+    explore_composition_scope_id: str | None = None,
     explore_graph_enabled: bool | None = None,
+    explore_mode: str | None = None,
+    clear_explore_configuration: bool = False,
     registered_agents: list[str] | None = None,
     clear_registered_agents: bool = False,
     peer_task_coordinator: str | None = None,
@@ -453,6 +503,10 @@ def configure_goal(
     write_scope: list[str] | None = None,
     replace_write_scope: bool = False,
     clear_write_scope: bool = False,
+    local_authority_shadow_file: bool = False,
+    clear_local_authority_shadow: bool = False,
+    coordination_runtime_shadow_file: bool = False,
+    clear_coordination_runtime_shadow: bool = False,
     waiting_on: str | None = None,
     clear_waiting_on: bool = False,
     boundary_authority_scopes: list[str] | None = None,
@@ -469,23 +523,33 @@ def configure_goal(
     lark_kanban_heartbeat_sync: bool | None = None,
     reward_memory_config: str | None = None,
     reward_memory_agents: list[str] | None = None,
+    reward_memory_agent_id: str | None = None,
     clear_reward_memory_config: bool = False,
     execute: bool = False,
+    _registry_transaction: ProjectRegistryTransaction | None = None,
 ) -> dict[str, Any]:
+    if execute and _registry_transaction is None:
+        forwarded = dict(locals())
+        with project_registry_transaction(
+            registry_path,
+            operation="configure_goal",
+        ) as transaction:
+            forwarded["_registry_transaction"] = transaction
+            return configure_goal(**forwarded)
     if not registry_path.exists():
         raise FileNotFoundError(f"registry file does not exist: {registry_path}")
-    if execution_turn_granularity is not None:
-        execution_turn_granularity = normalize_turn_granularity(
-            execution_turn_granularity
-        )
     if clear_allowed_domains and allowed_domains:
-        raise ValueError("--clear-allowed-domains cannot be combined with --allowed-domain")
+        raise ValueError(
+            "--clear-allowed-domains cannot be combined with --allowed-domain"
+        )
     if clear_explore_harness_profile and explore_harness_profile:
         raise ValueError(
             "--clear-explore-harness-profile cannot be combined with --explore-harness-profile"
         )
     if clear_registered_agents and registered_agents:
-        raise ValueError("--clear-registered-agents cannot be combined with --registered-agent")
+        raise ValueError(
+            "--clear-registered-agents cannot be combined with --registered-agent"
+        )
     if clear_peer_task_coordinator and peer_task_coordinator:
         raise ValueError(
             "--clear-peer-task-coordinator cannot be combined with "
@@ -494,13 +558,15 @@ def configure_goal(
     if agent_model is not None:
         agent_model = str(agent_model).strip().lower()
         if agent_model not in AGENT_MODEL_CHOICES:
-            raise ValueError("--agent-model must be one of: " + ", ".join(AGENT_MODEL_CHOICES))
+            raise ValueError(
+                "--agent-model must be one of: " + ", ".join(AGENT_MODEL_CHOICES)
+            )
     if automation_prompt_migration_ack is not None:
-        automation_prompt_migration_ack = str(
-            automation_prompt_migration_ack
-        ).strip()
+        automation_prompt_migration_ack = str(automation_prompt_migration_ack).strip()
         if not automation_prompt_migration_ack:
-            raise ValueError("--ack-automation-prompt-migration requires a migration id")
+            raise ValueError(
+                "--ack-automation-prompt-migration requires a migration id"
+            )
         if registered_agents is not None or clear_registered_agents:
             raise ValueError(
                 "--ack-automation-prompt-migration cannot change registered agents; "
@@ -518,7 +584,11 @@ def configure_goal(
     if replace_write_scope and not write_scope:
         raise ValueError("--replace-write-scope requires --write-scope")
     if clear_write_scope and replace_write_scope:
-        raise ValueError("--clear-write-scope cannot be combined with --replace-write-scope")
+        raise ValueError(
+            "--clear-write-scope cannot be combined with --replace-write-scope"
+        )
+    shadow.validate_coordination_shadow_changes(
+        local_authority_shadow_file, clear_local_authority_shadow, coordination_runtime_shadow_file, clear_coordination_runtime_shadow)
     if clear_waiting_on and waiting_on:
         raise ValueError("--clear-waiting-on cannot be combined with --waiting-on")
     adding_boundary_authority = any(
@@ -532,7 +602,9 @@ def configure_goal(
         )
     )
     if clear_boundary_authority and adding_boundary_authority:
-        raise ValueError("--clear-boundary-authority cannot be combined with boundary authority fields")
+        raise ValueError(
+            "--clear-boundary-authority cannot be combined with boundary authority fields"
+        )
     if (
         clear_issue_fix_reviewer_notification_config
         and issue_fix_reviewer_notification_config
@@ -553,24 +625,45 @@ def configure_goal(
             "--lark-event-inbox-agent-id requires --lark-event-inbox-config "
             "or --clear-lark-event-inbox-config"
         )
-    if clear_reward_memory_config and (
-        reward_memory_config or reward_memory_agents
-    ):
+    if clear_reward_memory_config and (reward_memory_config or reward_memory_agents):
         raise ValueError(
             "--clear-reward-memory-config cannot be combined with "
             "--reward-memory-config or --reward-memory-agent"
         )
     if waiting_on and waiting_on not in WAITING_ON_CHOICES:
-        raise ValueError("--waiting-on must be one of: " + ", ".join(WAITING_ON_CHOICES))
-    if multi_subagent_feature is not None and multi_subagent_feature not in MULTI_SUBAGENT_FEATURE_CHOICES:
-        raise ValueError("--multi-subagent-feature must be one of: " + ", ".join(MULTI_SUBAGENT_FEATURE_CHOICES))
-    if multi_subagent_feature is not None and (orchestration_mode is not None or spawn_allowed is not None):
+        raise ValueError(
+            "--waiting-on must be one of: " + ", ".join(WAITING_ON_CHOICES)
+        )
+    if (
+        multi_subagent_feature is not None
+        and multi_subagent_feature not in MULTI_SUBAGENT_FEATURE_CHOICES
+    ):
+        raise ValueError(
+            "--multi-subagent-feature must be one of: "
+            + ", ".join(MULTI_SUBAGENT_FEATURE_CHOICES)
+        )
+    if multi_subagent_feature is not None and (
+        orchestration_mode is not None or spawn_allowed is not None
+    ):
         raise ValueError(
             "--multi-subagent-feature cannot be combined with --orchestration-mode or --spawn-allowed; "
             "use --max-children/--allowed-domain for bounded feature settings"
         )
+    if clear_subagent_model_config and (
+        subagent_model is not None or subagent_reasoning_effort is not None
+    ):
+        raise ValueError(
+            "--clear-subagent-model-config cannot be combined with model settings"
+        )
+    if clear_subagent_execution_config and subagent_execution_config:
+        raise ValueError(
+            "--clear-subagent-execution-config cannot be combined with "
+            "--subagent-execution-config"
+        )
     if explore_harness_profile is not None:
-        explore_harness_profile = str(explore_harness_profile).strip().lower().replace("_", "-")
+        explore_harness_profile = (
+            str(explore_harness_profile).strip().lower().replace("_", "-")
+        )
         if explore_harness_profile not in EXPLORE_HARNESS_PROFILES:
             raise ValueError(
                 "--explore-harness-profile must be one of: "
@@ -578,14 +671,20 @@ def configure_goal(
             )
 
     quota_compute = _non_negative_number(quota_compute, field="quota_compute")
-    quota_window_hours = _positive_number(quota_window_hours, field="quota_window_hours")
+    quota_window_hours = _positive_number(
+        quota_window_hours, field="quota_window_hours"
+    )
     max_children = _non_negative_int(max_children, field="max_children")
     allowed_domains = _clean_domains(allowed_domains)
     if multi_subagent_feature == "off":
         if max_children not in (None, 0):
-            raise ValueError("--multi-subagent-feature off cannot be combined with --max-children greater than 0")
+            raise ValueError(
+                "--multi-subagent-feature off cannot be combined with --max-children greater than 0"
+            )
         if allowed_domains:
-            raise ValueError("--multi-subagent-feature off cannot be combined with --allowed-domain")
+            raise ValueError(
+                "--multi-subagent-feature off cannot be combined with --allowed-domain"
+            )
     registered_agents = _clean_registered_agents(registered_agents)
     if peer_task_coordinator is not None:
         peer_task_coordinator = normalize_todo_claimed_by(peer_task_coordinator)
@@ -600,7 +699,7 @@ def configure_goal(
         clear_todo_lifecycle_authority
     )
     supervised_agents = _clean_registered_agents(supervised_agents)
-    write_scope = _clean_write_scope(write_scope)
+    write_scope = normalize_goal_write_scope(write_scope, fold=False)
     issue_fix_reviewer_notification_config = _local_private_config_path(
         issue_fix_reviewer_notification_config,
         label="reviewer notification config",
@@ -609,9 +708,7 @@ def configure_goal(
         lark_event_inbox_config,
         label="lark event inbox config",
     )
-    normalized_lark_inbox_agent = normalize_todo_claimed_by(
-        lark_event_inbox_agent_id
-    )
+    normalized_lark_inbox_agent = normalize_todo_claimed_by(lark_event_inbox_agent_id)
     if lark_event_inbox_agent_id and not normalized_lark_inbox_agent:
         raise ValueError(
             "--lark-event-inbox-agent-id must be a public-safe registered agent id"
@@ -620,17 +717,41 @@ def configure_goal(
         reward_memory_config,
         label="reward memory experiment config",
     )
-
-    payload = read_json(registry_path)
+    subagent_execution_config = _local_private_config_path(
+        subagent_execution_config,
+        label="subagent execution config",
+    )
+    periodic_report_change = periodic_report_config.normalize_change(
+        periodic_report_configuration, clear=clear_periodic_report_configuration
+    )
+    change_quality_change = change_quality_config.normalize_change(
+        change_quality_enabled,
+        change_quality_safe_fix,
+        change_quality_strict_receipt,
+        clear=clear_change_quality_configuration,
+    )
+    progress_review_change = progress_review_config.normalize_change(
+        progress_review_mode,
+        progress_review_signal,
+        progress_review_drift_threshold,
+        progress_review_contract_revision,
+        clear=clear_progress_review_configuration,
+    )
+    payload = (
+        _registry_transaction.payload_copy()
+        if _registry_transaction is not None
+        else load_project_registry(registry_path)
+    )
+    require_runtime_compatible_project_registry(
+        payload,
+        operation="Goal configuration",
+    )
     goals = registry_goals(payload)
     goal = next((item for item in goals if str(item.get("id")) == goal_id), None)
     if goal is None:
         raise ValueError(f"goal_id not found in registry: {goal_id}")
-
     existing_coordination = (
-        goal.get("coordination")
-        if isinstance(goal.get("coordination"), dict)
-        else {}
+        goal.get("coordination") if isinstance(goal.get("coordination"), dict) else {}
     )
     effective_registered_agents = (
         []
@@ -654,42 +775,17 @@ def configure_goal(
             "--peer-task-coordinator must name an agent already registered for "
             f"this goal: {peer_task_coordinator}"
         )
-    existing_reward_memory = reward_memory_goal_policy(goal)
-    effective_reward_memory_agents = (
-        reward_memory_agents
-        if reward_memory_agents is not None
-        else existing_reward_memory["enabled_agents"]
+    reward_memory_plan = plan_reward_memory_goal_configuration(
+        goal=goal,
+        goal_id=goal_id,
+        registered_agents=effective_registered_agents,
+        requested_config_path=reward_memory_config,
+        requested_agents=reward_memory_agents,
+        agent_id=reward_memory_agent_id,
+        clear=clear_reward_memory_config,
+        observed_at=_now_iso(),
+        execute=execute,
     )
-    if reward_memory_config is not None or reward_memory_agents is not None:
-        effective_reward_memory_config = (
-            reward_memory_config or existing_reward_memory["config_path"]
-        )
-        if not effective_reward_memory_config:
-            raise ValueError(
-                "--reward-memory-agent requires an existing or supplied "
-                "--reward-memory-config"
-            )
-        if not effective_reward_memory_agents:
-            raise ValueError(
-                "enabling Reward Memory requires at least one "
-                "--reward-memory-agent"
-            )
-    unknown_reward_memory_agents = sorted(
-        set(effective_reward_memory_agents) - set(effective_registered_agents)
-    )
-    reward_memory_remains_enabled = (
-        not clear_reward_memory_config
-        and (
-            existing_reward_memory["enabled"]
-            or reward_memory_config is not None
-            or reward_memory_agents is not None
-        )
-    )
-    if reward_memory_remains_enabled and unknown_reward_memory_agents:
-        raise ValueError(
-            "Reward Memory agents must already be registered for this goal: "
-            + ", ".join(unknown_reward_memory_agents)
-        )
     normalized_agent_profiles: dict[str, dict[str, Any]] = {}
     for raw_profile in agent_profiles or []:
         if not isinstance(raw_profile, Mapping):
@@ -738,11 +834,18 @@ def configure_goal(
 
     before_goal = deepcopy(goal)
     before = _settings_summary(before_goal)
-    if execution_turn_granularity is not None:
-        goal["execution_profile"] = execution_profile_with_turn_granularity(
-            goal.get("execution_profile"),
-            execution_turn_granularity,
-        )
+    apply_goal_execution_profile_change(
+        goal,
+        turn_granularity=execution_turn_granularity,
+        replan_after_completed_todos=execution_replan_after_todos,
+        replan_after_effective_turns=execution_replan_after_turns,
+        planning_horizon_goal=execution_planning_horizon_goal,
+        clear_planning_horizon_goal=clear_execution_planning_horizon_goal,
+        yardstick_enabled=execution_yardstick_enabled,
+        clear_yardstick_enabled=clear_execution_yardstick_enabled,
+        clear_replan_after_effective_turns=clear_execution_replan_after_turns,
+        clear_replan_after_completed_todos=clear_execution_replan_after_todos,
+    )
     legacy_hierarchy_before = legacy_agent_hierarchy_present(before_goal)
     expected_migration_id = peer_agent_runtime_migration_id(goal_id, before_goal)
     completed_migration_before = completed_peer_agent_runtime_migration(before_goal)
@@ -765,12 +868,17 @@ def configure_goal(
                 "automation prompt migration id does not match the current goal state; "
                 f"expected {expected_migration_id}"
             )
-    elif execute and legacy_hierarchy_before and not migration_completed_before and (
-        agent_model is not None
-        or registered_agents is not None
-        or peer_task_coordinator is not None
-        or clear_peer_task_coordinator
-        or clear_registered_agents
+    elif (
+        execute
+        and legacy_hierarchy_before
+        and not migration_completed_before
+        and (
+            agent_model is not None
+            or registered_agents is not None
+            or peer_task_coordinator is not None
+            or clear_peer_task_coordinator
+            or clear_registered_agents
+        )
     ):
         raise ValueError(
             "legacy agent hierarchy requires the one-time host automation migration first; "
@@ -793,42 +901,24 @@ def configure_goal(
         or self_repair_waiting_projection is not None
     ):
         control_plane = _mutable_control_plane(goal)
-        self_repair = control_plane.get("self_repair") if isinstance(control_plane.get("self_repair"), dict) else {}
+        self_repair = (
+            control_plane.get("self_repair")
+            if isinstance(control_plane.get("self_repair"), dict)
+            else {}
+        )
         if self_repair_enabled is not None:
             self_repair["enabled"] = self_repair_enabled
         if self_repair_health is not None:
             self_repair["allow_health_blocker_repair"] = self_repair_health
         if self_repair_waiting_projection is not None:
-            self_repair["allow_waiting_projection_repair"] = self_repair_waiting_projection
+            self_repair["allow_waiting_projection_repair"] = (
+                self_repair_waiting_projection
+            )
         control_plane["self_repair"] = self_repair
-
-    if (
-        change_quality_enabled is not None
-        or change_quality_safe_fix is not None
-        or change_quality_strict_receipt is not None
-    ):
-        control_plane = _mutable_control_plane(goal)
-        current = change_quality_goal_policy_summary(goal)
-        change_quality = {
-            "schema_version": CHANGE_QUALITY_POLICY_SCHEMA_VERSION,
-            "enabled": (
-                change_quality_enabled
-                if change_quality_enabled is not None
-                else current["enabled"]
-            ),
-            "safe_fix": (
-                change_quality_safe_fix
-                if change_quality_safe_fix is not None
-                else current["safe_fix"]
-            ),
-            "strict_receipt": (
-                change_quality_strict_receipt
-                if change_quality_strict_receipt is not None
-                else current["strict_receipt"]
-            ),
-        }
-        control_plane["change_quality_qualification"] = change_quality
-
+    periodic_report_config.apply_change(goal, periodic_report_change)
+    change_quality_config.apply_change(goal, change_quality_change)
+    progress_review_config.apply_change(goal, progress_review_change)
+    improvement_config.apply_change(goal, capability_improvement_configuration, clear=clear_capability_improvement_configuration)
     if (
         issue_fix_reviewer_notification_config is not None
         or clear_issue_fix_reviewer_notification_config
@@ -850,7 +940,6 @@ def configure_goal(
             control_plane["issue_fix"] = issue_fix
         else:
             control_plane.pop("issue_fix", None)
-
     if lark_event_inbox_config is not None or clear_lark_event_inbox_config:
         control_plane = _mutable_control_plane(goal)
         if normalized_lark_inbox_agent:
@@ -862,10 +951,17 @@ def configure_goal(
             if clear_lark_event_inbox_config:
                 agent_inboxes.pop(normalized_lark_inbox_agent, None)
             else:
-                agent_inboxes[normalized_lark_inbox_agent] = {
+                agent_inbox_binding: dict[str, Any] = {
                     "enabled": True,
                     "config_path": lark_event_inbox_config,
                 }
+                config_digest = local_private_config_digest(
+                    project=str(goal.get("repo") or ""),
+                    config_path=str(lark_event_inbox_config or ""),
+                )
+                if config_digest:
+                    agent_inbox_binding["config_digest"] = config_digest
+                agent_inboxes[normalized_lark_inbox_agent] = agent_inbox_binding
             if agent_inboxes:
                 control_plane["lark_event_inboxes"] = agent_inboxes
             else:
@@ -877,7 +973,6 @@ def configure_goal(
                 "enabled": True,
                 "config_path": lark_event_inbox_config,
             }
-
     if lark_kanban_heartbeat_sync is not None:
         control_plane = _mutable_control_plane(goal)
         lark_kanban = (
@@ -888,70 +983,74 @@ def configure_goal(
         lark_kanban["heartbeat_sync_enabled"] = lark_kanban_heartbeat_sync
         control_plane["lark_kanban"] = lark_kanban
 
-    if (
-        reward_memory_config is not None
-        or reward_memory_agents is not None
-        or clear_reward_memory_config
-    ):
-        control_plane = _mutable_control_plane(goal)
-        if clear_reward_memory_config:
-            control_plane.pop("reward_memory", None)
-        else:
-            current_reward_memory = reward_memory_goal_policy(goal)
-            control_plane["reward_memory"] = {
-                "enabled": True,
-                "experimental": True,
-                "config_path": (
-                    reward_memory_config or current_reward_memory["config_path"]
-                ),
-                "enabled_agents": list(effective_reward_memory_agents),
-            }
+    apply_reward_memory_goal_configuration(goal, reward_memory_plan)
 
-    if explore_graph_enabled is not None:
+    if clear_explore_configuration:
+        if any(value is not None for value in (
+            explore_mode, explore_graph_enabled, explore_harness_enabled, explore_harness_profile,
+            explore_composition_mode, explore_composition_scope_id,
+        )) or clear_explore_harness_profile:
+            raise ValueError("Clear Explore configuration or set Explore options, not both")
+        goal.pop("explore_graph", None)
+        if isinstance(goal.get("spawn_policy"), dict):
+            goal["spawn_policy"].pop("explore_harness", None)
+
+    if any(value is not None for value in (explore_mode, explore_graph_enabled, explore_harness_enabled)):
+        existing_harness = (goal.get("spawn_policy") or {}).get("explore_harness")
+        explore_plan = plan_explore_configuration(
+            explore_configuration(goal.get("explore_graph"), existing_harness),
+            {"mode": explore_mode, "evidence_enabled": explore_graph_enabled,
+             "planning_enabled": explore_harness_enabled},
+        )
+        explore_graph_enabled = explore_plan["evidence_enabled"]
+        if explore_mode is not None or explore_harness_enabled is not None or existing_harness:
+            explore_harness_enabled = explore_plan["planning_enabled"]
         goal["explore_graph"] = {"enabled": explore_graph_enabled}
 
     if (
         multi_subagent_feature is not None
-        or
-        orchestration_mode is not None
+        or orchestration_mode is not None
         or spawn_allowed is not None
         or max_children is not None
+        or subagent_model is not None
+        or subagent_reasoning_effort is not None
+        or clear_subagent_model_config
+        or subagent_execution_config is not None
+        or clear_subagent_execution_config
         or allowed_domains is not None
         or clear_allowed_domains
         or explore_harness_enabled is not None
         or explore_harness_profile is not None
         or clear_explore_harness_profile
+        or explore_composition_mode is not None
+        or explore_composition_scope_id is not None
     ):
-        spawn_policy = goal.get("spawn_policy") if isinstance(goal.get("spawn_policy"), dict) else {}
-        if multi_subagent_feature == "enabled":
-            spawn_policy["mode"] = MULTI_SUBAGENT_ORCHESTRATION_MODE
-            spawn_policy["allowed"] = True
-            if max_children is None:
-                existing_children = int(compact_orchestration_policy(spawn_policy).get("max_children") or 0)
-                spawn_policy["max_children"] = (
-                    existing_children
-                    if existing_children > 0
-                    else DEFAULT_MULTI_SUBAGENT_MAX_CHILDREN
-                )
-        elif multi_subagent_feature == "off":
-            spawn_policy["mode"] = DEFAULT_ORCHESTRATION_MODE
-            spawn_policy["allowed"] = False
-            spawn_policy["max_children"] = 0
-            spawn_policy["allowed_domains"] = []
-        elif orchestration_mode is not None:
-            spawn_policy["mode"] = orchestration_mode
-        if spawn_allowed is not None:
-            spawn_policy["allowed"] = spawn_allowed
-        if max_children is not None:
-            spawn_policy["max_children"] = max_children
-        if clear_allowed_domains:
-            spawn_policy["allowed_domains"] = []
-        elif allowed_domains is not None:
-            spawn_policy["allowed_domains"] = allowed_domains
+        spawn_policy = (
+            goal.get("spawn_policy")
+            if isinstance(goal.get("spawn_policy"), dict)
+            else {}
+        )
+        update_spawn_execution_policy(
+            spawn_policy,
+            multi_subagent_feature=multi_subagent_feature,
+            orchestration_mode=orchestration_mode,
+            spawn_allowed=spawn_allowed,
+            max_children=max_children,
+            subagent_model=subagent_model,
+            subagent_reasoning_effort=subagent_reasoning_effort,
+            clear_subagent_model_config=clear_subagent_model_config,
+            subagent_execution_config=subagent_execution_config,
+            clear_subagent_execution_config=clear_subagent_execution_config,
+            allowed_domains=allowed_domains,
+            clear_allowed_domains=clear_allowed_domains,
+            default_max_children=DEFAULT_MULTI_SUBAGENT_MAX_CHILDREN,
+        )
         if (
             explore_harness_enabled is not None
             or explore_harness_profile is not None
             or clear_explore_harness_profile
+            or explore_composition_mode is not None
+            or explore_composition_scope_id is not None
         ):
             explore_harness = (
                 spawn_policy.get("explore_harness")
@@ -964,6 +1063,15 @@ def configure_goal(
                 explore_harness.pop("profile", None)
             elif explore_harness_profile is not None:
                 explore_harness["profile"] = explore_harness_profile
+            if explore_composition_mode is not None:
+                explore_harness["composition_mode"] = explore_composition_mode
+            if explore_composition_scope_id is not None:
+                if explore_composition_scope_id:
+                    explore_harness["composition_scope_id"] = explore_composition_scope_id
+                else:
+                    explore_harness.pop("composition_scope_id", None)
+            from .orchestration import compact_explore_harness_policy
+            compact_explore_harness_policy(explore_harness)
             if explore_harness:
                 spawn_policy["explore_harness"] = explore_harness
             else:
@@ -996,7 +1104,11 @@ def configure_goal(
         or clear_boundary_authority
         or adding_boundary_authority
     ):
-        coordination = goal.get("coordination") if isinstance(goal.get("coordination"), dict) else {}
+        coordination = (
+            goal.get("coordination")
+            if isinstance(goal.get("coordination"), dict)
+            else {}
+        )
         effective_agent_model = AgentRuntimeModel.PEER_V1.value
         if clear_registered_agents:
             coordination.pop("registered_agents", None)
@@ -1109,8 +1221,7 @@ def configure_goal(
             else:
                 coordination.pop("agent_work_modes", None)
         if not clear_registered_agents and (
-            normalized_todo_lifecycle_authority
-            or clear_todo_lifecycle_authority
+            normalized_todo_lifecycle_authority or clear_todo_lifecycle_authority
         ):
             current_authority = normalize_todo_lifecycle_authority(
                 coordination.get("todo_lifecycle_authority"),
@@ -1135,7 +1246,10 @@ def configure_goal(
                 )
             else:
                 coordination.pop("todo_lifecycle_authority", None)
-        if automation_prompt_migration_ack is not None and not migration_already_completed:
+        if (
+            automation_prompt_migration_ack is not None
+            and not migration_already_completed
+        ):
             coordination = migrate_coordination_to_peer_v1(
                 coordination,
                 migration_id=automation_prompt_migration_ack,
@@ -1159,11 +1273,26 @@ def configure_goal(
         if clear_write_scope:
             coordination["write_scope"] = []
         elif write_scope is not None:
+            goal_repo = goal.get("repo")
             if replace_write_scope:
-                coordination["write_scope"] = write_scope
+                coordination["write_scope"] = (
+                    normalize_goal_write_scope(write_scope, goal_repo=goal_repo) or []
+                )
             else:
-                existing_write_scope = _clean_write_scope(coordination.get("write_scope") or []) or []
-                coordination["write_scope"] = _clean_write_scope([*existing_write_scope, *write_scope]) or []
+                existing_write_scope = (
+                    normalize_goal_write_scope(
+                        coordination.get("write_scope") or [],
+                        goal_repo=goal_repo,
+                    )
+                    or []
+                )
+                coordination["write_scope"] = (
+                    normalize_goal_write_scope(
+                        [*existing_write_scope, *write_scope],
+                        goal_repo=goal_repo,
+                    )
+                    or []
+                )
         if clear_boundary_authority:
             coordination.pop("checkpointed_boundary_authority", None)
         if adding_boundary_authority:
@@ -1182,8 +1311,22 @@ def configure_goal(
             coordination["checkpointed_boundary_authority"] = [*entries, entry]
         goal["coordination"] = coordination
 
+    shadow.apply_coordination_shadow_changes(
+        goal, local_authority_shadow_file, clear_local_authority_shadow, coordination_runtime_shadow_file, clear_coordination_runtime_shadow)
+    pr_review_config.apply_change(goal, pull_request_review_configuration, clear=clear_pull_request_review_configuration,
+                                 agent_order_updates=pull_request_review_agent_orders,
+                                 reconcile_registered_agents=registered_agents is not None or clear_registered_agents)
     after = _settings_summary(goal)
     changed_fields = _changed_fields(before, after)
+    if goal != before_goal and not changed_fields:
+        # Some local-private control-plane bindings intentionally project only
+        # counts and booleans. Rebinding one enabled provider to another can
+        # therefore preserve the public summary while still requiring a write.
+        changed_fields = [
+            field
+            for field in ("execution_profile", "control_plane")
+            if before_goal.get(field) != goal.get(field)
+        ] or ["control_plane"]
     dry_run = not execute
     model_changed = bool(
         before.get("legacy_hierarchy_present")
@@ -1200,10 +1343,14 @@ def configure_goal(
                 f"{registry_path.name}.before-agent-model-{stamp}.bak"
             )
             shutil.copy2(registry_path, backup_path)
-        atomic_write_json(registry_path, payload)
+        if _registry_transaction is None:
+            raise RuntimeError("configure_goal mutation requires a registry transaction")
+        _registry_transaction.commit(payload)
 
     feature_summary = {
-        "multi_subagent": _multi_subagent_feature_status(after.get("orchestration") or {}),
+        "multi_subagent": _multi_subagent_feature_status(
+            after.get("orchestration") or {}
+        ),
         "explore_graph": deepcopy(after.get("explore_graph") or {"enabled": False}),
         "explore_harness": deepcopy(
             (after.get("orchestration") or {}).get("explore_harness")
@@ -1213,16 +1360,22 @@ def configure_goal(
         "peer_task_coordination": deepcopy(
             after.get("peer_task_coordination") or {"enabled": False}
         ),
+        "local_authority_shadow": deepcopy(after["local_authority_shadow"]),
+        "coordination_runtime_shadow": deepcopy(after["coordination_runtime_shadow"]),
         "lark_event_inbox": _lark_event_inbox_config_summary(goal),
         "lark_kanban_heartbeat_sync": _lark_kanban_heartbeat_config_summary(goal),
-        "reward_memory": reward_memory_goal_policy_summary(goal),
+        "reward_memory": reward_memory_goal_configuration_summary(goal),
+        "pull_request_review": pr_review_config.configuration_summary(goal),
         "change_quality_qualification": change_quality_goal_policy_summary(goal),
+        "progress_review": progress_review_config.configuration_summary(goal),
+        "goal_capability_organization": improvement_config.configuration_summary(goal),
         "default": "off",
         "configuration_entry": "multi_subagent_feature",
     }
 
     return {
-        "ok": True,
+        "ok": reward_memory_plan["preflight"] is None
+        or reward_memory_plan["preflight"].get("ok") is True,
         "dry_run": dry_run,
         "execute": execute,
         "registry": str(registry_path),
@@ -1233,6 +1386,7 @@ def configure_goal(
         "before": before,
         "after": after,
         "written": bool(execute and changed_fields),
+        "reward_memory_enablement_preflight": deepcopy(reward_memory_plan["preflight"]),
         "automation_prompt_migration": {
             "migration_id": automation_prompt_migration_ack,
             "status": (
@@ -1246,8 +1400,12 @@ def configure_goal(
             ),
             "exactly_once_effect": True,
         },
-        "control_plane_summary": control_plane_policy_summary(after.get("control_plane")),
-        "orchestration_summary": orchestration_policy_summary(after.get("orchestration")),
+        "control_plane_summary": control_plane_policy_summary(
+            after.get("control_plane")
+        ),
+        "orchestration_summary": orchestration_policy_summary(
+            after.get("orchestration")
+        ),
         "feature_summary": feature_summary,
         "configuration_catalog": build_goal_configuration_catalog(
             goal_id=goal_id,
@@ -1255,6 +1413,9 @@ def configure_goal(
             feature_summary=feature_summary,
             default_multi_subagent_max_children=DEFAULT_MULTI_SUBAGENT_MAX_CHILDREN,
             explore_harness_profiles=EXPLORE_HARNESS_PROFILES,
+            machine_inheritable_goal_overrides=(
+                builtin_machine_inheritable_goal_overrides(goal)
+            ),
         ),
         "heartbeat_prompt_migration": _build_heartbeat_prompt_migration(
             goal_id=goal_id,
@@ -1293,6 +1454,11 @@ def render_configure_goal_markdown(payload: dict[str, Any]) -> str:
         return "\n".join(lines)
     fields = payload.get("changed_fields") or []
     lines.append(f"- changed_fields: `{', '.join(fields) if fields else 'none'}`")
+    lines.extend(
+        reward_memory_preflight_markdown_lines(
+            payload.get("reward_memory_enablement_preflight")
+        )
+    )
     global_sync = payload.get("global_sync")
     if isinstance(global_sync, dict):
         selected_target = (
@@ -1317,9 +1483,23 @@ def render_configure_goal_markdown(payload: dict[str, Any]) -> str:
         lines.append(f"- control_plane: {payload.get('control_plane_summary')}")
     if payload.get("orchestration_summary"):
         lines.append(f"- orchestration: {payload.get('orchestration_summary')}")
+    codex_capacity = payload.get("codex_host_capacity")
+    if isinstance(codex_capacity, dict):
+        lines.extend(
+            [
+                f"- codex_host_capacity: `{codex_capacity.get('status')}`",
+                f"- codex_required_children: `{codex_capacity.get('required_children')}`",
+                f"- codex_configured_children: `{codex_capacity.get('configured_children')}`",
+                f"- codex_alignment_requested: `{codex_capacity.get('alignment_requested')}`",
+                f"- codex_capacity_written: `{codex_capacity.get('written', False)}`",
+                f"- codex_new_session_required: `{codex_capacity.get('new_session_required', False)}`",
+            ]
+        )
     feature_summary = payload.get("feature_summary")
     if isinstance(feature_summary, dict):
-        lines.append(f"- feature_multi_subagent: `{feature_summary.get('multi_subagent')}`")
+        lines.append(
+            f"- feature_multi_subagent: `{feature_summary.get('multi_subagent')}`"
+        )
         graph = feature_summary.get("explore_graph")
         if isinstance(graph, dict):
             lines.append(
@@ -1378,9 +1558,7 @@ def render_configure_goal_markdown(payload: dict[str, Any]) -> str:
         for command in migration.get("commands") or []:
             if not isinstance(command, dict):
                 continue
-            lines.append(
-                f"  - {command.get('agent_id')}: `{command.get('command')}`"
-            )
+            lines.append(f"  - {command.get('agent_id')}: `{command.get('command')}`")
     supervisor_prompt = payload.get("supervisor_prompt")
     if isinstance(supervisor_prompt, dict):
         lines.append(f"- supervisor_prompt_status: `{supervisor_prompt.get('status')}`")

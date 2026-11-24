@@ -3,12 +3,16 @@ import test from "node:test";
 
 import {
   buildVisionCheckpoint,
-  VISION_CHECKPOINT_REQUEST_SCHEMA,
+  VISION_REFRESH_PREPARED_SCHEMA_VERSION,
+  VISION_REFRESH_REQUEST_SCHEMA,
+  visionAuthoringContract,
+  normalizeGoalPathDelta,
 } from "../../loopx/control_plane/goals/vision_checkpoint.ts";
 
-function request(overrides: Record<string, unknown> = {}) {
+function finalizeRequest(overrides: Record<string, unknown> = {}) {
   return {
-    schema_version: VISION_CHECKPOINT_REQUEST_SCHEMA,
+    schema_version: VISION_REFRESH_REQUEST_SCHEMA,
+    phase: "finalize",
     agent_id: "codex-main",
     agent_vision: null,
     existing_agent_vision: null,
@@ -23,18 +27,647 @@ function request(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function prepareRequest(overrides: Record<string, unknown> = {}) {
+  return {
+    schema_version: VISION_REFRESH_REQUEST_SCHEMA,
+    phase: "prepare",
+    goal_id: "goal-main",
+    agent_id: "codex-main",
+    agent_vision_packet: {
+      state: "vision_patch_proposed",
+      vision_patch: {
+        vision_summary: "Ship one bounded route.",
+      },
+    },
+    existing_agent_vision: null,
+    merge_patch: false,
+    require_path_delta_for_durable_change: false,
+    ...overrides,
+  };
+}
+
+test("authoring examples distinguish ordinary continuation from autonomous durable changes", () => {
+  const existing = {vision_patch: {acceptance_summary: "Original evidence pending."}};
+  for (const autonomous of [false, true]) {
+    const packet = visionAuthoringContract(autonomous).minimal_example as Record<string, unknown>;
+    const result = buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: packet, existing_agent_vision: existing,
+      require_path_delta_for_durable_change: autonomous,
+    })).agent_vision as Record<string, unknown>;
+    assert.equal((result.path_delta as Record<string, unknown>).outcome, autonomous ? "replan" : "continue");
+    assert.deepEqual(result.vision_patch, packet.vision_patch);
+  }
+  const ordinary = visionAuthoringContract().minimal_example;
+  assert.throws(() => buildVisionCheckpoint(prepareRequest({
+    agent_vision_packet: ordinary, existing_agent_vision: existing,
+    require_path_delta_for_durable_change: true,
+  })), /changes durable fields acceptance_summary/);
+});
+
+test("autonomous JSON authoring retains the complete current packet before changing evidence", () => {
+  const contract = visionAuthoringContract(true);
+  assert.match(String(contract.authoring_hint), /JSON replaces the complete packet/);
+  assert.match(String(contract.authoring_hint), /current Agent's complete packet and full vision_patch/);
+  assert.match(String(contract.authoring_hint), /path_delta.retained text does not merge omitted fields/);
+  assert.doesNotMatch(String(visionAuthoringContract().authoring_hint), /JSON replaces/);
+  const existing = {
+    state: "active", todo_delta: ["retain:todo_current001"],
+    vision_patch: {
+      vision_summary: "Verify the whole delivery.", role_scope: "Own only the current role.",
+      advancement_policy: "repeat_until_closed", acceptance_summary: "Original evidence pending.",
+      dreaming_policy: "Propose bounded alternatives.",
+    },
+  };
+  const example = contract.minimal_example as Record<string, unknown>;
+  // The documented procedure copies known intent and overlays deliberate edits;
+  // replacement semantics and the existing durable-change validator stay intact.
+  const packet = {...existing,
+    vision_patch: {...existing.vision_patch, ...(example.vision_patch as Record<string, unknown>)},
+    path_delta: example.path_delta};
+  const result = buildVisionCheckpoint(prepareRequest({agent_vision_packet: packet,
+    existing_agent_vision: existing, require_path_delta_for_durable_change: true,
+  })).agent_vision as Record<string, unknown>;
+  assert.deepEqual(result.vision_patch, {...existing.vision_patch,
+    acceptance_summary: "Verified result; scoped work remains."});
+  assert.equal(result.state, existing.state);
+  assert.deepEqual(result.todo_delta, existing.todo_delta);
+  // Sparse JSON remains a replacement: fixing guidance must not silently change
+  // callers that intentionally replace a packet or weaken the validator.
+  const sparse = buildVisionCheckpoint(prepareRequest({agent_vision_packet: example,
+    existing_agent_vision: existing, require_path_delta_for_durable_change: true,
+  })).agent_vision as Record<string, unknown>;
+  assert.deepEqual(sparse.vision_patch, example.vision_patch);
+});
+
+test("prepare owns packet normalization, budgets, and path delta", () => {
+  const result = buildVisionCheckpoint(prepareRequest({
+    agent_vision_packet: {
+      goal_id: "goal-main",
+      agent_id: "codex-main",
+      state: "closed",
+      vision_patch: {
+        vision_summary: "  Ship   one bounded route.  ",
+        role_scope: "Own the route.",
+        acceptance_summary: "The route produces evidence.",
+        advancement_policy: "repeat-until-closed",
+      },
+      path_delta: {
+        outcome: "replan",
+        prior_assumption: "The old route remained viable.",
+        observed_reality: "Fresh evidence invalidated it.",
+        changed: ["Use the bounded successor."],
+      },
+      todo_delta: [" create_successor "],
+      validation: { write_correctness_checked: true },
+    },
+  }));
+
+  assert.equal(result.schema_version, VISION_REFRESH_PREPARED_SCHEMA_VERSION);
+  const vision = result.agent_vision as Record<string, unknown>;
+  assert.equal(vision.state, "vision_closed");
+  assert.deepEqual(vision.vision_patch, {
+    vision_summary: "Ship one bounded route.",
+    role_scope: "Own the route.",
+    acceptance_summary: "The route produces evidence.",
+    advancement_policy: "repeat_until_closed",
+  });
+  assert.deepEqual(vision.todo_delta, ["create_successor"]);
+  assert.deepEqual(vision.path_delta, {
+    schema_version: "goal_path_delta_v0",
+    outcome: "replan",
+    prior_assumption: "The old route remained viable.",
+    observed_reality: "Fresh evidence invalidated it.",
+    changed: ["Use the bounded successor."],
+  });
+  assert.deepEqual(vision.validation, {
+    write_correctness_checked: true,
+    budget_checked: true,
+    budget_status: "ok",
+  });
+});
+
+test("authoring rejects misplaced declared deltas without classifying telemetry", () => {
+  const delta = {schema_version: "goal_path_delta_v0", outcome: "replan",
+    prior_assumption: "Keep the route.", observed_reality: "A dependency changed.",
+    changed: ["Use the successor."]};
+  const patch = {vision_summary: "Deliver the successor."};
+  for (const extra of [
+    {goal_path_delta_v0: delta}, {comparison: delta},
+    {path_delta: delta, comparison: delta},
+    {vision_patch: {...patch, path_delta: delta}},
+  ]) {
+    assert.throws(() => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: {vision_patch: patch, ...extra},
+    })), /must be supplied as agent_vision.path_delta/);
+  }
+  const telemetry = {outcome: "ok", evidence_refs: ["evidence:probe"]};
+  const baseline = buildVisionCheckpoint(prepareRequest({agent_vision_packet: {vision_patch: patch}}));
+  assert.deepEqual(buildVisionCheckpoint(prepareRequest({
+    agent_vision_packet: {vision_patch: patch, telemetry},
+  })), baseline);
+  assert.throws(() => buildVisionCheckpoint(prepareRequest({agent_vision_packet: {
+    vision_patch: patch, path_delta: {...delta, schema_version: "unsupported"},
+  }})), /path_delta.schema_version must be goal_path_delta_v0/);
+  const accepted = buildVisionCheckpoint(prepareRequest({agent_vision_packet: {
+    vision_patch: patch, path_delta: delta, telemetry,
+  }}));
+  assert.deepEqual((accepted.agent_vision as Record<string, unknown>).path_delta, delta);
+});
+
+test("structured replans have a bounded 1800-character budget including path evidence", () => {
+  for (const character of ["x", "界"]) {
+    // Independent boundary oracle: 420 + 420 + 280 + 320 + 320 + 6 + 34.
+    const packet = {
+      vision_patch: {vision_summary: character.repeat(420), acceptance_summary: character.repeat(420),
+        role_scope: character.repeat(280)},
+      path_delta: {outcome: "replan", prior_assumption: character.repeat(320),
+        observed_reality: character.repeat(320), changed: [character.repeat(34)]},
+    };
+    const accepted = buildVisionCheckpoint(prepareRequest({agent_vision_packet: packet}));
+    const vision = accepted.agent_vision as Record<string, unknown>;
+    const budget = vision.vision_budget as Record<string, unknown>;
+    assert.equal(budget.total_usage, 1800);
+    assert.equal(budget.total_limit, 1800);
+    assert.equal((vision.path_delta as Record<string, unknown>).observed_reality, character.repeat(320));
+    assert.throws(() => buildVisionCheckpoint(prepareRequest({agent_vision_packet: {
+      ...packet, path_delta: {...packet.path_delta, observed_reality: character.repeat(321)},
+    }})), /path_delta.observed_reality uses 321 chars; limit is 320/);
+    assert.throws(() => buildVisionCheckpoint(prepareRequest({agent_vision_packet: {
+      ...packet, path_delta: {...packet.path_delta, changed: [character.repeat(35)]},
+    }})), /total_agent_vision uses 1801 chars; limit is 1800; usage: vision_patch=1120, path_delta=681, stride_decision=0, fallback_declarations=0/);
+  }
+});
+
+test("prepare preserves v0 JSON-to-text compatibility", () => {
+  const result = buildVisionCheckpoint(prepareRequest({
+    agent_vision_packet: {
+      vision_summary: true,
+      todo_delta: [["one", "two"], { route: "bounded" }, {}],
+      path_delta: {
+        outcome: "replan",
+        prior_assumption: { route: "old" },
+        observed_reality: "Fresh evidence invalidated it.",
+        changed: ["Use the bounded successor."],
+      },
+    },
+  }));
+
+  const vision = result.agent_vision as Record<string, unknown>;
+  assert.deepEqual(vision.vision_patch, { vision_summary: "True" });
+  assert.deepEqual(vision.todo_delta, [
+    "['one', 'two']",
+    "{'route': 'bounded'}",
+  ]);
+  assert.equal(
+    (vision.path_delta as Record<string, unknown>).prior_assumption,
+    "{'route': 'old'}",
+  );
+});
+
+test("prepare merges a patch and requires an explicit durable replan", () => {
+  const existing = {
+    state: "vision_active",
+    vision_patch: {
+      vision_summary: "Old route.",
+      role_scope: "Own framing.",
+      acceptance_summary: "Produce evidence.",
+      advancement_policy: "as_needed",
+    },
+  };
+  const agentVisionPacket = {
+    vision_patch: { vision_summary: "New route." },
+    path_delta: {
+      outcome: "replan",
+      prior_assumption: "The old route would hold.",
+      observed_reality: "New evidence changed the route.",
+      changed: ["Use the new route."],
+    },
+  };
+  const result = buildVisionCheckpoint(prepareRequest({
+    agent_vision_packet: agentVisionPacket,
+    existing_agent_vision: existing,
+    merge_patch: true,
+    require_path_delta_for_durable_change: true,
+  }));
+  assert.deepEqual(
+    (result.agent_vision as Record<string, unknown>).vision_patch,
+    {
+      vision_summary: "New route.",
+      role_scope: "Own framing.",
+      acceptance_summary: "Produce evidence.",
+      advancement_policy: "as_needed",
+    },
+  );
+
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: { vision_patch: { vision_summary: "New route." } },
+      existing_agent_vision: existing,
+      merge_patch: true,
+      require_path_delta_for_durable_change: true,
+    })),
+    /provide path_delta with schema_version=goal_path_delta_v0 and outcome=replan/,
+  );
+});
+
+test("prepare rejects identity drift, private text, and typed budget overflow", () => {
+  assert.throws(() => buildVisionCheckpoint(prepareRequest({
+    agent_vision_packet: {vision_summary: "Read /ext" + "_data" + "/artifact.txt"},
+  })), /contains a private-looking value/);
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: {
+        goal_id: "other-goal",
+        vision_summary: "Bounded route.",
+      },
+    })),
+    /does not match/,
+  );
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: {
+        vision_summary: "Read \/Users\/owner\/private.txt",
+      },
+    })),
+    /contains a private-looking value/,
+  );
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: { vision_summary: "x".repeat(421) },
+    })),
+    (error: unknown) => {
+      const rejection = error as { code?: string; message?: string };
+      assert.equal(
+        rejection.code,
+        "vision_budget_exceeded",
+      );
+      assert.match(rejection.message ?? "", /suggested compact value/);
+      assert.ok((rejection.message ?? "").length <= 240);
+      return true;
+    },
+  );
+});
+
+test("prepare reports independent text and list budget failures together without changing input", () => {
+  const packet = {
+    vision_patch: {vision_summary: "Retain the accepted objective.", last_patch_summary: "s".repeat(244)},
+    path_delta: {outcome: "continue", prior_assumption: "The route remains viable.",
+      observed_reality: "o".repeat(354), retained: ["a", "b", "c", "d"],
+      changed: ["Measured a change.", "c".repeat(178)], evidence_refs: ["a", "b", "c", "d", "e"]},
+  };
+  const original = structuredClone(packet);
+  assert.throws(() => buildVisionCheckpoint(prepareRequest({agent_vision_packet: packet})),
+    (error: unknown) => {
+      const rejection = error as {code: string; message: string; details: string[]};
+      assert.equal(rejection.code, "vision_budget_exceeded");
+      const diagnostic = [rejection.message, ...rejection.details].join("\n");
+      for (const message of ["last_patch_summary uses 244 chars; limit is 240",
+        "path_delta.observed_reality uses 354 chars; limit is 320",
+        "path_delta.retained has 4 items; limit is 3",
+        "path_delta.changed[1] uses 178 chars; limit is 120",
+        "path_delta.evidence_refs has 5 items; limit is 4"]) {
+        assert.ok(diagnostic.includes(message), message);
+      }
+      // Oversized lists retain count-before-content rejection; a partial count
+      // must never masquerade as a complete total.
+      assert.doesNotMatch(diagnostic, /total_agent_vision/);
+      return true;
+    });
+  assert.deepEqual(packet, original);
+  // Shared non-prepare consumers keep the original first-error contract.
+  assert.throws(() => normalizeGoalPathDelta(packet.path_delta), (error: unknown) => {
+    assert.match((error as Error).message, /path_delta.observed_reality uses 354/);
+    assert.equal((error as {details?: string[]}).details, undefined);
+    return true;
+  });
+  const corrected = {...packet, vision_patch: {...packet.vision_patch, last_patch_summary: "Verified change."},
+    path_delta: {...packet.path_delta, observed_reality: "Fresh evidence supports continuing.",
+      retained: ["Keep existing acceptance."], changed: ["Measured a change."], evidence_refs: ["evidence:checked"]}};
+  const prepared = buildVisionCheckpoint(prepareRequest({agent_vision_packet: corrected}));
+  assert.deepEqual((prepared.agent_vision as Record<string, unknown>).path_delta,
+    {schema_version: "goal_path_delta_v0", ...corrected.path_delta});
+});
+
+test("prepare reports complete total usage beside field overages and keeps structural rejection", () => {
+  const packet = {vision_patch: {vision_summary: "v".repeat(421), role_scope: "r".repeat(280),
+    acceptance_summary: "a".repeat(420), last_patch_summary: "s".repeat(240)},
+    path_delta: {outcome: "continue", prior_assumption: "p".repeat(320),
+      observed_reality: "o".repeat(320), retained: ["Keep acceptance."]}};
+  assert.throws(() => buildVisionCheckpoint(prepareRequest({agent_vision_packet: packet})), (error: unknown) => {
+    assert.match((error as {details: string[]}).details.join("\n"), /total_agent_vision uses 2025 chars; limit is 1800/);
+    return true;
+  });
+  for (const path_delta of [{...packet.path_delta, outcome: "invented"},
+    {...packet.path_delta, retained: "invalid"}, {...packet.path_delta, observed_reality: "Read /Users/owner/private.txt"}]) {
+    assert.throws(() => buildVisionCheckpoint(prepareRequest({agent_vision_packet: {...packet, path_delta}})),
+      /must be one of|must be a JSON array|private-looking/);
+  }
+});
+
+test("prepare keeps an over-budget enum's own budget error before enum decoding", () => {
+  const packet = {vision_patch: {advancement_policy: "x".repeat(41)}};
+  assert.throws(() => buildVisionCheckpoint(prepareRequest({agent_vision_packet: packet})), (error: unknown) => {
+    assert.equal((error as {code: string}).code, "vision_budget_exceeded");
+    assert.equal((error as Error).message, 'vision_budget_exceeded: advancement_policy uses 41 chars; limit is 32; suggested compact value: "' + "x".repeat(29) + '..."');
+    return true;
+  });
+  assert.throws(() => buildVisionCheckpoint(prepareRequest({agent_vision_packet: {advancement_policy: "invalid"}})), (error: unknown) => {
+    assert.equal((error as {code: string}).code, "invalid_request");
+    return true;
+  });
+  const valid = buildVisionCheckpoint(prepareRequest({agent_vision_packet: {advancement_policy: "as_needed"}}));
+  assert.deepEqual((valid.agent_vision as Record<string, unknown>).vision_patch, {advancement_policy: "as_needed"});
+  // A collected enum budget failure must not defer unrelated shape/privacy checks.
+  for (const path_delta of [{outcome: "invalid"}, {outcome: "continue", prior_assumption: "Retain the route.",
+    observed_reality: "Read /Users/owner/private.txt", retained: ["Keep acceptance."]}]) {
+    assert.throws(() => buildVisionCheckpoint(prepareRequest({agent_vision_packet: {...packet, path_delta}})), (error: unknown) => {
+      assert.equal((error as {code: string}).code, "invalid_request");
+      return true;
+    });
+  }
+});
+
+test("prepare rejects incomplete and over-wide path deltas", () => {
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: {
+        vision_summary: "Bounded route.",
+        path_delta: { outcome: "replan" },
+      },
+    })),
+    /requires prior_assumption and observed_reality/,
+  );
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: {
+        vision_summary: "Bounded route.",
+        path_delta: {
+          outcome: "replan",
+          prior_assumption: "Old assumption.",
+          observed_reality: "New reality.",
+          retained: ["one", "two", "three", "four"],
+        },
+      },
+    })),
+    /path_delta.retained has 4 items; limit is 3/,
+  );
+});
+
+test("prepare validates and carries bounded unique fallback declarations", () => {
+  const result = buildVisionCheckpoint(prepareRequest({
+    agent_vision_packet: {
+      vision_summary: "Ship one bounded route.",
+      fallback_declarations: [
+        {
+          declaration_id: " declared_fallback_direction ",
+          target_todo_id: "todo_declared_fallback",
+          successor_todo_id: null,
+        },
+        { declaration_id: "typed_successor", successor_todo_id: "todo_successor" },
+      ],
+    },
+  }));
+
+  const vision = result.agent_vision as Record<string, unknown>;
+  assert.deepEqual(vision.fallback_declarations, [
+    {
+      declaration_id: "declared_fallback_direction",
+      target_todo_id: "todo_declared_fallback",
+    },
+    { declaration_id: "typed_successor", successor_todo_id: "todo_successor" },
+  ]);
+  const budget = vision.vision_budget as Record<string, unknown>;
+  const fieldLimits = budget.field_limits as Record<string, number>;
+  const fieldUsage = budget.field_usage as Record<string, number>;
+  assert.equal(fieldLimits["fallback_declarations"], 4);
+  assert.equal(fieldLimits["fallback_declarations[]"], 120);
+  assert.equal(
+    fieldUsage["fallback_declarations[0].declaration_id"],
+    "declared_fallback_direction".length,
+  );
+
+  const empty = buildVisionCheckpoint(prepareRequest({
+    agent_vision_packet: {
+      vision_summary: "Ship one bounded route.",
+      fallback_declarations: [],
+    },
+  })) as Record<string, unknown>;
+  assert.equal(
+    (empty.agent_vision as Record<string, unknown>).fallback_declarations,
+    undefined,
+  );
+});
+
+test("prepare rejects unbounded, duplicated, and unsafe fallback declarations", () => {
+  const declaration = (id: string) => ({ declaration_id: id });
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: {
+        vision_summary: "Ship one bounded route.",
+        fallback_declarations: "declared_fallback_direction",
+      },
+    })),
+    /fallback_declarations must be a JSON array/,
+  );
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: {
+        vision_summary: "Ship one bounded route.",
+        fallback_declarations: [1, 2, 3, 4, 5].map(() => declaration("one")),
+      },
+    })),
+    /fallback_declarations has 5 items; limit is 4/,
+  );
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: {
+        vision_summary: "Ship one bounded route.",
+        fallback_declarations: [
+          declaration("declared_fallback_direction"),
+          declaration("declared_fallback_direction"),
+        ],
+      },
+    })),
+    /repeats declaration_id "declared_fallback_direction"/,
+  );
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: {
+        vision_summary: "Ship one bounded route.",
+        fallback_declarations: [{ target_todo_id: "todo_declared_fallback" }],
+      },
+    })),
+    /requires a non-empty declaration_id/,
+  );
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: {
+        vision_summary: "Ship one bounded route.",
+        fallback_declarations: [
+          { declaration_id: "route", target_todo_id: "todo_with_fallback" },
+          { declaration_id: "token = leaked", successor_todo_id: "todo_x" },
+        ],
+      },
+    })),
+    /contains a private-looking value/,
+  );
+  assert.throws(
+    () => buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: {
+        vision_summary: "Ship one bounded route.",
+        fallback_declarations: [
+          { declaration_id: "x".repeat(121) },
+        ],
+      },
+    })),
+    (error: unknown) => {
+      const rejection = error as { code?: string; message?: string };
+      assert.equal(rejection.code, "vision_budget_exceeded");
+      return true;
+    },
+  );
+});
+
+test("pure prepare and finalize reductions replay deterministically", () => {
+  const prepare = prepareRequest();
+  assert.deepEqual(
+    buildVisionCheckpoint(prepare),
+    buildVisionCheckpoint(prepare),
+  );
+  const finalize = finalizeRequest({
+    agent_vision: (buildVisionCheckpoint(prepare) as Record<string, unknown>)
+      .agent_vision,
+  });
+  assert.deepEqual(
+    buildVisionCheckpoint(finalize),
+    buildVisionCheckpoint(finalize),
+  );
+});
+
 test("semantic closeout retains the strict material vision checkpoint", () => {
-  const result = buildVisionCheckpoint(request());
+  const result = buildVisionCheckpoint(finalizeRequest());
   assert.equal(result.required, true);
   assert.equal(result.satisfied, false);
   assert.equal(result.decision, "missing_required");
+  assert.equal(result.missing_baseline, true);
+  assert.deepEqual(result.required_resolution, ["write_vision_patch"]);
   assert.deepEqual(result.triggers, [
     { kind: "material_delivery_outcome", delivery_outcome: "outcome_progress" },
   ]);
 });
 
+test("material closeout leaves an invalid path decision recoverable", () => {
+  const packet = (outcome: string) => ({
+    state: "vision_patch_proposed",
+    vision_patch: {acceptance_summary: "Verified result; scoped work remains."},
+    path_delta: {
+      outcome,
+      prior_assumption: "The current route remained valid.",
+      observed_reality: "Fresh evidence confirms the bounded next step.",
+      retained: ["Continue from the verified evidence."],
+      evidence_refs: ["evidence:verified-result"],
+    },
+  });
+  const prepared = (outcome: string) =>
+    buildVisionCheckpoint(prepareRequest({
+      agent_vision_packet: packet(outcome),
+    })).agent_vision;
+
+  for (const outcome of ["continue", "no_change", "replan"]) {
+    const result = buildVisionCheckpoint(finalizeRequest({agent_vision: prepared(outcome)}));
+    assert.equal(result.decision, "patched");
+    assert.equal(result.satisfied, true);
+  }
+  for (const outcome of ["wait", "ask_human", "stop"]) {
+    const result = buildVisionCheckpoint(finalizeRequest({agent_vision: prepared(outcome)}));
+    assert.equal(result.decision, "missing_required");
+    assert.equal(result.satisfied, false);
+    assert.deepEqual(result.unqualified_components, ["path_outcome_valid"]);
+    assert.deepEqual(result.required_resolution, ["write_vision_patch"]);
+  }
+
+  const reportedGap = buildVisionCheckpoint(finalizeRequest({
+    delivery_outcome: "outcome_gap",
+    agent_vision: prepared("replan"),
+  }));
+  assert.equal(reportedGap.decision, "patched");
+});
+
+test("missing checkpoint offers unchanged only with a persisted vision", () => {
+  const baseline = {state: "vision_active", generated_at: "2026-09-01T10:00:00Z"};
+  const missing = buildVisionCheckpoint(finalizeRequest({
+    existing_agent_vision: baseline,
+  }));
+  assert.equal(missing.satisfied, false);
+  assert.deepEqual(missing.required_resolution, [
+    "write_vision_patch", "record_unchanged_reason",
+  ]);
+  assert.equal("missing_baseline" in missing, false);
+  assert.equal(buildVisionCheckpoint(finalizeRequest({
+    existing_agent_vision: baseline,
+    vision_unchanged_reason: "The verified scope is still current.",
+  })).satisfied, true);
+  const rejected = buildVisionCheckpoint(finalizeRequest({
+    vision_unchanged_reason: "The verified scope is still current.",
+  }));
+  assert.equal(rejected.satisfied, false);
+  assert.equal(rejected.missing_baseline, true);
+  assert.deepEqual(rejected.required_resolution, ["write_vision_patch"]);
+});
+
+test("advertised Todo delta limits match retained items and item validation", () => {
+  const fields = visionAuthoringContract().fields as Record<string, unknown>;
+  assert.deepEqual(fields.todo_delta, {max_retained_items: 8, max_item_chars: 80});
+  const packet = (todo_delta: string[]) => prepareRequest({
+    agent_vision_packet: {vision_summary: "Deliver the scoped result.", todo_delta},
+  });
+  const deltas = Array.from({length: 9}, (_, index) => String(index).repeat(80));
+  const vision = buildVisionCheckpoint(packet(deltas)).agent_vision as Record<string, unknown>;
+  assert.deepEqual(vision.todo_delta, deltas.slice(0, 8));
+  assert.throws(() => buildVisionCheckpoint(packet(["x".repeat(81)])),
+    /todo_delta uses 81 chars; limit is 80/);
+});
+
+test("a bounded blocked retry does not invent a vision change", () => {
+  const blockedRetry = {
+    schema_version: "quota_blocked_retry_v0",
+    source: "turn_settlement",
+    todo_id: "todo_current001",
+    observed_at: "2026-09-24T14:00:00Z",
+    due_at: "2026-09-24T14:05:00Z",
+    resume_when: "resume_at:2026-09-24T14:05:00Z",
+  };
+  const blocked = buildVisionCheckpoint(finalizeRequest({
+    delivery_outcome: "outcome_gap", blocked_retry: blockedRetry,
+  }));
+  assert.equal(blocked.required, false);
+  assert.equal(blocked.satisfied, true);
+  assert.equal(blocked.decision, "not_required");
+  assert.deepEqual(blocked.triggers, []);
+
+  const changedAction = buildVisionCheckpoint(finalizeRequest({
+    delivery_outcome: "outcome_gap", blocked_retry: blockedRetry,
+    active_state_next_action_would_update: true,
+  }));
+  assert.equal(changedAction.required, true);
+  assert.deepEqual(changedAction.triggers, [{kind: "durable_next_action_update"}]);
+  assert.throws(() => buildVisionCheckpoint(finalizeRequest({
+    delivery_outcome: "outcome_gap",
+    blocked_retry: {...blockedRetry, todo_id: "todo_other"},
+  })), /blocked retry does not bind/);
+  assert.throws(() => buildVisionCheckpoint(finalizeRequest({
+    delivery_outcome: "outcome_gap",
+    blocked_retry: {
+      ...blockedRetry,
+      observed_at: "2026-02-30T14:00:00Z",
+      due_at: "2026-02-30T14:05:00Z",
+      resume_when: "resume_at:2026-02-30T14:05:00Z",
+    },
+  })), /blocked retry does not bind/);
+});
+
 test("explicit in-flight progress records continuity without vision repetition", () => {
-  const result = buildVisionCheckpoint(request({
+  const result = buildVisionCheckpoint(finalizeRequest({
     delivery_boundary: "in_flight_continuation",
   }));
   assert.equal(result.required, false);
@@ -46,7 +679,7 @@ test("explicit in-flight progress records continuity without vision repetition",
 });
 
 test("non-material delivery remains valid without opening a vision checkpoint", () => {
-  const result = buildVisionCheckpoint(request({
+  const result = buildVisionCheckpoint(finalizeRequest({
     delivery_outcome: "surface_only",
   }));
   assert.equal(result.required, false);
@@ -56,7 +689,7 @@ test("non-material delivery remains valid without opening a vision checkpoint", 
 });
 
 test("unchanged closeout binds the exact persisted vision revision", () => {
-  const result = buildVisionCheckpoint(request({
+  const result = buildVisionCheckpoint(finalizeRequest({
     existing_agent_vision: {
       state: "vision_active",
       generated_at: "2026-08-22T18:30:17+08:00",
@@ -73,7 +706,7 @@ test("unchanged closeout binds the exact persisted vision revision", () => {
 });
 
 test("legacy vision without a revision cannot claim outcome continuity", () => {
-  const result = buildVisionCheckpoint(request({
+  const result = buildVisionCheckpoint(finalizeRequest({
     existing_agent_vision: { state: "vision_active" },
     vision_unchanged_reason: "The legacy route is still current.",
   }));
@@ -83,21 +716,21 @@ test("legacy vision without a revision cannot claim outcome continuity", () => {
 
 test("completion, replan, and durable route changes reject in-flight claims", () => {
   assert.throws(
-    () => buildVisionCheckpoint(request({
+    () => buildVisionCheckpoint(finalizeRequest({
       delivery_boundary: "in_flight_continuation",
       completion_todo_id: "todo_current001",
     })),
     /conflicts with Todo completion/,
   );
   assert.throws(
-    () => buildVisionCheckpoint(request({
+    () => buildVisionCheckpoint(finalizeRequest({
       delivery_boundary: "in_flight_continuation",
       autonomous_replan_recorded: true,
     })),
     /conflicts with autonomous replan/,
   );
   assert.throws(
-    () => buildVisionCheckpoint(request({
+    () => buildVisionCheckpoint(finalizeRequest({
       delivery_boundary: "in_flight_continuation",
       active_state_next_action_would_update: true,
     })),
@@ -107,17 +740,32 @@ test("completion, replan, and durable route changes reject in-flight claims", ()
 
 test("only accountable agent-bound progress may be in flight", () => {
   assert.throws(
-    () => buildVisionCheckpoint(request({
+    () => buildVisionCheckpoint(finalizeRequest({
       delivery_boundary: "in_flight_continuation",
       delivery_outcome: "outcome_gap",
     })),
     /requires delivery_outcome=outcome_progress/,
   );
   assert.throws(
-    () => buildVisionCheckpoint(request({
+    () => buildVisionCheckpoint(finalizeRequest({
       delivery_boundary: "in_flight_continuation",
       todo_id: null,
     })),
     /requires an agent-bound Todo settlement/,
+  );
+});
+
+test("finalize owns unchanged-reason public safety and budget", () => {
+  assert.throws(
+    () => buildVisionCheckpoint(finalizeRequest({
+      vision_unchanged_reason: "Read \/Users\/owner\/private.txt",
+    })),
+    /contains a private-looking value/,
+  );
+  assert.throws(
+    () => buildVisionCheckpoint(finalizeRequest({
+      vision_unchanged_reason: "x".repeat(241),
+    })),
+    /vision_unchanged_reason exceeds 240 chars/,
   );
 });

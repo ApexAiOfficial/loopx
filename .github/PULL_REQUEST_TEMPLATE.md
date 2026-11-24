@@ -1,17 +1,139 @@
-## Summary
+## Goal And Delivered Outcome
 
--
+<!-- State the reproduced defect, accepted request or concrete maintenance
+outcome. A public issue, roadmap card or RFC section is optional for a
+self-contained ordinary contribution. Curated board work follows its anchor
+rule; do not invent an issue or roadmap id only to admit a useful repair.
+Catalog entries, behavior-pinning tests and fixture dimensions still need a
+concrete gap and consumer. These author facts are independently reviewed.
+-->
 
-## Issue Or Task
+- Outcome basis / optional anchor:
 
-- Closes #
-- Contributor task ID:
+- Goal/source and gap:
+- Observable before → after, with the validation row that proves it:
+- Issue/task and intended base: <!-- Use Closes only for the issue actually completed; otherwise Related to. -->
+
+## Author Declaration
+
+<!--
+Who wrote this change, and what it was implemented against. A reviewer may be a
+different operator's agent, working from a different host and context: this
+section is the only place it can learn both without guessing, and unlike the
+rest of the body it is published attribution rather than a reviewed claim. Keep
+it to one short line plus the spec rows; do not paste runtime identifiers,
+endpoints, credentials or internal routing detail, and never claim a
+verification you did not run.
+-->
+
+- Written by: <!-- model_agent or human_operator; for an agent, the model and provider in ordinary product-family wording; keep it to one line -->
+
+### Implemented against
+
+<!-- The accepted specification this change was built for: an accepted RFC,
+accepted contract/protocol document, the linked issue or task, or a
+maintainer-agreed review frame. Give the exact file path or public link and the
+revision, so a reviewer can open the same text. One row per criterion the
+specification states, using its own section or identifier when it has one.
+Disposition: implemented | deferred | out_of_scope | not_met — a not_met row
+blocks approval and needs its gap and repair. Write "no written specification;
+the request in this PR is the basis" when none exists. Ignore aspirational or
+future properties; they are not obligations.
+-->
+
+- Specification and revision:
+- Criteria:
+
+| Criterion (spec clause) | Disposition | Symbol / path | Test or command |
+| --- | --- | --- | --- |
+|  |  |  |  |
+
+- Self-check before submission: <!-- What you ran, what you read, and what you deliberately left out. Separate what you verified from what you assumed; "none" with a reason is valid. -->
+
+## Scope And Continuation
+
+<!-- A scoped fix may be complete while the parent program remains open.
+For a staged increment, explain the useful delta, remaining gap, next owner/task
+and why this is an independently testable/reversible boundary. Link existing
+work before creating follow-ups. Docs/research/maintenance need a concrete value,
+not a fabricated runtime caller. Write "complete within this scope" when no
+successor is needed. Do not grade quality from LOC, PR counts or test counts.
+-->
+
+- Completed scope and remaining work:
+- Slice boundary / successor: <!-- N/A with reason when the accepted task is complete. -->
 
 ## Validation
 
-- [ ] `python3 -m py_compile loopx/*.py`
-- [ ] `loopx check --scan-root .`
-- [ ] Other:
+> Public-safe summaries only, including in HTML comments. Do not paste raw logs,
+> private data or prompts, private screenshots, credentials, internal URLs, connection
+> strings, or local paths. Use repository-relative commands without sensitive
+> arguments, aggregate results, and already-public CI links. If evidence is
+> private, report its category and limitations only; do not upload it to prove a claim.
+
+<!-- Replace placeholders; do not leave every enum alternative selected.
+Use one row per relevant check, including required checks not run or blocked.
+Delete the example row. Add rows as needed; there is no required test-count target.
+-->
+
+- Tested revision: <!-- public commit SHA; identify older runs after a code change -->
+- Run state: <!-- choose one: not_run | running | finished (not a claim of adequacy or success) -->
+- Input classes: <!-- choose all used: none | synthetic | public_fixture | authorized_private_read_only; use none alone -->
+
+| Check kind | Result | Public-safe evidence / limitation |
+| --- | --- | --- |
+| `unit` | `not_run` | Example only: repository-relative test path; behavior checked; aggregate outcome or generic reason not run. |
+
+<!-- Check kind: static | unit | integration | real_entrypoint | real_backend | regression_parity | manual
+Result: passed | failed | running | not_run | blocked | not_applicable
+Evidence: name the affected behavior and safe command/CI link; for a real backend,
+give only its product/version and isolation mode, never its address or credentials.
+Mocks/in-memory substitutes are not real_backend. For regression_parity, summarize
+baseline/head comparison and a failing-before or mutation check, not just test counts.
+-->
+
+- Coverage and gaps: <!-- Why do these checks cover the changed paths? Name untested paths,
+  skipped/failed checks and follow-up, or "none identified" with a brief rationale.
+  Documentation-only changes may use a static/manual row and explain runtime N/A.
+  A passing row does not waive required real-path/backend gates. -->
+
+See [validation disclosure guidance](https://github.com/loopx-project/loopx/blob/main/CONTRIBUTING.md#validation-disclosure).
+
+## Frontend / Visual Evidence
+
+<!--
+Required for dashboard, website, desktop, documentation chrome, or any other
+user-visible UI change. Attach public-safe screenshots that let reviewers judge
+the changed state, not only a happy-path landing screen. For an existing surface,
+show both before and after. For a new surface, write "Before: N/A" and show the
+after view. Include desktop and mobile when responsive layout changes, and include
+loading, empty, error, permission, or gated states when those states changed. Add
+a short recording only when still images cannot explain the interaction.
+
+Put the first viewport screenshot directly in this description, with the tested
+revision, data/build boundary and a working preview link when available. Refresh
+it for materially changed presentation. Ordinary authorized implementation and
+refinement do not require another user-confirmation round; reuse prior scoped
+direction. Ask only for an explicitly reserved presentation decision or a real
+scope/authority gap. See AGENTS.md's First-Screen Review Evidence rule.
+
+Keep generated captures in ignored output/playwright/ and attach the selected
+evidence here. Do not commit a capture pack just to embed it in this PR. Tracked
+media needs a current documentation/product consumer or a versioned fixture
+contract; follow docs/development/documentation-layout.md#visual-evidence-retention.
+
+Use synthetic or public fixture data only. Do not upload live/private screenshots,
+even when the underlying access was authorized.
+-->
+
+- UI impact: <!-- choose one: none | changed -->
+- Before:
+- After:
+- First viewport and preview: <!-- Embed the screenshot here; identify revision and prototype/packaged/installed boundary. N/A for no UI impact. -->
+- States and viewports shown:
+- Source data: <!-- choose one: none | synthetic | public_fixture -->
+- Attention review: <!-- Per docs/development/design.md: what earns its place through high-value information, essential interaction, or expressive visual presentation? Name consolidation/removal across the whole viewport, and how failures, uncertainty, and one-step controls remain available. -->
+- Craft review: <!-- Per docs/development/design.md#craft-review, judged on showcase-workspace screenshots: one hero, no grouping-only cards, designed loading/unknown/failure states, motion by token, status glyph family, no new raw hex. -->
 
 ## Type of Change
 
@@ -37,20 +159,34 @@
 
 ## Technical Direction
 
-<!-- Select one. Direction labels route review; they do not imply maturity or merge authority. -->
+<!-- Optional routing: Core control-plane hardening; Long-horizon benchmark evidence;
+Operator surface and IM integration; Shared Goal Authority and cross-host coordination;
+Architecture and research incubator. For cross-cutting work, reference an existing
+roadmap S/G/R or domain acceptance id rather than copying the plan.
+Routing is not maturity or implementation authority.
+-->
 
-- [ ] Core control-plane hardening
-- [ ] Long-horizon benchmark evidence
-- [ ] Operator surface and IM integration
-- [ ] Shared Goal Authority and cross-host coordination
-- [ ] Architecture and research incubator
+- Direction / acceptance reference, when applicable:
 
-- Target base branch:
-- Direction tracker or promotion unit:
+## Shared-authority RFC fixture impact
+
+<!--
+Complete this section only when the PR claims progress against the TypeScript
+control-plane migration or shared Goal Authority RFC. Otherwise write N/A.
+Apply the same public-safe rules here. Reference the validation rows above rather
+than attaching private fixtures, snapshot identifiers, raw output or infrastructure details.
+-->
+
+- Production-scale fixture schema:
+- Semantic dimensions changed, or reviewed no-impact rationale:
+- Provider conformance arms run:
+- Read-only legacy/file/PostgreSQL three-arm rehearsal (required for promotion, runtime-routing, or compatibility-projection changes):
 
 ## Boundary Checklist
 
-- [ ] I did not commit `.loopx/`, `.codex/goals/`, live `ACTIVE_GOAL_STATE.md`, credentials, private benchmark traces, verifier output, raw agent sessions, internal document links, or local machine paths.
+- [ ] Neither the diff nor this PR body/comments/attachments disclose private state, credentials, raw traces or verifier output, internal links, or local machine paths (including `.loopx/`, `.codex/goals/`, and live `ACTIVE_GOAL_STATE.md`).
 - [ ] I did not duplicate maintainer-owned benchmark work unless a maintainer split out a public issue for it.
 - [ ] I kept the change scoped to the linked issue/task.
+- [ ] Existing English/Chinese RFC pairs (including ledger entries) both have a diff, and the local premerge check `python3 scripts/check_rfc_bilingual.py --base origin/main --head HEAD` passes, or no paired RFC changed.
+- [ ] I completed the visual evidence section for UI changes, or marked UI impact `none`.
 - [ ] Every commit includes a DCO `Signed-off-by` trailer (`git commit -s`).

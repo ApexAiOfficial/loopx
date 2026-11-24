@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from .bindings import DELIVERY_INTENT_SCHEMA
+from .core import TRIGGER_DECISION_SCHEMA
+
 
 PERIODIC_REPORT_CATALOG_ENTRY: dict[str, Any] = {
     "id": "periodic-report",
@@ -82,8 +85,18 @@ PERIODIC_REPORT_CATALOG_ENTRY: dict[str, Any] = {
             "doc": "docs/reference/protocols/periodic-report-v0.md",
         },
         {
-            "schema_version": "periodic_report_trigger_decision_v0",
+            "schema_version": TRIGGER_DECISION_SCHEMA,
             "module": "loopx.capabilities.periodic_report.triggers",
+            "doc": "docs/reference/protocols/periodic-report-v0.md",
+        },
+        {
+            "schema_version": "periodic_report_stage_completion_receipt_v0",
+            "module": "loopx.capabilities.periodic_report.stage_completion",
+            "doc": "docs/reference/protocols/periodic-report-v0.md",
+        },
+        {
+            "schema_version": "periodic_report_trigger_evaluation_intent_v0",
+            "module": "loopx.capabilities.periodic_report.post_writeback_hook",
             "doc": "docs/reference/protocols/periodic-report-v0.md",
         },
         {
@@ -107,6 +120,16 @@ PERIODIC_REPORT_CATALOG_ENTRY: dict[str, Any] = {
             "doc": "docs/reference/protocols/periodic-report-v0.md",
         },
         {
+            "schema_version": "periodic_report_workspace_projection_v0",
+            "module": "loopx.capabilities.periodic_report.workspace",
+            "doc": "docs/reference/protocols/periodic-report-v0.md",
+        },
+        {
+            "schema_version": "periodic_report_workspace_index_v0",
+            "module": "loopx.capabilities.periodic_report.workspace",
+            "doc": "docs/reference/protocols/periodic-report-v0.md",
+        },
+        {
             "schema_version": "periodic_report_sink_binding_v0",
             "module": "loopx.capabilities.periodic_report.bindings",
             "doc": "docs/reference/protocols/periodic-report-v0.md",
@@ -127,8 +150,23 @@ PERIODIC_REPORT_CATALOG_ENTRY: dict[str, Any] = {
             "doc": "docs/reference/protocols/periodic-report-v0.md",
         },
         {
-            "schema_version": "periodic_report_delivery_intent_v0",
+            "schema_version": DELIVERY_INTENT_SCHEMA,
             "module": "loopx.extensions.lark.miaoda_report",
+            "doc": "docs/reference/protocols/periodic-report-v0.md",
+        },
+        {
+            "schema_version": "periodic_report_goal_channel_delivery_request_v0",
+            "module": "loopx.extensions.lark.periodic_report_delivery",
+            "doc": "docs/reference/protocols/periodic-report-v0.md",
+        },
+        {
+            "schema_version": "periodic_report_delivery_authority_v0",
+            "module": "loopx.capabilities.periodic_report.machine_defaults",
+            "doc": "docs/reference/protocols/periodic-report-v0.md",
+        },
+        {
+            "schema_version": "periodic_report_goal_channel_delivery_result_v0",
+            "module": "loopx.extensions.lark.periodic_report_delivery",
             "doc": "docs/reference/protocols/periodic-report-v0.md",
         },
         {
@@ -160,6 +198,7 @@ PERIODIC_REPORT_CATALOG_ENTRY: dict[str, Any] = {
         "The document builder compiles hero summaries only from typed primary outcomes, risks, and next actions; renderers reject authored or stale summaries.",
         "Markdown and HTML render from one normalized document; runtime and delivery-receipt items must be supporting, HTML collapses them, and Markdown preserves them in a labeled appendix.",
         "Raw content, messages, logs, transcripts, credentials, secrets, and private paths are rejected.",
+        "The default-off post-writeback hook is admitted only after a committed identity-complete primary writeback; its core-owned sidecar atomically advances retryable failures to one idempotent trigger-evaluation intent and grants no generation or external-delivery authority.",
         "The optional openviking-periodic-report extension implements only the archive sink; it rejects activation unless the periodic-report profile is enabled, its sink binding matches, and openviking_context_write is observed.",
     ],
     "next_real_step": (

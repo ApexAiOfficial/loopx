@@ -6,16 +6,21 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import shlex
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from loopx import cli as loopx_cli
+from loopx import cli as loopx_cli  # noqa: E402
+from loopx.control_plane.testing.canary_harness import import_fixture_authority  # noqa: E402
+from tests.control_plane.cli_output_fixture import read_cli_context_for_oracle  # noqa: E402
 
 
 GOAL_ID = "autonomous-replan-fixture"
@@ -25,12 +30,6 @@ USE_SUBPROCESS_CLI = False
 
 
 def _argv(args: tuple[str, ...], *, registry_path: Path, runtime: Path) -> list[str]:
-    project_root = registry_path.parent.parent
-    scan_path_args = (
-        ["--scan-path", str(project_root)]
-        if args and args[0] in {"status", "quota"}
-        else []
-    )
     return [
         "--registry",
         str(registry_path),
@@ -39,7 +38,6 @@ def _argv(args: tuple[str, ...], *, registry_path: Path, runtime: Path) -> list[
         "--format",
         "json",
         *args,
-        *scan_path_args,
     ]
 
 
@@ -53,14 +51,15 @@ def run_cli(
     if not USE_SUBPROCESS_CLI:
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        with patch.dict(os.environ, {"LOOPX_CONTEXT_DELIVERY": "off"}), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             exit_code = loopx_cli.main(argv)
         if exit_code != 0:
             raise AssertionError(
                 f"loopx fixture command failed with exit {exit_code}: {' '.join(args)}\n"
                 f"{stderr.getvalue().strip()}\n{stdout.getvalue().strip()}"
             )
-        return json.loads(stdout.getvalue())
+        return json.loads(read_cli_context_for_oracle(stdout.getvalue())[0])
 
     command = [sys.executable, "-m", "loopx.cli", *argv]
     try:
@@ -71,12 +70,13 @@ def run_cli(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env={**os.environ, "LOOPX_CONTEXT_DELIVERY": "off"},
         )
     except subprocess.TimeoutExpired as exc:
         raise AssertionError(
             f"loopx fixture command timed out after {timeout}s: {' '.join(args)}"
         ) from exc
-    return json.loads(result.stdout)
+    return json.loads(read_cli_context_for_oracle(result.stdout)[0])
 
 
 def run_cli_error(
@@ -89,7 +89,8 @@ def run_cli_error(
     if not USE_SUBPROCESS_CLI:
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        with patch.dict(os.environ, {"LOOPX_CONTEXT_DELIVERY": "off"}), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             exit_code = loopx_cli.main(argv)
         assert exit_code != 0, stdout.getvalue()
         return "\n".join((stderr.getvalue(), stdout.getvalue()))
@@ -101,9 +102,10 @@ def run_cli_error(
         capture_output=True,
         text=True,
         timeout=timeout,
+        env={**os.environ, "LOOPX_CONTEXT_DELIVERY": "off"},
     )
     assert result.returncode != 0, result.stdout
-    return result.stderr
+    return "\n".join((result.stderr, result.stdout))
 
 
 def append_run_record(runs_dir: Path, record: dict) -> None:
@@ -262,6 +264,7 @@ def write_fixture(
                 "delivery_outcome": "outcome_progress",
             },
         )
+    import_fixture_authority(registry_path, GOAL_ID)
     return registry_path, runtime
 
 
@@ -298,9 +301,49 @@ def assert_typed_repeat_requires_two_equivalent_observations() -> None:
         assert guard["replan_action_packet"]["required_outcome"] == "semantic_delta", guard
 
 
+def _write_stride_stop_vision(path: Path, guard: dict) -> Path:
+    decision = dict(guard["replan_action_packet"]["stride_control"]["minimal_example"])
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "goal_vision_replan_contract_v0",
+                "agent_id": AGENT_ID,
+                "state": "active",
+                "vision_patch": {
+                    "acceptance_summary": "Advance the next bounded hardening slice.",
+                },
+                "path_delta": {
+                    "schema_version": "goal_path_delta_v0",
+                    "outcome": "stop",
+                    "prior_assumption": "Repeating the prior surface could advance the slice.",
+                    "observed_reality": "Two equivalent observations produced no semantic progress.",
+                    "stopped": ["Stop repeating the prior unchanged surface."],
+                    "evidence_refs": ["evidence-current-route"],
+                },
+                "stride_decision": decision,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def assert_equivalent_observation_is_rejected_before_write() -> None:
     with tempfile.TemporaryDirectory(prefix="loopx-typed-replan-") as tmp:
         registry_path, runtime = write_fixture(Path(tmp), typed_repeat_count=2)
+        guard = run_cli(
+            "quota",
+            "should-run",
+            "--goal-id",
+            GOAL_ID,
+            "--agent-id",
+            AGENT_ID,
+            registry_path=registry_path,
+            runtime=runtime,
+        )
+        vision_path = _write_stride_stop_vision(Path(tmp) / "stop-vision.json", guard)
         runs_index = runtime / "goals" / GOAL_ID / "runs" / "index.jsonl"
         before = runs_index.read_text(encoding="utf-8")
         error = run_cli_error(
@@ -311,6 +354,8 @@ def assert_equivalent_observation_is_rejected_before_write() -> None:
             AGENT_ID,
             "--classification",
             "source_audit_progress",
+            "--agent-vision-json",
+            str(vision_path),
             "--progress-result-class",
             "advanced",
             "--progress-surface-id",
@@ -342,14 +387,23 @@ def assert_new_typed_surface_closes_exact_obligation() -> None:
             runtime=runtime,
         )
         obligation_id = before["autonomous_replan_obligation"]["obligation_id"]
-        refresh = run_cli(
-            "refresh-state",
-            "--goal-id",
-            GOAL_ID,
-            "--agent-id",
-            AGENT_ID,
-            "--classification",
-            "bounded_replan_progress",
+        vision_path = _write_stride_stop_vision(Path(tmp) / "stop-vision.json", before)
+        # Execute the host projection itself; a hand-authored command can hide
+        # missing flags or an unusable printed transition.
+        action = next(
+            action for action in before["interaction_contract"]["cli_channel"]["next_cli_actions"]
+            if "refresh-state" in action
+        )
+        tokens = shlex.split(action)
+        replacements = {
+            "<path-to-evidence-linked-goal-vision-replan-contract-v0.json>": str(vision_path),
+        }
+        # The fixture supplies the isolated registry/runtime; preserve every
+        # projected refresh argument and replace only declared input slots.
+        args = [
+            replacements.get(token, token)
+            for token in tokens[tokens.index("refresh-state"):]
+        ] + [
             "--progress-result-class",
             "advanced",
             "--progress-surface-id",
@@ -360,9 +414,8 @@ def assert_new_typed_surface_closes_exact_obligation() -> None:
             "probe-current-route",
             "--progress-evidence-id",
             "evidence-new-route",
-            registry_path=registry_path,
-            runtime=runtime,
-        )
+        ]
+        refresh = run_cli(*args, registry_path=registry_path, runtime=runtime)
         semantic_delta = refresh["autonomous_replan_ack"]["semantic_delta"]
         assert semantic_delta["accepted"] is True, refresh
         assert semantic_delta["obligation_id"] == obligation_id, refresh
@@ -381,7 +434,7 @@ def assert_new_typed_surface_closes_exact_obligation() -> None:
         assert "autonomous_replan_obligation" not in after, after
 
 
-def assert_typed_monitor_and_periodic_thresholds_remain_explicit() -> None:
+def assert_typed_monitor_threshold_remains_explicit() -> None:
     with tempfile.TemporaryDirectory(prefix="loopx-monitor-replan-") as tmp:
         registry_path, runtime = write_fixture(Path(tmp), monitor_repeat_count=6)
         item = attention_item(run_cli("status", registry_path=registry_path, runtime=runtime))
@@ -402,14 +455,38 @@ def assert_typed_monitor_and_periodic_thresholds_remain_explicit() -> None:
             "dead_monitor_repeat"
         ), item
 
+
+def assert_explicit_completed_todo_periodic_fallback() -> None:
     with tempfile.TemporaryDirectory(prefix="loopx-periodic-replan-") as tmp:
         registry_path, runtime = write_fixture(Path(tmp), periodic_run_count=20)
+        # Twenty durable records have no settlement evidence. They cannot
+        # satisfy the default effective-Turn cadence. The retained 20-record
+        # fallback belongs only to the explicit completed-Todo unit.
+        item = attention_item(
+            run_cli("status", "--limit", "30", registry_path=registry_path, runtime=runtime)
+        )
+        assert "autonomous_replan_obligation" not in item["project_asset"], item
+        run_cli(
+            "configure-goal", "--goal-id", GOAL_ID,
+            "--execution-replan-after-todos", "5", "--execute",
+            registry_path=registry_path, runtime=runtime,
+        )
         item = attention_item(
             run_cli("status", "--limit", "30", registry_path=registry_path, runtime=runtime)
         )
         obligation = item["project_asset"]["autonomous_replan_obligation"]
         assert obligation["triggers"][0]["kind"] == "periodic_review_due", obligation
         assert obligation["triggers"][0]["run_count"] == 20, obligation
+        assert obligation["triggers"][0]["threshold"] == 20, obligation
+        run_cli(
+            "configure-goal", "--goal-id", GOAL_ID,
+            "--clear-execution-replan-after-todos", "--execute",
+            registry_path=registry_path, runtime=runtime,
+        )
+        item = attention_item(
+            run_cli("status", "--limit", "30", registry_path=registry_path, runtime=runtime)
+        )
+        assert "autonomous_replan_obligation" not in item["project_asset"], item
 
 
 def main() -> int:
@@ -421,7 +498,8 @@ def main() -> int:
     assert_typed_repeat_requires_two_equivalent_observations()
     assert_equivalent_observation_is_rejected_before_write()
     assert_new_typed_surface_closes_exact_obligation()
-    assert_typed_monitor_and_periodic_thresholds_remain_explicit()
+    assert_typed_monitor_threshold_remains_explicit()
+    assert_explicit_completed_todo_periodic_fallback()
     print("autonomous-replan-obligation-smoke ok")
     return 0
 

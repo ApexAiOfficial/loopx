@@ -1,4 +1,4 @@
-.TH LOOPX 1 "" "LoopX 0.5.2" "User Commands"
+.TH LOOPX 1 "" "LoopX 2.4.1" "User Commands"
 .SH NAME
 loopx \- control-plane helper for long-running agent work
 .SH SYNOPSIS
@@ -6,6 +6,7 @@ loopx \- control-plane helper for long-running agent work
 [\fB\-\-registry\fR \fIPATH\fR]
 [\fB\-\-runtime\-root\fR \fIPATH\fR]
 [\fB\-\-format\fR \fImarkdown|json\fR]
+[\fB\-\-cli\-bin\fR \fIPROGRAM\fR]
 \fICOMMAND\fR
 [\fIARGS\fR]
 .br
@@ -35,6 +36,9 @@ Check install, PATH, release snapshot, skills, and import health.
 \fBloopx first\-run\-report\fR
 Print a local first\-run receipt and an optional public feedback issue link.
 .TP
+\fBloopx usage\-ping [status|enable|disable]\fR
+Show or change the default\-on basic usage statistics and its exact payload.
+.TP
 \fBloopx slash\-commands \-\-install\fR
 Refresh host slash\-command prompt and skill files.
 .TP
@@ -63,6 +67,12 @@ Show goals, gates, attention queue, and next action.
 \fBloopx dashboard\fR
 Start the local dashboard, status service, and Agent Chat service with one command.
 .TP
+\fBloopx workbench start / loopx workbench status / loopx workbench stop\fR
+Start, inspect or stop the optional Workbench; preserve its data and independently managed Core.
+.TP
+\fBloopx dsh\-launch [dsh args...]\fR
+Launch DeepSeek Harness with this machine's stored provider credential and no secret in argv or output.
+.TP
 \fBloopx chat \-\-goal\-id <goal\-id>\fR
 Open Goal Studio, ask the read\-only Agent for a bounded Todo, and approve its preview before writeback.
 .TP
@@ -70,22 +80,37 @@ Open Goal Studio, ask the read\-only Agent for a bounded Todo, and approve its p
 Build a compact evidence packet when behavior is surprising.
 .TP
 \fBloopx review\-packet \-\-goal\-id <goal\-id>\fR
-Render a handoff or review packet with any required evidence\-log reads.
+Render a handoff or review packet with host\-projected replan context.
 .TP
 \fBloopx goal\-channel \-\-help\fR
 Set up, inspect, sync, or notify the provider channel bound to one goal.
 .TP
+\fBloopx goal\-portfolio \-\-help\fR
+Read bounded, source\-covered evidence across explicitly selected Goals.
+.TP
+\fBloopx manager\-inbox \-\-help\fR
+Read source\-bound Manager context and record the receiving Agent's decision.
+.TP
 \fBloopx goal\-lifecycle \-\-help\fR
 Preview, stop, or resume a Goal without deleting its history, todos, or evidence.
 .TP
-\fBloopx evidence\-log \-\-goal\-id <goal\-id> \-\-agent\-id <agent\-id> \-\-thin\fR
-Read the current agent's thin public\-safe ledger before replan or handoff.
+\fBloopx agent\-capabilities \-\-help\fR
+Inspect or correct a registered Agent's observed runtime capabilities.
+.TP
+\fBloopx handoff \-\-help\fR
+Prepare, inspect, or adopt one explicit cross\-agent Todo handoff.
+.TP
+\fBloopx machine\-config \-\-help\fR
+Inspect typed machine policy, preview changes, and apply an exact plan revision.
+.TP
+\fBloopx migrate\-local\-state \-\-help\fR
+Preview an explicit local\-state path migration or receipt\-bound rollback; stop writers before execution.
 .TP
 \fBloopx todo \-\-help\fR
 Show todo lifecycle commands.
 .TP
-\fBloopx task\-lease \-\-help\fR
-Acquire, renew, transfer, release, or inspect a hard per\-todo lease.
+\fBloopx coordination\-shadow \-\-help\fR
+Inspect, bootstrap, or revision\-fenced rollback the default\-off Stage 2C file shadow.
 .TP
 \fBloopx quota should\-run\fR
 Decide whether the next agent turn should run.
@@ -135,19 +160,13 @@ Generate a copy\-paste project connection prompt for an agent.
 Persist one stable host thread binding to an already registered LoopX agent.
 .TP
 \fBloopx resolve\-agent\-thread\fR
-Read one exact host thread binding across the current project without mutating authority.
+Read one exact host thread binding from an opaque id or copied Codex task deep link without mutating authority.
 .TP
 \fBloopx unbind\-agent\-thread\fR
 Remove one exact host thread binding without unregistering its agent or peer sessions.
 .TP
 \fBloopx codex\-cli\-bootstrap\-message\fR
 Generate the visible Codex CLI TUI setup message.
-.TP
-\fBloopx codex\-cli\-tui\-bootstrap\-smoke\-bundle\fR
-Generate a transcript\-free Codex CLI first\-run smoke bundle.
-.TP
-\fBloopx codex\-cli\-visible\-attach\-acceptance\fR
-Check public\-safe visible Codex CLI attach evidence.
 .TP
 \fBloopx heartbeat\-prompt\fR
 Generate a guarded heartbeat automation body.
@@ -164,8 +183,8 @@ Preview, append, or read supervisor proposals and host execution receipts.
 \fBloopx upgrade\-plan\fR
 Plan default heartbeat upgrade propagation.
 .TP
-\fBloopx update\fR
-Check, dry\-run, or execute the no\-clone update path.
+\fBloopx update [check|plan|apply] / loopx upgrade\fR
+Inspect installation ownership, then explicitly apply archive updates, or run one command that upgrades the CLI and the installed macOS App.
 .TP
 \fBloopx project\-skill \-\-help\fR
 Install, inspect, or remove release\-owned skills in selected project agent hosts.
@@ -174,11 +193,17 @@ Install, inspect, or remove release\-owned skills in selected project agent host
 Inspect, install, or remove packaged user\-level LoopX workflow skills.
 .SH MAINTAINER AND ADAPTER COMMANDS
 .TP
+\fBloopx task\-lease \-\-help\fR
+Host/adapter execution ownership protocol; ordinary task work uses todo claim and update.
+.TP
 \fBloopx check\fR
 Run contract and public/private boundary checks.
 .TP
 \fBloopx change\-quality \-\-help\fR
 Qualify one exact final diff against an enabled project policy and receipt contract.
+.TP
+\fBloopx goal\-acceptance\fR
+Configure, inspect or verify a versioned Goal acceptance basis.
 .TP
 \fBloopx integration\-branch \-\-help\fR
 Detect reviewed source\-branch drift and rebuild one local integration branch.
@@ -198,6 +223,12 @@ Safely retire explicitly named orphaned global goal routes.
 \fBloopx register\-agent\fR
 Register an automation agent.
 .TP
+\fBloopx agent\-directory\fR
+Produce the local, goal\-scoped peer agent directory this host can hand work to.
+.TP
+\fBloopx resolve\-peer\-route\fR
+Resolve an existing peer to one exact host route before sending work.
+.TP
 \fBloopx lark\-kanban\fR
 Project LoopX state into a Feishu/Lark Base board.
 .TP
@@ -213,6 +244,9 @@ Inspect and manage doctor\-verified subprocess extension activations.
 \fBloopx connector\fR
 List, register, rank, and record usage for public connector providers.
 .TP
+\fBloopx external\-evidence\fR
+Plan, admit, and retire provenance\-bound external evidence.
+.TP
 \fBloopx issue\-fix\fR
 Build public\-safe issue or PR fix workflow packets.
 .TP
@@ -222,17 +256,26 @@ Compose provider\-neutral bounded review packets and bind exact decisions.
 \fBloopx periodic\-report\fR
 Resolve a portable weekly profile, evaluate report triggers, and compose provider\-neutral run receipts.
 .TP
-\fBloopx auto\-research\fR
-Project public\-safe research frontiers.
+\fBloopx deepresearch\fR
+Run a bounded, citation\-auditable research ledger and report workflow.
 .TP
 \fBloopx agent\-turn\-recall\fR
 Prepare goal\-scoped memory guidance for one admitted autonomous agent turn.
 .TP
-\fBloopx multi\-agent\fR
-Launch visible role\-scoped Codex TUI agents.
-.TP
 \fBloopx canary\fR
 Plan or run catalog\-informed smoke profiles.
+.TP
+\fBloopx performance\-diagnosis \-\-help\fR
+Plan an explicit local capture or inspect an existing profile without executing or uploading it.
+.TP
+\fBloopx goal\-direction \-\-help\fR
+Inspect or explicitly configure a Goal material basis; writes require \-\-execute.
+.TP
+\fBloopx zcode\-goal \-\-help\fR
+Explicitly bind and inspect one managed ZCode CLI native Goal session.
+.TP
+\fBloopx research\-checkpoint \-\-help\fR
+Explicitly capture, verify, or adopt a sealed checkpoint through current Goal and native Host owners.
 .TP
 \fBloopx promotion\-readiness\fR
 Record release\-scoped canary readiness evidence in the shared runtime ledger.

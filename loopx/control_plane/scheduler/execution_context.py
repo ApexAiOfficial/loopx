@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import shlex
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any
 
 SCHEDULER_EXECUTION_CONTEXT_SCHEMA_VERSION = "scheduler_execution_context_v0"
 GOAL_RUNTIME_CONTINUATION_SCHEMA_VERSION = "goal_runtime_continuation_v0"
@@ -15,9 +16,13 @@ class HostSurface(str, Enum):
     CODEX_APP = "codex_app"
     CODEX_APP_SSH = "codex_app_ssh"
     CODEX_CLI = "codex_cli"
+    CODEX_APP_SERVER = "codex_app_server"
+    TRAE_APP = "trae_app"
+    ANTIGRAVITY_APP = "antigravity_app"
     GENERIC_CLI = "generic_cli"
     CLAUDE_CODE = "claude_code"
     KUNLUNCODE = "kunluncode"
+    KIRO_CLI = "kiro_cli"
     LOCAL_SCHEDULER = "local_scheduler"
 
 
@@ -40,29 +45,18 @@ class SchedulerRuntimeProfile(str, Enum):
     CODEX_APP_HEARTBEAT = "codex_app_heartbeat"
     CODEX_APP_SSH_VISIBLE = "codex_app_ssh_goal"
     CODEX_CLI_VISIBLE = "codex_cli"
+    TRAE_APP = "trae_app"
+    ANTIGRAVITY_APP = "antigravity_app"
     CLAUDE_CODE_VISIBLE = "claude_code"
     KUNLUNCODE_VISIBLE = "kunluncode"
+    KIRO_CLI_VISIBLE = "kiro_cli"
     GENERIC_CLI_AGENT_LOOP = "generic_cli"
     GENERIC_CLI_OUTER_CONTROLLER = "outer_controller"
+    CODEX_APP_SERVER = "codex_app_server"
 
 
-class GoalRuntimeContinuationDisposition(str, Enum):
-    CONTINUE_NOW = "continue_now"
-    DEFER = "defer"
-    COMPLETE = "complete"
 
 
-GOAL_RUNTIME_DEFER_ACTIONS = frozenset(
-    {
-        "backoff_agent_monitor_only",
-        "backoff_until_fresh_evidence",
-        "backoff_until_material_transition",
-        "backoff_until_reassigned",
-        "backoff_until_state_change",
-        "backoff_waiting_for_user",
-        "repair_interaction_contract_projection",
-    }
-)
 
 
 NATIVE_GOAL_RUNTIME_PROFILES = frozenset(
@@ -70,6 +64,44 @@ NATIVE_GOAL_RUNTIME_PROFILES = frozenset(
         SchedulerRuntimeProfile.ARK_MANAGED_AGENT_GOAL,
         SchedulerRuntimeProfile.CODEX_APP_SSH_VISIBLE,
         SchedulerRuntimeProfile.CODEX_CLI_VISIBLE,
+    }
+)
+
+# Interactive hosts in this set can carry one explicit Turn identity through
+# accountable writeback and visible-Goal quota settlement. Claude's ordinary
+# Todo delivery remains MCP-owned; this shared contract also permits its
+# Todo-less replan re-entry to finish once a Turn has been supplied. Kiro CLI
+# drives its own in-session `/goal` loop, so its spend is a visible-Goal spend
+# rather than a heartbeat one. It is deliberately not a native-goal profile:
+# that family renders the Codex `/goal` task body and blocked-state rules,
+# which the Kiro host does not share.
+VISIBLE_GOAL_SETTLEMENT_RUNTIME_PROFILES = frozenset(
+    {
+        *NATIVE_GOAL_RUNTIME_PROFILES,
+        SchedulerRuntimeProfile.CLAUDE_CODE_VISIBLE,
+        SchedulerRuntimeProfile.KIRO_CLI_VISIBLE,
+    }
+)
+
+GUIDED_START_TURN_RUNTIME_PROFILES = frozenset(
+    {
+        SchedulerRuntimeProfile.CODEX_APP_HEARTBEAT,
+        SchedulerRuntimeProfile.TRAE_APP,
+        SchedulerRuntimeProfile.ANTIGRAVITY_APP,
+        SchedulerRuntimeProfile.CODEX_APP_SSH_VISIBLE,
+    }
+)
+
+
+# Hosted App runtimes share the receipt-bound settlement lifecycle while
+# retaining independent host, state, and provider identities. Keep this set as
+# the typed owner so downstream work-item code does not drift through repeated
+# Codex-only profile checks.
+APP_HEARTBEAT_SETTLEMENT_RUNTIME_PROFILES = frozenset(
+    {
+        SchedulerRuntimeProfile.CODEX_APP_HEARTBEAT,
+        SchedulerRuntimeProfile.TRAE_APP,
+        SchedulerRuntimeProfile.ANTIGRAVITY_APP,
     }
 )
 
@@ -95,6 +127,16 @@ _SCHEDULER_RUNTIME_PROFILE_CONTEXTS = {
         SchedulerOwner.AGENT_CLI_LOOP,
         ExecutionMode.INTERACTIVE,
     ),
+    SchedulerRuntimeProfile.TRAE_APP: (
+        HostSurface.TRAE_APP,
+        SchedulerOwner.HOST_AUTOMATION,
+        ExecutionMode.HOSTED_AUTOMATION,
+    ),
+    SchedulerRuntimeProfile.ANTIGRAVITY_APP: (
+        HostSurface.ANTIGRAVITY_APP,
+        SchedulerOwner.HOST_AUTOMATION,
+        ExecutionMode.HOSTED_AUTOMATION,
+    ),
     SchedulerRuntimeProfile.CLAUDE_CODE_VISIBLE: (
         HostSurface.CLAUDE_CODE,
         SchedulerOwner.AGENT_CLI_LOOP,
@@ -105,6 +147,11 @@ _SCHEDULER_RUNTIME_PROFILE_CONTEXTS = {
         SchedulerOwner.AGENT_CLI_LOOP,
         ExecutionMode.INTERACTIVE,
     ),
+    SchedulerRuntimeProfile.KIRO_CLI_VISIBLE: (
+        HostSurface.KIRO_CLI,
+        SchedulerOwner.AGENT_CLI_LOOP,
+        ExecutionMode.INTERACTIVE,
+    ),
     SchedulerRuntimeProfile.GENERIC_CLI_AGENT_LOOP: (
         HostSurface.GENERIC_CLI,
         SchedulerOwner.AGENT_CLI_LOOP,
@@ -112,6 +159,11 @@ _SCHEDULER_RUNTIME_PROFILE_CONTEXTS = {
     ),
     SchedulerRuntimeProfile.GENERIC_CLI_OUTER_CONTROLLER: (
         HostSurface.GENERIC_CLI,
+        SchedulerOwner.OUTER_CONTROLLER,
+        ExecutionMode.ISOLATED_HEADLESS,
+    ),
+    SchedulerRuntimeProfile.CODEX_APP_SERVER: (
+        HostSurface.CODEX_APP_SERVER,
         SchedulerOwner.OUTER_CONTROLLER,
         ExecutionMode.ISOLATED_HEADLESS,
     ),
@@ -140,18 +192,41 @@ class SchedulerExecutionContext:
             and self.execution_mode is ExecutionMode.HOSTED_AUTOMATION
         )
 
+    @property
+    def app_automation_applicable(self) -> bool:
+        return (
+            self.host_surface
+            in {
+                HostSurface.CODEX_APP,
+                HostSurface.TRAE_APP,
+                HostSurface.ANTIGRAVITY_APP,
+            }
+            and self.scheduler_owner is SchedulerOwner.HOST_AUTOMATION
+            and self.execution_mode is ExecutionMode.HOSTED_AUTOMATION
+        )
+
     def projection(self) -> dict[str, Any]:
-        return {
+        projection = {
             "schema_version": SCHEDULER_EXECUTION_CONTEXT_SCHEMA_VERSION,
             "host_surface": self.host_surface.value,
             "scheduler_owner": self.scheduler_owner.value,
             "execution_mode": self.execution_mode.value,
             "source": self.source,
             "valid": True,
-            "codex_app_applicability": (
-                "applicable" if self.codex_app_applicable else "not_applicable"
-            ),
         }
+        # Keep existing non-Trae projections byte-compatible. The neutral App
+        # field is needed to identify Trae/Antigravity's independent automation
+        # contract, but a second negative applicability flag adds no information
+        # for CLI and Goal runtimes.
+        if self.host_surface in {HostSurface.TRAE_APP, HostSurface.ANTIGRAVITY_APP}:
+            projection["app_automation_applicability"] = (
+                "applicable" if self.app_automation_applicable else "not_applicable"
+            )
+        else:
+            projection["codex_app_applicability"] = (
+                "applicable" if self.codex_app_applicable else "not_applicable"
+            )
+        return projection
 
 
 @dataclass(frozen=True)
@@ -159,6 +234,9 @@ class SchedulerExecutionContextResolution:
     context: SchedulerExecutionContext | None
     errors: tuple[str, ...] = ()
     supplied: Mapping[str, Any] | None = None
+    # Only the external Turn driver sets this in-process. A context supplied
+    # to quota or recovered from its serialized projection cannot assert it.
+    turn_driver_owned: bool = False
 
     @property
     def ok(self) -> bool:
@@ -168,32 +246,50 @@ class SchedulerExecutionContextResolution:
         if self.context is not None:
             return self.context.projection()
         supplied = dict(self.supplied or {})
-        return {
+        projection = {
             "schema_version": SCHEDULER_EXECUTION_CONTEXT_SCHEMA_VERSION,
             "host_surface": supplied.get("host_surface"),
             "scheduler_owner": supplied.get("scheduler_owner"),
             "execution_mode": supplied.get("execution_mode"),
             "source": supplied.get("source") or "explicit",
             "valid": False,
-            "codex_app_applicability": "blocked_invalid_context",
             "errors": list(self.errors),
         }
+        if supplied.get("host_surface") in {
+            HostSurface.TRAE_APP.value,
+            HostSurface.ANTIGRAVITY_APP.value,
+        }:
+            projection["app_automation_applicability"] = "blocked_invalid_context"
+        else:
+            projection["codex_app_applicability"] = "blocked_invalid_context"
+        return projection
 
 
 def _validation_errors(context: SchedulerExecutionContext) -> list[str]:
     errors: list[str] = []
+    if context.host_surface is HostSurface.CODEX_APP_SERVER:
+        if (context.scheduler_owner is not SchedulerOwner.OUTER_CONTROLLER
+                or context.execution_mode is not ExecutionMode.ISOLATED_HEADLESS):
+            errors.append("codex_app_server requires outer_controller and isolated_headless")
+        return errors
     cli_surfaces = {
         HostSurface.CODEX_APP_SSH,
         HostSurface.CODEX_CLI,
         HostSurface.GENERIC_CLI,
         HostSurface.CLAUDE_CODE,
         HostSurface.KUNLUNCODE,
+        HostSurface.KIRO_CLI,
     }
-    if context.host_surface is HostSurface.CODEX_APP:
+    if context.host_surface in {
+        HostSurface.CODEX_APP,
+        HostSurface.TRAE_APP,
+        HostSurface.ANTIGRAVITY_APP,
+    }:
+        host_name = context.host_surface.value
         if context.scheduler_owner is not SchedulerOwner.HOST_AUTOMATION:
-            errors.append("codex_app requires scheduler_owner=host_automation")
+            errors.append(f"{host_name} requires scheduler_owner=host_automation")
         if context.execution_mode is not ExecutionMode.HOSTED_AUTOMATION:
-            errors.append("codex_app requires execution_mode=hosted_automation")
+            errors.append(f"{host_name} requires execution_mode=hosted_automation")
     if context.host_surface is HostSurface.ARK_MANAGED_AGENT:
         if context.scheduler_owner is not SchedulerOwner.GOAL_RUNTIME:
             errors.append("ark_managed_agent requires scheduler_owner=goal_runtime")
@@ -290,9 +386,9 @@ def resolve_scheduler_execution_context(
             supplied=supplied,
         )
     context = SchedulerExecutionContext(
-        host_surface=host_surface,
-        scheduler_owner=scheduler_owner,
-        execution_mode=execution_mode,
+        host_surface=cast(HostSurface, host_surface),
+        scheduler_owner=cast(SchedulerOwner, scheduler_owner),
+        execution_mode=cast(ExecutionMode, execution_mode),
         source=str(supplied.get("source") or "explicit"),
     )
     errors = _validation_errors(context)
@@ -354,6 +450,10 @@ def _render_scheduler_runtime_profile_args(
 ) -> str:
     if profile is SchedulerRuntimeProfile.CODEX_APP_HEARTBEAT:
         return " --codex-app"
+    if profile is SchedulerRuntimeProfile.TRAE_APP:
+        return " --trae_app"
+    if profile is SchedulerRuntimeProfile.ANTIGRAVITY_APP:
+        return " --antigravity_app"
     return f" --runtime-profile {shlex.quote(profile.value)}"
 
 
@@ -383,9 +483,9 @@ def render_scheduler_execution_args(
         raise ValueError(
             "invalid scheduler_execution_context: " + "; ".join(resolution.errors)
         )
-    profile = scheduler_runtime_profile_for_execution_context(resolution)
-    if profile is not None:
-        return _render_scheduler_runtime_profile_args(profile)
+    resolved_profile = scheduler_runtime_profile_for_execution_context(resolution)
+    if resolved_profile is not None:
+        return _render_scheduler_runtime_profile_args(resolved_profile)
     context = resolution.context
     return "".join(
         (
@@ -405,9 +505,13 @@ def scheduler_execution_context_for_turn(
     host_surface = {
         "codex-app-ssh": HostSurface.CODEX_APP_SSH.value,
         "codex-cli": HostSurface.CODEX_CLI.value,
+        "codex-app-server": HostSurface.CODEX_APP_SERVER.value,
         "generic-cli": HostSurface.GENERIC_CLI.value,
         "claude-code": HostSurface.CLAUDE_CODE.value,
         "pi": HostSurface.GENERIC_CLI.value,
+        # The built-in dsh host runs one bounded in-process attempt under the
+        # generic-cli scheduling surface, same as the pi visible alias.
+        "dsh": HostSurface.GENERIC_CLI.value,
     }.get(host, host)
     normalized_mode = {
         "interactive-visible": ExecutionMode.INTERACTIVE.value,
@@ -415,17 +519,16 @@ def scheduler_execution_context_for_turn(
     }.get(execution_mode, execution_mode)
     owner = scheduler_owner or (
         SchedulerOwner.OUTER_CONTROLLER.value
-        if host_surface == HostSurface.GENERIC_CLI.value
+        if host_surface in {HostSurface.GENERIC_CLI.value, HostSurface.CODEX_APP_SERVER.value}
         else SchedulerOwner.AGENT_CLI_LOOP.value
     )
-    return resolve_scheduler_execution_context(
-        {
-            "host_surface": host_surface,
-            "scheduler_owner": owner,
-            "execution_mode": normalized_mode,
-            "source": "loopx_turn",
-        }
-    )
+    resolution = resolve_scheduler_execution_context({
+        "host_surface": host_surface,
+        "scheduler_owner": owner,
+        "execution_mode": normalized_mode,
+        "source": "loopx_turn",
+    })
+    return replace(resolution, turn_driver_owned=True)
 
 
 def build_goal_runtime_continuation(
@@ -433,131 +536,12 @@ def build_goal_runtime_continuation(
     *,
     frontier_recheck_after_seconds: int | None = None,
 ) -> dict[str, Any]:
-    action = str(scheduler_hint.get("action") or "")
-    if action == "run_now":
-        disposition = GoalRuntimeContinuationDisposition.CONTINUE_NOW
-    elif action == "stop_until_explicit_resume":
-        disposition = GoalRuntimeContinuationDisposition.COMPLETE
-    elif action in GOAL_RUNTIME_DEFER_ACTIONS:
-        disposition = GoalRuntimeContinuationDisposition.DEFER
-    else:
-        raise ValueError(f"unsupported Goal runtime scheduler action: {action or 'missing'}")
+    from .scheduler_hint import _project_hint
 
-    continuation = {
-        "schema_version": GOAL_RUNTIME_CONTINUATION_SCHEMA_VERSION,
-        "disposition": disposition.value,
-    }
-    if disposition is GoalRuntimeContinuationDisposition.DEFER:
-        if (
-            isinstance(frontier_recheck_after_seconds, int)
-            and frontier_recheck_after_seconds > 0
-        ):
-            continuation["recheck_after_seconds"] = frontier_recheck_after_seconds
-            continuation["recheck_source"] = "frontier_earliest_material_transition"
-        else:
-            host_cadence = scheduler_hint.get("codex_app")
-            host_cadence = host_cadence if isinstance(host_cadence, Mapping) else {}
-            recommended_interval = host_cadence.get("recommended_interval_minutes")
-            if not isinstance(recommended_interval, int) or recommended_interval <= 0:
-                raise ValueError(
-                    "deferred Goal runtime continuation requires a positive recheck interval"
-                )
-            continuation["recheck_after_seconds"] = recommended_interval * 60
-        continuation["wake_policy"] = "state_change_or_deadline"
-    return continuation
-
-
-def apply_scheduler_execution_context(
-    result: dict[str, Any],
-    resolution: SchedulerExecutionContextResolution,
-    *,
-    frontier_recheck_after_seconds: int | None = None,
-) -> dict[str, Any]:
-    """Scope a generic cadence hint to the selected runtime owner."""
-
-    if not resolution.ok or resolution.context is None:
-        raise ValueError("cannot apply an invalid scheduler execution context")
-    context = resolution.context
-
-    codex_app = (
-        result.get("codex_app") if isinstance(result.get("codex_app"), dict) else {}
+    return _project_hint(
+        "continuation",
+        {
+            "hint": dict(scheduler_hint),
+            "frontier_recheck_after_seconds": frontier_recheck_after_seconds,
+        },
     )
-    if context.codex_app_applicable:
-        codex_app["applicability"] = "applicable"
-        backoff = (
-            codex_app.get("stateful_backoff")
-            if isinstance(codex_app.get("stateful_backoff"), dict)
-            else {}
-        )
-        apply_needed = (
-            backoff.get("apply_needed") is True
-            or codex_app.get("host_action_required") is True
-        )
-        ack_needed = backoff.get("ack_needed") is True
-        result["codex_app"] = codex_app
-        execution_phase = {
-            "schema_version": "scheduler_execution_phase_v0",
-            "host_surface": context.host_surface.value,
-            "scheduler_owner": context.scheduler_owner.value,
-            "disposition": (
-                "host_action_required" if apply_needed or ack_needed else "not_required"
-            ),
-            "completed": not (apply_needed or ack_needed),
-            "apply_needed": apply_needed,
-            "ack_needed": ack_needed,
-            "acknowledged": False,
-        }
-        cold_path = result.get("cold_path_detail")
-        if isinstance(cold_path, dict):
-            cold_path["execution_context"] = resolution.projection()
-            cold_path["execution_phase"] = execution_phase
-        return result
-
-    goal_runtime_continuation = (
-        build_goal_runtime_continuation(
-            result,
-            frontier_recheck_after_seconds=frontier_recheck_after_seconds,
-        )
-        if context.scheduler_owner is SchedulerOwner.GOAL_RUNTIME
-        else None
-    )
-
-    result["execution_context"] = resolution.projection()
-    result["codex_app"] = {
-        "applicability": "not_applicable",
-        "reason_code": f"cadence_owned_by_{context.scheduler_owner.value}",
-        "apply": "none",
-        "host_action": "none",
-        "ack_required": False,
-        "no_spend_for_cadence_change": True,
-    }
-    reset_policy = result.get("reset_policy")
-    if isinstance(reset_policy, dict):
-        for key in tuple(reset_policy):
-            if key.startswith("codex_app_"):
-                reset_policy.pop(key, None)
-    cold_path = result.get("cold_path_detail")
-    if isinstance(cold_path, dict):
-        cold_path.pop("stateful_backoff_detail", None)
-        reset_detail = cold_path.get("reset_policy_detail")
-        if isinstance(reset_detail, dict):
-            for key in tuple(reset_detail):
-                if key.startswith("codex_app_"):
-                    reset_detail.pop(key, None)
-    owner = context.scheduler_owner.value
-    result["execution_phase"] = {
-        "schema_version": "scheduler_execution_phase_v0",
-        "host_surface": context.host_surface.value,
-        "scheduler_owner": owner,
-        "disposition": f"{owner}_owned",
-        "completed": True,
-        "apply_needed": False,
-        "ack_needed": False,
-        "acknowledged": False,
-        "completion_reason": (
-            "selected scheduler owner requires no Codex App apply or ACK"
-        ),
-    }
-    if goal_runtime_continuation is not None:
-        result["goal_runtime_continuation"] = goal_runtime_continuation
-    return result

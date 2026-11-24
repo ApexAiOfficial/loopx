@@ -16,16 +16,23 @@ Local WideSearch（公开 web 表格填充 benchmark，200 题）practice：同�
 - Verifier：官方 `widesearch_evaluator.py`（SR / 行级 / 项级 F1 + LLM judge，
   judge 复用 ARK 模型）。
 
-## 答案隔离边界（重要）
+## 隔离边界（重要）
 
-本地路径是**过程性隔离**，不是沙盒强隔离：
+native runner 现在默认 fail closed，并组合两层 runner-owned 边界：
 - 每次 run 用独立 fresh workspace，run 前清空，杜绝旧答案误用；
 - answer 必须存在、非空、mtime 晚于 run 开始（否则判定失败）；
 - evaluator 在 agent 结束后独立后置执行，只读 sealed answer + gold；
-- 但 agent（codex）拥有宿主全盘读权限（`workspace-write` 不挡读；macOS
-  `sandbox-exec` 会破坏 codex 运行时，已实测证伪），因此**不能假定 agent 读不到
-  gold**。任何结论都限定为内部能力论证，发布权威结果需真沙盒
-  （pier/colima docker 或云端 sealed-dual 强隔离）。
+- upstream provider key 只在 namespace 外的 runner-owned loopback gateway；
+  app-server 只收到 gateway URL 与固定非秘密 sentinel；
+- app-server 在 Linux user/mount/PID namespace 的合成 root 中运行，只暴露
+  fresh workspace、每次 run 新建的正式 LoopX profile 与只读系统 runtime；
+  runner/祖先进程环境、ambient HOME/CODEX_HOME、gold 和 provider 文件均不可见。
+
+`shell_environment_policy` 只是 defense in depth，不能代替上述 OS authority
+boundary。当前 native runner 需要 Linux unprivileged namespace primitives；macOS
+或禁用 user namespace 的 Linux 会以
+`widesearch_native_isolation_unavailable_use_pier` 失败，不会退回 ambient
+`danger-full-access`。这些平台请使用下文 Pier/Colima 路径。
 
 ## 运行
 
@@ -44,8 +51,9 @@ uv run --python 3.12 --with dateparser==1.2.2 \
   --arm treatment --case ws_en_001 --data-root <data-root>
 ```
 
-模型凭据：`ARK_OPENAI_BASE_URL` / `ARK_OPENAI_API_KEY` / `ARK_OPENAI_MODEL`
-（本地可从 cc-switch `volcengine-ark-deepseek` 读取）。
+runner-owned gateway 凭据：`ARK_OPENAI_BASE_URL` / `ARK_OPENAI_API_KEY`；模型名：
+`ARK_OPENAI_MODEL`。真实 key 不进入 app-server 环境、正式 profile 或 agent
+namespace。不要把这些值写入数据目录、job 模板或命令行。
 
 ## Hosted Responses API 兼容（重要）
 

@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { defineConfig, type Plugin } from "vite";
 
 const dashboardPublicDir = resolve(import.meta.dirname, "public");
+const chatOutDir = process.env.LOOPX_CHAT_OUT_DIR ?? resolve(import.meta.dirname, "../../../loopx/web/chat");
 const sharedPwaAssets = ["manifest.webmanifest", "pwa/icon-192.png", "pwa/icon-512.png"] as const;
 
 function emitSharedPwaAssets(): Plugin {
@@ -30,10 +31,8 @@ export default defineConfig({
   publicDir: false,
   plugins: [react(), tailwindcss(), emitSharedPwaAssets()],
   build: {
-    outDir: resolve(import.meta.dirname, "../../../loopx/web/chat"),
-    // Keep prior hashed assets: a running dashboard or an in-flight page may
-    // still reference an older index.html; deleting old files turns a stale
-    // page into a white screen. index.html always points at the newest hashes.
-    emptyOutDir: false,
+    outDir: chatOutDir,
+    // The delivery builder stages output and retains only an explicit prior delivery.
+    emptyOutDir: true,
   },
 });

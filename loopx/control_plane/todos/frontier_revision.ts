@@ -1,0 +1,397 @@
+/** Complete advancement frontier identity and long-chain checkpoint policy.
+ * Python supplies normalized legacy facts and the exact v0 serialization codec;
+ * selection, completeness, hashing, thresholds and ACK authority live here.
+ */
+import { createHash } from "node:crypto";
+import {inflateSync} from "node:zlib";
+import type { JsonObject } from "../effect_program.ts";
+import { requireJsonObject, requireBoolean, requireNonEmptyString, requireStringArray, optionalNonEmptyString } from "../runtime_decode.ts";
+import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
+import { parseTodoTimestampMicros } from "../runtime_timestamp.ts";
+import { normalizeTodoAgent, stripPythonWhitespace } from "../coordination/todo_agents.ts";
+import { AuthorityStoreProtocolError, canonicalAuthorityObject,
+  canonicalAuthoritySha256 } from "../coordination/authority_store_codec.ts";
+import {claimAllowsAgent} from "./agent_scope.ts";
+import {legacyTodoPriority} from "./priority.ts";
+
+const REVISION = "todo_frontier_revision_v0";
+const INDEX = "todo_frontier_revision_index_v0";
+const TRIGGER = "long_todo_chain";
+type Checkpoint = { complete: false } | {
+  complete: true; frontier_revision: string; frontier_updated_at: string;
+  frontier_owned_identity: string | null;
+};
+type Row = {
+  id: string; claim: string | null; excluded: string[];
+  updated: string; serialized: string; advancement: boolean; actionable: boolean | null;
+};
+type LongChainObservation = {
+  trigger_count: number;
+  count_kind: "selectable_advancement_todos" | "selectable_open_todos" |
+    "claimed_advancement_todos";
+  selectable_open_count: number; selectable_advancement_count: number;
+  current_agent_claimed_open_count: number;
+  current_agent_claimed_advancement_count: number; unclaimed_advancement_count: number;
+  threshold: 15 | 20; agent_id: string | null;
+  frontier_revision: string | null; frontier_revision_complete: boolean;
+  frontier_owned_identity: string | null;
+};
+type AckDecision = {acknowledged: boolean; rearmed_after_obligation_id: string | null};
+type SuccessorBinding = {kind: "exact"; todo_id: string} |
+  {kind: "predecessor"; todo_id: string; frontier_revision: string; obligation_identity_revision: string};
+type TriggerCheckpoint = {
+  kind: string; frontier_revision: string; frontier_owned_identity?: string;
+};
+const object = (value: unknown): JsonObject =>
+  value !== null && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
+const text = (value: unknown): string => typeof value === "string" ? stripPythonWhitespace(value) : "";
+function agentId(value: unknown): string | null {
+  try { return normalizeTodoAgent(value, "agent_id"); }
+  catch (error) {
+    if (error instanceof AuthorityStoreProtocolError) return null;
+    throw error;
+  }
+}
+const strings = (value: unknown): string[] => Array.isArray(value)
+  ? value.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean) : [];
+const count = (value: unknown): number => {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : 0;
+};
+
+/** One receipt shape for observation, successor and semantic-writeback paths.
+ * Historical revision-only checkpoints remain valid. An owned identity cannot
+ * stand alone or confer the long-chain matching rule on another trigger kind.
+ */
+function triggerCheckpoint(value: unknown): TriggerCheckpoint | null {
+  const row = object(value), kind = text(row.kind), revision = text(row.frontier_revision);
+  if (!kind || !revision || row.frontier_revision_complete === false) return null;
+  const owned = kind === TRIGGER ? text(row.frontier_owned_identity) : "";
+  return {kind, frontier_revision: revision, ...(owned ? {frontier_owned_identity: owned} : {})};
+}
+
+function triggerCheckpoints(value: unknown): TriggerCheckpoint[] {
+  return (Array.isArray(value) ? value : []).map(triggerCheckpoint).filter(row => row !== null);
+}
+
+function decodeRows(value: unknown): Row[] | null {
+  if (value == null) return null;
+  if (!Array.isArray(value)) {
+    const encoded = requireJsonObject(value, "frontier rows transport");
+    if (encoded.encoding !== "deflate-base64-json-v0" || typeof encoded.data !== "string" ||
+        encoded.data.length > 2 * 1024 * 1024 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded.data)) {
+      throw new EffectRuntimeRequestError("invalid frontier rows transport");
+    }
+    try {
+      value = JSON.parse(inflateSync(Buffer.from(encoded.data, "base64"), {
+        maxOutputLength: 64 * 1024 * 1024,
+      }).toString("utf8"));
+    } catch {
+      throw new EffectRuntimeRequestError("frontier rows must be valid compressed JSON within 64 MiB");
+    }
+  }
+  if (!Array.isArray(value)) throw new EffectRuntimeRequestError("frontier source must be an array");
+  return value.map(raw => {
+    const row = requireJsonObject(raw, "frontier row");
+    if (typeof row.serialized !== "string" || typeof row.advancement !== "boolean") {
+      throw new EffectRuntimeRequestError("frontier row codec facts are missing");
+    }
+    if (row.actionable !== undefined && typeof row.actionable !== "boolean") {
+      throw new EffectRuntimeRequestError("frontier actionable fact must be boolean");
+    }
+    return {id: text(row.id), claim: text(row.claim) || null,
+      excluded: strings(row.excluded), updated: text(row.updated),
+      serialized: row.serialized, advancement: row.advancement,
+      actionable: typeof row.actionable === "boolean" ? row.actionable : null};
+  });
+}
+
+/** Full-source commitment counts, not a claim/exclusion or execution grant.
+ * Historical indexes/row codecs without evaluated actionability keep their
+ * observed lower bounds. Never turn an incomplete codec into an exact total.
+ */
+function claimedAdvancementCounts(rows: Row[] | null): JsonObject | null {
+  if (rows === null || rows.some(row => row.actionable === null || !row.id) ||
+      new Set(rows.map(row => row.id)).size !== rows.length) return null;
+  const counts = new Map<string, number>();
+  for (const row of rows) if (row.claim) {
+    counts.set(row.claim, (counts.get(row.claim) ?? 0) + Number(row.advancement && row.actionable));
+  }
+  return Object.fromEntries([...counts].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+}
+
+export function claimedAdvancementCountFromIndex(value: unknown, agent: string): number | null {
+  const index = object(value);
+  if (index.schema_version !== INDEX || index.claimed_advancement_counts === undefined) return null;
+  const counts = requireJsonObject(index.claimed_advancement_counts, "claimed advancement counts");
+  for (const [claim, total] of Object.entries(counts)) {
+    if (agentId(claim) !== claim || typeof total !== "number" || !Number.isSafeInteger(total) || total < 0) {
+      throw new EffectRuntimeRequestError("invalid claimed advancement count");
+    }
+  }
+  return Object.hasOwn(counts, agent) ? counts[agent] as number : 0;
+}
+
+function checkpoint(rows: Row[] | null, agent: string | null, unclaimedOnly = false): Checkpoint {
+  if (rows === null) return {complete: false};
+  const selected = rows.filter(row => row.advancement &&
+    (!unclaimedOnly || row.claim === null) &&
+    claimAllowsAgent(row, agent));
+  if (selected.length === 0) return {complete: false};
+  const ids = new Set<string>();
+  let latest: bigint | null = null;
+  let updated = "";
+  for (const row of selected) {
+    const instant = parseTodoTimestampMicros(row.updated);
+    if (!row.id || ids.has(row.id) || instant === null) return {complete: false};
+    ids.add(row.id);
+    if (latest === null || instant > latest) { latest = instant; updated = row.updated; }
+  }
+  selected.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  const digest = createHash("sha256").update(`[${selected.map(row => row.serialized).join(",")}]`).digest("hex");
+  // The selectable set above also contains rows nobody has claimed yet, so any
+  // other lane that claims or edits one of them moves the revision. That is a
+  // real change to the measured chain but not to this agent's own work basis,
+  // so the ACK fence also carries an identity over the rows this agent owns.
+  const owned = agent === null ? [] : selected.filter(row => row.claim === agent);
+  // Display title and priority remain full-revision freshness, but do not buy
+  // another review of the same owned work. Canonical text is the requirement
+  // when no enabled acceptance contract covers this Todo, so preserve its
+  // exact bytes alongside task/target/dependency identity. The separate exact
+  // owner-contract hold checkpoint governs already-held acceptance reviews;
+  // this generic chain must not guess whether a body edit is merely a rename.
+  const ownedDigest = owned.length === 0 ? null : canonicalAuthoritySha256(owned.map(row => {
+    const work = canonicalAuthorityObject(JSON.parse(row.serialized), "frontier work");
+    const {title: _title, priority: _priority, ...basis} = work;
+    // The original priority writer decorates `text` as well. Decode only its
+    // declared marker syntax; retain the entire remaining requirement body.
+    if (typeof basis.text === "string") basis.text = legacyTodoPriority(basis.text).title;
+    return basis;
+  })).slice(0, 24);
+  return {complete: true, frontier_revision: `${REVISION}:${digest.slice(0, 24)}`,
+    frontier_updated_at: updated,
+    frontier_owned_identity: ownedDigest === null ? null : `${REVISION}:owned:${ownedDigest}`};
+}
+
+function readIndex(value: unknown, agent: string | null): Checkpoint | null {
+  if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) return null;
+  const index = object(value);
+  if (index.schema_version !== INDEX) return {complete: false};
+  let raw = index.all;
+  if (agent) {
+    if (!Array.isArray(index.by_agent)) return {complete: false};
+    const matches = index.by_agent.filter(row => agentId(object(row).agent_id) === agent);
+    if (matches.length > 1) return {complete: false};
+    raw = matches[0] ?? index.unclaimed;
+  }
+  const entry = object(raw);
+  const revision = text(entry.frontier_revision), updated = text(entry.frontier_updated_at);
+  if (entry.complete !== true || !revision || parseTodoTimestampMicros(updated) === null) return {complete: false};
+  return {complete: true, frontier_revision: revision, frontier_updated_at: updated,
+    frontier_owned_identity: text(entry.frontier_owned_identity) || null};
+}
+
+function successorCheckpoints(request: JsonObject, agent: string | null): JsonObject | null {
+  const indexed = readIndex(request.index, agent);
+  const rows = decodeRows(request.rows);
+  const source = indexed ?? checkpoint(rows, agent);
+  if (!source.complete) return null;
+  const latest = parseTodoTimestampMicros(source.frontier_updated_at)!;
+  const candidates = (Array.isArray(request.candidates) ? request.candidates : []).map(object)
+    .filter(row => {
+      const updated = parseTodoTimestampMicros(text(row.updated_at));
+      return text(row.todo_id) && updated !== null && updated >= latest;
+    });
+  const bindings: SuccessorBinding[] = candidates.filter(row => row.origin_obligation_id === request.obligation_id)
+    .map(row => ({kind: "exact", todo_id: text(row.todo_id)}));
+  const triggers = Array.isArray(request.triggers) ? request.triggers : [];
+  const trigger = object(triggers[0]);
+  // A new successor changes the revision it was created to settle. Reconstruct
+  // only a unique fresh insertion, using a complete source matching the index.
+  // The existing obligation-id owner still verifies the predecessor revision.
+  const priorAdvancement = count(agent === null ? trigger.selectable_advancement_count
+    : trigger.current_agent_claimed_advancement_count) - 1;
+  const priorOpen = count(agent === null ? trigger.selectable_open_count
+    : trigger.current_agent_claimed_open_count) - 1;
+  // Retain the former open-count threshold when reading historical obligations.
+  // New Agent-lane observations below count only advancement commitments.
+  if (bindings.length === 0 && candidates.length === 1 && triggers.length === 1 &&
+      trigger.kind === TRIGGER && trigger.frontier_revision === source.frontier_revision && (priorAdvancement >= 15 || priorOpen >= 20 && priorAdvancement > 0)) {
+    const completeSource = indexed === null ? source : checkpoint(rows, agent);
+    if (completeSource.complete && completeSource.frontier_revision === source.frontier_revision) {
+      const candidate = candidates[0];
+      const prior = checkpoint(rows === null ? null : rows.filter(row => row.id !== candidate.todo_id), agent);
+      if (prior.complete && prior.frontier_revision !== source.frontier_revision) {
+        bindings.push({kind: "predecessor", todo_id: text(candidate.todo_id), frontier_revision: prior.frontier_revision,
+          obligation_identity_revision: prior.frontier_owned_identity ?? prior.frontier_revision});
+      }
+    }
+  }
+  return {trigger_checkpoints: [
+    ...triggerCheckpoints(request.triggers).filter(row => row.kind !== TRIGGER),
+    triggerCheckpoint({kind: TRIGGER, ...source}),
+  ], bindings};
+}
+
+/** Classify legacy summary views without transporting private Todo content.
+ * An explicit empty executable slot wins. Count floors preserve observation
+ * coverage; they never synthesize selectable rows or an execution grant.
+ */
+function classifyFrontier(request: JsonObject, agent: string | null): JsonObject {
+  const sources = requireJsonObject(request.sources, "frontier sources");
+  const decode = (value: unknown) => {
+    if (value == null) return null;
+    if (!Array.isArray(value)) throw new EffectRuntimeRequestError("frontier source must be an array");
+    return value.map((raw, index) => {
+      const row = requireJsonObject(raw, "frontier classification row");
+      const actionable = requireBoolean(row.actionable, "actionable");
+      const advancement = requireBoolean(row.advancement, "advancement");
+      return {index, claim: optionalNonEmptyString(row.claim, "claim"),
+        excluded: requireStringArray(row.excluded, "excluded"),
+        eligible: actionable && advancement};
+    });
+  };
+  const executable = decode(sources.executable_backlog_items);
+  const free = decode(sources.unclaimed_priority_open_items) ?? [];
+  const claimed = decode(sources.claimed_advancement_open_items) ?? [];
+  const eligible = (row: typeof free[number]) => row.eligible;
+  const excluded = (row: typeof free[number]) => agent !== null && row.excluded.includes(agent);
+  const current = executable !== null
+    ? executable.filter(row => eligible(row) && row.claim !== null && (!agent || claimAllowsAgent(row, agent)))
+    : claimed.filter(row => eligible(row) && (!agent || row.claim === agent) && !excluded(row));
+  const unclaimed = executable !== null
+    ? executable.filter(row => eligible(row) && row.claim === null && !excluded(row))
+    : free.filter(row => eligible(row) && !excluded(row));
+  const others = (executable ?? claimed).filter(row => eligible(row) && agent !== null && row.claim !== null && row.claim !== agent);
+  // Python integer observations may exceed the JSON number precision boundary.
+  // Keep the floor exact in transit; selection still depends only on real rows.
+  const encodedFloor = requireNonEmptyString(request.claimed_count_floor, "claimed_count_floor");
+  if (!/^(0|[1-9][0-9]*)$/.test(encodedFloor)) {
+    throw new EffectRuntimeRequestError("claimed count floor must be canonical nonnegative decimal");
+  }
+  const floor = BigInt(encodedFloor);
+  const currentCount = floor > BigInt(current.length) ? floor : BigInt(current.length);
+  const group = (source: string, rows: typeof free) => ({source, indices: rows.map(row => row.index)});
+  return {groups: {
+    current_agent_claimed_items: group(executable !== null ? "executable_backlog_items" : "claimed_advancement_open_items", current),
+    unclaimed_items: group(executable !== null ? "executable_backlog_items" : "unclaimed_priority_open_items", unclaimed),
+    other_agent_claimed_items: group(executable !== null ? "executable_backlog_items" : "claimed_advancement_open_items", others),
+  }, counts: {
+    current_agent_claimed_advancement_count: currentCount <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(currentCount) : currentCount.toString(),
+    unclaimed_advancement_count: unclaimed.length,
+    other_agent_claimed_advancement_count: Math.max(others.length, (decode(request.diagnostic_peers) ?? []).filter(eligible).length),
+  }};
+}
+
+export function projectAdvancementFrontier(value: unknown): JsonObject {
+  const request = requireJsonObject(value, "frontier revision request");
+  if (request.schema_version !== "todo_frontier_revision_request_v0") throw new EffectRuntimeRequestError("frontier revision schema mismatch");
+  const agent = agentId(request.agent_id);
+  if (request.operation === "classify") return classifyFrontier(request, agent);
+  if (request.operation === "trigger_checkpoints") {
+    return {trigger_checkpoints: triggerCheckpoints(request.triggers)};
+  }
+  if (request.operation === "successor_checkpoints") {
+    return {source_checkpoint: successorCheckpoints(request, agent)};
+  }
+  if (request.operation === "read") return {checkpoint: readIndex(request.index, agent)};
+  const rows = decodeRows(request.rows);
+  if (request.operation === "select") return {checkpoint: checkpoint(rows, agent)};
+  if (request.operation !== "index") throw new EffectRuntimeRequestError("unsupported frontier revision operation");
+  return {index: frontierIndex(rows)};
+}
+
+function frontierIndex(rows: Row[] | null): JsonObject {
+  // An excluded agent can have no claimed rows. It still needs its own lane;
+  // falling back to the global unclaimed checkpoint would include excluded work.
+  const agents = [...new Set((rows ?? []).filter(row => row.advancement)
+    .flatMap(row => [...(row.claim ? [row.claim] : []), ...row.excluded]))].sort();
+  const counts = claimedAdvancementCounts(rows);
+  return {schema_version: INDEX, ...(counts === null ? {} : {claimed_advancement_counts: counts}),
+    all: checkpoint(rows, null),
+    unclaimed: checkpoint(rows, null, true),
+    by_agent: agents.map(agent_id => ({agent_id, ...checkpoint(rows, agent_id)}))};
+}
+
+/** Compose the existing index owner inside an already-required summary read.
+ * Bind the lossless legacy codec to the validated source before selecting;
+ * display limits must never decide replan identity or commitment counts. */
+export function projectSummaryFrontierIndex(value: unknown, source: readonly JsonObject[],
+  indices: readonly number[]): JsonObject {
+  const rows = decodeRows(value);
+  if (rows === null || rows.length !== source.length) {
+    throw new EffectRuntimeRequestError("summary frontier source cardinality mismatch");
+  }
+  for (const [index, row] of rows.entries()) {
+    const fact = source[index];
+    const actionable = fact.status === "open" && !fact.done &&
+      (!fact.has_resume || fact.resume_ready === true) && !fact.acceptance_blocked;
+    if (row.id !== text(fact.todo_id) || row.claim !== (text(fact.claim) || null) ||
+        JSON.stringify(row.excluded) !== JSON.stringify(fact.excluded) ||
+        row.advancement !== (fact.task_class === "advancement_task") ||
+        row.actionable !== actionable || row.updated !== text(fact.updated_at || fact.completed_at)) {
+      throw new EffectRuntimeRequestError("summary frontier facts disagree with the validated source");
+    }
+  }
+  return frontierIndex(indices.map(index => rows[index]));
+}
+
+function classifyAck(observation: LongChainObservation, value: unknown): AckDecision {
+  const ack = object(value), delta = object(ack.semantic_delta);
+  const id = text(delta.obligation_id);
+  const rejected = {acknowledged: false, rearmed_after_obligation_id: null};
+  if (ack.recorded !== true || delta.accepted !== true ||
+      !strings(delta.trigger_kinds).includes(TRIGGER) || !/^replan-[a-f0-9]{16}$/.test(id) ||
+      observation.frontier_revision_complete !== true || !text(observation.frontier_revision)) return rejected;
+  const matches = Array.isArray(delta.trigger_checkpoints) && delta.trigger_checkpoints.some(raw => {
+    const row = triggerCheckpoint(raw);
+    if (row === null || row.kind !== TRIGGER) return false;
+    if (row.frontier_revision === observation.frontier_revision) return true;
+    // Another lane claiming or editing an unclaimed row moves the revision but
+    // leaves this agent's own selectable rows untouched; that is not new
+    // evidence about this agent's chain, so it must not re-arm the obligation.
+    const recorded = text(row.frontier_owned_identity);
+    return Boolean(recorded) && recorded === text(observation.frontier_owned_identity);
+  });
+  return {acknowledged: matches, rearmed_after_obligation_id: matches ? null : id};
+}
+
+export function evaluateLongTodoChain(value: unknown): JsonObject {
+  const request = requireJsonObject(value, "long chain request");
+  if (request.schema_version !== "long_todo_chain_request_v0") throw new EffectRuntimeRequestError("long chain schema mismatch");
+  if (request.operation !== "observe") throw new EffectRuntimeRequestError("unsupported long chain operation");
+  const summary = object(request.summary), frontier = object(request.frontier_counts);
+  const agent = agentId(request.agent_id);
+  const current = count(frontier.current_agent_claimed_advancement_count);
+  const unclaimed = count(frontier.unclaimed_advancement_count);
+  const advancement = current + unclaimed;
+  const open = Math.max(advancement, request.summary == null ? count(object(request.agent_counts).open) :
+    count(summary.current_agent_claimed_open_count) + count(summary.unclaimed_open_count));
+  const claimedOpen = Math.max(current, count(summary.current_agent_claimed_open_count));
+  // A lane replans commitments it owns. Shared candidates remain selectable,
+  // but must not impose a chain obligation with no owned ACK fence.
+  const measuredAdvancement = agent === null ? advancement : current;
+  const threshold = measuredAdvancement >= 15 ? 15
+    : agent === null && open >= 20 && measuredAdvancement > 0 ? 20 : null;
+  if (threshold === null) return {observation: null, decision: null};
+  const revision = readIndex(summary.advancement_frontier_revision_index, agent)
+    ?? checkpoint(decodeRows(request.rows), agent);
+  const observation: LongChainObservation = {trigger_count: threshold === 15 ? measuredAdvancement : open,
+    count_kind: agent === null
+      ? threshold === 15 ? "selectable_advancement_todos" : "selectable_open_todos"
+      : "claimed_advancement_todos",
+    selectable_open_count: open, selectable_advancement_count: advancement,
+    current_agent_claimed_open_count: claimedOpen,
+    current_agent_claimed_advancement_count: current, unclaimed_advancement_count: unclaimed,
+    threshold, agent_id: agent, frontier_revision: revision.complete ? revision.frontier_revision : null,
+    frontier_revision_complete: revision.complete,
+    frontier_owned_identity: revision.complete ? revision.frontier_owned_identity : null};
+  const {frontier_revision, frontier_revision_complete, frontier_owned_identity, ...counts} = observation;
+  const receipt = triggerCheckpoint({kind: TRIGGER, frontier_revision,
+    frontier_revision_complete, frontier_owned_identity});
+  return {observation: {...observation, trigger: {...counts, ...receipt,
+    ...(revision.complete ? {obligation_identity_revision:
+      revision.frontier_owned_identity ?? revision.frontier_revision} : {})}},
+    decision: classifyAck(observation, request.ack)};
+}

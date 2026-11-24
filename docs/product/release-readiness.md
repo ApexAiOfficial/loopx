@@ -1,6 +1,6 @@
 # Release Readiness
 
-Status: v0.x maintainer contract.
+Status: stable maintainer contract.
 
 LoopX can move quickly without making every merged PR feel like a product
 release. This note defines the small mental model maintainers should use before
@@ -9,48 +9,119 @@ which control-plane surfaces are safe to build on.
 
 ## Supported Install And Update Paths
 
-For a first-time user, prefer the no-clone archive installer:
+For a first-time user, prefer the canonical PyPI release:
 
 ```bash
-curl -fsSL https://huangruiteng.github.io/loopx/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
+python3 -m pip install --upgrade loopx
+loopx workflow-skills --install
 loopx doctor
 ```
 
-The installer and `loopx update` use the public `stable` ref by default. Use
-`LOOPX_REF=main` or `loopx update --ref main` only for maintainer/dev repair
-when you intentionally want the current repository head instead of the stable
-channel.
+Restart the agent host after this first install so the newly delivered
+workflow skills become active.
 
-For a user who already installed from the archive, update through the explicit
-CLI flow:
+PyPI owns normal release acquisition and dependency resolution. `loopx update
+apply` uses that same owning environment and then refreshes LoopX host material
+and readbacks; it does not switch channels.
+
+Use the same explicit intent flow for PyPI and archive installations:
 
 ```bash
-loopx update --check
-loopx update --dry-run
-loopx update --execute
+loopx update check
+loopx update plan
+loopx update apply
 loopx doctor
+loopx extension doctor --all-enabled --execute
 ```
 
-Re-running the curl installer remains a repair/fallback path when the wrapper
-or local release snapshot is broken. It is not the primary update path for a
-healthy archive install.
+After `loopx update apply`, revalidate enabled extensions with
+`loopx extension doctor --all-enabled --execute`. Stale extension readiness
+is already revalidated during a successful apply; the explicit command above
+is an independent readback and recovery entry point. A provider that still
+fails remains closed until its per-extension doctor result is repaired and the
+command passes. See [Extension lifecycle](../reference/extensions.md#runtime-lifecycle).
+
+For an archive installed with custom directories, keep the same
+`LOOPX_BIN_DIR` and `LOOPX_RELEASES_DIR` overrides when rolling back.
+Unset or empty overrides use the default locations.
+
+Do not collapse package acquisition, host-material delivery, core runtime
+activation, and enabled-extension readiness into one "installed" claim. The
+[installation guide's active-layer checklist](../guides/installing-loopx.md#verify-the-active-layers)
+names the readback and recovery command for each layer.
+
+For a pip or pipx distribution, apply delegates to that owner. For an archive
+snapshot, apply uses the public `stable` ref by default. Before replacing the
+launchers, `loopx update --rollback previous` checks that the selected release
+can read the current authoritative Todos for registered local File and SQLite
+Goals. Both the registry's configured runtime and an explicit runtime override
+participate in this check. Rollback switches `loopx` and an archive-managed
+`loopx-apply-rrule` to the selected release under the installer's promotion lock.
+A selected release must provide an executable scheduler helper if the helper
+is managed by that archive installation. The lock covers Todo checks, both
+replacements, Doctor and recovery. Rollback verifies each destination against
+its original inode immediately before replacing it. A changed destination,
+an interrupted or failed switch, or a failed core Doctor triggers recovery
+only for links still owned by the rollback. A failed extension Doctor leaves
+the selected release active so the extension can be repaired.
+Use a release with a matching state backup if older code cannot read the
+current data. Use `loopx update plan
+--ref main` and `loopx update apply --ref main` only for maintainer/dev archive
+qualification. Re-running the curl installer remains a repair path when an
+archive wrapper is too broken to run its own updater.
 
 For contributors, keep the clone-plus-canary path:
 
 ```bash
-git clone https://github.com/huangruiteng/loopx ~/loopx
+git clone https://github.com/loopx-project/loopx ~/loopx
 ~/loopx/scripts/install-local.sh
 loopx doctor
 loopx-canary doctor
 ```
 
-The no-clone path is the user default. The clone-plus-canary path is the
-maintainer validation path.
+The PyPI path is the user default. The clone-plus-canary path is the maintainer
+validation path, and the no-clone archive is the recovery fallback.
 
 Before promoting a stable install/update recommendation, maintainers must move
 the public `stable` ref to the release commit that passed this gate. Do not
 claim stable-channel readiness while `stable` is missing or stale.
+
+## Atomic Local Promotion Failure Matrix
+
+Local clone installs promote through `scripts/install-local.sh`. Default
+executable swaps are atomic symlink replaces that run only after a candidate
+release directory passes deep `loopx doctor` validation and any required
+workflow-skill preflight. Contributors should treat the matrix below as the
+safe failure contract; do not invent a second promotion path or claim that a
+failed candidate became the live default.
+
+Shipped coverage lives in
+`examples/release/release-promotion-concurrency-smoke.py` (lock, wait, and
+pre-swap rejection) and
+`examples/release/local-install-promotion-boundary-smoke.py` (canary-only
+boundary, explicit override, and skill preflight stop).
+
+| Case | When it happens | Before default symlink swap? | Waiter / recovery behavior | Contributor stop |
+| --- | --- | --- | --- | --- |
+| Promotion guard held | Another install holds `releases/.install-guard` | Yes: waiter has not reserved or swapped yet | Waiter polls the flock; it must not create a competing `.install-lock` while blocked. After the owner unlocks, the waiter acquires the guard and completes | Retry is safe. Do not delete a live guard or force-promote around it |
+| Live legacy lock owner | `releases/.install-lock` names a live PID | Yes: timed-out waiter never reaches candidate build or swap | Waiter times out with `timed out waiting for another local install`; the live owner lock and PID file stay untouched | Stop and wait for the live installer, or ask a maintainer. Do not reap a live owner's lock |
+| Empty or dead legacy lock | Lock directory has no valid live PID | Yes: reaped before a new owner publishes its PID | Waiter reaps the interrupted lock, then acquires ownership and continues | Safe automatic recovery. No maintainer action required |
+| Concurrent same-second install | Two promoted installs race with a shared release-id seed | Partial: each waiter serializes under the guard/lock before its own swap | Each run gets a distinct release directory (`id`, `id-2`, …); one audited default symlink remains after both finish | Treat distinct release ids as expected. Do not hand-edit release directory names mid-install |
+| Incomplete candidate (doctor fail) | Candidate package fails deep doctor or required package-root checks | Yes: candidate directory is removed; previous default target is preserved | No waiter swap occurs. Re-run only after the checkout is complete and doctor-clean | Stop promoting. Fix the checkout; do not set `LOOPX_PROMOTE_DEFAULT=1` to bypass doctor |
+| Skill preflight blocked | Exact-host entry skill cannot be materialized (for example a user-owned colliding skill) | Yes: release candidate is removed; existing default binary stays unchanged | Failure is local to the install attempt; no partial default promotion | Stop. Resolve the skill ownership collision or install without that skill surface before retrying |
+| Untrusted checkout (auto mode) | Checkout is dirty, not on the approved default ref, or otherwise untrusted | Yes for default: installer never builds a promoted release snapshot | Installer exits canary-only (`promotion mode: canary_only_untrusted_checkout`), leaves the existing default executable alone, and may refresh `loopx-canary` | Use `loopx-canary` for validation. Do not set `LOOPX_PROMOTE_DEFAULT=1` unless you are explicitly approving this checkout as a maintainer-owned default |
+| Explicit override | `LOOPX_PROMOTE_DEFAULT=1` on an otherwise untrusted checkout | No: this is the intentional swap path after candidate validation | Promotion is auditable as `explicit_override` in `release.json` and doctor provenance | Contributor boundary ends here. Explicit default promotion, moving public `stable`, tagging, and PyPI publish remain maintainer-only |
+
+Contributor-safe defaults:
+
+- Prefer canary-only installs from ordinary feature checkouts.
+- Treat any failure listed as "before default symlink swap" as proof that the
+  previous default must still be live.
+- When a waiter times out on a live owner, stop; recovery belongs to that
+  owner finishing or a maintainer reclaiming a truly dead lock.
+- Do not document, script, or smoke a contributor path that moves `stable`,
+  publishes packages, or claims default promotion without
+  `LOOPX_PROMOTE_DEFAULT=1` plus an explicit maintainer approval.
 
 ## Merged Is Not Runtime-Active
 
@@ -59,41 +130,97 @@ prove that an installed LoopX runtime contains that commit. This distinction
 matters when a fix reaches `main` after the latest named release: package
 versions may still match while the installed source commit is behind.
 
-Use `loopx update --check --ref main` for maintainer qualification. Its
+Use `loopx update check --ref main` for archive maintainer qualification. Its
 `runtime_activation_qualification` result compares the release-manifest source
-commit with the trusted source lineage reported by `loopx doctor`:
+commit with the selected ref's current GitHub commit. `source_commit_check`
+records the bounded read; an unavailable lookup does not turn equal package
+versions or a locally cached ref into an up-to-date claim:
 
 - `runtime_active` means the installed commit is the target commit or contains it;
 - `release_or_install_successor_required` means the installed commit is behind
   or diverged, so a release/install successor must remain explicit;
-- `activation_qualification_required` means commit lineage is unavailable or
-  belongs to a different `repo/ref`; the runtime-active claim must fail closed
-  until identity is refreshed.
+- `activation_qualification_required` means the selected commit differs without
+  proven ancestry, the ref lookup is unavailable, or archive identity is not
+  established; the runtime-active claim must fail closed until qualified.
+
+A pinned full commit SHA is its own trusted target, so
+`loopx update check --ref <40-hex-commit>` qualifies against the installed
+manifest source commit without waiting for a branch lineage lookup. Installed
+and pinned commits match: the receipt is `runtime_active`. They differ: the
+receipt stays `activation_qualification_required` and names the installed
+commit difference instead of the generic lineage message.
 
 Closing a PR monitor after latest-`main` validation is valid, but the closeout
 must not say the fix is active in the installed runtime unless this receipt is
 `runtime_active`. Publishing a release remains a separate maintainer action.
 When the qualification command itself runs from newer source code, pass a local
 snapshot from the older installed CLI with `--installed-doctor-json`; this
-option is read-only and accepted only by `update --check`.
+option is read-only and accepted only by `update check`.
 
 ## Named Version Contract
 
-LoopX v0.x is distributed from GitHub, but each stable promotion still needs a
-package version name. The version source is `loopx.__version__`, mirrored by
-`pyproject.toml`; the expected public tag is `vX.Y.Z` for that version.
+LoopX releases are tagged and built from GitHub. The release workflow
+publishes artifacts to GitHub Releases and, when its Trusted Publisher gate
+passes, PyPI; each stable promotion still needs one package version name. The
+version source is `loopx.__version__`, mirrored by `pyproject.toml`; the
+expected public tag is `vX.Y.Z` for that version.
+
+Exact-source qualification reads both version declarations from the selected
+checkout without executing its package. Missing, malformed or conflicting build
+metadata refuses qualification even when the commit is clean and all supplied
+receipts agree. Release artifact tooling loads the shared static reader without
+bootstrapping the candidate package, including when the tool and candidate use
+the same checkout. Invalid metadata retains the artifact CLI's normal error
+output; inspection does not execute package initialization.
 
 Before moving `stable`, maintainers should:
 
+- before freezing the candidate, fetch `stable` from the verified target
+  repository and check that its released commit is an ancestor of the candidate
+  with `git merge-base --is-ancestor STABLE_COMMIT CANDIDATE_COMMIT`.
+  Inspect its exit status directly: only zero permits the fast-forward path;
+  a later successful command does not make an earlier ancestry check pass.
+  Resolve divergent history through a reviewed merge PR, retain current behavior,
+  then qualify the new exact source. Never force-update the released ref;
+- run the complete packaged Personal Workspace journey against the exact
+  candidate before publishing a release, including every catalog scenario and
+  the companion flows in `npm run smoke:personal-workspace-packaged`;
+  installation, upgrade and Host checks alone do not qualify the page. The
+  `install_upgrade_host` result uses `release_install_upgrade_host_summary_v1`
+  and requires `packaged_frontend_passed=true` as well as the three existing
+  checks. Missing, failed or skipped page validation holds release readiness;
 - bump `loopx.__version__` and `pyproject.toml` together when user-visible
   release behavior changes;
+- before freezing the candidate, align the existing canonical help catalog,
+  generated versioned manpage and current developer-book release checkpoint;
+  run the documentation preflight below without changing historical examples;
 - create or verify the matching Git tag, for example `v0.1.3`;
+- for host Goal/prompt changes, explicitly run the
+  [release-only native Goal regression](../development/testing-and-quality.md#release-only-native-goal-regression--仅发布前的原生-goal-回归)
+  in a supported Codex environment; record an unavailable environment as
+  `skipped`, not a live pass. Never enable paid model execution in default PR CI;
+- for conversational intake/routing changes, run the
+  [public intake evaluation](use-cases/steward/golden-queries.md#gq01-conversational-preparation-variant)
+  on the release candidate for the default and newly advertised model profiles,
+  with at least two repeats. Record the exact commit, model/settings, prompt/case
+  hashes, usage, failures and skips. Paid calls belong to release qualification,
+  never routine PR work, per-commit checks or heartbeats; ordinary development
+  uses offline regressions and affected browser scenarios. A skipped profile is
+  not qualified, and provider failures must remain visible;
 - fast-forward `stable` to that tagged commit after the release canary passes;
-- confirm `release.json`, `loopx doctor`, and `loopx update --check` report the
+- confirm `release.json`, `loopx doctor`, and `loopx update check` report the
   same package version and tag;
-- tell existing users to run `loopx update --check`, then
-  `loopx update --execute` when the check recommends or when they want to
+- tell existing users to run `loopx update check`, then
+  `loopx update apply` when the check recommends or when they want to
   refresh to the named stable release.
+
+Run the existing documentation preflight from the candidate worktree:
+
+```bash
+uv run --extra test python scripts/render-manpage.py --output man/loopx.1
+uv run --extra test python examples/cli-help-manpage-smoke.py
+uv run --extra test python examples/dev-book-publication-smoke.py
+```
 
 The release workflow builds a wheel and source distribution from the tagged
 commit. Its release assets include a canonical `SHA256SUMS` file, and GitHub
@@ -102,8 +229,8 @@ manifest. Verify a downloaded bundle before installation:
 
 ```bash
 sha256sum --check SHA256SUMS
-gh attestation verify loopx-X.Y.Z-py3-none-any.whl --repo huangruiteng/loopx
-gh attestation verify loopx-X.Y.Z.tar.gz --repo huangruiteng/loopx
+gh attestation verify loopx-X.Y.Z-py3-none-any.whl --repo loopx-project/loopx
+gh attestation verify loopx-X.Y.Z.tar.gz --repo loopx-project/loopx
 ```
 
 The checksum proves that the downloaded bytes match the release manifest. The
@@ -111,18 +238,387 @@ attestation separately binds those bytes to the repository, workflow, commit,
 and build event; neither mechanism claims that the package is vulnerability
 free.
 
+Wheel builds recreate the LoopX package subtrees in `build_lib` and wheel staging
+after verifying the frontend bundle. Reused build or retained staging directories
+must not carry modules, packages or resources deleted from current source.
+Current package data and the bundle's qualified previous asset generation
+remain included; unrelated build output
+and editable setup remain untouched. A build destination overlapping the
+source package is rejected. Explicit `bdist_wheel --skip-build` still packages
+the selected existing build; it is not a fresh-source qualification. Before
+qualifying retirement, inspect the built wheel and run its installed entry
+points outside the source checkout.
+
+Before a recovery dispatch, inspect the existing `pypi` environment's allowed
+branch/tag refs as well as the Trusted Publisher and enabled variable:
+
+```bash
+gh api repos/loopx-project/loopx/environments/pypi/deployment-branch-policies
+gh api repos/loopx-project/loopx/actions/variables/PYPI_PUBLISH_ENABLED
+```
+
+The workflow ref must satisfy that existing deployment policy. For a tag-only
+policy, use an explicitly labelled release-tooling tag pinned to the reviewed
+workflow commit, separately from the immutable product tag passed as `tag`.
+Retain the tooling ref for provenance verification; do not move the product tag,
+relax the environment policy, or replace Trusted Publishing with a token.
+
+When a tagged build passed but publication stopped after a partial upload,
+dispatch the reviewed release workflow with the original product `tag` and its
+`validated_run_id`. This path reuses the successful release-event build without
+rebuilding packages or repeating qualification. It checks the repository,
+workflow, tag, source and successful build job, then verifies every recovered
+file's attestation against that tagged source. Existing Release assets must
+match downloaded bytes exactly before any missing file is uploaded; a mismatch
+or case-insensitive name collision stops publication without replacement.
+Trusted Publishing and the existing environment policy still apply.
+
+Reserve `qualification.json` for the workflow's attested runtime qualification.
+Use `RELEASE-QUALIFICATION.json` for a separately maintained release overview;
+GitHub Release asset names must also be unique when compared ignoring case.
+
+The main runtime publisher verifies its downloaded installation qualification
+against the source revision, channel, archive digest and byte count before any
+remote write. Every installation/recovery check must pass, and immutable metadata
+must match the candidate channel metadata. Missing, failed or mismatched evidence
+leaves the existing releases and channel untouched. Record supported-profile
+adoption, matched model outcomes and complete cost separately under RFC §9.
+
+main 运行时发布器在任何远端写入前，将下载的安装资格与源码提交、渠道、归档摘要及
+字节数逐项核对。安装和恢复检查必须全部通过，不可变元数据必须与候选渠道元数据一致。
+证据缺失、失败或不匹配时，保留已有发布及渠道。按 RFC §9 单独记录受支持 profile 的
+采用、匹配的模型成果和完整成本。
+
+New public runtime descriptors carry the observed C1 contract in
+`qualified_default_contract`. The archive identity and qualification receipt
+retain `default_contract`. Existing v1 updaters can use the same ordinary
+`loopx update` flow to verify the source revision, archive digest and byte
+count. Current readers normalize the attestation and verify that it matches
+the archive identity. The builder probes the committed runtime before
+writing a descriptor. Qualification checks the installed candidate's
+ordinary quota writer in an isolated Goal with context delivery off.
+The publisher requires the compatibility descriptor and exact identity match
+before uploading a candidate. The main publishers offer engineering-qualified
+candidates as immutable prereleases for explicit verification. Test a Runtime
+candidate with `loopx update check --ref <source-sha>` and the corresponding
+`apply` command in a qualification installation. A signed Desktop candidate
+uses the immutable release for its exact build.
+The Runtime and Desktop update channels use the same reviewed `public_channel`
+in `loopx/cli_commands/public_default_contract.json` for main and stable.
+The named release uploader verifies the stable Runtime archive and its
+qualification against the release source before uploading any package assets.
+A held stable Runtime fails that upload and therefore blocks its PyPI job.
+Desktop uploads the exact tagged build for verification and keeps
+`desktop-stable` on its published profile until the gate passes.
+Archive updaters shipped before this cutover resolve stable through GitHub
+Latest. The maintainer publishes a prepared, already tagged release through
+`create-named-release` after the final release body is approved. It passes
+`--latest=false` to GitHub at creation, keeping old stable installs on the
+previous complete release while the existing published-release workflow builds
+and uploads the new bundle.
+
+```bash
+python scripts/release_artifacts.py create-named-release --repo loopx-project/loopx \
+  --title "$RELEASE_TITLE" --notes-file "$RELEASE_BODY"
+```
+
+From the tagged source, run
+`python scripts/release_artifacts.py promote-latest --repo loopx-project/loopx --dist-dir dist`
+with its validated bundle. The command reruns stable qualification and
+downloads the published assets to check their bytes against that bundle.
+When the maintainer authorizes the pointer move, rerun with `--execute` to
+update the exact release and verify GitHub Latest. If a write response is lost,
+read the release or Latest before retrying. Keep C1 candidates on their immutable
+main revision while the stable gate is held. Promote C1 by reviewing the policy
+change with the supported installation, adoption, matched outcome and
+complete-cost evidence under RFC §9.
+Desktop packaging observes its actual archived source
+through the same probe and support validator. Runtime updates reject an unsupported
+declared contract before downloading or activating it, and bind the archive's
+contract identity to its metadata. Historical v1 descriptors remain readable.
+The published `v2.4.0` tag retains `quota_packet`. New runtime and Desktop
+builds qualify only the observed `complete_turn` (`loopx_turn_envelope_v1`)
+default. Their update readers accept both exact profiles so an installed C1
+reader can verify a pinned historical archive during rollback. Keep historical
+readback separate from publication, which requires the current default.
+Record actual Host adoption and the matched single-session outcome and full-cost
+comparison under [RFC §9](../architecture/rfcs/controller-executor-unified-contract-v0.md#9-validation-and-acceptance).
+
+新的公开 runtime 描述符将实测的 C1 契约写入 `qualified_default_contract`，
+归档身份和资格回执使用 `default_contract`。已有 v1 更新器可沿原 `loopx update`
+流程校验源码提交、归档摘要和字节数。当前读取端会归一化该声明，并核对归档身份。
+构建器在写入描述符前探测已提交的 runtime。安装资格检查在隔离 Goal 中关闭上下文传输后
+再次观察普通 quota writer。发布器上传候选前要求使用兼容描述符，并核对精确身份。
+通过工程资格的 main 候选可从不可变预发布版本取得，供显式验证。用
+`loopx update check --ref <source-sha>` 和对应的 `apply` 命令在资格验证安装中测试
+Runtime 候选。签名 Desktop 候选使用其精确构建的不可变发布。
+Runtime 与 Desktop 的 main 和 stable 更新渠道共用
+`loopx/cli_commands/public_default_contract.json` 中通过评审的 `public_channel`。
+正式版本的上传步骤先核对 stable Runtime 归档、安装资格回执与版本来源，再上传包制品。
+stable Runtime 资格未通过时，上传失败，其 PyPI 任务也不会执行。
+Desktop 保留按具体标签验证的签名构建，`desktop-stable` 继续提供已发布的契约。
+切换前已安装的归档更新器经 GitHub Latest 解析 stable。维护者确认最终发布正文后，
+使用上面的 `create-named-release` 发布已打标签的版本。创建时显式传入
+`--latest=false`，让旧客户端在现有发布工作流构建和上传制品期间继续使用上一完整版本。
+
+在该标签的源码目录，用已验证的制品运行
+`python scripts/release_artifacts.py promote-latest --repo loopx-project/loopx --dist-dir dist`。命令重新核验 stable 资格，
+下载已发布的资产并核对字节。维护者授权切换后，为该命令加上 `--execute`，
+更新精确发布记录并读回 Latest。如果写入响应丢失，先读回发布记录或 Latest，再决定
+是否重试。stable 门禁未通过时，继续通过不可变的 main 提交验证 C1 候选。推进 C1 时，
+按 RFC §9 一并评审受支持的安装、采用、匹配成果和完整成本。
+桌面打包通过相同探测与支持校验器检查实际归档源码。runtime 更新在下载或激活前拒绝
+未支持的声明契约，并核对归档身份与元数据中的契约；历史 v1 描述符保留读取兼容。
+已发布的 `v2.4.0` 标签保留 `quota_packet`。新的 runtime 和 Desktop 构建只为
+实际探测到的 `complete_turn`（`loopx_turn_envelope_v1`）默认契约签发资格。
+更新读取端接受两种精确契约，已安装 C1 的读取端可在回退时校验固定版本的历史归档。
+历史制品读取与新制品发布资格各自核验。按
+[RFC §9](../architecture/rfcs/controller-executor-unified-contract-v0.zh-CN.md#9-验证与验收)
+记录受支持 Host 的实际采用，并完成同单会话匹配成果和完整成本对照。
+
+#### macOS preview upgrade across the C1 cutover
+
+The quota-packet-only macOS updater rejects a C1 archive at the contract
+check. Once a compatible signed preview is published, use this one-time manual
+replacement path from the older App:
+
+1. Download `LoopX.app.tar.gz` and `LoopX.app.tar.gz.sig` from the same official
+   `desktop-main-*` [release](https://github.com/loopx-project/loopx/releases)
+   for a C1-capable source revision. In a scratch directory, verify the archive
+   against the already trusted updater key. The key is the base64 value of
+   `plugins.updater.pubkey` in the installed version's trusted Tauri configuration.
+2. Decode the trusted key and the release signature and verify before unpacking.
+   With the trusted configuration saved as `trusted-tauri.conf.json`, run:
+
+   ```bash
+   set -euo pipefail
+   jq -er '.plugins.updater.pubkey' trusted-tauri.conf.json | base64 -D > updater.pub
+   base64 -D -i LoopX.app.tar.gz.sig -o updater.minisig
+   minisign -Vm LoopX.app.tar.gz -p updater.pub -x updater.minisig
+   tar -xzf LoopX.app.tar.gz
+   codesign --verify --deep --strict LoopX.app
+   ```
+
+3. Quit LoopX and save the existing App bundle and a compatible state backup
+   before replacing the App. Launch the verified replacement, then confirm the
+   App version, the same Goal and original receipt, and the installed runtime's
+   v1 default. If the checks fail, quit and restore the previous verified bundle
+   with the compatible backup as needed. The standalone CLI has its own update
+   and rollback path.
+
+仅支持 quota-packet 的 macOS updater 会在契约校验处拒绝 C1 归档。兼容的签名预览版
+发布后，首次跨越此边界时按上面的手动流程操作。从同一官方 `desktop-main-*` 发行版下载归档和签名，
+用已信任的旧版 updater 公钥校验归档，再解包并校验 App 签名。退出 LoopX，备份旧
+App 与兼容状态后再替换。启动后读回版本、同一 Goal、原回执及已安装 runtime 的 v1
+默认值。检查失败时，退出并恢复已验证旧 App，需要时恢复兼容状态备份。独立 CLI
+沿自己的更新与回退路径处理。
+
+For a browser-fixture error discovered after an immutable tag was published,
+maintainers may dispatch the release workflow from reviewed tooling with
+`tag` set to that existing release and `browser_fixture_commit` set to a full,
+merged commit SHA. Only the personal-workspace fixture, typed-actions,
+goal-work-map, goal-workspace-m2, lark-cli-missing, pr-review-agent-order and
+workspace-locale browser-smoke files are
+extracted from that commit;
+its other changes are not applied to the product checkout. All candidate files
+must remain regular source files before any correction is copied; deletion or a
+symlink fails closed without partially applying the fixture correction.
+A non-default commit must contain at least one correction in these fixture owners. The wheel and sdist are built before
+those test corrections are applied; checksums are verified again after the
+browser and managed-runtime tests, and the fixtures are restored. An empty
+input uses the tagged fixtures. This does not skip browser validation, rebuild
+from `main`, move the tag, or authorize product changes.
+
+`RELEASE-SOURCES.json` records the product tag/commit, browser fixture commit,
+workflow commit/ref, and package/checksum hashes. It is uploaded and attested
+alongside the packages. For a dispatched recovery, the attestation's build
+source identifies the workflow commit; the product source remains the tagged
+commit named in this separately attested record. Verify both, rather than
+assuming the builder and product commits are identical:
+
+```bash
+gh attestation verify RELEASE-SOURCES.json --repo loopx-project/loopx
+```
+
 PyPI publication is an explicit, fail-closed extension of the same build. The
 release workflow publishes only when maintainers have configured all of these:
 
 - a PyPI project named `loopx` with a Trusted Publisher for
-  `huangruiteng/loopx` and `.github/workflows/release-artifacts.yml`;
+  `loopx-project/loopx` and `.github/workflows/release-artifacts.yml`;
 - a protected GitHub environment named `pypi` that matches the Trusted
   Publisher configuration;
 - the repository variable `PYPI_PUBLISH_ENABLED=true`.
 
-Do not add a long-lived PyPI token. Without every condition above, GitHub
-Release packages and their verification material are still produced, while
-the PyPI job remains skipped.
+Do not add a long-lived PyPI token. Without the enabled variable, the PyPI
+job is skipped. With publication enabled, a disallowed workflow ref or invalid
+Trusted Publisher configuration fails closed; it does not become a successful
+or skipped publication. GitHub packages and PyPI publication retain separate
+readbacks.
+
+## Desktop Builder Publication Preflight
+
+The Desktop Release Artifacts workflow has a default-off, **read-only**
+`publication_probe` mode. It measures whether an already admitted Windows builder
+can verify the complete release set without waiting for another runner. It does
+not publish assets or reserve organization capacity. Ordinary release events,
+PR/fork builds and manual dispatches with this input omitted or false retain the
+existing separate Ubuntu publisher, job permissions, signing, complete asset set,
+backup and manifest-last ordering.
+
+Activate only from a reviewed workflow ref with an existing public Release tag:
+
+```bash
+gh workflow run desktop-release-artifacts.yml --ref <reviewed-workflow-ref> \
+  -f tag=<existing-release-tag> -f publication_probe=true
+```
+
+The probe checks out immutable workflow tooling separately from the product tag.
+It records and attests each platform's actual product commit, workflow commit,
+run/attempt and artifact digests in isolated source artifacts. Windows requires a
+successful terminal Mac job and at least 10 minutes plus a 60-second margin within
+its existing 30-minute job. It performs bounded metadata reads without polling or
+holding a runner while another builder is queued. On a failed-jobs-only rerun, an
+earlier successful Mac attempt is usable only with matching attested source
+lineage; a later failed/unfinished Mac attempt cannot fall back to older success.
+The bounded probe supports at most ten attempts and ten metadata pages per attempt.
+
+Read back the actual run and both build jobs, then download the report:
+
+```bash
+gh run view <run-id> --json headSha,event,status,conclusion,jobs
+gh run download <run-id> -n desktop-publication-preflight-<attempt> -D preflight-result
+cat preflight-result/report.json
+```
+
+The report distinguishes `eligible`, `held` and `unavailable` and always sets
+`publicationAuthorized=false`. An eligible report requires same-run downloads,
+verified source/binary attestations pinned to the workflow commit, the canonical
+four-asset/checksum owner, an unchanged Release inventory and a final budget check.
+It still precedes the Windows job's post-actions and final outcome. Missing Release,
+changed tag/source, incomplete or ambiguous jobs, failed downloads, API 403/429,
+timeouts, missing/extra/stale bytes and verification failures never qualify a
+writer. A green build or report is not permission to publish.
+
+In probe mode, the existing `upload-release` job is disabled, including on manual
+dispatch: only CI artifacts, their provenance attestations and a job summary are produced. The builder retains
+`contents:read` and its existing attestation permissions. The probe grants no
+release-content, infrastructure, billing, credential or merge authority. Check the
+before/after Release asset inventory when qualifying a hosted pilot; synthetic
+metadata/local smokes do not establish Windows transport, signing, timing or cost.
+A writing fast path would change job-wide credentials and the two-build-terminal
+success condition and requires its own exact-head review and maintainer authorization.
+
+Disable by omitting `publication_probe` or setting it to false; this restores the
+ordinary isolated publisher. Reverting the probe change removes the optional CI
+mode without modifying already published Release assets. Publication recovery keeps
+the existing backup, complete replacement, manifest-last and remote readback rules;
+never launch a second writer after a mutation's response is unknown. Standard runner
+reuse cannot guarantee the first admission or organization-wide release priority.
+See the [versioned release contract](https://github.com/loopx-project/loopx/blob/v1.4.0/docs/product/release-readiness.md)
+for the published baseline; this probe remains unqualified until its reviewed
+workflow has actual hosted evidence. No hosted pilot or release mutation is part
+of a local validation run.
+
+桌面发布只读预检默认关闭。仅在既有公开 Release tag 和已评审 workflow ref 上显式
+传入 `publication_probe=true` 激活；该模式禁用原上传 job，不写 Release。通过真实
+run/attempt 的完整 jobs、`desktop-publication-preflight-<attempt>` 制品及前后 Release
+库存验收。`eligible` 只表示源码、四资产、证明和预算的只读条件满足，Windows 最终
+job 结果仍待确认，`publicationAuthorized` 始终为 false。API/下载/校验失败、移动 tag、
+不明 lineage 或预算不足都不能放行；不占槽轮询等另一平台。省略该输入或设为 false
+恢复既有隔离 publisher；撤回代码不影响已发布资产。写入快路的权限、双 job 终态门、
+实际 Windows 路径及发布恢复须独立评审和维护者授权；本机 smoke 不等于 hosted 采用，
+复用 runner 也不构成组织级容量预留。
+
+## Multi-Surface Release Execution Pipeline
+
+A complete LoopX release coordinates four deliverables: **Core CLI/PyPI +
+`stable` ref**, **Desktop App / Tauri Updater**, **`dsh-loopx-plugin` (GitHub
+Release + npm + `awesome-dsh-plugin`)**, and **Bilingual Release Notes + Personal
+Feishu Guide**. Execute these stages concurrently where safe instead of waiting
+serially:
+
+### Stage 0: Fast Upfront Preflight (`< 5s`)
+
+Run one static & online inventory command before starting long qualification
+runs so version skew, missing signing secrets, or npm bootstrap prerequisites
+surface immediately:
+
+```bash
+uv run --extra test python scripts/release_multi_surface_preflight.py --online
+```
+
+### Stage 1: Four Concurrent Local Qualification Lanes
+
+On one clean, frozen release commit (preserving `origin/stable` ancestry), fan
+out four independent qualification lanes in parallel:
+
+1. **Lane A (Static, Boundary, Canary & Companion Packaging):**
+   `loopx check --scan-root .`, `examples/release/*-smoke.py`, manpage + dev-book
+   smokes, `dsh-loopx-plugin` unit tests & registry smoke.
+2. **Lane B (Low-Frequency Live Model Behavior):**
+   `uv run --extra test python scripts/qualify-doubao-model-behavior-live.py --qualification-id <release-qual-id> --repo-root .`
+   against the exact commit (and optional DeepSeek/Ark smoke).
+3. **Lane C (Wheel Install, Upgrade, Runtime Probe & Packaged UI):**
+   Build `wheel`/`sdist`, install in a clean environment, verify
+   `runtime_activation_qualification`, upgrade from `origin/stable`, and run
+   `npm --prefix apps/presentation/dashboard run smoke:personal-workspace-packaged`.
+4. **Lane D (Single-Wave Sharded Pytest & Release Receipt):**
+   `uv run --extra test python scripts/qualify_release_commit.py --repo-root . --output-dir .local/release-qualification --preflight-since <previous-tag> --resume`
+   (using single-wave shard concurrency via `default_pytest_parallelism`), then
+   settle with `uv run --extra test loopx canary release-qualification --manifest-json <release-qualification-manifest.json> --repo-root .`.
+
+### Stage 2: Concurrent Tag Fan-Out & Reactive Waiting
+
+1. Fast-forward/push annotated tags (`vX.Y.Z` for Core + Desktop, and
+   `dsh-loopx-plugin-vA.B.C` when the DSH plugin changed) to trigger
+   `release-artifacts.yml` and `desktop-release-artifacts.yml`; once the
+   non-draft `vX.Y.Z` and `dsh-loopx-plugin-vA.B.C` GitHub Releases are
+   published, `desktop-updater.yml` runs on release publication (or
+   `workflow_dispatch`) and `dsh-plugin-publish.yml` is dispatched via
+   `workflow_dispatch`.
+2. Never busy-poll workflow runs with `sleep` loops. While GitHub Actions builds
+   and notarizes binaries, immediately author the companion
+   [Personal Feishu Release Guide](#personal-feishu-release-guide) (using real
+   post-upgrade screenshots) and open/update the `awesome-dsh-plugin` catalog PR.
+
+### Stage 3: npm Trusted Publisher Bootstrap (First-Time Package Setup)
+
+npm OIDC Trusted Publishing (`dsh-plugin-publish.yml`) cannot create a package
+before it exists on `registry.npmjs.org` (`HTTP 404` catch-22):
+
+1. Enable `auth-and-writes` 2FA on the owning npm account.
+2. Perform a one-time web-auth publish using the **exact immutable GitHub Release
+   tarball** (`npm publish dsh-loopx-plugin-VERSION.tgz --access public --tag
+   latest --ignore-scripts`), then immediately run `npm logout` so no long-lived
+   CLI token remains on disk.
+3. On `https://www.npmjs.com/package/<name>/access` under **Trusted Publisher**,
+   select **GitHub Actions** with Organization/User `loopx-project`, Repository
+   `loopx`, Workflow filename `dsh-plugin-publish.yml`, **blank** `Environment
+   name`, and **`Allow npm publish` checked** (the default `npm stage publish`
+   only setting rejects direct `npm publish --provenance`). Re-dispatch
+   `dsh-plugin-publish.yml` to verify OIDC provenance and readback.
+
+### Stage 4: Complete Cross-Surface Readback & `stable` Promotion
+
+1. Run end-to-end online readback:
+   ```bash
+   uv run --extra test python scripts/release_multi_surface_preflight.py --online --require-published
+   node packages/dsh-loopx-plugin/scripts/verify-distribution.mjs --tarball <downloaded-dsh-tarball.tgz>
+   ```
+2. Verify `SHA256SUMS` / `DESKTOP-SHA256SUMS`, GitHub artifact attestations,
+   signed `desktop-stable/desktop-updater.json`, remote GitHub Release body hash
+   (`release-readiness-doc-smoke.py`), and fast-forward `origin/stable` once
+   all surfaces pass.
+
+### 多端协同发布执行流水线（中文精要）
+
+完整发布协同 **Core CLI / PyPI 与 `stable` 分支**、**Desktop 应用与签名热更新**、**`dsh-loopx-plugin`（GitHub Release + npm + `awesome-dsh-plugin`）** 及 **双语 Release Notes 与个人飞书使用指南**，按 5 个阶段并行推进：
+
+1. **阶段 0（5 秒前置巡检）：** 先跑 `uv run --extra test python scripts/release_multi_surface_preflight.py --online`，在耗时资格化前暴露版本漂移、桌面配置缺失或 npm 首包前置门禁。
+2. **阶段 1（本地四路并行资格化）：** 在同一冻结提交上并发执行静态/边界/文档/DSH smoke、低频模型行为门禁（`scripts/qualify-doubao-model-behavior-live.py --qualification-id <release-qual-id>`）、Wheel+Upgrade+Packaged UI（`npm --prefix apps/presentation/dashboard run smoke:personal-workspace-packaged`）全链路，以及单波多片 `qualify_release_commit.py --resume`，汇总至 `loopx canary release-qualification`。
+3. **阶段 2（远端并发触发与响应式等待）：** 并发推注核心 tag（`vX.Y.Z`）与插件 tag（`dsh-loopx-plugin-vA.B.C`）触发 `release-artifacts.yml` 与 `desktop-release-artifacts.yml`；非草稿 Release 发布后，`desktop-updater.yml` 按发布事件（或 `workflow_dispatch`）运行、`dsh-plugin-publish.yml` 经 `workflow_dispatch` 执行。等待构建/公证期间并行编写[个人飞书指南](#personal-feishu-release-guide)与 `awesome-dsh-plugin` 目录 PR（禁止用轮询 `sleep` 干等）。
+4. **阶段 3（npm 首包建档与 Trusted Publisher 一次性引导）：** 若 `registry.npmjs.org` 尚无包档（`404`），先开启 `auth-and-writes` 2FA，取 GitHub Release 同字节 `.tgz` 经网页 2FA 执行一次 `npm publish --access public --tag latest --ignore-scripts` 后立即 `npm logout`；再到包 Access 页添加 `GitHub Actions`（`loopx-project` / `loopx` / `dsh-plugin-publish.yml`、`Environment name` 留空、必须勾选 **`Allow npm publish`**），随后重跑 `dsh-plugin-publish.yml` 验签。
+5. **阶段 4（全端回读与 `stable` 推广）：** 运行 `release_multi_surface_preflight.py --online --require-published` 与 `verify-distribution.mjs`，核对全部校验和/证明/更新清单/飞书链接/Release 正文哈希无误后推广 `origin/stable`。
 
 ## Public Release Timeline
 
@@ -361,7 +857,7 @@ path, and canary route rather than as a user-facing release baseline.
   Lark delivery are also hardened without making them first-run requirements
   ([#2200](https://github.com/huangruiteng/loopx/pull/2200)). No persisted-state
   migration is required; advanced capabilities remain explicitly activated.
-- `v0.2.7` on 2026-07-17: control-plane convergence and exact-release-evidence
+- `v0.2.7` on 2026-07-18: control-plane convergence and exact-release-evidence
   release at the matching `v0.2.7` tag. Scheduler, quota, and todo decisions
   share one agent/runtime/capability/ACK scope; monitors converge independently
   without resetting one another; blocking user gates use one typed response
@@ -385,7 +881,7 @@ path, and canary route rather than as a user-facing release baseline.
   `v0.2.11` tag. `loopx periodic-report inspect-profile --preset weekly`
   exposes the built-in provider-neutral preset; it creates no schedule, invokes
   no external sink, and grants no external-write authority.
-- `v0.2.12` on 2026-07-23: heartbeat receipt and review-quality release at the
+- `v0.2.12` on 2026-07-24: heartbeat receipt and review-quality release at the
   matching `v0.2.12` tag. One quota receipt is persisted per heartbeat turn,
   monitor/replan routing stays fresh, `loopx pr-review` gains a code-volume and
   simplification lens, and adaptive multi-turn live-worker lifecycle phases
@@ -401,7 +897,7 @@ path, and canary route rather than as a user-facing release baseline.
   provider-neutral decision context, governed material lifecycle workflows,
   managed-project delivery, and Ark Managed Agent host support while ordering
   quota rules and making recoverable Turn stages explicit.
-- `v0.4.0` on 2026-08-01: onboarding and turn-authority release at the matching
+- `v0.4.0` on 2026-08-02: onboarding and turn-authority release at the matching
   `v0.4.0` tag. Goal startup projects capability-owned admission routes,
   replan acknowledgements require canonical agent-visible evidence, the default
   `quota should-run` JSON stays inside a bounded model-facing budget, and the
@@ -411,12 +907,12 @@ path, and canary route rather than as a user-facing release baseline.
   across turns, Goal hosts wake on the earliest material frontier transition,
   grouped Issue Fix PR monitors materialize explicitly, and default-off Agent
   Turn Recall ships with agent/goal/project/Todo/authority scoping.
-- `v0.4.2` on 2026-08-06: host and workflow surface release at the matching
+- `v0.4.2` on 2026-08-07: host and workflow surface release at the matching
   `v0.4.2` tag. Pi and TraeX become first-class host paths, adaptive child
   admission enforces domain/capability/repository/write-scope readiness,
   provider-neutral PR queue observation and PR program workflows ship, and
   Issue Fix pins work to an approved base snapshot.
-- `v0.4.3` on 2026-08-08: effect-interpreter evolution release at the matching
+- `v0.4.3` on 2026-08-09: effect-interpreter evolution release at the matching
   `v0.4.3` tag. A second real `EffectTurn` interpreter consumes turn results,
   data-encoded execution and an ordered effect program shape land, the runtime
   plan is replacement-first, and a unified bilingual Dev Book adds an
@@ -425,7 +921,7 @@ path, and canary route rather than as a user-facing release baseline.
   matching `v0.4.4` tag. Hot control-plane modules are bounded,
   `EffectTurn`/`EffectProgram` are consumed by real runtime paths, and the M6
   RFC is marked Complete with audit evidence.
-- `v0.4.5` on 2026-08-12: security-hardening and control-plane release at the
+- `v0.4.5` on 2026-08-13: security-hardening and control-plane release at the
   matching `v0.4.5` tag. LoopX fixes five privately reported security
   advisories, adds caller-approved completion validation, ships a
   durable-smoke review gate, and continues replan/evidence/settlement
@@ -466,6 +962,313 @@ path, and canary route rather than as a user-facing release baseline.
   generation-fenced, adds a native DeepSeek Harness Goal workspace and
   Agent-scoped external Connector providers, and hardens long Todo chains,
   prepared-effect recovery, benchmark admission, and public-smoke release gates.
+- `v0.5.3` on 2026-08-27: host reach and autonomous-continuation reliability
+  release at the matching `v0.5.3` tag. LoopX adds ZCode and Antigravity CLI
+  Goal surfaces, a bounded citation-led deep-research workflow, and an explicit
+  Pi task-lease facade; it also strengthens Lark inbox routing and catch-up,
+  typed Todo/quota/scheduler settlement, repository delivery admission, and
+  runtime startup recovery.
+- `v0.5.4` on 2026-09-03: typed control-plane and governed-workflow release at
+  the matching `v0.5.4` tag. LoopX moves more Todo, task-lease, quota,
+  scheduler, Vision, and replan transactions behind TypeScript owners;
+  advances staged file, PostgreSQL, and NoKV shared-authority providers;
+  completes the periodic-report lifecycle; makes the DSH plugin one-step ready; and adds
+  public-safe benchmark study projection without granting upload authority.
+- `v1.0.0` on 2026-09-06 20:44 +08:00: the Workspace milestone release at the
+  matching `v1.0.0` tag (merge `d6e8387e`). The desktop companion gains signed
+  in-app updates with a paired runtime and a recovery path for interrupted
+  installs (#3994); Todo claim and update authority finishes its
+  claim-neutral correction through the TypeScript transaction (#4005, with
+  promoted claim retry identity from #3987); multi-agent Goal Channels ship
+  with per-agent connection resolution (#3969); and reward-memory recall
+  guides outbound messages behind a digest-bound review loop (#3968).
+- `v1.0.1` on 2026-09-08 06:51 +08:00: post-1.0 reliability release at the
+  matching `v1.0.1` tag (`7f2a020b`). Goal Channels gain resumable multi-Agent
+  onboarding and Agent-authorized typed report requests; Desktop recovery gains
+  bounded diagnostics and verified signed updates; Todo ownership, projection
+  recovery, and Stage 2C management use stronger typed transaction boundaries;
+  and frozen bundles install the same version-bound workflow skills as package
+  distributions. The exact-tag Python, PyPI, macOS, Windows, signed-update,
+  public-smoke, and live-model gates passed before `stable` fast-forwarded.
+- `v1.0.2` on 2026-09-09 11:22 +08:00: single-owner Todo authority and
+  recovery release at the matching `v1.0.2` tag (`a5374d5b`). Promoted Todo
+  terminal transitions commit through one TypeScript-owned provider
+  transaction; missing generated Todo projections recover without making
+  Markdown authoritative; and long-history, Desktop, DSH, and managed-skill
+  paths gain bounded reads and clearer recovery diagnostics. The published
+  wheel, source distribution, macOS, Windows, checksum, update, and PyPI
+  artifacts were verified against the exact release source before promotion.
+- `v1.0.3` on 2026-09-11 11:53 +08:00: native monitor observation and consumer
+  closure release at the matching `v1.0.3` tag (`0496975e`). Native monitor
+  observations and their successors commit atomically through one typed
+  transaction, and completed history stays out of target-key selection (#4187);
+  quota unifies typed scope selection without erasing user gates, and the
+  scheduler hint accepts canonical Base64 transport; archived history preserves
+  decision and resume semantics (#4184); the manager keeps concrete Core
+  findings in progress reports behind scoped evidence reads (#4213, #4218);
+  Goal Channels extract runtime command ownership (#4154) and deliver manager
+  terminal failure receipts (#4217); and iteration-fresh host dispatch plus
+  typed upstream terminal errors land through #4126 and #4215. The published
+  wheel, source distribution, macOS, Windows, checksum, update, and PyPI
+  artifacts were verified against the exact release source before promotion.
+- `v1.0.4` on 2026-09-15 14:19 +08:00: bounded local authority storage,
+  human-confirmed operations, and a wider typed kernel release at the matching
+  `v1.0.4` tag (`b6d877b0c`). The opt-in SQLite authority provider keeps its
+  retained state log bounded with compact operation deltas plus periodic
+  checkpoints, separates storage, head, and continuity integrity, and migrates
+  V1 -> V2 as one idempotent, fail-closed transaction with a plan/execute
+  operator command (#4408, #4328, #4121); PostgreSQL authority admission
+  becomes a service-owned boundary whose authority ladder runs against a real
+  server in CI (#4334, #4399). Goal Channel operations ship as human-confirmed
+  typed actions whose review decision travels with the operation instead of
+  being re-derived per surface (#4275, #4364, #4132), and Todo, quota, lease,
+  monitor, and decision-scope rules converge on shared typed owners (#4273,
+  #4289, #4292, #4348, #4351). The published wheel, source distribution,
+  macOS, Windows, checksum, signed-update, and PyPI artifacts were verified
+  against the exact release source before `stable` fast-forwarded.
+- `v1.0.5` on 2026-09-16 03:14 +08:00: first-connect registration and explicit
+  host selection hot-fix release at the matching `v1.0.5` tag (`0c3971fea`).
+  `connect`/`bootstrap` register the goal and write the active state only, so a
+  freshly connected goal is immediately eligible instead of parking on a
+  generated owner gate, and the eight first-connect bootstrap options plus the
+  `onboarding_*` payload fields and the `adapter.connection_validation`
+  annotation are removed (#4465). Managed execution is selected rather than
+  inferred: the managed Turn host (#4443, #4451) and the steward channel
+  endpoint (#4446, #4419) come from explicit configuration, PR-review CI
+  waiting is configurable per machine or goal (#4452) under a documented review
+  frame (#4434), and update activation is qualified from an immutable source
+  commit (#4460) while the serving runtime publishes its identity with a
+  restart path (#4423). Quota window-slot spend clamps against the voids that
+  target it (#4384), the held coordination fence survives an authority-source
+  change (#4429), and a goal frontier missing its final-outcome claims is
+  diagnosed (#4341). Community contributions cover text-mode subprocess
+  decoding (#4396), stale executor revisions rejected before persisting
+  (#4398), CLI dash options (#4428), manager delegation reconciliation (#4372),
+  window-slot clamping (#4384), the semantic vocabulary registry and its
+  governance (#4433, #4453), and the Codex App autonomous goal guide (#4442).
+  The published wheel, source distribution, checksum, and PyPI artifacts were
+  verified against the exact release source before `stable` fast-forwarded.
+- `v1.1.0` on 2026-09-20 01:04 +08:00: organization migration and governed
+  collaboration release at the matching `v1.1.0` tag (`607c11d75`). LoopX
+  moved its repository, Pages, installer, and update surfaces to
+  `loopx-project`; team plans gained an explicit confirmation-to-canonical-work
+  path, local delegation gained durable operation recovery and checked returns,
+  and Goal acceptance plus replan obligations retained their existing authority
+  owners. The published package, desktop artifacts, signed update feed, and
+  website were verified before `stable` fast-forwarded.
+
+- `v1.2.0` on 2026-09-25 10:19 +08:00: recoverable authority, typed Todo
+  transitions, and inspectable host activation at commit `eb11130e1`.
+  The release separates package acquisition, delivered host material, runtime
+  activation, and enabled-extension readiness.
+
+- `v1.2.1` on 2026-09-27 16:22 +08:00: recoverable work, clearer Chat usage,
+  and lifecycle compatibility at commit `fce1a4bac`.
+  The published package, desktop artifacts, signed update feed, and website
+  were verified against the release source before `stable` fast-forwarded.
+
+- `v1.2.2` on 2026-09-28 07:17 +08:00: recoverable App conversations,
+  delegation continuity and local authority replay at commit
+  `ee9dad81b`. Settings identify device, Goal and Agent
+  targets; usage statistics preserve visible disclosure and persistent opt-out.
+  The published package, four Mac/Windows desktop artifacts, signed update
+  feed, PyPI installation and public Pages were verified against the tagged
+  source before `stable` fast-forwarded. The first full-public attempt hit a
+  disposable native-profile cleanup race; the complete same-source rerun passed
+  under unchanged budgets. Its remaining fixture-quiescence limit is retained
+  on the [existing profile lifecycle owner](https://github.com/loopx-project/loopx/pull/5226#issuecomment-5860681814).
+
+- `v1.2.3` on 2026-09-29 22:54 +08:00: App Goal drafts with explicit Apply,
+  exact Goal ownership for Chat and delegation, opt-in Kiro CLI mode, and typed
+  Explore observations at commit `0a401fe75`. The [published release](https://github.com/loopx-project/loopx/releases/tag/v1.2.3)
+  has 11 assets; package and desktop installer checksums, matching PyPI package
+  hashes, and the signed `desktop-stable` update feed were read back after all
+  three release workflows passed. `stable` was fast-forwarded to the tag.
+  This expedited release used focused local version, packaging, and two native
+  canary checks; the full Python/public smoke/model-behavior/PostgreSQL matrix
+  and a separate Pages check were not run.
+
+- `v1.2.4` on 2026-10-03 20:38 +08:00: scoped Chat coordination, recoverable
+  state migration, explicit local preferences, and handoff ownership at commit
+  `fc42b84cedb21a56c15ca3b4af5eab0407829cf8`. See the
+  [published release](https://github.com/loopx-project/loopx/releases/tag/v1.2.4)
+  for its shipped capability usage and qualification limits.
+
+- `v1.3.0` on 2026-10-06 09:41 +08:00: long-horizon benchmark findings and
+  Astra-assisted semantic control-plane engineering, with continuing-work
+  ownership, evidence-driven replanning and recoverable workspace interaction
+  at commit `e1dd9e519c3057fda4b3765d0c93e7ae793608bf`. The
+  [published release](https://github.com/loopx-project/loopx/releases/tag/v1.3.0)
+  contains bilingual operating instructions and annotated community credits;
+  the [personal illustrated guide](https://my.feishu.cn/docx/Rlg0d9pvAo6zXExWTvWcv0ben0f)
+  was read back with the released UI. Eight source-qualification lanes passed,
+  including the full Python/public smoke suites, installed wheel upgrade and
+  isolated real-model validation. Package checksums, PyPI hashes, hosted
+  attestations, desktop assets, signed update feed and the fast-forwarded
+  `stable` installation were independently verified. The attested source
+  record distinguishes immutable product source from reviewed workflow and
+  browser-fixture corrections. Native desktop builds passed; the maintainer
+  published verified CI outputs after cancelling queued publication jobs.
+  Windows execution, Apple Developer ID/notarization, live Lark/Bot channels
+  and unavailable Harbor/SForge/PostgreSQL/NoKV environments remain unqualified.
+
+- `v1.3.1` on 2026-10-06 16:10 +08:00: a focused compatibility release at
+  commit `7445ae360aaf330e0067959a5e0084ffd9f76de4`, adapting the renderer to
+  the `linkify-it` 6 named export while preserving user-info URL handling.
+  The [published release](https://github.com/loopx-project/loopx/releases/tag/v1.3.1)
+  records the shipped operating instructions and validation limits. Package,
+  PyPI, desktop assets, signed update feed, `stable` installation and the
+  personal illustrated guide were independently read back. Focused checks
+  passed; full Python/public smoke and paid model matrices were not rerun.
+
+- `v1.4.0` on 2026-10-11 22:47 +08:00: evidence reuse, native workspace
+  continuity and semantic control-plane quality at frozen commit
+  `1b452b00a114bd9f0d9c24868c9f45df42661748`. New unconfigured Goals use
+  canonical SQLite/hard leases; existing Goals retain their recorded storage
+  and use reviewed migration or cold-source import. The
+  [published release](https://github.com/loopx-project/loopx/releases/tag/v1.4.0)
+  includes fifteen bilingual capability operating entries and annotated
+  community credits. Public GitHub/PyPI packages, four desktop installers,
+  the signed macOS update feed, `desktop-stable` and source `stable` were
+  independently read back. Package hashes and hosted source attestations
+  match the frozen tag; actual PyPI 1.3.1-to-1.4.0 upgrade, installed Chat,
+  installation/deep doctor and stable runtime activation passed. The
+  [personal illustrated guide](https://my.feishu.cn/docx/E9sTdmBuSoX9wqxkKGPcuAPRnTc)
+  has verified user ownership, actual released UI screenshots and native
+  rendering. At the frozen source, 515 public smokes and 360 affected Python
+  checks passed; the authorized DS Flash/high alternative passed all 22
+  scenarios twice and six contrasts, with zero failures or skips. Earlier
+  Doubao qualification failures remain unqualified. Windows execution, Apple notarization,
+  authenticated Host interaction, external backend execution and sustained
+  SQLite qualification remain unqualified. No paired-version benchmark uplift
+  or isolated Astra causal effect is claimed.
+
+- `v1.4.1` on 2026-10-15: workspace visibility, semantic replan and recovery
+  hardening at frozen commit `4f27801c4e26fd51246d352eada72c98f8e7e657`.
+  The [published release](https://github.com/loopx-project/loopx/releases/tag/v1.4.1)
+  records nineteen bilingual operating entries and concrete community credits.
+  GitHub/PyPI packages, four desktop installers, the signed macOS update feed,
+  `desktop-stable`, source `stable`, the website download path and the personal
+  illustrated guide were independently read back. An actual PyPI
+  1.4.0-to-1.4.1 upgrade preserved existing work; package hashes and source bytes
+  matched the immutable product tag. Reviewed publication-fixture recovery did
+  not move that tag. At the final source, 515 public smokes and 2,213 affected
+  Python checks passed, with five explicit native-environment skips; this was
+  not a fresh full-tree Python sweep. Doubao Evolving/high completed the fixed
+  22-scenario, two-repeat portfolio and six contrasts with zero failures or
+  skips. Mac artifacts retain ad-hoc signing without Apple notarization;
+  Windows artifacts were verified without native client execution. No paired
+  benchmark, sustained scientific continuation or isolated model causal uplift
+  is claimed.
+  Existing Goals retain their recorded policy and require explicit migration;
+  canonical-only retirement remains a separate 2.0 candidate.
+
+- `v1.4.2` on 2026-10-16: clearer workspace onboarding and Agent work pages,
+  state-aware suggestions, version-bound delivery checks, and original-operation
+  recovery. New Todos default to P1; existing unranked work remains unchanged.
+  The immutable tag targets `77d6b07fb65c7ddffe14f45549f97295aca995d6`.
+  The [published release](https://github.com/loopx-project/loopx/releases/tag/v1.4.2)
+  records twenty-one bilingual operating entries and annotated community credits.
+  GitHub/PyPI packages, four Mac/Windows desktop installers, signed macOS updates,
+  `desktop-stable`, source `stable`, and website download links were independently
+  read back. Package checksums, hosted attestations, and included source bytes
+  match the tag. An actual PyPI 1.4.1-to-1.4.2 upgrade preserved the original
+  Goal/Todo; fresh installation, doctor, and packaged UI checks passed. The
+  [personal illustrated guide](https://my.feishu.cn/docx/HsYgdSqSHo4u6gxJR03cNmVEnrb)
+  has verified user ownership, two released UI screenshots, reviewed native
+  rendering, and public-link read-only access. At the final source, 515 public
+  smokes and 1,655 affected checks across 37 complete modules passed; this was
+  not a fresh full-tree Python sweep. Dependency-pinned benchmark tests recorded
+  781 passes and 68 explicit environment qualification skips. The authorized
+  DS V4.1 Flash/high alternative passed all 22 scenarios twice and six contrasts,
+  with zero failures or skips. The final-source Evolving/high selected-Todo
+  failure remains unqualified; diagnostic passes do not establish a repair.
+  The separate native-Codex live profile was unavailable and explicitly skipped.
+  Mac artifacts remain ad-hoc signed without Apple notarization; Windows client
+  execution and optional host dependency security remain separately unqualified.
+  No paired benchmark, sustained scientific continuation, or isolated model
+  causal improvement is claimed.
+
+- `v2.0.0` on 2026-10-21 00:40 +08:00: TypeScript control-plane migration,
+  the long-horizon research workbench, and explicit recovery for existing Goals.
+  The [published release](https://github.com/loopx-project/loopx/releases/tag/v2.0.0)
+  and source `stable` reference immutable commit
+  `774d0c5f768284c1b5bb5f665c5abad25755e5e2`.
+  GitHub provides the Python wheel/source distribution, Mac and Windows desktop
+  installers, signed macOS update feed, checksum manifests and source manifest.
+  Read the [2.0 migration guide](releases/v2.0.0.md) before continuing existing
+  work. Asset availability is separate from native Windows execution or a new
+  full-tree qualification of later source changes.
+
+- `v2.1.0` preview at commit `a65c71f789459c12b68d6feeec233fbb99f65c91`:
+  the [original release](https://github.com/loopx-project/loopx/releases/tag/v2.1.0)
+  remains a prerelease. Python publication stopped at the packaged-page checks;
+  its desktop artifacts and earlier source-only checks do not establish complete
+  package readiness. During that hold, the stable source and signed desktop
+  feed were retained or restored to the qualified `v2.0.0` baseline. The immutable
+  preview and failed evidence remain part of the release history.
+
+- `v2.1.1` maintenance release at commit
+  `87e5b4f88d207adf062eea57002cda6fe04fd535`:
+  the [published release](https://github.com/loopx-project/loopx/releases/tag/v2.1.1)
+  provides matching Python wheel/source distributions on GitHub and PyPI,
+  Mac/Windows desktop build assets, checksum manifests, source provenance and
+  a signed macOS updater. All eight exact-source qualification categories,
+  including the complete installed-wheel frontend, passed before publication.
+  Published packages, build attestations, macOS bundle identity and updater
+  signatures were independently checked before the Git stable and Latest
+  promotion; the mutable signed desktop feed matches the immutable release.
+  The desktop remains a preview: native Windows execution and Apple
+  notarization are not claimed. This maintenance line starts from the retained
+  `v2.1.0` preview, keeps its failed evidence and does not roll up later `main`
+  snapshots. Read the [versioned upgrade guide](https://github.com/loopx-project/loopx/blob/v2.1.1/docs/product/releases/v2.1.1.md)
+  before replacing an existing installation.
+
+- `v2.2.0` release at commit
+  `2c3524857e8a3dd553335b79444333786f492c43`:
+  the [published release](https://github.com/loopx-project/loopx/releases/tag/v2.2.0)
+  (2026-11-01) and the public `stable` ref point at the same commit. The
+  [versioned release note](https://github.com/loopx-project/loopx/blob/v2.2.0/docs/product/releases/v2.2.0.md)
+  records the canonical-authority upgrade boundary, the context-delivery
+  default and the readback path. Read it before replacing an existing
+  installation; artifact and native-host claims remain those stated by that
+  release note.
+
+- `v2.3.0` release at commit
+  `92271fe114916428be6fd36558bb7a93fbe49da8` (2026-11-09).
+  The Git `stable` ref, CLI archive and bundled macOS runtime matched the tag.
+  GitHub and PyPI carry matching Python wheel and source packages.
+  The signed desktop stable feed for this release serves Apple Silicon macOS.
+  Windows stable upgrades use the MSI or NSIS installer.
+  [Published release](https://github.com/loopx-project/loopx/releases/tag/v2.3.0),
+  [PyPI packages](https://pypi.org/project/loopx/2.3.0/#files).
+  Check the installation owner and read back an existing Goal after updating.
+  [Versioned upgrade guide](https://github.com/loopx-project/loopx/blob/v2.3.0/docs/product/releases/v2.3.0.md#upgrade).
+
+- `v2.4.0` release at commit
+  `a6ffb3be6e7bdb48e02311ec58d618200fe0501c` (2026-11-22).
+  The Git `stable` ref, CLI archive
+  (`loopx-runtime-a6ffb3be6e7bdb48e02311ec58d618200fe0501c.tar.gz`), and bundled
+  macOS runtime match the tag with verified GitHub artifact attestations.
+  GitHub and PyPI carry matching Python wheel and source packages.
+  The signed `desktop-stable` updater serves Apple Silicon macOS
+  (`LoopX_2.4.0_aarch64.dmg`, `LoopX.app.zip`, and `LoopX.app.tar.gz`).
+  Windows stable upgrades use `LoopX_2.4.0_x64-setup.exe` or
+  `LoopX_2.4.0_x64_en-US.msi`.
+  The companion
+  [DSH plugin 0.1.1-beta.7](https://github.com/loopx-project/loopx/releases/tag/dsh-loopx-plugin-v0.1.1-beta.7)
+  is published on both GitHub Releases (targeting LoopX 2.4.0+ and DSH
+  `0.2.2-rc.1..rc.3`),
+  [npm (`dsh-loopx-plugin`)](https://www.npmjs.com/package/dsh-loopx-plugin), and
+  the `awesome-dsh-plugin` marketplace catalog
+  (`awesome-dsh-plugin#17660`); token-free CI OIDC awaits final Trusted
+  Publisher confirmation on npmjs.
+  [Published release](https://github.com/loopx-project/loopx/releases/tag/v2.4.0),
+  [PyPI packages](https://pypi.org/project/loopx/2.4.0/#files),
+  [Personal illustrated guide](https://my.feishu.cn/docx/JXvbdWcFDoZJgvxktvScYfJwnRf).
+  Run `loopx authority-archive upgrade --all-known --require-current` first,
+  check the installation owner, and read back an existing Goal after updating.
+  [Versioned upgrade guide](https://github.com/loopx-project/loopx/blob/v2.4.0/docs/product/releases/v2.4.0.md#upgrade).
 
 When a new public release is promoted, add it here only after the matching tag,
 release note, stable ref, update path, and focused release canary agree.
@@ -496,10 +1299,24 @@ After the individual lanes pass, bind their compact receipts to the exact clean
 release checkout before tagging or moving `stable`:
 
 ```bash
+python3 scripts/qualify_release_commit.py \
+  --repo-root . \
+  --output-dir .local/release-qualification \
+  --preflight-since v2.3.0 \
+  --resume
 loopx canary release-qualification \
   --manifest-json release-qualification.json \
   --repo-root .
 ```
+
+For clean full-suite release runs, `scripts/qualify_release_commit.py` runs an
+optional changed-file preflight first (`--preflight-since`), then executes
+hardware-sized single-wave isolated pytest shards (defaulting to
+two-thirds of host CPUs capped at 12, with optional `--durations-path`,
+`--durations-out`, and fail-closed exact-commit/tree `--resume`) and reduces
+the shards into `receipt-pytest.json` with no local paths. Keep
+`scripts/qualify-doubao-model-behavior-live.py` or `scripts/qualify-deepseek-model-behavior-live.py` (`--max-workers 6` by default)
+concurrent with network/CPU lanes without mutating the clean candidate tree.
 
 The `exact_release_commit_qualification_manifest_v0` contract requires the
 same Git commit, Git tree id, package version, and version tag across pytest,
@@ -601,19 +1418,21 @@ python3 -m pytest tests/test_smoke_suite.py \
   --junitxml smoke-suite.xml
 ```
 
-The required Python test workflow keeps `tests/**`, `canary/**`,
-`control_plane/**`, `domain_packs/**`, and `presentation/**` Ruff-clean. It also
-enforces an initial 19.6% package coverage floor.
-The floor is intentionally a regression guard, not a claim that 19.6% is
-sufficient; raise it as durable behavior moves from subprocess smokes into
-focused tests. An architecture test also prevents new control-plane dependencies
-on presentation, CLI, capability, or benchmark-adapter layers while preserving
-one explicit quota-Markdown migration debt edge. Existing source-wide lint debt
-is characterized separately. Strict mypy checking covers twelve characterized
-kernel and runtime contracts and should expand only as each next boundary
-becomes clean;
-expand the protected namespace list only after a bounded cleanup, rather than
-mass-fixing unrelated code merely to make a broad gate green.
+The required [Python test workflow](../../.github/workflows/python-tests.yml)
+owns the Ruff namespace selection and package coverage floor. The floor is a
+regression guard, not a claim of sufficient coverage; raise it as durable
+behavior moves from subprocess smokes into focused tests.
+
+[Architecture tests](../../tests/architecture/test_control_plane_import_boundaries.py)
+reject outward control-plane dependencies and forbidden status dependencies
+without migration exceptions, and protect presentation ownership of quota
+Markdown. See the [dependency policy](../architecture.md#current-dependency-budget)
+for the boundary rationale. Existing source-wide lint debt is characterized
+separately. Strict mypy scope is the `[tool.mypy].files` list in
+[`pyproject.toml`](../../pyproject.toml); use `python -m mypy` to check that exact
+scope. Expand each protected namespace only after a bounded cleanup rather
+than duplicating changing file counts or mass-fixing unrelated code to make a
+broad gate green.
 
 If the source checkout has optional frontend dependencies installed, dashboard
 readiness can be included in the same canary. If a release snapshot omits the
@@ -627,6 +1446,8 @@ Treat these v0.x surfaces as stable enough for user guides, examples, and
 host integrations when their focused smokes pass:
 
 - `loopx doctor`, `loopx update`, `loopx check`, and the no-clone installer;
+- `loopx extension doctor` for enabled-extension readiness after install or
+  update apply;
 - project lifecycle commands: `bootstrap`, `connect`, `status`,
   `refresh-state`, `registry`, and `sync-global`;
 - todo lifecycle commands: `todo add`, `todo claim`, `todo update`,
@@ -637,7 +1458,7 @@ host integrations when their focused smokes pass:
 - public slash command names: `/loopx`, `/loopx <goal>`,
   `/loopx-global-summary`, `/loopx-global-gates`, `/loopx-global-todos`, and
   `/loopx-global-risks`;
-- ignored local state boundaries under `~/.codex/loopx`, project-local registry
+- ignored local state boundaries under `~/.loopx`, project-local registry
   files, and project-local active-state workbench files recognized by
   `loopx doctor`, `loopx status`, and `loopx check`.
 
@@ -690,6 +1511,14 @@ not commit display names or an unreviewed generated changelog. Attribution is
 part of the release contract even when the same pull request is linked again
 under a product group.
 
+Match the complete Git range against GitHub's actual merge commit identifiers;
+PR numbers in commit titles are navigation, not a completeness check. Confirm
+that metadata coverage reaches the whole range, resolving unmatched integration
+commits through their associated merged PRs. Check an author's earlier merged
+PR history before calling a contribution first-time. Reconcile both language
+lists and their summary counts against that verified set. Refresh this evidence when the final
+release range changes.
+
 Organize the remaining release note into the following stable groups. Omit an
 empty product group instead of inventing filler:
 
@@ -718,7 +1547,7 @@ non-empty English group, or weaken contributor attribution.
 Within each non-empty group, every material claim must carry one or more direct
 GitHub pull-request links such as
 `[#2051](https://github.com/huangruiteng/loopx/pull/2051)`. A compare link is
-still useful at the end, but it does not replace per-claim PR attribution.
+still useful at the end.
 Avoid bare PR ranges as the only evidence because ranges can hide omitted or
 unrelated changes.
 
@@ -752,6 +1581,56 @@ also record:
   mirrors the English group structure and material claims in neutral product
   language. Keep each group shorter than its English counterpart while
   preserving direct PR attribution and compatibility boundaries.
+
+### Personal Feishu Release Guide
+
+Each named public release needs a companion illustrated Feishu document in the
+maintainer's personal user account. This is part of completing the release,
+alongside the GitHub release body; a changelog link alone is insufficient.
+Use the existing release-communication and document-authoring workflows when
+available, with the following durable procedure:
+
+1. Verify the personal account through an authoritative account mapping or
+   email, and explicitly use user identity for every document operation. A
+   matching display name or a profile named "personal" is insufficient. Never
+   fall back to a corporate account or bot; if personal access is unavailable,
+   keep the draft and report the access gap.
+2. Find the last substantive release guide in that personal account with a
+   bounded search. Read it and record its URL, date and covered version in the
+   private release checkpoint. Use that covered version as the guide's baseline;
+   do not substitute the previous GitHub tag. Read all intervening release notes
+   and derive cumulative claims from their merged PRs and the verified target
+   snapshot. If history cannot be verified, label an owner-supplied baseline
+   explicitly rather than claiming a complete audit. The GitHub release body
+   retains its own previous-tag-to-release-tag range.
+   Organize the guide around ordinary user tasks: who should
+   upgrade, what they can now do, where to find it, and how to verify the result.
+   Distinguish released behavior, experimental capabilities, simulated examples,
+   and failed or unavailable validation. A candidate draft must remain labeled
+   as such until the release and its artifacts are verified.
+3. Include legible screenshots of the actual released interface with public-safe
+   data. Label isolated demo data and any annotations; retain capture provenance
+   privately. Place concise explanations beside the relevant images and inspect
+   mobile readability. Do not fabricate UI, expose private workspaces, or use
+   an older screenshot as evidence of changed behavior.
+4. Teach the minimum upgrade and readback commands, compatibility or migration
+   behavior, and each highlighted optional capability's activation, validation,
+   disable or rollback path, and authority/privacy boundary. Link canonical
+   documentation at the release tag and the complete GitHub release body.
+   Preserve concrete community contribution credit from the guide's cumulative
+   range, deduplicated across the intervening releases; verify contribution
+   descriptions and first-time labels against merged PR metadata. Screenshot
+   captions must distinguish intervening released features from candidate-only
+   changes and retain their actual capture version.
+5. Create one document under the verified personal user identity, then repair
+   that document in place if content or media fails. Read back its ownership,
+   title, text, image blocks, and rendered presentation before declaring success.
+   Add the verified guide URL to the final GitHub release body in both languages,
+   and repeat the existing remote-body validation after that update.
+
+Record the guide URL and verified ownership/readback in the existing private
+release checkpoint. Credentials, account identifiers, private reference URLs,
+drafts, and raw evidence do not belong in public repository changes.
 
 ### Final Release Body Usage Gate
 
@@ -824,8 +1703,54 @@ after rebasing or merging any additional runtime change; results from an
 earlier commit do not qualify a later tag. Public git history, merged PR
 metadata, and shipped CLI behavior remain the source of truth.
 
+## Versioned Evaluation Gate (a+b Dual-Scale)
+
+Every minor or major release is measured on LoopX's four-state Global Commander
+Evaluation Ledger under
+[releases/evaluations/INDEX.md](releases/evaluations/INDEX.md)
+(`loopx/control_plane/testing/release_evaluation_gate.py`):
+
+- **`horizon.{json,md}`**: freezes the constant 8-domain (`D1..D8`, weights
+  `16/16/15/14/12/10/10/7%`) / 41-battleline rubric (`30` `2.x_core` + `11`
+  `3.x/4.x_horizon`), `4×25` dimension anti-bloat caps (`C <= 15` without
+  `paired_public_evidence`, `D <= 12` when `default_off`), `open_protocol_core`
+  public-repo criteria, and Major `(a)` exit gates.
+- **`history/`**: maintains an unbroken, version-ordered record across every
+  released `a.b` series (`v0.1.3` onward). Releases prior to `v2.3.0` carry
+  `evaluation_mode: retrospective_git_audit`; releases from `v2.3.0` onward
+  require `evaluation_mode: release_gate_qualified`. Old releases stay in
+  `history/` (tagged `eol` or `superseded`) and are never isolated into
+  `archive/`.
+- **`current.{json,md}`**: tracks the active stable release baseline alongside
+  post-release `origin/main` movement and explicit `v2.x -> v3.0` ceiling
+  blockers.
+- **`archive/`**: holds physically retired components and frozen rubric
+  snapshots ([archive/README.md](releases/evaluations/archive/README.md)).
+
+When running `loopx canary release-qualification` with `--evaluations-dir
+docs/product/releases/evaluations --prior-stable-version <prior>` (plus optional
+`--evaluation-json` and `--verify-git-tags`), SemVer transitions follow a
+two-tier deterministic policy:
+
+1. **Major `(a)` promotion (`a' > a`)**: requires a `release_gate_qualified`
+   `full_41_battlelines` artifact matching candidate `git_commit` / `git_tree`,
+   all arithmetic closures and `C/D` caps, plus `major_promotion_gate` marking
+   every `horizon.json` exit gate for the prior major as `met: true` with real
+   `evidence_ref`s and `breaking_migration_contract.verified: true`.
+2. **Minor `(b)` feature release (`a' == a`, `b' > b`)**: requires an exact
+   `release_gate_qualified` evaluation matching candidate source and `v{version}`
+   metadata, closed `a`-Scale (`41` lines, `delta_from_prior` vs prior stable)
+   and `b`-Scale (`generation_major == a`), enforced `C <= 15` / `D <= 12` caps,
+   and non-contradictory `7.2` benchmark uplift claims
+   (`claims_net_benchmark_uplift`).
+3. **Patch `(c)` maintenance release (`a' == a`, `b' == b`, `c' > c`)**:
+   inherits and re-validates the parent `a.b.0` evaluation (`v0.1.3` for `0.1.x`)
+   cleanly so ordinary hotfixes and patch PRs carry zero evaluation tax.
+
 ## Related Docs
 
+- [Release evaluations ledger](releases/evaluations/INDEX.md)
+- [Global Commander horizon & 41 battlelines](releases/evaluations/horizon.md)
 - [Codex CLI packaged install path](runtimes/codex-cli/codex-cli-packaged-install.md)
 - [Codex CLI no-clone release verification](runtimes/codex-cli/codex-cli-no-clone-release-verification.md)
 - [Getting started](../guides/getting-started.md)

@@ -77,7 +77,7 @@ ACTIVE_USER_PUBLIC_TEXT_FORBIDDEN_MARKERS = (
     "tok" + "en=",
     "pass" + "word=",
 )
-ACTIVE_USER_SECRET_KEY_SHAPED_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8,}")
+ACTIVE_USER_SECRET_KEY_SHAPED_RE = re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 
 
 def build_worker_bridge_mounts(
@@ -170,7 +170,12 @@ def _coerce_public_safe_worker_text(
     text = str(value or "").strip()
     if not text:
         raise ValueError(f"{field} is required")
-    leaked = [marker for marker in ACTIVE_USER_PUBLIC_TEXT_FORBIDDEN_MARKERS if marker in text]
+    text_lower = text.lower()
+    leaked = [
+        marker
+        for marker in ACTIVE_USER_PUBLIC_TEXT_FORBIDDEN_MARKERS
+        if marker.lower() in text_lower
+    ]
     if ACTIVE_USER_SECRET_KEY_SHAPED_RE.search(text):
         leaked.append("sk-token-shaped")
     if leaked:
@@ -707,63 +712,6 @@ def append_worker_bridge_counter_trace_row(
     except OSError:
         return False
     return True
-
-
-def load_worker_bridge_counter_trace_file(path: str | Path | None) -> list[dict[str, Any]]:
-    """Load compact worker-side counter trace rows, ignoring malformed rows."""
-
-    if not path:
-        return []
-    trace_path = Path(path)
-    if not trace_path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    try:
-        for line in trace_path.read_text(encoding="utf-8").splitlines():
-            text = line.strip()
-            if not text:
-                continue
-            try:
-                row = json.loads(text)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, dict):
-                rows.append(row)
-    except OSError:
-        return []
-    return rows
-
-
-def build_worker_bridge_interaction_counters_from_trace(
-    trace_rows: list[dict[str, Any]] | None,
-) -> dict[str, Any]:
-    """Build generic compact interaction counters from worker bridge trace rows."""
-
-    loopx_cli_calls: dict[str, int] = {}
-    total = 0
-    for row in trace_rows or []:
-        if not isinstance(row, dict):
-            continue
-        kind = _compact_counter_trace_label(
-            row.get("kind") or row.get("type") or row.get("event")
-        )
-        command = _compact_counter_trace_label(row.get("command") or row.get("call"))
-        if kind and kind != "loopx_cli_call":
-            continue
-        if not command:
-            continue
-        total += 1
-        loopx_cli_calls[command] = loopx_cli_calls.get(command, 0) + 1
-    loopx_cli_calls["total"] = total
-    return {
-        "schema_version": "loopx_worker_bridge_interaction_counters_v0",
-        "loopx_cli_calls": loopx_cli_calls,
-        "trace_row_count": len(trace_rows or []),
-        "state_reads": loopx_cli_calls.get("active_user_observe", 0),
-        "state_writes": 0,
-        "raw_trace_recorded": False,
-        "raw_paths_recorded": False,
-    }
 
 
 def build_worker_bridge_install_contract(

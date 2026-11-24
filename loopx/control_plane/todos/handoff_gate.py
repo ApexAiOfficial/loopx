@@ -5,23 +5,16 @@ from enum import Enum
 from typing import Any
 
 from .contract import (
-    TODO_RESUME_KIND_TODO_DONE,
-    TODO_STATUS_DEFERRED,
     TODO_STATUS_DONE,
     TODO_STATUS_OPEN,
-    TODO_TASK_CLASS_ADVANCEMENT,
     normalize_todo_claimed_by,
     normalize_todo_excluded_agents,
     normalize_todo_id,
-    normalize_todo_no_followup,
-    normalize_todo_resume_when,
     normalize_todo_status,
-    normalize_todo_task_class,
     todo_done_for_status,
 )
 
 TODO_HANDOFF_GATE_SCHEMA_VERSION = "todo_handoff_gate_v1"
-TODO_ARCHIVE_STATE_ACTIVE = "active"
 
 
 class HandoffGateState(str, Enum):
@@ -48,85 +41,12 @@ def _todo_text(item: dict[str, Any]) -> str:
     return str(item.get("text") or "").strip()
 
 
-def _todo_archive_state(item: dict[str, Any]) -> str:
-    value = str(item.get("archive_state") or TODO_ARCHIVE_STATE_ACTIVE).strip()
-    return value or TODO_ARCHIVE_STATE_ACTIVE
-
-
-def _successor_todo_ids(
-    gate: dict[str, Any],
-    *,
-    items: list[dict[str, Any]],
-) -> list[str]:
-    gate_id = normalize_todo_id(gate.get("todo_id"))
-    superseded_by = normalize_todo_id(gate.get("superseded_by"))
-    successor_ids: list[str] = []
-    if superseded_by:
-        successor_ids.append(superseded_by)
-    if not gate_id:
-        return successor_ids
-
-    for item in items:
-        if normalize_todo_task_class(
-            item.get("task_class"),
-            text=_todo_text(item),
-            action_kind=item.get("action_kind"),
-        ) != TODO_TASK_CLASS_ADVANCEMENT:
-            continue
-        candidate_id = normalize_todo_id(item.get("todo_id"))
-        if not candidate_id or candidate_id == gate_id:
-            continue
-        resume_when = normalize_todo_resume_when(item.get("resume_when")) or ""
-        resume_kind, separator, resume_target = resume_when.partition(":")
-        candidate_unblocks = normalize_todo_id(item.get("unblocks_todo_id"))
-        if (
-            candidate_id == superseded_by
-            or candidate_unblocks == gate_id
-            or (
-                separator
-                and resume_kind == TODO_RESUME_KIND_TODO_DONE
-                and normalize_todo_id(resume_target) == gate_id
-            )
-        ) and candidate_id not in successor_ids:
-            successor_ids.append(candidate_id)
-    return successor_ids
-
-
-def _stale_handoff_closeout_replan_required(gate: dict[str, Any]) -> bool:
-    if _todo_done(gate):
-        return False
-    label = " ".join(
-        str(gate.get(key) or "")
-        for key in ("action_kind", "title", "text")
-        if str(gate.get(key) or "").strip()
-    ).lower()
-    return "stale" in label and "handoff" in label and "closeout" in label
-
-
-def _handoff_gate_state(
-    gate: dict[str, Any],
-    *,
-    successor_ids: list[str],
-) -> HandoffGateState:
-    status = _todo_status(gate)
-    if normalize_todo_id(gate.get("superseded_by")):
-        return HandoffGateState.SUPERSEDED
-    if status == TODO_STATUS_DEFERRED:
-        return HandoffGateState.DEFERRED
-    if not _todo_done(gate):
-        return HandoffGateState.BLOCKING
-    if normalize_todo_no_followup(gate.get("no_followup")) is True:
-        return HandoffGateState.CLEARED_NO_FOLLOWUP
-    if successor_ids:
-        return HandoffGateState.CLEARED_WITH_SUCCESSOR
-    return HandoffGateState.CLEARED_WITHOUT_SUCCESSOR
-
-
 def _compact_handoff_gate(
     gate: dict[str, Any],
     *,
     state: HandoffGateState,
     successor_ids: list[str],
+    route_replan_required: bool,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schema_version": TODO_HANDOFF_GATE_SCHEMA_VERSION,
@@ -169,7 +89,7 @@ def _compact_handoff_gate(
     superseded_by = normalize_todo_id(payload.get("superseded_by"))
     if superseded_by:
         payload["superseded_by"] = superseded_by
-    if _stale_handoff_closeout_replan_required(gate):
+    if route_replan_required:
         payload["route_continuation_replan_required"] = True
         payload.setdefault(
             "route_continuation_reason",
@@ -180,44 +100,30 @@ def _compact_handoff_gate(
     return {key: value for key, value in payload.items() if value not in (None, "")}
 
 
-def build_todo_handoff_gate_states(items: Iterable[Any]) -> list[dict[str, Any]]:
-    """Project dependency-linked executor exclusions into a handoff state machine."""
+def build_todo_handoff_gate_states(
+    items: Iterable[Any], *, evaluations: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Render the typed full-source handoff decision; retain presentation only."""
+    from .succession_warning import project_succession
 
     todo_items = [item for item in items if isinstance(item, dict)]
-    gates: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for item in todo_items:
-        if _todo_archive_state(item) != TODO_ARCHIVE_STATE_ACTIVE:
-            continue
-        excluded_agents = normalize_todo_excluded_agents(item.get("excluded_agents"))
-        if not excluded_agents or not normalize_todo_id(item.get("unblocks_todo_id")):
-            continue
-        identity = (str(item.get("todo_id") or ""), _todo_text(item))
-        if identity in seen:
-            continue
-        seen.add(identity)
-        successor_ids = _successor_todo_ids(item, items=todo_items)
-        gates.append(
-            _compact_handoff_gate(
-                item,
-                state=_handoff_gate_state(item, successor_ids=successor_ids),
-                successor_ids=successor_ids,
-            )
-        )
-    return sorted(
-        gates,
-        key=lambda item: (
-            int(item.get("index") or 999999),
-            str(item.get("todo_id") or ""),
-        ),
-    )
+    decisions = evaluations if evaluations is not None else project_succession(todo_items)
+    gates = [
+        _compact_handoff_gate(item, state=HandoffGateState(decision["handoff_state"]),
+            successor_ids=decision["successor_todo_ids"],
+            route_replan_required=decision["route_continuation_replan_required"])
+        for item, decision in zip(todo_items, decisions, strict=True)
+        if decision["handoff_state"] is not None
+    ]
+    return sorted(gates, key=lambda item: (int(item.get("index") or 999999), str(item.get("todo_id") or "")))
 
 
 def todo_summary_handoff_gates(value: dict[str, Any]) -> list[dict[str, Any]]:
     projected = value.get("handoff_gates")
     if isinstance(projected, list):
         return [item for item in projected if isinstance(item, dict)]
-    source_items = value.get("items") if isinstance(value.get("items"), list) else []
+    raw_items = value.get("items")
+    source_items = raw_items if isinstance(raw_items, list) else []
     return build_todo_handoff_gate_states(source_items)
 
 
@@ -236,48 +142,3 @@ def handoff_ready_successor_todo_ids(value: dict[str, Any]) -> set[str]:
             if normalized:
                 ready.add(normalized)
     return ready
-
-
-def build_todo_handoff_gate_lanes(
-    value: dict[str, Any],
-    *,
-    agent_identity: dict[str, Any] | None,
-    item_limit: int,
-) -> dict[str, Any]:
-    handoff_gates = todo_summary_handoff_gates(value)
-    if not handoff_gates:
-        return {}
-    lanes: dict[str, Any] = {
-        "handoff_gate_count": len(handoff_gates),
-        "handoff_gates": handoff_gates[:item_limit],
-    }
-    agent_id = (
-        normalize_todo_claimed_by(agent_identity.get("agent_id"))
-        if isinstance(agent_identity, dict)
-        else None
-    )
-    if agent_id:
-        current_agent_items = [
-            item
-            for item in handoff_gates
-            if agent_id in normalize_todo_excluded_agents(item.get("excluded_agents"))
-        ]
-        cleared_without_successor = [
-            item
-            for item in current_agent_items
-            if item.get("gate_state")
-            == HandoffGateState.CLEARED_WITHOUT_SUCCESSOR.value
-        ]
-        lanes.update(
-            {
-                "current_agent_handoff_gate_count": len(current_agent_items),
-                "current_agent_handoff_gates": current_agent_items[:item_limit],
-                "current_agent_cleared_without_successor_handoff_count": len(
-                    cleared_without_successor
-                ),
-                "current_agent_cleared_without_successor_handoff_gates": (
-                    cleared_without_successor[:item_limit]
-                ),
-            }
-        )
-    return lanes

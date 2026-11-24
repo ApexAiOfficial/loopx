@@ -99,11 +99,16 @@ proposal 必须引用 evidence packet 的稳定指纹，并显式标记
 
 ### `decision_review_receipt_v0`
 
-结算层记录四种 disposition：
+结算层记录五种 disposition：
 
 - `approve`、`reject`、`defer` 必须精确回读现有 `user_gate` event，且 gate scope
   必须是 `direction:action:<proposal-packet-ref>`；
-- `no_change` 必须有显式 semantic rebase 证明，不创建 gate。
+- `no_change` 必须有显式无实质变化的 semantic rebase 证明，不创建 gate；
+- `observed` 记录已评审的新事实，不提出或授权动作；必须有 material-change
+  rebase，且不能携带 proposal 或 gate 引用。
+
+空 rebase 不能结算。采集或读取来源本身不证明语义评审；预览与执行使用相同的证据链
+校验，在任何写入前拒绝不完整或不匹配的证明。
 
 该 receipt 只证明“这批证据已评审或没有实质影响”，允许在 lifecycle writeback
 验证后推进私有 source cursor；它不是 outcome，也不创造动作权限。
@@ -217,6 +222,15 @@ capability 与 goal 配置承担。
 source manifest，以及显式配置、只读的 `local-file` source adapter。该切片刻意
 停在 source 编排和私有 cursor checkpoint 之前。
 
+local-file transport 在已打开的普通文件 handle 上执行 `max_bytes`，最多读取上限
+加一个字节以检测超限。读取前后对比文件 identity、大小、修改/变更时间，并核对
+当前解析后的 source。检测到增长、替换或原地改写时按 provider failure 处理，不能
+推进 capture cursor 或创建 exact-read receipt。显式配置的稳定 symlink 仍可用。
+修复 source 后沿既有 capture cadence 重试；reviewed cursor 仍由 settlement owner
+控制。这是有界观察，不是原子文件系统快照，也不是网络文件系统读取的硬 deadline；
+host 仍需保留进程 timeout 边界。
+
+
 第二个切片增加薄 host API `assemble_profile_decision_evidence(...)`，以及只读的
 CLI 预览 `decision-context prepare-evidence`。profile 会解析已启用的 source
 provider，执行 bounded scan 与 exact read，并输出公开安全的 scan、revision、
@@ -225,6 +239,13 @@ health、evidence 和 cursor checkpoint 记录。host API 通过领域 rebase ca
 只要 changed source 尚未被事实、拒绝项或冲突记录完整解释，cursor 就保持
 `preserve`，避免把“扫描/读过”误记成“已吸收”。`on_demand` source 不进入自动
 扫描，只有显式选择后才会读取。
+
+显式激活的 profile 也可以只选择 advisory context provider。
+`decision-context recall-context` 接受一个仅用于本次调用的 provider-neutral scope，
+返回 local-private transient 结果及嵌套的 public-safe receipt。该路径不修改 profile、
+不扫描 authority source、不访问 cursor、不创建 pending settlement，也不授予执行
+权限。它是复制 task locator 的最窄入口；若召回结果需要进入 durable decision，仍须
+回到标准 evidence rebase 和既有 lifecycle owner。
 
 私有 cursor commit 仍是独立验收边界。Review 可能跨 Agent turn，所以
 `prepare-review --execute` 会保存一份私有 pending settlement：其中包含公开安全的

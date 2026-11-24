@@ -6,6 +6,9 @@ from typing import Any
 from .capabilities.issue_fix.pr_gate_reconcile import (
     reconcile_acknowledged_issue_fix_pr_reviews,
 )
+from .capabilities.turn_start import extend_turn_start_dispatch
+from .history import load_registry
+from .paths import resolve_runtime_root
 
 
 HEARTBEAT_PRE_QUOTA_SCHEMA_VERSION = "heartbeat_pre_quota_v0"
@@ -44,6 +47,22 @@ def run_heartbeat_pre_quota(
             "write_count": 0,
         }
 
+    runtime = resolve_runtime_root(load_registry(registry_path), runtime_root_arg, registry_path=registry_path)
+    dispatch = extend_turn_start_dispatch({}, registry_path=registry_path, runtime_root=runtime,
+        goal_id=goal_id, agent_id=agent_id, available=None,
+        provider_options={"issue-fix": {"fetch_timeout_seconds": fetch_timeout_seconds}})
+    # Keep the released command's compatibility projection. Observation itself
+    # is registered and permission-resolved by the same lifecycle as execution.
+    failed = next((row for row in dispatch.get("failures", [])
+        if row.get("capability_id") == "issue-fix"), None)
+    dependencies = next((row["readback"] for row in dispatch.get("results", [])
+        if row.get("capability_id") == "issue-fix" and isinstance(row.get("readback"), dict)),
+        {"ok": not bool(failed), "degraded": bool(failed), "failure_count": 1 if failed else 0,
+         "external_read_count": None if failed else 0, "state_written": None if failed else False,
+         "status": "observation_unavailable" if failed else "not_configured_or_unavailable"})
+    degraded = degraded or bool(dependencies.get("degraded"))
+    failure_count += int(dependencies.get("failure_count") or 0)
+
     return {
         "ok": True,
         "schema_version": HEARTBEAT_PRE_QUOTA_SCHEMA_VERSION,
@@ -53,7 +72,9 @@ def run_heartbeat_pre_quota(
         "failure_count": failure_count,
         "checks": {
             "acknowledged_pr_reviews": review_reconciliation,
+            "pr_dependencies": dependencies,
         },
+        "turn_start_capability_hook_dispatch": dispatch,
         "quota_spend_required": False,
         "continue_to_quota": True,
     }
@@ -74,6 +95,7 @@ def render_heartbeat_pre_quota_markdown(payload: dict[str, Any]) -> str:
             f"- degraded: `{payload.get('degraded')}`",
             f"- reconciled_count: `{review.get('reconciled_count', 0)}`",
             f"- failure_count: `{payload.get('failure_count')}`",
+            f"- PR dependency reads: `{checks.get('pr_dependencies', {}).get('external_read_count', 0)}`",
             f"- continue_to_quota: `{payload.get('continue_to_quota')}`",
             "- quota_spend_required: `False`",
         ]

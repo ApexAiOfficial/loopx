@@ -21,7 +21,7 @@ for arg in "$@"; do
     continue
   fi
   case "$arg" in
-    --format|--registry|--runtime-root|--goal-id|--agent-id|--git-diff-base|--tier|--timeout-seconds|--changed-file|--catalog|--surface|--family|--profile|--suite|--module|--exclude-module|--script|--limit|--offset|--max-checks-per-family|--max-checks-per-profile)
+    --format|--registry|--runtime-root|--cli-bin|--goal-id|--agent-id|--git-diff-base|--tier|--timeout-seconds|--changed-file|--catalog|--surface|--family|--profile|--suite|--module|--exclude-module|--script|--limit|--offset|--max-checks-per-family|--max-checks-per-profile)
       skip_next_arg=1
       continue
       ;;
@@ -37,17 +37,81 @@ for arg in "$@"; do
   fi
 done
 
-python_bin="${LOOPX_PYTHON:-}"
-if [[ -z "$python_bin" && -f "$repo_root/.loopx-python" ]]; then
-  IFS= read -r python_bin <"$repo_root/.loopx-python"
+native_scheduler_facts=0
+native_scheduler_turn=0
+native_scheduler_host_match=0
+native_scheduler_non_codex_app=0
+for arg in "$@"; do
+  case "$arg" in
+    --scheduler-host-facts-chunk|--scheduler-host-facts-chunk=*)
+      native_scheduler_facts=1
+      ;;
+    --turn-instance-id|--turn-instance-id=*)
+      native_scheduler_turn=1
+      ;;
+    --host-match-observed)
+      native_scheduler_host_match=1
+      ;;
+    --trae_app|--antigravity_app)
+      native_scheduler_non_codex_app=1
+      ;;
+  esac
+done
+
+if [[ "$loopx_command" == "quota" \
+  && ( "$loopx_subcommand" == "scheduler-ack-current" || "$loopx_subcommand" == "scheduler-fail-current" ) \
+  && "$native_scheduler_facts" == "1" \
+  && "$native_scheduler_turn" == "1" \
+  && "${LOOPX_KUNLUNCODE_OUTER_CONTROLLER:-}" != "1" \
+  && ! ( "$loopx_subcommand" == "scheduler-ack-current" \
+    && "$native_scheduler_host_match" == "1" && "$native_scheduler_non_codex_app" == "0" ) ]]; then
+  native_scheduler_entry="$repo_root/loopx/control_plane/scheduler/heartbeat_followup_cli.ts"
+  if ! command -v node >/dev/null 2>&1; then
+    echo "loopx runtime error: native scheduler follow-up requires Node.js 22.22.3 or newer" >&2
+    exit 2
+  fi
+  export LOOPX_RELEASE_ROOT="$repo_root"
+  node_ts_flags=()
+  if [[ "$(uname -s 2>/dev/null || true)" == Linux* ]]; then
+    case "$(uname -m 2>/dev/null || true)" in
+      x86_64|amd64)
+        node_ts_flags=(--liftoff-only --no-wasm-tier-up --no-wasm-dynamic-tiering)
+        ;;
+    esac
+  fi
+  exec node --no-warnings --experimental-strip-types ${node_ts_flags[@]+"${node_ts_flags[@]}"} "$native_scheduler_entry" "$@"
 fi
-if [[ -z "$python_bin" ]]; then
-  python_bin="python3"
-fi
-if ! command -v "$python_bin" >/dev/null 2>&1; then
-  echo "loopx runtime error: configured Python executable not found: $python_bin" >&2
-  echo "Set LOOPX_PYTHON to Python 3.11+ and reinstall LoopX." >&2
-  exit 2
+
+# Codex host-match ACKs need the entrypoint's fresh App read before TS commit.
+# Outer-controlled writes also retain that entrypoint's owning permission guard.
+
+python_selector="$repo_root/scripts/loopx-python.sh"
+if [[ -n "${LOOPX_PYTHON:-}" ]]; then
+  python_bin="$LOOPX_PYTHON"
+  if ! command -v "$python_bin" >/dev/null 2>&1; then
+    echo "loopx runtime error: configured Python executable not found: $python_bin" >&2
+    echo "Set LOOPX_PYTHON to Python 3.11+ and reinstall LoopX." >&2
+    exit 2
+  fi
+elif [[ -f "$python_selector" ]]; then
+  if ! python_bin="$(bash "$python_selector")"; then
+    echo "Set LOOPX_PYTHON to Python 3.11+ and reinstall LoopX." >&2
+    exit 2
+  fi
+else
+  # Keep old release snapshots runnable if the companion selector is absent.
+  python_bin="${LOOPX_PYTHON:-}"
+  if [[ -z "$python_bin" && -f "$repo_root/.loopx-python" ]]; then
+    IFS= read -r python_bin <"$repo_root/.loopx-python"
+  fi
+  if [[ -z "$python_bin" ]]; then
+    python_bin="python3"
+  fi
+  if ! command -v "$python_bin" >/dev/null 2>&1; then
+    echo "loopx runtime error: configured Python executable not found: $python_bin" >&2
+    echo "Set LOOPX_PYTHON to Python 3.11+ and reinstall LoopX." >&2
+    exit 2
+  fi
 fi
 
 if [[ "$loopx_command" == "canary" && "$loopx_subcommand" == "premerge" ]]; then
@@ -67,6 +131,10 @@ exec "$python_bin" -c '
 import os
 import runpy
 import sys
+
+# Stable process identity for LoopX Desktop stale-service recovery. Keep this
+# independent from the selected Python entry module.
+LOOPX_MANAGED_RELEASE_LAUNCHER_V1 = True
 
 if sys.version_info < (3, 11):
     print(
@@ -89,5 +157,10 @@ for entry in sys.path:
     filtered_path.append(entry)
 sys.path[:] = [release_root, *filtered_path]
 sys.argv[0] = os.path.join(release_root, "scripts", "loopx")
-runpy.run_module("loopx.cli", run_name="__main__")
+module = (
+    "loopx.entrypoint"
+    if os.path.isfile(os.path.join(release_root, "loopx", "entrypoint.py"))
+    else "loopx.cli"
+)
+runpy.run_module(module, run_name="__main__")
 ' "$@"

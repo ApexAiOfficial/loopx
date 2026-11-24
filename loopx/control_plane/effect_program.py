@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from types import MappingProxyType
+from typing import Any, Generic, Literal, TypeAlias, TypeVar
 
 from .effect_runtime import EffectRuntimeRejected, effect_runtime_result
 
@@ -25,10 +26,14 @@ class ReceiptBoundMonitorPhase(StrEnum):
     SETTLED = "settled"
 
 
-class ReceiptBoundTerminalPhase(StrEnum):
+class ReceiptBoundReplayPhase(StrEnum):
     OPEN = "open"
     SETTLEMENT_PENDING = "settlement_pending"
     SETTLED = "settled"
+
+
+# Compatibility alias for callers that predate ordinary-completion replay.
+ReceiptBoundTerminalPhase = ReceiptBoundReplayPhase
 
 
 def receipt_bound_monitor_phase(
@@ -52,23 +57,45 @@ def receipt_bound_monitor_phase(
     return ReceiptBoundMonitorPhase(str(result))
 
 
+def receipt_bound_replay_phase(
+    *,
+    binding_kind: SettlementBindingKind | str | None = None,
+    writeback_completes_binding: bool = False,
+    completion_receipt_present: bool,
+    durable_writeback_present: bool,
+    quota_spend_present: bool,
+) -> ReceiptBoundReplayPhase | None:
+    params: dict[str, Any] = {
+        "completion_receipt_present": completion_receipt_present,
+        "durable_writeback_present": durable_writeback_present,
+        "quota_spend_present": quota_spend_present,
+    }
+    if binding_kind is not None:
+        params["binding_kind"] = str(binding_kind)
+    if writeback_completes_binding:
+        params["writeback_completes_binding"] = True
+    result = effect_runtime_result(
+        "settlement.receipt_bound_replay_phase",
+        params,
+    )
+    if result is None:
+        return None
+    return ReceiptBoundReplayPhase(str(result))
+
+
 def receipt_bound_terminal_phase(
     *,
     terminal_closeout_present: bool,
     durable_writeback_present: bool,
     quota_spend_present: bool,
 ) -> ReceiptBoundTerminalPhase | None:
-    result = effect_runtime_result(
-        "settlement.receipt_bound_terminal_phase",
-        {
-            "terminal_closeout_present": terminal_closeout_present,
-            "durable_writeback_present": durable_writeback_present,
-            "quota_spend_present": quota_spend_present,
-        },
+    """Compatibility adapter for the pre-successor terminal-only contract."""
+
+    return receipt_bound_replay_phase(
+        completion_receipt_present=terminal_closeout_present,
+        durable_writeback_present=durable_writeback_present,
+        quota_spend_present=quota_spend_present,
     )
-    if result is None:
-        return None
-    return ReceiptBoundTerminalPhase(str(result))
 
 
 @dataclass(frozen=True)
@@ -94,9 +121,10 @@ class EffectInterpretation:
 class EffectObservation:
     decision: str
     should_run: bool
-    effective_action: str
+    effective_action: str | None
     recommended_action: str
     action_portfolio: Mapping[str, Any] | None = None
+    planning_horizon: Mapping[str, Any] | None = None
     protocol_summary: str | None = None
 
 
@@ -149,15 +177,41 @@ class SettlementStepKind(StrEnum):
     TERMINAL_CLOSEOUT = "terminal_closeout"
 
 
+TurnProviderStepKind: TypeAlias = Literal[
+    SettlementStepKind.DURABLE_WRITEBACK,
+    SettlementStepKind.QUOTA_SPEND,
+    SettlementStepKind.TERMINAL_CLOSEOUT,
+]
+TURN_PROVIDER_STEP_KINDS: tuple[TurnProviderStepKind, ...] = (
+    SettlementStepKind.DURABLE_WRITEBACK,
+    SettlementStepKind.QUOTA_SPEND,
+    SettlementStepKind.TERMINAL_CLOSEOUT,
+)
+
+
+def require_turn_provider_step_kind(
+    step_kind: SettlementStepKind,
+) -> TurnProviderStepKind:
+    if step_kind is SettlementStepKind.DURABLE_WRITEBACK:
+        return step_kind
+    if step_kind is SettlementStepKind.QUOTA_SPEND:
+        return step_kind
+    if step_kind is SettlementStepKind.TERMINAL_CLOSEOUT:
+        return step_kind
+    raise ValueError("validation is not a provider effect step")
+
+
 class SettlementBindingKind(StrEnum):
     TODO = "todo"
     AUTONOMOUS_REPLAN = "autonomous_replan"
+    REQUEST = "request"
     UNBOUND = "unbound"
 
 
 class SettlementFailureKind(StrEnum):
     INVALID_IDENTITY = "invalid_identity"
     RECEIPT_MISSING = "receipt_missing"
+    RECEIPT_UNBOUND = "receipt_unbound"
     IDENTITY_MISMATCH = "identity_mismatch"
     WRITEBACK_MISSING = "writeback_missing"
     WRITEBACK_REJECTED = "writeback_rejected"
@@ -176,6 +230,7 @@ def _settlement_identity_full(
     todo_id: str | None,
     turn_instance_id: str,
     replan_obligation_id: str | None,
+    request_subject_json: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         result = effect_runtime_result(
@@ -186,6 +241,7 @@ def _settlement_identity_full(
                 "todo_id": todo_id,
                 "turn_instance_id": turn_instance_id,
                 "replan_obligation_id": replan_obligation_id,
+                **({"request_subject": json.loads(request_subject_json)} if request_subject_json is not None else {}),
             },
         )
     except EffectRuntimeRejected as exc:
@@ -206,6 +262,7 @@ class SettlementIdentity:
     todo_id: str | None
     turn_instance_id: str
     replan_obligation_id: str | None = None
+    request_subject: Mapping[str, Any] | None = None
     _runtime_identity: Mapping[str, Any] = field(
         init=False,
         repr=False,
@@ -224,11 +281,14 @@ class SettlementIdentity:
             self.todo_id,
             self.turn_instance_id,
             self.replan_obligation_id,
+            json.dumps(dict(self.request_subject), sort_keys=True) if self.request_subject is not None else None,
         )
         object.__setattr__(self, "todo_id", identity.get("todo_id"))
         object.__setattr__(
             self, "replan_obligation_id", identity.get("replan_obligation_id")
         )
+        subject = identity.get("request_subject")
+        object.__setattr__(self, "request_subject", MappingProxyType(dict(subject)) if subject is not None else None)
         object.__setattr__(self, "_runtime_identity", identity)
         object.__setattr__(self, "_runtime_payload", payload)
 
@@ -244,8 +304,83 @@ class SettlementIdentity:
     def effect_id(self) -> str:
         return str(self._runtime_identity["effect_id"])
 
-    def as_dict(self) -> dict[str, str]:
-        return {key: str(value) for key, value in self._runtime_payload.items()}
+    def as_dict(self) -> dict[str, Any]:
+        return {**self._runtime_payload,
+            **({"request_subject": dict(self._runtime_payload["request_subject"])} if self.request_subject is not None else {})}
+
+    @classmethod
+    def from_runtime_payload(cls, payload: Any) -> SettlementIdentity:
+        """Decode a TS-owned identity; saved requests reuse the strict decoder."""
+
+        if not isinstance(payload, Mapping):
+            raise RuntimeError("TypeScript settlement identity shape mismatch")
+        schema_version = payload.get("schema_version")
+        if schema_version not in {
+            SETTLEMENT_IDENTITY_SCHEMA_VERSION,
+            SCOPED_SETTLEMENT_IDENTITY_SCHEMA_VERSION,
+        }:
+            raise RuntimeError("TypeScript settlement identity shape mismatch")
+        required = ("effect_id", "goal_id", "agent_id", "turn_instance_id")
+        if any(
+            not isinstance(payload.get(key), str) or not str(payload[key]).strip()
+            for key in required
+        ):
+            raise RuntimeError("TypeScript settlement identity shape mismatch")
+        todo_id = str(payload.get("todo_id") or "").strip() or None
+        replan_obligation_id = (
+            str(payload.get("replan_obligation_id") or "").strip() or None
+        )
+        request_subject = payload.get("request_subject")
+        if request_subject is not None:
+            # New request identities also enter through saved transaction plans.
+            # Reuse the typed decoder; Python equality accepts True == 1.
+            verified = cls(goal_id=str(payload["goal_id"]), agent_id=str(payload["agent_id"]),
+                todo_id=todo_id, replan_obligation_id=replan_obligation_id,
+                turn_instance_id=str(payload["turn_instance_id"]), request_subject=request_subject)
+            if verified.as_dict() != payload:
+                raise RuntimeError("TypeScript settlement identity shape mismatch")
+            return verified
+        if bool(todo_id) == bool(replan_obligation_id):
+            raise RuntimeError("TypeScript settlement identity shape mismatch")
+        binding_kind = (
+            SettlementBindingKind.TODO
+            if todo_id
+            else SettlementBindingKind.AUTONOMOUS_REPLAN
+        )
+        binding_id = todo_id or replan_obligation_id
+        if schema_version == SCOPED_SETTLEMENT_IDENTITY_SCHEMA_VERSION and (
+            payload.get("binding_kind") != binding_kind.value
+            or payload.get("binding_id") != binding_id
+        ):
+            raise RuntimeError("TypeScript settlement identity shape mismatch")
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "goal_id", str(payload["goal_id"]))
+        object.__setattr__(instance, "agent_id", str(payload["agent_id"]))
+        object.__setattr__(instance, "todo_id", todo_id)
+        object.__setattr__(
+            instance,
+            "turn_instance_id",
+            str(payload["turn_instance_id"]),
+        )
+        object.__setattr__(instance, "replan_obligation_id", replan_obligation_id)
+        object.__setattr__(instance, "request_subject", request_subject)
+        object.__setattr__(
+            instance,
+            "_runtime_identity",
+            {
+                "goal_id": instance.goal_id,
+                "agent_id": instance.agent_id,
+                "todo_id": todo_id,
+                "turn_instance_id": instance.turn_instance_id,
+                "replan_obligation_id": replan_obligation_id,
+                **({"request_subject": request_subject} if request_subject is not None else {}),
+                "binding_kind": binding_kind.value,
+                "binding_id": str(binding_id),
+                "effect_id": str(payload["effect_id"]),
+            },
+        )
+        object.__setattr__(instance, "_runtime_payload", dict(payload))
+        return instance
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +634,9 @@ class SettlementStep:
     expected_receipt: str
     command_template: str | None = None
     conditional: bool = False
+    command_condition: str | None = None
+    vision_authoring: Mapping[str, Any] | None = None
+    semantic_closeout_command_template: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         step: dict[str, Any] = {
@@ -512,6 +650,12 @@ class SettlementStep:
             step["command_template"] = self.command_template
         if self.conditional:
             step["conditional"] = True
+        if self.command_condition:
+            step["command_condition"] = self.command_condition
+        if self.vision_authoring is not None:
+            step["vision_authoring"] = dict(self.vision_authoring)
+        if self.semantic_closeout_command_template is not None:
+            step["semantic_closeout_command_template"] = self.semantic_closeout_command_template
         return step
 
 
@@ -519,8 +663,13 @@ class SettlementStep:
 class SettlementPlan:
     identity: SettlementIdentity
     steps: tuple[SettlementStep, ...]
+    _runtime_payload: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
+        if self._runtime_payload is not None:
+            # A native plan is already serialized and validated by its owner.
+            # Re-rendering guidance must not add another runtime crossing.
+            return dict(json.loads(json.dumps(self._runtime_payload)))
         payload = effect_runtime_result(
             "settlement.plan_payload",
             {
@@ -600,11 +749,20 @@ def _effect_turn_from_payload(payload: Any) -> EffectTurn:
         observation=EffectObservation(
             decision=str(observation.get("decision") or ""),
             should_run=observation.get("should_run") is True,
-            effective_action=str(observation.get("effective_action") or ""),
+            effective_action=(
+                str(observation["effective_action"])
+                if observation.get("effective_action") is not None
+                else None
+            ),
             recommended_action=str(observation.get("recommended_action") or ""),
             action_portfolio=(
                 dict(observation["action_portfolio"])
                 if isinstance(observation.get("action_portfolio"), Mapping)
+                else None
+            ),
+            planning_horizon=(
+                dict(observation["planning_horizon"])
+                if isinstance(observation.get("planning_horizon"), Mapping)
                 else None
             ),
             protocol_summary=(
@@ -644,19 +802,20 @@ def effect_program_from_ordered_steps(
     ordered_steps: Sequence[Mapping[str, Any]],
     *,
     execution_mode: str | None = None,
+    include_raw: bool = True,
 ) -> EffectProgram:
-    """Map existing `guided_transaction.ordered_steps` onto an effect program."""
+    """Map ordered steps onto an effect program, including source fields by default."""
 
-    payload = effect_runtime_result(
-        "effect.program_from_ordered_steps",
-        {
-            "ordered_steps": [
-                dict(step) if isinstance(step, Mapping) else step
-                for step in ordered_steps
-            ],
-            "execution_mode": execution_mode,
-        },
-    )
+    params: dict[str, object] = {
+        "ordered_steps": [
+            dict(step) if isinstance(step, Mapping) else step
+            for step in ordered_steps
+        ],
+        "execution_mode": execution_mode,
+    }
+    if not include_raw:
+        params["include_raw"] = False
+    payload = effect_runtime_result("effect.program_from_ordered_steps", params)
     if not isinstance(payload, Mapping) or not isinstance(payload.get("steps"), list):
         raise RuntimeError("TypeScript Effect Program shape mismatch")
     steps = tuple(
@@ -674,6 +833,13 @@ def effect_program_from_ordered_steps(
     return EffectProgram(
         steps=steps, execution_mode=str(mode) if mode is not None else None
     )
+
+
+def reject_retired_quota_format(payload: Mapping[str, object]) -> None:
+    """Send retired carriers to the typed reader; supported rendering adds no RPC."""
+    for candidate in (payload, payload.get("contract_capsule")):
+        if isinstance(candidate, Mapping) and "protocol_action_packet" in candidate:
+            interpret_quota_should_run_packet(candidate)
 
 
 def interpret_quota_should_run_packet(
@@ -706,7 +872,7 @@ def interpret_turn_result_packet(
     agent_id: str | None = None,
     capabilities: Sequence[str] = (),
 ) -> EffectTurn:
-    """Map an existing `loopx_turn_result_v0` packet onto canonical slots."""
+    """Project a Turn verdict; the TS owner emits no quota action (None)."""
     return _effect_turn_from_payload(
         effect_runtime_result(
             "effect.interpret_turn_result",

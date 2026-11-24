@@ -1,0 +1,1102 @@
+# Native EdgeBench worker trials
+
+This research adapter calls SForge's native `run_agent`. Task images, prompts,
+submission cooldowns, judge isolation and scoring remain owned by the pinned
+EdgeBench checkout. Best-only adds host capture/admission scheduling; native and
+blind retain native automatic evaluation. The canonical repository and pinned
+revision/compatibility-patch pair live in [`source-default.json`](source-default.json).
+Run the controller on Linux with Docker and native SForge
+iptables permissions; a macOS Docker socket alone does not provide that boundary.
+
+## Select and freeze the native provider
+
+The first CLI entry for a log directory fetches the selected revision into
+`.edgebench-source/checkout` and atomically freezes the effective source in
+`.edgebench-source/receipt.json`. Concurrent worker/judge startup shares that lock.
+Later entries reuse the frozen checkout without fetching, even if the branch,
+repository default, or bundled compatibility patch changes. Dirty/moved source,
+conflicting explicit selection, and existing runs without a source receipt fail
+before model/container entry. Use a new log directory to adopt a newer source;
+never repin an active or historical cohort.
+
+For a **new cohort with no explicit source options**, `source-default.json`
+selects the reviewed provider commit
+[`476b34d17e759a7dbcf9ec36a12ff42b757b462a`](https://github.com/huangruiteng/EdgeBench/commit/476b34d17e759a7dbcf9ec36a12ff42b757b462a)
+and the versioned
+[`nonfinite-checkpoint-v2` compatibility patch](compatibility/nonfinite-checkpoint-v2.patch).
+This LoopX-owned patch fixes the native checkpoint representation of nonfinite
+released scores and metrics. Native scoring, report values and selection remain
+unchanged. The upstream revision fixes ordinary HTTP feedback serialization;
+checkpoint encoding is a separate boundary and still requires this patch.
+Preparation verifies the asset digest and each touched file's exact
+upstream blob and mode, applies the patch before provider import/installation,
+and creates a clean, reproducible Git commit with the fetched commit as its
+parent. The snapshot uses an explicit LoopX compatibility identity and the
+upstream commit time; it does not attribute the patch to an upstream author.
+The default revision and patch are one reviewed pair: advancing the integration
+branch does not change a new default cohort. Updating the pair requires reviewing
+the new source and qualifying the native checkpoint transport again. A changed
+patch preimage, including a later upstream implementation of the fix, still stops
+preparation without publishing a source directory. Explicit branch/revision
+selection remains available and uses unmodified provider code; it does not
+silently inherit the default patch or its qualification.
+
+Patched sources use `edgebench_source_v2` receipts. `upstream_commit` is the
+fetched remote revision; `compatibility_patch` records the patch ID and SHA-256;
+`commit` is the **effective local derived revision** actually imported and bound
+by native checkpoint provenance. This derived SHA is not an upstream revision
+that a fresh remote fetch can retrieve. The frozen `compatibility.patch` copy,
+Git parent/tree, complete upstream-to-effective diff, and deterministic commit
+contents are cross-checked on reuse. Verification uses the frozen copy rather
+than the current LoopX asset, so later asset changes do not invalidate an older
+cohort. Preserve the complete `.edgebench-source` directory for offline reuse or
+exact patched-source replay. Older `edgebench_source_v1` cohorts retain their
+original unmodified source and receipt; preparation never upgrades them.
+
+The bundled patch uses one-line unified context and Git's
+`diff.suppressBlankEmpty=true` representation. This keeps its full-index file
+identities and changed content readable while avoiding unrelated example text
+and trailing-space context markers in the containing repository. Validation
+accepts that exact canonical form or the original three-line, space-prefixed
+context form retained by earlier v2 cohorts; it does not ignore arbitrary
+whitespace. Changing the representation changes its digest and derived commit,
+even when the provider tree is identical. Existing cohorts keep their original
+patch bytes, receipt and commit and remain verifiable offline.
+
+Prepare dependencies in an isolated environment before starting a study:
+
+```sh
+python -m benchmark.edgebench.source --log-dir /data/private-runs
+python -m pip install /data/private-runs/.edgebench-source/checkout harbor
+```
+
+The bootstrap selects this checkout before importing SForge, so an unrelated
+installed package or ambient `PYTHONPATH` cannot silently supply the provider.
+Worker `runtime-receipt.json` includes the verified `sforge_source`. This records
+code selection, not enabled task/scoring options or benchmark qualification.
+No dependency installation is performed automatically.
+
+Start the native judge and workers with the **same log directory**:
+
+```sh
+SFORGE_TASKS_DIR=/data/tasks python -m benchmark.edgebench.serve \
+  --log-dir /data/private-runs --port 8080
+python -m benchmark.edgebench.run \
+  --task TASK_ID --tasks-dir /data/tasks --log-dir /data/private-runs \
+  --run-id UNIQUE_ATTEMPT --worker native-goal --model MODEL --effort high \
+  --feedback native --submission-cooldown 1800 --eval-interval 300 \
+  --judge-url http://HOST:8080
+```
+
+For an alternative source, pass `--sforge-repository URL` with `--sforge-ref REF`
+or a full `--sforge-revision SHA` on the first entry (including preparation).
+For example, `--sforge-repository https://github.com/ByteDance-Seed/EdgeBench.git
+--sforge-ref refs/heads/main` selects upstream instead. These source options also
+apply to the online judge CLI; `SFORGE_LOG_DIR` is equivalent to `--log-dir` there.
+**Any explicit repository, ref, or revision selects unmodified source for a new
+cohort**, even when it names the default repository/branch. These selections use
+the original v1 receipt contract and do not apply the bundled patch. Use an
+explicit upstream SHA to replay an unmodified known revision; retain its native
+checkpoint limitations. For an already frozen cohort, options only assert that
+its existing selection matches; they cannot apply/remove a patch or change its
+commit. A server in another log directory is a separate cohort: the launcher
+cannot attest a remote server's loaded code.
+
+These defaults apply to the LoopX EdgeBench CLI. Direct `sforge serve` and imported
+Python APIs remain caller-managed compatibility entrypoints; use them only with
+an explicitly pinned provider environment. Keep offline backfill pinned to the
+original scorer, or record regrading under a different source separately.
+Maintainers update the shared branch through reviewed integration work and keep
+its PR manifest current. Changing the default repository/branch requires updating
+the single source file and this protocol; adding a second contributor-specific
+default would split the source of truth again.
+
+## Reserve a native evaluator per arm
+
+For matched native or blind archive-submission trials, give the judge the exact
+`--run-id` of each worker at startup. Use the same log directory for the judge and
+workers. This example reserves four evaluator lanes.
+
+```sh
+SFORGE_TASKS_DIR=/data/tasks python -m benchmark.edgebench.serve \
+  --log-dir /data/private-runs --port 8080 \
+  --judge-isolated-run official-01 --judge-isolated-run native-goal-01 \
+  --judge-isolated-run context-on-01 --judge-isolated-run context-off-01 \
+  --judge-max-concurrent 4 --judge-max-pending 4
+```
+
+Each listed run gets one FIFO evaluator and an equal share of
+`--judge-max-pending`, rounded down. A full lane rejects another submission
+before spending a round or starting its cooldown. The judge rejects
+registrations for unlisted run IDs. Set `--judge-max-concurrent` to at least the
+number of reserved runs and provision enough CPU, memory and host evaluation
+slots for all of them. Shared hardware can still affect grading latency.
+Omitting the run list selects the shared evaluator pool.
+
+### Inspect cached images by case
+
+The worker's existing Docker preflight records the local image ID and logical
+size for the work and judge images in `runtime-receipt.json`. Review observations
+across selected run directories without reading trajectories or contacting Docker:
+
+```sh
+python -m benchmark.edgebench.image_inventory \
+  --log-dir /data/private-runs --log-dir /data/older-runs --task TASK_ID
+```
+
+Omit `--task` to include every case in those directories. The report groups
+observations by task specification digest, image role and image ID. It counts
+older receipts without observations and keeps distinct image revisions separate.
+Docker's logical image sizes include shared layers. Use them for cache inventory,
+and measure incremental disk use and runtime memory separately. Observations
+describe the worker's local Docker daemon at preflight. A remote judge requires
+its own image provenance, and a later retag can change what gets launched.
+
+## Worker profiles
+
+The worker profiles are `official`, `single`, `native-goal`, `heartbeat-resume`,
+`heartbeat-explore`, and `turn-resume`. `official` uses SForge's Codex Stop
+hook and outer recovery. `single` executes once with neither. `native-goal` uses
+the shared native Codex Goal transport. The heartbeat profiles use the shared
+LoopX scheduler and resume store. `heartbeat-explore` additionally enables the
+existing Explore Graph and analysis-only Explore Harness gates with the
+`adaptive-resilient` profile; this grants no child-agent execution authority.
+
+Use `--worker turn-resume --validation-command-json '["/opt/task-checks/check-work"]'`
+to run the same case through the public `loopx turn run-once` entry. Supply a
+trusted executable available **inside the guest** that reads the normalized
+result on stdin and checks an independent work postcondition. Pin that
+executable with the trial image or source. The receipts record the digest of
+the argv. Keep hidden tests and judge credentials outside the solver. Only
+the native judge supplies the benchmark score.
+
+Both `heartbeat-resume` and `turn-resume` use the external quota scheduler,
+planned task entry and one Agent-scoped Codex session by default. Turn sends
+the captured work to the Host, runs the validator and settles through Core.
+For a comparison, freeze both source revisions, task, feedback, model, effort
+and effective solve time. Heartbeat's native context delivery defaults on.
+Turn uses its product Host request and reserves 160 seconds for managed cleanup.
+Allow for that difference when choosing the phase budget.
+
+A lost reply leaves a private pending marker. The next Turn wake looks up the
+original journal by Goal, Agent and wake identity. A committed replay produces
+no Host invocation or additional spend. Missing or conflicting history holds
+the wake for reconciliation. Older markers without a validator digest also
+require reconciliation against the original validator; the current command
+cannot establish that history. Retain the original trial state while diagnosing
+a failure. To return to heartbeat, select `heartbeat-resume` for a new trial.
+The Controller–Worker profile and its matched comparison are specified in the
+[delivery RFC](../../docs/architecture/rfcs/controller-executor-unified-contract-v0.md#from-current-code-to-a-useful-product-dependencies-and-delivery-slices).
+
+All profiles use the same explicitly staged Codex binary and model/effort. This
+permits an updated Codex version with the native scaffold; it is not a claim of
+identical settings to a published leaderboard. Preserve the version receipt and
+report hardware, emulation and every protocol deviation with results.
+
+Use the offline runtime payloads documented in
+[`benchmark/runtime/RUNTIME.md`](../runtime/RUNTIME.md). `CODEX_AUTH_JSON_PATH`
+opts into a private local Codex login; it is copied into each disposable trial
+and excluded from artifact collection. Host network isolation additionally
+permits the OpenAI OAuth endpoint for refresh during long runs.
+
+If the Linux host requires an HTTP proxy, start the restricted TLS relay with
+`python -m benchmark.runtime.connect_proxy --host BRIDGE_IP --port 9090
+--allow-host chatgpt.com --allow-host auth.openai.com`, with the host upstream
+in `HTTPS_PROXY`. Pass `--api-proxy-url http://BRIDGE_IP:9090` to the trial.
+The relay rejects other hosts and ports and never decrypts TLS. Check both an
+allowed TLS handshake and a denied external destination before admission;
+stop the relay process after the campaign. Do not expose an unrestricted host
+proxy to isolated tasks. This transport does not grant general internet access.
+`LOOPX_INSTALL_HTTPS_PROXY` may separately provide the trusted install phase's
+proxy when the pinned source installer needs to build frontend assets. It is
+passed only to setup subprocesses and cleared before solver execution and native
+network isolation. It is never placed in the container's persistent environment.
+
+### Retry transient API rate limits
+
+For API-key trials, an explicit `--provider-rate-limit-retry-seconds 900`
+lets the SForge host credential gateway retry HTTP 429 before forwarding any
+response bytes. Both `native-goal` and `official` workers use this transport.
+This requires a SForge revision with `agent_rate_limit_retry_seconds`; an older
+source or an OAuth-only route fails before launch when the option is requested.
+The default is zero, preserving historical pass-through behavior.
+
+The gateway honors `Retry-After` seconds and HTTP dates. Without a usable header,
+it backs off from about 5 seconds to at most 60 seconds, with jitter, within the
+configured window. A provider delay beyond the remaining window returns the
+original 429 instead of retrying early. Cancellation or trial cleanup stops
+further retries. Other status codes and already-started streams are passed
+through without gateway replay. Upstream requests already in flight retain the
+existing request timeout.
+
+This is distinct from Codex `stream_max_retries`: a directly returned HTTP 429
+can terminate a native Goal without entering the stream retry loop. Increasing
+that count alone does not qualify HTTP 429 recovery. The gateway preserves the
+request, Codex session, Goal, workspace and original trial deadline; retry wait
+consumes that deadline. It does not continue a completed Goal or grant more time.
+The run receipt records the configured retry window and source revision; proxy
+logs record retry counts and delays without prompts or credentials. Apply the
+same option to comparison arms and keep older attempts under their original
+settings. Sustained limits beyond the window can still fail the trial.
+
+### Continue after native account exhaustion
+
+Keep a quota interruption distinct from a task result. Codex's message-only
+`You've hit your usage limit` failure is hard quota; generic HTTP 429, unknown
+codes, authentication failures and unavailable quota observations do not prove
+that another login should be selected. Do not keep restarting an exhausted
+account, change the model or restart a task from zero to hide the interruption.
+
+On the host that owns the installed Native Codex accounts, an authorized
+operator can reuse that provider's credential reader and TypeScript selection
+policy to prepare an isolated continuation login. Install the optional
+[`loopx-codex-provider-routing`](../../packages/loopx-codex-provider-routing/NATIVE.md)
+package in this Python environment. Explicitly choose the permitted slots and
+retain the source run's absolute deadline:
+
+```sh
+python -m benchmark.runtime.codex_accounts \
+  --source-login /private/source-profile/auth.json \
+  --destination /private/continuation-profile --slots a b c \
+  --operation-id quota-continuation-1 --run-id SOURCE_RUN \
+  --deadline-epoch ORIGINAL_ABSOLUTE_DEADLINE
+```
+
+Preview only observes allowance. Add `--execute` to create one new private
+profile after fresh source exhaustion and target availability are verified.
+The content-free result reports the selected slot. Credentials never appear in
+stdout; the prepared `auth.json` is the ordinary `CODEX_AUTH_JSON_PATH` input.
+Native global selection, desktop clients, model configuration and history are
+untouched. A repeated operation verifies its original receipt and bytes; a
+partial or changed destination requires inspection, never an overwrite.
+Recheck usable allowance before admitting a delayed launch. This helper does
+not refresh logins, buy credits, launch jobs or mutate an active worker home.
+
+For a checkpoint-enabled worker whose container was removed, use the latest
+verified complete checkpoint with the standard `--restore-checkpoint` flow,
+fresh destination run/Goal/Agent identities and the selected login. Preserve
+the old failed attempt, source revision, research/session history, incumbent,
+accepted submission counters and remaining cooldown. Keep inherited and new
+results separate in the maintained comparison view. A credential preparation
+receipt alone does not qualify session recovery or subsequent useful work.
+
+The native checkpoint controller preserves captured remaining phase duration;
+it does **not** by itself retain the source's absolute wall-clock deadline.
+When that original deadline remains binding, the run owner must enforce an
+external finite cutoff at that deadline, including cleanup reserve. Do not edit
+the sealed checkpoint or activation receipt, grant a fresh task budget, refill
+evaluation opportunities or silently extend the experiment by its offline time.
+An Official worker without a checkpoint must retain its existing session and
+use its authorized runtime owner's idle credential handoff; this preparation
+helper does not provide a live credential-replacement transaction.
+
+An unchanged stopped heartbeat worker with a completed Host or an empty-output
+legacy failure can use the explicit [idle-host handoff](../runtime/RUNTIME.md) after independent
+native-history, source, current Goal and account qualification. Seal with
+`python -m benchmark.edgebench.stopped_recovery --idle-host-handoff` using the
+original source declaration; then select the original scheduler digest with
+`benchmark.runtime.scheduler --idle-host-state-sha256`. Both options are off by
+default. The original return, session, and source remain recorded.
+Native judge restoration, opportunity/cooldown conservation, the audited
+remaining allowance and a finite owner cutoff remain separate requirements.
+It does not apply to Official or native-Goal workers.
+
+When the product must run from main while the adapter is under development, set
+`LOOPX_SRC_DIR` / `LOOPX_EXPECTED_COMMIT` to the clean product checkout and
+`LOOPX_RUNNER_SRC_DIR` / `LOOPX_EXPECTED_RUNNER_COMMIT` to the clean runner checkout.
+Only `benchmark/runtime` is overlaid from the runner archive; installed LoopX
+code remains at the product pin. Both revisions are recorded. Without separate
+runner settings, the existing single-checkout contract applies.
+
+For an explicitly selected best-only trial, start the dedicated online judge with the same task
+and private log roots. It requires a pinned SForge revision with bounded
+asynchronous judge capacity (`judge_max_concurrent` / `judge_max_pending`).
+Each slot reserves one solver (4 CPUs/16 GiB) and one evaluator (4 CPUs/8 GiB):
+
+```sh
+SFORGE_TASKS_DIR=/data/tasks SFORGE_LOG_DIR=/data/private-runs \
+  python -m benchmark.edgebench.online_judge --slots 2 --port 8080
+```
+
+The preflight counts existing Docker container limits and retains 2 CPUs/4 GiB
+of host headroom. Unlimited containers or insufficient capacity block admission.
+Run this in an operator-controlled Docker pool: the host lock coordinates this
+adapter's online/offline processes, not arbitrary outside Docker launches. Keep
+that reserved capacity available for the cohort. Online policy v2 releases a
+run's slot after verified worker removal. An evaluation still in flight keeps
+that slot until its native result is terminal; stopping a solver alone does not
+free evaluator capacity. Native histories, archives and original registration
+identities remain readable, and released registrations reject new captures.
+Native/blind use `python -m benchmark.edgebench.serve` instead. Existing v1 cohorts remain
+frozen: this does not upgrade or reclaim slots in an already-running server.
+
+An operator may explicitly pass `--allow-resource-overcommit` for a monitored
+shared Docker pool. Container CPU/memory ceilings then remain enforced, but are
+not treated as exclusive reservations. Startup requires available memory for
+each evaluator's ceiling, up to 4 GiB per worker, and 4 GiB host headroom; unknown
+container limits still block admission. The admission receipt explicitly records
+zero exclusive reservation and the monitoring requirement. Monitor actual memory,
+CPU pressure and grading latency throughout the cohort and stop affected trials
+if sustained pressure makes operation unreliable. This mode preserves per-run
+evaluation lanes but does not guarantee dedicated compute or equal latency;
+record shared-pool contention when comparing experiments. For a larger explicitly
+shared cohort, `--shared-startup-memory-gib 16` may replace the per-slot startup
+estimate. It requires `--allow-resource-overcommit`, cannot be below one evaluator,
+one worker startup allowance and host headroom (16 GiB with current limits), and
+still fails on insufficient available memory or unbounded containers. This is a
+startup margin, not sustained capacity qualification: retain continuous load and
+grading-latency monitoring and stop affected trials on sustained pressure. Strict
+admission and the shared mode without this explicit option retain their defaults.
+
+Then run:
+
+```sh
+python -m benchmark.edgebench.run \
+  --task TASK_ID --tasks-dir /data/tasks --log-dir /data/private-runs \
+  --run-id UNIQUE_ATTEMPT --worker heartbeat-resume \
+  --feedback best-only \
+  --model MODEL --effort xhigh --judge-url http://HOST:8080 \
+  --api-proxy-url http://PROXY_IP:9090
+```
+
+Trial timeouts use **explicit `--timeout` → [task defaults](task-defaults.json)
+→ 64,800 seconds (18 hours)**. Portfolio Risk Calibration defaults to
+**43,200 seconds (12 hours)**; Lean Analysis Proofs defaults to
+**43,200 seconds (12 hours)**. Both task defaults apply to every worker and
+feedback profile; other tasks retain the 18-hour fallback. These are total trial
+budgets, including planning, not per-turn limits.
+
+New trials disable LoopX's background usage sender with `LOOPX_USAGE_PING=0`.
+The shared runtime sets it for installation/control commands and explicitly in
+Codex's shell environment policy for every worker profile. Install and worker
+receipts record `loopx_usage_ping_enabled: false`; this records the configured
+policy, not a claim of measured model adoption or throughput. This research
+setting avoids an unnecessary detached statistics process per CLI invocation.
+It does not change product defaults, scoring or feedback, and does not replace
+container-provider orphan reaping. Existing trials retain their pinned settings.
+
+SForge `loopx-planned` has **no independent planning timeout**. Planning and
+execution share the original absolute trial deadline; planning consumes that
+budget and a process resume cannot reset it. Runtime and worker receipts record
+`planning_timeout_seconds: null`. The existing 160-second startup/settlement
+reserve still controls admission of execution wakes. Shared Harbor retains its
+300-second planning default.
+
+The adapter also records the actual solver command's exit code, timeout and
+elapsed time in `execution-receipt.json`. A positive runtime alone no longer
+qualifies completion. An expired deadline before execution entry fails; an inner
+GNU timeout after verified execution entry is a normal budget stop. Other nonzero
+or unknown exits, including an early exit with code 124, are `runner_failed` and
+do not publish `final_result.json`. Keep their captures and failure evidence;
+do not count an initial artifact's score as a solver outcome.
+For native Goals with positive runtime, `partial_result.json` preserves the full
+scoring result and its `runtime_status` / `native_goal_outcome` without making
+SForge's visualizer count the attempt as done. A handled terminal stop records
+completed execution, not necessarily completed grading. When the native result
+includes `grading_status`, only `complete` permits `final_result.json`; explicit
+`pending`, `unknown` or other values remain in `partial_result.json`, preserving
+the native grading reason, scores and `runtime_status: terminal`. The report
+exporter also rejects explicit incomplete grading, including older attempts that
+already wrote a final marker. Sources predating `grading_status` retain their
+existing completion behavior; absence does not add a new grading attestation.
+Result publication does not rescore submissions, replace the current final
+archive with a historical best, or rewrite native history. A final marker still
+does not independently qualify a score. Use new source pins for new attempts and
+leave frozen histories unchanged; see the
+[native outcome contract](../runtime/RUNTIME.md) for rollback and classification.
+
+New native archive-submission trials default to **no periodic auto-evaluation**
+(`--eval-interval 0`) and **3,600 seconds between accepted active submissions**.
+The first submission is immediately eligible. The native judge measures cooldown
+from acceptance, not result arrival; unused intervals do not bank extra submissions.
+These defaults apply equally to all five workers. The startup prompt describes
+the resolved cooldown and keeps submission paths runnable as the current promising
+candidate, with a separate checkpoint of the best supported version. It does not
+require every local proxy metric to improve before exposing a candidate.
+The same policy body is appended to the task workspace's `AGENTS.md` before model
+entry, preserving the task's existing instructions. The runner reads it back as
+the ordinary worker and records `workspace-AGENTS.md` in the private trial log.
+Resume does not rewrite later task edits. A conflicting/partial policy block,
+symlink, non-file target, write failure or readback mismatch stops entry. This
+provides durable instructions across continuation and context compression;
+file delivery is not evidence that the model read or followed them.
+
+Blind and best-only retain **explicit `--eval-interval` → task defaults →
+300 seconds**, and their existing 120-second native submission setting. Best-only
+requires a positive interval. Native/blind permit zero; negative intervals or
+cooldowns are rejected before creating an attempt directory. Explicit values
+override these defaults and are passed to SForge and recorded in the runtime
+receipt. Native terminal evaluation and native final selection remain unchanged.
+An explicitly enabled periodic sampler can add hidden evaluations to native final
+selection; it is not a feedback-budget control or an independent holdout.
+
+These are research-adapter defaults. The upstream Codex leaderboard experiment
+[configuration](https://github.com/ByteDance-Seed/EdgeBench/blob/main/examples/all-tasks-k8s/experiment-codex.yaml)
+uses 1,800 seconds for these tasks. A native-agent `official` arm does not imply
+that all leaderboard settings are reproduced. Existing attempts keep their
+recorded sampling interval; new defaults never rewrite a running attempt or
+create historical snapshots. Sampling cadence does not set evaluator
+concurrency or replace the submission cooldown.
+`--timeout`,
+`--eval-interval`, and `--submission-cooldown` support explicitly recorded
+qualification runs. The shared Harbor defaults are unchanged. Native task
+internet policy is retained. Each attempt requires a new output directory.
+
+Heartbeat and native Goal workers have no independent per-call time limit.
+The shared worker uses the remaining trial budget, retaining 160 seconds for
+startup/cleanup; natural completion determines continuation boundaries. A second
+scheduler wake alone does not prove resume: verify another actual model
+invocation with the same session identity. Native Goal owns its continuation
+without an outer resume loop. Heartbeat profiles now also disable SForge outer
+recovery: their LoopX scheduler owns repeated wakes, error backoff and terminal
+exit. Once it exits, SForge collects the final artifacts instead of restarting
+the scheduler. This changes the heartbeat transport, not LoopX's decision to
+continue or end a lane; scheduler exit alone does not prove task success.
+The private execution receipt distinguishes wrapper startup from actual work
+entry. For LoopX workers, both inner deadline expiry and Docker's outer timeout
+must have an execution-entry marker before the runner writes a final result;
+a timeout during planning remains a failed attempt. Direct native Codex commands
+enter execution without that planning wrapper. Cancellation remains separate.
+The official profile retains native outer recovery, and single/native Goal
+behavior is unchanged. Record a new runner revision for new attempts; do not
+rewrite earlier `outer_resume` receipts. Explicit total timeouts can support diagnostics,
+but short probes are not a prerequisite for running the intended protocol.
+
+## Feedback protocol (new-run default: native)
+
+`--feedback native` is the default for **new attempts across all five workers**,
+replacing best-only. This changes new-run defaults, not existing trials or pinned
+study manifests, and does not establish a score improvement. Native feedback
+retains the provider's complete public result; a score-only API/artifact filter
+is not implemented. Freeze feedback content, cooldown, terminal selection and
+resource policy in the study manifest before launching a new comparison.
+Use explicit `--feedback best-only` to retain strict-improvement publication, or
+`--feedback blind` as an evaluator-feedback-free control. Harbor is unchanged.
+
+### Native artifact evidence and independent measurements
+
+Native heartbeat workers with `--execution-observation local_probe` expose
+`loopx-bind-native-candidate` as an artifact reader. Native results do not need
+a preceding successful local execution:
+
+```sh
+loopx-bind-native-candidate --result native-result.json
+```
+
+The original receipt names the accepted upload as `archive:<sha256>` and records
+its size. This offline command checks the receipt shape, not service identity.
+For additional file-content evidence, pass `--archive submission.tar.gz`. It
+checks the original receipt against the bytes and safely reads the complete
+ordinary gzip tar without extracting files, bounded to 256 members and 64 MiB
+compressed/expanded. The returned `submitted_file_set_ref` uses the shared
+Explore `candidate_content` path-and-byte manifest. File mode, packing, build
+lineage and execution conditions remain separate; equal content refs alone do
+not prove equivalent execution. Generated outputs belong to the full file set,
+and a probe's selected subset or extra fixtures are a different subject.
+
+Local and native producers each retain their own actual workload, evaluator,
+subject and evidence through ordinary Explore measurements. There is no
+required local-to-native work order. Missing content evidence limits pairing,
+not retention of an otherwise valid result. Never rewrite an earlier
+measurement or resubmit merely to force a candidate match. When the installed
+native client advertises `--retain-archive` and `--json`, it can retain bytes of
+a planned upload; this is optional evidence, not an extra evaluation.
+
+The old `--observation`, `--snapshot` and `--generated-file` options remain an
+explicit offline diagnostic for sealed probe artifacts. They keep their strict
+original correspondence checks and do not gate ordinary native facts.
+
+For an explicit native Explore trial, opt in with `--native-result-comparison`.
+`local_probe` is an independent option. Split source pins must also include the
+product's existing `record_work_finding` and `explore finding --result-json`
+entrypoint. Preflight rejects an older product explicitly; startup checks the
+actual staged product APIs before qualifying the service context. Use `--submission-id ID` instead of
+`--result FILE` to read one existing result. A single GET supplies native feedback
+and, when its service receipt/context are valid, a formal `native_measurement`
+with the stable accepted `archive:<sha256>` subject. No local execution or local
+archive is required. Optional `--archive` adds file-content evidence; its absence
+or mismatch does not erase a valid formal measurement or change its subject.
+Pending or unverified service results retain raw feedback with no measurement.
+
+This opt-in requires the native service's run-scoped `/context` route. Before
+the solver starts, the runner checks the task and benchmark digests and score
+direction against that service's fixed registration. The installed
+`evaluation_ref` fingerprints the service's task specification, grading source,
+immutable judge image, execution configuration and selection policy; use it for
+the native Yardstick. The result receipt must carry that exact registration and
+conditions. A local checkout label does not identify the running evaluator.
+Older services without this context require ordinary native feedback instead;
+older results without those conditions remain unpaired. Qualification adds one
+startup request and no extra request to each result read. The conditions do not
+claim to freeze external services or mutable external data.
+
+Record local and native measurements on the same claimed Todo with
+[`loopx explore finding --result-json`](../../loopx/capabilities/explore/README.md#quantitative-findings).
+Reuse the applicable question; each producer keeps its original workload, evaluator
+and subject. Different profile revisions are valid. Pair only the same subject
+under applicable conditions; content equality alone does not alias an archive or
+prove execution equivalence. Explore returns
+the comparable change in the write receipt. With a declared Yardstick, the
+receipt can show that the two evaluators prefer different candidates. The
+native read creates no finding and spends no submission opportunity.
+
+
+The common content capture lives in the product's existing Explore producer
+neighborhood; benchmark runtime only adapts native receipt/archive fields. A
+split product/runner install selecting capture must pin a product revision with
+`loopx.capabilities.explore.candidate_content`. Preflight rejects an older
+product before worker staging; it never overlays product code or falls back to
+a benchmark copy. Omitted capture preserves the historical source-pin behavior.
+
+
+For native archive submission, start `python -m benchmark.edgebench.serve` and use the runner
+without `--feedback` to select the defaults. Explicit
+`--feedback native --submission-cooldown 120 --eval-interval 300` restores the
+previous native timing for a new attempt. Do not edit running receipts. Game
+tasks retain the provider's game prompt and API; the archive-submission cooldown
+does not limit game API calls.
+
+The pinned native judge's cooldown is in-memory session state. Server restart or
+fresh registration does not prove cooldown continuity or safe retry after an
+ambiguous response. For matched trials, [reserve a native evaluator per arm](#reserve-a-native-evaluator-per-arm)
+and record the scheduling configuration in the study manifest. Qualify restart
+and reconciliation, shared-host contention and infrastructure failure accounting
+before admitting a campaign.
+
+The shared native task policy also describes accepted-result recovery. Check the
+pinned provider's generated `sforge-submit --help`: clients that support
+`--result ID` can use `sforge-submit --result ID --details` to read or poll an
+already accepted submission without a new evaluation or cooldown reset. If the
+acceptance reply was lost, inspect `sforge-submit --list` and reconcile the
+submission identity before retrieving it. Plain `--details` still
+creates a new submission. Older clients may lack result lookup; unavailable
+commands, missing sessions and missing results remain unresolved feedback,
+and never justify blind resubmission. This does not add restart persistence.
+
+New non-game native trials describe the task, submission tools, feedback and
+evaluation rules in the startup prompt and workspace `AGENTS.md`. The wrapper no
+longer prescribes incremental implementation or a best-validated-candidate
+workflow. A brief objective/completion reminder retains continued optimization:
+implementation, passing checks and submission alone do not complete the objective.
+Useful in-scope improvements remain the goal. The wrapper does not repeat a
+generic stop/budget/blocker reminder; the original task and runner still own
+those boundaries. The wrapper adds no local-test pass or
+prior-improvement prerequisite for submission; task-owned requirements still
+apply. New LoopX Goals retain the original `agent_query` as their objective,
+including references to task files. Existing Goals and restored checkpoints keep
+their captured objective.
+
+Native submission prompts omit the host's periodic sampling explanation, both
+when the interval is positive and when it is zero. The interval still reaches
+the runner unchanged; it no longer changes the native prompt. Host capture and
+selection behavior are unchanged. The prompt retains on-disk manual/terminal
+submission, recoverable candidate and result/source identity guidance without
+adding a local-test pass or prior-improvement requirement.
+
+Blind and best-only prompts still describe automatic capture using the resolved
+runner interval: positive intervals name the independent on-disk sampling and
+runnable-candidate requirement; zero reports periodic evaluation as disabled.
+The shared observation describes capture, not feedback access. Blind exposes no
+official feedback; best-only retains its strictly improving snapshot channel.
+
+Shared `loopx-planned` entry also drops the adapter's research-strategy prefix.
+The product planning packet, including Core first-delivery guidance, is unchanged
+and remains a separate experimental variable. Optional execution observations
+and checkpoint storage guidance retain their explicit selection; LoopX arms
+always run the `evidence_conditioned_v1` stride policy.
+Budgets and deadlines stay with the existing runner. Opted-in native Goal
+continuation retains the original task and evaluation rules without requiring a
+prior improvement claim before submission.
+
+This is a prompt-policy behavior change for new native attempts across all five
+workers. Grading, cooldown, selection, blind/best-only task wrappers, game prompts
+and frozen runs are unchanged. Pin the new runner revision for new trials;
+cross-version comparisons also change prompt policy and cannot isolate feedback
+alone. Instruction readback establishes neither earlier feedback nor score gains;
+those require matched studies.
+
+| Mode | Agent-visible evaluator feedback | Evaluation access |
+| --- | --- | --- |
+| native | Exact score, pass rate, counts, summary, metrics and failed names; `--details` exposes per-check messages; `--list` shows active-submission history | Agent may submit within the native cooldown/budget; automatic samples are hidden |
+| blind | None; public task files, local tests and compiler feedback remain available | Host evaluates fixed automatic samples; agent has no judge route or credentials |
+| best-only | Latest strict improvement's complete official result API response and corresponding submitted-source checkpoint; baseline, ties, regressions and unsuccessful evaluations stay silent | Fixed capture cadence; one evaluator and latest pending capture per run; agent cannot request extra evaluations |
+
+Best-only supports non-game, offline tasks with `score_first`,
+`valid_then_score` or `pass_rate_first` selection, including maximizing and minimizing scores. It
+requires the explicit API-only proxy and a positive sampling interval. Unsupported
+selection policies fail with an actionable error instead of silently changing
+the task's ranking. Native grading and score selection remain unchanged. The
+publisher requires the online judge and runner to share their native log root,
+including each submission's original source archive. Ordinary native judges fail
+the best-only admission preflight before a solver is launched.
+
+Online scheduling keeps one evaluation in flight and one latest pending capture
+per run. Every capture is archived with its original capture time and digest;
+new captures supersede only the pending online candidate. A run cannot fill a
+shared FIFO with stale samples, and a second run has its own reserved opportunity.
+This guarantees capacity opportunity, not identical grading duration or equal
+numbers of improvements. Submission retries reuse an epoch-bound capture identity;
+a lost response cannot create duplicate evaluations. An unexpected judge restart
+holds that attempt for reconciliation instead of silently replaying it.
+
+The publisher accepts only that sampler's admitted submission/round identities
+and verifies the original source digest. Before publication it fetches the
+selected submission's official result, verifies task/submission/score/pass-rate
+against native history, and checks the admission epoch and evaluator provenance.
+Provenance includes native Python source and task-specification digests, the judge
+image key, selection policy and score direction; the image key is not an immutable
+image-content attestation. Result-body digests bind hook delivery to that response.
+An unavailable or mismatched response preserves the incumbent for retry.
+The response is returned in full as provided by the native API, including any
+summary, metrics and diagnostics the task supplies. This does not expand access
+to raw judge output, hidden files, evaluator code or unrelated trials.
+Offline/history-only results cannot
+establish the baseline or change the online incumbent. The solver command's exit
+pauses capture/delivery; official outer resume reuses the same publisher and lane.
+After native worker cleanup, the host sends an epoch-bound release for the exact
+run/task, including failures before feedback startup. The private
+`online-captures/release.json` records acknowledgement without credentials.
+Release is idempotent and does not cancel an evaluation or erase native history.
+If cleanup or release acknowledgement fails, treat release as unconfirmed and
+reconcile the exact registration before replacement admission; do not restart
+the live judge.
+
+After the entire online cohort ends, stop its judge and backfill all captures:
+
+```sh
+python -m benchmark.edgebench.offline_scoring \
+  --trial /data/private-runs/runs/UNIQUE_ATTEMPT/TASK_ID --tasks-dir /data/tasks
+```
+
+The offline command requires terminal solver state, the original task digest and
+a final capture. It acquires the same exclusive pool lock, runs native grading
+sequentially, and writes a separate `offline-scoring/result.json`. Superseded and
+final captures remain visible at their original times. Failed scores remain
+failed; a rerun resumes saved results without silently retrying or rewriting them.
+This first implementation reevaluates online captures too, favoring a complete
+uniform offline record over evaluation reuse. The original native final result
+covers online submissions only; use the complete offline result for post-run
+qualification. Neither report by itself certifies integrity or score countability.
+No offline result is routed to the worker.
+
+Offline score files, the combined result and the command's summary retain native
+non-finite scores and nested metrics. Finite documents keep their existing JSON.
+Other documents use the local `sforge_nonfinite_json: 1` transport envelope:
+`value` contains JSON data with each non-finite number replaced by `null`, and
+`nonfinite_values` records its path and `positive_infinity`, `negative_infinity`
+or `nan` kind. Use `benchmark.runtime.sforge_json.loads` to read either form.
+Restart decodes saved scores before calling the unchanged native selector;
+it does not turn these results into zero, missing feedback or grading errors.
+Literal marker-shaped metrics remain data, including an escaped root marker.
+Malformed paths, duplicate keys and unmarked non-finite constants are rejected.
+
+The first completed valid finite score establishes a silent baseline. The task's
+native selection policy is the sole improvement criterion among valid scored
+snapshots. Only a strictly better native rank updates `/opt/edgebench-feedback/latest.json`; ties,
+regressions, invalid/non-finite results and errors do not update it. Multiple
+completed improvements observed together coalesce to the best one. Out-of-order
+results compete against the best observed native rank, never against the last result.
+For `pass_rate_first`, a higher pass rate can be an improvement even when its
+scalar score is lower; a scalar gain with a lower native rank is silent.
+When that policy returns no winner (for example, all pass rates are zero),
+polling stays silent and continues normally. A later native winner can improve
+the already established baseline; no scalar fallback or evaluator change is used.
+Notifications describe the named **evaluated snapshot**, not the current workspace.
+The source archive is the agent's own original submission, with its SHA-256; it
+contains no judge output. The adapter never restores files automatically.
+Before publishing an improvement, the adapter makes only the disclosed copy
+readable and verifies its digest as the ordinary `agent` worker. A read or digest
+failure retains the previous notification and incumbent for retry. Private host
+archives retain their original permissions; evaluator and secret directories
+are not made public. The hook script and system hook configuration are also
+checked for ordinary-worker readability before handoff.
+
+All five workers receive the source-bound official result directly through managed
+Codex `PostToolUse`, `SessionStart` and `UserPromptSubmit` hooks. A short synchronous
+reader adds `additionalContext` before the next model request, preserving the
+original tool result. It does not force a wake, interrupt active reasoning or
+change Stop/continuation behavior. The official worker keeps its native Stop
+hook. Delivery is serialized and deduplicated per Codex session; a fresh session
+receives the latest checkpoint, while resume receives only a new one. The
+reader neither queries the evaluator nor interprets arbitrary packet prose.
+Official report text is evaluation data, not executable instructions or authority.
+
+Qualification uses a real native judge and publisher, staged Codex 0.160.0, the
+actual system hook in a disposable container and a synthetic Responses endpoint:
+a complete official result arriving
+during a tool call enters the next model request; a subsequent result enters a
+resumed request. Earlier Codex versions must be qualified before admission.
+Inspect session input and subsequent checkpoint adoption separately: injection
+proves model visibility, not use or score improvement. A missing notification
+says nothing about failure: evaluation or delivery may still be pending.
+
+A notification looks like this (digest abbreviated for illustration):
+
+```json
+{
+  "schema_version": "edgebench_best_feedback_v2",
+  "latest": {
+    "kind": "new_best",
+    "snapshot_id": "auto-7",
+    "source_sha256": "<SHA-256>",
+    "source_archive": "/opt/edgebench-feedback/auto-7-<SHA-256>.tar.gz",
+    "run_id": "example-run",
+    "task_id": "example-task",
+    "online_epoch": "<judge-process-epoch>",
+    "evaluator": {
+      "native_source_sha256": "<SHA-256>",
+      "task_spec_sha256": "<SHA-256>",
+      "judge_image_key": "example.judge.task:version",
+      "selection": "score_first",
+      "score_direction": "maximize"
+    },
+    "result_sha256": "<SHA-256 of the canonical official_result JSON>",
+    "official_result": {
+      "submission_id": "example-submission",
+      "status": "completed",
+      "error": null,
+      "report": {
+        "task_id": "example-task",
+        "submission_id": "example-submission",
+        "valid": true,
+        "score": 3,
+        "pass_rate": 0.75,
+        "summary": "Task-provided official summary",
+        "metrics": {"coverage": 0.75}
+      }
+    },
+    "message": "This evaluated snapshot strictly improved the task's native ranking among valid scored snapshots. It may differ from your current files; keep using local validation."
+  }
+}
+```
+
+Before the first improvement, `latest` is null. Native outer resume preserves the
+same publisher and session cursor; it does not reset the incumbent. Delivery
+failures retry before committing an improvement. The host-only `best-only-host`
+artifacts record file publication and health; never mount or copy them into the
+worker. Worker-local session hook receipts under `/logs/agent/best-feedback-delivery`
+record emission, not model acknowledgement.
+Each hook reads the current packet while holding its session delivery lock, so a
+waiting reader cannot overwrite a newer delivery cursor and replay old feedback.
+Treat missing archive/delivery evidence as an unqualified treatment, not as a
+successful best-only trial. Public notifications do not include these errors.
+
+The delivery hook uses the runner's staged `LOOPX_PORTABLE_PYTHON` interpreter,
+including for Official and Single workers. A task image does not need to provide
+`python3` on its PATH. Native and blind plain workers retain their installation
+path without this additional staging.
+
+Sparse feedback reduces disclosed information but still supports adaptive tuning;
+it does not prove protection against evaluator overfitting or generalization.
+Keep native/blind comparisons and any independent final evaluation separate.
+First qualify the real network/judge boundary with the opt-in Docker smoke in
+`benchmark/tests/test_edgebench_feedback_docker.py`, then compare matched tasks,
+models, budgets and sampling schedules. Synthetic transport validation alone
+cannot establish solver uptake or score improvement.
+
+`--feedback native` preserves native evaluator feedback.
+`--feedback blind` requires a non-game task with native internet isolation and
+an explicit API-only proxy IP/port. Its host firewall omits the judge route;
+native registration sets the agent submission allowance to zero, task environments
+omit judge credentials, and the submission command is removed. Its prompt keeps
+the task query, deliverable paths, incremental iteration, runnable files,
+best-version objective and no penalty for failed attempts. Local validation
+replaces official feedback instructions; submission limits and host evaluation
+details are omitted. Host auto-evaluation is unchanged, and neither its existence,
+schedule nor results enter the blind prompt. `agent_prompt.md` records the actual
+overridden prompt, including for native Goal and heartbeat workers.
+
+This provider-specific prompt variant lives with the Python SForge adapter; it
+does not change LoopX goal authority or the official native wrapper. Earlier
+blind trials used a minimal task-only wrapper and are a different protocol:
+restart with a new attempt id rather than splicing their curves. Report actual
+runtime separately from the time limit, and distinguish the agent's final
+artifact from the evaluator-selected historical best. Prompt parity does not
+establish feedback isolation or matched experimental validity by itself.
+Qualify actual denied judge reads/submissions and successful host evaluation
+before admitting blind trial results; a prompt or unit test alone is insufficient.
+Configuration receipts prove requested startup settings; actual session model,
+resume continuity, capability use, evaluator completion and integrity need
+runtime/post-run qualification before any score is countable. Raw trial outputs
+and credentials belong outside the public repository.
+
+## Research checkpoint storage
+
+New native non-game runs give every worker profile the same research directory,
+`/tmp/loopx-benchmark-research`, outside the task workspace and submitted paths.
+Keep experiment notes, local probes and candidate history there; required build
+and runtime inputs still belong in the task's declared submission paths. The
+runner does not filter submissions, extend evaluator feedback or alter grading.
+Overlapping submission/capture roots and existing unrelated data at this reserved
+path reject setup before solver execution.
+
+Terminal collection retains this directory under `collected/research`. With an
+explicit checkpoint request, the runner adds a separate `benchmark_research`
+component to the staged declaration, without modifying the caller's file. Warm
+continuation restores that exact component at its original path through the
+ordinary verified research-file transport. Other external research components
+still require explicit selection. Old checkpoints remain valid and preserve
+their workspace files; they start with an empty external research directory,
+without automatic relocation or deletion of historical artifacts. A warm receiver
+appends a bounded storage-policy update to its existing `AGENTS.md`, preserving
+the original task text and prior feedback policy; it does not rewrite the sealed
+checkpoint or Goal state. Terminal
+collection alone does not make a run resumable. Game and restricted-feedback
+runs retain their existing storage behavior.
+
+Full controller capture requires a filesystem that preserves case-sensitive and
+Unicode-normalization-sensitive filenames. A Linux controller using a shared
+host volume may not have those properties. New controller-enabled launches probe
+the export volume before native registration; incompatible storage fails early
+instead of losing a later replan checkpoint. Capture-disabled runs do not probe it.
+
+Use `--checkpoint-export-root /data/private-checkpoints` to place full worker
+exports on a separately provisioned compatible volume. The root must already
+exist and be a physical absolute directory. Each run uses
+`ROOT/RUN_ID/TASK_ID/checkpoints`, which must not already exist; its private runtime receipt records
+`checkpoint_export_directory`. Without the option, the original
+`LOG_DIR/runs/RUN_ID/TASK_ID/checkpoints` location remains in use. The probe checks
+filename fidelity, not free space or retention capacity: reserve enough space for
+the source export and sealed copy. Credentials and native evaluator storage keep
+their existing owners. No worker path, scoring, deadline or capture opportunity
+changes. Select this option only for a new run; it does not relocate a running
+bank or recover a missed point.
+
+## Preserve a failed worker before teardown
+
+For a new heartbeat run with full native controller capture, add
+`--preserve-failed-worker` to preserve the last source after a nonzero or uncertain
+solver exit. This is opt-in and requires agent-only submissions (`--eval-interval 0`);
+ordinary runs, successful exits and Native Goal completion keep their previous
+cleanup behavior. Removing the option disables the policy for later runs; it does
+not delete a previously retained worker.
+
+At the exact solver-return boundary, before the native provider stops its work
+container, the adapter closes the periodic observer and attempts one bounded joint
+capture through the existing Docker writer barrier and native checkpoint owner.
+It captures the complete task workspace, declared external research components,
+Goal state, scheduler/wake evidence, native session/configuration and native SQLite
+participants (including committed WAL data). It never exports the native credential
+home or `auth.json`. The native capsule retains its own submission history,
+incumbent, opportunity counter, cooldown and original phase. No new submission,
+model request, successful settlement or extended clock is created.
+
+The trial's private `terminal-preservation.json` records the original execution,
+export outcome/digest, preservation time and confirmed stopped-container state.
+The file export explicitly remains **unqualified for restoration**: a failed native
+Turn is not a completed conversation checkpoint. Both successful and failed exports
+retain the original stopped container until an operator separately qualifies a
+receiver or authorizes disposal. Compute is stopped before returning to provider final-archive extraction or
+grading drain, and cleanup verifies that stop again;
+a stop failure is reported without deleting the source. Missing participants, full
+storage or an uncertain writer barrier cannot fall through to force-removal.
+The provider still performs its ordinary network/proxy cleanup and grader drain.
+Its best-effort final submission archive may be absent because its extraction
+requires a running container; latest files remain in the stopped source and, on
+successful export, the terminal point. Native graded history/results remain
+independent and are not discarded with that optional archive.
+
+If the joint export failed, a confirmed stopped worker with a completed grading
+drain gets one independent native scorer capture before the original scorer
+exits. The receipt links this separate checkpoint, including the released results,
+incumbent and consumed rounds. It carries no worker clock or resume qualification;
+a receiver still needs to prove the original workspace, session and remaining
+allowance together. An unknown grading outcome or unconfirmed stop does not
+trigger this capture.
+If the native runner raises after writing its drain receipt, the runner
+checks the matching run history before attempting the same capture.
+
+If the optional preservation receipt cannot be written, a redacted warning reports
+that gap; observer shutdown, one capture attempt and verified source stopping
+still proceed. The known solver exit and native grading remain authoritative.
+An unconfirmed stop still fails explicitly, even if receipt storage also fails.
+Missing receipt files never establish successful export or recovery eligibility.
+
+Inspect this receipt, the exported manifest and the exact retained container before
+planning recovery. Do not restart it, treat a file digest as receiver adoption, or
+roll back to an older point to fill a tail gap. Retained containers still occupy
+**disk** and may contain their original private credentials; reserve storage and
+explicitly dispose of the exact owned container after recovery/disposal approval.
+Terminal preservation does not rotate away the last qualified regular checkpoint,
+and it does not increase the daily/fresh-replan capture frequency.
+
+## Default research checkpoint retention
+
+**Default change:** new controller-enabled native runs automatically keep only
+the newest complete point plus explicit pins. After publishing a successful
+capture reply, a separate storage worker applies the policy saved at
+`checkpoints/.checkpoint-retention/policy.json`. Pass
+`--checkpoint-retention-policy PRIVATE_POLICY_JSON` to override that policy, or
+`--no-checkpoint-retention` to keep every point without starting storage
+maintenance. These options are mutually exclusive. Capture itself remains
+explicitly enabled through its existing declaration and controller; runs without
+that path do not start retention. A storage-maintenance failure is reported separately in
+`checkpoints/retention-error.json`; it does not turn a successful capture into
+a failure or cancel source research. Inspect that error before assuming space
+was reclaimed. Successful maintenance writes `retention-last.json` and the
+bank's durable deletion receipts.
+
+Use the [checkpoint retention policy and preview](../../docs/reference/research-checkpoint.md#default-bank-rotation)
+to choose uniform or tiered history, protect recent publications and pin every
+selected continuation/dependency. The policy controls the outer inert artifact
+bank only; native submissions, archives, counters and cooldown keep their owners.
+Use separate policy files for separate lineages. Do not import a donor's pins
+into a different receiver's new bank.
+
+For frozen running donors, use the documented standalone storage watcher rather
+than editing or restarting the research runtime. Stop that watcher to disable
+its rotation; use `--no-checkpoint-retention` for new runs. Removing the custom
+policy option reselects the default. The existing CLI/Host
+qualification remains separate from frontend delivery and scientific utility.
+
+## Default replan cadence
+
+New `heartbeat-resume` and `heartbeat-explore` trials replan after **6 settled
+effective work Turns** by default. Use `--replan-after-turns N` to set a different
+count (1–6); `--replan-after-turns 3` retains the previous benchmark default.
+Use `--replan-after-todos 3` for the previous completed-Todo cadence
+as an explicit ablation. The two options are mutually exclusive and require a
+heartbeat profile. This default is independent of `--task-entry` and feedback mode.
+Official, single and native-goal profiles are unchanged.
+
+The shared control plane counts settled work Turns, not tool calls or idle wakes;
+other replan reasons may trigger sooner. Both runtime and worker-profile receipts
+record the resolved cadence. Only newly launched attempts use the new default;
+keep existing runs and archived settings pinned.
+
+### Default Goal context and advanced opt-out
+
+New `heartbeat-resume` and `heartbeat-explore` trials include the same-source
+original Goal and acceptance in preselection planning context by default.
+`--no-planning-horizon-goal` disables it for rollback or comparison;
+`--planning-horizon-goal` explicitly enables it. Plain and native-Goal workers reject
+this setting. It does not change stride, Explore or TurnEnvelope.
+
+The adapter writes the shared `execution_profile.planning_horizon_goal` through
+`configure-goal`, checks the effective readback before work, and records an
+resolved boolean in both worker profile and runtime receipt, including when
+the command-line option is omitted. Restore follows the same path: the new
+attempt's resolved setting overrides the donor setting and must read back as
+that exact boolean before work. To preserve an older off treatment, explicitly
+pass `--no-planning-horizon-goal`. Historical receipts without this field remain absent;
+report export rejects mismatched or malformed settings.
+
+Compare on/off from the same qualified pre-replan checkpoint with equal remaining
+budget, source and other settings. Input fidelity does not establish better
+research or scores. See the [shared Goal configuration and rollback](../../docs/reference/protocols/quota-planning-horizon-v0.md#enable-read-back-and-disable).
+
+### Structured stride strategy (always on for LoopX arms)
+
+`evidence_conditioned_v1` is the only live LoopX stride policy. New
+`heartbeat-resume`, `heartbeat-explore` and `turn-resume` trials run it
+unconditionally; there is no on/off switch, and the former `--stride-strategy`
+option has been removed (passing it fails argument parsing before a trial is
+created). The runner no longer sends a stride setting to `configure-goal`.
+The install, worker-profile and runtime receipts of every new LoopX trial record
+`"stride_strategy": "evidence_conditioned_v1"`, and report export requires the
+worker profile and runtime receipt to agree. Plain and native-Goal workers do not
+run LoopX and keep their previous receipt shape without this field.
+
+Historical receipts remain readable as recorded: absence, `"off"` and
+`"evidence_conditioned_v1"` all validate in report export and causal
+attribution, so archived studies are not rewritten or relabeled. Comparisons
+with older off-treatment runs must pin their original product/runner revisions.
+
+The [Goal review contract](../../docs/reference/protocols/goal-vision-replan-contract-v0.md)
+defines structured proposals and the three independently controlled axes.
+Strategy configuration grants no new execution authority, evaluator feedback,
+budget or submissions. Freeze it with exact sources under a new run ID; do not
+change live workers. Receipts qualify requested configuration, while actual
+review, proposal adoption and task gains require trajectory evidence.
+
+## Quota input and historical Short
+
+Both heartbeat profiles use complete v1. Context delivery remains a separate
+setting. See the [Host protocol](../../docs/reference/protocols/turn-envelope-v0.md#complete-v1-host-entry--完整-v1-host-入口)
+for original captures, readback and settlement.
+
+Reproduce historical Short and explicit Complete treatments on their recorded
+product and runner revisions. Review the original decision, wake receipt and
+complete startup and wake costs before using the result in a comparison.
+
+中文：两种 heartbeat profile 默认使用完整 v1，交付传输单独配置。复现历史 Short
+或显式 Complete 组时按原产品和 runner 版本执行，并核对原决策、回执和完整成本。
+
+## Close a managed native attempt
+
+For a native-feedback run with an existing experiment-board row and a fresh
+concurrency admission, pass `--managed-run-json PRIVATE_BINDING.json` to the
+EdgeBench runner. Keep the binding owner-only and outside the solver workspace.
+It contains `goal_id`, the absolute controller `project` path, the original
+`admission_receipt` from `loopx benchmark concurrency-admit --execute --format json`,
+and the board `identity` (`benchmark_id`, `study_id`, `case_id`, `run_id`, `arm_id`,
+`arm_role`, `attempt`). Match `case_id` to `--task` and `run_id` to `--run-id`.
+Use the receipt that created the slot and a unique run ID across the Goal.
+
+The runner retains `managed-run.json` beside the runtime receipt. Before the
+solver starts, the receipt captures the binding and source pins. At return, it
+binds the original solver execution record when termination is confirmed. The
+runner publishes `managed-terminal.json` after validating those receipts and
+the native grading drain for the same run. The controller holds the registered
+Goal and project access.
+
+If grading drains later, the native grading owner must first retain its
+complete, drained `grading_status.json` and the matching history in the same
+attempt. To validate that evidence or retry a proof write, run the following
+once on the host that owns the attempt. Omit `--execute` to preview.
+
+```sh
+python -m benchmark.edgebench.managed_run --trial "$ATTEMPT_DIR" --execute
+```
+
+The replay reads retained evidence. Pending, unknown, or mismatched native
+evidence leaves the reservation active. After a terminal receipt write fails,
+replay can use the runner's completed result when it agrees with the original
+launch pins, the exact native solver record, and the drained grading history.
+Use the proof from the exact attempt on the controller and retain the command's
+JSON receipt with its binding.
+
+```sh
+loopx benchmark terminal-reconcile --goal-id "$GOAL_ID" --project "$PROJECT" \
+  --request-json "$ATTEMPT_DIR/managed-terminal.json" --execute --format json
+```
+
+The [toolkit closeout contract](../../loopx/capabilities/benchmark_toolkit/README.md#concurrency-envelope)
+defines readback, release and replay. Omit the flag on new ordinary trials.
+
+## Sharing terminal results
+
+The [Portfolio ten-arm retrospective report](studies/portfolio-ten-arm-20261006/README.md)
+contains recorded scores and per-arm runner settings, with explicit evaluator
+cohorts and qualification limits. Use `python -m benchmark.edgebench.export_report`
+to reduce an explicitly selected terminal collection or verify its settings/data
+hash bindings. The adapter does not launch jobs, qualify integrity, read sessions,
+or upload to a network service. Supplemental settings need publication review;
+missing provenance must remain explicit. Canonical experiment-board rows continue
+to use benchmark-toolkit's upload-envelope and readback contracts.
+
+For a new export using native ranking, add `"native_ranking"` to each selected
+run's reviewed `settings`, with exactly these two fields:
+
+```json
+{"native_ranking": {"selection": "pass_rate_first", "score_direction": "maximize"}}
+```
+
+Copy the effective values from the pinned native task's judge configuration:
+`selection` is `score_first`, `valid_then_score`, or `pass_rate_first`;
+`score_direction` is `maximize` or `minimize`. Task names never select a policy.
+Unknown/incomplete metadata and a contradictory `best_score.higher_is_better`
+fail export. The adapter binds native history and final `best_round`,
+`best_score`, and `best_pass_rate`, then checks the selected sample's score and
+pass rate. It exports numeric sample pass rates and the selected pass-rate metric;
+it does not rerank submissions or call a scorer. A selected score may therefore
+be below another sample even when scores are maximized.
+
+Without this metadata, the historical scalar-maximum verification path remains;
+immutable Portfolio snapshots need no migration. Neither path requires SForge
+for export or standalone offline verification. `--verify` checks file bindings,
+direction consistency, and selected-sample witnesses, not ranking optimality or
+the truth of supplied policy metadata. The recorded task/source hashes do not
+prove that metadata matches the private task configuration; that provenance
+still needs operator review. This is an S11/E2 terminal-report repair, with no
+change to native scoring, integrity qualification, or study promotion.

@@ -1,31 +1,95 @@
 from __future__ import annotations
 
+from enum import StrEnum
+from collections.abc import Callable
+import json
 from pathlib import Path
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
+import time
+from tempfile import TemporaryDirectory
+import zipimport
 from typing import Any
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from .activation_qualification import (
+    RUNTIME_ACTIVATION_QUALIFICATION_SCHEMA_VERSION,
+    runtime_activation_qualification,
+)
 from .doctor import collect_doctor
 from .install_contract import NO_CLONE_INSTALL_URL
+from .python_install_owner import interpreter_invocation
+from .runtime_activation import restart_services_for_runtime_activation
+from .self_update_download import run_archive_installer
 
 
 UPDATE_PLAN_SCHEMA_VERSION = "loopx_update_plan_v0"
-DEFAULT_UPDATE_REPO = "huangruiteng/loopx"
+DEFAULT_UPDATE_REPO = "loopx-project/loopx"
 DEFAULT_UPDATE_REF = "stable"
 ROLLBACK_PREVIOUS_ALIAS = "previous"
 SOURCE_VERSION_CHECK_SCHEMA_VERSION = "loopx_source_version_check_v0"
-RUNTIME_ACTIVATION_QUALIFICATION_SCHEMA_VERSION = (
-    "loopx_runtime_activation_qualification_v0"
-)
+SOURCE_COMMIT_CHECK_SCHEMA_VERSION = "loopx_source_commit_check_v0"
 SOURCE_VERSION_CHECK_TIMEOUT_SECONDS = 3
 SOURCE_VERSION_READ_LIMIT_BYTES = 64 * 1024
+SOURCE_COMMIT_CHECK_TIMEOUT_SECONDS = 3
+SOURCE_COMMIT_READ_LIMIT_BYTES = 256
 PERSISTED_PYTHON_FILENAME = ".loopx-python"
 _PACKAGE_VERSION_PATTERN = re.compile(r'^__version__\s*=\s*"([^"]+)"$', re.MULTILINE)
+
+
+def _installed_readback(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    try:
+        doctor = json.loads(result.stdout)
+        if isinstance(doctor, dict):
+            identity = doctor.get("service_runtime_identity")
+            if isinstance(identity, dict):
+                return identity
+    except (ValueError, TypeError):
+        pass
+    return {}
+
+
+class UpdateAction(StrEnum):
+    """Stable operator intent for the self-update boundary."""
+
+    CHECK = "check"
+    PLAN = "plan"
+    APPLY = "apply"
+
+
+def resolve_update_action(
+    action: UpdateAction | str | None = None,
+    *,
+    check: bool = False,
+    dry_run: bool = False,
+    execute: bool = False,
+) -> UpdateAction:
+    """Resolve explicit actions and legacy flag aliases without ambiguity."""
+
+    explicit = UpdateAction(action) if action is not None else None
+    legacy_actions = [
+        candidate
+        for enabled, candidate in (
+            (check, UpdateAction.CHECK),
+            (dry_run, UpdateAction.PLAN),
+            (execute, UpdateAction.APPLY),
+        )
+        if enabled
+    ]
+    if len(legacy_actions) > 1:
+        raise ValueError("choose one update action: check, plan, or apply")
+    legacy = legacy_actions[0] if legacy_actions else None
+    if explicit is not None and legacy is not None and explicit != legacy:
+        raise ValueError(
+            f"update action `{explicit.value}` conflicts with the legacy option for "
+            f"`{legacy.value}`; use `loopx update {explicit.value}` alone"
+        )
+    return explicit or legacy or UpdateAction.PLAN
 
 
 def _source_config(
@@ -33,14 +97,20 @@ def _source_config(
     repo: str | None,
     ref: str | None,
     archive_url: str | None,
+    installed: dict[str, Any] | None = None,
+    build_from_source: bool = False,
 ) -> dict[str, Any]:
-    selected_repo = repo or os.environ.get("LOOPX_REPO") or DEFAULT_UPDATE_REPO
+    installed = installed or {}
+    selected_repo = repo or os.environ.get("LOOPX_REPO") or installed.get("manifest_source_repo") or DEFAULT_UPDATE_REPO
     ref_override = ref or os.environ.get("LOOPX_REF")
-    selected_ref = ref_override or DEFAULT_UPDATE_REF
+    inherited_ref = installed.get("manifest_source_ref")
+    selected_ref = ref_override or inherited_ref or DEFAULT_UPDATE_REF
     archive_url_override = archive_url or os.environ.get("LOOPX_ARCHIVE_URL")
     selected_archive_url = archive_url_override
     if not selected_archive_url:
-        selected_archive_url = f"https://codeload.github.com/{selected_repo}/tar.gz/{selected_ref}"
+        selected_archive_url = (
+            f"https://codeload.github.com/{selected_repo}/tar.gz/{selected_ref}"
+        )
     if archive_url_override:
         channel = "github_archive_url_override"
     elif ref_override:
@@ -51,9 +121,11 @@ def _source_config(
         "channel": channel,
         "repo": selected_repo,
         "ref": selected_ref,
-        "ref_source": "default_stable" if not ref_override else "override",
+        "ref_source": "override" if ref_override else "installed_manifest" if inherited_ref else "default_stable",
         "archive_url": selected_archive_url,
         "installer_url": NO_CLONE_INSTALL_URL,
+        "distribution": "source" if build_from_source or archive_url_override else "runtime",
+        "explicit_archive": bool(archive_url_override),
     }
 
 
@@ -64,20 +136,7 @@ def _command_for_source(source: dict[str, Any]) -> str:
             "Update a trusted LoopX checkout, then run its "
             "`scripts/install-windows.ps1` with PowerShell 7."
         )
-    exports = [
-        f"LOOPX_REPO={shlex.quote(str(source['repo']))}",
-        f"LOOPX_REF={shlex.quote(str(source['ref']))}",
-    ]
-    archive_url = source.get("archive_url")
-    if source.get("channel") == "github_archive_url_override" and archive_url:
-        exports.append(f"LOOPX_ARCHIVE_URL={shlex.quote(str(archive_url))}")
-    return (
-        "set -o errexit -o pipefail\n"
-        + "\n".join(f"export {value}" for value in exports)
-        + f"\ncurl -fsSL {shlex.quote(str(source['installer_url']))} | bash\n"
-        'export PATH="$HOME/.local/bin:$PATH"\n'
-        "loopx doctor"
-    )
+    return _update_action_command(UpdateAction.APPLY, source)
 
 
 def _installer_env_for_source(
@@ -103,8 +162,13 @@ def _installer_env_for_source(
             )
         env["LOOPX_PYTHON"] = persisted_python
     env["LOOPX_REPO"] = str(source.get("repo") or DEFAULT_UPDATE_REPO)
-    env["LOOPX_REF"] = str(source.get("ref") or DEFAULT_UPDATE_REF)
-    if source.get("channel") == "github_archive_url_override" and source.get("archive_url"):
+    env["LOOPX_REF"] = str(source.get("resolved_revision") or source.get("ref") or DEFAULT_UPDATE_REF)
+    env["LOOPX_UPDATE_CHANNEL"] = str(source.get("ref") or DEFAULT_UPDATE_REF)
+    env["LOOPX_BUILD_FROM_SOURCE"] = "1" if source.get("distribution", "source") == "source" else "0"
+    env["LOOPX_UPDATE_EVENTS"] = "1"
+    if source.get("channel") == "github_archive_url_override" and source.get(
+        "archive_url"
+    ):
         env["LOOPX_ARCHIVE_URL"] = str(source["archive_url"])
     else:
         env.pop("LOOPX_ARCHIVE_URL", None)
@@ -182,99 +246,86 @@ def _source_version_check(source: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _runtime_activation_qualification(
-    *,
-    install_freshness: dict[str, Any],
-    source: dict[str, Any],
+def _source_commit_check(
+    source: dict[str, Any], *, installed_commit: Any, allow_remote: bool
 ) -> dict[str, Any]:
-    installed_commit = install_freshness.get("manifest_source_git_commit")
-    target_commit = install_freshness.get("freshness_source_git_commit")
-    revision_relation = install_freshness.get("manifest_source_freshness_relation")
-    qualified_repo = install_freshness.get("manifest_source_repo")
-    qualified_ref = install_freshness.get("manifest_source_ref")
-    selected_repo = source.get("repo")
-    selected_ref = source.get("ref")
-    package_matches_runtime = install_freshness.get(
-        "manifest_package_version_matches_runtime"
-    )
-    requires_upgrade = install_freshness.get("requires_upgrade")
-    has_commit_pair = all(
-        isinstance(commit, str) and bool(commit)
-        for commit in (installed_commit, target_commit)
-    )
-    source_identity_matches = all(
-        isinstance(value, str) and bool(value)
-        for value in (qualified_repo, qualified_ref, selected_repo, selected_ref)
-    ) and (
-        str(qualified_repo).removesuffix(".git").lower()
-        == str(selected_repo).removesuffix(".git").lower()
-        and str(qualified_ref).removeprefix("refs/heads/")
-        == str(selected_ref).removeprefix("refs/heads/")
-    )
+    """Resolve the selected archive ref, not merely its package version.
 
-    if package_matches_runtime is False:
-        decision = "release_or_install_successor_required"
-        runtime_active: bool | None = False
-        successor_kind = "release_or_install"
-        reason = "release manifest package version does not match the active runtime"
-    elif not source_identity_matches:
-        decision = "activation_qualification_required"
-        runtime_active = None
-        successor_kind = "activation_qualification"
-        reason = "trusted source lineage does not identify the selected update source"
-    elif has_commit_pair and (
-        installed_commit == target_commit or revision_relation == "installed_ahead"
-    ):
-        decision = "runtime_active"
-        runtime_active = True
-        successor_kind = None
-        reason = "installed source contains the trusted target source commit"
-    elif has_commit_pair and revision_relation in {"installed_behind", "diverged"}:
-        decision = "release_or_install_successor_required"
-        runtime_active = False
-        successor_kind = "release_or_install"
-        reason = "installed source does not contain the trusted target source commit"
-    else:
-        decision = "activation_qualification_required"
-        runtime_active = None
-        successor_kind = "activation_qualification"
-        reason = "trusted installed-versus-target source lineage is unavailable"
+    A moving branch can change while ``__version__`` and the local install-age
+    window stay the same. The GitHub SHA media type keeps this read bounded;
+    an offline/invalid response remains unknown, never evidence of equality.
+    """
 
-    return {
-        "schema_version": RUNTIME_ACTIVATION_QUALIFICATION_SCHEMA_VERSION,
-        "decision": decision,
-        "runtime_active": runtime_active,
-        "installed_release_id": install_freshness.get("release_id"),
-        "installed_version": install_freshness.get("current_version"),
-        "installed_source_commit": installed_commit,
-        "target_source_label": install_freshness.get("freshness_source_label"),
-        "target_source_commit": target_commit,
-        "revision_relation": revision_relation,
-        "qualified_source": {
-            "repo": qualified_repo,
-            "ref": qualified_ref,
-        },
-        "source_identity_matches": source_identity_matches,
-        "package_version_matches_runtime": package_matches_runtime,
-        "requires_upgrade": requires_upgrade,
-        "selected_source": {
-            "repo": selected_repo,
-            "ref": selected_ref,
-        },
-        "successor": {
-            "required": runtime_active is not True,
-            "kind": successor_kind,
-        },
-        "reason": reason,
+    base = {
+        "schema_version": SOURCE_COMMIT_CHECK_SCHEMA_VERSION,
+        "attempted": False,
+        "status": "skipped",
+        "installed_commit": installed_commit,
+        "target_commit": None,
+        "matches_current": None,
+        "source_url": None,
+        "reason": None,
     }
+    if source.get("channel") == "github_archive_url_override":
+        return {**base, "reason": "custom archive URL has no trusted GitHub ref identity"}
+    repo = str(source.get("repo") or "")
+    ref = str(source.get("ref") or "")
+    parts = repo.split("/")
+    if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts) or not ref:
+        return {**base, "reason": "GitHub owner/name and ref are required"}
+    if re.fullmatch(r"[0-9a-fA-F]{40}", ref):
+        target = ref.lower()
+        return {**base, "status": "available", "target_commit": target,
+                "matches_current": installed_commit.lower() == target
+                if isinstance(installed_commit, str) else None,
+                "reason": "immutable ref identifies its own commit"}
+    if not allow_remote:
+        return {**base, "status": "not_requested",
+                "reason": "source comparison omitted for an injected doctor snapshot"}
+
+    owner, name = parts
+    source_url = (
+        "https://api.github.com/repos/"
+        f"{quote(owner, safe='')}/{quote(name, safe='')}/commits/{quote(ref, safe='')}"
+    )
+    request = Request(
+        source_url,
+        headers={"Accept": "application/vnd.github.sha", "User-Agent": "LoopX-update-check"},
+    )
+    try:
+        with urlopen(  # noqa: S310 - repo/ref are validated and the host is fixed.
+            request, timeout=SOURCE_COMMIT_CHECK_TIMEOUT_SECONDS
+        ) as response:
+            body = response.read(SOURCE_COMMIT_READ_LIMIT_BYTES).decode("ascii").strip()
+    except Exception as exc:  # Remote comparison is advisory and must degrade offline.
+        return {**base, "attempted": True, "status": "unavailable",
+                "source_url": source_url,
+                "reason": f"remote commit check unavailable ({type(exc).__name__})"}
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", body):
+        return {**base, "attempted": True, "status": "unavailable",
+                "source_url": source_url, "reason": "remote commit response was not a full SHA"}
+    target = body.lower()
+    return {**base, "attempted": True, "status": "available",
+            "target_commit": target,
+            "matches_current": installed_commit.lower() == target
+            if isinstance(installed_commit, str) else None,
+            "source_url": source_url}
 
 
 def _release_root_from_doctor(doctor_payload: dict[str, Any]) -> str | None:
-    package = doctor_payload.get("package") if isinstance(doctor_payload.get("package"), dict) else {}
+    package = (
+        doctor_payload.get("package")
+        if isinstance(doctor_payload.get("package"), dict)
+        else {}
+    )
     release_root = package.get("release_root")
     if isinstance(release_root, str) and release_root:
         return release_root
-    path = doctor_payload.get("path") if isinstance(doctor_payload.get("path"), dict) else {}
+    path = (
+        doctor_payload.get("path")
+        if isinstance(doctor_payload.get("path"), dict)
+        else {}
+    )
     realpath = path.get("loopx_realpath")
     if isinstance(realpath, str) and realpath:
         realpath_path = Path(realpath)
@@ -284,10 +335,14 @@ def _release_root_from_doctor(doctor_payload: dict[str, Any]) -> str | None:
 
 
 def _user_loopx_bin(home: Path | None = None) -> Path:
+    if home is None and (bin_dir := os.environ.get("LOOPX_BIN_DIR")):
+        return Path(bin_dir) / "loopx"
     return (home or Path.home()) / ".local" / "bin" / "loopx"
 
 
 def _user_releases_dir(home: Path | None = None) -> Path:
+    if home is None and (releases_dir := os.environ.get("LOOPX_RELEASES_DIR")):
+        return Path(releases_dir)
     return (home or Path.home()) / ".local" / "share" / "loopx" / "releases"
 
 
@@ -332,17 +387,215 @@ def _rollback_plan(doctor_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _install_lifecycle(doctor_payload: dict[str, Any]) -> dict[str, Any]:
+    package = (
+        doctor_payload.get("package")
+        if isinstance(doctor_payload.get("package"), dict)
+        else {}
+    )
+    freshness = (
+        doctor_payload.get("install_freshness")
+        if isinstance(doctor_payload.get("install_freshness"), dict)
+        else {}
+    )
+    install_kind = package.get("install_kind")
+    if not isinstance(install_kind, str) or not install_kind:
+        if freshness.get("install_kind") == "python_distribution":
+            install_kind = "python_distribution"
+        elif _release_root_from_doctor(doctor_payload):
+            install_kind = "release_snapshot"
+        else:
+            install_kind = "live_checkout"
+
+    installer = None
+    installer_environment = None
+    if install_kind == "release_snapshot":
+        owner = "loopx_release_snapshot"
+        apply_supported = os.name != "nt"
+        execution_driver = "archive_snapshot" if apply_supported else None
+        reason = (
+            "LoopX owns this archive release snapshot and can atomically replace it"
+            if apply_supported
+            else "native Windows snapshot updates remain owned by install-windows.ps1"
+        )
+        owner_command = None
+    elif install_kind == "python_distribution":
+        owner = "python_package_manager"
+        installer = freshness.get("python_distribution_installer")
+        installer_environment = freshness.get(
+            "python_distribution_installer_environment"
+        )
+        if not isinstance(installer, str) or not installer:
+            distribution = (
+                package.get("python_distribution")
+                if isinstance(package.get("python_distribution"), dict)
+                else {}
+            )
+            installer = distribution.get("installer")
+            installer_environment = distribution.get("installer_environment")
+        apply_supported = installer in {"pip", "pipx"}
+        execution_driver = (
+            "python_pipx"
+            if installer == "pipx"
+            else "python_pip"
+            if installer == "pip"
+            else None
+        )
+        reason = (
+            "LoopX can ask the owning Python interpreter's pip to upgrade the same environment"
+            if installer == "pip"
+            else "LoopX can ask pipx to upgrade its recorded LoopX environment"
+            if installer == "pipx"
+            else (
+                f"the active Python environment is owned by {installer or 'an unknown installer'}; "
+                "use that package manager directly"
+            )
+        )
+        owner_command = freshness.get("upgrade_command")
+    else:
+        owner = "source_checkout"
+        apply_supported = False
+        execution_driver = None
+        reason = (
+            "the active checkout owns contributor updates; LoopX must not replace it with "
+            "an archive snapshot"
+        )
+        owner_command = freshness.get("contributor_upgrade_command")
+
+    return {
+        "install_kind": install_kind,
+        "owner": owner,
+        "loopx_apply_supported": apply_supported,
+        "execution_driver": execution_driver,
+        "package_manager": installer if install_kind == "python_distribution" else None,
+        "package_manager_environment": (
+            installer_environment if install_kind == "python_distribution" else None
+        ),
+        "reason": reason,
+        "owner_upgrade_command": owner_command,
+    }
+
+
+def _update_action_command(action: UpdateAction, source: dict[str, Any]) -> str:
+    parts = ["loopx", "update", action.value]
+    default_source = (
+        source.get("repo") == DEFAULT_UPDATE_REPO
+        and source.get("ref") == DEFAULT_UPDATE_REF
+        and source.get("channel") == "github_archive_stable"
+    )
+    if not default_source:
+        parts.extend(["--repo", str(source.get("repo") or DEFAULT_UPDATE_REPO)])
+        parts.extend(["--ref", str(source.get("ref") or DEFAULT_UPDATE_REF)])
+        if source.get("channel") == "github_archive_url_override":
+            parts.extend(["--archive-url", str(source.get("archive_url") or "")])
+    if source.get("distribution") == "source" and not source.get("explicit_archive"):
+        parts.append("--source")
+    if source.get("allow_downgrade"):
+        parts.append("--allow-downgrade")
+    return shlex.join(parts)
+
+
+def _python_distribution_rollback_plan(
+    current_version: object,
+    lifecycle: dict[str, Any],
+) -> dict[str, Any]:
+    if lifecycle.get("execution_driver") == "python_pipx":
+        return {
+            "available": False,
+            "reason": (
+                "pipx owns its environment metadata; inspect the recorded spec before "
+                "requesting a version rollback with pipx"
+            ),
+            "rollback_command": None,
+        }
+    if not isinstance(current_version, str) or not current_version:
+        return {
+            "available": False,
+            "reason": "the installed Python distribution version is unavailable",
+            "rollback_command": None,
+        }
+    command = (
+        f"{interpreter_invocation(sys.executable)} -m pip install "
+        f"{shlex.quote(f'loopx=={current_version}')}\n"
+        "loopx workflow-skills --install\n"
+        "loopx slash-commands --install\n"
+        "loopx doctor"
+    )
+    return {
+        "available": True,
+        "reason": "pip can request the previously installed LoopX version",
+        "rollback_version": current_version,
+        "rollback_command": command,
+    }
+
+
+def _windows_console_update_refusal(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """A distlib launcher holds its own executable open until Python exits.
+
+    Use its actual zip loader, not argv[0]: distlib removes the .exe suffix.
+    The module entry has a source loader and can safely replace the launcher.
+    """
+    loader = getattr(sys.modules.get("__main__"), "__loader__", None)
+    lifecycle = payload.get("install_lifecycle") or {}
+    if (
+        sys.platform != "win32"
+        or not isinstance(loader, zipimport.zipimporter)
+        or lifecycle.get("execution_driver") not in {"python_pip", "python_pipx"}
+    ):
+        return None
+    launcher = Path(loader.archive)
+    if launcher.name.casefold() != "loopx.exe":
+        # pipx suffixes the exposed app name, but its symlink/hardlink can still
+        # hold this installation's actual console executable open.
+        owned_launcher = Path(sys.executable).with_name("loopx.exe")
+        try:
+            if not launcher.samefile(owned_launcher):
+                return None
+        except FileNotFoundError:
+            return None
+    retry = interpreter_invocation(sys.executable, ["-m", "loopx.entrypoint", *sys.argv[1:]])
+    reason = (
+        "The running Windows console launcher cannot be replaced by pip. "
+        "No update was started; retry through the owning Python interpreter."
+    )
+    return {
+        **payload,
+        "ok": False,
+        "changes_applied": False,
+        "execution": None,
+        "error": reason,
+        "recommended_action": f"{reason}\n{retry}",
+        "install_lifecycle": {**lifecycle, "loopx_apply_supported": False, "reason": reason},
+        "plan": {
+            **payload.get("plan", {}), "apply_supported": False,
+            "blocked_reason": reason, "mutates_release_install": False,
+        },
+        "commands": {**payload.get("commands", {}), "apply": retry},
+        "next_action": {
+            "kind": "use_installation_owner", "command": retry,
+            "mutating": True, "requires_explicit_approval": True, "reason": reason,
+        },
+    }
+
+
 def build_rollback_plan(
     *,
     release_id: str,
     doctor_payload: dict[str, Any] | None = None,
     home: Path | None = None,
+    registry_path: Path | None = None,
+    runtime_root: str | None = None,
 ) -> dict[str, Any]:
-    doctor = doctor_payload or collect_doctor()
+    doctor = doctor_payload or (
+        collect_doctor(registry_path=registry_path, runtime_root_override=runtime_root)
+        if registry_path is not None or runtime_root is not None else collect_doctor()
+    )
     current_release_root = _release_root_from_doctor(doctor)
     releases_dir = _user_releases_dir(home)
     releases = _list_release_roots(releases_dir)
-    current_root_path = Path(current_release_root).resolve() if current_release_root else None
+    current_root_path = (
+        Path(current_release_root).resolve() if current_release_root else None
+    )
     requested_release_id = release_id.strip()
     selected: Path | None = None
     reason = None
@@ -406,11 +659,27 @@ def build_update_plan(
     repo: str | None = None,
     ref: str | None = None,
     archive_url: str | None = None,
+    action: UpdateAction | str | None = None,
     check_only: bool = False,
     execute: bool = False,
     doctor_payload: dict[str, Any] | None = None,
+    registry_path: Path | None = None,
+    runtime_root: str | None = None,
+    build_from_source: bool = False,
+    allow_downgrade: bool = False,
+    resolve_remote: bool | None = None,
 ) -> dict[str, Any]:
-    doctor = doctor_payload or collect_doctor()
+    requested_action = resolve_update_action(
+        action,
+        check=check_only,
+        execute=execute,
+    )
+    check_only = requested_action is UpdateAction.CHECK
+    execute = requested_action is UpdateAction.APPLY
+    doctor = doctor_payload or (
+        collect_doctor(registry_path=registry_path, runtime_root_override=runtime_root)
+        if registry_path is not None or runtime_root is not None else collect_doctor()
+    )
     install_freshness = (
         doctor.get("install_freshness")
         if isinstance(doctor.get("install_freshness"), dict)
@@ -426,22 +695,39 @@ def build_update_plan(
         if isinstance(release_manifest.get("manifest"), dict)
         else {}
     )
-    source = _source_config(repo=repo, ref=ref, archive_url=archive_url)
-    install_command = _command_for_source(source)
+    lifecycle = _install_lifecycle(doctor)
+    source = _source_config(repo=repo, ref=ref, archive_url=archive_url,
+        installed=install_freshness if lifecycle["owner"] == "loopx_release_snapshot" else None,
+        build_from_source=build_from_source)
+    source["allow_downgrade"] = allow_downgrade
+    remote = doctor_payload is None if resolve_remote is None else resolve_remote
+    archive_install_command = _command_for_source(source)
     dry_run = not execute
     path = doctor.get("path") if isinstance(doctor.get("path"), dict) else {}
     requires_upgrade = install_freshness.get("requires_upgrade")
     current_version = install_freshness.get("current_version")
-    source_version_check = _source_version_check(source) if check_only else {
-        "schema_version": SOURCE_VERSION_CHECK_SCHEMA_VERSION,
-        "attempted": False,
-        "status": "not_requested",
-        "version": None,
-        "version_tag": None,
-        "matches_current": None,
-        "source_url": None,
-        "reason": "remote source comparison runs only for update --check",
-    }
+    source_version_check = (
+        _source_version_check(source)
+        if check_only and lifecycle["owner"] == "loopx_release_snapshot" and source["distribution"] == "source"
+        else {
+            "schema_version": SOURCE_VERSION_CHECK_SCHEMA_VERSION,
+            "attempted": False,
+            "status": (
+                "delegated"
+                if check_only and lifecycle["owner"] != "loopx_release_snapshot"
+                else "not_requested"
+            ),
+            "version": None,
+            "version_tag": None,
+            "matches_current": None,
+            "source_url": None,
+            "reason": (
+                f"update availability is owned by {lifecycle['owner']}"
+                if check_only and lifecycle["owner"] != "loopx_release_snapshot"
+                else "remote source comparison runs only for `loopx update check`"
+            ),
+        }
+    )
     source_version = source_version_check.get("version")
     if source_version_check.get("status") == "available":
         source_version_check["matches_current"] = (
@@ -449,12 +735,81 @@ def build_update_plan(
             if isinstance(current_version, str) and current_version
             else None
         )
-    runtime_activation = _runtime_activation_qualification(
-        install_freshness=install_freshness,
-        source=source,
+    source_commit_check = (
+        _source_commit_check(
+            source,
+            installed_commit=install_freshness.get("manifest_source_git_commit"),
+            allow_remote=remote,
+        )
+        if lifecycle["owner"] == "loopx_release_snapshot" and source["distribution"] == "source"
+        else {"schema_version": SOURCE_COMMIT_CHECK_SCHEMA_VERSION,
+              "attempted": False, "status": "not_requested",
+              "installed_commit": install_freshness.get("manifest_source_git_commit"),
+              "target_commit": None, "matches_current": None, "source_url": None,
+              "reason": "source commit comparison applies to snapshot check/plan"}
     )
-    if execute:
+    runtime_activation = (
+        runtime_activation_qualification(
+            install_freshness=install_freshness,
+            source=source,
+            resolved_source_commit=(
+                source_commit_check.get("target_commit")
+                if source_commit_check.get("status") == "available"
+                else None
+            ),
+            selected_source_unresolved=(
+                not execute
+                and source_commit_check.get("status") in {"unavailable", "not_requested"}
+            ),
+        )
+        if lifecycle["owner"] == "loopx_release_snapshot"
+        else {
+            "schema_version": RUNTIME_ACTIVATION_QUALIFICATION_SCHEMA_VERSION,
+            "decision": "not_applicable",
+            "runtime_active": None,
+            "successor": {"required": False, "kind": None},
+            "reason": (
+                f"runtime activation is governed by {lifecycle['owner']}, not an archive snapshot"
+            ),
+        }
+    )
+    apply_supported = bool(lifecycle["loopx_apply_supported"])
+    owner_upgrade_command = lifecycle.get("owner_upgrade_command")
+    install_command = (
+        archive_install_command
+        if lifecycle["owner"] == "loopx_release_snapshot"
+        else owner_upgrade_command
+    )
+    backup = (
+        _python_distribution_rollback_plan(current_version, lifecycle)
+        if lifecycle["execution_driver"] in {"python_pip", "python_pipx"}
+        else _rollback_plan(doctor)
+    )
+    if execute and not apply_supported:
+        recommended_action = (
+            f"use the active {lifecycle['owner']} upgrade path:\n{owner_upgrade_command}"
+            if owner_upgrade_command
+            else f"use the active {lifecycle['owner']} upgrade path"
+        )
+    elif execute:
         recommended_action = "review execution result and post-update doctor output"
+    elif check_only and lifecycle["owner"] != "loopx_release_snapshot":
+        recommended_action = (
+            f"use the active {lifecycle['owner']} upgrade path:\n{owner_upgrade_command}"
+            if owner_upgrade_command
+            else f"use the active {lifecycle['owner']} upgrade path"
+        )
+    elif lifecycle["owner"] != "loopx_release_snapshot":
+        recommended_action = (
+            "run `loopx update apply` to use the active Python package manager, "
+            "then review host-material readback"
+            if apply_supported
+            else (
+                f"use the active {lifecycle['owner']} upgrade path:\n{owner_upgrade_command}"
+                if owner_upgrade_command
+                else f"use the active {lifecycle['owner']} upgrade path"
+            )
+        )
     elif (
         check_only
         and runtime_activation.get("decision")
@@ -462,22 +817,22 @@ def build_update_plan(
     ):
         recommended_action = (
             "installed runtime does not contain the trusted target source; "
-            "project a release/install successor, then run `loopx update --dry-run`"
+            "project a release/install successor, then run `loopx update plan`"
         )
     elif check_only and source_version_check.get("matches_current") is False:
         recommended_action = (
             f"source version v{source_version} differs from installed version "
-            f"v{current_version}; run `loopx update --dry-run`, then `loopx update --execute`"
+            f"v{current_version}; run `loopx update plan`, then `loopx update apply`"
         )
     elif check_only and source_version_check.get("status") == "unavailable":
         recommended_action = (
             "local install health is known, but the selected source version could not be checked; "
-            "retry online or run `loopx update --execute` to refresh"
+            "retry online or run `loopx update apply` to refresh"
         )
     elif check_only and source_version_check.get("status") == "skipped":
         recommended_action = (
             "local install health is known, but source version comparison was skipped; "
-            "run `loopx update --dry-run` to review the source"
+            "run `loopx update plan` to review the source"
         )
     elif (
         check_only
@@ -487,36 +842,104 @@ def build_update_plan(
             "installed runtime activation is not proven; refresh trusted source lineage "
             "before claiming the merged behavior is active"
         )
-    elif check_only and source_version_check.get("matches_current") is True and requires_upgrade is False:
-        recommended_action = "installed version and trusted source lineage match; no update needed"
+    elif source_commit_check.get("matches_current") is False:
+        recommended_action = (
+            "selected source commit differs from the installed release; compare its "
+            "lineage or run `loopx update apply` to install the selected source"
+        )
+    elif runtime_activation.get("decision") == "activation_qualification_required":
+        recommended_action = (
+            "selected source activation is unproven; do not treat matching package "
+            "version or install age as current. Retry online or select an immutable "
+            "commit with `--ref` before deciding whether to update"
+        )
+    elif (
+        check_only
+        and source_version_check.get("matches_current") is True
+        and requires_upgrade is False
+    ):
+        recommended_action = (
+            "installed version and trusted source lineage match; no update needed"
+        )
     elif check_only and requires_upgrade is True:
-        recommended_action = "run `loopx update --dry-run` to review the source and rollback plan"
+        recommended_action = (
+            "run `loopx update plan` to review the source and rollback plan"
+        )
     elif requires_upgrade is False:
         recommended_action = (
-            "no update needed; use `loopx update --dry-run` or "
-            "`loopx update --execute` only to force a refresh"
+            "no update needed; use `loopx update plan` or "
+            "`loopx update apply` only to force a refresh"
         )
     elif check_only:
-        recommended_action = "run `loopx update --dry-run` to review the source and rollback plan"
+        recommended_action = (
+            "run `loopx update plan` to review the source and rollback plan"
+        )
     else:
-        recommended_action = "run `loopx update --execute` if you accept the source and rollback plan"
-    return {
-        "ok": True,
+        recommended_action = (
+            "run `loopx update apply` if you accept the source and rollback plan"
+        )
+    apply_command = (
+        _update_action_command(UpdateAction.APPLY, source)
+        if apply_supported
+        else None
+    )
+    commands = {
+        "check": _update_action_command(UpdateAction.CHECK, source),
+        "plan": _update_action_command(UpdateAction.PLAN, source),
+        "apply": apply_command,
+        "owner_upgrade": owner_upgrade_command,
+    }
+    if execute and apply_supported:
+        next_action = {
+            "kind": "review_execution",
+            "command": "loopx doctor",
+            "mutating": False,
+            "requires_explicit_approval": False,
+            "reason": recommended_action,
+        }
+    elif apply_command:
+        next_action = {
+            "kind": "apply_update",
+            "command": apply_command,
+            "mutating": True,
+            "requires_explicit_approval": True,
+            "reason": recommended_action,
+        }
+    else:
+        next_action = {
+            "kind": "use_installation_owner",
+            "command": owner_upgrade_command,
+            "mutating": bool(owner_upgrade_command),
+            "requires_explicit_approval": bool(owner_upgrade_command),
+            "reason": recommended_action,
+        }
+    payload = {
+        "ok": not execute or apply_supported,
         "schema_version": UPDATE_PLAN_SCHEMA_VERSION,
         "mode": "update",
+        "requested_action": requested_action.value,
         "check_only": check_only,
         "dry_run": dry_run,
         "execute_requested": execute,
+        "changes_applied": False,
+        "install_lifecycle": lifecycle,
+        "commands": commands,
+        "next_action": next_action,
         "source": source,
         "source_version_check": source_version_check,
+        "source_commit_check": source_commit_check,
         "runtime_activation_qualification": runtime_activation,
         "current": {
             "loopx_command": path.get("loopx"),
             "loopx_realpath": path.get("loopx_realpath"),
             "current_version": current_version,
             "current_version_tag": install_freshness.get("current_version_tag"),
-            "manifest_package_version": install_freshness.get("manifest_package_version"),
-            "manifest_package_version_tag": install_freshness.get("manifest_package_version_tag"),
+            "manifest_package_version": install_freshness.get(
+                "manifest_package_version"
+            ),
+            "manifest_package_version_tag": install_freshness.get(
+                "manifest_package_version_tag"
+            ),
             "manifest_package_version_matches_runtime": install_freshness.get(
                 "manifest_package_version_matches_runtime"
             ),
@@ -529,54 +952,284 @@ def build_update_plan(
             "release_manifest": release_manifest_body,
         },
         "plan": {
-            "action": "check_only" if check_only else "execute_installer" if execute else "dry_run",
+            "action": "check_only"
+            if check_only
+            else "execute_installer"
+            if execute
+            else "dry_run",
+            "apply_supported": apply_supported,
+            "blocked_reason": lifecycle["reason"]
+            if execute and not apply_supported
+            else None,
             "install_command": install_command,
             "post_update_validation": "loopx doctor",
             "mutates_loopx_runtime_state": False,
-            "mutates_release_install": execute,
-            "backup": _rollback_plan(doctor),
+            "mutates_release_install": execute and apply_supported,
+            "backup": backup,
         },
         "execution": None,
+        "error": (
+            f"`loopx update apply` cannot mutate an installation owned by {lifecycle['owner']}"
+            if execute and not apply_supported
+            else None
+        ),
         "recommended_action": recommended_action,
     }
+    from .cli_commands.update_source import prepare_target
+    payload = prepare_target(payload, freshness=install_freshness,
+        resolve_remote=remote, allow_downgrade=allow_downgrade)
+    if lifecycle["owner"] == "python_package_manager" and (ref or build_from_source or archive_url):
+        reason = "The Python package manager owns this installation; choose main/source in a separate snapshot installation"
+        payload.update(ok=not execute, error=reason, recommended_action=reason)
+        payload["plan"].update(apply_supported=False, blocked_reason=reason, mutates_release_install=False)
+    return (_windows_console_update_refusal(payload) if execute else None) or payload
 
 
-def restart_managed_loopx_services() -> list[str]:
-    """Best-effort restart of user LaunchAgent-managed LoopX services on macOS.
+def _retain_pending_service_activation(updated: dict[str, Any]) -> bool:
+    """Keep installation success distinct from switching its live consumers."""
+    if not updated["execution"].get("activation_pending"):
+        return False
+    updated["ok"] = False
+    updated["recommended_action"] = (
+        "the runtime is installed, but managed-service activation is incomplete. "
+        "Let original Chat work finish, or inspect the reported service-state or "
+        "restart failure, then retry the same update source"
+    )
+    updated["next_action"] = {
+        "kind": "retry_runtime_activation",
+        "command": (updated.get("commands") or {}).get("apply")
+        or _update_action_command(UpdateAction.APPLY, updated.get("source") or {}),
+        "mutating": True,
+        "requires_explicit_approval": True,
+        "reason": updated["recommended_action"],
+    }
+    return True
 
-    After ``loopx update`` replaces the installed release, running status/chat
-    services still belong to the previous release. Restarting the managed
-    LaunchAgents makes them run the new ``loopx`` immediately, so the dashboard
-    and desktop shell keep working without a release-identity mismatch.
-    """
-    if sys.platform != "darwin":
-        return []
-    agents_dir = Path.home() / "Library" / "LaunchAgents"
-    if not agents_dir.is_dir():
-        return []
-    labels: list[str] = []
-    for plist in sorted(agents_dir.glob("*.plist")):
-        stem = plist.stem.lower()
-        if "loopx" not in stem and "goal-harness" not in stem:
+
+def _execute_python_distribution_update(
+    payload: dict[str, Any],
+    *,
+    timeout_seconds: int,
+    route_arguments: list[str],
+    progress: Callable[[str], None] = lambda _stage: None,
+) -> dict[str, Any]:
+    refused = _windows_console_update_refusal(payload)
+    if refused is not None:
+        return refused
+    lifecycle = (
+        payload.get("install_lifecycle")
+        if isinstance(payload.get("install_lifecycle"), dict)
+        else {}
+    )
+    driver = lifecycle.get("execution_driver")
+    package_manager_environment = lifecycle.get("package_manager_environment")
+    install_command = (
+        ["pipx", "upgrade", str(package_manager_environment or "loopx")]
+        if driver == "python_pipx"
+        else [sys.executable, "-m", "pip", "install", "--upgrade", "loopx"]
+    )
+    commands = {
+        "install": install_command,
+        "authority_upgrade": [sys.executable, "-m", "loopx.cli", "--format", "json",
+                              "authority-archive", "upgrade", "--all-known", "--execute"],
+        "workflow_skills": [
+            sys.executable,
+            "-m",
+            "loopx.cli",
+            "workflow-skills",
+            "--install",
+            "--format",
+            "json",
+        ],
+        "slash_commands": [
+            sys.executable,
+            "-m",
+            "loopx.cli",
+            "slash-commands",
+            "--install",
+            "--format",
+            "json",
+        ],
+        "doctor": [
+            sys.executable,
+            "-m",
+            "loopx.cli",
+            "doctor",
+            "--format",
+            "json",
+        ],
+        "extension_doctor": [
+            sys.executable,
+            "-m",
+            "loopx.cli",
+            "extension",
+            "doctor",
+            "--all-enabled",
+            "--execute",
+            "--format",
+            "json",
+        ],
+    }
+    for step, command in commands.items():
+        if step != "install":
+            command[3:3] = route_arguments
+    results: dict[str, subprocess.CompletedProcess[str]] = {}
+    progress("Updating CLI through its Python package manager")
+    results["install"] = subprocess.run(
+        commands["install"],
+        text=True, encoding="utf-8", errors="replace",
+        capture_output=True,
+        timeout=timeout_seconds,
+    )
+    if results["install"].returncode == 0:
+        for step in ("authority_upgrade", "workflow_skills", "slash_commands", "doctor"):
+            progress(f"Validating updated runtime: {step}")
+            results[step] = subprocess.run(
+                commands[step],
+                text=True, encoding="utf-8", errors="replace",
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+            if results[step].returncode != 0:
+                break
+        if all(
+            step in results and results[step].returncode == 0
+            for step in ("authority_upgrade", "workflow_skills", "slash_commands", "doctor")
+        ):
+            results["extension_doctor"] = subprocess.run(
+                commands["extension_doctor"],
+                text=True, encoding="utf-8", errors="replace",
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+
+    execution: dict[str, Any] = {
+        "driver": driver,
+        "python_executable": sys.executable,
+        "install_returncode": results["install"].returncode,
+        "install_stdout_tail": results["install"].stdout[-2000:],
+        "install_stderr_tail": results["install"].stderr[-2000:],
+    }
+    for step in ("authority_upgrade", "workflow_skills", "slash_commands", "doctor", "extension_doctor"):
+        result = results.get(step)
+        if result is None:
+            execution[f"{step}_status"] = "skipped_prior_step_failed"
             continue
-        if not (stem.endswith(".status") or stem.endswith(".chat")):
-            continue
-        labels.append(plist.stem)
-    restarted: list[str] = []
-    uid = os.getuid() if hasattr(os, "getuid") else 0
-    for label in labels:
-        result = subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
-            capture_output=True,
-            text=True,
-            timeout=30,
+        execution[f"{step}_returncode"] = result.returncode
+        execution[f"{step}_stdout_tail"] = result.stdout[-2000:]
+        execution[f"{step}_stderr_tail"] = result.stderr[-2000:]
+        if step == "doctor" and result.returncode == 0:
+            execution["installed_runtime_identity"] = _installed_readback(result)
+
+    runtime_steps = (
+        "install",
+        "authority_upgrade",
+        "workflow_skills",
+        "slash_commands",
+        "doctor",
+    )
+    runtime_ready = all(
+        step in results and results[step].returncode == 0 for step in runtime_steps
+    )
+    extension_ready = (
+        "extension_doctor" in results and results["extension_doctor"].returncode == 0
+    )
+    updated = dict(payload)
+    updated["execution"] = execution
+    updated["ok"] = runtime_ready and extension_ready
+    updated["changes_applied"] = results["install"].returncode == 0
+    execution.update(
+        restart_services_for_runtime_activation(
+            changes_applied=updated["changes_applied"],
+            runtime_ready=runtime_ready,
         )
-        if result.returncode == 0:
-            restarted.append(label)
-    return restarted
+    )
+    if _retain_pending_service_activation(updated):
+        return updated
+    if updated["ok"]:
+        updated["recommended_action"] = (
+            "PyPI update and host-material readback passed; use the new LoopX process"
+        )
+        updated["next_action"] = {
+            "kind": "use_updated_runtime",
+            "command": "loopx doctor",
+            "mutating": False,
+            "requires_explicit_approval": False,
+            "reason": updated["recommended_action"],
+        }
+    elif runtime_ready:
+        updated["recommended_action"] = (
+            "the updated runtime is installed and serving; repair the blocked "
+            "enabled extension providers, then rerun "
+            "`loopx extension doctor --all-enabled --execute`"
+        )
+        updated["next_action"] = {
+            "kind": "repair_blocked_extensions",
+            "command": "loopx extension doctor --all-enabled --execute",
+            "mutating": False,
+            "requires_explicit_approval": False,
+            "reason": updated["recommended_action"],
+        }
+    else:
+        updated["recommended_action"] = (
+            "inspect the failed update step and retry the verified authority upgrade; "
+            "do not roll back the package without checking current data-format compatibility"
+        )
+        updated["next_action"] = {
+            "kind": "review_update_failure",
+            "command": "loopx --format json authority-archive upgrade --all-known",
+            "mutating": False,
+            "requires_explicit_approval": False,
+            "reason": updated["recommended_action"],
+        }
+
+    return updated
 
 
-def execute_update_plan(payload: dict[str, Any], *, timeout_seconds: int = 600) -> dict[str, Any]:
+def _runtime_route_arguments(registry_path: Path | None, runtime_root: str | None) -> list[str]:
+    arguments = []
+    if registry_path is not None:
+        arguments += ["--registry", str(registry_path.resolve())]
+    if runtime_root is not None:
+        arguments += ["--runtime-root", runtime_root]
+    return arguments
+
+
+def execute_update_plan(
+    payload: dict[str, Any], *, timeout_seconds: int = 600,
+    registry_path: Path | None = None, runtime_root: str | None = None,
+    progress: Callable[[str], None] = lambda _stage: None,
+) -> dict[str, Any]:
+    if not payload.get("plan", {}).get("apply_supported", True):
+        return dict(payload, ok=False, changes_applied=False)
+    route_arguments = _runtime_route_arguments(registry_path, runtime_root)
+    lifecycle = (
+        payload.get("install_lifecycle")
+        if isinstance(payload.get("install_lifecycle"), dict)
+        else {}
+    )
+    driver = lifecycle.get("execution_driver")
+    if driver is None and isinstance(payload.get("source"), dict):
+        # Compatibility for callers that persisted the v0 archive plan before
+        # install_lifecycle became explicit.
+        driver = "archive_snapshot"
+    if driver in {"python_pip", "python_pipx"}:
+        return _execute_python_distribution_update(
+            payload,
+            timeout_seconds=timeout_seconds,
+            route_arguments=route_arguments,
+            progress=progress,
+        )
+    if driver != "archive_snapshot":
+        updated = dict(payload)
+        updated["ok"] = False
+        updated["changes_applied"] = False
+        updated["execution"] = {
+            "status": "unsupported_install_owner",
+            "owner": lifecycle.get("owner"),
+            "reason": lifecycle.get("reason"),
+        }
+        return updated
     if os.name == "nt":
         updated = dict(payload)
         updated["execution"] = {
@@ -600,37 +1253,245 @@ def execute_update_plan(payload: dict[str, Any], *, timeout_seconds: int = 600) 
             current_release_root if isinstance(current_release_root, str) else None
         ),
     )
-    install_result = subprocess.run(
-        ["bash", "-lc", f"set -o pipefail; curl -fsSL {shlex.quote(installer_url)} | bash"],
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=timeout_seconds,
-    )
-    loopx_bin = Path.home() / ".local" / "bin" / "loopx"
+    if registry_path is not None:
+        env["LOOPX_REGISTRY"] = str(registry_path.resolve())
+    if runtime_root is not None:
+        env["LOOPX_RUNTIME_ROOT"] = runtime_root
+    if source.get("distribution") == "runtime":
+        from .cli_commands.update_artifact import install_artifact
+        if not source.get("artifact"):
+            return dict(payload, ok=False, changes_applied=False,
+                error="No resolved runtime artifact; rebuild the update plan online before applying")
+        install_result, download_observation = install_artifact(source["artifact"], env=env,
+            timeout_seconds=timeout_seconds, progress=progress)
+    else:
+        install_result, download_observation = run_archive_installer(
+            installer_url, env=env, timeout_seconds=timeout_seconds, progress=progress)
+    # Match install-local.sh's LOOPX_BIN_DIR override, including its empty-value
+    # default. Read back the installation that this update actually replaced.
+    loopx_bin = Path(env.get("LOOPX_BIN_DIR") or _user_loopx_bin().parent) / "loopx"
+    progress("Validating installed CLI")
     doctor_result = subprocess.run(
-        [str(loopx_bin), "--format", "json", "doctor"],
-        text=True,
+        [str(loopx_bin), *route_arguments, "--format", "json", "doctor"],
+        text=True, encoding="utf-8", errors="replace",
         capture_output=True,
         env=env,
         timeout=timeout_seconds,
     )
     execution = {
+        "installer_download": download_observation,
         "install_returncode": install_result.returncode,
         "doctor_returncode": doctor_result.returncode,
         "install_stdout_tail": install_result.stdout[-2000:],
         "install_stderr_tail": install_result.stderr[-2000:],
         "doctor_stdout_tail": doctor_result.stdout[-2000:],
         "doctor_stderr_tail": doctor_result.stderr[-2000:],
+        "installed_runtime_identity": _installed_readback(doctor_result) if doctor_result.returncode == 0 else {},
     }
+    try:
+        installed_freshness = json.loads(doctor_result.stdout).get("install_freshness", {})
+    except (ValueError, AttributeError):
+        installed_freshness = {}
+    if not isinstance(installed_freshness, dict):
+        installed_freshness = {}
+    # A host-material step can fail after a healthy candidate became active.
+    # Do not report "nothing changed" merely from the installer's exit code.
+    activation_observed = bool(doctor_result.returncode == 0 and source.get("resolved_revision")
+        and installed_freshness.get("manifest_source_git_commit") == source["resolved_revision"]
+        and installed_freshness.get("release_id")
+        and installed_freshness["release_id"] != payload.get("current", {}).get("release_id"))
+    execution["activation_observed"] = activation_observed
+    extension_doctor_result = None
+    if (install_result.returncode == 0 or activation_observed) and doctor_result.returncode == 0:
+        progress("Validating enabled extensions")
+        extension_doctor_result = subprocess.run(
+            [
+                str(loopx_bin),
+                *route_arguments,
+                "--format",
+                "json",
+                "extension",
+                "doctor",
+                "--all-enabled",
+                "--execute",
+            ],
+            text=True, encoding="utf-8", errors="replace",
+            capture_output=True,
+            env=env,
+            timeout=timeout_seconds,
+        )
+        execution.update(
+            {
+                "extension_doctor_returncode": extension_doctor_result.returncode,
+                "extension_doctor_stdout_tail": extension_doctor_result.stdout[-2000:],
+                "extension_doctor_stderr_tail": extension_doctor_result.stderr[-2000:],
+            }
+        )
+    else:
+        execution["extension_doctor_status"] = "skipped_release_update_failed"
+    runtime_ready = (install_result.returncode == 0 or activation_observed) and doctor_result.returncode == 0
     updated = dict(payload)
     updated["execution"] = execution
-    updated["ok"] = install_result.returncode == 0 and doctor_result.returncode == 0
-    if not updated["ok"]:
-        updated["recommended_action"] = "inspect update execution tails and restore from rollback plan if needed"
+    updated["ok"] = (
+        install_result.returncode == 0 and runtime_ready
+        and extension_doctor_result is not None
+        and extension_doctor_result.returncode == 0
+    )
+    updated["changes_applied"] = install_result.returncode == 0 or activation_observed
+    execution.update(
+        restart_services_for_runtime_activation(
+            changes_applied=updated["changes_applied"],
+            runtime_ready=runtime_ready,
+            installed_bin=loopx_bin,
+        )
+    )
+    if _retain_pending_service_activation(updated):
         return updated
-    execution["restarted_services"] = restart_managed_loopx_services()
+    if not updated["ok"] and runtime_ready:
+        updated["recommended_action"] = (
+            "the updated runtime is installed; repair the blocked "
+            "enabled extension providers, then rerun "
+            "`loopx extension doctor --all-enabled --execute`"
+        )
+        updated["next_action"] = {
+            "kind": "repair_blocked_extensions",
+            "command": "loopx extension doctor --all-enabled --execute",
+            "mutating": False,
+            "requires_explicit_approval": False,
+            "reason": updated["recommended_action"],
+        }
+        return updated
+    if not updated["ok"]:
+        updated["recommended_action"] = (
+            "inspect update execution tails and restore from rollback plan if needed"
+        )
+        rollback_command = backup.get("rollback_command")
+        updated["next_action"] = {
+            "kind": "review_or_rollback",
+            "command": rollback_command,
+            "mutating": bool(rollback_command),
+            "requires_explicit_approval": bool(rollback_command),
+            "reason": updated["recommended_action"],
+        }
+        return updated
+    updated["recommended_action"] = (
+        "archive update and readback passed; use the new LoopX process"
+    )
+    updated["next_action"] = {
+        "kind": "use_updated_runtime",
+        "command": "loopx doctor",
+        "mutating": False,
+        "requires_explicit_approval": False,
+        "reason": updated["recommended_action"],
+    }
     return updated
+
+
+def _verify_rollback_todos(
+    target_script: Path, registry_path: Path, runtime_root: str | None,
+    *, timeout_seconds: int,
+) -> None:
+    """Verify registered local Todo heads with the executable to be activated."""
+    from .control_plane.coordination.local_authority import (
+        local_authority_is_promoted,
+        read_canonical_todos_if_promoted,
+    )
+    from .control_plane.goals.activation_service import authority_upgrade_registries
+    from .control_plane.projects.registry_codec import read_activation_upgrade_registry
+    from .paths import GLOBAL_REGISTRY_FILENAME, resolve_runtime_root
+    from .registry import registry_goals
+
+    selected = registry_path.expanduser().resolve()
+    registries = authority_upgrade_registries(selected, runtime_root, all_known=True)
+    routes: list[tuple[Path, str | None]] = [(registry, None) for registry in registries]
+    if runtime_root:
+        routes.append((selected, runtime_root))
+    checked: set[tuple[Path, str]] = set()
+    deadline = time.monotonic() + timeout_seconds
+    for registry, override in routes:
+        document = read_activation_upgrade_registry(registry)
+        if registry.name == GLOBAL_REGISTRY_FILENAME and override is None:
+            root = registry.parent
+        else:
+            root = resolve_runtime_root(document, override, registry_path=registry)
+        root = root.resolve()
+        for goal in registry_goals(document):
+            goal_id = str(goal["id"])
+            key = (root, goal_id)
+            if key in checked or not local_authority_is_promoted(runtime_root=root, goal_id=goal_id):
+                continue
+            checked.add(key)
+            live = read_canonical_todos_if_promoted(runtime_root=root, goal_id=goal_id)
+            if live["source_authority"] not in ("file_v0", "sqlite_v0"):
+                continue
+            refusal = (
+                f"Rollback target could not verify current Todo state for Goal {goal_id!r}. "
+                "Keep the current runtime and verify the target version with a matching state backup."
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(refusal)
+            result = subprocess.run(
+                [str(target_script), *_runtime_route_arguments(registry, str(root)), "--format", "json",
+                 "todo", "list", "--goal-id", goal_id, "--limit", "1"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=remaining,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(refusal)
+            try:
+                projected = json.loads(result.stdout)
+            except ValueError:
+                raise RuntimeError(refusal) from None
+            authority = projected.get("authority_read") if isinstance(projected, dict) else None
+            if (
+                not isinstance(authority, dict)
+                or projected.get("ok") is not True
+                or projected.get("goal_id") != goal_id
+                or authority.get("decision_read_from_provider") is not True
+                or authority.get("legacy_fallback_used") is not False
+                or authority.get("source_authority") != live["source_authority"]
+                or authority.get("provider_revision") != live["provider_revision"]
+            ):
+                raise RuntimeError(refusal)
+
+
+def _rollback_launcher_stat(launcher: Path) -> os.stat_result | None:
+    try:
+        return launcher.lstat()
+    except FileNotFoundError:
+        return None
+
+
+def _verify_rollback_launcher(launcher: Path, original: os.stat_result | None) -> None:
+    current = _rollback_launcher_stat(launcher)
+    if original is None:
+        unchanged = current is None
+    else:
+        unchanged = current is not None and os.path.samestat(original, current)
+    if not unchanged:
+        raise RuntimeError(
+            f"LoopX launcher changed during rollback checks ({launcher.name}). "
+            "Read it back before retrying."
+        )
+
+
+def _managed_rollback_helper_target(
+    helper: Path, releases_dir: Path, original: os.stat_result | None,
+) -> str | None:
+    if original is None or not stat.S_ISLNK(original.st_mode):
+        return None
+    previous = os.readlink(helper)
+    # Allow a prior partial rollback: either release can own this sibling.
+    # Check the archive launcher path even if that release was pruned.
+    script = helper.parent / previous
+    if (
+        script.name == helper.name
+        and script.parent.name == "scripts"
+        and script.parent.parent.parent.resolve() == releases_dir.resolve()
+    ):
+        return previous
+    return None
 
 
 def execute_rollback_plan(
@@ -638,6 +1499,8 @@ def execute_rollback_plan(
     *,
     timeout_seconds: int = 600,
     home: Path | None = None,
+    registry_path: Path | None = None,
+    runtime_root: str | None = None,
 ) -> dict[str, Any]:
     if os.name == "nt":
         updated = dict(payload)
@@ -657,8 +1520,17 @@ def execute_rollback_plan(
         return payload
     release_root = Path(str(selected_release_root))
     target_script = _release_script(release_root)
+    route_arguments = _runtime_route_arguments(registry_path, runtime_root)
     loopx_bin = _user_loopx_bin(home)
-    previous_link_target = os.readlink(loopx_bin) if loopx_bin.is_symlink() else None
+    primary_stat = _rollback_launcher_stat(loopx_bin)
+    previous_link_target = (
+        os.readlink(loopx_bin) if primary_stat is not None and stat.S_ISLNK(primary_stat.st_mode) else None
+    )
+    primary_was_absent = primary_stat is None
+    original_launchers = {loopx_bin: primary_stat}
+    previous_targets = {loopx_bin: previous_link_target}
+    target_scripts = {loopx_bin: target_script}
+    helper = loopx_bin.with_name("loopx-apply-rrule")
     execution: dict[str, Any] = {
         "target_script": str(target_script),
         "loopx_command": str(loopx_bin),
@@ -666,16 +1538,70 @@ def execute_rollback_plan(
         "restored_previous_on_failure": False,
     }
     updated = dict(payload)
+    staged_launchers: dict[Path, os.stat_result] = {}
+    temporary: TemporaryDirectory[str] | None = None
+    promotion_guard = None
     try:
+        helper_stat = _rollback_launcher_stat(helper)
+        previous_helper = _managed_rollback_helper_target(helper, release_root.parent, helper_stat)
+        if previous_helper is not None:
+            original_launchers[helper] = helper_stat
+            previous_targets[helper] = previous_helper
+            target_scripts[helper] = target_script.with_name(helper.name)
+        compatible = subprocess.run(
+            [str(target_script), *route_arguments, "--format", "json", "authority-archive", "upgrade",
+             "--all-known", "--require-current"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout_seconds,
+        )
+        execution.update(
+            compatibility_returncode=compatible.returncode,
+            compatibility_stdout_tail=compatible.stdout[-2000:],
+            compatibility_stderr_tail=compatible.stderr[-2000:],
+        )
+        if compatible.returncode != 0:
+            raise RuntimeError("Rollback target authority check failed. Keep the current runtime "
+                               "and inspect the compatibility readback before retrying.")
+        from .file_lock import _open_lock_descriptor, _try_acquire_kernel_lock
+
+        # Share the archive installer's exact guard through checks and recovery.
+        guard_path = release_root.parent / ".install-guard"
+        guard_path.parent.mkdir(parents=True, exist_ok=True)
+        promotion_guard = os.fdopen(_open_lock_descriptor(guard_path, flags=os.O_CREAT | os.O_RDWR), "r+", encoding="utf-8")
+        deadline = time.monotonic() + timeout_seconds
+        while not _try_acquire_kernel_lock(promotion_guard):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Timed out waiting for another local install to finish before rollback.")
+            time.sleep(min(0.1, remaining))
+        if registry_path is not None:
+            _verify_rollback_todos(target_script, registry_path, runtime_root, timeout_seconds=timeout_seconds)
+        if previous_helper is not None:
+            helper_script = target_scripts[helper]
+            if not helper_script.is_file() or not os.access(helper_script, os.X_OK):
+                raise RuntimeError(
+                    "Rollback target lacks an executable loopx-apply-rrule. "
+                    "Choose a release containing both managed launchers."
+                )
+            if previous_link_target is None and not primary_was_absent:
+                raise RuntimeError(
+                    "Cannot roll back the managed launcher pair over a regular loopx command."
+                )
         loopx_bin.parent.mkdir(parents=True, exist_ok=True)
-        temp_link = loopx_bin.with_name(f".{loopx_bin.name}.rollback.{os.getpid()}")
-        if temp_link.exists() or temp_link.is_symlink():
-            temp_link.unlink()
-        temp_link.symlink_to(target_script)
-        os.replace(temp_link, loopx_bin)
+        temporary = TemporaryDirectory(prefix=".loopx-rollback-", dir=loopx_bin.parent)
+        staging = Path(temporary.name)
+        for launcher, script in target_scripts.items():
+            _verify_rollback_launcher(launcher, original_launchers[launcher])
+            staged = staging / launcher.name
+            staged.symlink_to(script)
+            staged_launchers[launcher] = staged.lstat()
+        # A signal can arrive immediately after the rename. Record ownership first.
+        for launcher in staged_launchers:
+            _verify_rollback_launcher(launcher, original_launchers[launcher])
+            os.replace(staging / launcher.name, launcher)
         doctor_result = subprocess.run(
-            [str(loopx_bin), "--format", "json", "doctor"],
-            text=True,
+            [str(loopx_bin), *route_arguments, "--format", "json", "doctor"],
+            text=True, encoding="utf-8", errors="replace",
             capture_output=True,
             timeout=timeout_seconds,
         )
@@ -686,45 +1612,111 @@ def execute_rollback_plan(
                 "doctor_stderr_tail": doctor_result.stderr[-2000:],
             }
         )
-        updated["ok"] = doctor_result.returncode == 0
-        if not updated["ok"] and previous_link_target:
-            restore_link = loopx_bin.with_name(f".{loopx_bin.name}.rollback.restore.{os.getpid()}")
-            if restore_link.exists() or restore_link.is_symlink():
-                restore_link.unlink()
-            restore_link.symlink_to(previous_link_target)
-            os.replace(restore_link, loopx_bin)
-            execution["restored_previous_on_failure"] = True
-    except Exception as exc:
+        if doctor_result.returncode == 0:
+            extension_doctor_result = subprocess.run(
+                [
+                    str(loopx_bin),
+                    *route_arguments,
+                    "--format",
+                    "json",
+                    "extension",
+                    "doctor",
+                    "--all-enabled",
+                    "--execute",
+                ],
+                text=True, encoding="utf-8", errors="replace",
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+            execution.update(
+                {
+                    "extension_doctor_returncode": extension_doctor_result.returncode,
+                    "extension_doctor_stdout_tail": extension_doctor_result.stdout[
+                        -2000:
+                    ],
+                    "extension_doctor_stderr_tail": extension_doctor_result.stderr[
+                        -2000:
+                    ],
+                }
+            )
+            updated["ok"] = extension_doctor_result.returncode == 0
+        else:
+            execution["extension_doctor_status"] = "skipped_core_doctor_failed"
+            updated["ok"] = False
+        if doctor_result.returncode != 0:
+            raise RuntimeError("Rollback target failed runtime checks; inspect the Doctor output.")
+        for launcher, staged_stat in staged_launchers.items():
+            if not os.path.samestat(staged_stat, launcher.lstat()):
+                raise RuntimeError(f"LoopX launcher changed during rollback validation ({launcher.name}).")
+    except BaseException as exc:
         execution["error"] = str(exc)
         updated["ok"] = False
-        if previous_link_target:
-            restore_link = loopx_bin.with_name(f".{loopx_bin.name}.rollback.restore.{os.getpid()}")
-            try:
-                if restore_link.exists() or restore_link.is_symlink():
-                    restore_link.unlink()
-                restore_link.symlink_to(previous_link_target)
-                os.replace(restore_link, loopx_bin)
-                execution["restored_previous_on_failure"] = True
-            except Exception as restore_exc:
-                execution["restore_error"] = str(restore_exc)
+        restore_errors = []
+        if temporary is not None:
+            for launcher, staged_stat in reversed(staged_launchers.items()):
+                try:
+                    try:
+                        current_stat = launcher.lstat()
+                    except FileNotFoundError:
+                        if launcher == loopx_bin and primary_was_absent:
+                            continue
+                        raise
+                    if not os.path.samestat(staged_stat, current_stat):
+                        continue
+                    previous = previous_targets[launcher]
+                    if previous is not None:
+                        staged = Path(temporary.name) / launcher.name
+                        staged.symlink_to(previous)
+                        # Preparing the restore link can overlap another publisher.
+                        current_stat = _rollback_launcher_stat(launcher)
+                        if current_stat is None or not os.path.samestat(staged_stat, current_stat):
+                            continue
+                        os.replace(staged, launcher)
+                        if launcher == loopx_bin:
+                            execution["restored_previous_on_failure"] = True
+                    elif primary_was_absent:
+                        launcher.unlink()
+                except OSError as restore_exc:
+                    restore_errors.append(f"{launcher.name}: {restore_exc}")
+        if restore_errors:
+            execution["restore_error"] = "\n".join(restore_errors)
+        if not isinstance(exc, Exception):
+            raise
     finally:
-        if "temp_link" in locals() and (temp_link.exists() or temp_link.is_symlink()):
-            temp_link.unlink()
-        if "restore_link" in locals() and (restore_link.exists() or restore_link.is_symlink()):
-            restore_link.unlink()
+        try:
+            if temporary is not None:
+                temporary.cleanup()
+        finally:
+            if promotion_guard is not None:
+                promotion_guard.close()
     updated["execution"] = execution
-    updated["recommended_action"] = (
-        "rollback complete; review doctor output"
-        if updated["ok"]
-        else "rollback failed; inspect execution error before retrying"
-    )
+    if updated["ok"]:
+        updated["recommended_action"] = "rollback complete; review doctor output"
+    elif (
+        "error" not in execution
+        and execution.get("doctor_returncode") == 0
+        and execution.get("extension_doctor_returncode") not in {None, 0}
+    ):
+        updated["recommended_action"] = (
+            "rollback activated, but one or more enabled extensions remain fail "
+            "closed; repair the provider and run `loopx extension doctor "
+            "--all-enabled --execute`"
+        )
+    else:
+        updated["recommended_action"] = (
+            "rollback failed; inspect execution error before retrying"
+        )
     return updated
 
 
 def render_update_plan_markdown(payload: dict[str, Any]) -> str:
     if payload.get("mode") == "rollback":
         plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
-        execution = payload.get("execution") if isinstance(payload.get("execution"), dict) else None
+        execution = (
+            payload.get("execution")
+            if isinstance(payload.get("execution"), dict)
+            else None
+        )
         lines = [
             "# LoopX Update Rollback",
             "",
@@ -739,22 +1731,40 @@ def render_update_plan_markdown(payload: dict[str, Any]) -> str:
         ]
         rollback_command = plan.get("rollback_command")
         if rollback_command:
-            lines.extend(["", "## Rollback Command", "", "```bash", str(rollback_command), "```"])
-        if execution:
             lines.extend(
-                [
-                    "",
-                    "## Execution",
-                    "",
-                    f"- Doctor return code: `{execution.get('doctor_returncode')}`",
-                ]
+                ["", "## Rollback Command", "", "```bash", str(rollback_command), "```"]
             )
+        if execution:
+            lines.extend(["", "## Execution", ""])
+            for stage, label in (
+                ("compatibility", "Authority compatibility"),
+                ("doctor", "Doctor"),
+                ("extension_doctor", "Extension doctor"),
+            ):
+                returncode = execution.get(f"{stage}_returncode")
+                if returncode is None:
+                    continue
+                lines.append(f"- {label} return code: `{returncode}`")
+                if returncode != 0:
+                    for stream in ("stdout", "stderr"):
+                        output = execution.get(f"{stage}_{stream}_tail")
+                        if output:
+                            lines.extend(["", f"### {label} {stream}", "", "```text", str(output), "```"])
+            if execution.get("error"):
+                lines.extend(["", f"Error: {execution['error']}"])
+            if execution.get("restore_error"):
+                lines.extend(["", f"Recovery error: {execution['restore_error']}"])
         return "\n".join(lines) + "\n"
 
     source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
     source_version_check = (
         payload.get("source_version_check")
         if isinstance(payload.get("source_version_check"), dict)
+        else {}
+    )
+    source_commit_check = (
+        payload.get("source_commit_check")
+        if isinstance(payload.get("source_commit_check"), dict)
         else {}
     )
     runtime_activation = (
@@ -765,45 +1775,120 @@ def render_update_plan_markdown(payload: dict[str, Any]) -> str:
     current = payload.get("current") if isinstance(payload.get("current"), dict) else {}
     plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
     backup = plan.get("backup") if isinstance(plan.get("backup"), dict) else {}
+    next_action = (
+        payload.get("next_action")
+        if isinstance(payload.get("next_action"), dict)
+        else {}
+    )
+    notice = (
+        "> **No update was applied.** This is a read-only check/plan."
+        if not payload.get("execute_requested")
+        else "> **Apply was requested.** Review the execution and validation result below."
+    )
     lines = [
         "# LoopX Update",
         "",
-        f"- OK: `{payload.get('ok')}`",
-        f"- Mode: `{plan.get('action')}`",
-        f"- Dry run: `{payload.get('dry_run')}`",
-        f"- Source: `{source.get('repo')}` @ `{source.get('ref')}`",
-        f"- Source version check: `{source_version_check.get('status')}`",
-        f"- Source version: `{source_version_check.get('version')}`",
-        f"- Source version tag: `{source_version_check.get('version_tag')}`",
-        f"- Source version matches current: `{source_version_check.get('matches_current')}`",
-        f"- Source version check reason: `{source_version_check.get('reason')}`",
-        f"- Runtime activation decision: `{runtime_activation.get('decision')}`",
-        f"- Runtime active: `{runtime_activation.get('runtime_active')}`",
-        f"- Installed source commit: `{runtime_activation.get('installed_source_commit')}`",
-        f"- Target source commit: `{runtime_activation.get('target_source_commit')}`",
-        f"- Source revision relation: `{runtime_activation.get('revision_relation')}`",
-        f"- Runtime activation reason: `{runtime_activation.get('reason')}`",
-        f"- Current version: `{current.get('current_version')}`",
-        f"- Current version tag: `{current.get('current_version_tag')}`",
-        f"- Manifest package version: `{current.get('manifest_package_version')}`",
-        f"- Manifest package version tag: `{current.get('manifest_package_version_tag')}`",
-        f"- Manifest package matches runtime: `{current.get('manifest_package_version_matches_runtime')}`",
-        f"- Freshness: `{current.get('install_freshness_status')}`",
-        f"- Requires upgrade: `{current.get('requires_upgrade')}`",
-        f"- Runtime state mutation: `{plan.get('mutates_loopx_runtime_state')}`",
-        f"- Release install mutation: `{plan.get('mutates_release_install')}`",
-        f"- Rollback available: `{backup.get('available')}`",
-        f"- Recommended action: {payload.get('recommended_action')}",
+        notice,
         "",
-        "## Install Command",
+        "## Next Action",
         "",
-        "```bash",
-        str(plan.get("install_command") or ""),
-        "```",
+        f"- Kind: `{next_action.get('kind')}`",
+        f"- Mutating: `{next_action.get('mutating')}`",
+        f"- Requires explicit approval: `{next_action.get('requires_explicit_approval')}`",
     ]
+    next_command = next_action.get("command")
+    if next_command:
+        lines.extend(["", "```bash", str(next_command), "```"])
+    prompt_upgrade = payload.get("automation_prompt_upgrade")
+    if isinstance(prompt_upgrade, dict):
+        lines.extend(["", "## Automation Prompts", "",
+                      f"- Status: `{prompt_upgrade.get('status')}`"])
+        if "upgrade_complete" in payload:
+            lines.append(f"- Upgrade complete (runtime + prompts): `{payload['upgrade_complete']}`")
+        for item in prompt_upgrade.get("results", []):
+            lines.append(f"- `{item['automation_id']}`: `{item['status']}`")
+            if item.get("reason"):
+                lines.append(f"  - {item['reason']}")
+        if prompt_upgrade.get("snapshot_file"):
+            lines.append(f"- Private recovery snapshot: `{prompt_upgrade['snapshot_file']}`")
+        if prompt_upgrade.get("next_action"):
+            lines.append(f"- Next: {prompt_upgrade['next_action']}")
+    installed_identity = (payload.get("execution") or {}).get("installed_runtime_identity")
+    if installed_identity:
+        lines.extend(["", "## Installed CLI Readback", "",
+                      f"- Version: `{installed_identity.get('package_version')}`",
+                      f"- Source revision: `{installed_identity.get('source_revision')}`",
+                      "- Fresh process installation check passed; the plan below describes the pre-update installation."])
+    if (payload.get("execution") or {}).get("activation_pending"):
+        lines.extend(["", "## Service activation pending", "",
+                      "- The CLI is installed; managed-service activation is incomplete.",
+                      f"- Reason: `{payload['execution'].get('restart_reason')}`",
+                      "- Accepted Chat work stays with its original consumer. Retry the same update after it finishes or its unreadable state is repaired."])
+    lines.extend(
+        [
+            "",
+            "## Plan (before execution)" if payload.get("execute_requested") else "## Details",
+            "",
+            f"- OK: `{payload.get('ok')}`",
+            f"- Requested action: `{payload.get('requested_action')}`",
+            f"- Changes applied: `{payload.get('changes_applied')}`",
+            f"- Mode: `{plan.get('action')}`",
+            f"- Dry run: `{payload.get('dry_run')}`",
+            f"- Source: `{source.get('repo')}` @ `{source.get('ref')}`",
+            f"- Source version check: `{source_version_check.get('status')}`",
+            f"- Source version: `{source_version_check.get('version')}`",
+            f"- Source version tag: `{source_version_check.get('version_tag')}`",
+            f"- Source version matches current: `{source_version_check.get('matches_current')}`",
+            f"- Source version check reason: {source_version_check.get('reason')}",
+            f"- Source commit check: `{source_commit_check.get('status')}`",
+            f"- Source commit matches current: `{source_commit_check.get('matches_current')}`",
+            f"- Source commit check reason: {source_commit_check.get('reason')}",
+            f"- Runtime activation decision: `{runtime_activation.get('decision')}`",
+            f"- Runtime active: `{runtime_activation.get('runtime_active')}`",
+            f"- Installed source commit: `{runtime_activation.get('installed_source_commit')}`",
+            f"- Target source commit: `{runtime_activation.get('target_source_commit')}`",
+            f"- Source revision relation: `{runtime_activation.get('revision_relation')}`",
+            f"- Runtime activation reason: {runtime_activation.get('reason')}",
+            f"- Current version: `{current.get('current_version')}`",
+            f"- Current version tag: `{current.get('current_version_tag')}`",
+            f"- Manifest package version: `{current.get('manifest_package_version')}`",
+            f"- Manifest package version tag: `{current.get('manifest_package_version_tag')}`",
+            f"- Manifest package matches runtime: `{current.get('manifest_package_version_matches_runtime')}`",
+            f"- Freshness: `{current.get('install_freshness_status')}`",
+            f"- Requires upgrade: `{current.get('requires_upgrade')}`",
+            f"- Runtime state mutation: `{plan.get('mutates_loopx_runtime_state')}`",
+            f"- Release install mutation: `{plan.get('mutates_release_install')}`",
+            f"- Install kind: `{(payload.get('install_lifecycle') or {}).get('install_kind')}`",
+            f"- Install owner: `{(payload.get('install_lifecycle') or {}).get('owner')}`",
+            f"- Apply supported: `{plan.get('apply_supported')}`",
+            f"- Rollback available: `{backup.get('available')}`",
+            f"- Recommended action: {payload.get('recommended_action')}",
+            "",
+            "## Planned Installation-owner Command",
+            "",
+            "```bash",
+            str(plan.get("install_command") or ""),
+            "```",
+        ]
+    )
+    commands = (
+        payload.get("commands") if isinstance(payload.get("commands"), dict) else {}
+    )
+    lines.extend(
+        [
+            "",
+            "## Intent Commands",
+            "",
+            f"- Check: `{commands.get('check')}`",
+            f"- Plan: `{commands.get('plan')}`",
+            f"- Apply: `{commands.get('apply')}`",
+        ]
+    )
     rollback_command = backup.get("rollback_command")
     if rollback_command:
-        lines.extend(["", "## Rollback Command", "", "```bash", str(rollback_command), "```"])
+        lines.extend(
+            ["", "## Rollback Command", "", "```bash", str(rollback_command), "```"]
+        )
     execution = payload.get("execution")
     if isinstance(execution, dict):
         lines.extend(
@@ -815,4 +1900,12 @@ def render_update_plan_markdown(payload: dict[str, Any]) -> str:
                 f"- Doctor return code: `{execution.get('doctor_returncode')}`",
             ]
         )
+        download = execution.get("installer_download")
+        if isinstance(download, dict):
+            lines.append(f"- Installer stage: `{download.get('stage')}`")
+            for attempt in download.get("attempts", []):
+                lines.append(
+                    f"- Download attempt {attempt['attempt']}: "
+                    f"HTTP `{attempt['http_status']}`, curl `{attempt['curl_returncode']}`"
+                )
     return "\n".join(lines) + "\n"

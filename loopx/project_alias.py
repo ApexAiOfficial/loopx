@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .paths import DEFAULT_RUNTIME_ROOT, global_registry_path
+from .paths import global_registry_path, select_default_runtime_root
 from .registry import registry_goals
 
 
@@ -21,7 +21,7 @@ def _run_git(project: Path, *args: str) -> subprocess.CompletedProcess[str] | No
     try:
         return subprocess.run(
             ["git", "-C", str(project), *args],
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -65,7 +65,7 @@ def _primary_repo_from_common_dir(common_dir: Path | None) -> Path | None:
 
 def _default_global_registry_path() -> Path:
     runtime_env = os.environ.get("LOOPX_RUNTIME_ROOT")
-    runtime_root = Path(runtime_env).expanduser() if runtime_env else DEFAULT_RUNTIME_ROOT
+    runtime_root = Path(runtime_env).expanduser() if runtime_env else select_default_runtime_root()
     return global_registry_path(runtime_root)
 
 
@@ -108,16 +108,26 @@ def resolve_canonical_project_alias(
 
     resolved_project = _resolve_path(project)
     target_common_dir = _git_common_dir(resolved_project)
+    if target_common_dir is None:
+        return {
+            "applied": False,
+            "kind": "none",
+            "input_project": str(resolved_project),
+            "global_registry": str(_resolve_path(global_registry)) if global_registry is not None else None,
+            "git_common_dir": None,
+            "reason": "git common-dir unavailable",
+        }
+
     global_path = _resolve_path(global_registry or _default_global_registry_path())
     payload = _read_global_registry(global_path)
-    if not payload or target_common_dir is None:
+    if not payload:
         return {
             "applied": False,
             "kind": "none",
             "input_project": str(resolved_project),
             "global_registry": str(global_path),
-            "git_common_dir": str(target_common_dir) if target_common_dir else None,
-            "reason": "global registry or git common-dir unavailable",
+            "git_common_dir": str(target_common_dir),
+            "reason": "global registry unavailable",
         }
 
     primary_repo = _primary_repo_from_common_dir(target_common_dir)

@@ -16,7 +16,7 @@ def build_todo_write_hint(goal_id: str) -> dict[str, str]:
             "--task-class user_action --bound-agent <id> --text '<action>'"
         ),
         "agent_todo_command_template": (
-            f"loopx todo add --goal-id {goal_id} --role agent --text '<agent action>'"
+            f"loopx todo add --goal-id {goal_id} --role agent --priority P1 --text '<agent action>'"
         ),
         "section": "User Todo / Owner Review Reading Queue",
     }

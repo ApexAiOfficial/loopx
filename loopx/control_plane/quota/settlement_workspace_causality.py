@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 from collections.abc import Mapping
-from typing import Any
 
 from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from ..coordination.coordination_state_contract_generated import (
+    DELIVERY_WORKSPACE_CAUSALITY_REQUEST_SCHEMA,
+    DELIVERY_WORKSPACE_CAUSALITY_RESULT_SCHEMA,
+    DELIVERY_WORKSPACE_CAUSALITY_SCHEMA,
+    DELIVERY_WORKSPACE_LEGACY_RECEIPT_EVIDENCE_SCHEMA,
+    DELIVERY_WORKSPACE_RESOLUTION_SCHEMA,
+    DELIVERY_WORKSPACE_SETTLEMENT_REQUIREMENT_SCHEMA,
+)
 from ..todos.contract import (
     normalize_required_write_scopes,
     normalize_todo_continuation_policy,
@@ -13,15 +22,34 @@ from ..todos.contract import (
     normalize_todo_task_repository,
 )
 
-DELIVERY_WORKSPACE_CAUSALITY_SCHEMA_VERSION = "delivery_workspace_causality_v0"
-DELIVERY_WORKSPACE_CAUSALITY_REQUEST_SCHEMA = (
-    "loopx_delivery_workspace_causality_request_v0"
+DELIVERY_WORKSPACE_CAUSALITY_SCHEMA_VERSION = DELIVERY_WORKSPACE_CAUSALITY_SCHEMA
+DELIVERY_WORKSPACE_RESOLUTION_SCHEMA_VERSION = DELIVERY_WORKSPACE_RESOLUTION_SCHEMA
+SETTLEMENT_WORKSPACE_REQUIREMENT_SCHEMA_VERSION = (
+    DELIVERY_WORKSPACE_SETTLEMENT_REQUIREMENT_SCHEMA
 )
-DELIVERY_WORKSPACE_CAUSALITY_RESULT_SCHEMA = (
-    "loopx_delivery_workspace_causality_result_v0"
+LEGACY_SETTLEMENT_RECEIPT_EVIDENCE_SCHEMA_VERSION = (
+    DELIVERY_WORKSPACE_LEGACY_RECEIPT_EVIDENCE_SCHEMA
 )
-DELIVERY_WORKSPACE_RESOLUTION_SCHEMA_VERSION = "delivery_workspace_resolution_v0"
 DELIVERY_WORKSPACE_REQUIREMENTS = frozenset({"required", "not_required", "unknown"})
+
+
+def project_goal_write_scopes(
+    project_root: str,
+    allowed_scopes: list[str],
+) -> dict[str, Any]:
+    """Adapt observed local-root facts to the existing typed work owner."""
+    result = _runtime_result(
+        "goal_write_scopes",
+        project_root=project_root,
+        allowed_scopes=allowed_scopes,
+    ).get("write_scope_projection")
+    if (
+        not isinstance(result, Mapping)
+        or not isinstance(result.get("allowed_write_scopes"), list)
+        or any(not isinstance(scope, str) for scope in result["allowed_write_scopes"])
+    ):
+        raise RuntimeError("TypeScript Goal write scope projection shape mismatch")
+    return dict(result)
 
 
 def _runtime_result(operation: str, **params: Any) -> Mapping[str, Any]:
@@ -132,23 +160,6 @@ def build_delivery_workspace_causality(
     )
 
 
-def normalize_delivery_workspace_causality(
-    value: Any,
-    *,
-    todo_id: str | None = None,
-) -> dict[str, str] | None:
-    prepared = _prepared_causality(value if isinstance(value, Mapping) else None)
-    if prepared is None:
-        return None
-    return _causality_result(
-        _runtime_result(
-            "normalize",
-            expected_todo_id=normalize_todo_id(todo_id),
-            causality=prepared,
-        )
-    )
-
-
 def delivery_workspace_causality_event_fields(
     causality: Mapping[str, Any] | None,
 ) -> dict[str, str]:
@@ -249,7 +260,7 @@ def missing_delivery_workspace_resolution(
             "todo_delivery_contract_not_explicit",
             True,
         ),
-    }.get(decision)
+    }.get(cast(str, decision))
     if expected is None:
         raise RuntimeError(
             "TypeScript delivery workspace resolution result shape mismatch"
@@ -287,13 +298,57 @@ def missing_delivery_workspace_resolution(
     return dict(value)
 
 
+def resolve_settlement_workspace_requirement(
+    causality: Mapping[str, Any] | None,
+    *,
+    settlement_binding_kind: str,
+    legacy_settlement_evidence: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Resolve workspace policy from the original typed settlement binding."""
+
+    result = _runtime_result(
+        "settlement_requirement",
+        expected_todo_id=None,
+        causality=_prepared_causality(causality),
+        settlement_binding_kind=settlement_binding_kind,
+        legacy_settlement_evidence=(
+            dict(legacy_settlement_evidence)
+            if isinstance(legacy_settlement_evidence, Mapping)
+            else None
+        ),
+    )
+    value = result.get("settlement_requirement")
+    expected_keys = {
+        "schema_version",
+        "settlement_binding_kind",
+        "requirement",
+        "source",
+        "reason",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != expected_keys
+        or value.get("schema_version")
+        != SETTLEMENT_WORKSPACE_REQUIREMENT_SCHEMA_VERSION
+        or value.get("settlement_binding_kind") != settlement_binding_kind
+        or value.get("requirement") not in DELIVERY_WORKSPACE_REQUIREMENTS
+        or not str(value.get("source") or "").strip()
+        or not str(value.get("reason") or "").strip()
+    ):
+        raise RuntimeError(
+            "TypeScript settlement workspace requirement result shape mismatch"
+        )
+    return {key: str(value[key]) for key in expected_keys}
+
+
 def completed_todo_workspace_causality(
     status_payload: Mapping[str, Any],
     *,
     goal_id: str,
-    todo_id: str,
+    todo_id: str | None,
+    source: str = "completed_todo_contract_fallback",
 ) -> dict[str, str] | None:
-    """Recover a legacy effect's causality from its exact completed Todo."""
+    """Recover an effect's causality from its exact projected Todo contract."""
 
     queue = status_payload.get("attention_queue")
     queue_items = queue.get("items") if isinstance(queue, Mapping) else []
@@ -320,6 +375,6 @@ def completed_todo_workspace_causality(
                         continue
                     return build_delivery_workspace_causality(
                         item,
-                        source="completed_todo_contract_fallback",
+                        source=source,
                     )
     return None

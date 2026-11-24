@@ -50,7 +50,7 @@ def _git_text(source: Path, *args: str) -> str:
             ["git", "--no-optional-locks", "-C", str(source), *args],
             check=False,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
     except OSError as exc:
         raise BenchmarkSourceRevisionFenceError(

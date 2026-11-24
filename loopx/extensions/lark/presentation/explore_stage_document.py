@@ -10,7 +10,13 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
-from .kanban import CommandRunner, _command_error, _run_command
+from ..cli_transport import (
+    CommandRunner,
+    command_error,
+    run_command,
+)
+from .kanban import _redact_credential_shapes, _redact_public_safe_shapes
+from .sink_visibility import SINK_VISIBILITY_SHARED
 
 
 class StageDocumentConfig(Protocol):
@@ -32,20 +38,30 @@ def _stage_section_title(*, role: str, stage_index: int) -> str:
     return f"{_stage_section_prefix(role=role)} {stage_index:02d}"
 
 
-def _stage_section_xml(stage: Mapping[str, Any], *, role: str) -> str:
+def _stage_section_xml(
+    stage: Mapping[str, Any], *, role: str, sink_visibility: str
+) -> str:
     stage_index = int(stage.get("stage_index") or 0)
     lane_labels = {
         "fix_pr": "PR issue-fix",
         "capability": "LoopX capability",
         "default": "Explore work",
     }
-    lanes = (
-        ", ".join(
-            lane_labels.get(str(item), str(item).replace("_", " ").title())
-            for item in stage.get("lanes") or []
+    lane_texts: list[str] = []
+    for item in stage.get("lanes") or []:
+        raw = str(item)
+        safe = (
+            _redact_public_safe_shapes(raw)
+            if sink_visibility == SINK_VISIBILITY_SHARED
+            else _redact_credential_shapes(raw)
         )
-        or "Explore work"
-    )
+        lane_texts.append(
+            lane_labels.get(
+                safe,
+                safe.replace("_", " ").title() if safe == raw else safe,
+            )
+        )
+    lanes = ", ".join(lane_texts) or "Explore work"
     return (
         f"<h2>{_stage_section_title(role=role, stage_index=stage_index)}</h2>"
         "<p>"
@@ -210,6 +226,7 @@ def ensure_stage_whiteboards(
     role_sink: Mapping[str, Any],
     stage_views: list[Mapping[str, Any]],
     config_path: Path,
+    sink_visibility: str,
     execute: bool,
     runner: CommandRunner,
     read_local_config: LocalConfigReader,
@@ -279,12 +296,12 @@ def ensure_stage_whiteboards(
                 "action": action,
                 "ok": bool(command.get("ok")),
                 "returncode": command.get("returncode"),
-                "error": None if command.get("ok") else _command_error(command),
+                "error": None if command.get("ok") else command_error(command),
             }
         )
 
     if execute and docx_token:
-        outline_command = _run_command(
+        outline_command = run_command(
             _docs_fetch_command(
                 config,
                 docx_token=docx_token,
@@ -307,7 +324,7 @@ def ensure_stage_whiteboards(
                 [],
                 reconciliation_commands,
                 reconciliation,
-                _command_error(outline_command)
+                command_error(outline_command)
                 if not outline_command.get("ok")
                 else "Evidence Stage outline could not be parsed",
             )
@@ -350,8 +367,7 @@ def ensure_stage_whiteboards(
             or duplicate_stage_indexes
         )
 
-        # A readable whiteboard token does not prove that the board is still
-        # embedded in the configured document. Drop detached checkpoints so
+                #  Drop detached checkpoints so
         # the normal missing-stage path recreates the managed section.
         for stage_index in missing_remote_stage_indexes:
             configured.pop(stage_index, None)
@@ -368,7 +384,7 @@ def ensure_stage_whiteboards(
         )
         for stage_index in indexes_to_inspect:
             for heading_block_id in headings_by_stage.get(stage_index, []):
-                section_command = _run_command(
+                section_command = run_command(
                     _docs_fetch_command(
                         config,
                         docx_token=docx_token,
@@ -399,7 +415,7 @@ def ensure_stage_whiteboards(
                         [],
                         reconciliation_commands,
                         reconciliation,
-                        _command_error(section_command)
+                        command_error(section_command)
                         if not section_command.get("ok")
                         else (
                             f"Evidence Stage {stage_index:02d} conflicts with an "
@@ -475,7 +491,7 @@ def ensure_stage_whiteboards(
             if revision is not None:
                 delete_args.extend(["--revision-id", str(revision)])
             delete_args.extend(["--format", "json"])
-            delete_command = _run_command(
+            delete_command = run_command(
                 delete_args,
                 execute=True,
                 runner=runner,
@@ -489,9 +505,9 @@ def ensure_stage_whiteboards(
                     [],
                     reconciliation_commands,
                     reconciliation,
-                    _command_error(delete_command),
+                    command_error(delete_command),
                 )
-            verification_command = _run_command(
+            verification_command = run_command(
                 _docs_fetch_command(
                     config,
                     docx_token=docx_token,
@@ -514,7 +530,7 @@ def ensure_stage_whiteboards(
                     [],
                     reconciliation_commands,
                     reconciliation,
-                    _command_error(verification_command)
+                    command_error(verification_command)
                     if not verification_command.get("ok")
                     else "updated Evidence Stage outline could not be parsed",
                 )
@@ -582,7 +598,7 @@ def ensure_stage_whiteboards(
     section_commands: list[dict[str, Any]] = []
     for stage in missing:
         stage_index = int(stage.get("stage_index") or 0)
-        command = _run_command(
+        command = run_command(
             [
                 config.cli_bin,
                 "docs",
@@ -594,7 +610,9 @@ def ensure_stage_whiteboards(
                 "--command",
                 "append",
                 "--content",
-                _stage_section_xml(stage, role=role),
+                _stage_section_xml(
+                    stage, role=role, sink_visibility=sink_visibility
+                ),
                 "--format",
                 "json",
             ],
@@ -609,7 +627,7 @@ def ensure_stage_whiteboards(
                 section_commands,
                 reconciliation_commands,
                 reconciliation,
-                _command_error(command),
+                command_error(command),
             )
         if execute:
             section = _created_stage_section(command)
@@ -640,7 +658,7 @@ def ensure_stage_whiteboards(
             }
 
     if execute and docx_token and missing:
-        verification_command = _run_command(
+        verification_command = run_command(
             _docs_fetch_command(
                 config,
                 docx_token=docx_token,
@@ -663,7 +681,7 @@ def ensure_stage_whiteboards(
                 section_commands,
                 reconciliation_commands,
                 reconciliation,
-                _command_error(verification_command)
+                command_error(verification_command)
                 if not verification_command.get("ok")
                 else "created Evidence Stage outline could not be parsed",
             )

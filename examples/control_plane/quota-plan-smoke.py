@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+FIXTURE_RUNTIME_ROOT = str((REPO_ROOT / "fixtures/runtime").resolve())
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -29,7 +30,7 @@ from loopx.control_plane.scheduler.execution_context import (  # noqa: E402
     scheduler_execution_context_for_runtime_profile,
 )
 
-from quota_plan_fixtures import (  # noqa: E402
+from examples.control_plane.quota_plan_fixtures import (  # noqa: E402
     _nested_value,
     _short_hash,
     assert_dry_run_left_cli_fixture_unchanged,
@@ -56,7 +57,7 @@ APP_SCHEDULER_CONTEXT = scheduler_execution_context_for_runtime_profile(
 )
 
 
-def assert_plan_shape(plan: dict, markdown: str | None = None) -> None:
+def assert_plan_shape(plan: dict, markdown: str | None = None, *, expected_user_todos: int = 1) -> None:
     eligible_ids = [item["goal_id"] for item in plan["groups"]["eligible"]]
     operator_gate_ids = [item["goal_id"] for item in plan["groups"]["operator_gate"]]
     throttled_ids = [item["goal_id"] for item in plan["groups"]["throttled"]]
@@ -72,7 +73,7 @@ def assert_plan_shape(plan: dict, markdown: str | None = None) -> None:
     assert gated["quota"]["blocked_action_scope"] == "gated_delivery", gated
     assert "operator_question" in gated, gated
     if "user_todos" in gated:
-        assert gated["user_todos"]["open_count"] == 1, gated
+        assert gated["user_todos"]["open_count"] == expected_user_todos, gated
     assert "throttled-half" not in eligible_ids, eligible_ids
     if markdown is not None:
         assert "next_automatic_turn=full-speed" in markdown, markdown
@@ -126,7 +127,7 @@ def assert_scheduler_advisory_does_not_override_goal_should_run() -> None:
     payload = {
         "ok": True,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 4,
         "run_count": 4,
         "attention_queue": {"items": [meta_item, creator_item, side_bypass_item, gated_item]},
@@ -289,7 +290,7 @@ def assert_focus_wait_should_run() -> None:
     payload = {
         "ok": True,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 1,
         "run_count": 1,
         "attention_queue": {"items": [focus_item]},
@@ -358,7 +359,7 @@ def assert_outcome_floor_recovery_should_run() -> None:
     payload = {
         "ok": True,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 1,
         "run_count": 1,
         "attention_queue": {"items": [recovery_item]},
@@ -468,7 +469,7 @@ def assert_outcome_floor_projected_blocker_quiet_noop() -> None:
     payload = {
         "ok": True,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 1,
         "run_count": 1,
         "attention_queue": {"items": [recovery_item]},
@@ -523,7 +524,7 @@ def assert_outcome_floor_projected_blocker_quiet_noop() -> None:
     assert monitor_contract["agent_channel"]["must_attempt"] is True, monitor_contract
     assert monitor_contract["agent_channel"]["quiet_noop_allowed"] is False, monitor_contract
     assert "outcome-floor evidence" in monitor_contract["agent_channel"]["primary_action"], monitor_contract
-    assert "outcome-floor evidence" in monitor_decision["protocol_action_packet"]["summary"], monitor_decision
+    assert "protocol_action_packet" not in monitor_decision, monitor_decision
 
 
 def assert_control_plane_health_self_repair_should_run() -> None:
@@ -542,7 +543,7 @@ def assert_control_plane_health_self_repair_should_run() -> None:
     payload = {
         "ok": False,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 1,
         "run_count": 1,
         "attention_queue": {"items": [health_item, meta_item]},
@@ -589,7 +590,7 @@ def assert_control_plane_self_repair_default_off() -> None:
     payload = {
         "ok": False,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 1,
         "run_count": 1,
         "attention_queue": {"items": [health_item, ordinary_item]},
@@ -621,7 +622,7 @@ def assert_control_plane_waiting_projection_self_repair_should_run() -> None:
     payload = {
         "ok": True,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 1,
         "run_count": 1,
         "attention_queue": {"items": [meta_item]},
@@ -701,7 +702,7 @@ def post_handoff_meta_fixture(
     return {
         "ok": True,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 1,
         "run_count": 1,
         "attention_queue": {"items": [meta_item]},
@@ -766,7 +767,7 @@ def assert_control_plane_post_handoff_agent_todo_stays_active() -> None:
     assert "execution_contract_obligation: advance_one_bounded_segment" in markdown, markdown
 
 
-def assert_dependency_observation_returns_to_primary_backlog() -> None:
+def assert_dependency_observation_label_keeps_primary_backlog() -> None:
     goal_id = "loopx-meta"
     payload = post_handoff_meta_fixture(
         with_agent_todo=True,
@@ -782,20 +783,20 @@ def assert_dependency_observation_returns_to_primary_backlog() -> None:
     first_todo = decision["agent_todo_summary"]["first_open_items"][0]
     first_todo_text = str(first_todo.get("title") or first_todo.get("text") or "")
     assert first_todo_text.startswith("SOTA long-horizon"), decision
-    assert decision["heartbeat_recommendation"]["recommended_mode"] == "follow_work_lane_contract", decision
+    assert decision["heartbeat_recommendation"]["recommended_mode"] == "post_handoff_observe_then_backlog_step", decision
     assert (
         decision["heartbeat_recommendation"]["latest_run"]["progress_scope"]
-        == "dependency_observation"
+        == "primary_goal"
     ), decision
     lane = decision["work_lane_contract"]
     assert lane["schema_version"] == "work_lane_contract_v1", lane
-    assert lane["lane"] == "continuous_monitor", lane
+    assert lane["lane"] == "advancement_task", lane
     assert lane["next_lane"] == "advancement_task", lane
-    assert lane["obligation"] == "advance_unless_material_monitor_transition", lane
-    assert lane["reason_codes"] == ["dependency_observation", "open_agent_todo"], lane
+    assert lane["obligation"] == "advance_one_bounded_segment", lane
+    assert lane["reason_codes"] == ["open_agent_todo"], lane
     assert "dependency_observation_cap" not in markdown, markdown
-    assert "follow_work_lane_contract" in markdown, markdown
-    assert "obligation=advance_unless_material_monitor_transition" in markdown, markdown
+    assert "post_handoff_observe_then_backlog_step" in markdown, markdown
+    assert "obligation=advance_one_bounded_segment" in markdown, markdown
     assert decision["execution_obligation"]["must_attempt_work"] is True, decision
     assert decision["execution_obligation"]["kind"] == "work_lane_contract", decision
     assert decision["execution_obligation"]["contract_obligation"] == lane["obligation"], decision
@@ -839,7 +840,7 @@ def assert_attention_queue_overrides_stale_run_history() -> None:
     payload = {
         "ok": True,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 1,
         "run_count": 1,
         "attention_queue": {"items": [current_item]},
@@ -910,7 +911,7 @@ def assert_project_asset_backed_no_evidence_should_run() -> None:
     payload = {
         "ok": True,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 1,
         "run_count": 1,
         "attention_queue": {"items": [project_item]},
@@ -983,7 +984,7 @@ def assert_heartbeat_recommendation_lifecycle() -> None:
     payload = {
         "ok": True,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 2,
         "run_count": 2,
         "attention_queue": {"items": [first_map_item, mapped_item]},
@@ -1019,9 +1020,9 @@ def assert_heartbeat_recommendation_lifecycle() -> None:
     assert mapped_decision["execution_obligation"]["kind"] == "quiet_noop_if_unchanged", mapped_decision
     scheduler = mapped_decision["scheduler_hint"]
     assert scheduler["action"] == "backoff_until_fresh_evidence", mapped_decision
-    assert scheduler["codex_app"]["recommended_interval_minutes"] == 60, mapped_decision
-    assert scheduler["codex_app"]["recommended_rrule"] == "FREQ=MINUTELY;INTERVAL=60", mapped_decision
-    assert scheduler["codex_app"]["example_progression_minutes"] == [60], mapped_decision
+    assert scheduler["app_automation"]["recommended_interval_minutes"] == 60, mapped_decision
+    assert scheduler["app_automation"]["recommended_rrule"] == "FREQ=MINUTELY;INTERVAL=60", mapped_decision
+    assert scheduler["app_automation"]["example_progression_minutes"] == [60], mapped_decision
     assert scheduler["unchanged_poll"]["limits"]["codex_cli_tui"] == 3, mapped_decision
     assert scheduler["unchanged_poll"]["final_quota_replan_check_enabled"] is True, mapped_decision
     assert "local_scheduler" not in scheduler, scheduler
@@ -1032,8 +1033,8 @@ def assert_heartbeat_recommendation_lifecycle() -> None:
     assert isinstance(reset["reset_token"], str) and len(reset["reset_token"]) == 16, reset
     assert reset["reset_token"] == expected_scheduler_reset_token(scheduler, mapped_decision), reset
     assert reset["host_state_key"] == "scheduler_hint.reset_policy.reset_token", reset
-    assert reset["codex_app_initial_interval_minutes"] == 60, reset
-    assert reset["codex_app_initial_rrule"] == "FREQ=MINUTELY;INTERVAL=60", reset
+    assert reset["app_automation_initial_interval_minutes"] == 60, reset
+    assert reset["app_automation_initial_rrule"] == "FREQ=MINUTELY;INTERVAL=60", reset
     assert len(reset["identity_signature"]) == 12, reset
     assert "identity_snapshot" not in reset, reset
     assert "profile_snapshot" not in reset, reset
@@ -1056,8 +1057,8 @@ def assert_heartbeat_recommendation_lifecycle() -> None:
     assert "heartbeat_recommendation: mode=mapped_noop_if_unchanged notify=DONT_NOTIFY" in mapped_markdown
     assert "heartbeat_stop_if_unchanged: `True`" in mapped_markdown, mapped_markdown
     assert "scheduler_hint: action=backoff_until_fresh_evidence" in mapped_markdown, mapped_markdown
-    assert "codex_app_rrule=FREQ=MINUTELY;INTERVAL=60" in mapped_markdown, mapped_markdown
-    assert "codex_app_progression=[60]" in mapped_markdown, mapped_markdown
+    assert "app_automation_rrule=FREQ=MINUTELY;INTERVAL=60" in mapped_markdown, mapped_markdown
+    assert "app_automation_progression=[60]" in mapped_markdown, mapped_markdown
     assert "scheduler_reset: initial_interval=60" in mapped_markdown, mapped_markdown
     assert "initial_rrule=FREQ=MINUTELY;INTERVAL=60" in mapped_markdown, mapped_markdown
     assert "reset_generation=" in mapped_markdown, mapped_markdown
@@ -1129,7 +1130,7 @@ def assert_goal_boundary_in_should_run() -> None:
     payload = {
         "ok": True,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 1,
         "run_count": 1,
         "attention_queue": {"items": [delivery_item]},
@@ -1184,7 +1185,7 @@ def assert_decision_freshness_warning_in_should_run() -> None:
     payload = {
         "ok": True,
         "registry": "./fixtures/registry.json",
-        "runtime_root": "./fixtures/runtime",
+        "runtime_root": FIXTURE_RUNTIME_ROOT,
         "goal_count": 1,
         "run_count": 3,
         "attention_queue": {"items": [stale_item]},
@@ -1249,7 +1250,7 @@ def assert_safe_bypass_slot_preview(status_payload: dict) -> None:
         slots=1,
     )
     assert rejected["ok"] is False, rejected
-    assert "accountable delivery writeback" in rejected["reason"], rejected
+    assert "Turn settlement writeback" in rejected["reason"], rejected
 
     with tempfile.TemporaryDirectory(prefix="loopx-safe-bypass-spend-") as tmp:
         runtime_root = Path(tmp)
@@ -1396,6 +1397,7 @@ def main() -> int:
     assert_default_quota_is_duty_cycle()
     assert_rolling_window_ledger_expires_old_spends()
     status_payload = build_status_fixture()
+    status_payload["runtime_root"] = FIXTURE_RUNTIME_ROOT
     plan = build_quota_plan(status_payload, mode="plan")
     markdown = render_quota_markdown(plan)
     assert_plan_shape(plan, markdown)
@@ -1410,7 +1412,7 @@ def main() -> int:
     assert_control_plane_waiting_projection_self_repair_should_run()
     assert_control_plane_post_handoff_observe_if_unchanged()
     assert_control_plane_post_handoff_agent_todo_stays_active()
-    assert_dependency_observation_returns_to_primary_backlog()
+    assert_dependency_observation_label_keeps_primary_backlog()
     assert_attention_queue_overrides_stale_run_history()
     assert_project_asset_backed_no_evidence_should_run()
     assert_heartbeat_recommendation_lifecycle()
@@ -1423,7 +1425,7 @@ def main() -> int:
     assert_slot_preview(build_quota_slot_preview(status_payload, goal_id="near-limit-half", slots=1))
     with tempfile.TemporaryDirectory(prefix="loopx-quota-plan-smoke-") as tmp:
         cli_plan, cli_markdown = run_cli_quota_plan(Path(tmp))
-    assert_plan_shape(cli_plan, cli_markdown)
+    assert_plan_shape(cli_plan, cli_markdown, expected_user_todos=0)
     with tempfile.TemporaryDirectory(prefix="loopx-quota-should-run-smoke-") as tmp:
         assert_throttled_cli_should_run(run_cli_throttled_should_run(Path(tmp)))
     with tempfile.TemporaryDirectory(prefix="loopx-quota-slot-smoke-") as tmp:

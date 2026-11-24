@@ -1,25 +1,45 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from loopx.control_plane.work_items import task_lease
+from loopx.control_plane.work_items import task_lease, task_lease_acquire_adapter
+from loopx.control_plane.work_items.local_lease_record import read_lease
 from loopx.control_plane.work_items.task_lease import (
     MAX_TASK_LEASE_TTL_SECONDS,
     TaskLeaseError,
-    acquire_task_lease,
-    assert_expected_version,
     normalize_idempotency_key,
     normalize_ttl_seconds,
     release_task_lease,
     renew_task_lease,
-    task_lease_owner_constraint,
-    transfer_task_lease,
     write_scopes_overlap,
 )
+
+
+@pytest.mark.parametrize("raw", [None, b'{"status":"active"}', b"{broken", b"\xff"],
+                         ids=["missing", "valid", "invalid-json", "invalid-utf8"])
+def test_local_lease_reader_preserves_bytes_and_types_corruption(tmp_path: Path, raw: bytes | None) -> None:
+    path = tmp_path / "lease.json"
+    if raw is not None:
+        path.write_bytes(raw)
+        before_mtime = path.stat().st_mtime_ns
+
+    if raw in (b"{broken", b"\xff"):
+        with pytest.raises(TaskLeaseError) as error:
+            read_lease(path)
+        assert error.value.code == "corrupt_lease"
+    else:
+        assert read_lease(path) == ({"status": "active"} if raw is not None else None)
+
+    if raw is None:
+        assert not path.exists()
+    else:
+        assert path.read_bytes() == raw
+        assert path.stat().st_mtime_ns == before_mtime
 
 
 @pytest.mark.parametrize(
@@ -30,8 +50,12 @@ from loopx.control_plane.work_items.task_lease import (
         (["docs/a*.md"], ["docs/ab.md"], True),
         (["docs/**"], ["docs/sub/**"], True),
         (["**"], ["loopx/cli.py"], True),
+        (["src/**/*.py"], ["src/a.py"], True),
+        (["**/*.py"], ["setup.py"], True),
+        (["src/**/*.py"], ["docs/a.py"], False),
         (["docs/a.md"], ["docs/b.md"], False),
         ([], ["docs/a.md"], False),
+        (["src//main.ts"], ["src/./main.ts"], True),
     ],
 )
 def test_write_scopes_overlap(
@@ -40,57 +64,6 @@ def test_write_scopes_overlap(
     expected: bool,
 ) -> None:
     assert write_scopes_overlap(left, right) is expected
-
-
-@pytest.mark.parametrize(
-    ("todo", "owner", "registered_agents", "reason"),
-    [
-        (None, "agent-a", ["agent-a"], "todo_not_found"),
-        ({"status": "done"}, "agent-a", ["agent-a"], "todo_not_open"),
-        ({"status": "open"}, "", ["agent-a"], "invalid_owner"),
-        ({"status": "open"}, "agent-b", ["agent-a"], "owner_not_registered"),
-        (
-            {"status": "open", "excluded_agents": ["agent-a"]},
-            "agent-a",
-            ["agent-a"],
-            "owner_excluded_from_todo",
-        ),
-        (
-            {"status": "open", "claimed_by": "agent-b"},
-            "agent-a",
-            ["agent-a", "agent-b"],
-            "owner_conflicts_with_claim",
-        ),
-    ],
-)
-def test_task_lease_owner_constraint_rejects_ineligible_owner(
-    todo: dict[str, Any] | None,
-    owner: str,
-    registered_agents: list[str],
-    reason: str,
-) -> None:
-    constraint = task_lease_owner_constraint(
-        todo,
-        owner=owner,
-        registered_agents=registered_agents,
-    )
-
-    assert constraint["effective"] is False
-    assert constraint["reason"] == reason
-
-
-def test_task_lease_owner_constraint_accepts_matching_claim() -> None:
-    constraint = task_lease_owner_constraint(
-        {
-            "status": "open",
-            "claimed_by": "agent-a",
-            "excluded_agents": ["agent-b"],
-        },
-        owner="agent-a",
-        registered_agents=["agent-a", "agent-b"],
-    )
-
-    assert constraint == {"effective": True}
 
 
 @pytest.mark.parametrize("ttl", [0, -1, MAX_TASK_LEASE_TTL_SECONDS + 1])
@@ -109,203 +82,103 @@ def test_normalize_idempotency_key_rejects_non_token(key: str) -> None:
     assert error.value.code == "invalid_idempotency_key"
 
 
-def test_expected_version_is_compare_and_swap_guard() -> None:
+@pytest.fixture
+def retained_lease(tmp_path: Path):
+    # Fixed original 1.x bytes; the current runtime must read/release these
+    # without relying on a surviving Python lease producer.
+    original = json.loads((Path(__file__).parent / "fixtures" / "retained_lease_receipts_1x.json").read_text())["scenarios"]["original"]
+    relative, lease = next(iter(original["files"].items()))
+    runtime = tmp_path / "runtime"
+    path = runtime / relative
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(lease))
+    request = {key: original["request"][key] for key in ("goal_id", "todo_id", "owner", "idempotency_key")}
+    return path, lease, {**request, "runtime_root": runtime, "expected_version": lease["version"]}
+
+
+def test_retained_release_enforces_cas_without_rewriting_history(retained_lease) -> None:
+    path, lease, request = retained_lease
+    before = path.read_bytes()
     with pytest.raises(TaskLeaseError) as error:
-        assert_expected_version({"version": 3}, 2)
-
+        release_task_lease(**{**request, "expected_version": lease["version"] + 1})
     assert error.value.code == "version_mismatch"
-    assert error.value.payload == {"expected_version": 2, "actual_version": 3}
+    assert path.read_bytes() == before
 
 
-def test_lease_epoch_migrates_legacy_records_and_rejects_corruption() -> None:
-    assert task_lease.lease_epoch(None) == 0
-    assert (
-        task_lease.lease_epoch({"schema_version": "task_lease_v0", "version": 7}) == 1
-    )
+@pytest.mark.parametrize(("field", "raw"), [
+    ("lease_epoch", value) for value in [0, -1, "not-an-epoch", True, False]
+] + [("version", value) for value in [-1, "not-a-version", True, False]])
+def test_retained_release_rejects_corrupt_generation_without_writes(retained_lease, field, raw) -> None:
+    path, lease, request = retained_lease
+    path.write_text(json.dumps({**lease, field: raw}))
+    before = path.read_bytes()
+    with pytest.raises(TaskLeaseError) as error:
+        release_task_lease(**request)
+    assert error.value.code == "corrupt_lease"
+    assert path.read_bytes() == before
 
-    for raw_epoch in (0, -1, "not-an-epoch"):
-        with pytest.raises(TaskLeaseError) as error:
-            task_lease.lease_epoch({"lease_epoch": raw_epoch})
-        assert error.value.code == "corrupt_lease"
 
-
-def test_task_lease_lifecycle_preserves_idempotency_and_versions(
+def test_lifecycle_mutation_fails_closed_without_registry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime(2026, 7, 13, tzinfo=timezone.utc)
     monkeypatch.setattr(task_lease, "now_utc", lambda: now)
-    monkeypatch.setattr(task_lease, "require_task_lease_owner_allowed", lambda **_: {})
-    monkeypatch.setattr(
-        task_lease,
-        "require_registered_task_lease_owner",
-        lambda **kwargs: kwargs["owner"],
-    )
-    monkeypatch.setattr(
-        task_lease,
-        "task_lease_owner_constraint",
-        lambda *_args, **_kwargs: {"effective": True},
-    )
-    monkeypatch.setattr(task_lease, "active_conflicts", lambda **_: [])
-    registry_path = tmp_path / "registry.json"
     runtime_root = tmp_path / "runtime"
-    arguments = {
-        "registry_path": registry_path,
-        "runtime_root": runtime_root,
+    lease_path = task_lease.task_lease_path(
+        runtime_root=runtime_root,
+        goal_id="goal-a",
+        todo_id="todo_missing_registry",
+    )
+    lease_path.parent.mkdir(parents=True)
+    lease_path.write_text(json.dumps({
+        "schema_version": "task_lease_v0",
+        "status": "active",
         "goal_id": "goal-a",
-        "todo_id": "todo_leasea",
+        "todo_id": "todo_missing_registry",
         "owner": "agent-a",
         "idempotency_key": "turn-1",
-        "ttl_seconds": 120,
-        "write_scopes": ["loopx/**"],
-    }
+        "write_scopes": [],
+        "acquire_ttl_seconds": 120,
+        "version": 1,
+        "lease_epoch": 1,
+        "acquired_at": now.isoformat().replace("+00:00", "Z"),
+        "updated_at": now.isoformat().replace("+00:00", "Z"),
+        "expires_at": (now + timedelta(seconds=120))
+            .isoformat()
+            .replace("+00:00", "Z"),
+    }))
+    before = task_lease.read_lease(lease_path)
 
-    acquired = acquire_task_lease(**arguments)
-    assert acquired["acquired"] is True
-    assert acquired["lease"]["version"] == 1
-    assert acquired["lease"]["lease_epoch"] == 1
-    assert acquired["lease"]["expires_at"] == (
-        now + timedelta(seconds=120)
-    ).isoformat().replace("+00:00", "Z")
-
-    repeated = acquire_task_lease(**arguments)
-    assert repeated["idempotent"] is True
-    assert repeated["lease"]["version"] == 1
-    assert repeated["lease"]["lease_epoch"] == 1
-
-    with pytest.raises(TaskLeaseError) as reuse_error:
-        acquire_task_lease(**{**arguments, "ttl_seconds": 600})
-    assert reuse_error.value.code == "idempotency_key_reuse"
-
-    with pytest.raises(TaskLeaseError) as renew_without_version:
+    with pytest.raises(TaskLeaseError) as error:
         renew_task_lease(
-            registry_path=registry_path,
+            registry_path=tmp_path / "missing-registry.json",
             runtime_root=runtime_root,
             goal_id="goal-a",
-            todo_id="todo_leasea",
+            todo_id="todo_missing_registry",
             owner="agent-a",
             idempotency_key="turn-1",
+            expected_version=1,
         )
-    assert renew_without_version.value.code == "version_required"
 
-    with pytest.raises(TaskLeaseError) as transfer_without_version:
-        transfer_task_lease(
-            registry_path=registry_path,
-            runtime_root=runtime_root,
-            goal_id="goal-a",
-            todo_id="todo_leasea",
-            owner="agent-a",
-            idempotency_key="turn-1",
-            new_owner="agent-b",
-            new_idempotency_key="turn-2",
-        )
-    assert transfer_without_version.value.code == "version_required"
-
-    renewed = renew_task_lease(
-        registry_path=registry_path,
-        runtime_root=runtime_root,
-        goal_id="goal-a",
-        todo_id="todo_leasea",
-        owner="agent-a",
-        idempotency_key="turn-1",
-        expected_version=1,
-    )
-    assert renewed["lease"]["version"] == 2
-    assert renewed["lease"]["lease_epoch"] == 1
-
-    transferred = transfer_task_lease(
-        registry_path=registry_path,
-        runtime_root=runtime_root,
-        goal_id="goal-a",
-        todo_id="todo_leasea",
-        owner="agent-a",
-        idempotency_key="turn-1",
-        new_owner="agent-b",
-        new_idempotency_key="turn-2",
-        expected_version=2,
-    )
-    assert transferred["lease"]["owner"] == "agent-b"
-    assert transferred["lease"]["version"] == 3
-    assert transferred["lease"]["lease_epoch"] == 2
-
-    released = release_task_lease(
-        runtime_root=runtime_root,
-        goal_id="goal-a",
-        todo_id="todo_leasea",
-        owner="agent-b",
-        idempotency_key="turn-2",
-        expected_version=3,
-    )
-    assert released["released"] is True
-    assert released["lease"]["status"] == "released"
-    assert released["lease"]["released_at"] == now.isoformat().replace("+00:00", "Z")
-    assert released["lease"]["updated_at"] == released["lease"]["released_at"]
-    assert task_lease.lease_is_active(released["lease"], at=now) is False
-    lease_path = Path(str(released["lease_path"]))
-    assert lease_path.exists()
-    assert task_lease.read_lease(lease_path) == released["lease"]
-
-    replayed_release = release_task_lease(
-        runtime_root=runtime_root,
-        goal_id="goal-a",
-        todo_id="todo_leasea",
-        owner="agent-b",
-        idempotency_key="turn-2",
-        expected_version=3,
-    )
-    assert replayed_release["released"] is True
-    assert replayed_release["idempotent"] is True
-    assert replayed_release["lease"] == released["lease"]
-
-    with pytest.raises(TaskLeaseError) as retired_key:
-        acquire_task_lease(
-            **{
-                **arguments,
-                "owner": "agent-b",
-                "idempotency_key": "turn-2",
-            }
-        )
-    assert retired_key.value.code == "idempotency_key_reuse"
-
-    reacquired = acquire_task_lease(
-        **{
-            **arguments,
-            "owner": "agent-b",
-            "idempotency_key": "turn-3",
-        }
-    )
-    assert reacquired["acquired"] is True
-    assert reacquired["lease"]["version"] == 4
-    assert reacquired["lease"]["lease_epoch"] == 3
-
-    with pytest.raises(TaskLeaseError) as missing_version:
-        release_task_lease(
-            runtime_root=runtime_root,
-            goal_id="goal-a",
-            todo_id="todo_leasea",
-            owner="agent-b",
-            idempotency_key="turn-3",
-        )
-    assert missing_version.value.code == "version_required"
+    assert error.value.code == "goal_not_found"
+    assert task_lease.read_lease(lease_path) == before
 
 
-def test_legacy_generation_and_unrelated_ttl_do_not_block_release_or_reacquire(
+def test_legacy_generation_and_unrelated_ttl_do_not_block_release(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime(2026, 7, 13, tzinfo=timezone.utc)
     monkeypatch.setattr(task_lease, "now_utc", lambda: now)
-    monkeypatch.setattr(task_lease, "require_task_lease_owner_allowed", lambda **_: {})
-    monkeypatch.setattr(task_lease, "active_conflicts", lambda **_: [])
     runtime_root = tmp_path / "runtime"
     lease_path = task_lease.task_lease_path(
         runtime_root=runtime_root,
         goal_id="goal-a",
         todo_id="todo_legacy",
     )
-    task_lease.write_lease(
-        lease_path,
-        {
+    lease_path.parent.mkdir(parents=True)
+    lease_path.write_text(json.dumps({
             "schema_version": "task_lease_v0",
             "goal_id": "goal-a",
             "todo_id": "todo_legacy",
@@ -320,8 +193,7 @@ def test_legacy_generation_and_unrelated_ttl_do_not_block_release_or_reacquire(
             "expires_at": (now + timedelta(seconds=120))
             .isoformat()
             .replace("+00:00", "Z"),
-        },
-    )
+        }))
 
     released = release_task_lease(
         runtime_root=runtime_root,
@@ -333,85 +205,82 @@ def test_legacy_generation_and_unrelated_ttl_do_not_block_release_or_reacquire(
     )
     assert released["lease"]["lease_epoch"] == 1
 
-    reacquired = acquire_task_lease(
-        registry_path=tmp_path / "registry.json",
-        runtime_root=runtime_root,
-        goal_id="goal-a",
-        todo_id="todo_legacy",
-        owner="agent-a",
-        idempotency_key="new-key",
-        ttl_seconds=120,
-        expected_version=7,
+
+@pytest.mark.parametrize(
+    ("expected_version", "expected_forwarded"),
+    [("2", 2), (2.5, 2)],
+)
+def test_native_lifecycle_expected_version_keeps_legacy_numeric_coercion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_version: Any,
+    expected_forwarded: int,
+) -> None:
+    import loopx.control_plane.effect_runtime as effect_runtime
+    forwarded: list[Any] = []
+
+    def rejecting_effect_runtime_result(
+        _method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float,
+    ) -> dict[str, Any]:
+        assert timeout == 15.0
+        forwarded.append(params["expected_version"])
+        return {
+            "ok": False,
+            "schema_version": "task_lease_v0",
+            "action": params["operation"],
+            "error": "expected_version must be a safe integer or null",
+            "error_code": "invalid_request",
+        }
+
+    monkeypatch.setattr(
+        effect_runtime,
+        "effect_runtime_result",
+        rejecting_effect_runtime_result,
     )
-    assert reacquired["lease"]["version"] == 8
-    assert reacquired["lease"]["lease_epoch"] == 2
+
+    with pytest.raises(TaskLeaseError) as error:
+        task_lease_acquire_adapter.execute_native_task_lease_lifecycle(
+            runtime_root=tmp_path / "runtime",
+            goal_id="goal-a",
+            todo_id="todo_target",
+            operation="release",
+            owner="agent-a",
+            idempotency_key="lease-a",
+            expected_version=expected_version,
+        )
+
+    assert error.value.code == "invalid_request"
+    assert "expected_version" in str(error.value)
+    assert forwarded == [expected_forwarded]
 
 
-def test_corrupt_lease_version_fields_fail_closed(
+def test_native_lifecycle_expected_version_bool_is_rejected_before_transport(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Hand-corrupted lease records are typed rejections, not silent input.
+    import loopx.control_plane.effect_runtime as effect_runtime
 
-    Disclosed behavior change of the local-record extraction: an expired
-    record with a negative version was previously accepted (the next acquire
-    kept counting from it), and a non-integer version or replay-fingerprint
-    ``acquire_ttl_seconds`` surfaced as a raw ``ValueError``. Every lease verb
-    now reads these fields through one normalizer that fails closed as
-    ``corrupt_lease``.
-    """
+    def unexpected_effect_runtime_result(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("bool expected_version must be rejected at the adapter edge")
 
-    now = datetime(2026, 7, 13, tzinfo=timezone.utc)
-    monkeypatch.setattr(task_lease, "now_utc", lambda: now)
-    monkeypatch.setattr(task_lease, "require_task_lease_owner_allowed", lambda **_: {})
-    monkeypatch.setattr(task_lease, "active_conflicts", lambda **_: [])
-    runtime_root = tmp_path / "runtime"
-    lease_path = task_lease.task_lease_path(
-        runtime_root=runtime_root,
-        goal_id="goal-a",
-        todo_id="todo_corrupt",
+    monkeypatch.setattr(
+        effect_runtime,
+        "effect_runtime_result",
+        unexpected_effect_runtime_result,
     )
 
-    def record(version: object, *, ttl: object = 120, expired: bool) -> dict[str, Any]:
-        stamp = now - timedelta(seconds=240)
-        expires = now + (timedelta(seconds=-120) if expired else timedelta(seconds=120))
-        return {
-            "schema_version": "task_lease_v0",
-            "goal_id": "goal-a",
-            "todo_id": "todo_corrupt",
-            "owner": "agent-a",
-            "idempotency_key": "stale-key",
-            "write_scopes": [],
-            "acquire_ttl_seconds": ttl,
-            "version": version,
-            "status": "active",
-            "acquired_at": stamp.isoformat().replace("+00:00", "Z"),
-            "updated_at": stamp.isoformat().replace("+00:00", "Z"),
-            "expires_at": expires.isoformat().replace("+00:00", "Z"),
-        }
-
-    def acquire(key: str = "new-key") -> dict[str, Any]:
-        return acquire_task_lease(
-            registry_path=tmp_path / "registry.json",
-            runtime_root=runtime_root,
+    with pytest.raises(TaskLeaseError) as error:
+        task_lease_acquire_adapter.execute_native_task_lease_lifecycle(
+            runtime_root=tmp_path / "runtime",
             goal_id="goal-a",
-            todo_id="todo_corrupt",
+            todo_id="todo_target",
+            operation="release",
             owner="agent-a",
-            idempotency_key=key,
-            ttl_seconds=120,
+            idempotency_key="lease-a",
+            expected_version=True,
         )
 
-    task_lease.write_lease(lease_path, record(-5, expired=True))
-    with pytest.raises(TaskLeaseError) as error:
-        acquire()
-    assert error.value.code == "corrupt_lease"
-
-    task_lease.write_lease(lease_path, record("not-a-version", expired=True))
-    with pytest.raises(TaskLeaseError) as error:
-        acquire()
-    assert error.value.code == "corrupt_lease"
-
-    task_lease.write_lease(lease_path, record(7, ttl="not-a-ttl", expired=False))
-    with pytest.raises(TaskLeaseError) as error:
-        acquire(key="stale-key")
-    assert error.value.code == "corrupt_lease"
+    assert error.value.code == "version_required"

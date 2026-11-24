@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from ...control_plane.runtime.public_safety import public_safe_compact_text
+from ...file_lock import exclusive_file_lock
 from .goal_channel_contracts import operation_packet
 from .goal_channel_transport import APP_ID_PATTERN, CHAT_ID_PATTERN, OPEN_ID_PATTERN
-from .presentation.kanban import DEFAULT_CLI_BIN
+from .cli_transport import DEFAULT_CLI_BIN
 from .private_json import write_private_json_atomic
 
 GOAL_CHANNEL_TARGETS_SCHEMA_VERSION = "loopx_goal_channel_provider_targets_v0"
@@ -144,30 +146,38 @@ def add_lark_goal_channel_target(
         bot_display_name=bot_display_name,
         cli_bin=cli_bin,
     )
-    payload = read_goal_channel_targets(target_path)
-    targets = dict(payload.get("targets") or {})
-    existing = targets.get(target["name"])
-    changed = existing != target
-    if execute and changed:
-        targets[str(target["name"])] = target
-        write_private_json_atomic(
-            target_path,
-            {
-                "schema_version": GOAL_CHANNEL_TARGETS_SCHEMA_VERSION,
-                "targets": targets,
-            },
-        )
-        readback = read_goal_channel_targets(target_path)
-        if goal_channel_target_for_name(readback, str(target["name"])) != target:
-            return operation_packet(
-                ok=False,
-                goal_id=None,
-                operation="target_add",
-                execute=True,
-                status="failed",
-                blocker="readback_mismatch",
-                public_summary="the shared Goal Channel target could not be read back",
+    mutation_lock = (
+        exclusive_file_lock(target_path, operation="lark_goal_channel_target")
+        if execute
+        else nullcontext()
+    )
+    with mutation_lock:
+        payload = read_goal_channel_targets(target_path)
+        targets = dict(payload.get("targets") or {})
+        existing = targets.get(target["name"])
+        changed = existing != target
+        if execute and changed:
+            targets[str(target["name"])] = target
+            write_private_json_atomic(
+                target_path,
+                {
+                    "schema_version": GOAL_CHANNEL_TARGETS_SCHEMA_VERSION,
+                    "targets": targets,
+                },
             )
+            readback = read_goal_channel_targets(target_path)
+            if goal_channel_target_for_name(readback, str(target["name"])) != target:
+                return operation_packet(
+                    ok=False,
+                    goal_id=None,
+                    operation="target_add",
+                    execute=True,
+                    status="failed",
+                    blocker="readback_mismatch",
+                    public_summary=(
+                        "the shared Goal Channel target could not be read back"
+                    ),
+                )
     status = (
         "configured"
         if execute and changed

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -12,6 +13,17 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "tests" / "control_plane"))
+
+from canonical_authority_fixture import initialize_canonical_authority  # noqa: E402
+from loopx.control_plane.coordination.authority_source_capture import (  # noqa: E402
+    build_todo_runtime_shadow_projection,
+    capture_todo_archive_dependencies,
+)
+from loopx.control_plane.coordination.local_authority import CanonicalAuthorityRequired, read_canonical_todos_if_promoted  # noqa: E402
+from loopx.control_plane.todos.goal_todo_projection import project_goal_todo_items  # noqa: E402
+
 GOAL_ID = "smoke-goal"
 RUNNABLE_GOAL_ID = "smoke-goal-runnable"
 DEFERRED_GOAL_ID = "smoke-goal-deferred"
@@ -80,7 +92,9 @@ def run_cli(
     )
 
 
-def write_fixture(root: Path) -> tuple[Path, Path, Path, Path, list[Path]]:
+def write_fixture(
+    root: Path, *, provider: str | None = None,
+) -> tuple[Path, Path, Path, Path, list[Path]]:
     runtime = root / "runtime"
     registry = root / "registry.global.json"
     projects = {
@@ -185,6 +199,21 @@ def write_fixture(root: Path) -> tuple[Path, Path, Path, Path, list[Path]]:
         ),
         encoding="utf-8",
     )
+    if provider:
+        for goal in goals:
+            state = states[goal["id"]]
+            state_text = state.read_text(encoding="utf-8")
+            todos = project_goal_todo_items(
+                goal, state_text=state_text, state_path=state, rollout_events=[],
+            )
+            # Deferred readiness depends on the completed archive, too.
+            todos = capture_todo_archive_dependencies(todos, state_text)
+            projection = build_todo_runtime_shadow_projection(
+                goal_id=goal["id"], todos=todos, handoff_mode="soft_claim",
+            )
+            initialize_canonical_authority(
+                runtime, goal["id"], projection, state_path=state, provider=provider,
+            )
     run_index = runtime / "goals" / GOAL_ID / "runs" / "index.jsonl"
     run_index.parent.mkdir(parents=True)
     run_index.write_text(
@@ -291,7 +320,9 @@ def assert_todos_markdown(markdown: str, *, private_root: Path) -> None:
     assert str(private_root) not in markdown, markdown
 
 
-def assert_risks_payload(payload: dict[str, object]) -> None:
+def assert_risks_payload(
+    payload: dict[str, object], *, unresolved_failure: bool,
+) -> None:
     assert payload["ok"] is True, payload
     request = payload["request"]
     assert request["command"] == "/loopx-global-risks", request
@@ -304,7 +335,9 @@ def assert_risks_payload(payload: dict[str, object]) -> None:
     boundary_rows = [
         row for row in risks if row["kind"] == "public_boundary_violation"
     ]
-    assert len(boundary_rows) >= 2, payload
+    # The status hot path does not scan repository content. Its risk projection
+    # must not invent public-boundary observations from uninspected files.
+    assert boundary_rows == [], payload
     assert len({row["occurrence_id"] for row in boundary_rows}) == len(boundary_rows)
     assert all(row["category"] == "boundary_warning" for row in boundary_rows)
     assert payload["groups"]["rollback_candidates"] == [], payload
@@ -320,9 +353,13 @@ def assert_risks_payload(payload: dict[str, object]) -> None:
     ], payload
 
     stale_rows = payload["groups"]["stale_runs"]
-    assert stale_rows, payload
-    assert stale_rows[0]["kind"] == "stale_latest_run_projection", stale_rows
-    assert stale_rows[0]["goal_id"] == GOAL_ID, stale_rows
+    if unresolved_failure:
+        assert len(stale_rows) == 1, payload
+        assert stale_rows[0]["kind"] == "stale_latest_run_projection", stale_rows
+        assert stale_rows[0]["goal_id"] == GOAL_ID, stale_rows
+    else:
+        # A successful current-state read reconciles ordinary stale progress.
+        assert stale_rows == [], payload
     assert any(
         warning["reason_code"] == "global_registry_unavailable"
         for warning in payload["source_warnings"]
@@ -424,7 +461,6 @@ def assert_unhealthy_status_envelope(
         runtime=runtime,
         command="status",
         output_format="json",
-        command_args=["--scan-path", str(safe_input)],
         check=False,
     )
     status_payload = json.loads(status_proc.stdout)
@@ -437,7 +473,6 @@ def assert_unhealthy_status_envelope(
         runtime=runtime,
         command="global-gates",
         output_format="json",
-        command_args=["--scan-path", str(safe_input)],
         check=False,
     )
     assert gates_proc.returncode != 0, gates_proc
@@ -455,7 +490,6 @@ def assert_unhealthy_status_envelope(
         runtime=runtime,
         command="global-todos",
         output_format="json",
-        command_args=["--scan-path", str(safe_input)],
         check=False,
     )
     assert todos_proc.returncode != 0, todos_proc
@@ -472,7 +506,6 @@ def assert_unhealthy_status_envelope(
         runtime=runtime,
         command="global-risks",
         output_format="json",
-        command_args=["--scan-path", str(safe_input)],
         check=False,
     )
     assert risks_proc.returncode == 0, risks_proc
@@ -483,12 +516,19 @@ def assert_unhealthy_status_envelope(
     assert_public_safe(risks_payload)
 
 
-def main() -> int:
+def run_scenario(provider: str | None) -> None:
     with tempfile.TemporaryDirectory(prefix="loopx-global-manager-smoke-") as tmp:
         root = Path(tmp)
-        registry, runtime, risk_input, safe_input, fixture_files = write_fixture(root)
+        registry, runtime, risk_input, safe_input, fixture_files = write_fixture(
+            root, provider=provider,
+        )
         files = [registry, *fixture_files]
         before = snapshot_files(files)
+        canonical_before = {
+            goal_id: read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=goal_id)
+            for goal_id in (GOAL_ID, RUNNABLE_GOAL_ID, DEFERRED_GOAL_ID)
+        }
+        assert all((value is not None) == bool(provider) for value in canonical_before.values())
 
         summary_proc = run_cli(
             registry=registry,
@@ -500,8 +540,6 @@ def main() -> int:
                 AGENT_ID,
                 "--limit",
                 "5",
-                "--scan-path",
-                str(safe_input),
             ],
         )
         gates_proc = run_cli(
@@ -514,8 +552,6 @@ def main() -> int:
                 AGENT_ID,
                 "--limit",
                 "5",
-                "--scan-path",
-                str(safe_input),
             ],
         )
         markdown_proc = run_cli(
@@ -528,8 +564,6 @@ def main() -> int:
                 AGENT_ID,
                 "--limit",
                 "5",
-                "--scan-path",
-                str(safe_input),
             ],
         )
         todos_proc = run_cli(
@@ -542,8 +576,6 @@ def main() -> int:
                 AGENT_ID,
                 "--limit",
                 "5",
-                "--scan-path",
-                str(safe_input),
             ],
         )
         todos_markdown_proc = run_cli(
@@ -556,8 +588,6 @@ def main() -> int:
                 AGENT_ID,
                 "--limit",
                 "5",
-                "--scan-path",
-                str(safe_input),
             ],
         )
         risks_args = [
@@ -567,8 +597,6 @@ def main() -> int:
             "1h",
             "--limit",
             "8",
-            "--scan-path",
-            str(risk_input),
         ]
         risks_proc = run_cli(
             registry=registry,
@@ -590,9 +618,23 @@ def main() -> int:
         assert_gates_markdown(markdown_proc.stdout, private_root=root)
         assert_todos_payload(json.loads(todos_proc.stdout))
         assert_todos_markdown(todos_markdown_proc.stdout, private_root=root)
-        assert_risks_payload(json.loads(risks_proc.stdout))
+        assert_risks_payload(json.loads(risks_proc.stdout), unresolved_failure=False)
         assert_risks_markdown(risks_markdown_proc.stdout, private_root=root)
         assert snapshot_files(files) == before
+
+        # Change only this synthetic historical run: real failures must not be
+        # hidden by the same current-state reconciliation that clears progress.
+        run_index = runtime / "goals" / GOAL_ID / "runs" / "index.jsonl"
+        record = json.loads(run_index.read_text(encoding="utf-8"))
+        record["classification"] = "runtime_error"
+        run_index.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        failure_before = snapshot_files(files)
+        failure_proc = run_cli(
+            registry=registry, runtime=runtime, command="global-risks",
+            output_format="json", command_args=risks_args,
+        )
+        assert_risks_payload(json.loads(failure_proc.stdout), unresolved_failure=True)
+        assert snapshot_files(files) == failure_before
         assert_error_envelope(root, runtime=runtime)
         assert_unhealthy_status_envelope(
             root,
@@ -600,7 +642,31 @@ def main() -> int:
             runtime=runtime,
             safe_input=safe_input,
         )
+        assert snapshot_files(files) == failure_before
+        assert {
+            goal_id: read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=goal_id)
+            for goal_id in canonical_before
+        } == canonical_before
 
+
+def main() -> int:
+    os.environ["NODE_OPTIONS"] = os.environ.get("NODE_OPTIONS", "") + " --experimental-sqlite"
+    # Unmigrated ordinary reads refuse; both real providers retain the complete journey.
+    with tempfile.TemporaryDirectory(prefix="loopx-global-manager-unmigrated-") as tmp:
+        root = Path(tmp)
+        registry, runtime, _, _, fixture_files = write_fixture(root)
+        before = snapshot_files([registry, *fixture_files])
+        for goal_id in (GOAL_ID, RUNNABLE_GOAL_ID, DEFERRED_GOAL_ID):
+            try:
+                read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=goal_id)
+            except CanonicalAuthorityRequired as error:
+                assert error.payload["write_admitted"] is False
+                assert error.payload["legacy_fallback_used"] is False
+            else:
+                raise AssertionError("Ordinary manager reads require canonical authority")
+        assert snapshot_files([registry, *fixture_files]) == before
+    for provider in ("file", "sqlite"):
+        run_scenario(provider)
     print("global-manager-command-cli-smoke ok")
     return 0
 

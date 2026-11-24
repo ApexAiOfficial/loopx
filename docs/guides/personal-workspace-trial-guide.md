@@ -60,9 +60,10 @@ bash scripts/dashboard-dev.sh
 ```
 
 ```bash
-python3.13 -m loopx.cli chat-endpoint add --config kimi.json   # 添加
-python3.13 -m loopx.cli chat-endpoint list                     # 查看
-python3.13 -m loopx.cli chat-endpoint remove --agent-id kimi   # 移除
+# 在仓库根目录运行，使用当前源码的项目环境
+uv run loopx chat-endpoint add --config kimi.json   # 添加
+uv run loopx chat-endpoint list                    # 查看
+uv run loopx chat-endpoint remove --agent-id kimi   # 移除
 ```
 
 自定义 Agent 信任范围是 read_only，写入同样走预览确认。
@@ -102,7 +103,7 @@ python3.13 -m loopx.cli chat-endpoint remove --agent-id kimi   # 移除
 - **聊天线**：页面会话 ↔ Agent 的对话 session——纠偏发生在这里，内容全程可见
 - **干活线**：LoopX 调度器 → Agent 的执行进程——自动跑任务在这里
 
-纠偏不是插手正在跑的进程，而是修改了共享的 Goal 状态：聊天线的 Agent 基于最新状态回答你，干活线的执行进程下一轮启动时重新读状态，你的纠偏就这样生效了。
+纠偏是修改了共享的 Goal 状态：聊天线的 Agent 基于最新状态回答你，干活线的执行进程下一轮启动时重新读状态，你的纠偏就这样生效了。
 
 **Q：LoopX 派的新任务怎么出现在页面上？**
 自动出现，不用刷新：页面持续轮询状态，新任务会进到看板"进行中"列和管家首页"运行中"；进行中的对话走实时流（SSE），右上角也有手动刷新兜底。
@@ -111,7 +112,7 @@ python3.13 -m loopx.cli chat-endpoint remove --agent-id kimi   # 移除
 目前能看到公开安全的**执行过程与结果**：Run 卡片/抽屉里的权威状态、进度、结果摘要、证据和产出文件。原始工具调用、命令日志和本地路径不会原样上页面；需要排障时使用折叠的高级诊断或本地运行记录。
 
 **Q：看板上的任务按什么顺序执行？**
-不是列表顺序。Todo 有优先级（P0/P1…）和依赖关系，调度器按"优先级 + 依赖 + 配额"选择下一个执行。
+Todo 有优先级（P0/P1…）和依赖关系，调度器按"优先级 + 依赖 + 配额"选择下一个执行。
 
 ## 安全边界
 

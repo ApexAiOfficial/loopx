@@ -6,9 +6,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -51,6 +54,42 @@ def normal_turns_use_cli_interaction_contract(task_body: str) -> bool:
     return False
 
 
+def read_installed_workflow_skill(
+    skill: Path, *, references: set[str]
+) -> dict[str, str]:
+    """Read installed procedures and verify links stay in the declared bundle."""
+    skill_root = skill.parent.resolve()
+    documents = {"SKILL.md": skill.read_text(encoding="utf-8")}
+    linked_references = {
+        destination.split("#", 1)[0]
+        for destination in re.findall(
+            r"\[[^\]]+\]\((references/[^)]+)\)", documents["SKILL.md"]
+        )
+    }
+    assert linked_references == references, linked_references
+    assert {
+        path.relative_to(skill_root).as_posix()
+        for path in (skill_root / "references").rglob("*.md")
+    } == references
+    for relative in sorted(linked_references):
+        documents[relative] = (skill_root / relative).read_text(encoding="utf-8")
+    for relative, text in documents.items():
+        document = skill_root / relative
+        source = REPO_ROOT / "skills" / skill_root.name / relative
+        assert document.read_bytes() == source.read_bytes(), document
+        for destination in re.findall(r"\[[^\]]+\]\(([^)]+)\)", text):
+            if "://" in destination or destination.startswith("#"):
+                continue
+            resource = (document.parent / destination.split("#", 1)[0]).resolve()
+            bundle_root = skill_root.parent
+            assert resource.is_relative_to(bundle_root), (document, destination)
+            bundled_path = resource.relative_to(bundle_root)
+            assert bundled_path.parts[0] in {"loopx", *PACKAGED_HOST_SKILL_IDS}, (document, destination)
+            assert resource.is_file(), (document, destination)
+            assert resource.read_bytes() == (REPO_ROOT / "skills" / bundled_path).read_bytes(), resource
+    return documents
+
+
 def source_git_commit(root: Path = REPO_ROOT) -> str:
     if root == REPO_ROOT:
         commit = git_output(["rev-parse", "HEAD"])
@@ -69,15 +108,29 @@ def run_install(
     release_id: str,
     *,
     cwd: Path = REPO_ROOT,
+    revalidate_extensions: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    print(f"install-local-smoke: installing {release_id}", flush=True)
+    started = time.monotonic()
+    result = subprocess.run(
         [str(INSTALL_SCRIPT)],
         cwd=cwd,
-        env={**env, "LOOPX_RELEASE_ID": release_id},
+        env={
+            **env,
+            "LOOPX_RELEASE_ID": release_id,
+            "LOOPX_INSTALL_REVALIDATE_EXTENSIONS": (
+                "1" if revalidate_extensions else "0"
+            ),
+        },
         check=True,
         capture_output=True,
         text=True,
     )
+    print(
+        f"install-local-smoke: installed {release_id} in {time.monotonic() - started:.2f}s",
+        flush=True,
+    )
+    return result
 
 
 def write_promotion_readiness(
@@ -115,7 +168,7 @@ def assert_release_snapshot_source_fallback(root: Path) -> None:
         "release_id": "fixture-source",
         "source": {
             "kind": "github_archive",
-            "repo": "huangruiteng/loopx",
+            "repo": "loopx-project/loopx",
             "ref": "main",
             "git_commit": "abc123def4567890abc123def4567890abc123de",
             "git_ref": "main",
@@ -205,12 +258,15 @@ def main() -> int:
             **os.environ,
             "HOME": str(home),
             "CODEX_HOME": str(codex_home),
+            "LOOPX_REGISTRY": str(home / ".loopx" / "registry.global.json"),
+            "LOOPX_RUNTIME_ROOT": str(home / ".loopx"),
             "OPENCODE_CONFIG_DIR": str(home / ".config" / "opencode"),
             "LOOPX_BIN_DIR": str(bin_dir),
             "LOOPX_SHELL_PROFILE": str(profile),
             "LOOPX_INSTALL_SKILL": "1",
             "LOOPX_PROMOTE_DEFAULT": "1",
             "LOOPX_PYTHON": sys.executable,
+            "LOOPX_USAGE_PING": "0",
             "PATH": os.environ.get("PATH", ""),
             "SHELL": "/bin/zsh",
         }
@@ -284,6 +340,17 @@ def main() -> int:
         release_python = release_root / ".loopx-python"
         assert release_python.read_text(encoding="utf-8").strip() == sys.executable
         assert (release_root / "loopx" / "cli.py").is_file(), release_root
+        repair = codex_home / "skills" / "loopx-self-repair" / "scripts" / "find_pattern.py"
+        assert repair.with_name("lexical_retrieval.py").read_bytes() == (
+            release_root / "loopx" / "capabilities" / "context_providers"
+            / "lexical_retrieval.py"
+        ).read_bytes()
+        repair_query = subprocess.run(
+            [sys.executable, "-I", str(repair), "--query", "closeout recovery"],
+            cwd=root, env={"PATH": str(root / "empty-path")},
+            check=True, capture_output=True, text=True,
+        )
+        assert json.loads(repair_query.stdout)["total_matches"] > 0
         runtime_package = release_root / "loopx" / "control_plane" / "runtime"
         assert (runtime_package / "run_compaction.py").is_file(), release_root
         assert (runtime_package / "session_runtime.py").is_file(), release_root
@@ -357,17 +424,58 @@ def main() -> int:
         )
         assert skill_readback["integration_mode"] == "fixed_install_script"
         assert skill_readback["source"]["revision"] == source_commit
-        assert set(skill_readback["materialized_skill_ids"]) == {
+        materialized_skill_ids = set(skill_readback["materialized_skill_ids"])
+        assert materialized_skill_ids == {
             "loopx",
             *PACKAGED_HOST_SKILL_IDS,
         }
-        skill_text = skill.read_text(encoding="utf-8")
-        compact_skill_text = " ".join(skill_text.split())
+        # Only declared global scopes are delivered: a repo-kept workflow carries
+        # no scope marker, so the fixed install keeps it in the checkout instead
+        # of copying a merge-decision workflow onto a host that never merges.
+        repo_only_skill_ids = {
+            path.name
+            for path in (REPO_ROOT / "skills").iterdir()
+            if path.is_dir() and not (path / ".loopx-skill-scope").exists()
+        }
+        assert repo_only_skill_ids, "the checkout no longer carries a repo-only skill source"
+        assert not (materialized_skill_ids & repo_only_skill_ids), sorted(
+            materialized_skill_ids & repo_only_skill_ids
+        )
+        skill_documents = read_installed_workflow_skill(
+            skill,
+            references={
+                "references/start-and-connect.md",
+                "references/installation-and-diagnosis.md",
+                "references/autonomous-execution.md",
+                "references/heartbeat-hosts.md",
+                "references/handoff-and-feedback.md",
+                "references/materials-explore-quality.md",
+                "references/outcome-refinement.md",
+            },
+        )
+        compact_skill_text = " ".join(skill_documents["SKILL.md"].split())
+        for phrase in (
+            "Before autonomous work, read fresh admission",
+            "Read `goal_boundary` for allowed scope, guards, approvals and stop conditions",
+            "Quota, context, tools and installed skills do not grant write or spawn authority",
+            "Continue while useful in-scope work remains authorized",
+            "must not override an explicit no-spend stop",
+            "retain unsettled state and do not claim settlement is complete",
+            "If `should_run=false`, do not begin delivery unless the current guard explicitly admits a safe bypass",
+            "Execute projected monitor, recovery and owed settlement actions within their current contract",
+            "`notify=DONT_NOTIFY` cannot cancel `execution_obligation.must_attempt_work=true`",
+            "Recover failed or uncertain heartbeat receipts with the same current turn identity",
+            "If context is absent, disabled, or the read fails, preserve the existing single agent workflow",
+            "Never save an expanded static execution body",
+        ):
+            assert phrase in compact_skill_text, phrase
+        # Scenario obligations remain reachable after installation; they need
+        # not all be repeated in the always-loaded entrypoint.
+        complete_skill_text = " ".join(" ".join(skill_documents.values()).split())
         for phrase in (
             "Set Up Recurring Heartbeats",
             "loopx heartbeat-prompt",
-            "run a short steering audit before choosing work",
-            "at least three plausible next-action candidates",
+            "Run a short steering audit over relevant alternatives without a fixed candidate count",
             "continuation check",
             "compute quota separate from focus quota",
             "Register Project Authority And Material Sources",
@@ -378,38 +486,61 @@ def main() -> int:
             "Identify the target project and goal first",
             "loopx register-authority-source",
             "loopx import-doc-registry-authority",
-            "--source heartbeat --execute",
+            "LoopX managed heartbeat bootstrap v2",
+            "Direct SQLite/TOML migration requires the App to be closed",
             "Generate A Review Packet",
             "loopx review-packet --goal-id",
             "loopx review-packet --goal-id <STABLE_GOAL_ID> --handoff-only",
             "loopx --format json review-packet --goal-id",
             "target project agent must not run this draft",
-            "This command is read-only",
-            "JSON output returns a minimized handoff payload with `handoff_text` instead of the full operator packet",
+            "This read-only command assembles agent context directly from current status",
+            "JSON `handoff_text` and `project_agent_handoff` always contain complete prepared text",
             "--classification <PUBLIC_SAFE_PROGRESS_CLASSIFICATION>",
             "--delivery-batch-scale <ACTUAL_DELIVERY_BATCH_SCALE>",
             "--delivery-outcome <ACTUAL_DELIVERY_OUTCOME>",
             "Never default or upgrade a smaller/preparatory turn",
             "do not infer scale/outcome from the classification name",
         ):
-            assert phrase in compact_skill_text, phrase
-        assert "JSON output still keeps the full payload" not in compact_skill_text, compact_skill_text
-        pr_review_skill = codex_home / "skills" / "loopx-pr-review" / "SKILL.md"
-        pr_review_text = " ".join(pr_review_skill.read_text(encoding="utf-8").split())
+            assert phrase in complete_skill_text, phrase
         for phrase in (
-            "loopx --format json pr-review --state all",
+            "Each wake reads the full fresh result and follows only its current `task_body` when `ok=true`",
+            "An unregistered or missing identity must fail closed before task execution or accounting",
+            "An old chat, trust setting, status or review command does not grant new execution authority",
+            "authorized private reads and recovery may continue",
+            "interaction_contract.cli_channel.settlement_plan.ordered_steps",
+            "use the current `next_cli_actions`",
+            "Accountable progress precedes its spend",
+            "The absence of an adapter run or an unchanged artifact does not waive settlement",
+            "never append another accountable progress record after spend",
+            "An already-settled heartbeat cannot claim or spend an independent successor with its old turn identity",
+        ):
+            assert phrase in complete_skill_text, phrase
+        assert "at least three plausible next-action candidates" not in complete_skill_text
+        assert "JSON output still keeps the full payload" not in complete_skill_text
+        pr_review_skill = codex_home / "skills" / "loopx-pr-review" / "SKILL.md"
+        pr_review_documents = read_installed_workflow_skill(
+            pr_review_skill, references=set()
+        )
+        pr_review_text = " ".join(pr_review_documents["SKILL.md"].split())
+        for phrase in (
+            "keeps ordinary queue discovery open-only",
+            "explicit `--state merged|all`",
             "thin host adapter",
             "agent_response_contract.review_execution_contract",
             "review_groups",
-            "pull_requests[].review_plan",
-            "pull_requests[].review_template",
-            "pull_requests[].evidence_commands",
+            "pull_requests[review_action_kind!=null].review_plan",
+            "pull_requests[review_action_kind!=null].review_template",
+            "pull_requests[review_action_kind!=null].evidence_commands",
             "Do not pipe the only copy through `jq`",
             "completion_gate",
-            "never infer `verified` from title",
+            "never infer `verified` from metadata or CI",
             "formal `REQUEST_CHANGES`",
             "Read the published review back",
-            "Merge still routes through `loopx-pr-merge`",
+            "Merge routes through `loopx-pr-merge`",
+            "Read the packet's actual no-action reason",
+            "null action does not imply an existing conclusion",
+            "A reviewer alone has no authority to change another author's submission state",
+            "With `wait_for_ci=false`, never fetch, poll or wait for CI",
         ):
             assert phrase in pr_review_text, phrase
         assert "Do not use this skill to approve" not in pr_review_text, pr_review_text
@@ -490,12 +621,10 @@ def main() -> int:
         self_repair_skill = codex_home / "skills" / "loopx-self-repair" / "SKILL.md"
         self_repair_text = " ".join(self_repair_skill.read_text(encoding="utf-8").split())
         for phrase in (
-            "Build a compact evidence packet",
-            "loopx --format json diagnose --goal-id <goal-id>",
-            "loopx --format json status --goal-id <goal-id> --limit 20",
-            "status` defaults to the registry/dashboard view, but accepts `--goal-id`",
-            "registry-declared active state file",
-            "references/repair-patterns.md",
+            "Reuse evidence before collecting more",
+            "scripts/find_pattern.py",
+            "references/targeted-diagnostics.md",
+            "references/pattern-lookup.md",
             "Repair at the lowest durable layer",
             "Do not solve contradictory payloads by guessing",
         ):
@@ -537,7 +666,7 @@ def main() -> int:
                 )
 
         cli_env = {**env, "PATH": f"{bin_dir}:{env['PATH']}"}
-        runtime_run_dir = home / ".codex" / "loopx" / "goals" / "loopx-meta" / "runs"
+        runtime_run_dir = home / ".loopx" / "goals" / "loopx-meta" / "runs"
         generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         write_promotion_readiness(runtime_run_dir, generated_at=generated_at, label="fresh")
 
@@ -567,7 +696,7 @@ def main() -> int:
         assert freshness["manifest_source_git_commit_short"] == source_commit[:12], freshness
         assert freshness["manifest_source_revision"] == source_commit, freshness
         assert freshness["manifest_skills_digest"] == release_manifest["skills"]["digest"], freshness
-        assert "huangruiteng.github.io/loopx/install.sh" in freshness["upgrade_command"], freshness
+        assert "loopx-project.github.io/loopx/install.sh" in freshness["upgrade_command"], freshness
         assert "loopx doctor" in freshness["upgrade_command"], freshness
         assert doctor_payload["upgrade_hint"] == freshness, doctor_payload
         assert doctor_payload["path"]["loopx"] == str(wrapper), doctor_payload
@@ -661,7 +790,7 @@ def main() -> int:
         assert f"manifest_source_git_commit: `{source_commit[:12]}`" in doctor_markdown, doctor_markdown
         assert "manifest_source: `local_checkout` @ `n/a`" not in doctor_markdown, doctor_markdown
         assert "manifest_skills_digest:" in doctor_markdown, doctor_markdown
-        assert "huangruiteng.github.io/loopx/install.sh" in doctor_markdown, doctor_markdown
+        assert "loopx-project.github.io/loopx/install.sh" in doctor_markdown, doctor_markdown
         assert "latest_promotion_readiness: available=`True`" in doctor_markdown, doctor_markdown
         assert "freshness=`fresh`" in doctor_markdown, doctor_markdown
         assert "requires_readiness_run=`False`" in doctor_markdown, doctor_markdown
@@ -692,7 +821,7 @@ def main() -> int:
         assert stale_install["status"] == "stale", stale_install
         assert stale_install["requires_upgrade"] is True, stale_install
         assert stale_install["release_age_hours"] == 192.0, stale_install
-        assert "huangruiteng.github.io/loopx/install.sh" in stale_install["no_clone_upgrade_command"], stale_install
+        assert "loopx-project.github.io/loopx/install.sh" in stale_install["no_clone_upgrade_command"], stale_install
 
         fresh_install = build_install_freshness(
             command_path=wrapper,
@@ -766,23 +895,22 @@ def main() -> int:
         )
         payload = json.loads(cli.stdout)
         assert payload["ok"] is True, payload
-        assert payload["quota_guard_command"] == (
-            'loopx --format json --registry "$HOME/.codex/loopx/registry.global.json" '
+        assert payload["schema_version"] == "heartbeat_agent_input_v1", payload
+        expected_quota_guard = (
+            f'loopx --registry {shlex.quote(str((home / ".loopx" / "registry.global.json").resolve()))} --format json '
             'quota should-run --goal-id installer-smoke-goal '
             '--turn-instance-id "${LOOPX_TURN:?}"'
-        ), payload
-        assert payload["quota_spend_command"] == (
-            'loopx --format json --registry "$HOME/.codex/loopx/registry.global.json" '
-            "quota spend-slot --goal-id installer-smoke-goal --slots 1 --source heartbeat --execute"
-        ), payload
-        assert payload["thin"] is True, payload
+        )
+        assert expected_quota_guard in payload["task_body"], payload
         assert payload["interface_budget"]["mode"] == "thin", payload
         assert payload["interface_budget"]["within_budget"] is True, payload
-        assert "--delivery-batch-scale <ACTUAL_DELIVERY_BATCH_SCALE>" in payload["progress_refresh_state_command"], payload
-        assert "--delivery-outcome <ACTUAL_DELIVERY_OUTCOME>" in payload["progress_refresh_state_command"], payload
-        assert "--delivery-batch-scale multi_surface" not in payload["progress_refresh_state_command"], payload
-        assert "--delivery-outcome outcome_progress" not in payload["progress_refresh_state_command"], payload
-        assert "<PUBLIC_SAFE_PROGRESS_CLASSIFICATION>" in payload["progress_refresh_state_command"], payload
+        for generator_only_field in (
+            "quota_guard_command",
+            "quota_spend_command",
+            "progress_refresh_state_command",
+            "cli_bin",
+        ):
+            assert generator_only_field not in payload, payload
         assert normal_turns_use_cli_interaction_contract(payload["task_body"]), payload
         assert not normal_turns_use_cli_interaction_contract(
             "Normal turns use the runtime skill; recovery may inspect CLI `interaction_contract`."
@@ -790,10 +918,14 @@ def main() -> int:
         assert not normal_turns_use_cli_interaction_contract(
             "Normal turns use the runtime skill and repair contract."
         )
-        assert "`LOOPX_TURN=<current_time_iso>`; reuse." in payload["task_body"], payload
-        assert "guard receipt; 2 stalls->replan" in payload["task_body"], payload
-        assert "no-change=`surface_only`/no spend" in payload["task_body"], payload
-        assert payload["cli_bin"] == "loopx", payload
+        assert "```sh\nLOOPX_TURN=<current_time_iso>\n" in payload["task_body"], payload
+        assert "not a command-prefix assignment" in payload["task_body"], payload
+        assert "obey projected replan/stop, never wake counts" in payload["task_body"], payload
+        assert "re-enter as instructed, do/verify authorized work." in payload["task_body"], payload
+        assert "2 stalls->replan" not in payload["task_body"], payload
+        assert "Exact monitor settlement=no refresh/spend" in payload["task_body"], payload
+        assert "Admitted work: settlement_plan even if artifacts unchanged" in payload["task_body"], payload
+        assert "no-change=surface_only/no spend" not in payload["task_body"], payload
 
         canary_cli = subprocess.run(
             [
@@ -818,61 +950,82 @@ def main() -> int:
         canary_payload = json.loads(canary_cli.stdout)
         assert canary_payload["cli_bin"] == "loopx-canary", canary_payload
         assert "loopx-canary doctor" in canary_payload["cli_preflight"], canary_payload
-        assert "loopx-canary --format json" in canary_payload["quota_guard_command"], canary_payload
-        assert "loopx-canary heartbeat-prompt --compact" in canary_payload["task_body"], canary_payload
-        canary_task_body = canary_payload["task_body"]
-        progress_command = canary_payload["progress_refresh_state_command"]
-        spend_command = canary_payload["quota_spend_command"]
-        assert progress_command in canary_task_body, canary_payload
-        assert spend_command in canary_task_body, canary_payload
-        assert canary_task_body.index(progress_command) < canary_task_body.index(
-            spend_command
+        guard_argv = shlex.split(canary_payload["quota_guard_command"])
+        assert guard_argv[0] == "loopx-canary", canary_payload
+        assert guard_argv[guard_argv.index("--format") + 1] == "json", canary_payload
+        assert guard_argv[guard_argv.index("--registry") + 1] == str(
+            (home / ".loopx" / "registry.global.json").resolve()
         ), canary_payload
+        # Brief diagnostics expose only the selected generator. The task body
+        # still teaches the compact drill-down; do not resurrect its removed
+        # diagnostic alias to qualify the installed CLI.
+        assert "compact_prompt_command" not in canary_payload, canary_payload
+        assert canary_payload["brief_prompt_command"].startswith("loopx-canary "), canary_payload
+        assert "heartbeat-prompt --compact" in canary_payload["task_body"], canary_payload
+        canary_task_body = canary_payload["task_body"]
+        # Brief mode renders one bounded guard block: it deliberately omits the
+        # accountable refresh/spend pair, which belongs to the full and compact
+        # modes. Assert the brief contract instead of the retired sequence.
+        assert canary_payload["quota_guard_command"] in canary_task_body, canary_payload
+        assert canary_payload["progress_refresh_state_command"] not in canary_task_body, canary_payload
+        assert canary_payload["quota_spend_command"] not in canary_task_body, canary_payload
+        assert "```bash\n" in canary_task_body and "LOOPX_TURN=<current_time_iso>" in canary_task_body, canary_payload
+        assert "not a command-prefix assignment" in canary_task_body, canary_payload
 
-        fresh_install = run_install(env, "install-smoke-fresh")
-        assert "loopx installed locally" in fresh_install.stdout, fresh_install.stdout
-        assert "loopx install warning" not in fresh_install.stderr, fresh_install.stderr
-
-        stale_generated_at = (datetime.now(timezone.utc) - timedelta(hours=25)).replace(microsecond=0).isoformat()
-        write_promotion_readiness(runtime_run_dir, generated_at=stale_generated_at, label="stale")
-        stale_install = run_install(env, "install-smoke-stale")
-        assert "loopx installed locally" in stale_install.stdout, stale_install.stdout
-        assert "promotion-readiness evidence is stale" in stale_install.stderr, stale_install.stderr
-        assert "age_hours=" in stale_install.stderr, stale_install.stderr
-        assert "non-blocking" in stale_install.stderr, stale_install.stderr
-
+        # Exercise two actual upgrades after the default install. Readiness
+        # freshness and optional Host configuration are independent inputs:
+        # pair fresh evidence with a broken OpenCode config, then stale evidence
+        # with a healthy config. Keep every warning/Host assertion without
+        # paying for two extra copies and complete candidate checks.
+        # The initial install covers post-install extension revalidation;
+        # repeating that same provider scan does not add upgrade coverage.
         blocked_opencode_root = home / ".config" / "opencode-blocked"
         blocked_opencode_root.mkdir(parents=True)
         (blocked_opencode_root / "opencode.jsonc").write_text(
             "{ invalid\n",
             encoding="utf-8",
         )
-        blocked_opencode_install = run_install(
+        fresh_install = run_install(
             {
                 **env,
                 "LOOPX_INSTALL_OPENCODE": "1",
                 "OPENCODE_CONFIG_DIR": str(blocked_opencode_root),
             },
-            "install-smoke-opencode-blocked",
+            "install-smoke-fresh",
+            revalidate_extensions=False,
         )
+        assert "loopx installed locally" in fresh_install.stdout, fresh_install.stdout
+        assert "loopx install warning" not in fresh_install.stderr, fresh_install.stderr
         assert (
             "loopx OpenCode bridge: install attempted; run manually:"
-            in blocked_opencode_install.stdout
-        ), blocked_opencode_install.stdout
+            in fresh_install.stdout
+        ), fresh_install.stdout
         assert (blocked_opencode_root / "commands" / "loopx.md").is_file()
         assert not (blocked_opencode_root / "plugins" / "loopx-goal.js").exists()
         assert not (blocked_opencode_root / "loopx" / "goal-bridge-runtime.mjs").exists()
         assert not (blocked_opencode_root / "package.json").exists()
+        assert wrapper.resolve().parents[1].name == "install-smoke-fresh"
+        assert fallback_wrapper.resolve().parents[1] == wrapper.resolve().parents[1]
 
-        opencode_install = run_install(
+        stale_generated_at = (datetime.now(timezone.utc) - timedelta(hours=25)).replace(microsecond=0).isoformat()
+        write_promotion_readiness(runtime_run_dir, generated_at=stale_generated_at, label="stale")
+        stale_install = run_install(
             {**env, "LOOPX_INSTALL_OPENCODE": "1"},
-            "install-smoke-opencode",
+            "install-smoke-stale",
+            revalidate_extensions=False,
         )
-        assert "loopx OpenCode bridge:" in opencode_install.stdout, opencode_install.stdout
+        assert "loopx installed locally" in stale_install.stdout, stale_install.stdout
+        assert "promotion-readiness evidence is stale" in stale_install.stderr, stale_install.stderr
+        assert "age_hours=" in stale_install.stderr, stale_install.stderr
+        assert "non-blocking" in stale_install.stderr, stale_install.stderr
+
+        assert "loopx OpenCode bridge:" in stale_install.stdout, stale_install.stdout
         assert (opencode_root / "commands" / "loopx.md").is_file()
         assert (opencode_root / "plugins" / "loopx-goal.js").is_file()
         assert (opencode_root / "loopx" / "goal-bridge-runtime.mjs").is_file()
         assert (opencode_root / "package.json").is_file()
+        assert wrapper.resolve().parents[1].name == "install-smoke-stale"
+        assert fallback_wrapper.resolve().parents[1] == wrapper.resolve().parents[1]
 
     print("install-local-smoke ok")
     return 0

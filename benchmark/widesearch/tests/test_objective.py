@@ -23,3 +23,5 @@ def test_objective_differences() -> None:
     assert "loopx" in treat.lower()
     assert "/ws/final_answer.md" in base
     assert "/ws/final_answer.md" in treat
+    assert "Use web_search / web_fetch" in base
+    assert "Use web_search / web_fetch" in treat

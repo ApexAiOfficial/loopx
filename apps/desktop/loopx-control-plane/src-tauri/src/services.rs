@@ -1,19 +1,64 @@
+use crate::service_endpoints::ServiceEndpoints;
 use command_group::{CommandGroup, GroupChild};
 use std::{
     env,
     ffi::OsStr,
     fmt, fs,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 
+/// Every loopback service the App must reach before it opens the workspace.
+pub const SERVICE_KINDS: [ServiceKind; 2] = [ServiceKind::Status, ServiceKind::Chat];
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_PROBE_RESPONSE_BYTES: u64 = 1024 * 1024;
+
+// Core owns activation admission. Keep its bounded reason codes intact across
+// the native supervisor and recovery view; a deferred provider prerequisite is
+// not a failed service transaction or proof that rollback happened.
+pub(crate) fn activation_error_code(code: &str) -> Option<&'static str> {
+    match code {
+        "chat_work_pending" => Some("chat_work_pending"),
+        "chat_state_unverified" => Some("chat_state_unverified"),
+        "chat_service_unverified" => Some("chat_service_unverified"),
+        "native_account_work_pending" => Some("native_account_work_pending"),
+        "native_observer_provider_binding_required" => {
+            Some("native_observer_provider_binding_required")
+        }
+        "native_observer_provider_upgrade_required" => {
+            Some("native_observer_provider_upgrade_required")
+        }
+        "native_observer_requires_target_runtime" => {
+            Some("native_observer_requires_target_runtime")
+        }
+        "service_runtime_alignment_unavailable" => Some("service_runtime_alignment_unavailable"),
+        "service_runtime_alignment_failed" => Some("service_runtime_alignment_failed"),
+        "service_runtime_route_unverified" => Some("service_runtime_route_unverified"),
+        "service_runtime_rollback_failed" => Some("service_runtime_rollback_failed"),
+        _ => None,
+    }
+}
+
+pub(crate) fn runtime_alignment_error(code: &str) -> bool {
+    matches!(
+        code,
+        "native_account_work_pending"
+            | "native_observer_provider_binding_required"
+            | "native_observer_provider_upgrade_required"
+            | "native_observer_requires_target_runtime"
+            | "service_runtime_alignment_unavailable"
+            | "service_runtime_route_unverified"
+            | "service_runtime_alignment_failed"
+            | "service_runtime_rollback_failed"
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceKind {
@@ -22,10 +67,21 @@ pub enum ServiceKind {
 }
 
 impl ServiceKind {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Status => "status",
             Self::Chat => "chat",
+        }
+    }
+
+    /// Name the services a `connecting` phase is still waiting for. One
+    /// pending service keeps its own name so a stalled connection stays
+    /// diagnosable on the boot page; a concurrent connect reports the loopback
+    /// set, which the boot page renders as "local services".
+    pub fn pending_label(pending: &[Self]) -> &'static str {
+        match pending {
+            [kind] => kind.label(),
+            _ => "local",
         }
     }
 
@@ -38,8 +94,8 @@ impl ServiceKind {
 
     fn probe_path(self) -> &'static str {
         match self {
-            Self::Status => "/",
-            Self::Chat => "/api/chat/capabilities",
+            Self::Status => "/?readiness=1",
+            Self::Chat => "/api/chat/readiness",
         }
     }
 
@@ -51,6 +107,11 @@ impl ServiceKind {
     }
 
     fn command_args(self) -> Vec<String> {
+        self.command_args_on_port(self.port())
+    }
+
+    fn command_args_on_port(self, port: u16) -> Vec<String> {
+        let port = port.to_string();
         match self {
             Self::Status => vec![
                 "serve-status",
@@ -58,7 +119,7 @@ impl ServiceKind {
                 "--host",
                 "127.0.0.1",
                 "--port",
-                "8766",
+                &port,
                 "--limit",
                 "80",
             ],
@@ -68,7 +129,7 @@ impl ServiceKind {
                 "--host",
                 "127.0.0.1",
                 "--port",
-                "8767",
+                &port,
                 "--no-open",
             ],
         }
@@ -81,7 +142,9 @@ impl ServiceKind {
 #[derive(Debug, Eq, PartialEq)]
 enum Probe {
     Matching,
+    NotReady,
     Unavailable,
+    Unresponsive,
     Foreign,
     Stale,
 }
@@ -99,112 +162,155 @@ impl std::error::Error for ServiceError {}
 
 struct OwnedService {
     child: GroupChild,
+    kind: ServiceKind,
 }
 
 impl OwnedService {
     fn stop(&mut self) {
+        #[cfg(target_os = "macos")]
+        let group = self.child.id();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        #[cfg(target_os = "macos")]
+        if let Err(error) = crate::service_lifetime::wait_for_group_exit(group) {
+            eprintln!(
+                "LoopX owned {} stop not confirmed: {error}",
+                self.kind.label()
+            );
+        }
     }
 }
 
 pub struct ServiceSet {
     owned: Vec<OwnedService>,
+    runtime: SelectedRuntime,
+    last_recovery_attempt: Option<Instant>,
     /// True when a stale LoopX service was restarted so the running frontend
     /// was transparently moved onto the current installed release.
     pub healed: bool,
 }
 
+/// Freeze one selected artifact for both concurrently started services.
+#[derive(Clone)]
+pub(crate) struct SelectedRuntime {
+    pub executable: String,
+    pub identity: Option<serde_json::Value>,
+}
+
+/// A qualified installation is reusable only when both existing listeners
+/// answer with its exact identity. Observation starts/stops no service.
+pub(crate) fn runtime_ready(runtime: &SelectedRuntime, endpoints: &ServiceEndpoints) -> bool {
+    runtime.identity.is_some()
+        && SERVICE_KINDS.iter().all(|kind| {
+            probe_on_port(*kind, endpoints.port(*kind), runtime.identity.as_ref())
+                == Probe::Matching
+        })
+}
+
 impl ServiceSet {
-    pub fn start() -> Result<Self, ServiceError> {
-        let mut services = Self {
-            owned: Vec::new(),
-            healed: false,
-        };
-        for kind in [ServiceKind::Status, ServiceKind::Chat] {
-            if let Err(error) = services.ensure(kind) {
-                services.stop();
-                return Err(error);
-            }
-        }
-        Ok(services)
+    pub(crate) fn runtime(&self) -> &SelectedRuntime {
+        &self.runtime
     }
 
-    fn ensure(&mut self, kind: ServiceKind) -> Result<(), ServiceError> {
-        let executable = loopx_executable();
-        let expected_runtime_identity = runtime_identity_for_executable(&executable);
-        let stale_deadline = Instant::now() + STARTUP_TIMEOUT;
-        loop {
-            match probe(kind, expected_runtime_identity.as_ref()) {
-                Probe::Matching => return Ok(()),
-                Probe::Foreign => {
-                    return Err(ServiceError(format!(
-                        "port {} is occupied by a service that is not LoopX {}",
-                        kind.port(),
-                        kind.label()
-                    )));
-                }
-                Probe::Stale => {
-                    // Self-heal: the port is owned by a LoopX service from a
-                    // different installed release (for example after a
-                    // `loopx update`). Terminate that stale listener and keep
-                    // waiting up to the startup timeout so a LaunchAgent-managed
-                    // service (KeepAlive + throttle) has time to restart on the
-                    // current release; unknown (Foreign) processes keep the
-                    // hard error.
-                    self.healed = true;
-                    terminate_listener(kind.port());
-                    if Instant::now() >= stale_deadline {
-                        return Err(ServiceError(format!(
-                            "port {} is serving LoopX {} from a different installed runtime and could not be restarted",
-                            kind.port(),
-                            kind.label()
-                        )));
-                    }
-                    thread::sleep(Duration::from_millis(200));
-                }
-                Probe::Unavailable => break,
+    pub(crate) fn runtime_identity(&self) -> Option<&serde_json::Value> {
+        self.runtime.identity.as_ref()
+    }
+
+    pub(crate) fn start(
+        runtime: &SelectedRuntime,
+        endpoints: &ServiceEndpoints,
+        progress: impl Fn(&[ServiceKind]) + Sync,
+    ) -> Result<Self, ServiceError> {
+        #[cfg(target_os = "macos")]
+        if !endpoints.isolated {
+            align_managed_runtime(runtime)?;
+        }
+        Self::collect(
+            connect_all(
+                SERVICE_KINDS,
+                |kind| connect(kind, runtime, endpoints),
+                progress,
+            ),
+            runtime.clone(),
+        )
+    }
+
+    /// Fold finished connection attempts into one owned set. Every outcome
+    /// surrenders its child here, so a set that fails still stops the
+    /// processes its successful peers started.
+    fn collect(
+        outcomes: [ServiceOutcome; SERVICE_KINDS.len()],
+        runtime: SelectedRuntime,
+    ) -> Result<Self, ServiceError> {
+        let mut services = Self {
+            owned: Vec::new(),
+            runtime,
+            last_recovery_attempt: None,
+            healed: false,
+        };
+        let mut failure = None;
+        for outcome in outcomes {
+            services.owned.extend(outcome.owned);
+            services.healed |= outcome.healed;
+            if let Err(error) = outcome.result {
+                failure.get_or_insert(error);
             }
         }
-
-        let mut command = Command::new(&executable);
-        command
-            .args(kind.command_args())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = command.group_spawn().map_err(|error| {
-            ServiceError(format!(
-                "could not start LoopX {} with `{executable}`: {error}",
-                kind.label()
-            ))
-        })?;
-        self.owned.push(OwnedService { child });
-
-        let deadline = Instant::now() + STARTUP_TIMEOUT;
-        while Instant::now() < deadline {
-            match probe(kind, expected_runtime_identity.as_ref()) {
-                Probe::Matching => return Ok(()),
-                Probe::Foreign => {
-                    return Err(ServiceError(format!(
-                        "LoopX {} startup reached an unexpected service on port {}",
-                        kind.label(),
-                        kind.port()
-                    )));
-                }
-                Probe::Stale => {
-                    self.healed = true;
-                    terminate_listener(kind.port());
-                    thread::sleep(Duration::from_millis(200));
-                }
-                Probe::Unavailable => thread::sleep(Duration::from_millis(100)),
+        match failure {
+            Some(error) => {
+                services.stop();
+                Err(error)
             }
+            None => Ok(services),
         }
-        Err(ServiceError(format!(
-            "LoopX {} did not become ready on port {}",
-            kind.label(),
-            kind.port()
-        )))
+    }
+
+    /// Recover only this window's exited owned children. Keep its qualified
+    /// artifact, ports and healthy peer; never infer ownership from a listener.
+    pub(crate) fn recover_exited(
+        &mut self,
+        endpoints: &ServiceEndpoints,
+        now: Instant,
+    ) -> Result<bool, ServiceError> {
+        if self
+            .last_recovery_attempt
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(2))
+        {
+            return Ok(false);
+        }
+        let mut recovered = false;
+        for service in &mut self.owned {
+            // Observe the direct child, not arbitrary worker descendants in
+            // its process group. An unknown wait result grants no restart.
+            let exited = match service.child.inner().try_wait() {
+                Ok(status) => status.is_some(),
+                Err(error) => {
+                    self.last_recovery_attempt = Some(now);
+                    return Err(ServiceError(error.to_string()));
+                }
+            };
+            if !exited {
+                continue;
+            }
+            self.last_recovery_attempt = Some(now);
+            service.stop();
+            let mut replacement = None;
+            let result = connect_owned_service(
+                service.kind,
+                endpoints.port(service.kind),
+                &self.runtime,
+                &mut replacement,
+            );
+            if let Err(error) = result {
+                if let Some(mut failed) = replacement {
+                    failed.stop();
+                }
+                return Err(error);
+            }
+            *service = replacement.expect("successful private start owns its child");
+            recovered = true;
+        }
+        Ok(recovered)
     }
 
     pub fn stop(&mut self) {
@@ -215,33 +321,710 @@ impl ServiceSet {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn align_managed_runtime(runtime: &SelectedRuntime) -> Result<(), ServiceError> {
+    let managed = SERVICE_KINDS
+        .iter()
+        .any(|kind| platform_managed_service_declared(env::var_os("HOME").as_deref(), *kind));
+    if !managed
+        || SERVICE_KINDS
+            .iter()
+            .all(|kind| probe(*kind, runtime.identity.as_ref()) == Probe::Matching)
+    {
+        return Ok(());
+    }
+    let mut command = Command::new(&runtime.executable);
+    configure_runtime_environment(&mut command);
+    command.args([
+        "--format",
+        "json",
+        "update",
+        "activate",
+        "--service",
+        "all",
+        "--runtime-executable",
+        &runtime.executable,
+    ]);
+    managed_runtime_alignment_result(
+        timed_output_with_timeout(command, Duration::from_secs(60)),
+        runtime.identity.as_ref(),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn managed_runtime_alignment_result(
+    output: Option<std::process::Output>,
+    expected: Option<&serde_json::Value>,
+) -> Result<(), ServiceError> {
+    let payload = output
+        .as_ref()
+        .and_then(|result| serde_json::from_slice::<serde_json::Value>(&result.stdout).ok());
+    let Some(payload) = payload.filter(|value| {
+        value["schema_version"] == "loopx_runtime_service_activation_v1"
+            && value["service"] == "all"
+    }) else {
+        return Err(ServiceError("service_runtime_alignment_unavailable".into()));
+    };
+    if payload["ok"] == true
+        && payload["status"] == "aligned"
+        && payload["readiness_verified"] == true
+        && expected.is_some_and(|identity| payload.get("runtime_identity") == Some(identity))
+        && output
+            .as_ref()
+            .is_some_and(|result| result.status.success())
+    {
+        return Ok(());
+    }
+    let code = payload["reason"]
+        .as_str()
+        .and_then(activation_error_code)
+        .unwrap_or("service_runtime_alignment_failed");
+    Err(ServiceError(code.into()))
+}
+
+// Ownership transfer (adopt, update handoff, stop) is exercisable without a
+// real runtime: the set owns exactly the groups a test hands it, so a reclaim
+// is observable on the same job objects production uses.
+#[cfg(test)]
+pub(crate) fn owned_set_for_test(children: Vec<GroupChild>) -> ServiceSet {
+    ServiceSet {
+        owned: children
+            .into_iter()
+            .map(|child| OwnedService {
+                child,
+                kind: ServiceKind::Status,
+            })
+            .collect(),
+        runtime: SelectedRuntime {
+            executable: String::new(),
+            identity: None,
+        },
+        last_recovery_attempt: None,
+        healed: false,
+    }
+}
+
+/// One service's connection attempt. The child this App spawned travels with
+/// the outcome even when the attempt failed, so `ServiceSet` can stop it
+/// instead of leaking a process that no longer has an owner.
+struct ServiceOutcome {
+    owned: Option<OwnedService>,
+    healed: bool,
+    result: Result<(), ServiceError>,
+}
+
+/// Connect every loopback service at once.
+///
+/// The services own separate ports, commands and processes, and neither reads
+/// the other's readiness, so the window should wait for the slowest one rather
+/// than their sum. A start that follows a runtime update pays that difference
+/// twice over: each stale listener is replaced and then warms a fresh
+/// interpreter before it answers a readiness probe.
+///
+/// `progress` names the services still being waited on: the whole set while
+/// they run together, then whichever connection outlives its peer, so a
+/// stalled service is still named on the boot page.
+fn connect_all<const N: usize>(
+    kinds: [ServiceKind; N],
+    connect: impl Fn(ServiceKind) -> ServiceOutcome + Sync,
+    progress: impl Fn(&[ServiceKind]) + Sync,
+) -> [ServiceOutcome; N] {
+    let pending = Mutex::new(kinds.to_vec());
+    progress(&kinds);
+    thread::scope(|scope| {
+        kinds
+            .map(|kind| {
+                let (connect, progress, pending) = (&connect, &progress, &pending);
+                scope.spawn(move || {
+                    let outcome = connect(kind);
+                    let remaining = {
+                        let mut pending = pending.lock().expect("pending service lock");
+                        pending.retain(|entry| *entry != kind);
+                        pending.clone()
+                    };
+                    if !remaining.is_empty() {
+                        progress(&remaining);
+                    }
+                    outcome
+                })
+            })
+            .map(|handle| handle.join().expect("service connection thread"))
+    })
+}
+
+fn connect(
+    kind: ServiceKind,
+    runtime: &SelectedRuntime,
+    endpoints: &ServiceEndpoints,
+) -> ServiceOutcome {
+    let mut owned = None;
+    let mut healed = false;
+    let result = if endpoints.isolated {
+        connect_owned_service(kind, endpoints.port(kind), runtime, &mut owned)
+    } else {
+        connect_service(kind, runtime, &mut owned, &mut healed)
+    };
+    ServiceOutcome {
+        owned,
+        healed,
+        result,
+    }
+}
+
+// Explicit private endpoints never borrow a listener or restart a LaunchAgent. A matching
+// revision alone cannot establish the listener's registry/process ownership.
+fn connect_owned_service(
+    kind: ServiceKind,
+    port: u16,
+    runtime: &SelectedRuntime,
+    owned: &mut Option<OwnedService>,
+) -> Result<(), ServiceError> {
+    if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        return Err(ServiceError(format!(
+            "LoopX {} private endpoint on port {port} is already occupied; retry startup",
+            kind.label()
+        )));
+    }
+    let mut command = Command::new(&runtime.executable);
+    configure_runtime_environment(&mut command);
+    if matches!(kind, ServiceKind::Chat) {
+        configure_codex_chat_home(
+            &mut command,
+            env::var_os("HOME"),
+            env::var_os("LOOPX_CHAT_CODEX_HOME"),
+        );
+    }
+    command
+        .args(kind.command_args_on_port(port))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(target_os = "macos")]
+    let child = crate::service_lifetime::spawn(&command);
+    #[cfg(not(target_os = "macos"))]
+    let child = command.group_spawn();
+    let child = child.map_err(|error| {
+        ServiceError(format!(
+            "could not start private LoopX {}: {error}",
+            kind.label()
+        ))
+    })?;
+    *owned = Some(OwnedService { child, kind });
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        let child = &mut owned.as_mut().expect("owned service").child;
+        if child
+            .try_wait()
+            .map_err(|error| ServiceError(error.to_string()))?
+            .is_some()
+        {
+            return Err(ServiceError(format!(
+                "private LoopX {} exited before readiness on port {port}",
+                kind.label()
+            )));
+        }
+        match probe_on_port(kind, port, runtime.identity.as_ref()) {
+            Probe::Matching => return Ok(()),
+            Probe::NotReady => return Err(ServiceError(format!(
+                "LoopX {} registry is invalid or unreadable on private port {port}; repair the registry and retry",
+                kind.label()
+            ))),
+            Probe::Foreign | Probe::Stale => return Err(ServiceError(format!(
+                "private LoopX {} reached an unexpected listener on port {port}; retry startup",
+                kind.label()
+            ))),
+            Probe::Unavailable | Probe::Unresponsive => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    Err(ServiceError(format!(
+        "private LoopX {} did not become ready on port {port}",
+        kind.label()
+    )))
+}
+
+fn connect_service(
+    kind: ServiceKind,
+    runtime: &SelectedRuntime,
+    owned: &mut Option<OwnedService>,
+    healed: &mut bool,
+) -> Result<(), ServiceError> {
+    let executable = &runtime.executable;
+    let expected_runtime_identity = &runtime.identity;
+    let stale_deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        match probe(kind, expected_runtime_identity.as_ref()) {
+            Probe::Matching => return Ok(()),
+            Probe::NotReady => return Err(status_readiness_error(kind)),
+            Probe::Foreign => {
+                return Err(ServiceError(format!(
+                    "port {} is occupied by a service that is not LoopX {}",
+                    kind.port(),
+                    kind.label()
+                )));
+            }
+            Probe::Stale => {
+                // Self-heal: the port is owned by a LoopX service from a
+                // different installed release (for example after a
+                // `loopx update`). Terminate that stale listener and keep
+                // waiting up to the startup timeout so a LaunchAgent-managed
+                // service (KeepAlive + throttle) has time to restart on the
+                // current release; unknown (Foreign) processes keep the
+                // hard error.
+                terminate_verified_listener(kind, executable, kind.port())?;
+                *healed = true;
+                if Instant::now() >= stale_deadline {
+                    return Err(ServiceError(format!(
+                            "port {} is serving LoopX {} from a different installed runtime and could not be restarted",
+                            kind.port(),
+                            kind.label()
+                        )));
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Probe::Unresponsive => {
+                // A bound socket is not HTTP readiness. Give slow startup
+                // a full grace period, then replace only a verified LoopX
+                // listener; unknown processes still fail closed.
+                if Instant::now() < stale_deadline {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                terminate_verified_listener(kind, executable, kind.port())?;
+                *healed = true;
+                break;
+            }
+            Probe::Unavailable => break,
+        }
+    }
+
+    if request_platform_managed_start(kind) {
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        while Instant::now() < deadline {
+            match probe(kind, expected_runtime_identity.as_ref()) {
+                Probe::Matching => return Ok(()),
+                Probe::NotReady => return Err(status_readiness_error(kind)),
+                Probe::Foreign => {
+                    return Err(ServiceError(format!(
+                        "LoopX {} startup reached an unexpected service on port {}",
+                        kind.label(),
+                        kind.port()
+                    )));
+                }
+                Probe::Stale => {
+                    terminate_verified_listener(kind, executable, kind.port())?;
+                    *healed = true;
+                    request_platform_managed_start(kind);
+                }
+                Probe::Unavailable | Probe::Unresponsive => {}
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        return Err(ServiceError(format!(
+            "system-managed LoopX {} did not become ready on port {}",
+            kind.label(),
+            kind.port()
+        )));
+    }
+
+    // A declared machine service owns its registry and Chat store even while
+    // launchd has it unloaded. Do not replace that source with an empty default.
+    #[cfg(target_os = "macos")]
+    if platform_managed_service_declared(env::var_os("HOME").as_deref(), kind) {
+        return Err(ServiceError(format!(
+            "system-managed LoopX {} is configured but not loaded; restore its service and retry",
+            kind.label()
+        )));
+    }
+
+    let mut command = Command::new(executable);
+    configure_runtime_environment(&mut command);
+    if matches!(kind, ServiceKind::Chat) {
+        configure_codex_chat_home(
+            &mut command,
+            env::var_os("HOME"),
+            env::var_os("LOOPX_CHAT_CODEX_HOME"),
+        );
+    }
+    command
+        .args(kind.command_args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = command.group_spawn().map_err(|error| {
+        ServiceError(format!(
+            "could not start LoopX {} with `{executable}`: {error}",
+            kind.label()
+        ))
+    })?;
+    *owned = Some(OwnedService { child, kind });
+
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        match probe(kind, expected_runtime_identity.as_ref()) {
+            Probe::Matching => return Ok(()),
+            Probe::NotReady => return Err(status_readiness_error(kind)),
+            Probe::Foreign => {
+                return Err(ServiceError(format!(
+                    "LoopX {} startup reached an unexpected service on port {}",
+                    kind.label(),
+                    kind.port()
+                )));
+            }
+            Probe::Stale => {
+                terminate_verified_listener(kind, executable, kind.port())?;
+                *healed = true;
+                thread::sleep(Duration::from_millis(200));
+            }
+            Probe::Unavailable | Probe::Unresponsive => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    Err(ServiceError(format!(
+        "LoopX {} did not become ready on port {}",
+        kind.label(),
+        kind.port()
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn request_platform_managed_start(kind: ServiceKind) -> bool {
+    let label = platform_managed_service_label(kind);
+    let uid = match Command::new("id").arg("-u").output() {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => return false,
+    };
+    if uid.is_empty() {
+        return false;
+    }
+    let target = format!("gui/{uid}/{label}");
+    let loaded = Command::new("launchctl")
+        .args(["print", target.as_str()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !loaded {
+        return false;
+    }
+    // Keep one service owner. A loaded KeepAlive LaunchAgent may be inside its
+    // throttle interval after stale-runtime replacement; ask launchd to wake
+    // it and wait instead of racing it with a Desktop-owned child process.
+    let _ = Command::new("launchctl")
+        .args(["kickstart", target.as_str()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn platform_managed_service_declared(home: Option<&OsStr>, kind: ServiceKind) -> bool {
+    let Some(home) = home else {
+        return false;
+    };
+    let path = PathBuf::from(home)
+        .join("Library/LaunchAgents")
+        .join(format!("{}.plist", platform_managed_service_label(kind)));
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+fn platform_managed_service_label(kind: ServiceKind) -> &'static str {
+    match kind {
+        ServiceKind::Status => "com.loopx.status",
+        ServiceKind::Chat => "com.loopx.chat",
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn request_platform_managed_start(_kind: ServiceKind) -> bool {
+    false
+}
+
 impl Drop for ServiceSet {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-fn terminate_listener(port: u16) {
+#[derive(Debug, Eq, PartialEq)]
+struct ListenerProcess {
+    pid: i32,
+    command_line: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum LoopxProcessInvocation {
+    DirectExecutable,
+    PythonModule,
+    ManagedReleaseLauncher,
+}
+
+/// Stable process fingerprint emitted by release launchers. The Desktop must
+/// not couple stale-service recovery to the launcher's current Python module:
+/// changing `loopx.cli` to `loopx.entrypoint` must not strand an older daemon.
+const MANAGED_RELEASE_LAUNCHER_MARKER: &str = "LOOPX_MANAGED_RELEASE_LAUNCHER_V1";
+const LEGACY_CLI_LAUNCHER_MARKER: &str = r#"runpy.run_module("loopx.cli", run_name="__main__")"#;
+const ENTRYPOINT_LAUNCHER_MODULE_MARKER: &str = r#""loopx.entrypoint""#;
+const DYNAMIC_MODULE_LAUNCH_MARKER: &str = r#"runpy.run_module(module, run_name="__main__")"#;
+const RELEASE_ARGV_ZERO_MARKER: &str =
+    r#"sys.argv[0] = os.path.join(release_root, "scripts", "loopx")"#;
+
+fn terminate_verified_listener(
+    kind: ServiceKind,
+    loopx_executable: &str,
+    port: u16,
+) -> Result<(), ServiceError> {
+    #[cfg(target_os = "macos")]
+    if kind == ServiceKind::Chat {
+        // Core owns the loaded manager's route, accepted-work fence and exact
+        // listener PID. A desktop Python-template match cannot authorize
+        // stopping a Chat worker, including one using a private bootstrap.
+        let mut command = Command::new(loopx_executable);
+        configure_runtime_environment(&mut command);
+        command.args([
+            "--format",
+            "json",
+            "update",
+            "activate",
+            "--service",
+            "chat",
+            "--port",
+            &port.to_string(),
+        ]);
+        return managed_chat_activation_result(timed_output_with_timeout(command, STARTUP_TIMEOUT));
+    }
     #[cfg(not(windows))]
     {
-        let output = Command::new("lsof")
-            .args(["-tiTCP", &format!(":{port}"), "-sTCP:LISTEN"])
-            .output();
-        if let Ok(output) = output {
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                if let Ok(pid) = line.trim().parse::<i32>() {
-                    let _ = Command::new("kill").arg(pid.to_string()).status();
-                }
+        let processes = listener_processes(port)?;
+        let pids = verified_loopx_listener_pids(kind, loopx_executable, port, &processes)?;
+        for pid in pids {
+            let current = inspect_process(pid, port)?;
+            verified_loopx_listener_pids(kind, loopx_executable, port, &[current])?;
+            let status = Command::new("kill")
+                .arg(pid.to_string())
+                .status()
+                .map_err(|error| {
+                    ServiceError(format!(
+                        "could not stop stale LoopX {} listener on port {port}: {error}",
+                        kind.label()
+                    ))
+                })?;
+            if !status.success() {
+                return Err(ServiceError(format!(
+                    "could not stop stale LoopX {} listener on port {port}",
+                    kind.label()
+                )));
             }
         }
+        Ok(())
     }
     #[cfg(windows)]
     {
-        // Windows keeps the owner-facing error path; no process is terminated.
+        let _ = (kind, loopx_executable, port);
+        Err(ServiceError(format!(
+            "port {port} is serving stale LoopX {}; automatic replacement is unavailable on Windows",
+            kind.label()
+        )))
     }
 }
 
-fn loopx_executable() -> String {
+#[cfg(any(target_os = "macos", test))]
+fn managed_chat_activation_result(
+    output: Option<std::process::Output>,
+) -> Result<(), ServiceError> {
+    let payload = output
+        .as_ref()
+        .and_then(|result| serde_json::from_slice::<serde_json::Value>(&result.stdout).ok());
+    let Some(payload) = payload.filter(|value| {
+        value["schema_version"] == "loopx_runtime_service_activation_v1"
+            && value["service"] == "chat"
+    }) else {
+        // An older Core or lost result grants no fallback raw kill. The next
+        // HTTP read observes whether the original manager actually recovered.
+        return Err(ServiceError("chat_service_unverified".into()));
+    };
+    match (payload["ok"].as_bool(), payload["status"].as_str()) {
+        (Some(true), Some("restart_requested" | "not_running"))
+            if output
+                .as_ref()
+                .is_some_and(|result| result.status.success()) =>
+        {
+            Ok(())
+        }
+        (Some(false), Some("deferred")) => match payload["reason"].as_str() {
+            Some("chat_work_pending") => Err(ServiceError("chat_work_pending".into())),
+            _ => Err(ServiceError("chat_state_unverified".into())),
+        },
+        _ => Err(ServiceError("chat_service_unverified".into())),
+    }
+}
+
+#[cfg(not(windows))]
+fn listener_processes(port: u16) -> Result<Vec<ListenerProcess>, ServiceError> {
+    let selector = format!("-iTCP:{port}");
+    let output = Command::new("lsof")
+        .args(["-nP", "-t", "-a", selector.as_str(), "-sTCP:LISTEN"])
+        .output()
+        .map_err(|error| {
+            ServiceError(format!(
+                "could not inspect the listener on port {port}: {error}"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(ServiceError(format!(
+            "could not identify the stale LoopX listener on port {port}"
+        )));
+    }
+
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let pid = line.trim().parse::<i32>().map_err(|_| {
+            ServiceError(format!(
+                "could not parse the listener process on port {port}"
+            ))
+        })?;
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    if pids.is_empty() {
+        return Err(ServiceError(format!(
+            "could not identify the stale LoopX listener on port {port}"
+        )));
+    }
+
+    pids.into_iter()
+        .map(|pid| inspect_process(pid, port))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn inspect_process(pid: i32, port: u16) -> Result<ListenerProcess, ServiceError> {
+    let output = Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .map_err(|error| {
+            ServiceError(format!(
+                "could not inspect the stale listener process on port {port}: {error}"
+            ))
+        })?;
+    let command_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || command_line.is_empty() {
+        return Err(ServiceError(format!(
+            "could not inspect the stale listener process on port {port}"
+        )));
+    }
+    Ok(ListenerProcess { pid, command_line })
+}
+
+fn verified_loopx_listener_pids(
+    kind: ServiceKind,
+    loopx_executable: &str,
+    port: u16,
+    processes: &[ListenerProcess],
+) -> Result<Vec<i32>, ServiceError> {
+    if processes.is_empty()
+        || processes.iter().any(|process| {
+            !is_expected_loopx_listener_command(kind, loopx_executable, port, &process.command_line)
+        })
+    {
+        return Err(ServiceError(format!(
+            "refusing to stop the listener on port {port} because its process is not a confirmed LoopX {} command",
+            kind.label()
+        )));
+    }
+    Ok(processes.iter().map(|process| process.pid).collect())
+}
+
+fn is_expected_loopx_listener_command(
+    kind: ServiceKind,
+    loopx_executable: &str,
+    port: u16,
+    command_line: &str,
+) -> bool {
+    let arguments = command_line.split_ascii_whitespace().collect::<Vec<_>>();
+    let is_loopx =
+        classify_loopx_process_invocation(loopx_executable, command_line, &arguments).is_some();
+    let expected_command = match kind {
+        ServiceKind::Status => "serve-status",
+        ServiceKind::Chat => "chat",
+    };
+    let has_command = arguments.contains(&expected_command);
+    let expected_port = port.to_string();
+    let has_port = arguments
+        .windows(2)
+        .any(|pair| pair[0] == "--port" && pair[1] == expected_port)
+        || arguments
+            .iter()
+            .any(|argument| *argument == format!("--port={port}"));
+    is_loopx && has_command && has_port
+}
+
+fn classify_loopx_process_invocation(
+    loopx_executable: &str,
+    command_line: &str,
+    arguments: &[&str],
+) -> Option<LoopxProcessInvocation> {
+    let interpreter_is_python = arguments
+        .first()
+        .and_then(|argument| Path::new(argument).file_name())
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.to_ascii_lowercase().starts_with("python"));
+    let executable_is_direct = arguments
+        .first()
+        .is_some_and(|argument| paths_refer_to_same_file(argument, loopx_executable))
+        || (interpreter_is_python
+            && arguments
+                .get(1)
+                .is_some_and(|argument| paths_refer_to_same_file(argument, loopx_executable)));
+    if executable_is_direct {
+        return Some(LoopxProcessInvocation::DirectExecutable);
+    }
+    if interpreter_is_python
+        && arguments
+            .windows(2)
+            .any(|pair| pair == ["-m", "loopx.cli"] || pair == ["-m", "loopx.entrypoint"])
+    {
+        return Some(LoopxProcessInvocation::PythonModule);
+    }
+
+    if interpreter_is_python
+        && arguments.contains(&"-c")
+        && is_managed_release_launcher(command_line)
+    {
+        return Some(LoopxProcessInvocation::ManagedReleaseLauncher);
+    }
+    None
+}
+
+fn is_managed_release_launcher(command_line: &str) -> bool {
+    if !command_line.contains("LOOPX_RELEASE_ROOT") {
+        return false;
+    }
+
+    // New release launchers carry an entrypoint-independent marker. Preserve
+    // both historical templates so an App installed after this fix can still
+    // replace daemons started before the marker existed.
+    command_line.contains(MANAGED_RELEASE_LAUNCHER_MARKER)
+        || command_line.contains(LEGACY_CLI_LAUNCHER_MARKER)
+        || (command_line.contains(ENTRYPOINT_LAUNCHER_MODULE_MARKER)
+            && command_line.contains(DYNAMIC_MODULE_LAUNCH_MARKER)
+            && command_line.contains(RELEASE_ARGV_ZERO_MARKER))
+}
+
+fn paths_refer_to_same_file(candidate: &str, expected: &str) -> bool {
+    candidate == expected
+        || fs::canonicalize(candidate)
+            .ok()
+            .zip(fs::canonicalize(expected).ok())
+            .is_some_and(|(candidate, expected)| candidate == expected)
+}
+
+pub(crate) fn loopx_executable() -> String {
     if let Ok(configured) = env::var("LOOPX_BIN") {
         if !configured.trim().is_empty() {
             return resolve_executable_path(&configured, env::var_os("PATH").as_deref())
@@ -250,6 +1033,13 @@ fn loopx_executable() -> String {
                 .into_owned();
         }
     }
+    discovered_loopx_executables()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "loopx".to_string())
+}
+
+pub(crate) fn discovered_loopx_executables() -> Vec<String> {
     let mut candidates = vec![
         PathBuf::from("/usr/local/bin/loopx"),
         PathBuf::from("/opt/homebrew/bin/loopx"),
@@ -257,12 +1047,493 @@ fn loopx_executable() -> String {
     if let Some(home) = env::var_os("HOME") {
         candidates.insert(0, PathBuf::from(home).join(".local/bin/loopx"));
     }
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .or_else(|| resolve_executable_path("loopx", env::var_os("PATH").as_deref()))
-        .map(|candidate| candidate.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "loopx".to_string())
+    if let Some(path) = resolve_executable_path("loopx", env::var_os("PATH").as_deref()) {
+        candidates.push(path);
+    }
+    let mut discovered = Vec::new();
+    for path in candidates.into_iter().filter(|path| path.is_file()) {
+        let executable = fs::canonicalize(&path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        if !discovered.contains(&executable) {
+            discovered.push(executable);
+        }
+    }
+    discovered
+}
+
+// Finder/launchd do not load a user's interactive shell profile. Use the same
+// bounded tool search for installation and owned services, without sourcing
+// arbitrary shell startup files or changing the parent process environment.
+pub(crate) fn configure_runtime_environment(command: &mut Command) {
+    command.env(
+        "PATH",
+        runtime_search_path(env::var_os("HOME"), env::var_os("PATH")),
+    );
+}
+
+// A desktop Chat service has its own account binding. An unrelated terminal's
+// CODEX_HOME must not pair the selected GPT model with another provider. CLI
+// launches retain their environment semantics; explicit Chat overrides win.
+fn configure_codex_chat_home(
+    command: &mut Command,
+    home: Option<std::ffi::OsString>,
+    chat_home: Option<std::ffi::OsString>,
+) {
+    if let Some(selected) = chat_home.filter(|value| !value.is_empty()) {
+        command.env("LOOPX_CHAT_CODEX_HOME", selected);
+    } else if let Some(home) = home.filter(|value| !value.is_empty()) {
+        command.env("LOOPX_CHAT_CODEX_HOME", PathBuf::from(home).join(".codex"));
+    }
+}
+
+// Alias files chain (`default` -> `lts/*` -> `lts/krypton` -> `v24.22.1`).
+// Read a bounded chain instead of running nvm, so a missing, cyclic or
+// malformed chain just falls through to installed-version discovery.
+#[cfg(unix)]
+const NVM_ALIAS_DEPTH_LIMIT: usize = 8;
+
+// `v24.22.1`, `24.22.1` and the alias targets that name them are the only
+// accepted forms; anything else is a non-version alias name to follow.
+#[cfg(unix)]
+fn nvm_version(name: &str) -> Option<(u64, u64, u64)> {
+    let trimmed = name.trim().strip_prefix('v').unwrap_or(name.trim());
+    let mut fields = trimmed.split('.');
+    let major = fields.next()?.parse().ok()?;
+    let minor = fields.next()?.parse().ok()?;
+    let patch = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some((major, minor, patch))
+}
+
+// Alias names are file names under `$NVM_DIR/alias`; keep the read inside that
+// directory instead of letting a crafted alias escape it.
+#[cfg(unix)]
+fn is_bounded_nvm_alias(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('\0')
+        && Path::new(name)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+#[cfg(unix)]
+fn resolve_nvm_alias(root: &Path, alias: &str, depth: usize) -> Option<String> {
+    if depth >= NVM_ALIAS_DEPTH_LIMIT {
+        return None;
+    }
+    let name = alias.trim();
+    if !is_bounded_nvm_alias(name) {
+        return None;
+    }
+    if let Some((major, minor, patch)) = nvm_version(name) {
+        // nvm names its version directories with the `v` prefix, whatever
+        // form the alias chain used to reach them.
+        return Some(format!("v{major}.{minor}.{patch}"));
+    }
+    let target = fs::read_to_string(root.join("alias").join(name)).ok()?;
+    resolve_nvm_alias(root, &target, depth + 1)
+}
+
+#[cfg(unix)]
+fn installed_nvm_versions(root: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(root.join("versions/node")) else {
+        return Vec::new();
+    };
+    let mut versions: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            nvm_version(&name).map(|version| (version, name))
+        })
+        .collect();
+    versions.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+    versions.into_iter().map(|(_, name)| name).collect()
+}
+
+// nvm activates a Node by prepending `$NVM_BIN` to the interactive shell
+// PATH. Finder/launchd never load that activation, so a host whose only Node
+// is nvm-managed looks Node-less to the private installer and the owned
+// services. Resolve the same bounded locations the Lark CLI resolver uses,
+// without executing nvm or sourcing any startup file.
+//
+// An activation inherited from the launching shell (`nvm use`, or a
+// terminal-launched App) is explicit intent, but only while it still matches
+// the Node that PATH selects. A shell can keep a stale `NVM_BIN` after putting
+// another Node first, and preferring the stale directory there would replace a
+// working Node with an unsupported one. A PATH that resolves no Node at all is
+// not evidence either: the variable may be residue from a launchd plist or an
+// earlier shell, and the standard Homebrew entries below may still hold a
+// supported Node. Without that agreement the directory is only a fallback,
+// ranked behind every discovered nvm location.
+#[cfg(unix)]
+fn explicit_nvm_directories(
+    nvm_bin: Option<&std::ffi::OsStr>,
+    inherited: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let Some(active) = nvm_bin.filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+    let directory = PathBuf::from(active);
+    if !nvm_bin_agrees_with_inherited_node(&directory, inherited) {
+        return Vec::new();
+    }
+    let mut directories = Vec::new();
+    push_tool_directory(&mut directories, directory);
+    directories
+}
+
+// `NVM_BIN` agrees only when the inherited PATH resolves a Node and that Node
+// is the same executable nvm activated. Both other shapes mean the variable is
+// not the shell's current choice: PATH selected a different Node, or PATH has no
+// Node at all and the value may simply be residue, which must not outrank a
+// supported Homebrew Node the same launch would otherwise find.
+#[cfg(unix)]
+fn nvm_bin_agrees_with_inherited_node(nvm_bin: &Path, inherited: Option<&std::ffi::OsStr>) -> bool {
+    match resolve_executable_path("node", inherited) {
+        Some(inherited_node) => paths_refer_to_same_file(
+            &inherited_node.to_string_lossy(),
+            &nvm_bin.join("node").to_string_lossy(),
+        ),
+        None => false,
+    }
+}
+
+// The App only ORDERS inferred nvm fallbacks; Core still performs the
+// authoritative qualification on the resolved `node`. This mirrors Core's
+// `MINIMUM_NODE_VERSION` (loopx/control_plane/runtime/node_probe.py) so an old
+// recorded `default` alias is not chosen over a newer installed version that
+// meets the supported floor.
+#[cfg(unix)]
+const MINIMUM_SUPPORTED_NODE: (u64, u64, u64) = (22, 22, 3);
+
+// `.../versions/node/<version>/bin` -> `<version>` as a comparable tuple.
+#[cfg(unix)]
+fn nvm_directory_version(directory: &Path) -> Option<(u64, u64, u64)> {
+    let version_dir = directory.parent()?.file_name()?;
+    nvm_version(&version_dir.to_string_lossy())
+}
+
+// nvm candidates for a host whose only Node is nvm-managed. Ordered so a
+// qualified Node is never hidden behind an old recorded `default`: the default
+// alias leads only while it meets the supported floor, otherwise the newest
+// installed version that does is promoted ahead of it (and ahead of any newer
+// aliases that still would not qualify). Everything stays behind the known
+// runtimes and the inherited PATH, so an inferred candidate never displaces a
+// Node the host already provides. A demoted `NVM_BIN` ranks last: it is an
+// explicit location the host no longer selects, so a discovered version must
+// win before it.
+#[cfg(unix)]
+fn discovered_nvm_directories(nvm_root: &Path, demoted_nvm_bin: Option<&Path>) -> Vec<PathBuf> {
+    // Installed versions newest-first; the recorded default is normally one of
+    // these, so it keeps its version position rather than being forced ahead.
+    let mut directories = Vec::new();
+    for version in installed_nvm_versions(nvm_root) {
+        push_tool_directory(
+            &mut directories,
+            nvm_root.join("versions/node").join(version).join("bin"),
+        );
+    }
+    let default_dir = resolve_nvm_alias(nvm_root, "default", 0)
+        .map(|version| nvm_root.join("versions/node").join(version).join("bin"));
+    if let Some(directory) = &default_dir {
+        push_tool_directory(&mut directories, directory.clone());
+    }
+    // Prefer the recorded default while it meets the floor; otherwise lead with
+    // the newest version that does, so an old default never hides a supported
+    // one from Core's qualification.
+    let qualifies = |directory: &Path| {
+        nvm_directory_version(directory).is_some_and(|version| version >= MINIMUM_SUPPORTED_NODE)
+    };
+    let lead = default_dir
+        .as_ref()
+        .filter(|directory| qualifies(directory))
+        .or_else(|| directories.iter().find(|directory| qualifies(directory)))
+        .cloned();
+    if let Some(lead) = lead {
+        if let Some(index) = directories.iter().position(|directory| directory == &lead) {
+            let lead = directories.remove(index);
+            directories.insert(0, lead);
+        }
+    }
+    if let Some(demoted) = demoted_nvm_bin {
+        push_tool_directory(&mut directories, demoted.to_path_buf());
+    }
+    directories
+}
+
+#[cfg(unix)]
+fn push_tool_directory(directories: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if candidate.is_dir() && !directories.contains(&candidate) {
+        directories.push(candidate);
+    }
+}
+
+// One tool search, one copy of each directory: a candidate discovered twice
+// (an activated version that is also the recorded default, or an inherited
+// entry this App also adds) must not appear twice in the search path.
+fn extend_unique(paths: &mut Vec<PathBuf>, candidates: impl IntoIterator<Item = PathBuf>) {
+    for candidate in candidates {
+        if !paths.contains(&candidate) {
+            paths.push(candidate);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn nvm_root(home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if let Some(configured) = env::var_os("NVM_DIR").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(configured));
+    }
+    home.map(|home| PathBuf::from(home).join(".nvm"))
+}
+
+fn runtime_search_path(
+    home: Option<std::ffi::OsString>,
+    inherited: Option<std::ffi::OsString>,
+) -> std::ffi::OsString {
+    #[cfg(unix)]
+    let nvm_root = nvm_root(home.as_deref());
+    #[cfg(unix)]
+    let nvm_bin = env::var_os("NVM_BIN").filter(|value| !value.is_empty());
+    runtime_search_path_from(
+        home,
+        inherited,
+        #[cfg(unix)]
+        nvm_root.as_deref(),
+        #[cfg(unix)]
+        nvm_bin.as_deref(),
+    )
+}
+
+// The nvm inputs are parameters so a test can pin them without mutating the
+// process environment that parallel tests read.
+fn runtime_search_path_from(
+    home: Option<std::ffi::OsString>,
+    inherited: Option<std::ffi::OsString>,
+    #[cfg(unix)] nvm_root: Option<&Path>,
+    #[cfg(unix)] nvm_bin: Option<&std::ffi::OsStr>,
+) -> std::ffi::OsString {
+    let mut paths = Vec::new();
+    if let Some(ref home) = home {
+        paths.push(PathBuf::from(home).join(".local/bin"));
+    }
+    // An activation the launching shell exported keeps the precedence the
+    // inherited PATH already gave it, but only while it still agrees with the
+    // Node that PATH selects.
+    #[cfg(unix)]
+    let explicit_nvm_bin = nvm_bin.and_then(|nvm_bin| {
+        explicit_nvm_directories(Some(nvm_bin), inherited.as_deref())
+            .into_iter()
+            .next()
+    });
+    #[cfg(unix)]
+    if let Some(nvm_bin) = explicit_nvm_bin.as_deref() {
+        extend_unique(&mut paths, [nvm_bin.to_path_buf()]);
+    }
+    if cfg!(target_os = "macos") {
+        extend_unique(
+            &mut paths,
+            [
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/local/bin"),
+                // Homebrew's supported LTS Node formulae are keg-only. Finder
+                // does not inherit the shell PATH that activates those runtimes.
+                // Use the same bounded search for the private installer and the
+                // services it starts; Core still qualifies the actual version.
+                PathBuf::from("/opt/homebrew/opt/node@24/bin"),
+                PathBuf::from("/usr/local/opt/node@24/bin"),
+                PathBuf::from("/opt/homebrew/opt/node@22/bin"),
+                PathBuf::from("/usr/local/opt/node@22/bin"),
+            ],
+        );
+    }
+    // A `NVM_BIN` the host no longer selects is demoted to the last resort,
+    // behind the discovered versions so a newer install still wins over it.
+    #[cfg(unix)]
+    let demoted_nvm_bin = nvm_bin
+        .filter(|nvm_bin| explicit_nvm_bin.as_deref() != Some(Path::new(nvm_bin)))
+        .map(PathBuf::from);
+    #[cfg(unix)]
+    let discovered = match nvm_root {
+        Some(nvm_root) => discovered_nvm_directories(nvm_root, demoted_nvm_bin.as_deref()),
+        // Without an nvm root to enumerate, the demoted directory is still the
+        // last-resort candidate rather than being dropped from the search.
+        None => demoted_nvm_bin.iter().cloned().collect(),
+    };
+    extend_unique(
+        &mut paths,
+        inherited
+            .as_deref()
+            .map(env::split_paths)
+            .into_iter()
+            .flatten(),
+    );
+    // Inferred nvm locations are the last resort: they extend the search for a
+    // host that has no other Node, and never displace one that already exists.
+    #[cfg(unix)]
+    extend_unique(&mut paths, discovered);
+    env::join_paths(paths).unwrap_or_else(|_| inherited.unwrap_or_default())
+}
+
+/// Resolve `python3` inside the same bounded tool search the installer and
+/// owned services use, and ask it for its version. Returns
+/// (found, version): `found` is filesystem-level resolution only, so a
+/// Command Line Tools stub that never finishes still reports found with no
+/// version — exactly the state `install-local.sh` rejects. The version probe
+/// is bounded so the status polling path cannot hang on it.
+pub(crate) fn python3_environment() -> (bool, Option<String>) {
+    let search_path = runtime_search_path(env::var_os("HOME"), env::var_os("PATH"));
+    let resolved = resolve_executable_path("python3", Some(search_path.as_os_str()));
+    let found = resolved.is_some();
+    let version = resolved.and_then(|python| {
+        let mut probe = Command::new(python);
+        probe.arg("--version");
+        timed_output(probe)
+            .filter(|output| output.status.success())
+            .and_then(|output| parse_python_version(&output))
+    });
+    (found, version)
+}
+
+pub(crate) fn node_environment() -> (bool, Option<String>) {
+    let path = runtime_search_path(env::var_os("HOME"), env::var_os("PATH"));
+    let executable = resolve_executable_path("node", Some(path.as_os_str()));
+    let found = executable.is_some();
+    let version = executable.and_then(|node| {
+        let mut probe = Command::new(node);
+        probe.arg("--version");
+        timed_output(probe)
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                let text = std::str::from_utf8(&output.stdout)
+                    .ok()?
+                    .trim()
+                    .strip_prefix('v')?;
+                let fields: Vec<_> = text.split('.').collect();
+                (fields.len() == 3
+                    && fields.iter().all(|field| {
+                        !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit())
+                    }))
+                .then(|| text.to_owned())
+            })
+    });
+    (found, version)
+}
+
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+// Installation qualification boots Core, checks the TypeScript runtime and
+// hashes the installed package. It is not a version-banner query: a valid cold
+// wheel can exceed one second. Keep that work bounded without weakening Core's
+// qualification or extending the lightweight environment probes.
+const INSTALLATION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) fn timed_output(command: Command) -> Option<std::process::Output> {
+    timed_output_with_timeout(command, VERSION_PROBE_TIMEOUT)
+}
+
+pub(crate) fn timed_output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.group_spawn().ok()?;
+    let mut stdout_pipe = child.inner().stdout.take();
+    let mut stderr_pipe = child.inner().stderr.take();
+
+    let stdout_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut stream) = stdout_pipe {
+            let _ = stream.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let stderr_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut stream) = stderr_pipe {
+            let _ = stream.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let started = Instant::now();
+    let poll_interval = Duration::from_millis(20);
+
+    let mut child_status: Option<std::process::ExitStatus> = None;
+
+    loop {
+        if child_status.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    child_status = Some(status);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return None;
+                }
+            }
+        }
+
+        if let Some(status) = child_status {
+            if stdout_reader.is_finished() && stderr_reader.is_finished() {
+                let stdout = stdout_reader.join().unwrap_or_default();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                return Some(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return None;
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+        thread::sleep(poll_interval.min(remaining));
+    }
+}
+
+// `python3 --version` prints `Python 3.11.9`; accept the version on either
+// stream (some wrappers print to stderr) and keep only a strict
+// major.minor.patch prefix so odd output never enters diagnostics.
+fn parse_python_version(output: &std::process::Output) -> Option<String> {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_python_banner(&text)
+}
+
+fn parse_python_banner(text: &str) -> Option<String> {
+    let version = text.trim().strip_prefix("Python ")?;
+    let mut digits_or_dots = String::new();
+    for character in version.chars() {
+        if character.is_ascii_digit() || character == '.' {
+            digits_or_dots.push(character);
+        } else {
+            break;
+        }
+    }
+    let parts: Vec<&str> = digits_or_dots.split('.').collect();
+    if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    Some(digits_or_dots)
 }
 
 fn resolve_executable_path(executable: &str, search_path: Option<&OsStr>) -> Option<PathBuf> {
@@ -289,22 +1560,7 @@ fn resolve_executable_path(executable: &str, search_path: Option<&OsStr>) -> Opt
     None
 }
 
-fn runtime_identity_from_manifest(manifest: &serde_json::Value) -> Option<serde_json::Value> {
-    let release_id = manifest.get("release_id")?.as_str()?;
-    let package_version = manifest.get("package")?.get("version")?.as_str()?;
-    let source_revision = manifest
-        .get("source")
-        .and_then(|source| source.get("git_commit"))
-        .and_then(serde_json::Value::as_str);
-    Some(serde_json::json!({
-        "schema_version": "loopx_runtime_identity_v1",
-        "package_version": package_version,
-        "release_id": release_id,
-        "source_revision": source_revision,
-    }))
-}
-
-fn runtime_identity_for_executable(executable: &str) -> Option<serde_json::Value> {
+pub(crate) fn runtime_identity_for_executable(executable: &str) -> Option<serde_json::Value> {
     runtime_identity_for_executable_with_path(executable, env::var_os("PATH").as_deref())
 }
 
@@ -314,38 +1570,145 @@ fn runtime_identity_for_executable_with_path(
 ) -> Option<serde_json::Value> {
     let resolved = resolve_executable_path(executable, search_path)?;
     let canonical = fs::canonicalize(resolved).ok()?;
-    let release_root = canonical.parent()?.parent()?;
-    let manifest = fs::read_to_string(Path::new(release_root).join("release.json")).ok()?;
-    let payload = serde_json::from_str::<serde_json::Value>(&manifest).ok()?;
-    runtime_identity_from_manifest(&payload)
+    // Core owns package qualification and hashing. Do not recreate RECORD,
+    // editable-install or byte-fingerprint rules inside the native shell.
+    // A surviving release manifest cannot prove its executable still works.
+    let mut command = Command::new(canonical);
+    configure_runtime_environment(&mut command);
+    command.args(["--format", "json", "doctor", "--installation-only"]);
+    let output = timed_output_with_timeout(command, INSTALLATION_PROBE_TIMEOUT)?;
+    if !output.status.success() {
+        return None;
+    }
+    let payload = serde_json::from_slice(&output.stdout).ok()?;
+    identity_from_installation_doctor(&payload)
+}
+
+fn identity_from_installation_doctor(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    if payload["ok"] != true || payload["scope"] != "installation_only" {
+        return None;
+    }
+    let identity = payload.get("service_runtime_identity")?;
+    let release = identity["release_id"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty());
+    if identity["schema_version"] != "loopx_runtime_identity_v1"
+        || !identity["package_version"].is_string()
+        || !(release || is_owned_package_identity(identity))
+    {
+        return None;
+    }
+    // This shape is shared with the HTTP startup fence, not source attestation.
+    let mut observed = serde_json::json!({
+        "schema_version": identity["schema_version"],
+        "package_version": identity["package_version"],
+        "release_id": identity["release_id"],
+        "source_revision": identity["source_revision"],
+    });
+    if !release {
+        observed["package_fingerprint"] = identity["package_fingerprint"].clone();
+    }
+    Some(observed)
+}
+
+pub(crate) fn is_owned_package_identity(identity: &serde_json::Value) -> bool {
+    identity["release_id"].is_null()
+        && identity["package_fingerprint"]
+            .as_str()
+            .and_then(|value| value.strip_prefix("sha256:"))
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+}
+
+fn status_readiness_error(kind: ServiceKind) -> ServiceError {
+    ServiceError(format!(
+        "LoopX {} is responding on port {} but its registry is invalid or unreadable; repair the registry configuration and retry",
+        kind.label(),
+        kind.port()
+    ))
 }
 
 fn probe(kind: ServiceKind, expected_runtime_identity: Option<&serde_json::Value>) -> Probe {
-    let address = SocketAddr::from(([127, 0, 0, 1], kind.port()));
-    let mut stream = match TcpStream::connect_timeout(&address, PROBE_TIMEOUT) {
-        Ok(stream) => stream,
-        Err(_) => return Probe::Unavailable,
+    probe_on_port(kind, kind.port(), expected_runtime_identity)
+}
+
+fn probe_on_port(
+    kind: ServiceKind,
+    port: u16,
+    expected_runtime_identity: Option<&serde_json::Value>,
+) -> Probe {
+    // This budget covers the whole observation, including any legacy request.
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut response = match read_probe_response(port, kind.probe_path(), deadline) {
+        Ok(response) => response,
+        Err(probe) => return probe,
     };
-    let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(PROBE_TIMEOUT));
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
-        kind.probe_path(),
-        kind.port()
-    );
-    if stream.write_all(request.as_bytes()).is_err() {
-        return Probe::Foreign;
-    }
-    let mut response = String::new();
-    if stream
-        .take(MAX_PROBE_RESPONSE_BYTES + 1)
-        .read_to_string(&mut response)
-        .is_err()
-        || response.len() as u64 > MAX_PROBE_RESPONSE_BYTES
+    if kind == ServiceKind::Chat
+        && response
+            .lines()
+            .next()
+            .and_then(|line| line.split_ascii_whitespace().nth(1))
+            == Some("404")
     {
-        return Probe::Foreign;
+        // A legacy Core has no lightweight endpoint. Keep its original
+        // fingerprint/identity checks; new services never enumerate metadata.
+        response = match read_probe_response(port, "/api/chat/capabilities", deadline) {
+            Ok(response) => response,
+            Err(probe) => return probe,
+        };
     }
     classify_response(kind, &response, expected_runtime_identity)
+}
+
+fn probe_time_left(deadline: Instant) -> Result<Duration, Probe> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(Probe::Unresponsive);
+    }
+    Ok(remaining)
+}
+
+fn read_probe_response(port: u16, path: &str, deadline: Instant) -> Result<String, Probe> {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, probe_time_left(deadline)?)
+        .map_err(|_| Probe::Unavailable)?;
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        path, port
+    );
+    let mut unsent = request.as_bytes();
+    while !unsent.is_empty() {
+        stream
+            .set_write_timeout(Some(probe_time_left(deadline)?))
+            .map_err(|_| Probe::Unresponsive)?;
+        match stream.write(unsent) {
+            Ok(0) => return Err(Probe::Unresponsive),
+            Ok(written) => unsent = &unsent[written..],
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(Probe::Unresponsive),
+        }
+    }
+    let mut reader = stream.take(MAX_PROBE_RESPONSE_BYTES + 1);
+    let mut response = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        reader
+            .get_ref()
+            .set_read_timeout(Some(probe_time_left(deadline)?))
+            .map_err(|_| Probe::Unresponsive)?;
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(Probe::Unresponsive),
+        }
+        if response.len() as u64 > MAX_PROBE_RESPONSE_BYTES {
+            return Err(Probe::Foreign);
+        }
+    }
+    probe_time_left(deadline)?;
+    String::from_utf8(response).map_err(|_| Probe::Unresponsive)
 }
 
 fn classify_response(
@@ -369,6 +1732,18 @@ fn classify_response(
     let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
         return Probe::Foreign;
     };
+    if kind == ServiceKind::Chat && payload["schema_version"] == "loopx_chat_readiness_v1" {
+        if payload["ok"] != true || payload["state"] != "ready" {
+            return Probe::Foreign;
+        }
+        return if expected_runtime_identity
+            .is_some_and(|expected| payload.get("runtime_identity") != Some(expected))
+        {
+            Probe::Stale
+        } else {
+            Probe::Matching
+        };
+    }
     let (field, expected) = kind.expected_fingerprint();
     if payload
         .as_object()
@@ -381,6 +1756,32 @@ fn classify_response(
                 return Probe::Stale;
             }
         }
+        if kind == ServiceKind::Status {
+            if let Some(readiness) = payload.get("readiness") {
+                if readiness
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("loopx_status_readiness_v0")
+                {
+                    return Probe::Foreign;
+                }
+                return match (
+                    readiness.get("state").and_then(serde_json::Value::as_str),
+                    readiness.get("reason").and_then(serde_json::Value::as_str),
+                ) {
+                    (Some("ready"), Some("registry_readable")) => Probe::Matching,
+                    (Some("failed"), Some("registry_invalid" | "registry_unavailable")) => {
+                        Probe::NotReady
+                    }
+                    _ => Probe::Foreign,
+                };
+            }
+            // Legacy status servers ignore the query and retain the existing
+            // release-fingerprint check. An advertised contract cannot vanish.
+            if payload.get("readiness_url").is_some() {
+                return Probe::Foreign;
+            }
+        }
         return Probe::Matching;
     }
     Probe::Foreign
@@ -389,6 +1790,103 @@ fn classify_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_chat_account_default_and_explicit_override_are_independent_of_caller_home() {
+        let user_home = PathBuf::from("synthetic-user-home");
+        for chat_home in [None, Some(std::ffi::OsString::new())] {
+            let mut command = Command::new("synthetic-loopx");
+            command.env("CODEX_HOME", "different-provider-home");
+            configure_codex_chat_home(&mut command, Some(user_home.clone().into()), chat_home);
+            assert!(command
+                .get_envs()
+                .any(|(key, value)| key == "LOOPX_CHAT_CODEX_HOME"
+                    && value == Some(user_home.join(".codex").as_os_str())));
+            assert!(command.get_envs().any(|(key, value)| key == "CODEX_HOME"
+                && value == Some(std::ffi::OsStr::new("different-provider-home"))));
+        }
+        let mut command = Command::new("synthetic-loopx");
+        configure_codex_chat_home(
+            &mut command,
+            Some(user_home.into()),
+            Some("selected-chat-home".into()),
+        );
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "LOOPX_CHAT_CODEX_HOME"
+                && value == Some(std::ffi::OsStr::new("selected-chat-home"))));
+        let mut command = Command::new("synthetic-loopx");
+        configure_codex_chat_home(&mut command, None, None);
+        assert_eq!(command.get_envs().count(), 0);
+    }
+    #[test]
+    fn package_identity_requires_core_installation_qualification() {
+        let identity = serde_json::json!({"schema_version":"loopx_runtime_identity_v1",
+            "package_version":"1.2.4", "release_id":null, "source_revision":null,
+            "package_fingerprint":format!("sha256:{}", "a".repeat(64)), "path":"PRIVATE"});
+        let qualified = serde_json::json!({"ok":true,"scope":"installation_only","service_runtime_identity":identity});
+        let observed = identity_from_installation_doctor(&qualified).unwrap();
+        assert!(is_owned_package_identity(&observed));
+        assert!(observed.get("path").is_none());
+        let mut rejected = qualified.clone();
+        rejected["ok"] = serde_json::json!(false);
+        assert!(identity_from_installation_doctor(&rejected).is_none());
+        rejected = qualified.clone();
+        rejected["scope"] = serde_json::json!("global");
+        assert!(identity_from_installation_doctor(&rejected).is_none());
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("sha256:not-a-digest"),
+        ] {
+            rejected = qualified.clone();
+            rejected["service_runtime_identity"]["package_fingerprint"] = value;
+            assert!(identity_from_installation_doctor(&rejected).is_none());
+        }
+    }
+
+    #[test]
+    fn same_version_package_replacement_cannot_reuse_old_http_services() {
+        let installed = serde_json::json!({"schema_version":"loopx_runtime_identity_v1",
+            "package_version":"1.2.4", "release_id":null, "source_revision":null,
+            "package_fingerprint":format!("sha256:{}", "a".repeat(64))});
+        let mut running = installed.clone();
+        running["package_fingerprint"] = serde_json::json!(format!("sha256:{}", "b".repeat(64)));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\r\n{}",
+            serde_json::json!({
+            "schema_version":"loopx_chat_capabilities_v1", "runtime_identity":running})
+        );
+        assert_eq!(
+            classify_response(ServiceKind::Chat, &response, Some(&installed)),
+            Probe::Stale
+        );
+    }
+
+    #[test]
+    fn private_endpoint_never_adopts_or_stops_an_existing_listener() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut owned = None;
+        let runtime = SelectedRuntime {
+            executable: "not-used-for-an-occupied-endpoint".into(),
+            identity: None,
+        };
+        let error =
+            connect_owned_service(ServiceKind::Chat, port, &runtime, &mut owned).unwrap_err();
+        assert!(error.to_string().contains("already occupied"));
+        assert!(owned.is_none());
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+    }
+
+    #[test]
+    fn private_commands_use_the_window_endpoint_and_keep_loopback_scope() {
+        for kind in SERVICE_KINDS {
+            let args = kind.command_args_on_port(49123);
+            assert!(args.windows(2).any(|pair| pair == ["--port", "49123"]));
+            assert!(args.windows(2).any(|pair| pair == ["--host", "127.0.0.1"]));
+            assert!(args.iter().any(|arg| arg == "--global-registry"));
+        }
+    }
 
     #[test]
     fn service_commands_stay_loopback_and_global() {
@@ -512,22 +2010,83 @@ mod tests {
     }
 
     #[test]
-    fn manifest_runtime_identity_is_public_and_exact() {
-        let manifest = serde_json::json!({
-            "release_id": "20260821T164921Z",
-            "package": {"version": "0.5.1"},
-            "source": {"git_commit": "62647e2e299d"},
-        });
-
+    fn python_version_parsing_accepts_strict_triplets_only() {
         assert_eq!(
-            runtime_identity_from_manifest(&manifest),
-            Some(serde_json::json!({
+            parse_python_banner("Python 3.13.5\n"),
+            Some("3.13.5".to_string())
+        );
+        // Some wrappers and old interpreters print the banner to stderr; the
+        // Output-level wrapper reads both streams through this parser.
+        assert_eq!(
+            parse_python_banner("Python 3.9.6\n"),
+            Some("3.9.6".to_string())
+        );
+        // A trailing pre-release tag is truncated to its release triplet.
+        assert_eq!(
+            parse_python_banner("Python 3.11.0b4\n"),
+            Some("3.11.0".to_string())
+        );
+        // Stub chatter, missing prefixes and partial triplets never enter
+        // diagnostics as a version.
+        assert_eq!(
+            parse_python_banner("xcode-select: note: install requested"),
+            None
+        );
+        assert_eq!(parse_python_banner("Python 3"), None);
+        assert_eq!(parse_python_banner("Python 3.11"), None);
+        assert_eq!(parse_python_banner(""), None);
+    }
+
+    #[test]
+    fn qualified_release_identity_is_public_and_exact() {
+        let identity = serde_json::json!({
                 "schema_version": "loopx_runtime_identity_v1",
                 "package_version": "0.5.1",
                 "release_id": "20260821T164921Z",
                 "source_revision": "62647e2e299d",
-            }))
-        );
+                "path": "PRIVATE",
+        });
+        let qualified = serde_json::json!({"ok":true,"scope":"installation_only",
+            "service_runtime_identity":identity});
+        let observed = identity_from_installation_doctor(&qualified).unwrap();
+        assert_eq!(observed["release_id"], identity["release_id"]);
+        assert_eq!(observed["source_revision"], identity["source_revision"]);
+        assert_eq!(observed.as_object().unwrap().len(), 4);
+        assert!(observed.get("path").is_none());
+        let mut rejected = qualified.clone();
+        rejected["ok"] = serde_json::json!(false);
+        assert!(identity_from_installation_doctor(&rejected).is_none());
+        rejected = qualified.clone();
+        rejected["service_runtime_identity"]["release_id"] = serde_json::json!("");
+        assert!(identity_from_installation_doctor(&rejected).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn release_metadata_cannot_qualify_a_broken_or_unready_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let scripts = root.path().join("scripts");
+        fs::create_dir(&scripts).unwrap();
+        let executable = scripts.join("loopx");
+        fs::write(
+            root.path().join("release.json"),
+            r#"{"release_id":"cached-release","package":{"version":"99.0.0"},"source":{"git_commit":"cached-revision"}}"#,
+        )
+        .unwrap();
+        for response in [
+            "exit 1",
+            "printf 'not JSON'",
+            "printf '%s' '{\"ok\":false,\"scope\":\"installation_only\"}'",
+        ] {
+            fs::write(&executable, format!("#!/bin/sh\n{response}\n")).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                runtime_identity_for_executable_with_path("loopx", Some(scripts.as_os_str()))
+                    .is_none(),
+                "a cached manifest must not override failed executable qualification: {response}"
+            );
+        }
     }
 
     #[test]
@@ -550,18 +2109,171 @@ mod tests {
         )
         .expect("fixture release manifest");
 
+        assert_eq!(
+            resolve_executable_path("loopx", Some(scripts_dir.as_os_str())),
+            Some(scripts_dir.join(executable_name))
+        );
+        // A path and manifest still do not make this non-executable fixture usable.
         let identity =
             runtime_identity_for_executable_with_path("loopx", Some(scripts_dir.as_os_str()));
         fs::remove_dir_all(&release_root).expect("remove runtime identity fixture");
 
-        assert_eq!(
-            identity,
-            Some(serde_json::json!({
-                "schema_version": "loopx_runtime_identity_v1",
-                "package_version": "0.5.1",
-                "release_id": "path-release",
-                "source_revision": "path-revision",
-            }))
+        assert!(identity.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn timed_output_terminates_and_reaps_child_process_on_timeout() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp_dir.path().join("helper.pid");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            &format!("echo $$ > \"{}\" && exec sleep 30", pid_path.display()),
+        ]);
+
+        let start = Instant::now();
+        let output = timed_output_with_timeout(cmd, Duration::from_millis(500));
+        let elapsed = start.elapsed();
+
+        assert!(output.is_none(), "timed_output must return None on timeout");
+        assert!(
+            elapsed >= Duration::from_millis(450) && elapsed < Duration::from_secs(5),
+            "timed_output must bound execution to around timeout (took {elapsed:?})"
+        );
+
+        let pid_str = fs::read_to_string(&pid_path).expect("read pidfile");
+        let pid: u32 = pid_str.trim().parse().expect("parse pid");
+
+        let check_status = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill -0");
+        assert!(
+            !check_status.success(),
+            "child process {pid} must be terminated and reaped, but kill -0 succeeded"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn timed_output_consecutive_refreshes_do_not_accumulate_workers() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut pids = Vec::new();
+
+        for i in 0..3 {
+            let pid_path = temp_dir.path().join(format!("helper_{i}.pid"));
+            let mut cmd = Command::new("sh");
+            cmd.args([
+                "-c",
+                &format!("echo $$ > \"{}\" && exec sleep 30", pid_path.display()),
+            ]);
+
+            let start = Instant::now();
+            let output = timed_output_with_timeout(cmd, Duration::from_millis(300));
+            let elapsed = start.elapsed();
+
+            assert!(
+                output.is_none(),
+                "probe iteration {i} must return None on timeout"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(3),
+                "probe iteration {i} must finish near timeout (took {elapsed:?})"
+            );
+
+            let pid_str = fs::read_to_string(&pid_path).expect("read pidfile");
+            let pid: u32 = pid_str.trim().parse().expect("parse pid");
+            pids.push(pid);
+        }
+
+        for pid in pids {
+            let check_status = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .expect("kill -0");
+            assert!(
+                !check_status.success(),
+                "accumulated worker candidate {pid} was not terminated/reaped"
+            );
+        }
+    }
+
+    #[test]
+    fn timed_output_large_output_does_not_deadlock() {
+        let mut cmd = Command::new("python3");
+        cmd.args(["-c", "import sys; sys.stdout.write('X' * 262144)"]);
+
+        let start = Instant::now();
+        let output = timed_output_with_timeout(cmd, Duration::from_secs(5));
+        let elapsed = start.elapsed();
+
+        assert!(
+            output.is_some(),
+            "timed_output must not deadlock on large output buffer"
+        );
+        let out = output.unwrap();
+        assert!(out.status.success(), "command must succeed");
+        assert_eq!(out.stdout.len(), 262144);
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "command completed in reasonable time without blocking (took {elapsed:?})"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn timed_output_descendant_inheriting_pipes_terminates_near_deadline() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp_dir.path().join("descendant.pid");
+        let mut cmd = Command::new("sh");
+        // Direct child `sh` exits immediately after launching background descendant `sleep 30`.
+        // The background descendant inherits the stdout/stderr pipe handles without exec.
+        cmd.args([
+            "-c",
+            &format!("(sleep 30 & echo $! > \"{}\")", pid_path.display()),
+        ]);
+
+        let start = Instant::now();
+        let output = timed_output_with_timeout(cmd, Duration::from_millis(300));
+        let elapsed = start.elapsed();
+
+        assert!(output.is_none(), "timed_output must return None on timeout");
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(2),
+            "timed_output must bound execution to around timeout (took {elapsed:?})"
+        );
+
+        let pid_str = fs::read_to_string(&pid_path).expect("read pidfile");
+        let pid: u32 = pid_str.trim().parse().expect("parse pid");
+
+        let mut descendant_alive = true;
+        for _ in 0..20 {
+            let check_status = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .expect("kill -0");
+            if !check_status.success() {
+                descendant_alive = false;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            !descendant_alive,
+            "descendant process {pid} inheriting pipes must be terminated, but kill -0 succeeded"
         );
     }
 }
+
+#[cfg(test)]
+#[path = "services_tests.rs"]
+mod supervisor_tests;
+
+#[cfg(all(test, unix))]
+#[path = "services_real_runtime_tests.rs"]
+mod real_runtime_tests;

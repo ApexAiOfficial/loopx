@@ -6,25 +6,26 @@ import shlex
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 from ...heartbeat_prompt import build_heartbeat_prompt
-from ..quota.turn_envelope import quota_action_signature_document
-from .doubao_model_behavior_actor import (
-    ARK_API_KEY_ENV,
-    DOUBAO_2_1_PRO_MODEL,
-    DOUBAO_MODEL_ENV,
-    DoubaoActorTransport,
-    _direct_ark_transport,
-)
 from .model_tool_behavior import (
-    DoubaoExecToolClient,
+    DoubaoExecToolBehaviorActorBase,
+    QuotaToolContext,
+    QUOTA_FIRST_TOOL_INSTRUCTION,
+    append_exec_tool_exchange,
     argument_value,
+    build_qualification_receipt,
     digest_text,
+    execute_bounded_read_steps,
     execute_loopx_cli,
+    extract_quota_action_contract_base,
+    hermetic_clock_output,
+    is_context_read_command,
+    is_fixture_quota_guard,
     loopx_command_tokens,
+    qualification_turn_instance_id,
 )
 
 SELECTED_TODO_TOOL_BEHAVIOR_RECEIPT_SCHEMA_VERSION = (
@@ -35,11 +36,17 @@ SELECTED_TODO_TOOL_BEHAVIOR_MAX_CALLS = 6
 SELECTED_TODO_TOOL_FIXTURE_GOAL_ID = "portfolio-goal"
 SELECTED_TODO_TOOL_FIXTURE_AGENT_ID = "codex-portfolio"
 SELECTED_TODO_TOOL_FIXTURE_TODO_ID = "todo_portfolio001"
+STALE_DONE_PRIMARY_TODO_ID = "todo_portfolio_stale001"
 _SELECTED_TARGET = "fixture/selected-lane.json"
 _DECOY_TARGET = "fixture/deferred-lane.json"
 SELECTED_TODO_TOOL_FIXTURE_ACTION_TEXT = (
     f"Read only `{_SELECTED_TARGET}`; use its self-contained JSON to verify "
     "the selected lane contract."
+)
+STALE_DONE_PRIMARY_ACTION_TEXT = (
+    "Do not repeat the legacy primary slice: its delivery and validation are "
+    "already complete, but this Todo is intentionally still open to model "
+    "stale-control-plane drift. Choose the visible successor instead."
 )
 _READ_ONLY_PREFLIGHT_COMMANDS = {
     "pwd",
@@ -75,6 +82,8 @@ def _build_fixture(
     root: Path,
     *,
     prior_in_flight_progress: bool = False,
+    unsuggested_selected_todo: bool = False,
+    stale_done_primary_successor: bool = False,
 ) -> _SelectedTodoToolFixture:
     source_root = Path(__file__).resolve().parents[3]
     project_root = root / "project"
@@ -124,22 +133,38 @@ def _build_fixture(
         cwd=project_root,
         check=True,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=10,
     )
-    next_action = (
+    decoy_action = (
+        STALE_DONE_PRIMARY_ACTION_TEXT
+        if stale_done_primary_successor
+        else
         f"Read only `{_DECOY_TARGET}`; start the newly queued sibling lane."
+    )
+    next_action = (
+        decoy_action
         if prior_in_flight_progress
+        or unsuggested_selected_todo
+        or stale_done_primary_successor
         else SELECTED_TODO_TOOL_FIXTURE_ACTION_TEXT
     )
+    decoy_count = 3 if unsuggested_selected_todo else 1 if prior_in_flight_progress else 0
     decoy_todo = (
-        f"- [ ] [P1] {next_action}\n"
+        f"- [ ] [P1] {STALE_DONE_PRIMARY_ACTION_TEXT}\n"
         "  <!-- loopx:todo "
-        "todo_id=todo_portfolio_decoy001 status=open "
-        "task_class=advancement_task action_kind=inspect_deferred_contract "
+        f"todo_id={STALE_DONE_PRIMARY_TODO_ID} status=open "
+        "task_class=advancement_task action_kind=legacy_slice_already_complete "
         f"claimed_by={SELECTED_TODO_TOOL_FIXTURE_AGENT_ID} priority=P1 -->\n"
-        if prior_in_flight_progress
-        else ""
+        if stale_done_primary_successor
+        else "".join(
+            f"- [ ] [P1] {decoy_action} Candidate {index}.\n"
+            "  <!-- loopx:todo "
+            f"todo_id=todo_portfolio_decoy00{index} status=open "
+            "task_class=advancement_task action_kind=inspect_deferred_contract "
+            f"claimed_by={SELECTED_TODO_TOOL_FIXTURE_AGENT_ID} priority=P1 -->\n"
+            for index in range(1, decoy_count + 1)
+        )
     )
     state_path.write_text(
         "---\n"
@@ -195,6 +220,12 @@ def _build_fixture(
         registry_path.parent.mkdir(parents=True, exist_ok=True)
         registry_path.write_text(registry_text + "\n", encoding="utf-8")
 
+    from .canary_harness import import_fixture_authority
+
+    import_fixture_authority(
+        global_registry_path, SELECTED_TODO_TOOL_FIXTURE_GOAL_ID, provider="sqlite",
+    )
+
     if prior_in_flight_progress:
         run = {
             "generated_at": "2026-08-12T00:01:00+00:00",
@@ -235,6 +266,7 @@ def _build_fixture(
         registered_agents=[SELECTED_TODO_TOOL_FIXTURE_AGENT_ID],
         available_capabilities=["shell", "filesystem_read"],
         runtime_profile="codex_app_heartbeat",
+        registry_path=os.path.relpath(global_registry_path, project_root),
     )
     quota_guard_command = str(prompt["quota_guard_command"])
     if quota_guard_command not in str(prompt["task_body"]):
@@ -251,39 +283,34 @@ def _build_fixture(
 
 
 def _clock_output(command: str) -> str | None:
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return None
-    if not tokens or Path(tokens[0]).name != "date" or len(tokens) > 4:
-        return None
-    if any(
-        token in {";", "&&", "||", "|"}
-        or (index > 0 and not token.startswith(("-", "+")))
-        for index, token in enumerate(tokens)
-    ):
-        return None
-    if "-u" in tokens or "--utc" in tokens:
-        return "2026-08-11T16:00:00Z\n"
-    return "2026-08-12T00:00:00+08:00\n"
+    return hermetic_clock_output(
+        command,
+        utc_output="2026-08-11T16:00:00Z\n",
+        local_output="2026-08-12T00:00:00+08:00\n",
+    )
 
 
 def _is_quota_guard(command: str) -> bool:
+    return is_fixture_quota_guard(
+        command,
+        goal_id=SELECTED_TODO_TOOL_FIXTURE_GOAL_ID,
+        agent_id=SELECTED_TODO_TOOL_FIXTURE_AGENT_ID,
+    )
+
+
+def _is_candidate_discovery(command: str) -> bool:
     tokens = loopx_command_tokens(command)
     if not tokens:
         return False
     try:
-        quota_index = tokens.index("quota")
+        todo_index = tokens.index("todo")
     except ValueError:
         return False
     return bool(
-        tokens[quota_index : quota_index + 2] == ["quota", "should-run"]
+        tokens[todo_index : todo_index + 2] == ["todo", "list"]
         and argument_value(tokens, "--goal-id")
         == SELECTED_TODO_TOOL_FIXTURE_GOAL_ID
-        and argument_value(tokens, "--agent-id")
-        == SELECTED_TODO_TOOL_FIXTURE_AGENT_ID
-        and "--codex-app" in tokens
-        and argument_value(tokens, "--turn-instance-id")
+        and argument_value(tokens, "--role") == "agent"
     )
 
 
@@ -328,6 +355,9 @@ def _resolve_metadata_path(
         (
             marker
             for marker in (
+                "~/.loopx",
+                "$HOME/.loopx",
+                "${HOME}/.loopx",
                 "~/.codex/loopx",
                 "$HOME/.codex/loopx",
                 "${HOME}/.codex/loopx",
@@ -366,6 +396,46 @@ def _is_fixture_metadata_target(
         ).resolve(),
     }
     return target.resolve() in allowed
+
+
+def _cat_operands(tokens: list[str]) -> list[str] | None:
+    """Parse bounded file operands without interpreting arbitrary cat options."""
+    if not tokens or Path(tokens[0]).name != "cat":
+        return None
+    explicit_end = len(tokens) > 1 and tokens[1] == "--"
+    operands = tokens[2:] if explicit_end else tokens[1:]
+    if not 1 <= len(operands) <= 8:
+        return None
+    if any(operand in {"|", ">", "<", ">>", "<<", "<<<", "&"} for operand in operands):
+        return None
+    if not explicit_end and any(operand.startswith("-") for operand in operands):
+        return None
+    return operands
+
+
+def _single_cat_operand(tokens: list[str]) -> str | None:
+    """Pipelines retain their existing single-file contract."""
+    operands = _cat_operands(tokens)
+    return operands[0] if operands is not None and len(operands) == 1 else None
+
+
+def _batch_cat_read_plan(
+    tokens: list[str], *, fixture: _SelectedTodoToolFixture,
+) -> list[BoundedWorkspaceReadStep] | None:
+    """Compile a standalone batch; fail closed at each prerequisite read."""
+    operands = _cat_operands(tokens)
+    if operands is None or len(operands) < 2:
+        return None
+    targets = [_resolve_project_path(value, fixture=fixture) for value in operands]
+    if any(target is None for target in targets):
+        return None
+    return [
+        BoundedWorkspaceReadStep(
+            "content", ("cat", "--", str(target)), target,
+            ";" if index == 0 else "&&",
+        )
+        for index, target in enumerate(targets)
+    ]
 
 
 def _metadata_pipeline_step(
@@ -415,9 +485,10 @@ def _metadata_pipeline_step(
             operator=operator,
             line_limit=limit,
         )
-    if len(left) != 2 or Path(left[0]).name != "cat":
+    operand = _single_cat_operand(left)
+    if operand is None:
         return None
-    target = _resolve_metadata_path(left[1], fixture=fixture)
+    target = _resolve_metadata_path(operand, fixture=fixture)
     allowed_registries = {
         fixture.global_registry_path.resolve(),
         (fixture.project_root / ".loopx" / "registry.json").resolve(),
@@ -428,7 +499,7 @@ def _metadata_pipeline_step(
             ("head", "-n", str(limit), str(target)),
             operator=operator,
         )
-    content_target = _resolve_project_path(left[1], fixture=fixture)
+    content_target = _resolve_project_path(operand, fixture=fixture)
     if content_target is None:
         return None
     return BoundedWorkspaceReadStep(
@@ -474,6 +545,11 @@ def bounded_workspace_read_plan(
             segments[-1].append(token)
     if not segments[-1] or len(segments) > 8:
         return None
+
+    if len(segments) == 1:
+        batch = _batch_cat_read_plan(segments[0], fixture=fixture)
+        if batch is not None:
+            return batch
 
     plan: list[BoundedWorkspaceReadStep] = []
     for operator, raw_segment in zip(operators, segments, strict=True):
@@ -549,7 +625,7 @@ def bounded_workspace_read_plan(
             )
             continue
         content_shape = bool(
-            (executable == "cat" and len(segment) == 2)
+            _single_cat_operand(segment) is not None
             or (
                 executable == "head"
                 and (
@@ -717,38 +793,17 @@ def _execute_read_plan(
     *,
     fixture: _SelectedTodoToolFixture,
 ) -> tuple[str, int]:
-    outputs: list[str] = []
-    status = 0
+    selected_target = fixture.selected_target.resolve()
     executed_content = 0
-    for step in plan:
-        should_run = bool(
-            step.operator == ";"
-            or (step.operator == "&&" and status == 0)
-            or (step.operator == "||" and status != 0)
-        )
-        if not should_run:
-            continue
-        completed = subprocess.run(
-            list(step.argv),
-            cwd=fixture.project_root,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        status = completed.returncode
-        step_output = completed.stdout
-        if step.line_limit is not None:
-            step_output = "".join(
-                step_output.splitlines(keepends=True)[: step.line_limit]
-            )
-        outputs.append(step_output)
-        if (
-            step.kind != "content"
-            or status != 0
-            or step.target != fixture.selected_target.resolve()
-        ):
-            continue
+
+    def _validate_step(
+        step: BoundedWorkspaceReadStep,
+        step_status: int,
+        step_output: str,
+    ) -> None:
+        nonlocal executed_content
+        if step.kind != "content" or step_status != 0 or step.target != selected_target:
+            return
         executed_content += 1
         observed = json.loads(step_output)
         if observed != {
@@ -757,9 +812,15 @@ def _execute_read_plan(
             "next_checkpoint": "qualify-one-bounded-slice",
         }:
             raise ValueError("selected todo readback does not match the fixture")
+
+    results, status = execute_bounded_read_steps(
+        plan,
+        cwd=fixture.project_root,
+        on_step=_validate_step,
+    )
     if status != 0:
         raise RuntimeError(f"bounded read plan failed with exit={status}")
-    return "".join(outputs), executed_content
+    return "".join(output for _, _, output in results), executed_content
 
 
 def _execute_workspace_read(
@@ -777,7 +838,7 @@ def _execute_workspace_read(
         cwd=fixture.project_root,
         check=False,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=10,
     )
     if completed.returncode != 0:
@@ -795,6 +856,8 @@ def _classify_tool_command(
 ) -> tuple[str, str | None]:
     if _is_quota_guard(command):
         return "quota_should_run", None
+    if _is_candidate_discovery(command):
+        return "candidate_discovery", None
     clock_output = _clock_output(command)
     if clock_output is not None:
         return "clock", clock_output
@@ -830,21 +893,41 @@ def _classify_tool_command(
 
 
 def _quota_contract(packet: Mapping[str, Any]) -> dict[str, Any]:
-    signature = quota_action_signature_document(packet)
-    action = dict(signature.get("action") or {})
-    user = dict(signature.get("user") or {})
-    selected = dict(action.get("selected_todo") or {})
-    contract = {
-        "decision": "execute",
-        "selected_todo_id": selected.get("todo_id"),
-        "user_action_required": bool(user.get("action_required")),
-        "must_attempt_work": bool(action.get("must_attempt")),
-        "delivery_allowed": bool(action.get("delivery_allowed")),
-        "quiet_noop_allowed": bool(action.get("quiet_noop_allowed")),
-        "external_write_requested": False,
+    base, _, _, _ = extract_quota_action_contract_base(packet)
+    action_portfolio_value = packet.get("action_portfolio")
+    action_portfolio: Mapping[str, Any] = (
+        action_portfolio_value
+        if isinstance(action_portfolio_value, Mapping)
+        else {}
+    )
+    raw_suggested_actions = action_portfolio.get("suggested_actions")
+    suggested_actions = (
+        raw_suggested_actions if isinstance(raw_suggested_actions, list) else []
+    )
+    suggested_action_ids = [
+        str(item.get("todo_id") or "").strip()
+        for item in suggested_actions
+        if isinstance(item, Mapping) and str(item.get("todo_id") or "").strip()
+    ]
+    interaction = packet.get("interaction_contract")
+    interaction = interaction if isinstance(interaction, Mapping) else {}
+    raw_cli_channel = interaction.get("cli_channel")
+    cli_channel = (
+        raw_cli_channel
+        if isinstance(raw_cli_channel, Mapping)
+        else {}
+    )
+    contract: dict[str, Any] = {
+        **base,
+        "selection_required": cli_channel.get("selection_required") is True,
+        "suggested_action_ids": suggested_action_ids,
     }
     if (
-        contract["selected_todo_id"] != SELECTED_TODO_TOOL_FIXTURE_TODO_ID
+        (
+            not contract["selection_required"]
+            and contract["selected_todo_id"]
+            != SELECTED_TODO_TOOL_FIXTURE_TODO_ID
+        )
         or contract["user_action_required"]
         or not contract["must_attempt_work"]
         or contract["quiet_noop_allowed"]
@@ -862,68 +945,24 @@ def _receipt(
     passed: bool,
     failure_code: str | None,
 ) -> dict[str, Any]:
-    return {
-        "schema_version": SELECTED_TODO_TOOL_BEHAVIOR_RECEIPT_SCHEMA_VERSION,
-        "qualification_id": qualification_id,
-        "actor_ref": actor_ref,
-        "qualification_passed": passed,
-        "failure_code": failure_code,
-        **dict(contract or {}),
-        "observed_tool_sequence": [step["kind"] for step in steps],
-        "tool_call_count": len(steps),
-        "selected_action_matched_todo": passed,
-        "tool_call_receipts": steps,
-        "boundary": {
-            "raw_prompt_persisted": False,
-            "raw_provider_response_persisted": False,
-            "raw_command_persisted": False,
+    return build_qualification_receipt(
+        schema_version=SELECTED_TODO_TOOL_BEHAVIOR_RECEIPT_SCHEMA_VERSION,
+        qualification_id=qualification_id,
+        actor_ref=actor_ref,
+        passed=passed,
+        failure_code=failure_code,
+        steps=steps,
+        contract=contract,
+        extra_fields={"selected_action_matched_todo": passed},
+        boundary={
             "filesystem_writes_executed": True,
-            "writes_limited_to_temporary_fixture": True,
-            "external_writes_executed": False,
-            "shell_commands_executed": False,
             "read_only_host_commands_executed": bool(steps),
         },
-    }
+    )
 
 
-class DoubaoSelectedTodoToolBehaviorActor:
+class DoubaoSelectedTodoToolBehaviorActor(DoubaoExecToolBehaviorActorBase):
     """Prove that the model acts on the Todo selected by real quota output."""
-
-    def __init__(
-        self,
-        *,
-        api_key: str,
-        model: str = DOUBAO_2_1_PRO_MODEL,
-        timeout_seconds: float = 90.0,
-        transport: DoubaoActorTransport = _direct_ark_transport,
-    ) -> None:
-        self._client = DoubaoExecToolClient(
-            api_key=api_key,
-            model=model,
-            timeout_seconds=timeout_seconds,
-            transport=transport,
-        )
-
-    @classmethod
-    def from_environment(
-        cls,
-        *,
-        environ: Mapping[str, str] | None = None,
-        transport: DoubaoActorTransport = _direct_ark_transport,
-        timeout_seconds: float = 90.0,
-    ) -> DoubaoSelectedTodoToolBehaviorActor:
-        values = os.environ if environ is None else environ
-        api_key = values.get(ARK_API_KEY_ENV, "")
-        if not api_key.strip():
-            raise RuntimeError(
-                "ARK_API_KEY is not injected; live Doubao qualification is unavailable"
-            )
-        return cls(
-            api_key=api_key,
-            model=values.get(DOUBAO_MODEL_ENV, DOUBAO_2_1_PRO_MODEL),
-            timeout_seconds=timeout_seconds,
-            transport=transport,
-        )
 
     def qualify(
         self,
@@ -931,10 +970,14 @@ class DoubaoSelectedTodoToolBehaviorActor:
         qualification_id: str,
         fixture_root: Path,
         prior_in_flight_progress: bool = False,
+        unsuggested_selected_todo: bool = False,
+        stale_done_primary_successor: bool = False,
     ) -> dict[str, Any]:
         fixture = _build_fixture(
             fixture_root,
             prior_in_flight_progress=prior_in_flight_progress,
+            unsuggested_selected_todo=unsuggested_selected_todo,
+            stale_done_primary_successor=stale_done_primary_successor,
         )
         messages: list[dict[str, Any]] = [
             {
@@ -942,10 +985,17 @@ class DoubaoSelectedTodoToolBehaviorActor:
                 "content": (
                     "You are Codex running one LoopX heartbeat. Follow the "
                     "heartbeat task and use the available shell tool when needed. "
+                    f"{QUOTA_FIRST_TOOL_INSTRUCTION}"
                     "The shell working directory is the connected goal project "
                     "root; resolve relative paths from the selected Todo there. "
-                    "Choose each next action from the latest tool result. After "
-                    "quota, execute the exact action in selected_todo.text directly. "
+                    "Choose each next action from the latest tool result. If quota "
+                    "sets selection_required, choose any currently eligible Todo; "
+                    "selection_command is non-binding. Replace {todo_id}, then "
+                    "run exactly `<route_prefix> <command_args_template>` for the "
+                    "second quota guard before delivery. Only when the visible "
+                    "packet lacks the Todo identity you need, run exactly "
+                    "`<route_prefix> <candidate_discovery_args>`. "
+                    "Otherwise execute the exact action in selected_todo.text directly. "
                     "When it names one file, read only that file; do not discover, "
                     "compare, or inspect other targets. After that selected Todo "
                     "tool succeeds, call no more tools."
@@ -955,11 +1005,12 @@ class DoubaoSelectedTodoToolBehaviorActor:
         ]
         steps: list[dict[str, Any]] = []
         quota_observed = False
+        quota_context: QuotaToolContext | None = None
+        selection_required = False
         contract: dict[str, Any] | None = None
         seen_once: set[str] = set()
         actor_ref = self._client.actor_ref
-        qualification_digest = sha256(qualification_id.encode()).hexdigest()[:16]
-        turn_instance_id = f"qualification-{qualification_digest}"
+        turn_instance_id = qualification_turn_instance_id(qualification_id)
 
         def receipt(*, passed: bool, failure_code: str | None) -> dict[str, Any]:
             return _receipt(
@@ -984,6 +1035,8 @@ class DoubaoSelectedTodoToolBehaviorActor:
                 fixture=fixture,
                 quota_observed=quota_observed,
             )
+            if is_context_read_command(tool_call.command):
+                kind, tool_output = "context_read", None
             steps.append(
                 {
                     "ordinal": len(steps) + 1,
@@ -992,6 +1045,11 @@ class DoubaoSelectedTodoToolBehaviorActor:
                 }
             )
             if kind == "selected_action":
+                if selection_required:
+                    return receipt(
+                        passed=False,
+                        failure_code="delivery_before_action_selection",
+                    )
                 try:
                     _execute_selected_read(tool_call.command, fixture=fixture)
                 except (RuntimeError, ValueError, json.JSONDecodeError):
@@ -1006,11 +1064,21 @@ class DoubaoSelectedTodoToolBehaviorActor:
                 "unexpected_command",
             }:
                 return receipt(passed=False, failure_code=kind)
-            if kind in {"clock", "quota_should_run"} and kind in seen_once:
+            if kind == "quota_should_run" and quota_observed:
+                tokens = loopx_command_tokens(tool_call.command) or []
+                requested_todo_id = argument_value(tokens, "--todo-id")
+                if not selection_required:
+                    return receipt(
+                        passed=False,
+                        failure_code="repeated_quota_should_run",
+                    )
+                kind = "quota_action_selection"
+                steps[-1]["kind"] = kind
+            if kind == "clock" and kind in seen_once:
                 return receipt(passed=False, failure_code=f"repeated_{kind}")
-            if kind in {"clock", "quota_should_run"}:
+            if kind == "clock":
                 seen_once.add(kind)
-            if kind == "quota_should_run":
+            if kind in {"quota_should_run", "quota_action_selection"}:
                 try:
                     tool_output = execute_loopx_cli(
                         tool_call.command,
@@ -1021,13 +1089,42 @@ class DoubaoSelectedTodoToolBehaviorActor:
                             "--turn-instance-id": turn_instance_id,
                         },
                     )
-                    quota_packet = json.loads(tool_output)
-                    contract = _quota_contract(quota_packet)
+                    quota_context = QuotaToolContext.from_output(tool_output)
+                    contract = _quota_contract(quota_context.packet)
                     quota_observed = True
+                    selection_required = bool(contract["selection_required"])
+                    if kind == "quota_action_selection":
+                        if selection_required:
+                            raise ValueError("action selection did not bind the turn")
+                        if contract["selected_todo_id"] != requested_todo_id:
+                            raise ValueError("action selection bound a different Todo")
                 except (RuntimeError, ValueError, json.JSONDecodeError):
                     return receipt(
                         passed=False,
                         failure_code="quota_execution_failed",
+                    )
+            elif kind == "context_read":
+                try:
+                    if quota_context is None:
+                        raise ValueError("context read before quota")
+                    tool_output = quota_context.read(tool_call.command,
+                        source_root=fixture.source_root, project_root=fixture.project_root)
+                except (OSError, RuntimeError, ValueError):
+                    return receipt(passed=False, failure_code="context_read_failed")
+            elif kind == "candidate_discovery":
+                try:
+                    tool_output = execute_loopx_cli(
+                        tool_call.command,
+                        source_root=fixture.source_root,
+                        project_root=fixture.project_root,
+                        argument_overrides={
+                            "--registry": str(fixture.global_registry_path),
+                        },
+                    )
+                except (RuntimeError, ValueError, json.JSONDecodeError):
+                    return receipt(
+                        passed=False,
+                        failure_code="candidate_discovery_failed",
                     )
             elif kind == "workspace_read":
                 try:
@@ -1040,19 +1137,8 @@ class DoubaoSelectedTodoToolBehaviorActor:
                         passed=False,
                         failure_code="workspace_read_failed",
                     )
-            messages.extend(
-                [
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [tool_call.provider_value],
-                    },
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.call_id,
-                        "content": tool_output or "",
-                    },
-                ]
+            append_exec_tool_exchange(
+                messages, tool_call, tool_output, include_assistant_content=False
             )
 
         return receipt(passed=False, failure_code="tool_call_budget_exhausted")

@@ -1,0 +1,76 @@
+"""Explicit warm-receiver native-context treatments at verified boundaries.
+
+The existing typed checkpoint owner qualifies the current decision. Native
+session IO remains at CodexAgentSession; this adapter composes those owners
+without resetting research, native opportunities, phase budget or authority.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from .checkpoint_continuation import retained_native_history
+
+
+def prepare_session_refresh(env, session, wake):
+    declaration = json.loads(Path(env["LOOPX_WARM_START"]).read_bytes())
+    if "fresh_after_replan" in declaration:
+        raise ValueError("fresh_after_replan is no longer supported; use a pre-replan checkpoint")
+    if type(declaration.get("fresh_replan", False)) is not bool:
+        raise ValueError("fresh_replan requires an explicit boolean treatment")
+    if not declaration.get("fresh_replan", False):
+        return ""
+    if env.get("LOOPX_ITERATION_CONTEXT") != "resume":
+        raise ValueError("checkpoint fresh context requires a resumed warm receiver")
+    if any(env[key] != declaration[field] for key, field in
+           (("LOOPX_GOAL_ID", "goal_id"), ("LOOPX_AGENT_ID", "agent_id"))):
+        raise ValueError("checkpoint fresh context destination lineage differs")
+    if not session.binding or session.binding.get("checkpoint_artifact_sha256") != declaration["sha256"]:
+        raise ValueError("checkpoint fresh context requires its exact checkpoint binding")
+    current = session.binding.get("checkpoint_context_refresh")
+    if current is not None:
+        if bool(current.get("pre_replan_basis")) != bool(declaration.get("fresh_replan")):
+            raise ValueError("checkpoint context treatment differs from committed session")
+        retained_native_history(session.binding, {})
+        return ""  # This receiver's initial reset is already committed.
+    return _prepare_fresh_replan(env, session, wake, declaration)
+
+
+def _prepare_fresh_replan(env, session, wake, declaration):
+    """Compose existing sealed-point selection and native admission before model work.
+
+    The TypeScript artifact owner decides whether this is a pending replan point;
+    native admission rejects an already-advanced source fork. No completed review
+    is manufactured or fed to the fresh decision maker.
+    """
+    from loopx.control_plane.effect_runtime import effect_runtime_result
+    from benchmark.runtime.sforge_warm_start import admit_warm_session
+
+    unit = Path(declaration["root"])
+    manifest = effect_runtime_result("runtime.checkpoint_artifacts", {
+        "action": "read_basis", "root": str(unit), "expected_sha256": declaration["sha256"],
+        "include_pending_replan": True}, large_local_snapshot=True)
+    pending = manifest["pending_replan"]
+    if pending is None:
+        raise ValueError("fresh replan requires the original pending decision boundary")
+    basis = {"decision_sha256": pending["decision_sha256"], "pending_replan": pending["intent"]}
+    attempt = Path(env["LOOPX_WARM_START"]).parent / "context-refresh" / "pre-replan.json"
+    # A lost launch reply is recovered only by the session owner's original
+    # output. Re-admitting an advanced fork would hide that outcome.
+    if not attempt.exists():
+        admitted = admit_warm_session(env, declaration)
+        if admitted["session_id"] != session.session_id:
+            raise ValueError("fresh replan source session differs")
+    session.prepare_checkpoint_refresh(None, attempt, wake / "stdout.jsonl", pre_replan_basis=basis)
+    return (
+        "This fresh conversation starts from a checkpoint captured BEFORE a pending replan. "
+        "No earlier native messages or decision made after that checkpoint are supplied. "
+        "Read the original task objective and scoring/acceptance rules from the current task document, "
+        "then the retained research evidence, failed alternatives, code and best validated candidate. "
+        "Historical plans are evidence to reconsider, not a decision to inherit. The retained Goal, "
+        "Todos, dependencies and settlement history continue unchanged. Follow the current guard "
+        "to complete the pending replan or its original-Turn recovery before choosing research work. "
+        "Keep the original submission opportunities, cooldown and cumulative deadline. "
+        "Do not resume archived commands or consult archived native conversation messages to choose "
+        "the route; use the checkpoint research evidence and original objective.\n\n"
+    )

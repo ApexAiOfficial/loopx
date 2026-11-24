@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -24,8 +25,8 @@ MUST_HAVE = (
     "one-message setup",
     "Codex CLI TUI",
     "setup/bootstrap instruction",
-    "thin task_body",
-    "/goal <thin task_body>",
+    "loader task_body",
+    "/goal <loader task_body>",
     "heartbeat automation",
     "host loop surface",
     "hidden headless `codex exec`",
@@ -46,11 +47,20 @@ MUST_HAVE = (
     "independent worktree",
     "raw Codex transcripts",
     "refresh-state",
-    "quota spend-slot",
+    "settlement_plan.ordered_steps",
+    "next_cli_actions",
+    "--bootstrap",
+    "--codex-app",
     "Do not spend quota for a setup-only turn",
-    "python3 -m pip install --upgrade loopx",
-    "workflow-skills --install",
-    "huangruiteng.github.io/loopx/install.sh",
+    *(
+        ("loopx doctor",)
+        if os.name == "nt"
+        else (
+            "python3 -m pip install --upgrade loopx",
+            "workflow-skills --install",
+            "loopx-project.github.io/loopx/install.sh",
+        )
+    ),
 )
 
 
@@ -60,9 +70,17 @@ def assert_message_contract(payload: dict[str, object]) -> None:
     assert payload["invocation_mode"] == "codex_cli_setup_then_goal_mode", payload
     assert payload["goal_id"] == GOAL_ID, payload
     assert payload["agent_id"] == AGENT_ID, payload
-    assert "python3 -m pip install --upgrade loopx" in str(payload["install_repair_command"]), payload
-    assert "workflow-skills --install" in str(payload["install_repair_command"]), payload
-    assert "huangruiteng.github.io/loopx/install.sh" in str(payload["install_repair_command"]), payload
+    repair = str(payload["install_repair_command"])
+    assert "loopx doctor" in repair, payload
+    if os.name == "nt":
+        # Native Windows has no python3 or Bash; the owner prints the checkout
+        # installer or the running interpreter's pip repair instead.
+        assert "| bash" not in repair, payload
+        assert "install-windows.ps1" in repair or "-m pip install --upgrade loopx" in repair, payload
+    else:
+        assert "python3 -m pip install --upgrade loopx" in repair, payload
+        assert "workflow-skills --install" in repair, payload
+        assert "loopx-project.github.io/loopx/install.sh" in repair, payload
     assert payload["existing_goal_probe_command"] == payload["quota_guard_command"], payload
     assert "heartbeat-prompt --thin" in str(payload["heartbeat_prompt_command"]), payload
     assert "heartbeat-prompt --thin" in str(payload["heartbeat_prompt_json_command"]), payload
@@ -99,17 +117,21 @@ def assert_message_contract(payload: dict[str, object]) -> None:
     assert normalized.index("shared global registry for this goal") < normalized.index("loopx bootstrap"), message
     assert normalized.index("bootstrap/connect this project") < normalized.index("heartbeat-prompt --thin"), message
     assert normalized.index("quota should-run") < normalized.index("interaction_contract"), message
-    assert message.index(progress_refresh) < message.index(quota_spend), message
-    assert message.index(quota_spend) < message.rindex(state_only_refresh), message
-    assert "must not carry a delivery outcome" in normalized, message
-    assert "Do not append another accountable progress refresh after spend" in normalized, message
-    assert "Never default or upgrade them to `multi_surface` / `outcome_progress`" in message, message
+    assert progress_refresh not in message and quota_spend not in message
+    assert state_only_refresh in message
+    assert "must not carry a delivery outcome" in normalized
+    assert "Accountable progress precedes its spend" in normalized
+    assert "readback/recovery, not blind retry" in normalized
+    assert "Never default or upgrade them to `multi_surface` / `outcome_progress`" in message
+    assert "--bootstrap" in str(payload["heartbeat_prompt_json_command"])
+    assert "--codex-app" in str(payload["codex_app_heartbeat_prompt_json_command"])
+    assert "--codex-app" in str(payload["codex_app_quota_guard_command"])
+    assert str(payload["codex_app_quota_guard_command"]) in message
+    assert "Never reuse the CLI binding for an App heartbeat" in normalized
     assert "do not run `loopx bootstrap` for the same `goal_id`" in normalized, message
     assert "Only run bootstrap when the probe clearly says the goal is absent" in normalized, message
     assert "registry/quota identity alone" in normalized, message
     assert "Headless fallback should never be the only way" not in message, message
-    assert "quota spend-slot --goal-id public-codex-cli-goal" in message, message
-    assert "--source heartbeat --execute --agent-id codex-side-bypass" in message, message
 
 
 def run_cli(*extra_args: str) -> str:
@@ -155,9 +177,9 @@ def assert_docs_surface_codex_cli_quickstart() -> None:
     assert "install or reuse LoopX" in normalized_getting_started
     assert "starts at 3 minutes" in normalized_getting_started
     assert (
-        "set the current Codex CLI goal to `/goal <thin task_body>`"
+        "set the current Codex CLI goal to `/goal <loader task_body>`"
         in normalized_product_contract
-        or "set the current Codex CLI goal to `/goal <thin task_body>`"
+        or "set the current Codex CLI goal to `/goal <loader task_body>`"
         in normalized_getting_started
     ), product_contract
     assert "reuse it" in normalized_getting_started, getting_started
@@ -170,14 +192,13 @@ def assert_docs_surface_codex_cli_quickstart() -> None:
     assert "setup-first rewrite of the App onboarding experience" in normalized_getting_started, getting_started
     assert "Codex App gets a heartbeat automation body that starts at 3 minutes" in normalized_getting_started, getting_started
     assert "transcript-free validation checklist" in normalized_getting_started, getting_started
-    assert "installs the thin LoopX goal/heartbeat body immediately" in normalized_product_contract, product_contract
-    assert "optional automation checks after the setup path works" in normalized_getting_started, getting_started
+    assert "installs the generated LoopX goal/heartbeat loader immediately" in normalized_product_contract, product_contract
     assert "first useful TUI response should be a control-plane snapshot" in normalized_product_contract, product_contract
     assert "setup-only work" in normalized_product_contract, product_contract
-    assert "loopx codex-cli-session-probe" in getting_started, getting_started
-    assert "loopx codex-cli-exec-handoff --project . --goal-id <goal-id>" in getting_started, getting_started
+    assert "loopx turn plan" in getting_started, getting_started
+    assert "loopx turn run-once" in getting_started, getting_started
     assert "headless-disabled boundary" in normalized_getting_started, getting_started
-    assert "This command no longer prints a runnable `codex exec` handoff script" in product_contract, product_contract
+    assert "default Codex CLI LoopX setup-then-`/goal` path does not expose a headless fallback" in normalized_product_contract, product_contract
 
 
 def main() -> int:
@@ -216,14 +237,18 @@ def main() -> int:
     assert "# Codex CLI LoopX Bootstrap Message" in cli_markdown, cli_markdown
     assert "Copy the block below into Codex CLI TUI" in cli_markdown, cli_markdown
     assert "setup message, not the reusable heartbeat body" in cli_markdown, cli_markdown
-    assert "`/goal <thin task_body>`" in cli_markdown, cli_markdown
+    assert "`/goal <loader task_body>`" in cli_markdown, cli_markdown
     assert "Codex App loop: set heartbeat automation initially every 3 minutes" in cli_markdown, cli_markdown
     assert "heartbeat-prompt --thin" in cli_markdown, cli_markdown
     assert "Fresh Repo Install Repair" in cli_markdown, cli_markdown
-    assert "Post-Bootstrap Thin Loop Prompt" in cli_markdown, cli_markdown
+    assert "Post-Bootstrap Loop Loader" in cli_markdown, cli_markdown
     assert "Transcript-Free Validation Checklist" in cli_markdown, cli_markdown
-    assert "huangruiteng.github.io/loopx/install.sh" in cli_markdown, cli_markdown
-    assert "python3 -m pip install --upgrade loopx" in cli_markdown, cli_markdown
+    if os.name == "nt":
+        assert "loopx doctor" in cli_markdown, cli_markdown
+        assert "| bash" not in cli_markdown, cli_markdown
+    else:
+        assert "loopx-project.github.io/loopx/install.sh" in cli_markdown, cli_markdown
+        assert "python3 -m pip install --upgrade loopx" in cli_markdown, cli_markdown
 
     cli_message_only = run_cli(
         "codex-cli-bootstrap-message",

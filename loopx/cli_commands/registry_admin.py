@@ -6,40 +6,39 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ..agent_registry import normalize_registered_agents
+from ..capabilities.multi_subagent import (
+    apply_codex_subagent_capacity,
+    plan_codex_subagent_capacity,
+)
 from ..configure_goal import configure_goal, render_configure_goal_markdown
 from ..control_plane.goals.configure_goal_service import (
     configure_goal_with_global_sync,
 )
-from ..file_lock import exclusive_file_lock, lock_timeout_error_fields
-from ..global_registry import (
-    render_global_goal_retirement_markdown,
-    render_global_sync_markdown,
-    retire_global_registry_goals,
-    sync_project_registry_to_global,
-)
+from ..control_plane.projects.registry_codec import project_registry_transaction
+from ..file_lock import lock_timeout_error_fields
+from ..global_registry import sync_project_registry_to_global
 from ..history import load_registry
-from ..paths import DEFAULT_RUNTIME_ROOT, global_registry_path, resolve_runtime_root
-from ..project_uninstall import render_project_uninstall_markdown, uninstall_project
 from ..registry import registry_goals
 from ..registry_writability import probe_registry_write_path
-from ..runtime import archive_runtime_goal, render_archive_runtime_markdown
-from ..state_migration import (
-    LEGACY_GLOBAL_REGISTRY,
-    LEGACY_RUNTIME_ROOT,
-    legacy_registry_goal_ids,
-    migrate_legacy_state,
-    parse_key_value_map,
-    render_state_migration_markdown,
-)
 from ..thread_agent_binding import (
     bind_thread_agent_in_registry,
     resolve_thread_agent_binding,
     unbind_thread_agent_in_registry,
 )
-from ..upgrade import build_upgrade_plan
-from .goal_lifecycle import handle_goal_lifecycle_command, register_goal_lifecycle_command
+from .goal_lifecycle import (
+    handle_goal_lifecycle_command,
+    register_goal_lifecycle_command,
+)
+from .goal_actions import handle_goal_actions_command, register_goal_actions_command
 from .registry_admin_configure import register_configure_goal_command
+from .registry_admin_lifecycle import (
+    REGISTRY_LIFECYCLE_COMMANDS,
+    handle_registry_lifecycle_command,
+    register_registry_lifecycle_commands,
+)
 from .registry_admin_peer import render_register_agent_markdown
+
+
 from .registry_admin_thread_resolution import (
     REGISTRY_THREAD_RESOLUTION_COMMANDS,
     handle_registry_thread_resolution_command,
@@ -52,6 +51,13 @@ from .registry_authority import (
 )
 from .support_control_registry import explicit_global_registry
 
+def _pr_review_agent_order_pair(value: str) -> tuple[str, str | None]:
+    agent, separator, direction = value.partition("=")
+    if not separator or not agent or direction not in {"forward", "reverse", "inherit"}:
+        raise ValueError("--pr-review-agent-order requires AGENT=forward|reverse|inherit")
+    return agent, None if direction == "inherit" else direction
+
+
 PrintPayload = Callable[
     [dict[str, object], str, Callable[[dict[str, object]], str]],
     None,
@@ -60,16 +66,12 @@ PrintPayload = Callable[
 REGISTRY_ADMIN_COMMANDS = {
     "configure-goal",
     "goal-lifecycle",
+    "goal-actions",
     "register-agent",
     "resolve-agent-thread",
     "bind-agent-thread",
     "unbind-agent-thread",
-    "archive-runtime",
-    "retire-global-goal",
-    "uninstall-project",
-    "sync-global",
-    "migrate-state",
-} | REGISTRY_AUTHORITY_COMMANDS | REGISTRY_THREAD_RESOLUTION_COMMANDS
+} | REGISTRY_AUTHORITY_COMMANDS | REGISTRY_THREAD_RESOLUTION_COMMANDS | REGISTRY_LIFECYCLE_COMMANDS
 
 
 def _registry_goal(path: Path, goal_id: str) -> dict[str, object]:
@@ -198,11 +200,7 @@ def register_agent_via_source_registry(
                 "registered_agents": merged_agents,
                 "changed": merged_agents != existing_agents,
                 "written": False,
-                "host_loop_activation": loop_activation_for_goal(
-                    registry_path=global_path,
-                    runtime_root_arg=runtime_root_arg,
-                    goal_id=goal_id,
-                ),
+                "host_loop_activation": unresolved_host_loop_activation(),
                 "global_registry_writability": global_writability,
                 "global_sync": {
                     "ok": False,
@@ -224,12 +222,24 @@ def register_agent_via_source_registry(
         "verified": False,
     }
     if execute:
-        with exclusive_file_lock(
+        with project_registry_transaction(
             source_registry_path,
             agent_id=requested_agents[0] if len(requested_agents) == 1 else None,
             operation="register_agent",
-        ):
-            source_goal = _registry_goal(source_registry_path, goal_id)
+        ) as registry_transaction:
+            source_goal = next(
+                (
+                    item
+                    for item in registry_goals(registry_transaction.payload_copy())
+                    if item.get("id") == goal_id
+                ),
+                None,
+            )
+            if source_goal is None:
+                raise ValueError(
+                    f"{goal_id}: registry does not contain the goal: "
+                    f"{source_registry_path}"
+                )
             existing_agents = _goal_registered_agents(source_goal)
             collisions = [
                 agent_id for agent_id in requested_agents if agent_id in existing_agents
@@ -254,6 +264,7 @@ def register_agent_via_source_registry(
                 registered_agents=merged_agents,
                 agent_model="peer_v1",
                 execute=True,
+                _registry_transaction=registry_transaction,
             )
             if configure_payload.get("written"):
                 sync_payload = sync_project_registry_to_global(
@@ -312,60 +323,20 @@ def register_agent_via_source_registry(
         "global_sync": sync_payload or {"enabled": bool(execute), "wrote": False},
         "registration_readback": readback_payload,
     }
-    result["host_loop_activation"] = loop_activation_for_goal(
-        registry_path=global_path,
-        runtime_root_arg=runtime_root_arg,
-        goal_id=goal_id,
-    )
+    result["host_loop_activation"] = unresolved_host_loop_activation()
     return result
 
 
-def loop_activation_for_goal(
-    *,
-    registry_path: Path,
-    runtime_root_arg: str | None,
-    goal_id: str,
-) -> dict[str, object]:
-    try:
-        plan = build_upgrade_plan(
-            registry_path=registry_path,
-            runtime_root_override=runtime_root_arg,
-            goal_ids=[goal_id],
-        )
-        goals = plan.get("managed_heartbeats") if isinstance(plan.get("managed_heartbeats"), list) else []
-        if not goals:
-            return {
-                "schema_version": "loopx_host_loop_activation_v0",
-                "host_surface": "codex_app_heartbeat",
-                "status": "unavailable",
-                "activated": False,
-                "recommended_action": (
-                    "run loopx upgrade-plan for this goal; do not claim setup complete until "
-                    "host_loop_activation.activated=true or a concrete host-tool gate is reported"
-                ),
-            }
-        activation = goals[0].get("host_loop_activation")
-        if isinstance(activation, dict):
-            return activation
-    except Exception as exc:
-        return {
-            "schema_version": "loopx_host_loop_activation_v0",
-            "host_surface": "codex_app_heartbeat",
-            "status": "error",
-            "activated": False,
-            "error": str(exc),
-            "recommended_action": (
-                "repair the host-loop activation check; do not claim setup complete until "
-                "host_loop_activation.activated=true or a concrete host-tool gate is reported"
-            ),
-        }
+def unresolved_host_loop_activation() -> dict[str, object]:
     return {
         "schema_version": "loopx_host_loop_activation_v0",
-        "host_surface": "codex_app_heartbeat",
-        "status": "unknown",
+        "host_surface": "unresolved",
+        "status": "selection_required",
         "activated": False,
         "recommended_action": (
-            "create or update the Codex App heartbeat automation from loopx heartbeat-prompt"
+            "run `loopx agent-onboard --list-agent-types`, then rerun onboarding "
+            "with the exact agent type; do not claim setup complete until the "
+            "host-specific activation is proven or a concrete host-tool gate is reported"
         ),
     }
 
@@ -373,6 +344,7 @@ def loop_activation_for_goal(
 def register_registry_admin_commands(subparsers: argparse._SubParsersAction) -> None:
     register_configure_goal_command(subparsers)
     register_goal_lifecycle_command(subparsers)
+    register_goal_actions_command(subparsers)
 
     register_agent_parser = subparsers.add_parser(
         "register-agent",
@@ -411,6 +383,19 @@ def register_registry_admin_commands(subparsers: argparse._SubParsersAction) -> 
     bind_thread_parser.add_argument("--host-surface", required=True, help="Host surface such as codex-app.")
     bind_thread_parser.add_argument("--agent-id", required=True, help="Already registered public-safe agent id.")
     bind_thread_parser.add_argument("--execute", action="store_true", help="Write the binding; otherwise preview only.")
+    bind_thread_parser.add_argument(
+        "--with-agy-hooks",
+        action="store_true",
+        help="Also preview or atomically write the bound Antigravity Stop recovery hook in hooks.json.",
+    )
+    bind_thread_parser.add_argument(
+        "--agy-home",
+        help="Antigravity config home for --with-agy-hooks (defaults to AGY_HOME or ~/.gemini/config).",
+    )
+    bind_thread_parser.add_argument(
+        "--cli-bin",
+        help="LoopX CLI executable path/name recorded in hooks.json when using --with-agy-hooks.",
+    )
 
     unbind_thread_parser = subparsers.add_parser(
         "unbind-agent-thread",
@@ -422,147 +407,7 @@ def register_registry_admin_commands(subparsers: argparse._SubParsersAction) -> 
     unbind_thread_parser.add_argument("--agent-id", required=True, help="Expected registered public-safe agent id.")
     unbind_thread_parser.add_argument("--execute", action="store_true", help="Remove the binding; otherwise preview only.")
 
-    archive_runtime_parser = subparsers.add_parser(
-        "archive-runtime",
-        help="Move an obsolete runtime goal directory into the archive area. Defaults to dry-run.",
-    )
-    archive_runtime_parser.add_argument("--goal-id", required=True, help="Runtime goal id to archive.")
-    archive_runtime_parser.add_argument(
-        "--archive-root",
-        help="Archive directory. Defaults to <runtime-root>/archived-goals.",
-    )
-    archive_runtime_parser.add_argument(
-        "--allow-registered",
-        action="store_true",
-        help="Allow archiving a goal that is still present in the registry.",
-    )
-    archive_runtime_parser.add_argument(
-        "--execute",
-        action="store_true",
-        help="Actually move the runtime directory. Without this flag the command is a dry-run.",
-    )
-
-    retire_global_goal_parser = subparsers.add_parser(
-        "retire-global-goal",
-        help=(
-            "Remove explicitly named obsolete goals from the global registry only when "
-            "both source_registry and state_file are missing. Defaults to dry-run."
-        ),
-    )
-    retire_global_goal_parser.add_argument(
-        "--goal-id",
-        action="append",
-        required=True,
-        help="Obsolete global goal id to retire. Repeat for multiple explicit goals.",
-    )
-    retire_global_goal_parser.add_argument(
-        "--execute",
-        action="store_true",
-        help="Write a full registry backup, then remove the eligible goals.",
-    )
-
-    uninstall_project_parser = subparsers.add_parser(
-        "uninstall-project",
-        help="Disconnect the current project from LoopX without uninstalling the LoopX CLI or other projects.",
-    )
-    uninstall_project_parser.add_argument(
-        "--goal-id",
-        action="append",
-        default=None,
-        help="Goal id to disconnect. Repeatable; defaults to every goal in this project registry.",
-    )
-    uninstall_project_parser.add_argument(
-        "--archive-state",
-        action="store_true",
-        help="Move each selected project-local .codex/goals/<goal-id> state directory into .loopx/archived-project-state/.",
-    )
-    uninstall_project_parser.add_argument(
-        "--remove-empty-registry",
-        action="store_true",
-        help="Remove .loopx/registry.json when all local goals are uninstalled. A backup is written first on --execute.",
-    )
-    uninstall_project_parser.add_argument(
-        "--execute",
-        action="store_true",
-        help="Write registry changes. Without this flag, uninstall-project is a dry-run preview.",
-    )
-
-    sync_global_parser = subparsers.add_parser(
-        "sync-global",
-        help="Merge this project-local registry into the shared global registry.",
-    )
-    sync_global_parser.add_argument("--goal-id", help="Only sync one goal id from the source registry.")
-    sync_global_parser.add_argument(
-        "--replace-state",
-        action="store_true",
-        help="Allow replacing an existing global route and write a backup before doing so.",
-    )
-    sync_global_parser.add_argument("--dry-run", action="store_true", help="Preview the global registry merge.")
-
-    migrate_state_parser = subparsers.add_parser(
-        "migrate-state",
-        help="One-shot migration from a legacy Goal Harness registry/runtime into LoopX state.",
-    )
-    migrate_state_parser.add_argument(
-        "--legacy-registry",
-        default=str(LEGACY_GLOBAL_REGISTRY),
-        help="Legacy registry JSON to import from. Defaults to ~/.codex/goal-harness/registry.global.json.",
-    )
-    migrate_state_parser.add_argument(
-        "--legacy-runtime-root",
-        default=str(LEGACY_RUNTIME_ROOT),
-        help="Legacy runtime root. Defaults to ~/.codex/goal-harness.",
-    )
-    migrate_state_parser.add_argument(
-        "--target-runtime-root",
-        help="LoopX runtime root. Defaults to --runtime-root or ~/.codex/loopx.",
-    )
-    migrate_goal_selector = migrate_state_parser.add_mutually_exclusive_group(required=True)
-    migrate_goal_selector.add_argument(
-        "--goal-id",
-        action="append",
-        help="Legacy goal id to migrate. Repeat for multiple explicit goals.",
-    )
-    migrate_goal_selector.add_argument(
-        "--all-goals",
-        action="store_true",
-        help="Migrate every goal listed in the explicit legacy registry. Still dry-run by default.",
-    )
-    migrate_state_parser.add_argument(
-        "--goal-id-map",
-        action="append",
-        default=[],
-        metavar="OLD=NEW",
-        help="Rename a goal id during migration, for example goal-harness-meta=loopx-meta.",
-    )
-    migrate_state_parser.add_argument(
-        "--path-map",
-        action="append",
-        default=[],
-        metavar="OLD=NEW",
-        help="Rewrite local path prefixes during migration.",
-    )
-    migrate_state_parser.add_argument(
-        "--copy-active-state",
-        action="store_true",
-        help="Copy and rewrite selected goals' active-state files into their migrated target paths.",
-    )
-    migrate_state_parser.add_argument(
-        "--copy-runtime",
-        action="store_true",
-        help="Copy and rewrite selected runtime goal directories from the legacy runtime root.",
-    )
-    migrate_state_parser.add_argument(
-        "--no-global-sync",
-        action="store_true",
-        help="Do not sync the migrated project registry into the LoopX global registry after --execute.",
-    )
-    migrate_state_parser.add_argument(
-        "--execute",
-        action="store_true",
-        help="Write migrated state. Without this flag the command is a dry-run preview.",
-    )
-
+    register_registry_lifecycle_commands(subparsers)
     register_registry_authority_commands(subparsers)
 
 
@@ -577,6 +422,13 @@ def handle_registry_admin_command(
 
     if args.command == "goal-lifecycle":
         return handle_goal_lifecycle_command(
+            args,
+            registry_path=registry_path,
+            print_payload=print_payload,
+        )
+
+    if args.command == "goal-actions":
+        return handle_goal_actions_command(
             args,
             registry_path=registry_path,
             print_payload=print_payload,
@@ -611,22 +463,74 @@ def handle_registry_admin_command(
                 quota_compute=args.quota_compute,
                 quota_window_hours=args.quota_window_hours,
                 execution_turn_granularity=args.execution_turn_granularity,
+                execution_replan_after_todos=args.execution_replan_after_todos,
+                execution_replan_after_turns=args.execution_replan_after_turns,
+                execution_planning_horizon_goal=args.execution_planning_horizon_goal,
+                clear_execution_planning_horizon_goal=args.clear_execution_planning_horizon_goal,
+                execution_yardstick_enabled=args.execution_yardstick_enabled,
+                clear_execution_yardstick_enabled=args.clear_execution_yardstick_enabled,
+                clear_execution_replan_after_turns=args.clear_execution_replan_after_turns,
+                clear_execution_replan_after_todos=bool(
+                    args.clear_execution_replan_after_todos
+                ),
                 self_repair_enabled=args.self_repair_enabled,
                 self_repair_health=args.self_repair_health,
                 self_repair_waiting_projection=args.self_repair_waiting_projection,
+                pull_request_review_configuration=({
+                    **({"wait_for_ci": args.pr_review_wait_for_ci} if args.pr_review_wait_for_ci is not None else {}),
+                    **({"review_order": getattr(args, "pr_review_order", None)} if getattr(args, "pr_review_order", None) is not None else {}),
+                    **({"owner_logins": getattr(args, "pr_review_owner_login", None)} if getattr(args, "pr_review_owner_login", None) is not None else
+                       {"owner_logins": []} if getattr(args, "clear_pr_review_owner_logins", False) else {}),
+                } or None),
+                pull_request_review_agent_orders=(dict(_pr_review_agent_order_pair(value) for value in getattr(args, "pr_review_agent_order", [])) or None),
+                clear_pull_request_review_configuration=args.clear_pr_review_configuration,
                 change_quality_enabled=args.change_quality_enabled,
                 change_quality_safe_fix=args.change_quality_safe_fix,
                 change_quality_strict_receipt=args.change_quality_strict_receipt,
+                clear_change_quality_configuration=bool(
+                    args.clear_change_quality_configuration
+                ),
+                progress_review_mode=args.progress_review_mode,
+                progress_review_signal=args.progress_review_signal,
+                progress_review_drift_threshold=args.progress_review_drift_threshold,
+                progress_review_contract_revision=args.progress_review_contract_revision,
+                clear_progress_review_configuration=bool(
+                    args.clear_progress_review_configuration
+                ),
                 multi_subagent_feature=args.multi_subagent_feature,
+                capability_improvement_configuration=({
+                    key: value for key, value in {
+                        "mode": args.capability_improvement_mode,
+                        "discovery_budget_minutes": args.capability_discovery_budget_minutes,
+                        "max_trials": args.capability_max_trials,
+                    }.items() if value is not None
+                } or None),
+                clear_capability_improvement_configuration=args.clear_capability_improvement_configuration,
                 orchestration_mode=args.orchestration_mode,
                 spawn_allowed=args.spawn_allowed,
                 max_children=args.max_children,
+                align_codex_subagent_capacity=bool(
+                    args.align_codex_subagent_capacity
+                ),
+                codex_host_capacity_planner=plan_codex_subagent_capacity,
+                codex_host_capacity_applier=apply_codex_subagent_capacity,
+                subagent_model=args.subagent_model,
+                subagent_reasoning_effort=args.subagent_reasoning_effort,
+                clear_subagent_model_config=args.clear_subagent_model_config,
+                subagent_execution_config=args.subagent_execution_config,
+                clear_subagent_execution_config=bool(
+                    args.clear_subagent_execution_config
+                ),
                 allowed_domains=args.allowed_domain,
                 clear_allowed_domains=bool(args.clear_allowed_domains),
                 explore_harness_enabled=args.explore_harness_enabled,
                 explore_harness_profile=args.explore_harness_profile,
                 clear_explore_harness_profile=bool(args.clear_explore_harness_profile),
+                explore_composition_mode=args.explore_composition_mode,
+                explore_composition_scope_id=args.explore_composition_scope_id,
                 explore_graph_enabled=args.explore_graph_enabled,
+                explore_mode=args.explore_mode,
+                clear_explore_configuration=bool(args.clear_explore_configuration),
                 lark_kanban_heartbeat_sync=args.lark_kanban_heartbeat_sync,
                 registered_agents=args.registered_agents,
                 clear_registered_agents=bool(args.clear_registered_agents),
@@ -650,6 +554,18 @@ def handle_registry_admin_command(
                 write_scope=args.write_scope,
                 replace_write_scope=bool(args.replace_write_scope),
                 clear_write_scope=bool(args.clear_write_scope),
+                local_authority_shadow_file=bool(
+                    args.local_authority_shadow_file
+                ),
+                clear_local_authority_shadow=bool(
+                    args.clear_local_authority_shadow
+                ),
+                coordination_runtime_shadow_file=bool(
+                    args.coordination_runtime_shadow_file
+                ),
+                clear_coordination_runtime_shadow=bool(
+                    args.clear_coordination_runtime_shadow
+                ),
                 waiting_on=args.waiting_on,
                 clear_waiting_on=bool(args.clear_waiting_on),
                 boundary_authority_scopes=args.boundary_authority_scope,
@@ -671,17 +587,14 @@ def handle_registry_admin_command(
                 ),
                 reward_memory_config=args.reward_memory_config,
                 reward_memory_agents=args.reward_memory_agents,
+                reward_memory_agent_id=args.reward_memory_agent_id,
                 clear_reward_memory_config=bool(
                     args.clear_reward_memory_config
                 ),
                 execute=bool(args.execute),
             )
             if payload.get("ok"):
-                payload["host_loop_activation"] = loop_activation_for_goal(
-                    registry_path=registry_path,
-                    runtime_root_arg=args.runtime_root,
-                    goal_id=args.goal_id,
-                )
+                payload["host_loop_activation"] = unresolved_host_loop_activation()
         except Exception as exc:
             payload = {
                 "ok": False,
@@ -729,6 +642,14 @@ def handle_registry_admin_command(
 
     if args.command in {"bind-agent-thread", "unbind-agent-thread"}:
         try:
+            with_agy_hooks = bool(
+                args.command == "bind-agent-thread"
+                and getattr(args, "with_agy_hooks", False)
+            )
+            if with_agy_hooks and args.host_surface not in {"agy", "antigravity-app"}:
+                raise ValueError(
+                    "--with-agy-hooks requires --host-surface agy or antigravity-app"
+                )
             global_path = explicit_global_registry(args.runtime_root)
             global_goal = _registry_goal(global_path, args.goal_id)
             source_registry = global_goal.get("source_registry")
@@ -789,11 +710,13 @@ def handle_registry_admin_command(
                     _registry_goal(source_path, args.goal_id),
                     host_surface=args.host_surface,
                     thread_id=args.thread_id,
+                    exact_surface=True,
                 )
                 global_binding = resolve_thread_agent_binding(
                     _registry_goal(global_path, args.goal_id),
                     host_surface=args.host_surface,
                     thread_id=args.thread_id,
+                    exact_surface=True,
                 )
                 if args.command == "bind-agent-thread":
                     readback_verified = all(
@@ -822,6 +745,28 @@ def handle_registry_admin_command(
                     payload["error_kind"] = "thread_agent_binding_readback_failed"
             else:
                 payload["global_sync"] = {"enabled": bool(args.execute), "wrote": False}
+            if with_agy_hooks:
+                from ..slash_command_install import sync_antigravity_hooks
+
+                cli_bin = (
+                    getattr(args, "cli_bin", None)
+                    or getattr(args, "control_cli_bin", None)
+                    or "loopx"
+                )
+                hooks_result = sync_antigravity_hooks(
+                    cli_bin=cli_bin,
+                    agy_home=getattr(args, "agy_home", None),
+                    execute=bool(args.execute and payload.get("ok")),
+                    goal_id=args.goal_id,
+                    agent_id=args.agent_id,
+                    runtime_root=str(global_path.parent),
+                    conversation_id=args.thread_id,
+                    registry=str(source_path),
+                )
+                payload["antigravity_hooks"] = hooks_result
+                if hooks_result["status"].startswith(("blocked_", "skipped_")):
+                    payload["ok"] = False
+                    payload["error_kind"] = hooks_result["status"]
         except Exception as exc:
             payload = {
                 "ok": False,
@@ -836,160 +781,13 @@ def handle_registry_admin_command(
         print_payload(payload, args.format, render_register_agent_markdown)
         return 0 if payload.get("ok") else 1
 
-    if args.command == "archive-runtime":
-        try:
-            payload = archive_runtime_goal(
-                registry_path=registry_path,
-                runtime_root_override=args.runtime_root,
-                goal_id=args.goal_id,
-                archive_root=Path(args.archive_root).expanduser() if args.archive_root else None,
-                allow_registered=bool(args.allow_registered),
-                execute=bool(args.execute),
-            )
-        except Exception as exc:
-            payload = {
-                "ok": False,
-                "registry": str(registry_path),
-                "runtime_root": args.runtime_root,
-                "goal_id": args.goal_id,
-                "dry_run": not bool(args.execute),
-                "archived": False,
-                "error": str(exc),
-            }
-        print_payload(payload, args.format, render_archive_runtime_markdown)
-        return 0 if payload.get("ok") else 1
-
-    if args.command == "retire-global-goal":
-        try:
-            payload = retire_global_registry_goals(
-                runtime_root_override=args.runtime_root,
-                goal_ids=args.goal_id,
-                execute=bool(args.execute),
-            )
-        except Exception as exc:
-            payload = {
-                "ok": False,
-                "schema_version": "loopx_global_goal_retirement_v0",
-                "dry_run": not bool(args.execute),
-                "execute": bool(args.execute),
-                "requested_goal_ids": args.goal_id or [],
-                "retired_goal_ids": [],
-                "wrote": False,
-                "backup_written": False,
-                "error": str(exc),
-            }
-        print_payload(payload, args.format, render_global_goal_retirement_markdown)
-        return 0 if payload.get("ok") else 1
-
-    if args.command == "uninstall-project":
-        try:
-            payload = uninstall_project(
-                registry_path=registry_path,
-                runtime_root_override=args.runtime_root,
-                goal_ids=args.goal_id,
-                archive_state=bool(args.archive_state),
-                remove_empty_registry=bool(args.remove_empty_registry),
-                execute=bool(args.execute),
-            )
-        except Exception as exc:
-            payload = {
-                "ok": False,
-                "schema_version": "loopx_project_uninstall_v0",
-                "dry_run": not bool(args.execute),
-                "execute": bool(args.execute),
-                "registry": str(registry_path),
-                "goal_ids": args.goal_id or [],
-                "wrote_local_registry": False,
-                "wrote_global_registry": False,
-                "error": str(exc),
-            }
-        print_payload(payload, args.format, render_project_uninstall_markdown)
-        return 0 if payload.get("ok") else 1
-
-    if args.command == "sync-global":
-        try:
-            payload = sync_project_registry_to_global(
-                registry_path=registry_path,
-                runtime_root_override=args.runtime_root,
-                goal_id=args.goal_id,
-                dry_run=bool(args.dry_run),
-                allow_route_replacement=bool(args.replace_state),
-            )
-        except Exception as exc:
-            registry = load_registry(registry_path)
-            runtime_root = resolve_runtime_root(registry, args.runtime_root)
-            payload = {
-                "ok": False,
-                "registry": str(registry_path),
-                "runtime_root": str(runtime_root),
-                "global_registry": str(global_registry_path(runtime_root)),
-                "dry_run": bool(args.dry_run),
-                "error": str(exc),
-            }
-        print_payload(payload, args.format, render_global_sync_markdown)
-        return 0 if payload.get("ok") else 1
-
-    if args.command == "migrate-state":
-        try:
-            target_runtime_root = (
-                Path(args.target_runtime_root).expanduser()
-                if args.target_runtime_root
-                else (Path(args.runtime_root).expanduser() if args.runtime_root else DEFAULT_RUNTIME_ROOT)
-            )
-            selected_goal_ids = (
-                legacy_registry_goal_ids(Path(args.legacy_registry))
-                if args.all_goals
-                else (args.goal_id or [])
-            )
-            payload = migrate_legacy_state(
-                legacy_registry_path=Path(args.legacy_registry),
-                target_registry_path=registry_path,
-                legacy_runtime_root=Path(args.legacy_runtime_root),
-                target_runtime_root=target_runtime_root,
-                goal_ids=selected_goal_ids,
-                goal_id_map=parse_key_value_map(args.goal_id_map, flag_name="--goal-id-map"),
-                path_map=parse_key_value_map(args.path_map, flag_name="--path-map"),
-                copy_active_state=bool(args.copy_active_state),
-                copy_runtime=bool(args.copy_runtime),
-                execute=bool(args.execute),
-            )
-            if payload.get("ok") and args.execute and not args.no_global_sync:
-                sync_results = []
-                for migrated_goal_id in payload.get("migrated_goal_ids") or []:
-                    sync_results.append(
-                        sync_project_registry_to_global(
-                            registry_path=registry_path,
-                            runtime_root_override=str(target_runtime_root),
-                            goal_id=str(migrated_goal_id),
-                            dry_run=False,
-                        )
-                    )
-                payload["global_sync"] = {
-                    "ok": all(result.get("ok") for result in sync_results),
-                    "dry_run": False,
-                    "wrote": bool(sync_results),
-                    "results": sync_results,
-                    "synced_goal_ids": [
-                        goal_id
-                        for result in sync_results
-                        for goal_id in (result.get("synced_goal_ids") or [])
-                    ],
-                }
-        except Exception as exc:
-            payload = {
-                "ok": False,
-                "schema_version": "loopx_state_migration_v0",
-                "dry_run": not bool(args.execute),
-                "execute": bool(args.execute),
-                "legacy_registry": args.legacy_registry,
-                "target_registry": str(registry_path),
-                "legacy_runtime_root": args.legacy_runtime_root,
-                "target_runtime_root": args.target_runtime_root or args.runtime_root or str(DEFAULT_RUNTIME_ROOT),
-                "selected_goal_ids": args.goal_id or ([] if not getattr(args, "all_goals", False) else ["<all-goals>"]),
-                "error": str(exc),
-            }
-        print_payload(payload, args.format, render_state_migration_markdown)
-        return 0 if payload.get("ok") else 1
+    lifecycle_result = handle_registry_lifecycle_command(
+        args,
+        registry_path=registry_path,
+        print_payload=print_payload,
+    )
+    if lifecycle_result is not None:
+        return lifecycle_result
 
     return handle_registry_authority_command(
         args,

@@ -5,17 +5,19 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from ..work_items.interaction_contract import INTERACTION_CONTRACT_SCHEMA_VERSION
-
+from ..agents.agent_scope_frontier import AGENT_SCOPE_FRONTIER_SCHEMA_VERSION, AgentScopeFrontierAction
+from ..effect_runtime import effect_runtime_result
+from ..goals.goal_vision_wait import exact_blocked_successor_wait_state
 
 SCHEDULER_ARBITRATION_SCHEMA_VERSION = "scheduler_arbitration_v0"
 
 
 class SchedulerDisposition(str, Enum):
     TERMINAL_STOP = "terminal_stop"
-    PEER_COORDINATION_STOP = "peer_coordination_stop"
+    PEER_COORDINATION_WAIT = "peer_coordination_wait"
     AGENT_MONITOR_ONLY_WAIT = "agent_monitor_only_wait"
     ACTIVE_WORK = "active_work"
+    SETTLED_REPLAY = "settled_replay"
     AGENT_SCOPE_WAIT = "agent_scope_wait"
     CONSISTENCY_REPAIR = "consistency_repair"
     HUMAN_GATE = "human_gate"
@@ -30,6 +32,8 @@ class SchedulerArbitration:
     reason_code: str
     mode: str
     errors: tuple[str, ...] = ()
+    scheduled_recheck_after_seconds: int | None = None
+    pending_dependency_wait: bool = False
 
     @property
     def ok(self) -> bool:
@@ -49,142 +53,72 @@ class SchedulerArbitration:
             ),
         }
 
-
-def _mapping(value: Any) -> Mapping[str, Any]:
-    return value if isinstance(value, Mapping) else {}
-
-
-def _required_bool(
-    source: Mapping[str, Any],
-    field: str,
-    *,
-    error_prefix: str,
-    errors: list[str],
-) -> bool:
-    value = source.get(field)
-    if type(value) is not bool:
-        errors.append(f"{error_prefix}.{field}_must_be_boolean")
-        return False
-    return value
+    @classmethod
+    def from_projection(cls, projection: Any) -> SchedulerArbitration:
+        if (not isinstance(projection, Mapping)
+                or any(not isinstance(projection.get(key), str) for key in ("disposition", "reason_code", "mode"))
+                or not isinstance(projection.get("errors"), list)
+                or any(not isinstance(error, str) for error in projection["errors"])):
+            raise TypeError("TypeScript scheduler arbitration shape mismatch")
+        scheduled = projection.get("scheduled_recheck_after_seconds")
+        if scheduled is not None and (type(scheduled) is not int or scheduled <= 0):
+            raise TypeError("TypeScript scheduler scheduled recheck must be positive integer seconds")
+        pending_dependency = projection.get("pending_dependency_wait", False)
+        if type(pending_dependency) is not bool:
+            raise TypeError("TypeScript scheduler pending dependency wait must be boolean")
+        return cls(SchedulerDisposition(projection["disposition"]), projection["reason_code"],
+                   projection["mode"], tuple(projection["errors"]), scheduled, pending_dependency)
 
 
-def _classify_disposition(
-    *,
-    mode: str,
-    user_required: bool,
-    must_attempt: bool,
-    quiet_noop_allowed: bool,
-    agent_scope_frontier_actions: Collection[str],
-) -> tuple[SchedulerDisposition, str]:
-    agent_scope_modes = {str(value) for value in agent_scope_frontier_actions}
-    if mode == "terminal_no_followup":
-        return SchedulerDisposition.TERMINAL_STOP, mode
-    if mode == "peer_coordination_blocked":
-        return SchedulerDisposition.PEER_COORDINATION_STOP, mode
-    if mode == "agent_monitor_only":
-        return SchedulerDisposition.AGENT_MONITOR_ONLY_WAIT, mode
-    if user_required and not must_attempt:
-        return SchedulerDisposition.HUMAN_GATE, "interaction_blocking_user_gate"
-    if mode == "monitor_quiet_skip":
-        return SchedulerDisposition.MONITOR_WAIT, "interaction_monitor_quiet_wait"
-    if mode == "heartbeat_settled_skip":
-        return SchedulerDisposition.QUIET_WAIT, "interaction_heartbeat_settled_wait"
-    if mode == "successor_replan_required" and must_attempt:
-        return SchedulerDisposition.ACTIVE_WORK, "interaction_successor_replan_required"
-    if mode in agent_scope_modes:
-        return SchedulerDisposition.AGENT_SCOPE_WAIT, "interaction_agent_scope_wait"
-    if mode == "mapped_noop_if_unchanged":
-        return SchedulerDisposition.UNCHANGED_WAIT, "interaction_unchanged_wait"
-    if must_attempt:
-        return SchedulerDisposition.ACTIVE_WORK, "interaction_agent_attempt_required"
-    if quiet_noop_allowed:
-        return SchedulerDisposition.QUIET_WAIT, "interaction_quiet_noop_allowed"
-    return SchedulerDisposition.QUIET_WAIT, "interaction_delivery_not_allowed"
-
-
-def build_scheduler_arbitration(
-    payload: Mapping[str, Any],
-    *,
-    agent_scope_frontier_actions: Collection[str] = (),
-) -> SchedulerArbitration:
-    """Derive scheduler authority from the final interaction contract.
-
-    Lower-level quota fields never participate in branch selection. Structural
-    contradictions inside the final contract fail closed to projection repair.
-    """
-
-    errors: list[str] = []
-    contract = _mapping(payload.get("interaction_contract"))
-    schema_version = contract.get("schema_version")
-    if schema_version != INTERACTION_CONTRACT_SCHEMA_VERSION:
-        errors.append("interaction_contract.schema_version_mismatch")
-
-    mode_value = contract.get("mode")
-    mode = str(mode_value or "").strip()
-    if not mode:
-        errors.append("interaction_contract.mode_missing")
-
-    user_channel = _mapping(contract.get("user_channel"))
-    agent_channel = _mapping(contract.get("agent_channel"))
-    if not user_channel:
-        errors.append("interaction_contract.user_channel_missing")
-    if not agent_channel:
-        errors.append("interaction_contract.agent_channel_missing")
-
-    user_required = _required_bool(
-        user_channel,
-        "action_required",
-        error_prefix="interaction_contract.user_channel",
-        errors=errors,
-    )
-    must_attempt = _required_bool(
-        agent_channel,
-        "must_attempt",
-        error_prefix="interaction_contract.agent_channel",
-        errors=errors,
-    )
-    delivery_allowed = _required_bool(
-        agent_channel,
-        "delivery_allowed",
-        error_prefix="interaction_contract.agent_channel",
-        errors=errors,
-    )
-    quiet_noop_allowed = _required_bool(
-        agent_channel,
-        "quiet_noop_allowed",
-        error_prefix="interaction_contract.agent_channel",
-        errors=errors,
-    )
-
-    if delivery_allowed and not must_attempt:
-        errors.append("interaction_contract.delivery_without_attempt")
-    if quiet_noop_allowed and (must_attempt or delivery_allowed or user_required):
-        errors.append("interaction_contract.quiet_noop_conflicts_with_required_action")
-    if mode in {
-        "terminal_no_followup",
-        "peer_coordination_blocked",
-        "agent_monitor_only",
-    } and (
-        user_required or must_attempt or delivery_allowed or not quiet_noop_allowed
+def _scheduler_arbitration_facts(
+    contract: Any, agent_scope_frontier_actions: Collection[str] = (),
+    *, payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Keep legacy Python scalar/Mapping codecs; transport only consumed facts."""
+    contract = contract if isinstance(contract, Mapping) else {}
+    channels = {}
+    for name, fields in (
+        ("user_channel", ("action_required", "non_gating_notice")),
+        ("agent_channel", ("must_attempt", "delivery_allowed", "quiet_noop_allowed")),
+        ("cli_channel", ("spend_allowed_now", "spend_after_validation")),
     ):
-        errors.append("interaction_contract.terminal_conflicts_with_open_action")
-    disposition, reason_code = _classify_disposition(
-        mode=mode,
-        user_required=user_required,
-        must_attempt=must_attempt,
-        quiet_noop_allowed=quiet_noop_allowed,
-        agent_scope_frontier_actions=agent_scope_frontier_actions,
-    )
+        source = contract.get(name)
+        source = source if isinstance(source, Mapping) else {}
+        channels[name] = {"present": bool(source), **{
+            field: source[field] if type(source[field]) is bool else None
+            for field in fields if field in source
+        }}
+    agent = contract.get("agent_channel")
+    wait = agent.get("wait") if isinstance(agent, Mapping) else None
+    source = wait.get("source") if isinstance(wait, Mapping) else None
+    channels["agent_channel"]["wait_source"] = source if isinstance(source, str) and len(source) <= 64 else None
+    facts = {"schema_version": contract.get("schema_version"),
+            "mode": str(contract.get("mode") or "").strip(), **channels,
+            "agent_scope_frontier_actions": [str(action) for action in agent_scope_frontier_actions]}
+    if not payload:
+        return facts
+    wait = exact_blocked_successor_wait_state(payload)
+    frontier = payload.get("agent_scope_frontier")
+    identity = payload.get("agent_identity")
+    agent_id = identity.get("agent_id") if isinstance(identity, Mapping) else None
+    scoped_wait = None
+    if (isinstance(frontier, Mapping) and frontier.get("schema_version") == AGENT_SCOPE_FRONTIER_SCHEMA_VERSION
+            and frontier.get("action") == AgentScopeFrontierAction.AGENT_SCOPE_WAIT.value
+            and frontier.get("agent_id") == agent_id):
+        scoped_wait = frontier.get("automatic_resume_todo")
+    if wait or scoped_wait:
+        facts.update({"effective_action": payload.get("effective_action"), "agent_id": agent_id,
+                      "vision_wait_state": wait or None, "scope_wait_todo": scoped_wait,
+                      "heartbeat_receipt": payload.get("heartbeat_receipt")})
+    return facts
 
-    if errors:
-        return SchedulerArbitration(
-            disposition=SchedulerDisposition.CONSISTENCY_REPAIR,
-            reason_code="scheduler_interaction_contract_inconsistent",
-            mode=mode,
-            errors=tuple(dict.fromkeys(errors)),
-        )
-    return SchedulerArbitration(
-        disposition=disposition,
-        reason_code=reason_code,
-        mode=mode,
+
+def monitor_quiet_stall_observation_required(payload: dict[str, Any]) -> bool:
+    """Keep automatic stall supervision unless typed arbitration proves a future wait."""
+    if not exact_blocked_successor_wait_state(payload):
+        return True
+    result = effect_runtime_result(
+        "work_item.blocked_wait_observation.project",
+        _scheduler_arbitration_facts(payload.get("interaction_contract"), payload=payload),
     )
+    return result["required"] is not False

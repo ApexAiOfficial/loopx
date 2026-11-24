@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 
 import pytest
+from todo_frontier_fixture import summary_frontier_index
 
 from loopx.control_plane.goals.goal_frontier import (
     derive_goal_frontier_replan_obligation_from_summaries,
@@ -19,11 +20,18 @@ from loopx.control_plane.goals.goal_frontier.replan_rules import (
     select_goal_frontier_replan_rule,
 )
 from loopx.control_plane.todos.addition import require_replan_successor_scope
+from loopx.control_plane.goals.goal_frontier.long_todo_chain import (
+    long_todo_chain_successor_checkpoints,
+)
+from loopx.control_plane.todos.frontier_revision import (
+    TODO_FRONTIER_REVISION_INDEX_SCHEMA_VERSION,
+)
 from loopx.control_plane.todos.summary_item import compact_todo_summary_item
 from loopx.control_plane.work_items.interaction_contract import (
     build_interaction_contract,
     interaction_next_cli_actions,
 )
+from loopx.control_plane.work_items.progress_observation import semantic_delta_from_writeback
 
 
 @pytest.mark.parametrize(
@@ -153,6 +161,27 @@ def test_goal_frontier_replan_decision_table(
     )
 
 
+def test_capability_evidence_gap_precedence_and_disabled_parity() -> None:
+    # A caller-owned gap enters before monitor fallback. Existing authority,
+    # runnable work and acceptance checkpoints retain their established order.
+    selected = select_goal_frontier_replan_rule(GoalFrontierReplanFacts(capability_gap_pending=True))
+    assert selected.rule is GoalFrontierReplanRule.CAPABILITY_EVIDENCE_GAP
+    assert selected.derives_obligation
+    for fields, expected in [
+        ({"existing_replan_required": True}, GoalFrontierReplanRule.EXISTING_OBLIGATION),
+        ({"blocking_handoff_gate_count": 1}, GoalFrontierReplanRule.BLOCKING_HANDOFF_GATE),
+        ({"ready_deferred_successor_count": 1}, GoalFrontierReplanRule.READY_DEFERRED_SUCCESSOR),
+        ({"blocking_user_open_count": 1}, GoalFrontierReplanRule.OPEN_USER_TODO),
+        ({"acceptance_gap_count": 1}, GoalFrontierReplanRule.VISION_ACCEPTANCE_GAP),
+        ({"long_todo_chain_triggered": True}, GoalFrontierReplanRule.LONG_TODO_CHAIN),
+        ({"current_agent_blocker_count": 1}, GoalFrontierReplanRule.CURRENT_AGENT_BLOCKER),
+        ({"selectable_frontier_advancement": 1}, GoalFrontierReplanRule.NOT_MONITOR_ONLY),
+    ]:
+        decision = select_goal_frontier_replan_rule(GoalFrontierReplanFacts(capability_gap_pending=True, **fields))
+        assert decision.rule is expected
+    assert select_goal_frontier_replan_rule(GoalFrontierReplanFacts()).rule is GoalFrontierReplanRule.NOT_MONITOR_ONLY
+
+
 def _repeat_vision_gap() -> list[dict[str, object]]:
     return [
         {
@@ -223,12 +252,13 @@ def _accepted_long_chain_ack(obligation: dict[str, object]) -> dict[str, object]
 def _derive_long_chain(
     source_items: list[dict[str, object]],
     *,
+    agent_todo_summary: dict[str, object] | None = None,
     latest_replan_ack: dict[str, object] | None = None,
     current_transition_replan_ack: dict[str, object] | None = None,
 ) -> dict[str, object] | None:
     return derive_goal_frontier_replan_obligation_from_summaries(
         user_todo_summary={"open_count": 0},
-        agent_todo_summary=_long_chain_summary(source_items),
+        agent_todo_summary=agent_todo_summary or _long_chain_summary(source_items),
         agent_todo_source_items=source_items,
         work_lane_contract={"lane": "advancement_task", "must_attempt_work": True},
         agent_id="current-agent",
@@ -256,7 +286,7 @@ def test_long_todo_chain_checkpoint_is_edge_triggered_and_rearms_on_change() -> 
 
     changed_items = deepcopy(source_items)
     changed_items[-1]["updated_at"] = "2026-08-22T09:10:00+08:00"
-    changed_items[-1]["priority"] = "P0"
+    changed_items[-1]["target_key"] = "experiment:authorized-new-probe"
     rearmed = _derive_long_chain(changed_items, latest_replan_ack=ack)
     assert rearmed is not None
     assert rearmed["obligation_id"] != original["obligation_id"]
@@ -264,6 +294,118 @@ def test_long_todo_chain_checkpoint_is_edge_triggered_and_rearms_on_change() -> 
     assert rearmed["triggers"][0]["frontier_revision"] != (
         original["triggers"][0]["frontier_revision"]
     )
+
+
+@pytest.mark.parametrize("change,rearms", [
+    ("peer_claim", False), ("unclaimed_priority", False),
+    ("owned_priority", False), ("owned_priority_marker", False),
+    ("owned_title", False), ("owned_text", True),
+    ("owned_target", True), ("maintenance_timestamp", False),
+])
+def test_writeback_ack_preserves_owned_material_basis(change: str, rearms: bool) -> None:
+    items = [*_long_chain_source_items(), {
+        **_advancement("todo_unclaimed", ""),
+        "updated_at": "2026-08-22T09:00:00+08:00",
+    }]
+    items[0]["text"] = "Check five finite integer samples."
+
+    def derive(rows, ack=None):
+        owned = [row for row in rows if row.get("claimed_by") == "current-agent"]
+        unclaimed = [row for row in rows if not row.get("claimed_by")]
+        return _derive_long_chain(rows, latest_replan_ack=ack, agent_todo_summary={
+            "open_count": len(rows), "current_agent_claimed_open_count": len(owned),
+            "current_agent_claimed_advancement_count": len(owned),
+            "unclaimed_open_count": len(unclaimed),
+            "unclaimed_priority_open_items": unclaimed,
+            "executable_backlog_items": owned + unclaimed,
+            "claim_scope": {"other_agent_claimed_items": [
+                row for row in rows if row not in owned + unclaimed]},
+        })
+
+    original = derive(items)
+    assert original is not None
+    delta = semantic_delta_from_writeback(obligation=original, progress_observation={
+        "result_class": "advanced", "surface_id": "dependency-recovery",
+        "evidence_ids": ["evidence:independent-acceptance"],
+    })
+    assert delta["accepted"]
+    ack = {"recorded": True, "semantic_delta": delta}
+    assert derive(items, ack) is None
+    changed = deepcopy(items)
+    if change == "peer_claim":
+        changed[-1]["claimed_by"] = "peer-agent"
+    elif change == "unclaimed_priority":
+        changed[-1]["priority"] = "P0"
+    elif change == "owned_priority":
+        changed[0]["priority"] = "P0"
+    elif change == "owned_priority_marker":
+        changed[0].update(priority="P0", text="[P0] Check five finite integer samples.")
+    elif change == "owned_title":
+        changed[0]["title"] = "Integer sample review"
+    elif change == "owned_text":
+        changed[0]["text"] = "Prove the result for every integer, beyond the finite tested samples."
+    elif change == "owned_target":
+        changed[0]["target_key"] = "experiment:authorized-new-probe"
+    else:
+        changed[0]["updated_at"] = "2026-08-22T10:00:00+08:00"
+    # The open obligation and an accepted ACK use the same owned-work boundary.
+    current = derive(changed)
+    assert (current["obligation_id"] != original["obligation_id"]) is rearms
+    if change in {"owned_priority", "owned_priority_marker", "owned_title"}:
+        assert current["triggers"][0]["frontier_revision"] != original["triggers"][0]["frontier_revision"]
+    assert (derive(changed, ack) is not None) is rearms
+
+
+def test_frontier_revision_index_preserves_complete_agent_lane_semantics() -> None:
+    source_items = [
+        {
+            **_advancement("todo_000000000001", "current-agent"),
+            "updated_at": "2026-08-22T09:00:00+08:00",
+        },
+        {
+            **_advancement("todo_000000000002", "other-agent"),
+            "updated_at": "2026-08-22T09:00:00+08:00",
+        },
+        {
+            "todo_id": "todo_000000000003",
+            "status": "open",
+            "task_class": "advancement_task",
+            "updated_at": "2026-08-22T09:00:00+08:00",
+        },
+    ]
+    original = summary_frontier_index(source_items)
+    current_revision = original["by_agent"][0]
+    assert current_revision["agent_id"] == "current-agent"
+    unclaimed_revision = original["unclaimed"]
+    all_revision = original["all"]
+    assert current_revision["complete"] is True
+    assert unclaimed_revision["complete"] is True
+    assert all_revision["complete"] is True
+
+    other_agent_change = deepcopy(source_items)
+    other_agent_change[1]["priority"] = "P0"
+    changed_other = summary_frontier_index(other_agent_change)
+    assert changed_other["by_agent"][0] == current_revision
+    assert changed_other["unclaimed"] == unclaimed_revision
+    assert changed_other["all"] != all_revision
+
+    unclaimed_change = deepcopy(source_items)
+    unclaimed_change[2]["priority"] = "P0"
+    changed_unclaimed = summary_frontier_index(unclaimed_change)
+    assert changed_unclaimed["by_agent"][0] != current_revision
+    assert changed_unclaimed["unclaimed"] != unclaimed_revision
+
+
+def test_frontier_revision_index_rejects_malformed_agent_rows() -> None:
+    assert long_todo_chain_successor_checkpoints(
+        _long_chain_source_items(), agent_id="current-agent", triggers=[],
+        obligation_id="replan-test", candidates=[], frontier_revision_index={
+            "schema_version": TODO_FRONTIER_REVISION_INDEX_SCHEMA_VERSION,
+            "all": {"complete": False},
+            "unclaimed": {"complete": False},
+            "by_agent": "not-a-list",
+        },
+    ) is None
 
 
 def test_todo_succession_gap_prefers_exact_lifecycle_settlement() -> None:
@@ -305,15 +447,15 @@ def test_todo_succession_gap_prefers_exact_lifecycle_settlement() -> None:
     assert obligation is not None
     assert obligation["resolution_mode"] == "todo_lifecycle_settlement"
     assert obligation["guidance_actions"][0] == "record_no_followup"
-    assert obligation["todo_actions"][0] == {
+    action = obligation["todo_actions"][0]
+    assert "original completion identity" in action["text"]
+    assert "mutable successor" in action["text"]
+    assert "do not update terminal links" in action["text"]
+    assert {key: value for key, value in action.items() if key != "text"} == {
         "action": "settle",
         "role": "agent",
         "priority": "P0",
         "todo_ids": ["todo_111111111111", "todo_222222222222"],
-        "text": (
-            "settle the exact completed Todos through no-follow-up or link each "
-            "to a real runnable successor"
-        ),
     }
     assert "todo_111111111111, todo_222222222222" in obligation[
         "recommended_action"
@@ -353,7 +495,7 @@ def test_todo_succession_gap_cli_actions_do_not_require_semantic_refresh() -> No
     )
 
     assert "--todo-id todo_111111111111" in actions[0]
-    assert "--turn-instance-id turn-implement" in actions[0]
+    assert "--completion-identity-key turn-implement" in actions[0]
     assert "--todo-id todo_222222222222" in actions[1]
     assert "--turn-instance-id" not in actions[1]
     assert all("refresh-state" not in action for action in actions)
@@ -361,6 +503,37 @@ def test_todo_succession_gap_cli_actions_do_not_require_semantic_refresh() -> No
     assert actions[-1] == (
         "loopx --format json quota should-run --goal-id goal-example "
         "--agent-id current-agent --available-capability shell"
+    )
+
+
+def test_todo_succession_gap_cli_actions_preserve_runtime_root() -> None:
+    actions = interaction_next_cli_actions(
+        {
+            "goal_id": "goal-example",
+            "agent_identity": {"agent_id": "current-agent"},
+            "autonomous_replan_obligation": {
+                "resolution_mode": "todo_lifecycle_settlement",
+                "triggers": [
+                    {
+                        "kind": "completed_advancement_without_successor",
+                        "todo_id": "todo_111111111111",
+                        "completion_turn_key": "turn-implement",
+                    }
+                ],
+            },
+        },
+        mode="autonomous_replan",
+        available_capabilities=["shell"],
+        runtime_root="/tmp/loopx runtime",
+    )
+
+    assert actions[0].startswith(
+        "when no real successor remains for completed Todo "
+        "todo_111111111111: loopx --runtime-root '/tmp/loopx runtime' todo complete"
+    )
+    assert actions[-1] == (
+        "loopx --runtime-root '/tmp/loopx runtime' --format json quota should-run "
+        "--goal-id goal-example --agent-id current-agent --available-capability shell"
     )
 
 
@@ -395,6 +568,9 @@ def test_todo_succession_gap_interaction_contract_is_model_actionable() -> None:
 
     assert contract["mode"] == "autonomous_replan"
     assert "todo_111111111111" in contract["agent_channel"]["primary_action"]
+    assert contract["agent_channel"]["must_attempt"] is True
+    assert contract["agent_channel"]["delivery_allowed"] is True
+    assert contract["agent_channel"]["quiet_noop_allowed"] is False
     assert "produce one typed outcome" not in contract["agent_channel"][
         "primary_action"
     ]
@@ -405,7 +581,7 @@ def test_todo_succession_gap_interaction_contract_is_model_actionable() -> None:
     assert "settlement_plan" not in contract["cli_channel"]
     actions = contract["cli_channel"]["next_cli_actions"]
     assert "--todo-id todo_111111111111" in actions[0]
-    assert "--turn-instance-id turn-implement" in actions[0]
+    assert "--completion-identity-key turn-implement" in actions[0]
     assert all("refresh-state" not in action for action in actions)
     assert all("spend-slot" not in action for action in actions)
 
@@ -501,6 +677,14 @@ def test_exact_replan_successor_uses_authoritative_todo_source() -> None:
         "action_kind": "validate",
         "target_key": "experiment:selected-bounded-slice",
     }
+    due = {"obligation_id": obligation_id, "triggers": [{"kind": "periodic_review_due"}]}
+    assert replan_successor_transition_ack(
+        None, agent_id="current-agent", replan_obligation=due,
+        agent_todo_items=[successor],
+    ) is None
+    assert not autonomous_replan_ack_satisfies_obligation(
+        ack, replan_obligation=due, acceptance_gaps=None,
+    )
 
 
 def test_long_chain_successor_transition_is_bound_to_current_frontier() -> None:
@@ -509,7 +693,7 @@ def test_long_chain_successor_transition_is_bound_to_current_frontier() -> None:
     assert original is not None
     changed_items = deepcopy(source_items)
     changed_items[-1]["updated_at"] = "2026-08-22T09:10:00+08:00"
-    changed_items[-1]["priority"] = "P0"
+    changed_items[-1]["target_key"] = "experiment:authorized-new-probe"
     rearmed = _derive_long_chain(changed_items)
     assert rearmed is not None
 
@@ -549,14 +733,16 @@ def test_long_chain_successor_transition_is_bound_to_current_frontier() -> None:
     assert post_successor_obligation["triggers"][0]["frontier_revision"] != (
         rearmed["triggers"][0]["frontier_revision"]
     )
-    assert fresh_ack["semantic_delta"]["trigger_checkpoints"] == [
-        {
-            "kind": "long_todo_chain",
-            "frontier_revision": post_successor_obligation["triggers"][0][
-                "frontier_revision"
-            ],
-        }
-    ]
+    fresh_checkpoints = fresh_ack["semantic_delta"]["trigger_checkpoints"]
+    assert [row["kind"] for row in fresh_checkpoints] == ["long_todo_chain"]
+    assert fresh_checkpoints[0]["frontier_revision"] == (
+        post_successor_obligation["triggers"][0]["frontier_revision"]
+    )
+    # The checkpoint also records the identity of the rows this agent owns, so
+    # another lane taking over unclaimed work does not re-arm this ACK.
+    assert fresh_checkpoints[0]["frontier_owned_identity"].startswith(
+        "todo_frontier_revision_v0:owned:"
+    )
     assert (
         _derive_long_chain(
             [*changed_items, stale_successor, fresh_successor],
@@ -712,6 +898,7 @@ def _ack(generated_at: str, delta_kind: str = "goal_vision_patch") -> dict[str, 
         "generated_at": generated_at,
         "schema_version": "autonomous_replan_ack_v0",
         "recorded": True,
+        "semantic_delta": {"accepted": True, "outcomes": ["fresh_vision_path_outcome"]},
         "delta_contract": {
             "schema_version": "repair_delta_contract_v0",
             "required": True,
@@ -879,12 +1066,13 @@ def test_open_user_action_owns_empty_frontier_without_obligation() -> None:
 
     assert obligation is None, "open user-owned work owns the empty frontier"
 
-def test_vision_patch_ack_settles_newer_gap_from_the_ack_turn() -> None:
+@pytest.mark.parametrize("delta_kind", ["goal_vision_patch", "goal_vision_replan_trigger"])
+def test_old_vision_ack_does_not_cover_later_gap(delta_kind: str) -> None:
     gap_time = "2026-08-13T09:10:00+08:00"
     ack_time = "2026-08-13T09:00:00+08:00"
 
     obligation = derive_goal_frontier_replan_obligation_from_summaries(
-        user_todo_summary={"open_count": 1},
+        user_todo_summary={"open_count": 0},
         agent_todo_summary={
             "open_count": 0,
             "claimed_advancement_open_count": 0,
@@ -897,9 +1085,31 @@ def test_vision_patch_ack_settles_newer_gap_from_the_ack_turn() -> None:
         agent_id="current-agent",
         existing_replan_obligation=None,
         acceptance_gaps=_vision_gap_with_generated_at(gap_time),
-        latest_replan_ack=_ack(ack_time, delta_kind="goal_vision_patch"),
+        latest_replan_ack=_ack(ack_time, delta_kind=delta_kind),
     )
 
-    assert obligation is None, (
-        "a goal_vision_patch ack settles vision gaps written by the ack turn itself"
-    )
+    assert obligation is not None, "later evidence must rearm even after a vision-patch ACK"
+
+
+def test_vision_ack_and_gap_from_same_durable_run_do_not_rearm() -> None:
+    from loopx.control_plane.goals.goal_frontier import _vision_gap_acknowledged
+
+    timestamp = "2026-08-13T09:00:00+08:00"
+    assert _vision_gap_acknowledged(_vision_gap_with_generated_at(timestamp), _ack(timestamp))
+
+
+def test_lifecycle_review_identity_binds_todo_and_original_completion_not_display_text() -> None:
+    def identity(todo_id: str, completion: str, text: str = "Verified source") -> str:
+        result = derive_goal_frontier_replan_obligation_from_summaries(
+            user_todo_summary={"open_count": 0},
+            agent_todo_summary={"open_count": 0, "completed_without_successor_items": [
+                {"todo_id": todo_id, "completion_turn_key": completion, "text": text,
+                 "task_class": "advancement_task", "claimed_by": "current-agent"}]},
+            work_lane_contract=None, agent_id="current-agent", existing_replan_obligation=None,
+        )
+        assert result is not None
+        return result["obligation_id"]
+    original = identity("todo_original", "original-completion")
+    assert original == identity("todo_original", "original-completion", "Changed display wording")
+    assert original != identity("todo_other", "original-completion")
+    assert original != identity("todo_original", "later-completion")

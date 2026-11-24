@@ -36,14 +36,15 @@ Then run `loopx doctor`. Work only from the current project root:
    goal or the active objective.
 2. If the project is not connected, prefer `loopx connect`; use
    `loopx bootstrap` only when project state clearly needs initialization.
-3. Ensure `.loopx/`, `.codex/goals/`, and `.local/` are ignored.
+3. Ensure `.loopx/` and `.local/` are ignored; keep legacy `.codex/goals/`
+   ignored when it exists.
 4. Set up the thin LoopX heartbeat for this surface. For Codex App, start the
    recurring automation at 3 minutes, then follow
    `quota should-run.scheduler_hint` for backoff and self-stop behavior.
 5. Stop after setup and report the active state id, current user gate, top
    agent todo, and next safe action.
 
-Do not commit `.loopx/`, `.codex/goals/`, `.local/`, live ACTIVE_GOAL_STATE
+Do not commit `.loopx/`, legacy `.codex/goals/`, `.local/`, live ACTIVE_GOAL_STATE
 files, runtime registries, raw logs, credentials, or private local paths. Do
 not start longer delivery work in this setup turn.
 ```
@@ -63,9 +64,15 @@ Success looks like this:
 
 - `loopx doctor` passes;
 - the project has `.loopx/registry.json`;
-- the project has `.codex/goals/<goal-id>/ACTIVE_GOAL_STATE.md`;
+- a new project has `.loopx/goals/<goal-id>/ACTIVE_GOAL_STATE.md`;
 - `loopx status` shows the goal and who should act next;
 - local runtime state is ignored, not committed.
+
+For existing installations, `loopx doctor --format json` reports
+`local_state_route`. A legacy-only installation stays on its declared route
+until the operator follows the [explicit local-state migration](../product/migrations/local-state-path-migration.md).
+Keep the old project `.codex/goals/` directory ignored until migration and
+readback are complete.
 
 ## Command Skill Registration
 
@@ -94,13 +101,19 @@ can discover user-installed skills:
   which drives the session over the OpenCode 2 HTTP API and owns the loop
   timers, so long runs survive TUI close. OpenCode 1 plugins do not run under
   OpenCode 2; see `loopx/opencode2_goal_mode/README.md`.
-- Pi: the self-contained goal extension under `.pi/extensions/loopx-goal.ts`
-  (with its loop core in `.pi/extensions/pi-goal-loop-runtime.mjs`) exposes
-  `/loopx` after restart and runs the quota-gated goal loop through
-  `loopx_goal_activate`. It is installed explicitly with
-  `loopx slash-commands --install --surface pi` (pass `--pi-project <path>`
-  to target another project from a different directory); private binding state
-  stays under each project's `.loopx/pi/` (already gitignored via `.loopx/`).
+- Pi: the self-contained goal extension exposes `/loopx` after `/reload` or a
+  restart and runs the quota-gated goal loop through `loopx_goal_activate`.
+  `loopx slash-commands --install --surface pi` installs it for the current
+  project; add `--pi-project <path>` for another project, or `--pi-scope user`
+  to install the discoverable `index.ts` and runtime under
+  `<agent-dir>/extensions/loopx/` for all projects. `<agent-dir>` defaults to
+  `~/.pi/agent` and follows `PI_CODING_AGENT_DIR`. Run
+  `loopx slash-commands --inspect --surface pi` to read both scopes, including
+  stale or partial installs and a warning when both scopes would load. To
+  remove one scope, use `--uninstall --surface pi` with that scope; reinstall
+  with `--install` to upgrade managed files. Only extension code is global:
+  private bindings remain under each project's `.loopx/pi/` (already
+  gitignored via `.loopx/`).
 
 The command family is the same across surfaces, even when the host-specific
 entry point is different:
@@ -158,6 +171,34 @@ project state. The legacy `codex-ide` value remains an accepted compatibility
 alias but is no longer advertised. This prevents an upgrade from silently
 routing an IDE plugin or terminal start to a desktop-app heartbeat.
 
+## Inspect an earlier run-history window
+
+To investigate an earlier day without dumping all newer runs, select a time
+window before applying the display limit:
+
+```bash
+loopx --format json history --goal-id <goal-id> --agent-id <agent-id> \
+  --since 2026-06-01T00:00:00Z --until 2026-06-02T00:00:00Z --limit 10
+```
+
+`--since` includes its boundary; `--until` excludes it, so adjacent windows do
+not overlap. Either bound may be omitted. ISO offsets are compared as instants;
+dates and timestamps without an offset use UTC. The default unfiltered read is
+unchanged. The selected window applies to run rows and retained semantic-history
+references, while quota accounting still uses the complete Goal history.
+Active retry status also uses complete relevant retained evidence: a later
+progress record outside the window can supersede an older blocker. The older
+Run stays readable in the window, but is not reported as an active retry.
+`run_count` counts matching runs before `--limit`; `time_filter` reports the
+normalized bounds and the number of excluded rows with missing or invalid times.
+Malformed/reversed bounds and combinations with history repair/audit actions or
+exact `--evidence-ref` reads are rejected.
+
+This is a read-only CLI investigation view over the retained local run indexes,
+not an archive restore or a bounded-cost index query. It reads those indexes;
+it cannot recover pruned or externally archived events. The research workspace
+retains its separate source-record browser and day-group navigation.
+
 ## Local State Backup
 
 Before risky migrations, local scheduler changes, or release-install repair,
@@ -173,10 +214,10 @@ Write the archive only when the preview looks right:
 loopx backup-state --project . --execute
 ```
 
-The backup is written under `~/.codex/loopx/backups` by default. It captures the
+The backup is written under `~/.loopx/backups` by default. It captures the
 shared LoopX runtime root, Codex App automations, installed `loopx-*` skills,
 the current project's state, and every reachable project's `.loopx`,
-`.codex/goals`, `.claude/goals`, `.local/goals`, registry-declared active state,
+`.loopx/goals`, `.claude/goals`, `.local/goals`, registry-declared active state,
 and source registry discovered from the global registry. Missing or stale
 project routes remain visible in the manifest. Use `--current-project-only`
 only when a deliberately narrow archive is sufficient. Treat the archive and
@@ -191,6 +232,25 @@ target overlap identifies exact recovery targets such as active-state or
 source-registry files that are also covered by a parent project directory.
 After `--execute`, use `archive_size_bytes` and the archive/logical ratio to
 judge the actual storage cost.
+
+SQLite files are recognized by content and captured through the same qualified
+TypeScript online-backup implementation used by authority format upgrades.
+The archive contains a verified standalone database at its original relative
+path; live `-wal`, `-shm`, and rollback-journal sidecars are omitted. Duplicate
+targets reuse that database snapshot. The manifest's
+`execution.sqlite_snapshots` records its archive paths, SHA-256, size, and actual
+Node/SQLite runtime identity. A snapshot failure fails the command and leaves
+the previously published archive intact. No raw-file fallback is used.
+
+Each database snapshot is transactionally consistent, including committed WAL
+data. The complete archive is **not one simultaneous snapshot across databases,
+registries, File journals, and project files**. Quiesce writers through the
+existing migration workflow before a coordinated cutover; a successful local
+backup does not grant restoration or promotion authority. Restore into an
+isolated directory first, verify the archived SQLite hashes and complete Goal
+history/receipts through `authority-archive`, and use the supported migration
+route to preserve writes made after the backup. Do not unpack old bytes over an
+active Goal.
 
 ## Codex CLI TUI Setup
 
@@ -216,10 +276,10 @@ loopx workflow-skills --install
 Then run `loopx doctor`. Work only from this project root: if LoopX state
 already exists, reuse it and do not create or overwrite a goal or the active objective; if the project
 is not connected, prefer `loopx connect`, and use `loopx bootstrap` only when
-project state clearly needs initialization. Ensure `.loopx/`, `.codex/goals/`,
+project state clearly needs initialization. Ensure `.loopx/`, `.loopx/goals/`,
 and `.local/` are ignored. Keep me in this TUI, do not use hidden headless
-execution. After the project is connected, generate the thin heartbeat prompt
-and set the current Codex CLI task body with `/goal <thin task_body>`. Then
+execution. After the project is connected, generate the host-specific bootstrap loader with `heartbeat-prompt --bootstrap --thin --runtime-profile codex_cli`
+and set the current Codex CLI task body with `/goal <loader task_body>`. Then
 stop and report the active state id, current user gate, top agent todo, and
 next safe action.
 ```
@@ -230,10 +290,17 @@ show the current state id, concrete user gate if one exists, top user todo if
 any, top agent todo, and next safe action before longer delivery work. The
 setup turn should not spend quota for delivery unless the user explicitly asks
 it to do delivery in the setup turn. The agent should still generate
-`heartbeat-prompt --thin` and install that body into the surface during setup:
-Codex CLI gets `/goal <thin task_body>`, while Codex App gets a heartbeat
+`heartbeat-prompt --bootstrap --thin --runtime-profile codex_cli` and install that body into the surface during setup:
+Codex CLI gets `/goal <loader task_body>`, while Codex App gets a heartbeat
 automation body that starts at 3 minutes and then follows
 `scheduler_hint`.
+
+The CLI loader binds `codex_cli`; App automation uses its own
+`heartbeat-prompt --bootstrap --thin --codex-app` loader. Each loads current
+instructions on entry. Never reuse the CLI guard for an App wake, freeze a Turn
+identity, or save today's execution body as the permanent prompt. Apply a new
+loader through the authorized host update and read it back; source changes alone
+do not migrate existing automations. Existing authority and cadence floors remain.
 
 Once `loopx` is installed, generate a stricter repo-specific setup
 message:
@@ -245,7 +312,7 @@ loopx codex-cli-bootstrap-message --project . --goal-id <goal-id>
 Keep that as the preferred interactive path: the human watches and steers in
 Codex CLI TUI, while LoopX owns quota/status/todos/gates/writeback. The
 generated packet also shows the no-clone install-repair command, the
-post-bootstrap thin prompt generation command, and a transcript-free validation
+host-specific bootstrap loader commands, and a transcript-free validation
 checklist, so a fresh repo path can be reviewed without touching raw Codex
 session data.
 
@@ -255,90 +322,17 @@ If the user only wants the pasteable TUI text, omit the wrapper:
 loopx codex-cli-bootstrap-message --project . --goal-id <goal-id> --message-only
 ```
 
-To review the whole one-message loop contract without running Codex, generate a
-pilot packet:
-
-```bash
-loopx codex-cli-one-message-loop-pilot --project . --goal-id <goal-id> --agent-id <agent-id>
-```
-
-The pilot ties the first TUI paste message to the later
-`codex-cli-local-scheduler-exec` bridge. It stays dry-run by default and is for
-operators/contributors validating the path, not a prerequisite for first-time
-users.
-
-To review the returning-user local-driver loop without touching a real Codex
-session, generate the visible local-driver pilot packet:
-
-```bash
-loopx codex-cli-visible-local-driver-pilot --project . --goal-id <goal-id> --agent-id <agent-id>
-```
-
-This keeps the first-message TUI start primary, then models later scheduler
-ticks, visible proof, idle guard, guarded execution, blocker writeback, and
-no-transcript boundaries as public-safe metadata.
-
-The later-turn rule is intentionally stricter than the first message: LoopX may
-add a visible steering turn only after public-safe visible proof,
-runtime idle evidence, a fresh guard, and explicit execution bounds. Without
-that proof, the driver should write a compact blocker or keep the one-message
-setup bootstrap as the product path.
-
-The commands below are optional automation checks after the setup path
-works. To evaluate future same-session automation support without touching
-transcripts or session files, run:
-
-```bash
-loopx codex-cli-session-probe
-```
-
-To turn that probe into a dry-run driver decision without mutating a Codex
-session, run:
-
-```bash
-loopx codex-cli-visible-driver-plan --project . --goal-id <goal-id>
-```
-
-To see the full local automation setup plan in one packet, including quota
-guard, visible-driver decision, TUI bootstrap command, the headless-disabled
-boundary, and idle-guard requirement, run:
-
-```bash
-loopx codex-cli-local-driver-plan --project . --goal-id <goal-id> --agent-id <agent-id>
-```
-
-This is still dry-run-only. It does not run Codex, read transcripts, read
-session files, mutate a session, or spend quota.
-
-When the driver plan says `resume [PROMPT]` or `remote-control` might support a
-visible same-session path, validate a public-safe proof fixture before treating
-that path as automation:
-
-```bash
-loopx codex-cli-visible-session-proof \
-  --project . \
-  --goal-id <goal-id> \
-  --agent-id <agent-id> \
-  --proof-fixture visible-proof.public.json
-```
-
-The fixture should contain only booleans and public-safe labels proving user
-opt-in, quota guard, idle guard, visible turn, interruptibility, no transcript
-or session-file reads, and compact writeback planning.
-
-The default Codex CLI setup-then-`/goal` product path does not offer a headless fallback.
-For compatibility, the old handoff command only reports the disabled boundary
-and points back to the message-only TUI bootstrap:
-
-```bash
-loopx codex-cli-exec-handoff --project . --goal-id <goal-id>
-```
+The default Codex CLI setup-then-`/goal` product path keeps execution visible in
+the TUI and preserves a headless-disabled boundary for onboarding. Explicit
+isolated-headless automation runs use `loopx turn plan` and `loopx turn run-once`
+instead; see the [LoopX Turn quickstart](../product/runtimes/codex-cli/loopx-turn-codex-cli-quickstart.md)
+and [Automation driver audit](../product/runtimes/codex-cli/codex-cli-automation-driver.md).
 
 See the [Codex CLI TUI-first loop](../product/runtimes/codex-cli/codex-cli-tui-loop.md) contract
 for the bootstrap, session-attached automation, and headless-disabled boundary.
 The [Codex CLI first-run rehearsal](../product/runtimes/codex-cli/codex-cli-first-run-rehearsal.md)
 keeps the shortest user-facing route in one place: no-clone install,
-one-message setup bootstrap, and proof-capture fixtures for later automation.
+one-message setup bootstrap, and explicit `loopx turn` boundaries.
 For current product scheduling, the
 [Codex CLI TUI continuation priority](../product/runtimes/codex-cli/codex-cli-tui-continuation-priority.md)
 keeps same-open-TUI continuation ahead of frontstage or showcase polish when
@@ -376,9 +370,128 @@ loopx slash-commands --install
 loopx doctor
 ```
 
-The GitHub Pages archive installer remains available as a fallback. Archive
-installs keep their existing `loopx update --check|--dry-run|--execute` path;
-do not mix that updater with the active PyPI executable.
+The GitHub Pages archive installer remains available as a fallback. `loopx
+update` now projects the active installation owner: PyPI environments stay
+package-manager owned, archive snapshots stay LoopX owned, and live source
+checkouts stay Git owned.
+
+### Workflow Skill Versions And Pinned Hosts
+
+Each installed skill, including the generated `$loopx` entry, records its source
+LoopX version in `.loopx-skill-version.json`. The root
+`.loopx-skill-install.json` also records `loopx_version`. Inspect with the CLI
+that the host will actually run:
+
+```bash
+loopx workflow-skills --skills-dir ./host-skills --format json
+loopx workflow-skills --install --skills-dir ./host-skills
+```
+
+The inspect result's `before` object reports `loopx_version`,
+`expected_loopx_version`, and `loopx_version_matches`; install reports these
+under `after`. A mismatch or missing/invalid marker makes the readback not
+ready. Legacy `loopx_skill_install_readback_v0` manifests require a one-time
+reinstall using a CLI that includes this version-marker fix. Reinstalling with
+an unpatched pinned CLI still writes unversioned metadata; upgrade that runtime
+or backport the fix first. This readiness rule also applies to
+Ark Managed Agent doctor, Ark/DeepSeek filesystem onboarding, and isolated
+native profiles. An isolated profile compares against its own installed CLI,
+even when its supervisor uses another LoopX version.
+
+User-level skill directories can be shared across hosts. For a pinned host,
+run its pinned executable (for example `./loopx-sidecar`) for both commands
+and use a separate `--skills-dir` for each runtime version. Configure the host
+to load that directory and compare the readback before loading skills; older
+or third-party hosts do not gain this check automatically. Restart the host
+after installing or repairing skills so its session reloads them. To roll
+back, reinstall into that same directory using the previous pinned executable.
+These commands only manage skill files; they grant no repository, network,
+credential, or merge authority.
+
+### Host-Bundled / Frozen Workflow Skills
+
+PyInstaller hosts can bundle the existing skill data without Python distribution
+metadata at runtime. In a frozen process, LoopX reads
+`share/loopx/skills` under `sys._MEIPASS` first, then the same bundle's `skills`
+directory for compatibility with existing checkout-like bundles. The first
+complete skill set wins; files from different layouts are never combined.
+If the freezer does not expose `_MEIPASS`, the root beside the bundled `loopx`
+package is used. These are existing wheel and source layouts, not a new wheel
+format. If neither contains a complete skill set, discovery fails with rebuild
+instructions, without searching another checkout or Python installation.
+Regular checkout and pip discovery is unchanged.
+
+Build from an isolated environment containing the exact LoopX version shipped
+with the host. Include the **entire** `share/loopx/skills` tree from that wheel,
+including each skill's `SKILL.md`, `agents/`, `references/`, and `scripts/` files
+where present. The wheel's data-file list is authoritative; do not copy only
+`loopx-project` or a separately maintained prompt. `--collect-data loopx` alone
+does not include wheel data installed outside the Python package.
+
+For example, create `sidecar.py`:
+
+```python
+from loopx.entrypoint import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+After installing your pinned LoopX wheel and PyInstaller in the build environment,
+run this Python build script there:
+
+```python
+import subprocess
+import sys
+from loopx.workflow_skill_install import resolve_workflow_skill_source
+
+source = resolve_workflow_skill_source()
+if not source["available"]:
+    raise SystemExit(source["reason"])
+subprocess.run([
+    sys.executable, "-m", "PyInstaller", "--onefile",
+    "--name", "loopx-sidecar", "--collect-submodules", "loopx",
+    "--collect-data", "loopx",
+    "--add-data", f"{source['skills_root']}:share/loopx/skills",
+    "sidecar.py",
+], check=True)
+```
+
+Use `--onedir` in place of `--onefile` for a directory bundle. See
+[PyInstaller runtime paths and data placement](https://pyinstaller.org/en/stable/runtime-information.html).
+This recipe covers skill installation and static slash-command generation;
+hosts must separately package and validate dependencies and non-Python resources
+for other LoopX capabilities they enable. Build and test on each target OS.
+
+Validate against a disposable host directory (on Windows use
+`dist/loopx-sidecar.exe`):
+
+```bash
+dist/loopx-sidecar --format json workflow-skills --skills-dir ./test-host/skills
+dist/loopx-sidecar --format json workflow-skills --install --skills-dir ./test-host/skills
+dist/loopx-sidecar --format json workflow-skills --skills-dir ./test-host/skills
+dist/loopx-sidecar --format json slash-commands --install --surface codex --codex-home ./test-host
+```
+
+Expect `source.kind: frozen_bundle`, successful installation, then
+`install_required: false`. The managed readback records the frozen bundle's
+LoopX package version, so a newer sidecar reports the older installed skills as
+requiring refresh. Static slash commands are generated from bundled Python code
+and do not require the workflow-skill data tree. `--skills-dir` selects the
+installation destination, not a source override. Skill installation does not
+enable schedulers, launch goals, or grant the host additional authority.
+
+Rebuild with the new pinned wheel and reinstall skills when upgrading the host;
+restart the agent host to reload them. Keep the previous sidecar for rollback and
+reinstall its matching skills. To remove managed material from the test host:
+
+```bash
+dist/loopx-sidecar workflow-skills --uninstall --skills-dir ./test-host/skills
+dist/loopx-sidecar slash-commands --uninstall --surface codex --codex-home ./test-host
+```
+
+Workflow uninstall preserves locally modified skills. Review preserved files
+before deleting the disposable directory.
 
 ## Contributor Install
 
@@ -386,7 +499,7 @@ Install one shared local checkout when you want to develop LoopX itself
 or test a live canary wrapper:
 
 ```bash
-git clone https://github.com/huangruiteng/loopx ~/loopx
+git clone https://github.com/loopx-project/loopx ~/loopx
 ~/loopx/scripts/install-local.sh
 loopx doctor
 ```
@@ -417,13 +530,18 @@ checkout to the default local release.
 - the local manual page under `~/.local/share/man`;
 - the LoopX Codex skills under `~/.codex/skills`.
 
-For a no-clone install, use `loopx update` to refresh the release snapshot and
-skills:
+Use the named update actions so read-only inspection and mutation are visible:
 
 ```bash
-loopx update --check
-loopx update --execute
+loopx update check
+loopx update plan
+loopx update apply
 ```
+
+On PyPI installs, apply uses the owning pip or pipx environment and then
+refreshes host material and readbacks. On archive installs, it atomically
+replaces the release snapshot. A live checkout is never pulled or rewritten by
+this command; update Git explicitly and rerun the contributor installer.
 
 For a contributor checkout, re-run the installer to update both surfaces from
 the current clean `origin/main` checkout:
@@ -493,8 +611,8 @@ Keep three layers separate:
 
 - **Global skill behavior** belongs in `skills/` and is installed under
   `~/.codex/skills`.
-- **Project state** belongs in `.loopx/`, `.codex/goals/`, and
-  `~/.codex/loopx`; keep it local unless a sanitized fixture is
+- **Project state** belongs in `.loopx/`, `.loopx/goals/`, and
+  `~/.loopx`; keep it local unless a sanitized fixture is
   intentionally committed.
 - **Repository rules** belong in `AGENTS.md`, `CONTRIBUTING.md`, and public
   docs. They can constrain contributors and agents in this repository, but they
@@ -559,7 +677,7 @@ loopx uninstall-project --goal-id <goal-id> --archive-state --execute
 from the shared global registry only when the global entry's `source_registry`
 points back to this project. It does not uninstall the LoopX CLI and does not
 delete other projects' runtime history. Pass `--archive-state` to move this
-project's `.codex/goals/<goal-id>/` directory under
+project's registered Goal state directory under
 `.loopx/archived-project-state/` instead of leaving it in place.
 
 For manual cleanup of the reusable LoopX CLI and skill surfaces, remove only
@@ -576,7 +694,7 @@ rm -rf ~/.codex/skills/loopx-project \
 ```
 
 This does not archive connected project state or runtime history. Archive or
-remove `.loopx/`, `.codex/goals/`, and `~/.codex/loopx` only when
+remove `.loopx/` and `~/.loopx` only when
 you intentionally want to retire those local project records.
 
 ## Connect A Project Manually
@@ -602,9 +720,9 @@ This creates or connects:
 ```text
 your-project/
   .loopx/registry.json
-  .codex/goals/your-project-goal/ACTIVE_GOAL_STATE.md
+  .loopx/goals/your-project-goal/ACTIVE_GOAL_STATE.md
 
-~/.codex/loopx/
+~/.loopx/
   goals/<goal-id>/runs/
 ```
 
@@ -613,6 +731,7 @@ the connected project `.gitignore` before committing:
 
 ```gitignore
 .loopx/
+# Legacy projects only:
 .codex/goals/
 .opencode/goals/
 goals/**/ACTIVE_GOAL_STATE.md
@@ -742,6 +861,7 @@ loopx operator-gate \
 
 loopx reward \
   --goal-id your-project-goal \
+  --actor-kind owner \
   --decision continue_route \
   --reward positive \
   --reason-summary "validation improved and the route is worth extending"
@@ -877,7 +997,7 @@ the completed migration again.
 
 `register-agent` resolves the existing global entry's `source_registry`, writes
 the project-local source of truth, and then syncs the shared global projection.
-If `~/.codex/loopx/registry.global.json` is not writable, the command fails
+If `~/.loopx/registry.global.json` is not writable, the command fails
 before changing the source registry and reports a `global_registry_write_denied`
 health error. Fix the shared runtime permission or run from a host that can
 write the LoopX runtime root, then rerun the command. Use `--no-global-sync`
@@ -897,27 +1017,34 @@ See [heartbeat automation prompt](../heartbeat-automation-prompt.md) and
 
 ## Dashboard
 
-Dashboard status is an experimental operator preview. The CLI and
-`loopx status` remain the canonical daily workflow; the React dashboard
-is useful for demos, public-safe fixtures, and local inspection.
+The Personal Workspace started by `loopx dashboard` is the supported
+browser/PWA entry for everyday use, as the README states: one local service
+serves the packaged UI, the status projection and Agent Chat. `loopx status`
+and the other CLI commands read the same state and remain the readback path
+for every claimed journey, for scripting and for remote hosts; neither surface
+is a preview of the other.
 
-Serve status JSON:
-
-```bash
-loopx serve-status --port 8765
-```
-
-Run the dashboard:
+Start the installed Personal Workspace with one command:
 
 ```bash
 loopx dashboard
 ```
 
-On first run, LoopX installs the dashboard's npm dependencies. The command then
-starts the UI, global status service, and Agent Chat service together. Open
-`http://127.0.0.1:5173/` after the readiness messages appear.
+The installed command serves the packaged UI, status projection, and Agent Chat
+from one process. It opens the browser by default; pass `--no-open` for a
+headless launch and use the URL printed by the command. With the default port,
+the workspace URL is `http://127.0.0.1:8767/chat/`. A separate
+`loopx serve-status` process is not required.
 
-For the shared multi-project view:
+For a minimum readback after starting with `--no-open`:
+
+```bash
+curl -fsS http://127.0.0.1:8767/chat/ >/dev/null
+curl -fsS http://127.0.0.1:8767/status.json
+```
+
+`serve-status` remains available when another client needs a standalone status
+feed, independently of the installed Personal Workspace:
 
 ```bash
 loopx serve-status --global-registry --port 8766 --limit 80
@@ -938,7 +1065,7 @@ The dashboard should answer, before raw log drill-down:
 - what boundary cannot be crossed yet.
 
 See
-[apps/presentation/dashboard/README.md](https://github.com/huangruiteng/loopx/blob/main/apps/presentation/dashboard/README.md).
+[apps/presentation/dashboard/README.md](https://github.com/loopx-project/loopx/blob/main/apps/presentation/dashboard/README.md).
 
 ## Public / Private Boundary
 
@@ -1011,7 +1138,7 @@ that omits dashboard validation; the runtime evidence records that skip.
 
 Start here:
 
-- [Documentation index](https://github.com/huangruiteng/loopx/blob/main/docs/README.md)
+- [Documentation index](https://github.com/loopx-project/loopx/blob/main/docs/README.md)
 - [Showcase catalog](../showcases/README.md)
 - [State interaction model](../state-interaction-model.md)
 - [Interaction pattern catalog](../concepts/interaction-pattern-catalog.md)
@@ -1022,10 +1149,10 @@ Start here:
 - [Heartbeat automation prompt](../heartbeat-automation-prompt.md)
 - [Long-task cadence hint](../operations/long-task-cadence-policy.md)
 - [Public/private boundary](../public-private-boundary.md)
-- [Benchmark research workspace](https://github.com/huangruiteng/loopx/blob/main/benchmark/README.md)
+- [Benchmark research workspace](https://github.com/loopx-project/loopx/blob/main/benchmark/README.md)
 - [Dashboard status contract](../status-data-contract.md)
 - [Codex peer task orchestration](../integrations/codex-subagent-orchestration.md)
-- [DeepSWE research practice](https://github.com/huangruiteng/loopx/blob/main/benchmark/deepswe/README.md)
+- [DeepSWE research practice](https://github.com/loopx-project/loopx/blob/main/benchmark/deepswe/README.md)
 
 ## Command Reference
 
@@ -1039,7 +1166,8 @@ bootstrap / connect     connect a project-local goal
 new-project-prompt      generate a Codex prompt for project connection
 demo                    create a disposable local demo goal
 doctor                  diagnose installation and import health
-update                  check or execute a no-clone LoopX self-update
+update [check|plan|apply] inspect or apply through the active install owner
+upgrade                 upgrade the CLI and the installed macOS App in one command
 registry                inspect registered goals
 registry-boundary       classify registry local/public boundary and push policy
 status                  show first-screen operator status

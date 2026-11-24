@@ -5,7 +5,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
-from ..chat_endpoints import AgentEndpointRegistry
+from ..chat.endpoints import AgentEndpointRegistry
 from ..history import load_registry
 from ..paths import resolve_runtime_root
 
@@ -26,7 +26,9 @@ def register_chat_endpoint_command(
         help="Manage owner-local ACP Agent bindings used by LoopX Chat.",
     )
     add_subcommand_format(parser)
-    parser.add_argument("action", choices=("list", "add", "remove"))
+    parser.add_argument(
+        "action", choices=("list", "add", "remove", "inspect-steward")
+    )
     parser.add_argument(
         "--config", help="Private JSON endpoint definition used by the add action."
     )
@@ -71,6 +73,30 @@ def handle_chat_endpoint_command(
                 "schema_version": "loopx_chat_endpoint_binding_v1",
                 "action": "removed" if deleted else "not_found",
                 "agent_id": args.agent_id,
+            }
+        elif args.action == "inspect-steward":
+            from ..capabilities.steward_executor import (
+                load_effective_steward_executor_defaults,
+            )
+            from ..chat_manager import manager_channel_binding, manager_channel_session
+            from ..chat_store import ChatSessionStore
+            from ..control_plane.operator_provider import (
+                operator_credential_source,
+                operator_provider_environ,
+            )
+
+            store = ChatSessionStore(runtime_root)
+            payload = {
+                "ok": True,
+                "schema_version": "loopx_steward_executor_readback_v0",
+                "binding": manager_channel_binding(
+                    operator_provider_environ(runtime_root),
+                    machine_defaults=load_effective_steward_executor_defaults(
+                        runtime_root
+                    ),
+                    session=manager_channel_session(store),
+                    credential_source=operator_credential_source(runtime_root),
+                ),
             }
         else:
             payload = {

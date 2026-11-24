@@ -374,11 +374,8 @@ def assert_connected_delivery_surface_loop_requires_macro_evidence() -> None:
     contract = payload["handoff_delivery_contract"]
     assert payload["ok"] is True, payload
     assert payload["connected_delivery_handoff"] is True, payload
-    required_reads = payload["project_agent_required_reads"]
-    assert required_reads[0]["kind"] == "agent_scoped_evidence_log", required_reads
-    assert required_reads[0]["agent_id"] == "codex-side-bypass", required_reads
-    assert "evidence-log" in required_reads[0]["command"], required_reads
-    assert " --agent-id codex-side-bypass " in f" {required_reads[0]['command']} ", required_reads
+    assert "project_agent_required_reads" not in payload, payload
+    assert payload["replan_context"]["agent_id"] == "codex-side-bypass", payload
     assert "quota should-run" in payload["project_agent_command"], payload
     assert "--goal-id delivery-side-bypass" in payload["project_agent_command"], payload
     assert contract["mode"] == "expand_after_surface_progress_loop", payload
@@ -387,8 +384,8 @@ def assert_connected_delivery_surface_loop_requires_macro_evidence() -> None:
     assert "connected-delivery" in handoff, handoff
     assert "真实 delivery" in handoff, handoff
     assert "可改文件、验证、写回、spend" in handoff, handoff
-    assert "必读流水账" in handoff, handoff
-    assert "evidence-log" in handoff, handoff
+    assert "重规划上下文" in handoff, handoff
+    assert "evidence-log" not in handoff, handoff
     assert "codex-side-bypass" in handoff, handoff
     assert "surface-only 下游传播" in handoff, handoff
     assert "只读或 dry-run 路径" not in handoff, handoff
@@ -406,7 +403,7 @@ def assert_connected_delivery_surface_loop_requires_macro_evidence() -> None:
     handoff_only = review_packet_handoff_only_payload(payload)
     assert_handoff_interface_budget(handoff_only, "connected-delivery handoff-only payload")
     assert_handoff_only_top_level_budget(handoff_only, "connected-delivery handoff-only payload")
-    assert handoff_only["project_agent_required_reads"] == required_reads, handoff_only
+    assert "project_agent_required_reads" not in handoff_only, handoff_only
     agent_contract = handoff_only["handoff_delivery_contract"]
     assert set(agent_contract) == {"mode", "instruction", "minimum_scale", "must_include", "if_blocked"}, handoff_only
     assert agent_contract["mode"] == "expand_after_surface_progress_loop", handoff_only
@@ -750,6 +747,35 @@ def assert_dense_handoff_stays_within_budget() -> None:
     assert_handoff_only_top_level_budget(handoff_only, "dense handoff-only json")
 
 
+def assert_overflow_cli_roundtrip() -> None:
+    """The real producer preserves constraints and the receiver cannot execute them."""
+    with tempfile.TemporaryDirectory(prefix="loopx-handoff-overflow-") as tmp:
+        root = Path(tmp)
+        registry = write_planned_registry(root)
+        mark_owner_review_todo_done(root)
+        # An independent synthetic approved command makes the actual CLI overflow.
+        command = "printf '%s' '" + "preserve-source-evidence " * 100 + "RETURN-VALIDATION'"
+        append_operator_gate_approval_fixture(root, command=command)
+        for handoff_only in (False, True):
+            flags = ["--handoff-only"] if handoff_only else []
+            args = ["review-packet", "--goal-id", GOAL_ID,  *flags]
+            payload = json.loads(run_cli(root, registry, "--format", "json", *args).stdout)
+            complete = payload["project_agent_handoff"]
+            assert payload["handoff_interface_budget"]["within_budget"] is False
+            assert "authority/material: topics=2, materials=4" in complete
+            assert "Run the read-only map dry-run after owner todo resolution." in complete
+            assert "生产动作、更高权限" in complete
+            assert command in complete
+            for input_format in ("json", "markdown"):
+                source = root / f"received.{input_format}"
+                source.write_text(run_cli(root, registry, "--format", input_format, *args).stdout)
+                result = run_cli(root, registry, "--format", "json", "handoff", "restore",
+                                 "--input", str(source), "--input-format", input_format)
+                restored = json.loads(result.stdout)
+                assert restored == {"ok": True, "handoff_text": complete}, restored
+                assert "【人只需判断】" not in restored["handoff_text"]
+
+
 def main() -> int:
     help_result = subprocess.run(
         [sys.executable, "-m", "loopx.cli", "review-packet", "--help"],
@@ -762,6 +788,7 @@ def main() -> int:
     assert "JSON output returns a minimized handoff payload" in compact_help, help_result.stdout
     assert "JSON output keeps the full payload" not in compact_help, help_result.stdout
 
+    assert_overflow_cli_roundtrip()
     assert_status_data_contract_documents_handoff_budget()
     assert_attention_queue_drives_approved_handoff_over_stale_history()
     assert_project_agent_handoff_prioritizes_advancement_todos()
@@ -782,8 +809,6 @@ def main() -> int:
             GOAL_ID,
             "--review-url",
             "https://example.invalid/review",
-            "--scan-root",
-            str(root / "project"),
         )
         packet = markdown_result.stdout
         assert "【LoopX Review Packet】" in packet, packet
@@ -822,8 +847,6 @@ def main() -> int:
             "review-packet",
             "--goal-id",
             GOAL_ID,
-            "--scan-root",
-            str(root / "project"),
         )
         payload = json.loads(json_result.stdout)
         assert payload["ok"] is True, payload
@@ -862,8 +885,6 @@ def main() -> int:
             "review-packet",
             "--goal-id",
             GOAL_ID,
-            "--scan-root",
-            str(root / "project"),
             "--handoff-only",
         )
         controller_handoff_payload = json.loads(controller_handoff_json_result.stdout)
@@ -891,8 +912,6 @@ def main() -> int:
             "review-packet",
             "--goal-id",
             GOAL_ID,
-            "--scan-root",
-            str(root / "project"),
             "--handoff-only",
             "--format",
             "json",
@@ -928,8 +947,6 @@ def main() -> int:
             "review-packet",
             "--goal-id",
             GOAL_ID,
-            "--scan-root",
-            str(root / "project"),
         )
         approved_packet = approved_markdown_result.stdout
         assert "类型：Codex" in approved_packet, approved_packet
@@ -958,8 +975,6 @@ def main() -> int:
             "review-packet",
             "--goal-id",
             GOAL_ID,
-            "--scan-root",
-            str(root / "project"),
             "--handoff-only",
         )
         handoff_only = handoff_only_result.stdout
@@ -986,8 +1001,6 @@ def main() -> int:
             "review-packet",
             "--goal-id",
             GOAL_ID,
-            "--scan-root",
-            str(root / "project"),
         )
         approved_payload = json.loads(approved_json_result.stdout)
         assert approved_payload["ok"] is True, approved_payload
@@ -1024,8 +1037,6 @@ def main() -> int:
             "review-packet",
             "--goal-id",
             GOAL_ID,
-            "--scan-root",
-            str(root / "project"),
             "--handoff-only",
         )
         handoff_payload = json.loads(handoff_json_result.stdout)

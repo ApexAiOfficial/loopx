@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
 
 from ...control_plane.quota.goal_boundary import registry_goal_by_id
 from ...control_plane.todos.contract import (
@@ -12,7 +13,7 @@ from ...control_plane.todos.contract import (
     normalize_explore_result_node_refs,
     normalize_todo_claimed_by,
 )
-from ...control_plane.todos.projection import (
+from ...control_plane.todos.todo_semantics import (
     todo_item_is_actionable_open,
     todo_item_task_class,
 )
@@ -152,12 +153,13 @@ def build_explore_composition_frontier(
         inputs = [nodes_by_id.get(input_id) for input_id in sorted(input_ids)]
         if len(inputs) < 2 or any(not isinstance(node, Mapping) for node in inputs):
             continue
-        if any(str(node.get("status") or "") not in _CLOSED_INPUT_STATUSES for node in inputs):
+        validated_inputs = cast(list[Mapping[str, Any]], inputs)
+        if any(str(node.get("status") or "") not in _CLOSED_INPUT_STATUSES for node in validated_inputs):
             continue
-        if any(not _evidence_backed(node) for node in inputs):
+        if any(not _evidence_backed(node) for node in validated_inputs):
             continue
         scheduled = experiment_id in bound_refs
-        input_refs = [str(node.get("node_id") or "") for node in inputs]
+        input_refs = [str(node.get("node_id") or "") for node in validated_inputs]
         gap_identity = {
             "goal_id": goal_id,
             "experiment_node_ref": experiment_id,
@@ -213,6 +215,8 @@ def project_live_explore_composition_frontier(
     goal_id: str,
     agent_id: str | None,
     status_payload: Mapping[str, Any],
+    state_text: str | None = None,
+    capability_guard: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Read the goal's Explore graph for one live quota decision.
 
@@ -233,14 +237,22 @@ def project_live_explore_composition_frontier(
         ),
         {},
     )
+    from .machine_defaults import resolve_explore_goal
+    goal = resolve_explore_goal(goal, runtime_root)
     orchestration = compact_orchestration_policy(goal.get("spawn_policy"))
     harness = (
-        orchestration.get("explore_harness")
+        cast(Mapping[str, Any], orchestration.get("explore_harness"))
         if isinstance(orchestration.get("explore_harness"), Mapping)
         else {}
     )
     enabled = harness.get("enabled") is True
     log_path = explore_result_log_path(runtime_root, goal_id)
+    pinned_research = (capability_guard or {}).get("capability_id") == "explore"
+    if pinned_research and (not enabled or harness.get("composition_mode") != "explicit_only"):
+        from .research_frontier import build_research_composition_frontier, read_research_todo_history
+        return build_research_composition_frontier({"goal_id": goal_id, "nodes": [], "edges": []},
+            candidate_sources=[], harness=harness, todos=read_research_todo_history(
+                runtime_root=runtime_root, goal=dict(goal), state_text=state_text), agent_id=agent_id)
     if not enabled:
         return None
     try:
@@ -273,16 +285,25 @@ def project_live_explore_composition_frontier(
         {},
     )
     project_asset = (
-        item.get("project_asset")
+        cast(Mapping[str, Any], item.get("project_asset"))
         if isinstance(item.get("project_asset"), Mapping)
         else {}
     )
-    item_todos = item.get("agent_todos") if isinstance(item.get("agent_todos"), Mapping) else {}
+    item_todos = cast(Mapping[str, Any], item.get("agent_todos")) if isinstance(item.get("agent_todos"), Mapping) else {}
     asset_todos = (
-        project_asset.get("agent_todos")
+        cast(Mapping[str, Any], project_asset.get("agent_todos"))
         if isinstance(project_asset.get("agent_todos"), Mapping)
         else {}
     )
+    if harness.get("composition_mode") == "explicit_only":
+        from .research_frontier import build_research_composition_frontier, read_research_todo_history
+        return build_research_composition_frontier(
+            projection, candidate_sources=[
+                {"node_id": event["result_id"], "research_observation": event["research_observation"]}
+                for event in events if event.get("research_observation")
+            ], harness=harness, todos=read_research_todo_history(
+                runtime_root=runtime_root, goal=dict(goal), state_text=state_text), agent_id=agent_id,
+        )
     return build_explore_composition_frontier(
         projection,
         todos=_todo_items(item_todos, asset_todos),

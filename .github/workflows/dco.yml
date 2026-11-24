@@ -2,9 +2,15 @@ name: DCO
 
 on:
   pull_request:
+  # A required check must also report on merge-queue candidates.
+  merge_group:
 
 permissions:
   contents: read
+
+concurrency:
+  group: dco-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   signoff:
@@ -17,22 +23,61 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require a DCO trailer on every commit
+      - name: Require DCO trailers on contribution commits
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+          # merge_group reports the base as a full ref (refs/heads/main).
+          BASE_REF="${BASE_REF#refs/heads/}"
+          test -n "${BASE_REF}" && test -n "${HEAD_SHA}"
+
+          # The event's base SHA can predate upstream commits already in the PR.
+          # Refresh the exact target branch before selecting PR-only commits.
+          git fetch --no-tags origin \
+            "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          # Keep this outside process substitution so a failed range lookup
+          # cannot silently turn into a successful check of zero commits.
+          commits=$(git rev-list --reverse "refs/remotes/origin/${BASE_REF}..${HEAD_SHA}")
 
           missing=0
           while IFS= read -r commit; do
-            if ! git show -s --format=%B "${commit}" |
+            [[ -z "${commit}" ]] && continue
+            if git show -s --format=%B "${commit}" |
               grep -Eq '^Signed-off-by: [^<]+ <[^<>[:space:]]+@[^<>[:space:]]+>$'; then
-              echo "::error::Commit ${commit} is missing a valid Signed-off-by trailer."
-              missing=1
+              continue
             fi
-          done < <(git rev-list --reverse "${BASE_SHA}..${HEAD_SHA}")
+
+            # GitHub adds signed integration commits without DCO trailers.
+            # A name/email alone is forgeable: require GitHub's verified record
+            # for this exact two-parent merge. Its parent commits stay in the
+            # range and are checked independently; manual merges are not exempt.
+            read -ra parents <<< "$(git show -s --format=%P "${commit}")"
+            if [[ "${#parents[@]}" -eq 2 ]] &&
+              [[ "$(git show -s --format=%cn "${commit}")" == "GitHub" ]] &&
+              [[ "$(git show -s --format=%ce "${commit}")" == "noreply@github.com" ]]; then
+              if ! metadata=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${commit}"); then
+                echo "::error::Cannot verify GitHub merge provenance for ${commit}; retry the check when the API is available."
+                exit 1
+              fi
+              if jq -e --arg sha "${commit}" --arg first "${parents[0]}" --arg second "${parents[1]}" '
+                .sha == $sha and .committer.login == "web-flow" and
+                .commit.committer.name == "GitHub" and
+                .commit.committer.email == "noreply@github.com" and
+                .commit.verification.verified == true and
+                .commit.verification.reason == "valid" and
+                ([.parents[].sha] == [$first, $second])
+              ' <<< "${metadata}" >/dev/null; then
+                echo "Verified GitHub-generated merge ${commit}; checking its contributions separately."
+                continue
+              fi
+            fi
+            echo "::error::Commit ${commit} is missing a valid Signed-off-by trailer."
+            missing=1
+          done <<< "${commits}"
 
           if [[ "${missing}" -ne 0 ]]; then
             echo "Add the DCO certification with: git commit --amend -s"

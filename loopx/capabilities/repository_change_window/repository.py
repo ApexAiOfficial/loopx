@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import os
-from pathlib import Path
 import re
 import subprocess
+from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import unquote, urlsplit
+
+from ...extensions.process_runtime import retire_owned_process
+
+# A managed commit or push hook must not wait forever on a Git helper. An
+# fsmonitor hook, a stale index lock or a checkout on a network mount can
+# otherwise hold the hook -- and the operation Git asked it to admit -- open.
+GIT_READ_TIMEOUT_SECONDS = 10.0
 
 
 class RepositoryChangeWindowError(ValueError):
@@ -24,19 +31,65 @@ class RepositoryContext:
     head_oid: str
 
 
+def _retire_owned_read(process: subprocess.Popen[bytes]) -> None:
+    """Retire the read's own process group and drop its pipes within a deadline.
+
+    The shared runtime bounds termination, Windows ``taskkill`` and pipe
+    closure under one budget. Git runs helpers -- fsmonitor hooks, pagers --
+    inside the session it starts in, so killing the leader alone leaves them
+    behind; an inherited pipe that a descendant still holds must not extend
+    the caller's wait either.
+    """
+
+    try:
+        retire_owned_process(process, process_tree_owned=True)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        # The answer is already unavailable; cleanup must not replace it with
+        # a traceback from a read-only or admission command. The read's own
+        # timeout or cancellation remains the caller's result.
+        pass
+
+
 def git(
     repo: Path,
     *args: str,
     check: bool = True,
     input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    result = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=False,
-        input=input_bytes,
+    """Run one Git read, or refuse when it cannot answer inside its budget.
+
+    An unanswered read is not an empty result. Callers fingerprint a pending
+    change, evaluate provider state and install or remove hooks from this one
+    entry point; raising here makes those paths fail closed instead of
+    reporting a clean worktree they never observed.
+    """
+
+    argv = ["git", "-C", str(repo), *args]
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if input_bytes is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=os.name == "posix",
     )
+    try:
+        stdout, stderr = process.communicate(
+            input=input_bytes, timeout=GIT_READ_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired:
+        _retire_owned_read(process)
+        raise RepositoryChangeWindowError(
+            "git "
+            + " ".join(args)
+            + f" did not answer within {GIT_READ_TIMEOUT_SECONDS:g} seconds"
+        ) from None
+    except BaseException:
+        # A terminal cancellation reaches this process, not the session the
+        # read owns. Retire that session before letting the cancellation
+        # continue to its handler.
+        _retire_owned_read(process)
+        raise
+    result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
     if check and result.returncode != 0:
         detail = (
             result.stderr.decode("utf-8", errors="replace").strip()
@@ -193,19 +246,93 @@ def _path_count(repo: Path, *args: str) -> int:
     return len([item for item in output.split(b"\0") if item])
 
 
+# A wholly-untracked directory arrives from ``git ls-files --others`` as one
+# entry, and ``git hash-object`` refuses a directory path. Descending into every
+# such tree is unbounded -- a build or dependency directory can be large -- so a
+# directory entry contributes a bounded, sorted inventory of the files inside
+# it, and says plainly when that inventory was cut short.
+UNTRACKED_DIRECTORY_ENTRY_LIMIT = 512
+
+
+def _untracked_directory_entries(repo: Path, path: str) -> tuple[list[str], bool]:
+    """Return the bounded file inventory inside one untracked directory entry."""
+
+    entries: list[str] = []
+    truncated = False
+    for current, dirnames, filenames in os.walk(os.path.join(repo, path)):
+        dirnames.sort()
+        for name in sorted(filenames):
+            if len(entries) >= UNTRACKED_DIRECTORY_ENTRY_LIMIT:
+                truncated = True
+                break
+            entries.append(os.path.relpath(os.path.join(current, name), repo))
+        if truncated:
+            break
+    return entries, truncated
+
+
+def _untracked_directory_digest(repo: Path, path: str) -> bytes:
+    """Digest one untracked directory by its bounded, sorted file inventory."""
+
+    entries, truncated = _untracked_directory_entries(repo, path)
+    digest = hashlib.sha256()
+    digest.update(b"untracked_directory\0")
+    digest.update(path.encode("utf-8", "surrogateescape"))
+    for entry in entries:
+        digest.update(b"\0")
+        digest.update(entry.encode("utf-8", "surrogateescape"))
+    if truncated:
+        digest.update(b"\0truncated")
+    return digest.hexdigest().encode("ascii")
+
+
+def _untracked_symlink_digest(repo: Path, path: str) -> bytes:
+    """Digest a symlink by the target text git would store as its blob.
+
+    ``git hash-object`` refuses a symlink whose target is a directory, so a
+    checkout holding one linked directory used to fail the whole repository
+    fingerprint instead of describing it.
+    """
+
+    digest = hashlib.sha256()
+    digest.update(b"symlink\0")
+    digest.update(os.readlink(os.path.join(repo, path)).encode("utf-8", "surrogateescape"))
+    return digest.hexdigest().encode("ascii")
+
+
 def _untracked_content_digest(repo: Path, names: bytes) -> str:
     paths = [os.fsdecode(item) for item in names.split(b"\0") if item]
     combined = hashlib.sha256(names)
-    for offset in range(0, len(paths), 128):
+    directories: list[str] = []
+    symlinks: list[str] = []
+    files: list[str] = []
+    for path in paths:
+        # An entry ``git hash-object`` cannot read still has to contribute to
+        # the fingerprint, because skipping it would drop content from the
+        # ledger. Each kind is digested by the fact that describes it.
+        target = os.path.join(repo, path)
+        if os.path.islink(target):
+            symlinks.append(path)
+        elif os.path.isdir(target):
+            directories.append(path)
+        else:
+            files.append(path)
+    for offset in range(0, len(files), 128):
         object_ids = git(
             repo,
             "hash-object",
             "--no-filters",
             "--",
-            *paths[offset : offset + 128],
+            *files[offset : offset + 128],
         ).stdout
         combined.update(b"\0")
         combined.update(object_ids)
+    for path in directories:
+        combined.update(b"\0")
+        combined.update(_untracked_directory_digest(repo, path))
+    for path in symlinks:
+        combined.update(b"\0")
+        combined.update(_untracked_symlink_digest(repo, path))
     return combined.hexdigest()
 
 

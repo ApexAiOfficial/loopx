@@ -39,10 +39,24 @@ BUILTIN_IDS = [
     "content-ops",
     "value-connectors",
     "explore",
-    "auto-research",
+    "deep-research",
     "public-safe-outbound",
     "connector-registry",
+    "external-evidence-research",
+    "performance-diagnosis",
+    "reliability-diagnostics",
+    "progress-review-sentinel",
+    "goal-capability-organization",
+    "anti-entropy-governance",
 ]
+
+
+def test_auto_research_is_not_a_product_catalog_capability() -> None:
+    """Auto-research is a demo showcase, not a shipped product capability."""
+
+    packet = build_capability_catalog_packet()
+    ids = [item["id"] for item in packet["capabilities"]]
+    assert "auto-research" not in ids
 
 
 def test_benchmark_toolkit_catalog_exposes_integrity_boundary() -> None:
@@ -55,7 +69,23 @@ def test_benchmark_toolkit_catalog_exposes_integrity_boundary() -> None:
         for command in capability["commands"]
     )
     assert any(
+        "continuation-decision" in command["command"]
+        for command in capability["commands"]
+    )
+    assert any(
+        protocol["schema_version"] == "benchmark_public_progress_v0"
+        for protocol in capability["implemented_protocols"]
+    )
+    assert any(
+        protocol["schema_version"] == "benchmark_continuation_decision_v0"
+        for protocol in capability["implemented_protocols"]
+    )
+    assert any(
         protocol["schema_version"] == "benchmark_integrity_qualification_v0"
+        for protocol in capability["implemented_protocols"]
+    )
+    assert any(
+        protocol["schema_version"] == "benchmark_restricted_access_adjudication_v0"
         for protocol in capability["implemented_protocols"]
     )
 
@@ -132,8 +162,70 @@ def test_builtin_catalog_preserves_order_and_marks_provider() -> None:
             "installed": True,
             "enabled": True,
             "ready": True,
+        },
+        {
+            "id": "git-hook",
+            "origin": "builtin",
+            "declared": True,
+            "installed": False,
+            "enabled": False,
+            "ready": False,
+        },
+        {
+            "id": "dsh-session-events",
+            "origin": "extension",
+            "declared": True,
+            "installed": False,
+            "enabled": False,
+            "ready": False,
+        },
+    ]
+
+
+def test_builtin_declared_implementation_provider_projects_state() -> None:
+    """A builtin default-off provider must not leak as a raw declaration.
+
+    `git-hook` is installed per repository, never through the extension
+    state file, so the catalog can only project its declared default-off
+    state. Before this guard the builtin declaration bypassed registration,
+    leaving `implementation_providers` without `provider_state` while the
+    provider itself was missing from `providers`.
+    """
+    detail = build_capability_detail_packet("repository-change-window")["capability"]
+    [implementation] = detail["implementation_providers"]
+    assert implementation["provider_id"] == "git-hook"
+    assert implementation["protocol"] == "repository_change_window_git_hook_state_v2"
+    assert implementation["status"] == "available_default_off"
+    assert implementation["provider_state"] == {
+        "declared": True,
+        "installed": False,
+        "enabled": False,
+        "ready": False,
+    }
+    providers = {item["id"]: item for item in build_capability_catalog_packet()["providers"]}
+    assert providers["git-hook"]["origin"] == "builtin"
+    assert providers["git-hook"]["ready"] is False
+
+
+def test_external_evidence_catalog_preserves_receipt_observation_boundary() -> None:
+    capability = build_capability_detail_packet("external-evidence-research")[
+        "capability"
+    ]
+
+    assert capability["implemented_protocols"] == [
+        {
+            "schema_version": "external_evidence_research_v0",
+            "module": "loopx.control_plane.capabilities.external_evidence",
+            "doc": "loopx/capabilities/external_research/README.md",
         }
     ]
+    receipt_command = next(
+        command
+        for command in capability["commands"]
+        if command["command"].startswith("loopx external-evidence receipt ")
+    )
+    assert "caller-presented provider receipt" in receipt_command["purpose"]
+    assert "without claiming provider execution" in receipt_command["purpose"]
 
 
 def test_material_lifecycle_catalog_exposes_managed_project_skill() -> None:
@@ -170,6 +262,33 @@ def test_benchmark_toolkit_catalog_exposes_packaged_task_triggered_skill() -> No
             "provider bindings, and host permissions remain authoritative."
         ),
     }
+
+
+def test_benchmark_toolkit_separates_monitor_observation_from_delivery() -> None:
+    capability = build_capability_detail_packet("benchmark-toolkit")["capability"]
+    handoff = capability["campaign_monitor_handoff"]
+
+    assert "continuous_monitor observes" in handoff["lane_boundary"]
+    command = handoff["material_transition_command"]
+    for required_option in (
+        "--material-change",
+        "--next-agent-todo",
+        "--next-action-kind",
+        "--next-task-repository",
+        "--next-required-capability",
+    ):
+        assert required_option in command
+    assert handoff["material_transition_result"] == {
+        "monitor_status": "open",
+        "successor_task_class": "advancement_task",
+        "successor_relationship": "independent_runnable_work",
+        "quota_spend": False,
+    }
+    external_wait = handoff["external_wait_command"]
+    assert "--status open" in external_wait
+    assert "--resume-when monitor_changed:<monitor-todo-id>" in external_wait
+    assert "--successor-todo-id <independent-runnable-successor-id>" in external_wait
+    assert "Do not mark it blocked" in handoff["external_wait_result"]
 
 
 def test_change_quality_catalog_exposes_default_off_managed_workflow() -> None:
@@ -421,9 +540,9 @@ def test_installed_runtime_is_catalog_truth_and_cli_default(
     }
 
 
-def test_active_explore_and_auto_research_records_point_to_real_smokes() -> None:
+def test_active_explore_record_points_to_real_smokes() -> None:
     repository = Path(__file__).resolve().parents[2]
-    for capability_id in ("explore", "auto-research"):
+    for capability_id in ("explore",):
         record = build_capability_detail_packet(capability_id)["capability"]
         assert record["provider_state"]["ready"] is True
         assert record["smokes"]
@@ -463,9 +582,18 @@ def test_context_provider_factory_dispatches_through_registered_builder() -> Non
 
 def test_cli_rejects_unknown_capability_without_traceback(
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     with pytest.raises(SystemExit) as exc_info:
-        main(["capability", "show", "not-registered"])
+        main(
+            [
+                "--runtime-root",
+                str(tmp_path / "runtime"),
+                "capability",
+                "show",
+                "not-registered",
+            ]
+        )
 
     assert exc_info.value.code == 2
     assert "unknown capability `not-registered`" in capsys.readouterr().err

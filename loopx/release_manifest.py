@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, distribution
 import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 from typing import Any
 
 from . import __version__
+from .doctor_git import GitSourceState, git_source_metadata
+from .python_install_owner import installed_loopx_distribution
 
 
 RELEASE_MANIFEST_SCHEMA_VERSION = "loopx_release_manifest_v0"
@@ -70,51 +72,6 @@ def _hash_tree(root: Path) -> dict[str, Any]:
     }
 
 
-def _run_git(source_root: Path, args: list[str]) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(source_root), *args],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    value = result.stdout.strip()
-    return value or None
-
-
-def _git_metadata(source_root: Path | None) -> dict[str, Any]:
-    if source_root is None:
-        return {
-            "git_commit": None,
-            "git_ref": None,
-            "git_dirty": None,
-        }
-    root = source_root.expanduser().resolve()
-    if not root.exists():
-        return {
-            "git_commit": None,
-            "git_ref": None,
-            "git_dirty": None,
-        }
-    commit = _run_git(root, ["rev-parse", "HEAD"])
-    branch = _run_git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"])
-    tag = _run_git(root, ["describe", "--tags", "--exact-match"])
-    status = _run_git(root, ["status", "--porcelain"])
-    if commit is None and branch is None and tag is None and status is None:
-        dirty: bool | None = None
-    else:
-        dirty = bool(status)
-    return {
-        "git_commit": commit,
-        "git_ref": branch or tag,
-        "git_dirty": dirty,
-    }
-
-
 def _manifest_source_metadata(source_root: Path | None) -> dict[str, Any]:
     if source_root is None:
         return {
@@ -170,8 +127,13 @@ def _manifest_source_metadata(source_root: Path | None) -> dict[str, Any]:
 
 
 def _source_metadata(source_root: Path | None) -> dict[str, Any]:
-    git_metadata = _git_metadata(source_root)
-    if any(git_metadata.get(key) is not None for key in ("git_commit", "git_ref", "git_dirty")):
+    git_metadata, git_state = git_source_metadata(source_root)
+    git_metadata.pop("root")
+    if git_state is not GitSourceState.ABSENT:
+        # A checkout with a `.git` of its own is its own source of truth. When
+        # Git cannot answer this run, the `release.json` next to it describes an
+        # earlier install, so it must not be written back as this one: an
+        # unanswered read stays unknown instead of claiming the old commit.
         return {
             **git_metadata,
             "kind": None,
@@ -198,7 +160,7 @@ def build_release_manifest(
     archive_url = source_env.get("LOOPX_ARCHIVE_URL") or source_metadata.get("archive_url")
     archive_sha256 = source_env.get("LOOPX_ARCHIVE_SHA256") or source_metadata.get("archive_sha256")
     repo = source_env.get("LOOPX_REPO") or source_metadata.get("repo")
-    ref = source_env.get("LOOPX_REF") or source_metadata.get("ref")
+    ref = source_env.get("LOOPX_UPDATE_CHANNEL") or source_env.get("LOOPX_REF") or source_metadata.get("ref")
     source_kind = "github_archive" if archive_url else (source_metadata.get("kind") or "local_checkout")
     promotion_mode = source_env.get("LOOPX_PROMOTION_MODE") or source_metadata.get("promotion_mode")
     skills_root = release_root / "skills"
@@ -299,8 +261,9 @@ def release_runtime_identity(release_root: Path | None = None) -> dict[str, str 
     """Return a public-safe identity for version-fencing local services.
 
     Installed snapshots carry an immutable release id and source revision. A
-    source checkout has neither, so callers can retain development coexistence
-    while installed launchers require an exact snapshot match.
+    source checkout has neither. Non-editable Python distributions instead
+    carry a digest of their owned package files. This fences local service
+    reuse.
     """
 
     root = release_root
@@ -318,7 +281,7 @@ def release_runtime_identity(release_root: Path | None = None) -> dict[str, str 
     package = package if isinstance(package, dict) else {}
     source = manifest.get("source")
     source = source if isinstance(source, dict) else {}
-    return {
+    identity = {
         "schema_version": RUNTIME_IDENTITY_SCHEMA_VERSION,
         "package_version": (
             package.get("version")
@@ -336,6 +299,58 @@ def release_runtime_identity(release_root: Path | None = None) -> dict[str, str 
             else None
         ),
     }
+    if not identity["release_id"] and root.resolve() == Path(__file__).resolve().parents[1]:
+        fingerprint = _distribution_runtime_fingerprint()
+        if fingerprint is not None:
+            identity["package_fingerprint"] = fingerprint
+    return identity
+
+
+def _distribution_artifact_file(path: Path) -> bool:
+    return "__pycache__" not in path.parts and path.suffix not in {".pyc", ".pyo"}
+
+
+def _distribution_runtime_fingerprint() -> str | None:
+    """Hash the actual imported, RECORD-owned wheel contents, not RECORD hashes.
+
+    Refuse editable, redirected, incomplete or ambiguous ownership. Bytecode
+    caches are generated by Python and are not part of the installed artifact.
+    """
+    try:
+        installed = installed_loopx_distribution(distribution)
+        direct_url = json.loads(installed.read_text("direct_url.json") or "{}")
+        if direct_url.get("dir_info", {}).get("editable") or installed.version != __version__:
+            return None
+        package_root = Path(__file__).resolve().parent
+        files = {
+            item.as_posix(): Path(item.locate())
+            for item in installed.files or ()
+            if item.as_posix().startswith("loopx/")
+            and _distribution_artifact_file(Path(item.as_posix()))
+        }
+        module = files.get("loopx/release_manifest.py")
+        if module is None or module.resolve() != Path(__file__).resolve():
+            return None
+        entries = list(package_root.rglob("*"))
+        if any(path.is_symlink() for path in entries):
+            return None
+        actual = {
+            "loopx/" + path.relative_to(package_root).as_posix()
+            for path in entries
+            if path.is_file() and _distribution_artifact_file(path.relative_to(package_root))
+        }
+        if actual != files.keys():
+            return None
+        digest = hashlib.sha256()
+        for name, path in sorted(files.items()):
+            expected = package_root.parent / name
+            if ".." in Path(name).parts or path.is_symlink() or path.resolve() != expected:
+                return None
+            digest.update(name.encode("utf-8") + b"\0")
+            digest.update(_sha256_file(path).encode("ascii") + b"\n")
+        return "sha256:" + digest.hexdigest()
+    except (PackageNotFoundError, OSError, ValueError, AttributeError, TypeError):
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:

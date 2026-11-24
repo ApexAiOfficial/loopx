@@ -3,14 +3,27 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import plistlib
+import signal
 import subprocess
 import sys
+import threading
+import time
+import zipfile
+import zipimport
 from unittest import mock
 
 from loopx import __version__
 import pytest
 
-from loopx.self_update import build_update_plan, execute_update_plan, restart_managed_loopx_services
+from loopx.control_plane.runtime import runtime_projection_route
+from loopx.self_update import (
+    UpdateAction,
+    build_update_plan,
+    execute_update_plan,
+    resolve_update_action,
+)
+from loopx.runtime_activation import restart_managed_loopx_services
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -19,8 +32,8 @@ TARGET_COMMIT = "2" * 40
 
 
 class FakeVersionResponse:
-    def __init__(self) -> None:
-        self.body = f'__version__ = "{__version__}"\n'.encode()
+    def __init__(self, body: bytes | None = None) -> None:
+        self.body = body if body is not None else f'__version__ = "{__version__}"\n'.encode()
 
     def __enter__(self) -> FakeVersionResponse:
         return self
@@ -76,7 +89,7 @@ def doctor_payload(
 
 def build_check(doctor: dict[str, object], *, ref: str = "main") -> dict[str, object]:
     with mock.patch("loopx.self_update.urlopen", return_value=FakeVersionResponse()):
-        return build_update_plan(
+        return build_update_plan(build_from_source=True,
             repo="example/loopx",
             ref=ref,
             check_only=True,
@@ -84,8 +97,166 @@ def build_check(doctor: dict[str, object], *, ref: str = "main") -> dict[str, ob
         )
 
 
+def build_live_check(
+    doctor: dict[str, object], *, remote_commit: str
+) -> dict[str, object]:
+    def response(request: object, **_kwargs: object) -> FakeVersionResponse:
+        url = getattr(request, "full_url", "")
+        return FakeVersionResponse(
+            remote_commit.encode()
+            if "/commits/main" in url
+            else f'__version__ = "{__version__}"\n'.encode()
+        )
+
+    with mock.patch("loopx.self_update.collect_doctor", return_value=doctor), mock.patch(
+        "loopx.self_update.urlopen", side_effect=response
+    ):
+        return build_update_plan(build_from_source=True,
+            repo="example/loopx", ref="main", check_only=True
+        )
+
+
+def test_update_plan_resolves_mutable_ref_commit_before_claiming_no_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    doctor = doctor_payload(target_commit=None, relation="same")
+    freshness = doctor["install_freshness"]
+    assert isinstance(freshness, dict)
+    freshness["requires_upgrade"] = False
+    monkeypatch.setattr("loopx.self_update.collect_doctor", lambda: doctor)
+    monkeypatch.setattr(
+        "loopx.self_update.urlopen",
+        lambda request, **_kwargs: FakeVersionResponse(
+            TARGET_COMMIT.encode()
+            if "/commits/main" in request.full_url
+            else f'__version__ = "{__version__}"\n'.encode()
+        ),
+    )
+
+    payload = build_update_plan(build_from_source=True, repo="example/loopx", ref="main", action="plan")
+    commit_check = payload["source_commit_check"]
+    assert commit_check["status"] == "available"
+    assert commit_check["matches_current"] is False
+    assert commit_check["target_commit"] == TARGET_COMMIT
+    assert payload["runtime_activation_qualification"]["runtime_active"] is not True
+    assert "no update needed" not in payload["recommended_action"]
+
+
+def test_update_plan_accepts_exact_commit_under_pinned_install_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    doctor = doctor_payload(
+        target_commit=None, relation="same", source_ref=INSTALLED_COMMIT
+    )
+    freshness = doctor["install_freshness"]
+    assert isinstance(freshness, dict)
+    freshness["requires_upgrade"] = False
+    monkeypatch.setattr("loopx.self_update.collect_doctor", lambda: doctor)
+    monkeypatch.setattr(
+        "loopx.self_update.urlopen",
+        lambda *_args, **_kwargs: FakeVersionResponse(INSTALLED_COMMIT.encode()),
+    )
+
+    payload = build_update_plan(build_from_source=True, repo="example/loopx", ref="main", action="plan")
+    assert payload["source_commit_check"]["matches_current"] is True
+    assert payload["runtime_activation_qualification"]["decision"] == "runtime_active"
+    assert "no update needed" in payload["recommended_action"]
+
+
+def test_update_plan_offline_never_calls_unqualified_source_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Even an equal *locally cached* ref cannot prove the moving remote ref
+    # has not advanced while the source lookup is offline.
+    doctor = doctor_payload(target_commit=INSTALLED_COMMIT, relation="same")
+    freshness = doctor["install_freshness"]
+    assert isinstance(freshness, dict)
+    freshness["requires_upgrade"] = False
+    monkeypatch.setattr("loopx.self_update.collect_doctor", lambda: doctor)
+    monkeypatch.setattr("loopx.self_update.urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("offline")))
+
+    payload = build_update_plan(build_from_source=True, repo="example/loopx", ref="main", action="plan")
+    assert payload["source_commit_check"]["status"] == "unavailable"
+    assert payload["runtime_activation_qualification"]["decision"] == "activation_qualification_required"
+    assert "no update needed" not in payload["recommended_action"]
+
+
+@pytest.mark.parametrize("action", ["check", "plan"])
+def test_update_readiness_remains_bounded_when_one_source_registry_stalls(
+    action: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    global_registry = runtime_root / "registry.global.json"
+    stalled_registry = tmp_path / "offline" / "registry.json"
+    stalled_registry.parent.mkdir()
+    stalled_registry.write_text("{}", encoding="utf-8")
+    global_registry.write_text(
+        json.dumps(
+            {
+                "registry_role": "global-local",
+                "common_runtime_root": str(runtime_root),
+                "goals": [
+                    {
+                        "id": "offline-goal",
+                        "source_registry": str(stalled_registry),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    release_stalled_read = threading.Event()
+    real_load_registry = runtime_projection_route.load_registry
+
+    def load_registry(path: Path):
+        if path == stalled_registry:
+            release_stalled_read.wait(timeout=2)
+        return real_load_registry(path)
+
+    observed: dict[str, object] = {}
+
+    def collect_bounded_doctor() -> dict[str, object]:
+        diagnostics = (
+            runtime_projection_route.collect_runtime_projection_route_diagnostics(
+                registry_path=global_registry,
+                runtime_root=runtime_root,
+                source_registry_read_timeout_seconds=0.02,
+            )
+        )
+        observed.update(diagnostics)
+        return doctor_payload(target_commit=INSTALLED_COMMIT, relation="same")
+
+    monkeypatch.setattr(runtime_projection_route, "load_registry", load_registry)
+    monkeypatch.setattr("loopx.self_update.collect_doctor", collect_bounded_doctor)
+    monkeypatch.setattr("loopx.self_update.urlopen", lambda *_args, **_kwargs: FakeVersionResponse())
+
+    started = time.monotonic()
+    payload = build_update_plan(build_from_source=True,
+        action=action,
+        repo="example/loopx",
+        ref="main",
+    )
+    elapsed = time.monotonic() - started
+    release_stalled_read.set()
+
+    assert elapsed < 0.5
+    assert payload["ok"] is True
+    assert observed["counts"] == {
+        "healthy": 0,
+        "ready": 0,
+        "single_runtime": 0,
+        "missing": 0,
+        "unavailable": 1,
+        "ambiguous": 0,
+        "lagging": 0,
+    }
+
+
 def test_same_version_older_commit_requires_release_or_install_successor() -> None:
-    payload = build_check(doctor_payload())
+    payload = build_live_check(doctor_payload(), remote_commit=TARGET_COMMIT)
 
     assert payload["source_version_check"]["matches_current"] is True
     activation = payload["runtime_activation_qualification"]
@@ -101,8 +272,9 @@ def test_same_version_older_commit_requires_release_or_install_successor() -> No
 
 
 def test_equal_commit_proves_runtime_active() -> None:
-    payload = build_check(
-        doctor_payload(target_commit=INSTALLED_COMMIT, relation="same")
+    payload = build_live_check(
+        doctor_payload(target_commit=INSTALLED_COMMIT, relation="same"),
+        remote_commit=INSTALLED_COMMIT,
     )
 
     activation = payload["runtime_activation_qualification"]
@@ -110,6 +282,17 @@ def test_equal_commit_proves_runtime_active() -> None:
     assert activation["runtime_active"] is True
     assert activation["source_identity_matches"] is True
     assert activation["successor"] == {"required": False, "kind": None}
+
+
+def test_injected_doctor_snapshot_does_not_prove_current_mutable_ref() -> None:
+    payload = build_check(
+        doctor_payload(target_commit=INSTALLED_COMMIT, relation="same")
+    )
+    assert payload["source_commit_check"]["status"] == "not_requested"
+    assert payload["runtime_activation_qualification"]["decision"] == (
+        "activation_qualification_required"
+    )
+    assert "no update needed" not in payload["recommended_action"]
 
 
 def test_missing_commit_lineage_never_proves_runtime_active() -> None:
@@ -124,9 +307,52 @@ def test_missing_commit_lineage_never_proves_runtime_active() -> None:
     }
 
 
+def test_immutable_ref_resolves_the_target_commit_without_remote_lineage() -> None:
+    immutable = INSTALLED_COMMIT
+    payload = build_check(
+        doctor_payload(
+            target_commit=None,
+            relation=None,
+            source_ref=immutable,
+        ),
+        ref=immutable,
+    )
+
+    activation = payload["runtime_activation_qualification"]
+    assert activation["decision"] == "runtime_active"
+    assert activation["runtime_active"] is True
+    assert activation["target_source_commit"] == immutable
+    assert activation["revision_relation"] == "same"
+    assert activation["successor"] == {"required": False, "kind": None}
+    assert payload["recommended_action"] == (
+        "installed version and trusted source lineage match; no update needed"
+    )
+
+
+def test_immutable_ref_mismatch_names_the_commit_difference() -> None:
+    payload = build_check(
+        doctor_payload(
+            target_commit=None,
+            relation=None,
+            source_ref=TARGET_COMMIT,
+        ),
+        ref=TARGET_COMMIT,
+    )
+
+    activation = payload["runtime_activation_qualification"]
+    assert activation["decision"] == "activation_qualification_required"
+    assert activation["runtime_active"] is None
+    assert activation["target_source_commit"] == TARGET_COMMIT
+    assert activation["reason"] == (
+        "installed source commit does not match the selected immutable source commit"
+    )
+
+
 def test_different_selected_source_never_reuses_unrelated_lineage() -> None:
     payload = build_check(
-        doctor_payload(target_commit=INSTALLED_COMMIT, relation="same", source_ref="stable"),
+        doctor_payload(
+            target_commit=INSTALLED_COMMIT, relation="same", source_ref="stable"
+        ),
         ref="main",
     )
 
@@ -148,9 +374,9 @@ def test_cli_check_qualifies_explicit_installed_doctor_snapshot(tmp_path: Path) 
             "-m",
             "loopx.cli",
             "update",
+            "check",
             "--format",
             "json",
-            "--check",
             "--repo",
             "example/loopx",
             "--ref",
@@ -170,9 +396,378 @@ def test_cli_check_qualifies_explicit_installed_doctor_snapshot(tmp_path: Path) 
     payload = json.loads(result.stdout)
     assert payload["installed_doctor_source"] == "explicit_json"
     activation = payload["runtime_activation_qualification"]
-    assert activation["decision"] == "release_or_install_successor_required"
+    assert activation["decision"] == "activation_qualification_required"
     assert activation["installed_source_commit"] == INSTALLED_COMMIT
     assert activation["target_source_commit"] == TARGET_COMMIT
+    assert activation["reason"] == "custom archive URL is not identified by the selected GitHub ref"
+
+
+def test_update_actions_are_explicit_and_legacy_flags_remain_compatible() -> None:
+    assert resolve_update_action("check") is UpdateAction.CHECK
+    assert resolve_update_action("plan") is UpdateAction.PLAN
+    assert resolve_update_action("apply") is UpdateAction.APPLY
+    assert resolve_update_action(check=True) is UpdateAction.CHECK
+    assert resolve_update_action(dry_run=True) is UpdateAction.PLAN
+    assert resolve_update_action(execute=True) is UpdateAction.APPLY
+    assert resolve_update_action() is UpdateAction.PLAN
+
+    with pytest.raises(ValueError, match="conflicts with the legacy option"):
+        resolve_update_action("check", execute=True)
+
+
+def test_python_distribution_apply_uses_the_owning_interpreter_pip() -> None:
+    doctor = doctor_payload()
+    doctor["package"] = {
+        "install_kind": "python_distribution",
+        "release_root": None,
+    }
+    doctor["install_freshness"]["install_kind"] = "python_distribution"
+    doctor["install_freshness"]["python_distribution_installer"] = "pip"
+    doctor["install_freshness"]["upgrade_command"] = (
+        "/managed/python -m pip install --upgrade loopx\n"
+        "loopx workflow-skills --install\n"
+        "loopx slash-commands --install\n"
+        "loopx doctor"
+    )
+
+    payload = build_update_plan(action="apply", doctor_payload=doctor)
+
+    assert payload["ok"] is True
+    assert payload["requested_action"] == "apply"
+    assert payload["changes_applied"] is False
+    assert payload["install_lifecycle"] == {
+        "install_kind": "python_distribution",
+        "owner": "python_package_manager",
+        "loopx_apply_supported": True,
+        "execution_driver": "python_pip",
+        "package_manager": "pip",
+        "package_manager_environment": None,
+        "reason": (
+            "LoopX can ask the owning Python interpreter's pip to upgrade the same environment"
+        ),
+        "owner_upgrade_command": doctor["install_freshness"]["upgrade_command"],
+    }
+    assert payload["commands"]["apply"] == "loopx update apply"
+    assert payload["commands"]["owner_upgrade"].startswith("/managed/python -m pip")
+    assert payload["plan"]["install_command"] == payload["commands"]["owner_upgrade"]
+    assert payload["plan"]["mutates_release_install"] is True
+    assert payload["plan"]["backup"]["rollback_version"] == __version__
+    assert f"loopx=={__version__}" in payload["plan"]["backup"]["rollback_command"]
+    assert payload["error"] is None
+
+    passed = subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout='{"ok": true}',
+        stderr="",
+    )
+    with (
+        mock.patch(
+            "loopx.self_update.subprocess.run",
+            side_effect=[passed, passed, passed, passed, passed, passed],
+        ) as run,
+        mock.patch(
+            "loopx.runtime_activation.restart_managed_loopx_services",
+            return_value=["com.loopx.status"],
+        ),
+    ):
+        result = execute_update_plan(payload)
+
+    assert result["ok"] is True
+    assert result["changes_applied"] is True
+    assert result["execution"]["driver"] == "python_pip"
+    assert result["execution"]["restarted_services"] == ["com.loopx.status"]
+    assert run.call_args_list[0].args[0] == [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "loopx",
+    ]
+    assert run.call_args_list[1].args[0][-4:] == ["authority-archive", "upgrade", "--all-known", "--execute"]
+    assert run.call_args_list[2].args[0][3:5] == ["workflow-skills", "--install"]
+    assert run.call_args_list[3].args[0][3:5] == ["slash-commands", "--install"]
+
+
+@pytest.mark.parametrize("installer", ["pip", "pipx"])
+@pytest.mark.parametrize("linked_alias", [False, True])
+def test_windows_console_apply_refuses_before_installation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, installer: str, linked_alias: bool,
+) -> None:
+    doctor = doctor_payload()
+    doctor["package"] = {"install_kind": "python_distribution"}
+    doctor["install_freshness"]["python_distribution_installer"] = installer
+    # A saved plan must not bypass the check at execution time.
+    saved_plan = build_update_plan(action="apply", doctor_payload=doctor)
+    launcher = tmp_path / "loopx.exe"
+    with zipfile.ZipFile(launcher, "w") as archive:
+        archive.writestr("__main__.py", "")
+    if linked_alias:
+        alias = tmp_path / "loopx-preview.exe"
+        alias.hardlink_to(launcher)
+        launcher = alias
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "python.exe"))
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys.modules["__main__"], "__loader__", zipimport.zipimporter(str(launcher)))
+    monkeypatch.setattr(sys, "argv", [str(launcher.with_suffix("")), "--registry", "project O'Brien $name/registry.json",
+                                      "--format", "json", "update", "--execute", "--timeout-seconds", "60"])
+    with mock.patch("loopx.self_update.subprocess.run") as run:
+        planned = build_update_plan(action="apply", doctor_payload=doctor)
+        executed = execute_update_plan(saved_plan)
+    run.assert_not_called()
+    for result in (planned, executed):
+        assert result["ok"] is False
+        assert result["changes_applied"] is False
+        assert result["execution"] is None
+        assert result["plan"]["apply_supported"] is False
+        assert result["plan"]["mutates_release_install"] is False
+        assert "launcher" in result["error"].lower()
+        retry = result["next_action"]["command"]
+        assert "loopx.entrypoint" in retry
+        assert "--registry" in retry and "--timeout-seconds" in retry
+        assert result["next_action"]["mutating"] is True
+
+
+@pytest.mark.parametrize("owned_exists", [False, True])
+def test_windows_unrelated_zip_console_keeps_update_plan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, owned_exists: bool,
+) -> None:
+    doctor = doctor_payload()
+    doctor["package"] = {"install_kind": "python_distribution"}
+    doctor["install_freshness"]["python_distribution_installer"] = "pipx"
+    owned = tmp_path / "loopx.exe"
+    with zipfile.ZipFile(owned, "w") as archive:
+        archive.writestr("__main__.py", "")
+    unrelated = tmp_path / "unrelated.exe"
+    unrelated.write_bytes(owned.read_bytes())
+    if not owned_exists:
+        owned.unlink()
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "python.exe"))
+    baseline = build_update_plan(action="apply", doctor_payload=doctor)
+    monkeypatch.setattr(sys.modules["__main__"], "__loader__", zipimport.zipimporter(str(unrelated)))
+    assert build_update_plan(action="apply", doctor_payload=doctor) == baseline
+
+
+@pytest.mark.parametrize("action", ["check", "plan"])
+def test_windows_console_read_only_update_keeps_its_plan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, action: str,
+) -> None:
+    doctor = doctor_payload()
+    doctor["package"] = {"install_kind": "python_distribution"}
+    doctor["install_freshness"]["python_distribution_installer"] = "pip"
+    baseline = build_update_plan(action=action, doctor_payload=doctor)
+    launcher = tmp_path / "loopx.exe"
+    with zipfile.ZipFile(launcher, "w") as archive:
+        archive.writestr("__main__.py", "")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys.modules["__main__"], "__loader__", zipimport.zipimporter(str(launcher)))
+    assert build_update_plan(action=action, doctor_payload=doctor) == baseline
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows console launcher")
+def test_real_windows_console_refuses_before_starting_installer(tmp_path: Path) -> None:
+    from distlib.scripts import ScriptMaker
+
+    marker = tmp_path / "installer-started"
+    (tmp_path / "update_probe.py").write_text(
+        "import json,subprocess\n"
+        "from pathlib import Path\n"
+        "from loopx import self_update\n"
+        "def main():\n"
+        "    def installer(*args, **kwargs):\n"
+        f"        Path({str(marker)!r}).write_text('unsafe installation', encoding='utf-8')\n"
+        "        return subprocess.CompletedProcess([], 1, '', 'installation refused by fixture')\n"
+        "    self_update.subprocess.run = installer\n"
+        "    payload = {'install_lifecycle': {'execution_driver': 'python_pip'}, 'plan': {'apply_supported': True}}\n"
+        "    result = self_update.execute_update_plan(payload)\n"
+        "    print(json.dumps(result))\n"
+        "    return 0 if result['ok'] else 1\n",
+        encoding="utf-8",
+    )
+    maker = ScriptMaker(None, str(tmp_path))
+    maker.variants = {""}
+    maker.make("loopx = update_probe:main")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(REPO_ROOT)])}
+    result = subprocess.run([str(tmp_path / "loopx.exe"), "update", "apply"],
+                            env=env, capture_output=True, encoding="utf-8", timeout=30)
+    assert result.returncode == 1, result.stderr
+    assert not marker.exists(), "the real launcher reached the installer"
+    refusal = json.loads(result.stdout)
+    assert refusal["execution"] is None
+    assert "loopx.entrypoint" in refusal["next_action"]["command"]
+
+
+def test_pipx_distribution_apply_preserves_the_pipx_environment() -> None:
+    doctor = doctor_payload()
+    doctor["package"] = {"install_kind": "python_distribution"}
+    doctor["install_freshness"].update(
+        {
+            "install_kind": "python_distribution",
+            "python_distribution_installer": "pipx",
+            "python_distribution_installer_environment": "loopx-preview",
+            "upgrade_command": "pipx upgrade loopx-preview\nloopx doctor",
+        }
+    )
+    payload = build_update_plan(action="apply", doctor_payload=doctor)
+
+    assert payload["install_lifecycle"]["execution_driver"] == "python_pipx"
+    assert (
+        payload["install_lifecycle"]["package_manager_environment"] == "loopx-preview"
+    )
+    assert payload["plan"]["backup"]["available"] is False
+
+    passed = subprocess.CompletedProcess([], 0, '{"ok": true}', "")
+    with (
+        mock.patch(
+            "loopx.self_update.subprocess.run",
+            side_effect=[passed, passed, passed, passed, passed, passed],
+        ) as run,
+        mock.patch(
+            "loopx.runtime_activation.restart_managed_loopx_services",
+            return_value=[],
+        ),
+    ):
+        result = execute_update_plan(payload)
+
+    assert result["ok"] is True
+    assert run.call_args_list[0].args[0] == ["pipx", "upgrade", "loopx-preview"]
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="archive snapshot updates require the POSIX installer path",
+)
+def test_archive_apply_restarts_managed_services_when_only_extensions_are_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = build_update_plan(build_from_source=True, action="apply", doctor_payload=doctor_payload())
+
+    assert payload["install_lifecycle"]["execution_driver"] == "archive_snapshot"
+
+    installed = subprocess.CompletedProcess([], 0, "", "")
+    blocked = subprocess.CompletedProcess([], 1, '{"blocked_count": 1}', "")
+    monkeypatch.setenv("LOOPX_PYTHON", sys.executable)
+    monkeypatch.setattr(
+        "loopx.self_update.run_archive_installer",
+        lambda *_args, **_kwargs: (installed, {"stage": "installer_execution"}),
+    )
+    monkeypatch.setattr(
+        "loopx.self_update.subprocess.run",
+        mock.Mock(side_effect=[installed, blocked]),
+    )
+    monkeypatch.setattr(
+        "loopx.runtime_activation.restart_managed_loopx_services",
+        lambda: ["com.loopx.chat"],
+    )
+
+    result = execute_update_plan(payload)
+
+    # The runtime is installed and serving, so the managed services must move
+    # onto it even though an unrelated enabled extension provider is blocked.
+    assert result["changes_applied"] is True
+    assert result["execution"]["restarted_services"] == ["com.loopx.chat"]
+    assert result["execution"]["restart_status"] == "restarted"
+    assert result["ok"] is False
+    assert result["next_action"]["kind"] == "repair_blocked_extensions"
+    assert result["next_action"]["mutating"] is False
+    assert "rollback" not in result["recommended_action"]
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="archive snapshot updates require the POSIX installer path",
+)
+def test_archive_apply_skips_managed_service_restart_when_the_runtime_is_unhealthy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = build_update_plan(build_from_source=True, action="apply", doctor_payload=doctor_payload())
+
+    failed_install = subprocess.CompletedProcess([], 1, "", "installer failed")
+    monkeypatch.setenv("LOOPX_PYTHON", sys.executable)
+    monkeypatch.setattr(
+        "loopx.self_update.run_archive_installer",
+        lambda *_args, **_kwargs: (failed_install, {"stage": "installer_execution"}),
+    )
+    monkeypatch.setattr(
+        "loopx.self_update.subprocess.run",
+        mock.Mock(return_value=failed_install),
+    )
+    restarted = mock.Mock(return_value=["com.loopx.chat"])
+    monkeypatch.setattr("loopx.runtime_activation.restart_managed_loopx_services", restarted)
+
+    result = execute_update_plan(payload)
+
+    assert result["changes_applied"] is False
+    assert result["ok"] is False
+    assert result["execution"]["restarted_services"] == []
+    assert result["execution"]["restart_status"] == "skipped_runtime_not_activated"
+    assert result["next_action"]["kind"] == "review_or_rollback"
+    restarted.assert_not_called()
+
+
+def test_live_checkout_apply_never_mutates_git_or_switches_install_channels() -> None:
+    doctor = doctor_payload()
+    doctor["package"] = {"install_kind": "live_checkout", "release_root": None}
+    doctor["install_freshness"]["contributor_upgrade_command"] = (
+        "/workspace/loopx/scripts/install-local.sh\nloopx doctor"
+    )
+
+    payload = build_update_plan(build_from_source=True, action="apply", doctor_payload=doctor)
+
+    assert payload["ok"] is False
+    assert payload["install_lifecycle"]["owner"] == "source_checkout"
+    assert payload["install_lifecycle"]["execution_driver"] is None
+    assert payload["commands"]["apply"] is None
+    assert payload["plan"]["install_command"].startswith("/workspace/loopx/")
+    assert "git pull" not in payload["plan"]["install_command"]
+    assert payload["changes_applied"] is False
+
+
+def test_unknown_package_manager_apply_fails_without_guessing_pip() -> None:
+    doctor = doctor_payload()
+    doctor["package"] = {"install_kind": "python_distribution"}
+    doctor["install_freshness"].update(
+        {
+            "install_kind": "python_distribution",
+            "python_distribution_installer": "custom-manager",
+            "upgrade_command": None,
+        }
+    )
+
+    payload = build_update_plan(action="apply", doctor_payload=doctor)
+
+    assert payload["ok"] is False
+    assert payload["install_lifecycle"]["execution_driver"] is None
+    assert payload["commands"]["apply"] is None
+    assert payload["commands"]["owner_upgrade"] is None
+    assert payload["next_action"]["command"] is None
+    assert "pip install" not in payload["recommended_action"]
+
+
+def test_cli_rejects_conflicting_named_and_legacy_actions() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loopx.cli",
+            "update",
+            "check",
+            "--execute",
+            "--format",
+            "json",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    payload = json.loads(result.stdout)
+    assert payload["changes_applied"] is False
+    assert "conflicts with the legacy option" in payload["error"]
 
 
 def test_cli_rejects_installed_doctor_snapshot_outside_check(tmp_path: Path) -> None:
@@ -200,14 +795,14 @@ def test_cli_rejects_installed_doctor_snapshot_outside_check(tmp_path: Path) -> 
     assert result.returncode == 1, (result.stdout, result.stderr)
     payload = json.loads(result.stdout)
     assert payload["ok"] is False
-    assert payload["error"] == "--installed-doctor-json requires update --check"
+    assert payload["error"] == "--installed-doctor-json requires `loopx update check`"
 
 
 def test_restart_managed_loopx_services_restarts_only_loopx_launchagents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("loopx.self_update.sys.platform", "darwin")
+    monkeypatch.setattr("loopx.runtime_activation.sys.platform", "darwin")
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     agents = tmp_path / "Library" / "LaunchAgents"
     agents.mkdir(parents=True)
@@ -217,7 +812,9 @@ def test_restart_managed_loopx_services_restarts_only_loopx_launchagents(
         "com.goal-harness.status.plist",
         "unrelated.plist",
     ):
-        (agents / name).write_text("<plist/>", encoding="utf-8")
+        (agents / name).write_bytes(plistlib.dumps({
+            "ProgramArguments": ["loopx", "--runtime-root", str(tmp_path / "runtime"), "chat"],
+        }))
 
     calls: list[list[str]] = []
 
@@ -225,22 +822,662 @@ def test_restart_managed_loopx_services_restarts_only_loopx_launchagents(
         calls.append(list(args))
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr("loopx.self_update.subprocess.run", fake_run)
+    monkeypatch.setattr("loopx.runtime_activation.subprocess.run", fake_run)
 
     restarted = restart_managed_loopx_services()
-    assert set(restarted) == {"com.loopx.status", "com.loopx.chat", "com.goal-harness.status"}
+    assert set(restarted) == {
+        "com.loopx.status",
+        "com.loopx.chat",
+        "com.goal-harness.status",
+    }
     assert len(calls) == 3
     assert all(call[0] == "launchctl" for call in calls)
 
 
-@pytest.mark.skipif(os.name != "nt", reason="native Windows update boundary")
-def test_windows_execute_update_fails_closed_without_launching_bash() -> None:
-    payload = {"ok": True, "source": {}, "plan": {}}
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="archive snapshot updates require the POSIX installer path",
+)
+def test_successful_update_revalidates_enabled_extensions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "source": {"installer_url": "https://example.invalid/install.sh"},
+        "plan": {"backup": {}},
+    }
+    completed = [
+        subprocess.CompletedProcess([], 0, "200", ""),
+        subprocess.CompletedProcess([], 0, "installed", ""),
+        subprocess.CompletedProcess([], 0, '{"ok": true}', ""),
+        subprocess.CompletedProcess([], 0, '{"ok": true}', ""),
+    ]
+    calls: list[list[str]] = []
 
-    with mock.patch("loopx.self_update.subprocess.run") as run:
-        updated = execute_update_plan(payload)
+    def fake_run(
+        args: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[0] == "curl":
+            Path(args[args.index("--output") + 1]).write_text("echo installed")
+        return completed[len(calls) - 1]
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(
+        "loopx.self_update._installer_env_for_source",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr("loopx.runtime_activation.subprocess.run", fake_run)
+
+    updated = execute_update_plan(payload)
+
+    assert updated["ok"] is True
+    assert updated["execution"]["extension_doctor_returncode"] == 0
+    assert calls[3] == [
+        str(tmp_path / ".local" / "bin" / "loopx"),
+        "--format",
+        "json",
+        "extension",
+        "doctor",
+        "--all-enabled",
+        "--execute",
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows update boundary")
+@pytest.mark.parametrize("selected_route", [False, True])
+def test_windows_execute_update_fails_closed_without_launching_bash(
+    tmp_path: Path, selected_route: bool,
+) -> None:
+    payload = {"ok": True, "source": {}, "plan": {}}
+    route = (
+        {
+            "registry_path": tmp_path / "project/.loopx/registry.json",
+            "runtime_root": str(tmp_path / "selected runtime"),
+        }
+        if selected_route else {}
+    )
+
+    with (
+        mock.patch("loopx.self_update.subprocess.run") as run,
+        mock.patch("loopx.self_update.run_archive_installer") as install,
+    ):
+        updated = execute_update_plan(payload, **route)
 
     run.assert_not_called()
+    install.assert_not_called()
     assert updated["ok"] is False
     assert updated["execution"]["status"] == "unsupported_platform"
     assert "install-windows.ps1" in updated["recommended_action"]
+
+
+def test_failed_authority_upgrade_does_not_activate_services_or_continue_host_updates():
+    doctor = doctor_payload()
+    doctor["package"] = {"install_kind": "python_distribution", "release_root": None}
+    doctor["install_freshness"].update(install_kind="python_distribution", python_distribution_installer="pip")
+    payload = build_update_plan(action="apply", doctor_payload=doctor)
+    with mock.patch("loopx.self_update.subprocess.run", side_effect=[
+        subprocess.CompletedProcess([], 0, "installed", ""),
+        subprocess.CompletedProcess([], 1, '{"status":"failed","reason":"backup failed"}', ""),
+    ]) as run, mock.patch("loopx.runtime_activation.restart_managed_loopx_services") as restart:
+        result = execute_update_plan(payload)
+    assert not result["ok"]
+    assert result["changes_applied"]  # Package installed; data migration failure is not a rollback.
+    assert result["execution"]["authority_upgrade_returncode"] == 1
+    assert result["execution"]["doctor_status"] == "skipped_prior_step_failed"
+    assert run.call_count == 2
+    restart.assert_not_called()
+
+
+def apply_plan_for_driver(driver):
+    doctor = doctor_payload()
+    archive = driver == "archive_snapshot"
+    if not archive:
+        doctor["package"] = {"install_kind": "python_distribution", "release_root": None}
+        doctor["install_freshness"].update(
+            install_kind="python_distribution",
+            python_distribution_installer=driver.removeprefix("python_"),
+        )
+    payload = build_update_plan(
+        build_from_source=archive, action="apply", doctor_payload=doctor,
+    )
+    assert payload["ok"]
+    assert payload["install_lifecycle"]["execution_driver"] == driver
+    return payload
+
+
+@pytest.mark.parametrize("driver", [
+    pytest.param(
+        "archive_snapshot",
+        marks=pytest.mark.skipif(os.name == "nt", reason="archive updates require a POSIX host"),
+    ),
+    "python_pip",
+    "python_pipx",
+])
+def test_update_preserves_selected_route_through_install_and_readback(tmp_path, monkeypatch, driver):
+    registry, runtime = tmp_path / "project/.loopx/registry.json", tmp_path / "selected runtime"
+    payload = apply_plan_for_driver(driver)
+    calls, installer_env = [], {}
+    monkeypatch.setenv("LOOPX_PYTHON", sys.executable)
+    passed = subprocess.CompletedProcess([], 0, '{"ok":true}', '')
+    def install(_url, *, env, **kwargs):
+        installer_env.update(env)
+        return passed, {"stage": "installer_execution"}
+    def run(command, **kwargs):
+        calls.append(command)
+        return passed
+    monkeypatch.setattr("loopx.self_update.run_archive_installer", install)
+    monkeypatch.setattr("loopx.self_update.subprocess.run", run)
+    monkeypatch.setattr("loopx.runtime_activation.restart_managed_loopx_services", lambda: [])
+    result = execute_update_plan(payload, registry_path=registry, runtime_root=str(runtime))
+    assert result["ok"]
+    followups = calls if driver == "archive_snapshot" else calls[1:]
+    for command in followups:
+        assert command[command.index("--registry") + 1] == str(registry.resolve())
+        assert command[command.index("--runtime-root") + 1] == str(runtime)
+    if driver == "archive_snapshot":
+        assert installer_env["LOOPX_REGISTRY"] == str(registry.resolve())
+        assert installer_env["LOOPX_RUNTIME_ROOT"] == str(runtime)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX snapshot rollback")
+@pytest.mark.parametrize("with_helper", [False, True])
+@pytest.mark.parametrize("failed_stage", [None, "compatibility", "doctor", "extensions"])
+def test_rollback_cli_preserves_selected_route_and_failure_boundaries(
+    tmp_path, monkeypatch, capsys, failed_stage, with_helper,
+):
+    from loopx.cli import main
+    from loopx.self_update import render_update_plan_markdown
+
+    runtime = tmp_path / "selected runtime"
+    runtime.mkdir()
+    registry = runtime / "registry.global.json"
+    registry.write_text(json.dumps({"goals": [], "common_runtime_root": str(runtime)}))
+    releases = tmp_path / "releases"
+    current, target = releases / "current", releases / "target"
+    for release in (current, target):
+        (release / "scripts").mkdir(parents=True)
+        (release / "scripts/loopx").write_text("#!/bin/sh\nexit 0\n")
+    launcher = tmp_path / "bin/loopx"
+    launcher.parent.mkdir()
+    launcher.symlink_to(current / "scripts/loopx")
+    helper = launcher.with_name("loopx-apply-rrule")
+    if with_helper:
+        for release in (current, target):
+            script = release / "scripts" / helper.name
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+        helper.symlink_to(current / "scripts" / helper.name)
+    monkeypatch.setattr("loopx.self_update._user_loopx_bin", lambda *_: launcher)
+    monkeypatch.setattr("loopx.self_update._user_releases_dir", lambda *_: releases)
+    snapshot = doctor_payload()
+    snapshot["package"]["release_root"] = str(current)
+    planning_calls, calls = [], []
+
+    def collect(**kwargs):
+        planning_calls.append(kwargs)
+        return snapshot
+
+    def run(command, **kwargs):
+        stage = ("compatibility" if "authority-archive" in command else
+                 "extensions" if "extension" in command else "doctor")
+        calls.append((stage, command))
+        if with_helper and stage != "compatibility":
+            assert helper.resolve() == target / "scripts" / helper.name
+        passed = stage != failed_stage
+        return subprocess.CompletedProcess(
+            command, 0 if passed else 1,
+            json.dumps({"ok": passed, "stage": stage, "error": None if passed else "synthetic refusal"}),
+            "" if passed else "synthetic diagnostic",
+        )
+
+    monkeypatch.setattr("loopx.self_update.collect_doctor", collect)
+    monkeypatch.setattr("loopx.self_update.subprocess.run", run)
+    exit_code = main([
+        "--registry", str(registry), "--runtime-root", str(runtime),
+        "--format", "json", "update", "--rollback", "target",
+    ])
+    result = json.loads(capsys.readouterr().out)
+    assert exit_code == (0 if failed_stage is None else 1)
+    assert result["ok"] is (failed_stage is None)
+    assert planning_calls == [{"registry_path": registry, "runtime_root_override": str(runtime)}]
+    assert [stage for stage, _ in calls] == {
+        None: ["compatibility", "doctor", "extensions"],
+        "compatibility": ["compatibility"],
+        "doctor": ["compatibility", "doctor"],
+        "extensions": ["compatibility", "doctor", "extensions"],
+    }[failed_stage]
+    for _, command in calls:
+        assert command[command.index("--registry") + 1] == str(registry.resolve())
+        assert command[command.index("--runtime-root") + 1] == str(runtime)
+    compatibility = calls[0][1]
+    assert "--require-current" in compatibility and "--execute" not in compatibility
+    assert result["execution"]["compatibility_returncode"] == (1 if failed_stage == "compatibility" else 0)
+    if failed_stage == "compatibility":
+        assert "synthetic refusal" in result["execution"]["compatibility_stdout_tail"]
+    rendered = render_update_plan_markdown(result)
+    if failed_stage:
+        assert "synthetic refusal" in rendered
+        assert "synthetic diagnostic" in rendered
+    if failed_stage == "compatibility":
+        assert "Rollback target authority check failed" in rendered
+        assert "cannot read current authority formats" not in rendered
+    expected_release = current if failed_stage in {"compatibility", "doctor"} else target
+    assert launcher.resolve() == expected_release / "scripts/loopx"
+    if with_helper:
+        assert helper.resolve() == expected_release / "scripts" / helper.name
+    else:
+        assert not os.path.lexists(helper)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX snapshot rollback")
+@pytest.mark.parametrize(
+    "scenario", [
+        "missing_helper", "switch_failure", "switch_failure_without_cli",
+        "signal_after_cli", "signal_after_helper", "later_writer", "interrupted", "foreign", "split",
+    ],
+)
+def test_rollback_reconciles_only_managed_helpers(tmp_path, monkeypatch, scenario):
+    from loopx.self_update import execute_rollback_plan
+
+    releases = tmp_path / ".local/share/loopx/releases"
+    current, target, other = (releases / name for name in ("current", "target", "other"))
+    launcher = tmp_path / ".local/bin/loopx"
+    helper = launcher.with_name("loopx-apply-rrule")
+    launcher.parent.mkdir(parents=True)
+    for release in (current, target, other):
+        (release / "scripts").mkdir(parents=True)
+        for command in (launcher, helper):
+            script = release / "scripts" / command.name
+            if release == target and command == helper and scenario == "missing_helper":
+                continue
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+    first_helper = (
+        tmp_path / "custom-helper" if scenario == "foreign"
+        else (other if scenario == "split" else current) / "scripts" / helper.name
+    )
+    if scenario == "foreign":
+        first_helper.touch()
+    if scenario != "switch_failure_without_cli":
+        launcher.symlink_to(current / "scripts" / launcher.name)
+    helper.symlink_to(os.path.relpath(first_helper, helper.parent))
+    before = (os.readlink(launcher) if launcher.is_symlink() else None, os.readlink(helper))
+    fail_before = {"switch_failure": helper, "switch_failure_without_cli": launcher}.get(scenario)
+    interrupt_after = {"signal_after_cli": launcher, "signal_after_helper": helper}.get(scenario)
+    replace_file = os.replace
+
+    def replace(source, destination):
+        if destination == fail_before:
+            raise OSError("synthetic launcher switch failure")
+        replace_file(source, destination)
+        if destination == interrupt_after and destination.resolve() == target / "scripts" / destination.name:
+            signal.raise_signal(signal.SIGINT)
+
+    def run(command, **_kwargs):
+        if interrupt_after is not None:
+            assert "authority-archive" in command
+        if scenario == "interrupted" and command[-1] == "doctor":
+            raise KeyboardInterrupt
+        if scenario == "later_writer" and command[-1] == "doctor":
+            replacement = helper.with_name("newer-helper")
+            replacement.symlink_to(other / "scripts" / helper.name)
+            replace_file(replacement, helper)
+            return subprocess.CompletedProcess(command, 1, '{"ok":false}', "")
+        return subprocess.CompletedProcess(command, 0, '{"ok":true}', "")
+
+    monkeypatch.setattr("loopx.self_update.os.replace", replace)
+    monkeypatch.setattr("loopx.self_update.subprocess.run", run)
+    payload = {"ok": True, "plan": {"selected_release_root": str(target)}}
+    if scenario == "interrupted" or interrupt_after is not None:
+        with pytest.raises(KeyboardInterrupt):
+            execute_rollback_plan(payload, home=tmp_path)
+        assert (os.readlink(launcher), os.readlink(helper)) == before
+        return
+    result = execute_rollback_plan(payload, home=tmp_path)
+
+    if scenario == "switch_failure_without_cli":
+        assert not result["ok"]
+        assert not result["execution"]["restored_previous_on_failure"]
+        assert "restore_error" not in result["execution"]
+        assert not os.path.lexists(launcher)
+        assert os.readlink(helper) == before[1]
+    elif scenario in {"missing_helper", "switch_failure", "later_writer"}:
+        assert not result["ok"]
+        assert result["execution"]["restored_previous_on_failure"] is (scenario != "missing_helper")
+        assert os.readlink(launcher) == before[0]
+        if scenario == "later_writer":
+            assert helper.resolve() == other / "scripts" / helper.name
+        else:
+            assert os.readlink(helper) == before[1]
+    else:
+        assert result["ok"]
+        assert launcher.resolve() == target / "scripts" / launcher.name
+        if scenario == "foreign":
+            assert os.readlink(helper) == before[1]
+        else:
+            assert helper.resolve() == target / "scripts" / helper.name
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX archive rollback")
+@pytest.mark.parametrize("same_target", [False, True])
+@pytest.mark.parametrize("during_restore", [False, True], ids=["activation", "recovery"])
+def test_rollback_preserves_concurrent_helper_replacement(tmp_path, monkeypatch, same_target, during_restore):
+    from loopx.self_update import execute_rollback_plan
+
+    releases = tmp_path / ".local/share/loopx/releases"
+    current, target = releases / "current", releases / "target"
+    launcher = tmp_path / ".local/bin/loopx"
+    helper = launcher.with_name("loopx-apply-rrule")
+    launcher.parent.mkdir(parents=True)
+    for release in (current, target):
+        scripts = release / "scripts"
+        scripts.mkdir(parents=True)
+        for name in (launcher.name, helper.name):
+            script = scripts / name
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+    launcher.symlink_to(current / "scripts" / launcher.name)
+    helper.symlink_to(current / "scripts" / helper.name)
+    owner_release = target if during_restore else current
+    replacement_target = (
+        owner_release / "scripts" / helper.name if same_target else tmp_path / "independent-rrule"
+    )
+    replacement_stat = None
+    replace_file = os.replace
+    create_symlink = Path.symlink_to
+
+    def replace_helper():
+        nonlocal replacement_stat
+        new_helper = helper.with_name("newer-helper")
+        new_helper.symlink_to(replacement_target)
+        replace_file(new_helper, helper)
+        replacement_stat = helper.lstat()
+
+    def replace(source, destination):
+        replace_file(source, destination)
+        if during_restore:
+            return
+        if destination == launcher and launcher.resolve() == target / "scripts" / launcher.name:
+            replace_helper()
+        elif destination == helper and helper.resolve() == target / "scripts" / helper.name:
+            raise OSError("synthetic interruption after the helper rename")
+
+    def symlink_to(link, link_target, target_is_directory=False):
+        create_symlink(link, link_target, target_is_directory=target_is_directory)
+        if during_restore and link.name == helper.name and Path(link_target) == current / "scripts" / helper.name:
+            replace_helper()
+
+    def run(command, **_kwargs):
+        if "authority-archive" in command:
+            return subprocess.CompletedProcess(command, 0, '{"ok":true}', "")
+        assert during_restore and command[-1] == "doctor"
+        return subprocess.CompletedProcess(command, 1, '{"ok":false}', "")
+
+    monkeypatch.setattr("loopx.self_update.os.replace", replace)
+    monkeypatch.setattr("loopx.self_update.subprocess.run", run)
+    monkeypatch.setattr(Path, "symlink_to", symlink_to)
+    result = execute_rollback_plan(
+        {"ok": True, "plan": {"selected_release_root": str(target)}}, home=tmp_path,
+    )
+    assert not result["ok"] and result["execution"]["restored_previous_on_failure"]
+    assert launcher.resolve() == current / "scripts" / launcher.name
+    assert replacement_stat is not None and os.path.samestat(helper.lstat(), replacement_stat)
+    assert helper.resolve() == replacement_target
+    error = result["execution"]["error"]
+    if during_restore:
+        assert "failed runtime checks" in error
+    else:
+        assert f"launcher changed during rollback checks ({helper.name})" in error
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX snapshot rollback")
+@pytest.mark.parametrize(
+    "target_read", ["compatible", "rejected", "other_revision", "legacy_fallback", "launcher_changed"],
+)
+@pytest.mark.parametrize("select_source_registry", [False, True])
+@pytest.mark.parametrize("archive_layout", ["default", "configured"])
+def test_rollback_checks_registered_todo_read_before_switching(
+    tmp_path, monkeypatch, capsys, target_read, select_source_registry, archive_layout,
+):
+    from loopx.cli import main
+
+    common_runtime = tmp_path / "common"
+    common_runtime.mkdir()
+    global_registry = common_runtime / "registry.global.json"
+    project = tmp_path / "project"
+    project.mkdir()
+    source_registry = project / "registry.json"
+    goal_id = "continued-work"
+    source_registry.write_text(json.dumps({
+        "common_runtime_root": "state", "goals": [{"id": goal_id}],
+    }))
+    global_registry.write_text(json.dumps({
+        "goals": [
+            {"id": goal_id, "source_registry": str(source_registry)},
+            {"id": "legacy-only"},
+        ],
+    }))
+    source_runtime = project / "state"
+    user_home = tmp_path / "user"
+    monkeypatch.setattr(Path, "home", lambda: user_home)
+    default_launcher = user_home / ".local/bin/loopx"
+    if archive_layout == "configured":
+        releases = tmp_path / "configured releases"
+        launcher = tmp_path / "configured bin/loopx"
+        monkeypatch.setenv("LOOPX_RELEASES_DIR", str(releases))
+        monkeypatch.setenv("LOOPX_BIN_DIR", str(launcher.parent))
+        default_launcher.parent.mkdir(parents=True)
+        default_launcher.write_text("Unrelated launcher")
+    else:
+        releases = user_home / ".local/share/loopx/releases"
+        launcher = default_launcher
+        monkeypatch.setenv("LOOPX_RELEASES_DIR", "")
+        monkeypatch.setenv("LOOPX_BIN_DIR", "")
+    current, target, concurrent = (
+        releases / label / "scripts/loopx" for label in ("current", "target", "concurrent")
+    )
+    for command in (current, target, concurrent):
+        command.parent.mkdir(parents=True)
+        command.touch()
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(current)
+    original_inode = launcher.lstat().st_ino
+    snapshot = doctor_payload()
+    snapshot["package"]["release_root"] = str(current.parent.parent)
+    monkeypatch.setattr("loopx.self_update.collect_doctor", lambda **_: snapshot)
+    authority = "loopx.control_plane.coordination.local_authority"
+    promoted = []
+    current_reads = []
+
+    def is_promoted(*, runtime_root, goal_id):
+        promoted.append((runtime_root, goal_id))
+        return runtime_root == source_runtime and goal_id != "legacy-only"
+
+    def read_current(*, runtime_root, goal_id):
+        current_reads.append((runtime_root, goal_id))
+        return {"source_authority": "sqlite_v0", "provider_revision": "sqlite:sample:7"}
+
+    steps = []
+
+    def run(argv, **kwargs):
+        if "todo" in argv:
+            steps.append("todo")
+            assert launcher.lstat().st_ino == original_inode
+            assert launcher.resolve() == current
+            assert argv == [
+                str(target), "--registry", str(source_registry), "--runtime-root", str(source_runtime),
+                "--format", "json", "todo", "list", "--goal-id", goal_id, "--limit", "1",
+            ]
+            result = {
+                "ok": target_read != "rejected", "goal_id": goal_id,
+                "authority_read": {
+                    "source_authority": "sqlite_v0",
+                    "provider_revision": "sqlite:sample:6" if target_read == "other_revision" else "sqlite:sample:7",
+                    "decision_read_from_provider": True,
+                    "legacy_fallback_used": target_read == "legacy_fallback",
+                },
+            }
+            if target_read == "launcher_changed":
+                replacement = launcher.with_name("concurrent-launcher")
+                replacement.symlink_to(concurrent)
+                os.replace(replacement, launcher)
+            return subprocess.CompletedProcess(argv, int(target_read == "rejected"), json.dumps(result), "")
+        steps.append("formats" if "authority-archive" in argv else "doctor" if "extension" not in argv else "extensions")
+        return subprocess.CompletedProcess(argv, 0, '{"ok":true}', "")
+
+    monkeypatch.setattr(f"{authority}.local_authority_is_promoted", is_promoted)
+    monkeypatch.setattr(f"{authority}.read_canonical_todos_if_promoted", read_current)
+    monkeypatch.setattr("loopx.self_update.subprocess.run", run)
+    exit_code = main([
+        "--registry", str(source_registry if select_source_registry else global_registry),
+        "--runtime-root", str(common_runtime),
+        "--format", "json", "update", "--rollback", "target",
+    ])
+    result = json.loads(capsys.readouterr().out)
+    if archive_layout == "configured":
+        assert default_launcher.read_text() == "Unrelated launcher"
+    assert (common_runtime, "legacy-only") in promoted
+    assert current_reads == [(source_runtime, goal_id)]
+    if target_read == "compatible":
+        assert exit_code == 0 and result["ok"]
+        assert steps == ["formats", "todo", "doctor", "extensions"]
+        assert launcher.resolve() == target
+    elif target_read == "launcher_changed":
+        assert exit_code == 1 and not result["ok"]
+        assert steps == ["formats", "todo"]
+        assert "launcher changed during rollback checks" in result["execution"]["error"]
+        assert launcher.resolve() == concurrent
+    else:
+        assert exit_code == 1 and not result["ok"]
+        assert steps == ["formats", "todo"]
+        assert "could not verify current Todo state" in result["execution"]["error"]
+        assert goal_id in result["execution"]["error"]
+        assert launcher.resolve() == current and launcher.lstat().st_ino == original_inode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX archive rollback")
+@pytest.mark.parametrize("legacy_writer", [False, True])
+def test_rollback_serializes_launcher_recovery_with_other_promotions(tmp_path, monkeypatch, legacy_writer):
+    from loopx.self_update import execute_rollback_plan
+
+    releases = tmp_path / ".local/share/loopx/releases"
+    current, target, concurrent = (
+        releases / label / "scripts/loopx" for label in ("current", "target", "concurrent")
+    )
+    for command in (current, target, concurrent):
+        command.parent.mkdir(parents=True)
+        command.touch()
+    launcher = tmp_path / ".local/bin/loopx"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(current)
+    entered_doctor = threading.Event()
+    release_doctor = threading.Event()
+    results = {}
+
+    def run(argv, **kwargs):
+        if "doctor" in argv and "extension" not in argv and launcher.resolve() == target:
+            entered_doctor.set()
+            assert release_doctor.wait(timeout=5)
+            if legacy_writer:
+                replacement = launcher.with_name("legacy-launcher")
+                replacement.symlink_to(concurrent)
+                os.replace(replacement, launcher)
+            return subprocess.CompletedProcess(argv, 1, '{"ok":false}', "")
+        return subprocess.CompletedProcess(argv, 0, '{"ok":true}', "")
+
+    monkeypatch.setattr("loopx.self_update.subprocess.run", run)
+    def payload(command):
+        return {"ok": True, "plan": {"selected_release_root": str(command.parent.parent)}}
+
+    def first_rollback():
+        results["first"] = execute_rollback_plan(payload(target), home=tmp_path, timeout_seconds=2)
+
+    first = threading.Thread(target=first_rollback)
+    first.start()
+    try:
+        assert entered_doctor.wait(timeout=5)
+        assert launcher.resolve() == target
+        blocked = execute_rollback_plan(payload(concurrent), home=tmp_path, timeout_seconds=0.05)
+        assert not blocked["ok"]
+        assert "waiting for another local install" in blocked["execution"]["error"]
+        assert not blocked["execution"]["restored_previous_on_failure"]
+        assert launcher.resolve() == target
+    finally:
+        release_doctor.set()
+        first.join(timeout=5)
+    assert not first.is_alive()
+    assert not results["first"]["ok"]
+    assert results["first"]["execution"]["restored_previous_on_failure"] is (not legacy_writer)
+    assert launcher.resolve() == (concurrent if legacy_writer else current)
+    resumed = execute_rollback_plan(payload(concurrent), home=tmp_path, timeout_seconds=2)
+    assert resumed["ok"]
+    assert launcher.resolve() == concurrent
+
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX archive installation ownership")
+@pytest.mark.parametrize("bin_target", [
+    None, "", "default_alias", "custom", "custom_launcher_link", "relative_custom",
+])
+@pytest.mark.parametrize("extension_returncode", [0, 1])
+def test_archive_readback_and_activation_follow_installer_bin_owner(
+    tmp_path, monkeypatch, bin_target, extension_returncode,
+):
+    default_bin = tmp_path / ".local/bin"
+    custom_bin = tmp_path / "custom/bin"
+    targets = {
+        None: None,
+        "": "",
+        "default_alias": str(default_bin / "../bin"),
+        "custom": str(custom_bin),
+        "custom_launcher_link": str(custom_bin),
+        "relative_custom": "custom/bin",
+    }
+    target = targets[bin_target]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.delenv("LOOPX_BIN_DIR", raising=False)
+    if target is not None:
+        monkeypatch.setenv("LOOPX_BIN_DIR", target)
+    if bin_target == "custom_launcher_link":
+        custom_bin.mkdir(parents=True)
+        # A custom launcher linking to the default runtime still belongs to the
+        # custom installation directory. Resolving the launcher loses ownership.
+        (custom_bin / "loopx").symlink_to(default_bin / "loopx")
+    passed = subprocess.CompletedProcess([], 0, '{"ok":true}', '')
+    extension = subprocess.CompletedProcess([], extension_returncode, '{}', '')
+    with (
+        mock.patch("loopx.self_update.run_archive_installer", return_value=(passed, {})),
+        mock.patch("loopx.self_update.subprocess.run", side_effect=[passed, extension]) as run,
+        mock.patch("loopx.runtime_activation.restart_managed_loopx_services", return_value=["com.loopx.status"]) as restart,
+    ):
+        result = execute_update_plan({"source": {}, "plan": {}})
+    selected_launcher = Path(target or default_bin) / "loopx"
+    assert [call.args[0][0] for call in run.call_args_list] == [str(selected_launcher)] * 2
+    assert result["ok"] is (extension_returncode == 0)
+    assert result["changes_applied"] is True
+    if bin_target in (None, "", "default_alias"):
+        restart.assert_called_once_with()
+        assert result["execution"]["restart_status"] == "restarted"
+    else:
+        restart.assert_not_called()
+        assert result["execution"]["restart_status"] == "skipped_custom_installation"
+        assert result["execution"]["restarted_services"] == []
+    if extension_returncode:
+        assert result["next_action"]["kind"] == "repair_blocked_extensions"
+
+
+@pytest.mark.parametrize("driver", ["python_pip", "python_pipx"])
+def test_python_distribution_activation_ignores_archive_bin_override(tmp_path, monkeypatch, driver):
+    monkeypatch.setenv("LOOPX_BIN_DIR", str(tmp_path / "custom/bin"))
+    payload = apply_plan_for_driver(driver)
+    passed = subprocess.CompletedProcess([], 0, '{"ok":true}', '')
+    with (
+        mock.patch("loopx.self_update.subprocess.run", return_value=passed),
+        mock.patch("loopx.runtime_activation.restart_managed_loopx_services", return_value=[]) as restart,
+    ):
+        result = execute_update_plan(payload)
+    assert result["ok"]
+    restart.assert_called_once_with()
+    assert result["execution"]["restart_status"] == "restarted"

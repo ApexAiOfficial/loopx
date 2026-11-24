@@ -1,128 +1,50 @@
-# Frontstage Dashboard Interaction Baseline
+# Public Presentation Interaction Baseline
 
-LoopX has two frontend jobs, and they should not collapse into one
-layout.
+The [surface strategy](frontstage-two-surface-strategy.md) owns route migration.
+Personal Workspace is the operator product; the homepage, research pages, and
+case directory are the public presentation. Frontstage's duplicate showcase
+and Ops boards are retired.
 
-The showcase surface sells the product model. The ops surface lets real users
-work. They can share React components, icons, tokens, and public-safe fixtures,
-but they should not share data defaults, information density, or motion rules.
+## Navigation
 
-## Surface Split
+- Homepage exploration exposes Personal Workspace's video and guide,
+  SWE-Marathon, DeepSWE behavior analysis, and the full case directory.
+- English and Chinese navigation use the corresponding localized pages where
+  available; the DeepSWE article is identified as Chinese in English copy.
+- Contributor tools remain discoverable at `/developers/projections/`.
+- Direct fragment URLs must land on the rendered section after the React shell
+  mounts, including cold loads and reloads. Fragment targets must remain visible
+  and stationary during entrance effects. Browser tests must assert the initial
+  viewport before calling any scroll or focus helpers; checking URL text or
+  clicking a link after render does not validate a shared deep link.
+- Both React pages share fragment restoration after mount and language reflow.
+  Back/forward navigation restores the URL language; section actions use native
+  links so they create normal history entries. Explicit `index.html` research
+  URLs select the same page as directory URLs. Research navigation stays sticky,
+  with fragment destinations below the bar; decorative overflow must not create
+  an intermediate scroll container.
+- Late font reflow may correct the initial destination once; user input or a
+  subsequent navigation cancels that correction so reading is never interrupted.
+- Do not link primary navigation to retired or deprecated surfaces.
+- Old bookmarks redirect to the current owner; public aliases discard live
+  status parameters instead of passing them into the local workspace.
 
-| Surface | Route posture | Primary job | Data source | Visual rule |
-| --- | --- | --- | --- | --- |
-| Showcase/homepage | Default `/frontstage` | Make the product feel obvious and compelling | `docs/showcases/showcase-catalog.json` plus sanitized share fixtures | Case-first, concise, animated, public-safe |
-| Ops/control-plane | Explicit `mode=ops` | Help an operator scan, decide, and review long-running agent work | Relative or loopback `goal_channel_projection_v0` status feeds | Dense, calm, read-only, repeatable |
+## Visual and interaction rules
 
-The default hosted or copied link must open the showcase surface. Live registry
-state requires an explicit ops route and a loopback or relative status source.
+Follow [the design system](../../development/design.md). Reuse existing
+homepage learning cards, typography, spacing, keyboard focus, and mobile menu.
+Resource cards collapse to one column on phones. Preserve the hero and primary
+setup action while making public resources easy to find.
 
-## Product Direction
+Personal Workspace owns task navigation, status sources and write affordances.
+Retiring the old boards does not change those contracts. Developer tools stay
+read-only and independent of live status state. Public product demonstrations
+must label synthetic data and reuse the current workspace if expanded.
 
-Use the Multica-style agent workspace direction as a product benchmark for
-density and interaction grammar: visible agents, claimed work, boards, timelines,
-search, filters, compact role state, and reusable workspace primitives. Do not
-clone its product model. LoopX still treats quota, status, todos, gates,
-leases, run history, and append-only evidence as the control-plane source of
-truth.
+## Checks
 
-The current stack is the baseline:
-
-- React, Vite, TypeScript, and TanStack Router for a static-build-first app with
-  URL-backed filters.
-- TanStack Table when rows need real sorting, grouping, and column control.
-- Tailwind plus owned shadcn/Base UI-like primitives for compact controls,
-  badges, panels, command surfaces, and accessible interaction states.
-- lucide-react for buttons, lane headers, and unfamiliar controls.
-- Zod at the status boundary so public fixtures and local live feeds fail
-  loudly instead of rendering ambiguous state.
-
-## Showcase Rules
-
-The showcase surface can be fancy because it is not an operator cockpit.
-
-- Lead with public cases and the asynchronous agent operating model.
-- Use motion to explain state flow: safe work moving, gates holding, evidence
-  closing loops, and multiple agent lanes converging through one shared control
-  plane.
-- Render only public-safe showcase catalog fields and sanitized share fixtures.
-- Keep local status exports, internal project labels, raw task ids, private
-  screenshots, benchmark raw logs, and machine paths out of this surface.
-- Link deeper reading to public GitHub showcase pages.
-
-## Ops Rules
-
-The ops surface should feel like a working console, not a landing page.
-
-- Map kernel state into the five user concepts from
-  [Frontend kernel-to-mental-model map](frontend-kernel-mental-model-map.md):
-  goal, next step, blocker/permission, evidence, and continue state.
-- Keep the first screen scannable: goal header, decision frame, quota guard,
-  user todo lane, agent todo lane, claims, gates, artifacts, source warnings,
-  and run timeline.
-- Avoid making `claim`, `scope`, `quota`, `run_history`, or `handoff` top-level
-  user vocabulary unless the user is searching, debugging, or resolving a live
-  decision.
-- Prefer rows, strips, filters, and compact panes over large hero sections.
-- Preserve URL-backed search and lane filters so a review can reproduce the
-  exact projected slice.
-- Keep panels at 8px radius or less and avoid nested cards.
-- Keep writes out of the route. Browser write authority belongs behind a
-  separate local capability gate, not inside the read-only frontstage.
-- Optimize for repeated use: stable dimensions, no horizontal overflow,
-  responsive constraints, and reduced-motion fallbacks.
-
-## Frontstage/Status Sufficiency Check
-
-Before building broader long-horizon LoopX UI, the frontstage/status slice is
-sufficient only if it proves three flows:
-
-- Todo-flow review: ops mode renders searchable user and agent todo lanes with
-  reproducible URL-backed filters and a visible result count.
-- Human-gate animation: showcase mode can explain that human judgment stays
-  visible while safe agent lanes continue, with reduced-motion fallbacks.
-- Multi-lane timeline: the surface can distinguish human decision, agent work,
-  and evidence writeback without making browser UI the source of truth.
-
-These checks intentionally stay narrower than future operator workflows. They
-prove that the existing status projection can carry the story before new
-screens add richer review, feed-style triage, or multi-agent launch controls.
-
-## Current Acceptance Anchors
-
-The route currently exposes these durable anchors:
-
-- `data-frontstage-surface="showcase-homepage"` for the public showcase mode.
-- `data-frontstage-surface="ops-control-plane"` for the live ops mode.
-- `frontstage-ops-workspace-shell` for the dense app shell.
-- `frontstage-ops-command-strip` for search/filter/result-count controls.
-- `frontstage-todo-search`, `frontstage-todo-lane-filter`, and
-  `frontstage-todo-result-count` for reviewable todo projection slices.
-- `frontstage-management-surface-mock` for the low-fidelity ops projection
-  that maps kernel state into mission, team roster, ticket board, gate inbox,
-  cadence/budget, and evidence timeline without introducing a parallel state
-  model.
-- `frontstage-role-map`, `frontstage-active-claims`, `frontstage-open-gates`,
-  `frontstage-artifacts`, and `frontstage-timeline` for the operator workspace.
-- `frontstage-budget-governance` for the ops budget, cadence, no-spend control,
-  and evidence-link contract.
-- `frontstage-showcase-motion-beam` and `frontstage-state-flow-beam` for
-  human-gate and state-flow animation checks.
-- `frontstage-self-iteration-timeline`, `frontstage-self-iteration-lane`,
-  `frontstage-self-iteration-event`, `frontstage-self-iteration-dashed-bridge`,
-  and `frontstage-self-iteration-truth-contract` for the public three-lane
-  self-iteration timeline.
-- `examples/fixtures/long-horizon-self-iteration-rollout.public.json` for a
-  public-safe multi-lane rollout fixture with human gate, handoff, validation,
-  inferred display bridge coverage, and visible frontstage consumption.
-
-`npm run smoke:frontstage-browser` remains the visual acceptance check for this
-surface. It captures desktop and mobile screenshots, checks animated showcase
-rails, verifies public/private boundary behavior, and exercises ops search,
-lane filtering, goal selection, and loopback-source rejection.
-
-`npm run smoke:frontstage-design-baseline` keeps this document, route anchors,
-CSS shell classes, package scripts, and README entry points aligned.
-
-`python3 examples/long-horizon-self-iteration-rollout-fixture-smoke.py` keeps
-the public fixture safe and useful for frontstage timeline consumption.
+`smoke:frontstage-route` protects retired-route ownership and source isolation;
+`smoke:frontstage-browser` exercises migration, current homepage navigation,
+language switching, keyboard focus, and narrow layouts in a real browser.
+`smoke:frontstage-share-bundle` checks the production export and its public
+boundary. The historical script names remain compatible for existing CI.

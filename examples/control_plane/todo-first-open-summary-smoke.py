@@ -12,6 +12,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from loopx.quota import build_quota_should_run, render_quota_should_run_markdown  # noqa: E402
+from loopx.control_plane.scheduler.execution_context import (  # noqa: E402
+    GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
+)
 from loopx.control_plane.todos.active_state_todo_parser import (  # noqa: E402
     parse_active_state_todos as parse_active_state_todos_read_model,
 )
@@ -90,6 +93,7 @@ def build_truncated_todo_group() -> dict:
     assert all(not item["done"] for item in group["items"][:4]), group
     assert all(item["done"] for item in group["items"][4:]), group
     assert group["open_count"] == 4, group
+    assert group["advancement_done_count"] == 13, group
     assert group["first_open_items"][0]["index"] == 17, group
     assert group["first_open_items"][0]["text"] == APPENDED_P0_TODO, group
     assert group["first_open_items"][0]["status"] == "open", group
@@ -161,6 +165,7 @@ def build_blocked_priority_fallback_status_payload() -> dict:
     assert agent_todos["first_executable_items"][0]["text"] == FALLBACK_TODO, agent_todos
     asset_summary = project_asset_todo_summary(agent_todos, role="agent")
     assert asset_summary is not None, agent_todos
+    assert asset_summary["advancement_done_count"] == 0, asset_summary
     direct_summary = direct_project_asset_todo_summary(agent_todos, role="agent")
     assert direct_summary == asset_summary, (direct_summary, asset_summary)
     attention_item = {
@@ -215,24 +220,38 @@ def build_blocked_priority_fallback_status_payload() -> dict:
     }
 
 
-def assert_blocked_priority_fallback_visible() -> None:
+def assert_blocked_priority_fallback_notice_visible() -> None:
+    """A blocked higher-priority todo is announced, but it never gates delivery.
+
+    Informing the owner and requiring owner action are different decisions, and
+    only the first one changed: the fallback still runs, `requires_user_action`
+    and the interactive user channel's `action_required` stay false, and the
+    markdown readback says the notice instead of the old silent default.
+    """
+
     decision = build_quota_should_run(
         build_blocked_priority_fallback_status_payload(),
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert decision["should_run"] is True, decision
     fallback = decision["blocked_priority_fallback"]
-    assert fallback["notify_user"] is False, fallback
+    assert fallback["notify_user"] is True, fallback
     assert fallback["requires_user_action"] is False, fallback
     assert fallback["blocked_items"][0]["text"] == BLOCKED_CORE_TODO, fallback
     assert fallback["selected_executable"]["text"] == FALLBACK_TODO, fallback
-    assert decision["heartbeat_recommendation"]["notify"] == "DONT_NOTIFY", decision
+    assert decision["heartbeat_recommendation"]["notify"] == "NOTIFY", decision
     user_channel = decision["interaction_contract"]["user_channel"]
     assert user_channel["action_required"] is False, user_channel
-    assert user_channel["notify"] == "DONT_NOTIFY", user_channel
+    assert user_channel["notify"] == "NOTIFY", user_channel
+    # The shipped notice starts this sentence with "No" (it follows a full
+    # stop), so assert the policy phrase case-insensitively instead of pinning
+    # the sentence-initial capitalization.
+    assert "no owner action is required" in user_channel["reason"].lower(), user_channel
     markdown = render_quota_should_run_markdown(decision)
-    assert "blocked_priority_fallback: notify_user=False" in markdown, markdown
+    assert "blocked_priority_fallback: notify_user=True" in markdown, markdown
+    assert "no owner action is required" in markdown.lower(), markdown
     assert f"blocked_priority_item[1]: {BLOCKED_CORE_TODO}" in markdown, markdown
     assert f"blocked_priority_selected: {FALLBACK_TODO}" in markdown, markdown
 
@@ -344,7 +363,10 @@ def assert_claimed_frontstage_lanes_visible() -> None:
             ]
         },
     }
-    decision = build_quota_should_run(status_payload, goal_id=GOAL_ID, agent_id="codex-side-bypass")
+    decision = build_quota_should_run(
+        status_payload, goal_id=GOAL_ID, agent_id="codex-side-bypass",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
+    )
     summary = decision["agent_todo_summary"]
     assert [item["index"] for item in summary["unclaimed_priority_open_items"]] == [1, 2], summary
     assert summary["payload_compaction"]["compacted_lanes"]["unclaimed_priority_open_items"] == {
@@ -512,6 +534,7 @@ def assert_claimed_markdown_todos_survive_visibility_lanes() -> None:
         status_payload,
         goal_id=GOAL_ID,
         agent_id="codex-side-bypass",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     summary = decision["agent_todo_summary"]
     assert [item["todo_id"] for item in summary["current_agent_claimed_open_items"]] == [
@@ -621,19 +644,24 @@ def assert_claimed_advancement_lanes_preserve_claimants() -> None:
         status_payload,
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     primary_summary = primary_decision["agent_todo_summary"]
     assert primary_summary["first_executable_items"][0]["todo_id"] == "todo_primary_1", primary_summary
     assert primary_summary["claim_scope"]["agent_model"] == "peer_v1", primary_summary
     assert "agent_role" not in primary_summary["claim_scope"], primary_summary
     assert primary_summary["claim_scope"]["other_agent_claimed_items"][0]["todo_id"] == "todo_side_tui", primary_summary
-    assert "Primary claimed advancement item 1" in primary_decision["recommended_action"], primary_decision
+    # Twenty claimed primary tasks require the shipped long-chain replan before
+    # ordinary delivery. The quota read model must still preserve their owners.
+    assert primary_decision["decision"] == "autonomous_replan_required", primary_decision
+    assert primary_decision["normal_delivery_allowed"] is False, primary_decision
     assert "state_action_projection_warning" not in primary_decision, primary_decision
 
     decision = build_quota_should_run(
         status_payload,
         goal_id=GOAL_ID,
         agent_id="codex-side-bypass",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     summary = decision["agent_todo_summary"]
     current_agent_advancement_ids = [
@@ -753,7 +781,10 @@ def main() -> int:
             ]
         },
     }
-    decision = build_quota_should_run(status_payload, goal_id=GOAL_ID)
+    decision = build_quota_should_run(
+        status_payload, goal_id=GOAL_ID,
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
+    )
     assert decision["should_run"] is True, decision
     agent_summary = decision["agent_todo_summary"]
     assert agent_summary["open_count"] == 4, decision
@@ -786,7 +817,7 @@ def main() -> int:
     ], packet
     assert f"Agent 待办：{APPENDED_P0_TODO}" in packet["project_agent_handoff"], packet
     assert f"Agent 待办候选 2：{OPEN_TODO}" in packet["project_agent_handoff"], packet
-    assert_blocked_priority_fallback_visible()
+    assert_blocked_priority_fallback_notice_visible()
     assert_claimed_frontstage_lanes_visible()
     assert_project_asset_claimed_counts_use_lane_fallback()
     assert_claimed_markdown_todos_survive_visibility_lanes()

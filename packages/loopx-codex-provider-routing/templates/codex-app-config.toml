@@ -1,0 +1,6 @@
+# Native OpenAI login. Retain the user's chosen model and unrelated settings.
+# Account effects are separately enabled in LoopX; this template enables none.
+model_provider = "openai"
+cli_auth_credentials_store = "file"
+forced_login_method = "chatgpt"
+# No custom model catalog, proxy endpoint, profile override or model fallback.

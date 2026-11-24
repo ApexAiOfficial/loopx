@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,39 +28,29 @@ def main() -> int:
     compact_readme = compact(readme)
     compact_readme_zh = "".join(readme_zh.split())
     compact_demo = compact(demo)
-    auto_research = readme.split("### Auto Research", 1)[1].split(
-        "### Used In Real Projects", 1
-    )[0]
-    auto_research_zh = readme_zh.split("### Auto Research", 1)[1].split(
-        "### 真实项目中的使用", 1
-    )[0]
-
     for required in [
         '<div align="center">',
-        "docs/assets/loopx-social-preview.png",
-        "LoopX loop engineering social preview banner",
-        "Loop engineering for long-horizon AI agents and peer agent teams.",
-        "The open, provider-neutral, stateful control plane for long-horizon agents.",
-        "Objectives, gates, todos, evidence, quota, and handoffs stay stable",
+        "long-horizon goals",
+        "multi-agent teams",
+        "## Meet the Personal Agent Workspace",
+        "docs/assets/personal-workspace/research-workbench-hero.webp",
+        "docs/architecture/rfcs/capable-manager-semantic-handoff-v0.md",
         "## Why LoopX",
-        "objective / issue / project",
-        "LoopX state: objective + gates + todos + scope + evidence + quota",
+        "docs/assets/harness-neutral.en.svg",
+        "docs/assets/control-plane-board.en.svg",
         "## Try LoopX",
         "### Start From Your Agent",
         "Codex App",
         "Codex CLI",
         "Claude Code",
         "Cursor, shell, or custom runner",
-        "Claude implements and Codex reviews",
-        "docs/product/use-cases/cross-runtime/cross-runtime-impl-review-demo.md",
+        "docs/product/use-cases/cross-runtime/README.md",
         "## Advanced Paths",
         "200+ hours of elapsed loop lifetime",
         "200+ hour public contribution arc",
-        "Redacted owner-run showcase",
-        "not 200 hours of continuous model execution",
+        "not continuous model execution or unattended production autonomy",
         "docs/assets/long-running-loop-openviking-trajectory.png",
-        "docs/assets/long-running-loop-ml-experiment-trajectory.png",
-        "### Presets and Auto Research",
+        "### Recurring Work Presets",
         "### Review Agent Work",
         "### App and Projection Paths",
         '<a id="how-it-works"></a>',
@@ -67,7 +58,6 @@ def main() -> int:
         '<a id="see-it-in-action"></a>',
         '<a id="capability-surface"></a>',
         '<a id="community--feedback"></a>',
-        "The v0.4.x line is a usable local control plane",
         "docs/assets/loopx-lark-developer-group.png",
         "docs/assets/loopx-wechat-contact.png",
         "WeChat: <code>huangrt00</code>",
@@ -77,12 +67,13 @@ def main() -> int:
         assert required in readme, required
 
     for required in [
+        "docs/assets/personal-workspace/research-workbench-hero.zh-CN.webp",
         '<a id="快速开始"></a>',
         '<a id="看几个例子"></a>',
+        "docs/assets/harness-neutral.zh.svg",
+        "docs/assets/control-plane-board.zh.svg",
         "200+ 小时自然时长",
         "超过 200 小时的公开贡献轨迹",
-        "经过脱敏的 owner-run showcase",
-        "`0.4.x` 已经是一套可用的长程 Agent 本地控制面",
         "docs/assets/loopx-lark-developer-group.png",
         "docs/assets/loopx-wechat-contact.png",
         "微信：<code>huangrt00</code>",
@@ -91,36 +82,28 @@ def main() -> int:
     ]:
         assert required in readme_zh, required
 
-    first_screen = readme.split("## Why LoopX", 1)[0]
-    assert "docs/assets/loopx-logo.png" not in first_screen
+    # Preserve bilingual, responsive diagrams without requiring an old ASCII
+    # rendering of the same architecture. Each picture needs a working fallback.
+    svg_ns = "{http://www.w3.org/2000/svg}"
+    for language, markdown in (("en", readme), ("zh", readme_zh)):
+        for diagram in ("harness-neutral", "control-plane-board"):
+            for variant in ("", ".mobile"):
+                asset = f"docs/assets/{diagram}.{language}{variant}.svg"
+                attribute = "srcset" if variant else "src"
+                assert f'{attribute}="{asset}"' in markdown, asset
+                root = ET.parse(REPO_ROOT / asset).getroot()
+                assert root.tag == f"{svg_ns}svg", asset
+                assert len(root.attrib["viewBox"].split()) == 4, asset
+                assert root.attrib.get("role") == "img", asset
+                for tag in ("title", "desc"):
+                    assert root.findtext(f"{svg_ns}{tag}"), (asset, tag)
+                assert root.find(f".//{svg_ns}script") is None, asset
+            assert '<source media="(max-width: 640px)"' in markdown
 
     for required in [
-        "company or employer endorsement",
-        "independent reproduction",
-    ]:
-        assert required in compact_readme, required
-    for required in [
-        "不等于 200 小时连续模型执行",
-        "公司或雇主背书",
-        "第三方独立复现",
+        "不是连续模型执行时长或无人值守的生产自治",
     ]:
         assert required.replace(" ", "") in compact_readme_zh, required
-
-    for required in [
-        "Reproducible public KNN demo",
-        "deterministic CPU evaluator",
-        "docs/product/use-cases/auto-research/decentralized-auto-research-showcase.md",
-    ]:
-        assert required in auto_research, required
-    assert "redacted" not in auto_research.lower()
-
-    for required in [
-        "可复现的公开 KNN demo",
-        "deterministic CPU evaluator",
-        "docs/product/use-cases/auto-research/decentralized-auto-research-showcase.md",
-    ]:
-        assert required in auto_research_zh, required
-    assert "脱敏" not in auto_research_zh
 
     for required in [
         "`$loopx <complex task>`",
@@ -156,7 +139,18 @@ def main() -> int:
         assert required in compact_demo, required
 
     assert "use-cases/README.md" in product_index
+    # Keep both public entry paths on the guide, while retaining the old design
+    # as a secondary reference rather than forbidding historical links entirely.
+    assert "docs/product/use-cases/cross-runtime/README.md" in readme.split(
+        "## Meet the Personal Agent Workspace", 1
+    )[0]
+    assert "docs/product/use-cases/cross-runtime/README.md#中文指南" in readme_zh.split(
+        "## 认识个人 Agent 工作区", 1
+    )[0]
     assert "cross-runtime-impl-review-demo.md" in cross_runtime_index
+    assert "../../../../examples/collaboration-delivery/README.md" in cross_runtime_index
+    assert "../../../integrations/runtime-connector-catalog.md" in cross_runtime_index
+    assert "[Agent collaboration guide](README.md)" in demo
     assert "### Recover History Index Collisions" in getting_started
     assert "history rebuild-index-collisions" in getting_started
     assert "--review-plan-json reviewed-plan.json" in getting_started

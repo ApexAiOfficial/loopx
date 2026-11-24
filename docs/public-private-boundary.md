@@ -117,6 +117,51 @@ token value, cookie, authorization header, private SSH key, session dump, or
 redaction that still preserves enough characters to reconstruct the secret
 ```
 
+The rule that decides whether control-plane text looks private has one owner:
+`loopx/public_safe_text.py`, mirrored by the TypeScript Vision checkpoint.
+It rejects credential shapes, including the header, assignment, and
+quoted-JSON key forms, while ordinary governance prose such as "needs owner
+authorization" stays public-safe. Both runtimes are pinned to the shared corpus
+in `tests/fixtures/public_safe_text_corpus.json`; extend that corpus rather
+than adding a per-file exception.
+
+Detection and permission are separate. The owner names a category for every
+recognized shape, and a surface picks the policy (the category set) its
+destination needs:
+
+- Repository publication -- a PR-time scan of development code -- uses the full
+  set (`ALL_CATEGORIES`). A bare credential word is rejected there.
+- LoopX's own operational state -- `feedback`, `authority`,
+  `boundary_authority`, and the Vision checkpoint -- uses
+  `TEXT_OWNER_CATEGORIES`, which recognizes a bare credential word without
+  rejecting it. "the Bearer token expired" describes a credential; it does not
+  carry one.
+
+The value arms stay in every policy, so the narrower tier releases prose only. A
+label carries a value when one of four independent signals is present: an
+assignment operator (`:` or `=`), including after a quoted object key, which
+carries whatever follows with no length condition; a connector (whitespace,
+comma, semicolon, dash, or a copula such as "is" or "set to") followed by a token
+containing a digit or one of `+ / =`; the same connector followed by a quoted
+run; or the same connector followed by an unbroken letter-only run of
+`OPAQUE_VALUE_MIN_LENGTH` (16) characters or more. A raw credential token with no
+label at all -- a GitHub token, a private key block -- is rejected by both tiers
+too, which the word-only rule never caught.
+
+No signal reads the length of a word to decide whether a credential *word* is
+present, so a scheme name beside an ordinary English word stays prose while the
+same word with one digit appended is a value. One residual is stated rather than
+argued: a letter-only run of fifteen characters or fewer, written beside the label
+with no quotes and no assignment operator, is prose to this owner. The publication
+tier still rejects the mention, and the internal-state tier is not a
+credential-storage exemption; the corpus carries that row as
+`disclosed_residual_short_letter_value` so the limit stays a decision with a test.
+
+A URL is in neither tier's internal-state policy yet. The rule these four owners
+enforced before never rejected an ordinary link, so this split does not start to;
+whether an internal-state field may carry one is decided per face, together with
+the remaining caller migration in #5136.
+
 ### Compact Artifacts
 
 Safe compact artifact:
@@ -136,6 +181,42 @@ Unsafe artifact:
 raw uploaded files, screenshots with private data, unredacted logs, hidden
 provider payloads, or a public artifact that points back to private storage
 ```
+
+Structured public-output mappings use string field names, as JSON does.
+`validate_public_safe_value` rejects a non-string key before classifying the
+field or inspecting its value. String keys are classified after case, separator,
+and camelCase normalization; converting a non-string key with `str()` is not a
+safe substitute for a field name.
+
+The typed public-export gate also rejects home-relative references, explicit
+`path:` local references, historical colon/equal-prefixed local references and
+`file://` URLs (including host-qualified and case-insensitive forms), in both
+keys and recursively nested values. It consumes
+`find_public_safe_local_path` from the shared text owner. Ordinary HTTP(S)
+links, other remote URIs and repository-relative references remain subject to
+their destination's existing rules; they are not generically private.
+
+This policy applies to the existing typed-export callers:
+
+| Destination | Behavior at the boundary |
+| --- | --- |
+| Goal lifecycle and acceptance projections | Omit unsafe labels and evidence references before compaction; preserve private source records. |
+| Goal notices, attention and delivery review | Reject unsafe facts or synthesized output, or use the caller's existing fallback. |
+| Research observations and diagnostic envelopes | Reject unsafe structured observations. |
+| Peer routing, child task packets and native-child receipts | Reject unsafe candidates, references and packet fields. |
+| Team plans, governed transition receipts, lane settlements and previews | Reject unsafe public payloads before admission/publication. |
+| Extension capability requests and results | Reject unsafe provider payloads at the existing admission boundary. |
+
+Decision-context packets and material-lifecycle fields already rejected file
+URLs. They now report their field-specific local-path error instead of a raw-URL
+error; their length limits and rejection verdicts remain unchanged. Historical
+absolute-path diagnostics at the typed export gate also remain unchanged.
+
+This is a destination-specific migration under #5136. The internal text-owner
+category policies, TypeScript Vision checkpoint, generic
+`public_safe_compact_text` helper and presentation redactor are unchanged;
+using that compactor alone is not proof that a payload passed the typed export
+gate. Other caller migrations remain separate work.
 
 ## Sub-Agent Data
 
@@ -167,7 +248,8 @@ The project repo should answer: "What is this specific goal currently doing?"
 The runtime root should answer: "What happened in recent goal ticks?"
 
 Real controller state belongs in ignored local files such as
-`.codex/goals/<goal-id>/ACTIVE_GOAL_STATE.md`,
+`.loopx/goals/<goal-id>/ACTIVE_GOAL_STATE.md`,
+legacy `.codex/goals/<goal-id>/ACTIVE_GOAL_STATE.md`,
 `.local/goals/<goal-id>/ACTIVE_GOAL_STATE.md`, or the shared runtime root. A
 public repository may track sanitized templates, fixtures, and compact
 projections, but not the live file that a controller updates on every turn.

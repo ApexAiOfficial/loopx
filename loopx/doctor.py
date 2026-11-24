@@ -1,32 +1,48 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 from datetime import datetime, timezone
-from enum import Enum
-from importlib.metadata import PackageNotFoundError, distribution
+from functools import partial
+from importlib.metadata import Distribution, PackageNotFoundError, distribution
 import json
 import os
 import re
 import shlex
-import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
-from . import __version__
+from . import __version__, doctor_git
 from .command_invocation import resolve_command_path
 from .control_plane.runtime.promotion_readiness import (
     PROMOTION_READINESS_CLASSIFICATION,
     PROMOTION_READINESS_RUNTIME_INDEX,
 )
-from .install_contract import NO_CLONE_INSTALL_URL
-from .paths import DEFAULT_RUNTIME_ROOT, global_registry_path
+from .control_plane.runtime.time import chronology_key
+from .install_contract import (
+    NO_CLONE_INSTALL_URL,
+    local_install_command,
+    no_clone_upgrade_command,
+    powershell_literal,
+)
+from .paths import configured_runtime_route, default_runtime_route, global_registry_path
+from .python_install_owner import (
+    PythonInstallOwner,
+    distribution_record_path,
+    installed_loopx_distribution,
+    python_distribution_upgrade_command,
+    resolve_python_install_owner,
+    verified_distribution_console,
+)
 from .capabilities.project_skill_delivery import discover_project_scoped_skill_ids
 from .registry_writability import probe_registry_write_path
-from .release_manifest import load_release_manifest, release_version_tag
+from .release_manifest import load_release_manifest, release_runtime_identity, release_version_tag
 from .skill_install_readback import (
     ARK_MANAGED_AGENT_REQUIRED_SKILL_IDS,
+    PACKAGED_HOST_SKILL_IDS,
     configured_host_skills_dir,
     inspect_skill_install_readback,
+    skill_install_doctor_checks,
 )
 
 
@@ -43,10 +59,11 @@ REQUIRED_INSTALLED_SKILL_PHRASES = {
         "--delivery-outcome <ACTUAL_DELIVERY_OUTCOME>",
     ),
     "loopx-pr-review": (
-        "loopx --format json pr-review --state all",
+        "keeps ordinary queue discovery open-only",
+        "explicit `--state merged|all`",
         "thin host adapter",
         "agent_response_contract.review_execution_contract",
-        "pull_requests[].review_plan",
+        "pull_requests[review_action_kind!=null].review_plan",
         "completion_gate",
         "loopx-pr-merge",
     ),
@@ -65,82 +82,17 @@ REQUIRED_INSTALLED_SKILL_PHRASES = {
     "loopx-benchmark": (
         "builtin `benchmark-toolkit` capability owns provider-neutral",
         "without a per-Goal enable switch",
-        "Installing this skill does not grant runner",
+        "Respect the selected todo's required capabilities, any external provider binding, host permissions, and user gates.",
         "For a generic library microbenchmark",
     ),
     "loopx-self-repair": (
-        "Build a compact evidence packet",
-        "loopx --format json diagnose --goal-id <goal-id>",
-        "loopx --format json status --goal-id <goal-id> --limit 20",
-        "registry-declared active state file",
-        "references/repair-patterns.md",
+        "Reuse evidence before collecting more",
+        "scripts/find_pattern.py",
+        "references/targeted-diagnostics.md",
+        "references/pattern-lookup.md",
         "Repair at the lowest durable layer",
     ),
 }
-
-
-class GitRevisionRelation(str, Enum):
-    SAME = "same"
-    INSTALLED_AHEAD = "installed_ahead"
-    INSTALLED_BEHIND = "installed_behind"
-    DIVERGED = "diverged"
-    UNKNOWN = "unknown"
-
-
-def _powershell_literal(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def local_install_command(repo_root: Path, *, skip_skills: bool = False) -> str:
-    if os.name == "nt":
-        return (
-            "pwsh -NoLogo -NoProfile -File "
-            f"{_powershell_literal(repo_root / 'scripts' / 'install-windows.ps1')} "
-            f"-Python {_powershell_literal(sys.executable)}"
-            + (" -SkipSkills" if skip_skills else "")
-        )
-    command = str(repo_root / "scripts" / "install-local.sh")
-    return f"LOOPX_INSTALL_SKILL=0 {command}" if skip_skills else command
-
-
-def no_clone_upgrade_command(
-    source_ref: Any = None,
-    *,
-    doctor_agent_type: str | None = None,
-    skip_skills: bool = False,
-) -> str:
-    if os.name == "nt":
-        repo_root = Path(__file__).resolve().parents[1]
-        doctor_agent_arg = (
-            f" --agent-type {_powershell_literal(doctor_agent_type)}"
-            if doctor_agent_type
-            else ""
-        )
-        return (
-            f"{local_install_command(repo_root, skip_skills=skip_skills)}\n"
-            f"loopx doctor{doctor_agent_arg}"
-        )
-    ref = str(source_ref or "").strip()
-    installer = f"curl -fsSL {NO_CLONE_INSTALL_URL}"
-    doctor_agent_arg = (
-        f" --agent-type {shlex.quote(doctor_agent_type)}"
-        if doctor_agent_type
-        else ""
-    )
-    install_env: list[str] = []
-    if ref and ref != "stable":
-        install_env.append(f"LOOPX_REF={shlex.quote(ref)}")
-    if skip_skills:
-        install_env.append("LOOPX_INSTALL_SKILL=0")
-    if install_env:
-        installer = f"{installer} | env {' '.join(install_env)} bash"
-    else:
-        installer = f"{installer} | bash"
-    return (
-        f"{installer}\n"
-        'export PATH="$HOME/.local/bin:$PATH"\n'
-        f"loopx doctor{doctor_agent_arg}"
-    )
 
 
 def user_local_bin() -> Path:
@@ -173,10 +125,10 @@ def command_release_root(command_realpath: Path | None) -> Path | None:
     return None
 
 
-def current_script_invocation_path() -> Path | None:
-    """Return the active LoopX executable when invoked through its console script."""
+def _current_invocation(*, inspect_distribution_launcher: bool) -> tuple[Path | None, bool]:
+    """Return the invocation path and whether a verified module owns the route."""
     if not sys.argv or not sys.argv[0]:
-        return None
+        return None, False
     path = Path(sys.argv[0]).expanduser()
     if not path.is_absolute():
         path = Path.cwd() / path
@@ -184,33 +136,76 @@ def current_script_invocation_path() -> Path | None:
         path = path.resolve()
     except OSError:
         path = path.absolute()
-    if path.exists() and path.name == "loopx":
-        return path
+    if path.exists() and path.name.lower() in {"loopx", "loopx.exe"}:
+        return path, False
+    module_path = Path(__file__).resolve()
+    entrypoint = module_path.with_name("entrypoint.py")
+    if path != entrypoint and (not inspect_distribution_launcher or path != module_path.with_name("cli.py")):
+        return None, False
+    installed = _python_distribution_owning_module(module_path)
+    if installed is None:
+        return None, False
+    if installed.name == "loopx-core":
+        return (path, True) if path == entrypoint else (None, False)
+    # Source metadata can list the module without recording an installed script.
+    if not inspect_distribution_launcher or installed.read_text("RECORD") is None:
+        return None, False
+
+    # The package updater invokes Doctor with its interpreter. Resolve that
+    # distribution's console script even if the shell names a different CLI.
+    script_name = "loopx.exe" if os.name == "nt" else "loopx"
+    scripts = {
+        distribution_record_path(item)
+        for item in installed.files or ()
+        if Path(item.as_posix()).name.lower() == script_name
+    }
+    if len(scripts) == 1:
+        script = verified_distribution_console(scripts.pop())
+        if script is not None and os.access(script, os.X_OK):
+            return script, True
+    return None, True
+
+
+def current_script_invocation_path() -> Path | None:
+    """Return the launcher eligible under the existing service activation policy."""
+    return _current_invocation(inspect_distribution_launcher=False)[0]
+
+
+def doctor_invocation_path() -> tuple[Path | None, bool]:
+    """Resolve Doctor's invocation while retaining ownership if its launcher is unavailable."""
+    return _current_invocation(inspect_distribution_launcher=True)
+
+
+def _python_distribution_owning_module(module_path: Path) -> Distribution | None:
+    try:
+        installed = installed_loopx_distribution(distribution)
+    except PackageNotFoundError:
+        return None
+    expected = module_path.resolve()
+    module_suffix = os.path.join("loopx", "doctor.py")
+    for item in installed.files or ():
+        entry = item.as_posix()
+        if os.path.normcase(entry).endswith(module_suffix) and distribution_record_path(item).resolve() == expected:
+            return installed
     return None
 
 
 def python_distribution_install(module_path: Path) -> dict[str, Any]:
     """Identify a wheel/sdist install that owns the imported LoopX module."""
-
-    try:
-        installed = distribution("loopx")
-    except PackageNotFoundError:
+    installed = _python_distribution_owning_module(module_path)
+    if installed is None:
         return {"available": False}
     installer = (installed.read_text("INSTALLER") or "").strip() or "unknown"
-    expected = module_path.resolve()
-    owns_module = any(
-        item.as_posix().endswith("loopx/doctor.py")
-        and Path(item.locate()).resolve() == expected
-        for item in installed.files or ()
-    )
-    if not owns_module:
-        return {"available": False}
+    owner = resolve_python_install_owner(default_installer=installer, prefix=Path(sys.prefix))
     return {
         "available": True,
         "kind": "python_distribution",
         "version": installed.version,
-        "installer": installer,
-        "root": str(Path(installed.locate_file("")).resolve()),
+        "installer": owner.manager,
+        "installer_environment": owner.environment,
+        "root": str(Path(cast(Path, installed.locate_file(""))).resolve()),
+        **({"distribution_name": "loopx-core"}
+           if getattr(installed, "name", "loopx") == "loopx-core" else {}),
     }
 
 
@@ -229,7 +224,7 @@ def command_root_summary(
         "command": str(command_path) if command_path else None,
         "realpath": str(command_realpath) if command_realpath else None,
         "root": str(root) if root else None,
-        "release_id": root.name if is_release_snapshot(root) else None,
+        "release_id": cast(Path, root).name if is_release_snapshot(root) else None,
         "is_release_snapshot": is_release_snapshot(root),
     }
 
@@ -252,187 +247,6 @@ def short_revision(value: Any, *, length: int = 12) -> str | None:
     return text[:length] if len(text) > length else text
 
 
-def git_metadata_for_root(root: Path | None) -> dict[str, Any]:
-    if root is None:
-        return {
-            "root": None,
-            "git_commit": None,
-            "git_ref": None,
-            "git_dirty": None,
-        }
-    try:
-        source_root = root.expanduser().resolve()
-    except OSError:
-        source_root = root.expanduser()
-    if not source_root.exists():
-        return {
-            "root": str(source_root),
-            "git_commit": None,
-            "git_ref": None,
-            "git_dirty": None,
-        }
-
-    def _run(args: list[str]) -> str | None:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(source_root), *args],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError:
-            return None
-        if result.returncode != 0:
-            return None
-        return result.stdout.strip() or None
-
-    commit = _run(["rev-parse", "HEAD"])
-    branch = _run(["symbolic-ref", "--quiet", "--short", "HEAD"])
-    tag = _run(["describe", "--tags", "--exact-match"])
-    status = _run(["status", "--porcelain"])
-    dirty = None if commit is None and branch is None and tag is None and status is None else bool(status)
-    return {
-        "root": str(source_root),
-        "git_commit": commit,
-        "git_ref": branch or tag,
-        "git_dirty": dirty,
-    }
-
-
-def git_revision_relation(
-    root: Path | None,
-    *,
-    installed_commit: Any,
-    comparison_commit: Any,
-) -> GitRevisionRelation:
-    """Classify installed vs comparison revisions in one Git object graph."""
-    if not isinstance(installed_commit, str) or not installed_commit.strip():
-        return GitRevisionRelation.UNKNOWN
-    if not isinstance(comparison_commit, str) or not comparison_commit.strip():
-        return GitRevisionRelation.UNKNOWN
-    installed_commit = installed_commit.strip()
-    comparison_commit = comparison_commit.strip()
-    if installed_commit == comparison_commit:
-        return GitRevisionRelation.SAME
-    if root is None:
-        return GitRevisionRelation.UNKNOWN
-
-    try:
-        source_root = root.expanduser().resolve()
-    except OSError:
-        source_root = root.expanduser()
-    if not source_root.exists():
-        return GitRevisionRelation.UNKNOWN
-
-    def _is_ancestor(ancestor: str, descendant: str) -> bool | None:
-        try:
-            result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(source_root),
-                    "merge-base",
-                    "--is-ancestor",
-                    ancestor,
-                    descendant,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError:
-            return None
-        if result.returncode == 0:
-            return True
-        if result.returncode == 1:
-            return False
-        return None
-
-    comparison_is_ancestor = _is_ancestor(comparison_commit, installed_commit)
-    installed_is_ancestor = _is_ancestor(installed_commit, comparison_commit)
-    if comparison_is_ancestor is None or installed_is_ancestor is None:
-        return GitRevisionRelation.UNKNOWN
-    if comparison_is_ancestor:
-        return GitRevisionRelation.INSTALLED_AHEAD
-    if installed_is_ancestor:
-        return GitRevisionRelation.INSTALLED_BEHIND
-    return GitRevisionRelation.DIVERGED
-
-
-def _github_repository_from_remote_url(value: Any) -> str | None:
-    text = str(value or "").strip().removesuffix(".git")
-    match = re.search(r"github\.com(?::|/)([^/\s]+/[^/\s]+)$", text, flags=re.IGNORECASE)
-    return match.group(1).lower() if match else None
-
-
-def trusted_release_ref_for_root(
-    root: Path | None,
-    *,
-    repository: Any,
-    ref: Any,
-) -> dict[str, Any] | None:
-    """Resolve the manifest repository's fetched ref without trusting canary HEAD."""
-    expected_repository = _github_repository_from_remote_url(repository) or (
-        str(repository or "").strip().removesuffix(".git").lower()
-    )
-    expected_ref = str(ref or "").strip().removeprefix("refs/heads/")
-    if root is None or not expected_repository or not expected_ref:
-        return None
-    try:
-        source_root = root.expanduser().resolve()
-    except OSError:
-        source_root = root.expanduser()
-    if not source_root.exists():
-        return None
-
-    try:
-        remotes = subprocess.run(
-            ["git", "-C", str(source_root), "remote"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return None
-    if remotes.returncode != 0:
-        return None
-
-    for remote in remotes.stdout.splitlines():
-        remote = remote.strip()
-        if not remote:
-            continue
-        try:
-            remote_url = subprocess.run(
-                ["git", "-C", str(source_root), "remote", "get-url", remote],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError:
-            continue
-        if (
-            remote_url.returncode != 0
-            or _github_repository_from_remote_url(remote_url.stdout) != expected_repository
-        ):
-            continue
-        trusted_ref = f"refs/remotes/{remote}/{expected_ref}"
-        resolved = subprocess.run(
-            ["git", "-C", str(source_root), "rev-parse", "--verify", f"{trusted_ref}^{{commit}}"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        commit = resolved.stdout.strip() if resolved.returncode == 0 else ""
-        if commit:
-            return {
-                "label": f"{expected_repository}@{expected_ref}",
-                "root": str(source_root),
-                "git_commit": commit,
-                "git_ref": f"{remote}/{expected_ref}",
-            }
-    return None
-
-
 def build_install_freshness(
     *,
     command_path: Path | None,
@@ -448,7 +262,7 @@ def build_install_freshness(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     reference = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    release_id = release_root.name if is_release_snapshot(release_root) else None
+    release_id = cast(Path, release_root).name if is_release_snapshot(release_root) else None
     release_time = parse_release_id_time(release_id)
     age_hours: float | None = None
     if release_time:
@@ -499,9 +313,9 @@ def build_install_freshness(
         requires_upgrade = False
 
     manifest = release_manifest if isinstance(release_manifest, dict) else {}
-    manifest_body = manifest.get("manifest") if isinstance(manifest.get("manifest"), dict) else {}
+    manifest_body = cast(dict[str, Any], manifest.get("manifest")) if isinstance(manifest.get("manifest"), dict) else {}
     manifest_package = (
-        manifest_body.get("package") if isinstance(manifest_body.get("package"), dict) else {}
+        cast(dict[str, Any], manifest_body.get("package")) if isinstance(manifest_body.get("package"), dict) else {}
     )
     manifest_package_version = manifest_package.get("version")
     manifest_package_version_tag = manifest_package.get("version_tag") or (
@@ -516,7 +330,7 @@ def build_install_freshness(
         else None
     )
     manifest_source = (
-        manifest_body.get("source") if isinstance(manifest_body.get("source"), dict) else {}
+        cast(dict[str, Any], manifest_body.get("source")) if isinstance(manifest_body.get("source"), dict) else {}
     )
     no_clone_command = no_clone_upgrade_command(
         manifest_source.get("ref"),
@@ -532,14 +346,16 @@ def build_install_freshness(
         f"{local_install_command(repo_root, skip_skills=externally_managed_skills)}\n"
         f"loopx doctor{doctor_agent_arg}"
     )
-    upgrade_command = (
-        f"{shlex.quote(sys.executable)} -m pip install --upgrade loopx\n"
-        "loopx workflow-skills --install\n"
-        "loopx slash-commands --install\n"
-        f"loopx doctor{doctor_agent_arg}"
-        if distribution_install
-        else no_clone_command
-    )
+    distribution_owner = PythonInstallOwner(
+        str(distribution_install.get("installer") or "unknown"),
+        distribution_install.get("installer_environment"),
+    ) if distribution_install else None
+    upgrade_command = python_distribution_upgrade_command(
+        owner=distribution_owner,
+        python_executable=sys.executable,
+        doctor_command=f"loopx doctor{doctor_agent_arg}",
+        distribution_name=str((distribution_install or {}).get("distribution_name") or "loopx"),
+    ) if distribution_owner else no_clone_command
     manifest_source_git_commit = manifest_source.get("git_commit")
     manifest_source_revision = (
         manifest_source_git_commit
@@ -566,7 +382,7 @@ def build_install_freshness(
     )
     source_commit_is_behind = (
         manifest_source_matches_freshness_source is False
-        and freshness_revision_relation == GitRevisionRelation.INSTALLED_BEHIND
+        and freshness_revision_relation == doctor_git.GitRevisionRelation.INSTALLED_BEHIND
     )
 
     if (
@@ -591,7 +407,7 @@ def build_install_freshness(
         requires_upgrade = True
 
     manifest_skills = (
-        manifest_body.get("skills") if isinstance(manifest_body.get("skills"), dict) else {}
+        cast(dict[str, Any], manifest_body.get("skills")) if isinstance(manifest_body.get("skills"), dict) else {}
     )
     return {
         "schema_version": "loopx_install_freshness_v0",
@@ -616,6 +432,9 @@ def build_install_freshness(
         ),
         "python_distribution_installer": (
             distribution_install.get("installer") if distribution_install else None
+        ),
+        "python_distribution_installer_environment": (
+            distribution_install.get("installer_environment") if distribution_install else None
         ),
         "externally_managed_skills": externally_managed_skills,
         "release_manifest_available": manifest.get("available"),
@@ -642,7 +461,7 @@ def build_install_freshness(
         "manifest_source_matches_comparison": manifest_source_matches_comparison,
         "manifest_source_comparison_relation": (
             comparison_revision_relation.value
-            if isinstance(comparison_revision_relation, GitRevisionRelation)
+            if isinstance(comparison_revision_relation, doctor_git.GitRevisionRelation)
             else comparison_revision_relation
         ),
         "freshness_source_label": freshness_source_label if trusted else None,
@@ -653,7 +472,7 @@ def build_install_freshness(
         "manifest_source_matches_freshness_source": manifest_source_matches_freshness_source,
         "manifest_source_freshness_relation": (
             freshness_revision_relation.value
-            if isinstance(freshness_revision_relation, GitRevisionRelation)
+            if isinstance(freshness_revision_relation, doctor_git.GitRevisionRelation)
             else freshness_revision_relation
         ),
         "manifest_archive_sha256": manifest_source.get("archive_sha256"),
@@ -739,7 +558,8 @@ def installed_skill_summary(skills_roots: tuple[Path, ...]) -> dict[str, dict[st
         raise ValueError("at least one Codex skill root is required")
     primary_root = skills_roots[0]
     summaries: dict[str, dict[str, Any]] = {}
-    for skill_name, phrases in REQUIRED_INSTALLED_SKILL_PHRASES.items():
+    for skill_name in PACKAGED_HOST_SKILL_IDS:
+        phrases = REQUIRED_INSTALLED_SKILL_PHRASES.get(skill_name, ())
         candidates = [
             (root, root / skill_name / "SKILL.md")
             for root in skills_roots
@@ -784,6 +604,66 @@ def installed_skill_check(
     }
 
 
+def optional_installation_script_check(
+    check_id: str,
+    *,
+    exists: bool,
+    path: Path,
+    distribution_install: bool,
+) -> dict[str, Any]:
+    """Report release scripts only where the installation includes them."""
+    applicable = not distribution_install
+    return {
+        "id": check_id,
+        "required": False,
+        "ok": exists if applicable else True,
+        "applicable": applicable,
+        "detail": (
+            str(path)
+            if applicable
+            else "not applicable: Python package installs do not include release installer scripts"
+        ),
+    }
+
+
+def _promotion_goal_segment(goal_id: object) -> str | None:
+    segment = str(goal_id or "").strip()
+    if not segment or segment in {".", ".."} or "/" in segment or "\\" in segment:
+        return None
+    return segment
+
+
+def _promotion_artifact_exists(
+    raw_path: object,
+    *,
+    extension: str,
+    runtime_root: Path,
+    goal_id: str | None,
+) -> bool:
+    """Stored path, or the same-named regular file copied into this goal's runs."""
+
+    text = str(raw_path or "")
+    path = Path(text)
+    # Path("") is ".", so a missing path still probes the working directory.
+    # That matches the previous ``Path(stored).exists()`` check.
+    if str(path):
+        try:
+            if path.exists():
+                return True
+        except (OSError, RuntimeError):
+            # A historical path can name an account that does not exist here.
+            # It is evidence of missing promotion output, not a doctor failure.
+            pass
+    segment = _promotion_goal_segment(goal_id)
+    stored = text.strip()
+    if segment is None or not stored:
+        return False
+    from .control_plane.quota.ledger_readback import relocated_run_artifact_path
+
+    runs_dir = runtime_root / "goals" / segment / "runs"
+    return relocated_run_artifact_path(runs_dir, segment, stored, extension) is not None
+
+
 def latest_promotion_readiness_event(runtime_root: Path, goal_id: str | None = None) -> dict[str, Any]:
     goals_dir = runtime_root / "goals"
     runtime_index = runtime_root / PROMOTION_READINESS_RUNTIME_INDEX
@@ -807,7 +687,7 @@ def latest_promotion_readiness_event(runtime_root: Path, goal_id: str | None = N
         )
     for index_path, current_goal_id, source in indexes:
         try:
-            lines = index_path.read_text(encoding="utf-8").splitlines()
+            lines = index_path.read_text(encoding="utf-8").split("\n")
         except OSError:
             continue
         for line in lines:
@@ -822,11 +702,12 @@ def latest_promotion_readiness_event(runtime_root: Path, goal_id: str | None = N
             classification = str(item.get("classification") or "")
             if classification not in PROMOTION_READINESS_CLASSIFICATIONS:
                 continue
-            json_path = Path(str(item.get("json_path") or ""))
-            markdown_path = Path(str(item.get("markdown_path") or ""))
             target_matches = (
                 runtime_matches if source == "runtime_release_ledger" else legacy_matches
             )
+            # Legacy indexes live under goals/<id>/runs. A release-ledger row
+            # remaps only when its own goal id and path use that same shape.
+            remap_goal_id = current_goal_id or _promotion_goal_segment(item.get("goal_id"))
             target_matches.append(
                 {
                     "available": True,
@@ -841,10 +722,22 @@ def latest_promotion_readiness_event(runtime_root: Path, goal_id: str | None = N
                     "delivery_batch_scale": item.get("delivery_batch_scale"),
                     "delivery_outcome": item.get("delivery_outcome"),
                     "recommended_action": item.get("recommended_action"),
-                    "json_exists": json_path.exists() if str(json_path) else False,
-                    "markdown_exists": markdown_path.exists() if str(markdown_path) else False,
+                    "json_exists": _promotion_artifact_exists(
+                        item.get("json_path"),
+                        extension=".json",
+                        runtime_root=runtime_root,
+                        goal_id=remap_goal_id,
+                    ),
+                    "markdown_exists": _promotion_artifact_exists(
+                        item.get("markdown_path"),
+                        extension=".md",
+                        runtime_root=runtime_root,
+                        goal_id=remap_goal_id,
+                    ),
                 }
             )
+        if runtime_matches:
+            break
 
     matches = runtime_matches or legacy_matches
     if not matches:
@@ -858,7 +751,10 @@ def latest_promotion_readiness_event(runtime_root: Path, goal_id: str | None = N
                 else "no canary promotion readiness run found"
             ),
         }
-    matches.sort(key=lambda item: str(item.get("generated_at") or ""), reverse=True)
+    matches.sort(
+        key=lambda item: chronology_key(item.get("generated_at")),
+        reverse=True,
+    )
     latest = matches[0]
     latest["runtime_root"] = str(runtime_root)
     return latest
@@ -868,11 +764,33 @@ def collect_doctor(
     *,
     deep: bool = False,
     agent_type: str | None = None,
+    installation_only: bool = False,
+    registry_path: Path | None = None,
+    runtime_root_override: str | None = None,
+    zcode_cli: str | None = None,
+    zcode_desktop: str | None = None,
+    zcode_source: str | None = None,
 ) -> dict[str, Any]:
+    if any(value is not None for value in (zcode_cli, zcode_desktop, zcode_source)):
+        from .host_loop_activation import normalize_agent_type
+
+        if installation_only or not agent_type or normalize_agent_type(agent_type) != "zcode":
+            raise ValueError("ZCode paths require --agent-type zcode and host integration scope")
+    if installation_only:
+        from .release_candidate import collect_installation_doctor
+
+        return collect_installation_doctor(deep=deep)
     from .control_plane.runtime.runtime_projection_route import (
         collect_runtime_projection_route_diagnostics,
     )
     from .control_plane.effect_runtime import collect_effect_runtime_readiness
+
+    local_state_route = (
+        configured_runtime_route(registry_path=registry_path, runtime_root_override=runtime_root_override)
+        if registry_path is not None or runtime_root_override is not None
+        else default_runtime_route()
+    )
+    selected_runtime_root = Path(str(local_state_route["selected_runtime_root"]))
 
     from .host_loop_activation import (
         agent_type_uses_host_managed_skills,
@@ -895,11 +813,18 @@ def collect_doctor(
         else None
     )
     loopx_path = resolve_command_path("loopx")
-    invocation_path = current_script_invocation_path()
+    invocation_path, module_owns_route = doctor_invocation_path()
     loopx_canary_path = resolve_command_path("loopx-canary")
-    command_path_primary = loopx_path or invocation_path
+    command_path = invocation_path if module_owns_route else loopx_path or invocation_path
+    if module_owns_route:
+        command_detail = str(invocation_path) if invocation_path else "installed Python console script unavailable"
+    elif loopx_path:
+        command_detail = str(loopx_path)
+    elif invocation_path:
+        command_detail = f"loopx was not found on PATH; using current invocation {invocation_path}"
+    else:
+        command_detail = "loopx was not found on PATH"
     canary_path = loopx_canary_path
-    command_path = command_path_primary
     command_realpath = command_path.resolve() if command_path else None
     canary_realpath = canary_path.resolve() if canary_path else None
     loopx_canary_realpath = loopx_canary_path.resolve() if loopx_canary_path else None
@@ -923,13 +848,52 @@ def collect_doctor(
     release_manifest = load_release_manifest(release_root)
     comparison_source = None
     if canary_realpath and command_realpath and canary_realpath != command_realpath:
-        comparison_source = git_metadata_for_root(command_release_root(canary_realpath))
+        comparison_source = doctor_git.git_metadata_for_root(
+            command_release_root(canary_realpath)
+        )
         comparison_source["label"] = "loopx-canary"
     path_entries = os.environ.get("PATH", "").split(os.pathsep)
     local_bin = user_local_bin()
-    skill_roots = codex_skill_roots()
-    skills = installed_skill_summary(skill_roots)
-    project_skill = skills["loopx-project"]
+    zcode_skill_repair_command = None
+    skill_roots: tuple[Path, ...]
+    if canonical_agent_type == "zcode":
+        from .slash_command_install import inspect_skill_facades
+        from .zcode_goal_mode import zcode_home
+
+        selected_zcode_home = zcode_home()
+        skill_roots = (selected_zcode_home / "skills",)
+        skills = inspect_skill_facades(skill_roots[0])
+        project_skill = skills["loopx"]
+        home_arg = (
+            powershell_literal(selected_zcode_home)
+            if os.name == "nt"
+            else shlex.quote(str(selected_zcode_home))
+        )
+        zcode_skill_repair_command = (
+            "loopx slash-commands --install --surface zcode "
+            f"--zcode-home {home_arg}"
+        )
+    elif canonical_agent_type in {"agy", "antigravity-app"}:
+        from .agy_goal_mode import antigravity_config_home
+        from .slash_command_install import inspect_skill_facades
+
+        agy_cfg_skills = antigravity_config_home() / "skills"
+        if (agy_cfg_skills / "loopx-project" / "SKILL.md").exists():
+            skill_roots = (agy_cfg_skills,)
+            skills = installed_skill_summary(skill_roots)
+            project_skill = skills["loopx-project"]
+        elif (agy_cfg_skills / "loopx" / "SKILL.md").exists():
+            skill_roots = (agy_cfg_skills,)
+            skills = inspect_skill_facades(agy_cfg_skills, host_surface="antigravity-app")
+            project_skill = skills["loopx"]
+        else:
+            skill_roots = (agy_cfg_skills, *codex_skill_roots())
+            skills = installed_skill_summary(skill_roots)
+            project_skill = skills["loopx-project"]
+    else:
+        skill_roots = codex_skill_roots()
+        skills = installed_skill_summary(skill_roots)
+        project_skill = skills["loopx-project"]
     skill_path = Path(str(project_skill["path"]))
     project_scoped_skill_ids = discover_project_scoped_skill_ids(
         repo_root / "skills"
@@ -947,23 +911,23 @@ def collect_doctor(
     default_release["release_manifest_available"] = release_manifest.get("available")
     default_release["release_manifest_path"] = release_manifest.get("path")
     release_manifest_body = (
-        release_manifest.get("manifest")
+        cast(dict[str, Any], release_manifest.get("manifest"))
         if isinstance(release_manifest.get("manifest"), dict)
         else {}
     )
     release_manifest_source = (
-        release_manifest_body.get("source")
+        cast(dict[str, Any], release_manifest_body.get("source"))
         if isinstance(release_manifest_body.get("source"), dict)
         else {}
     )
     if comparison_source:
         comparison_root = comparison_source.get("root")
-        comparison_source["revision_relation"] = git_revision_relation(
+        comparison_source["revision_relation"] = doctor_git.git_revision_relation(
             Path(str(comparison_root)) if comparison_root else None,
             installed_commit=release_manifest_source.get("git_commit"),
             comparison_commit=comparison_source.get("git_commit"),
         )
-    freshness_source = trusted_release_ref_for_root(
+    freshness_source = doctor_git.trusted_release_ref_for_root(
         Path(str(comparison_source.get("root")))
         if comparison_source and comparison_source.get("root")
         else None,
@@ -971,14 +935,14 @@ def collect_doctor(
         ref=release_manifest_source.get("ref"),
     )
     if freshness_source:
-        freshness_source["revision_relation"] = git_revision_relation(
+        freshness_source["revision_relation"] = doctor_git.git_revision_relation(
             Path(str(freshness_source.get("root"))),
             installed_commit=release_manifest_source.get("git_commit"),
             comparison_commit=freshness_source.get("git_commit"),
         )
     default_release["promotion_mode"] = release_manifest_source.get("promotion_mode")
     release_provenance = {
-        "runtime_root": str(DEFAULT_RUNTIME_ROOT),
+        "runtime_root": str(selected_runtime_root),
         "default_release": default_release,
         "live_canary": {
             **command_root_summary(canary_path, canary_realpath),
@@ -996,10 +960,11 @@ def collect_doctor(
             ),
         },
         "promotion_readiness": add_promotion_readiness_freshness(
-            latest_promotion_readiness_event(DEFAULT_RUNTIME_ROOT)
+            latest_promotion_readiness_event(selected_runtime_root)
         ),
     }
-    install_freshness = build_install_freshness(
+    freshness_projection = partial(
+        build_install_freshness,
         command_path=command_path,
         release_root=release_root,
         repo_root=repo_root,
@@ -1007,10 +972,27 @@ def collect_doctor(
         release_manifest=release_manifest,
         comparison_source=comparison_source,
         freshness_source=freshness_source,
-        require_installed_skills=installed_skills_required,
         doctor_agent_type=canonical_agent_type,
         python_distribution=python_distribution,
+        now=datetime.now(timezone.utc),
     )
+    install_freshness = freshness_projection(require_installed_skills=installed_skills_required)
+    zcode_installation_requires_upgrade = False
+    if zcode_skill_repair_command:
+        install_freshness["skill_repair_command"] = zcode_skill_repair_command
+        # Reuse the installation owner without Skill admission: the aggregate
+        # classification reports only its first problem and can hide another repair.
+        zcode_installation_requires_upgrade = bool(
+            freshness_projection(require_installed_skills=False)["requires_upgrade"]
+        )
+        if command_path is not None and not all(
+            skill.get("required_phrases") for skill in skills.values()
+        ):
+            surface_repair = zcode_skill_repair_command + "\nloopx doctor --agent-type zcode"
+            install_freshness["upgrade_command"] = (
+                install_freshness["upgrade_command"] + "\n" + surface_repair
+                if zcode_installation_requires_upgrade else surface_repair
+            )
     externally_managed_skills = bool(
         install_freshness.get("externally_managed_skills")
     )
@@ -1047,26 +1029,39 @@ def collect_doctor(
         ),
         "mode": "surface_managed" if installed_skills_required else "host_managed",
         "codex_skills_root_applicable": installed_skills_required
-        and not external_skill_delivery,
+        and not external_skill_delivery
+        and canonical_agent_type != "zcode",
         "installed_skills_required_for_freshness": installed_skills_required,
         "skill_roots": [str(root) for root in skill_roots],
         "status": skill_delivery_status,
+        **(
+            {"repair_command": zcode_skill_repair_command}
+            if zcode_skill_repair_command else {}
+        ),
         **(
             {"filesystem_readback": host_skill_install_readback}
             if host_skill_install_readback
             else {}
         ),
     }
-    default_global_registry = global_registry_path(DEFAULT_RUNTIME_ROOT)
-    global_registry_writability = probe_registry_write_path(default_global_registry, create_parent=True)
+    default_global_registry = global_registry_path(selected_runtime_root)
+    global_registry_writability = (
+        probe_registry_write_path(default_global_registry, create_parent=True)
+        if local_state_route["status"] not in {"conflict", "invalid"}
+        else {"ok": False, "error": local_state_route["recommended_action"]}
+    )
     runtime_projection_routes = (
         collect_runtime_projection_route_diagnostics(
             registry_path=default_global_registry,
-            runtime_root=DEFAULT_RUNTIME_ROOT,
+            runtime_root=selected_runtime_root,
         )
-        if default_global_registry.exists()
+        if default_global_registry.exists() and local_state_route["status"] not in {"conflict", "invalid"}
         else {
             "schema_version": "runtime_projection_route_diagnostics_v0",
+            "registry": str(default_global_registry.resolve()),
+            "runtime_root": str(selected_runtime_root.resolve()),
+            "goal_filter": None,
+            "activation_state_filter": None,
             "available": False,
             "goal_count": 0,
             "healthy": True,
@@ -1074,11 +1069,17 @@ def collect_doctor(
             "items": [],
         }
     )
+    from .capabilities.decision_context.freshness import (
+        capture_host_diagnostics_detail,
+        collect_capture_host_diagnostics,
+    )
+
+    decision_context_capture = collect_capture_host_diagnostics(selected_runtime_root)
     typescript_control_plane = collect_effect_runtime_readiness(deep=deep)
     typescript_runtime_required = True
     deep_validation = None
     if deep:
-        from .release_candidate import collect_release_candidate_checks
+        from .release_candidate import collect_deep_install_checks
 
         invocation_root_text = os.environ.get("LOOPX_RELEASE_ROOT")
         invocation_root = (
@@ -1086,23 +1087,19 @@ def collect_doctor(
             if invocation_root_text
             else release_root
         )
-        deep_validation = collect_release_candidate_checks(
+        deep_validation = collect_deep_install_checks(
             command_path=command_path,
+            invocation_path=invocation_path,
             package_root=repo_root,
             invocation_root=invocation_root,
+            distribution_root=python_distribution.get("root"),
         )
     checks = [
         {
             "id": "command_available",
             "required": True,
             "ok": command_path is not None,
-            "detail": str(loopx_path)
-            if loopx_path
-            else (
-                f"loopx was not found on PATH; using current invocation {invocation_path}"
-                if invocation_path
-                else "loopx was not found on PATH"
-            ),
+            "detail": command_detail,
         },
         {
             "id": "command_on_path",
@@ -1140,18 +1137,18 @@ def collect_doctor(
             "ok": module_path.exists(),
             "detail": str(module_path),
         },
-        {
-            "id": "install_script_exists",
-            "required": False,
-            "ok": install_script.exists(),
-            "detail": str(install_script),
-        },
-        {
-            "id": "wrapper_script_exists",
-            "required": False,
-            "ok": wrapper_script.exists(),
-            "detail": str(wrapper_script),
-        },
+        optional_installation_script_check(
+            "install_script_exists",
+            exists=install_script.exists(),
+            path=install_script,
+            distribution_install=bool(python_distribution.get("available")),
+        ),
+        optional_installation_script_check(
+            "wrapper_script_exists",
+            exists=wrapper_script.exists(),
+            path=wrapper_script,
+            distribution_install=bool(python_distribution.get("available")),
+        ),
         {
             "id": "local_bin_on_path",
             "required": False,
@@ -1199,19 +1196,13 @@ def collect_doctor(
                 else ",".join(globally_visible_project_skills)
             ),
         },
-        *(
-            [
-                {
-                    "id": "host_skill_installation_readback",
-                    "required": False,
-                    "ok": bool(host_skill_install_readback.get("ready")),
-                    "applicable": True,
-                    "detail": str(host_skill_install_readback.get("reason")),
-                }
-            ]
-            if host_skill_install_readback
-            else []
-        ),
+        *skill_install_doctor_checks(host_skill_install_readback),
+        {
+            "id": "local_state_route_unambiguous",
+            "required": True,
+            "ok": local_state_route["status"] not in {"conflict", "invalid"},
+            "detail": str(local_state_route["recommended_action"] or local_state_route["status"]),
+        },
         {
             "id": "global_registry_writable",
             "required": True,
@@ -1231,17 +1222,34 @@ def collect_doctor(
             ),
         },
         {
+            "id": "decision_context_capture_hosts_healthy",
+            "required": False,
+            "ok": bool(decision_context_capture["healthy"]),
+            "detail": capture_host_diagnostics_detail(decision_context_capture),
+        },
+        {
             "id": "typescript_effect_runtime_ready",
             "required": typescript_runtime_required,
             "ok": bool(typescript_control_plane.get("ready")),
             "detail": str(typescript_control_plane.get("status")),
         },
     ]
+    from .desktop_installation import desktop_installation_status
+
+    desktop_installation = desktop_installation_status(release_manifest_source.get("git_commit"))
+    if desktop_installation["apps"]:
+        checks.append({
+            "id": "desktop_app_runtime_pairing",
+            "required": False,
+            "ok": desktop_installation["status"] == "paired",
+            "detail": desktop_installation["recommended_action"] or "App bundle and CLI source revisions match; running App not verified",
+        })
     if deep_validation:
         checks.extend(deep_validation["checks"])
-    payload = {
+    payload: dict[str, Any] = {
         "ok": all(check["ok"] for check in checks if check["required"]),
         "mode": "deep" if deep else "standard",
+        "service_runtime_identity": release_runtime_identity(),
         "agent_type": canonical_agent_type,
         "python": {
             "executable": sys.executable,
@@ -1275,9 +1283,12 @@ def collect_doctor(
             "python_distribution": python_distribution,
         },
         "release_manifest": release_manifest,
+        "desktop_installation": desktop_installation,
         "release_provenance": release_provenance,
+        "local_state_route": local_state_route,
         "global_registry_writability": global_registry_writability,
         "runtime_projection_routes": runtime_projection_routes,
+        "decision_context_capture": decision_context_capture,
         "typescript_control_plane": typescript_control_plane,
         "install_freshness": install_freshness,
         "upgrade_hint": install_freshness,
@@ -1306,9 +1317,16 @@ def collect_doctor(
             if canonical_agent_type
             and agent_type_uses_host_managed_skills(canonical_agent_type)
             else (
-                "Run `loopx workflow-skills --install`, then "
-                "`loopx slash-commands --install`, and rerun doctor. Upgrade this "
-                f"installation with `{shlex.quote(sys.executable)} -m pip install --upgrade loopx`."
+                (
+                    f"Upgrade this installation with:\n\n```\n{install_freshness['upgrade_command']}\n```"
+                    if install_freshness["upgrade_command"]
+                    else (
+                        "Run `loopx workflow-skills --install`, then "
+                        "`loopx slash-commands --install`, and rerun doctor. "
+                        "Use the original package manager "
+                        f"({python_distribution.get('installer') or 'unknown installer'}) to upgrade this installation."
+                    )
+                )
                 if python_distribution.get("available")
                 else (
                     f"Run `{local_install_command(repo_root, skip_skills=externally_managed_skills)}` "
@@ -1325,6 +1343,95 @@ def collect_doctor(
             )
         ),
     }
+    if canonical_agent_type == "zcode":
+        from .zcode_goal_mode.diagnostics import collect_zcode_host_diagnostics
+
+        payload["zcode"] = collect_zcode_host_diagnostics(
+            cli_path=zcode_cli, desktop_path=zcode_desktop, source_root=zcode_source,
+        )
+        skill_fix = (
+            f"Run `{zcode_skill_repair_command}` and then `loopx doctor --agent-type zcode` "
+            "with the same ZCode home. User-owned files are preserved; resolve any reported "
+            "name collision before installing. Filesystem checks do not verify runtime skill loading."
+        )
+        if (
+            payload["ok"] and command_path is not None
+            and not zcode_installation_requires_upgrade
+        ):
+            payload["fix"] = skill_fix
+        else:
+            payload["fix"] += "\nAfter restoring the LoopX installation/runtime, " + skill_fix
+    if canonical_agent_type in {"agy", "antigravity-app"}:
+        from .agy_goal_mode import (
+            ANTIGRAVITY_HOOKS_CONFIG_FILENAME,
+            ANTIGRAVITY_MCP_CONFIG_FILENAME,
+            ANTIGRAVITY_SIDECAR_FILENAME,
+            agy_home,
+            antigravity_config_home,
+        )
+        from .slash_command_install import inspect_skill_facades
+
+        agy_cfg_home = antigravity_config_home()
+        legacy_agy_home = agy_home()
+        agy_workflow_readback = inspect_skill_install_readback(
+            skills_dir=agy_cfg_home / "skills",
+            required_skill_ids=ARK_MANAGED_AGENT_REQUIRED_SKILL_IDS,
+            source_root=repo_root,
+        )
+        agy_facades = inspect_skill_facades(
+            agy_cfg_home / "skills",
+            host_surface="antigravity-app",
+        )
+        workflow_skill_ids = set(
+            agy_workflow_readback.get("materialized_skill_ids") or ()
+        )
+        agy_facades_ready = all(
+            item.get("required_phrases") or name in workflow_skill_ids
+            for name, item in agy_facades.items()
+        )
+        legacy_loopx_exists = (legacy_agy_home / "skills" / "loopx.md").is_file()
+        agy_ready = bool(
+            agy_workflow_readback.get("ready")
+            or agy_facades_ready
+            or legacy_loopx_exists
+        )
+        payload["antigravity"] = {
+            "config_home": str(agy_cfg_home),
+            "legacy_cli_home": str(legacy_agy_home),
+            "skills_dir": str(agy_cfg_home / "skills"),
+            "legacy_skills_dir": str(legacy_agy_home / "skills"),
+            "workflow_skills_readback": agy_workflow_readback,
+            "command_facades": agy_facades,
+            "command_facades_ready": agy_facades_ready,
+            "legacy_cli_loopx_skill_exists": legacy_loopx_exists,
+            "mcp_config_path": str(agy_cfg_home / ANTIGRAVITY_MCP_CONFIG_FILENAME),
+            "mcp_config_exists": (
+                agy_cfg_home / ANTIGRAVITY_MCP_CONFIG_FILENAME
+            ).is_file(),
+            "hooks_config_path": str(agy_cfg_home / ANTIGRAVITY_HOOKS_CONFIG_FILENAME),
+            "hooks_config_exists": (
+                agy_cfg_home / ANTIGRAVITY_HOOKS_CONFIG_FILENAME
+            ).is_file(),
+            "sidecar_config_path": str(agy_cfg_home / "sidecars" / "loopx-antigravity-heartbeat" / ANTIGRAVITY_SIDECAR_FILENAME),
+            "sidecar_config_exists": (
+                agy_cfg_home / "sidecars" / "loopx-antigravity-heartbeat" / ANTIGRAVITY_SIDECAR_FILENAME
+            ).is_file(),
+            "repair_commands": [
+                "loopx workflow-skills --install --host-surface antigravity-app",
+                "loopx slash-commands --install --surface antigravity-app --with-agy-mcp --with-agy-hooks",
+            ],
+        }
+        checks.append(
+            {
+                "id": "antigravity_host_surface_ready",
+                "required": False,
+                "ok": agy_ready,
+                "applicable": True,
+                "detail": (
+                    f"{agy_cfg_home / 'skills'} (ready={agy_ready})"
+                ),
+            }
+        )
     if deep_validation:
         payload["release_candidate"] = deep_validation
     return payload
@@ -1334,12 +1441,12 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
     release_provenance = payload.get("release_provenance") or {}
     default_release = release_provenance.get("default_release") or {}
     typescript_control_plane = (
-        payload.get("typescript_control_plane")
+        cast(dict[str, Any], payload.get("typescript_control_plane"))
         if isinstance(payload.get("typescript_control_plane"), dict)
         else {}
     )
     typescript_runtime_lifecycle = (
-        typescript_control_plane.get("runtime_lifecycle")
+        cast(dict[str, Any], typescript_control_plane.get("runtime_lifecycle"))
         if isinstance(typescript_control_plane.get("runtime_lifecycle"), dict)
         else {}
     )
@@ -1361,25 +1468,38 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
         f"- skill_delivery_mode: `{(payload.get('skill_delivery') or {}).get('mode')}`",
         f"- skill_delivery_status: `{(payload.get('skill_delivery') or {}).get('status')}`",
         f"- global_registry_writable: `{(payload.get('global_registry_writability') or {}).get('ok')}`",
-        f"- runtime_projection_routes_healthy: `{(payload.get('runtime_projection_routes') or {}).get('healthy')}`",
+        f"- local_state_route: `{(payload.get('local_state_route') or {}).get('status')}`"
+        f" (selected=`{(payload.get('local_state_route') or {}).get('selected_runtime_root')}`;"
+        f" target=`{(payload.get('local_state_route') or {}).get('target_runtime_root')}`)",
+        f"- runtime_projection_routes_healthy: `{(payload.get('runtime_projection_routes') or {}).get('healthy')}`"
+        f" (registry=`{(payload.get('runtime_projection_routes') or {}).get('registry')}`,"
+        f" goals=`{(payload.get('runtime_projection_routes') or {}).get('goal_count')}`,"
+        f" counts=`{json.dumps((payload.get('runtime_projection_routes') or {}).get('counts') or {}, sort_keys=True)}`)",
+        f"- decision_context_capture_hosts_healthy: `{(payload.get('decision_context_capture') or {}).get('healthy')}`"
+        f" (hosts=`{(payload.get('decision_context_capture') or {}).get('host_count')}`,"
+        f" unhealthy=`{(payload.get('decision_context_capture') or {}).get('unhealthy_count')}`)",
         f"- user_local_bin_on_path: `{(payload.get('path') or {}).get('user_local_bin_on_path')}`",
         f"- python: `{(payload.get('python') or {}).get('executable')}`",
         f"- typescript_control_plane: `{typescript_control_plane.get('status')}`",
         f"- typescript_runtime_state: `{typescript_runtime_lifecycle.get('state')}`",
         f"- typescript_runtime_diagnostic: `{typescript_runtime_lifecycle.get('diagnostic_code')}`",
+        "- typescript_runtime_locator_state: "
+        f"`{(typescript_runtime_lifecycle or {}).get('locator_state')}`",
+        "- typescript_runtime_recorded_pid_alive: "
+        f"`{(typescript_runtime_lifecycle or {}).get('recorded_pid_alive')}`",
         "",
         "## Checks",
     ]
     for check in payload.get("checks") or []:
         required = "required" if check.get("required") else "optional"
         lines.append(f"- {check.get('id')} ({required}): `{check.get('ok')}` - {check.get('detail')}")
-    provenance = payload.get("release_provenance") if isinstance(payload.get("release_provenance"), dict) else {}
+    provenance = cast(dict[str, Any], payload.get("release_provenance")) if isinstance(payload.get("release_provenance"), dict) else {}
     if provenance:
-        default_release = provenance.get("default_release") if isinstance(provenance.get("default_release"), dict) else {}
-        live_canary = provenance.get("live_canary") if isinstance(provenance.get("live_canary"), dict) else {}
-        current = provenance.get("current_invocation") if isinstance(provenance.get("current_invocation"), dict) else {}
+        default_release = cast(dict[str, Any], provenance.get("default_release")) if isinstance(provenance.get("default_release"), dict) else {}
+        live_canary = cast(dict[str, Any], provenance.get("live_canary")) if isinstance(provenance.get("live_canary"), dict) else {}
+        current = cast(dict[str, Any], provenance.get("current_invocation")) if isinstance(provenance.get("current_invocation"), dict) else {}
         readiness = (
-            provenance.get("promotion_readiness")
+            cast(dict[str, Any], provenance.get("promotion_readiness"))
             if isinstance(provenance.get("promotion_readiness"), dict)
             else {}
         )
@@ -1416,7 +1536,7 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
                 ),
             ]
         )
-    freshness = payload.get("install_freshness") if isinstance(payload.get("install_freshness"), dict) else {}
+    freshness = cast(dict[str, Any], payload.get("install_freshness")) if isinstance(payload.get("install_freshness"), dict) else {}
     if freshness:
         manifest_source_repo = freshness.get("manifest_source_repo") or freshness.get("manifest_source_kind")
         manifest_source_ref = (
@@ -1461,11 +1581,6 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
                 "```",
             ]
         )
-    typescript_control_plane = (
-        payload.get("typescript_control_plane")
-        if isinstance(payload.get("typescript_control_plane"), dict)
-        else {}
-    )
     if typescript_control_plane:
         lines.extend(
             [
@@ -1478,11 +1593,59 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
                 f"- minimum_node_version: `{typescript_control_plane.get('minimum_node_version')}`",
                 f"- detected_node_version: `{typescript_control_plane.get('detected_node_version')}`",
                 f"- semantic_probe: `{typescript_control_plane.get('semantic_probe')}`",
+                "- locator_state: "
+                f"`{(typescript_runtime_lifecycle or {}).get('locator_state')}`",
+                "- recorded_pid_alive: "
+                f"`{(typescript_runtime_lifecycle or {}).get('recorded_pid_alive')}`",
             ]
         )
+        runtime_identity = typescript_control_plane.get("runtime_identity")
+        if isinstance(runtime_identity, dict):
+            lines.append(
+                "- runtime_identity: "
+                f"node=`{runtime_identity.get('node_version')}`, "
+                f"sqlite=`{runtime_identity.get('sqlite_version')}`, "
+                "sqlite_authority_qualified="
+                f"`{runtime_identity.get('sqlite_authority_qualified')}`"
+            )
         recommended_action = typescript_control_plane.get("recommended_action")
         if recommended_action:
             lines.append(f"- recommended_action: {recommended_action}")
+    if payload.get("agent_type") == "zcode":
+        lines.extend(["", "## ZCode Skill Delivery"])
+        for name, skill in sorted((payload.get("skills") or {}).items()):
+            lines.append(
+                f"- {name}: `{skill.get('readback_status')}` — {skill.get('reason')} "
+                f"(`{skill.get('path')}`)"
+            )
+        repair_command = (payload.get("skill_delivery") or {}).get("repair_command")
+        if repair_command:
+            lines.extend([
+                "", "Refresh managed facades (user files are preserved):",
+                "```", str(repair_command), "```",
+            ])
+        zcode = payload.get("zcode")
+        if isinstance(zcode, dict):
+            from .zcode_goal_mode.diagnostics import render_zcode_diagnostics_markdown
+
+            lines.extend(render_zcode_diagnostics_markdown(zcode))
+    restart = payload.get("effect_runtime_restart")
+    if isinstance(restart, dict):
+        previous = restart.get("previous_runtime_identity")
+        previous_text = (
+            f"Node {previous.get('node_version')} / SQLite "
+            f"{previous.get('sqlite_version')}"
+            if isinstance(previous, dict)
+            else "no runtime was serving"
+        )
+        lines.extend(
+            [
+                "",
+                "## Effect Runtime Restart",
+                f"- status: `{restart.get('status')}`",
+                f"- stopped_runtime: {previous_text}",
+            ]
+        )
     if not payload.get("ok"):
         lines.extend(["", "## Fix", str(payload.get("fix"))])
         writable = payload.get("global_registry_writability")

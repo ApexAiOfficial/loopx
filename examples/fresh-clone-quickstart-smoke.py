@@ -113,7 +113,7 @@ def main() -> int:
         assert doctor["package"]["release_root"] == str(release_root), doctor
         assert doctor["install_freshness"]["schema_version"] == "loopx_install_freshness_v0", doctor
         assert doctor["install_freshness"]["status"] == "unknown", doctor
-        assert "huangruiteng.github.io/loopx/install.sh" in doctor["install_freshness"]["upgrade_command"], doctor
+        assert "loopx-project.github.io/loopx/install.sh" in doctor["install_freshness"]["upgrade_command"], doctor
         assert doctor["skills"]["loopx-project"]["exists"] is True, doctor
         assert doctor["skills"]["loopx-pr-program"]["exists"] is True, doctor
         assert doctor["skills"]["loopx-pr-review"]["exists"] is True, doctor
@@ -138,8 +138,6 @@ def main() -> int:
             "--goal-doc",
             "README.md",
             "--no-global-sync",
-            "--accept-onboarding-agent-todos",
-            "--begin-autonomous-advance",
             cwd=project,
             env=cli_env,
         )
@@ -147,10 +145,10 @@ def main() -> int:
         assert bootstrap["goal_id"] == GOAL_ID, bootstrap
         assert "python3 -m pip install --upgrade loopx" in bootstrap["install_repair_command"], bootstrap
         assert "loopx workflow-skills --install" in bootstrap["install_repair_command"], bootstrap
-        assert "huangruiteng.github.io/loopx/install.sh" in bootstrap["archive_fallback_install_command"], bootstrap
+        assert "loopx-project.github.io/loopx/install.sh" in bootstrap["archive_fallback_install_command"], bootstrap
         assert "loopx doctor" in bootstrap["install_repair_command"], bootstrap
         assert (project / ".loopx" / "registry.json").is_file(), bootstrap
-        assert (project / ".codex" / "goals" / GOAL_ID / "ACTIVE_GOAL_STATE.md").is_file(), bootstrap
+        assert (project / ".loopx" / "goals" / GOAL_ID / "ACTIVE_GOAL_STATE.md").is_file(), bootstrap
 
         registry = project / ".loopx" / "registry.json"
         status = run_loopx("--registry", str(registry), "status", cwd=project, env=cli_env)
@@ -181,8 +179,14 @@ def main() -> int:
             env=cli_env,
         )
         assert heartbeat["ok"] is True, heartbeat
-        assert "quota should-run" in heartbeat["quota_guard_command"], heartbeat
-        assert "--source heartbeat --execute" in heartbeat["quota_spend_command"], heartbeat
+        # The default heartbeat JSON is the thin Agent-input projection: the
+        # current task body carries the guard, while settlement commands come
+        # from the successful interaction contract and are intentionally not
+        # duplicated as stale top-level fields.
+        assert heartbeat["schema_version"] == "heartbeat_agent_input_v1", heartbeat
+        assert "quota should-run" in heartbeat["task_body"], heartbeat
+        assert "quota_guard_command" not in heartbeat, heartbeat
+        assert "quota_spend_command" not in heartbeat, heartbeat
 
     print("fresh-clone-quickstart-smoke ok")
     return 0

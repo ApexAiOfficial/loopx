@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from loopx.control_plane.agents.agent_scope_frontier import AgentScopeFrontierAction
+from loopx.control_plane.quota.scheduler_ack import (
+    record_quota_scheduler_ack_for_decision,
+)
 from loopx.control_plane.scheduler import scheduler_hint as scheduler_hint_module
-from loopx.control_plane.scheduler.ack import build_codex_app_scheduler_ack_event
 from loopx.control_plane.scheduler.execution_context import (
     scheduler_execution_context_for_runtime_profile,
 )
-from loopx.control_plane.scheduler.scheduler_hint import build_scheduler_hint
-
+from tests.control_plane.scheduler_arbitration_fixture import build_native_scheduler_hint as build_scheduler_hint
 
 GOAL_ID = "scheduler-backoff-convergence"
 AGENT_ID = "codex-fixture"
@@ -171,13 +173,23 @@ def _hint(
     )
 
 
-def _ack_state(hint: dict, *, applied_rrule: str, generated_at: datetime) -> dict:
-    event = build_codex_app_scheduler_ack_event(
+def _ack_state(
+    hint: dict,
+    *,
+    runtime_root: Path,
+    applied_rrule: str,
+    generated_at: datetime,
+) -> dict:
+    event = record_quota_scheduler_ack_for_decision(
         {"goal_id": GOAL_ID, "scheduler_hint": hint},
+        runtime_root=runtime_root,
+        goal_id=GOAL_ID,
         agent_id=AGENT_ID,
+        execute=True,
         applied_rrule=applied_rrule,
         generated_at=generated_at.isoformat(),
     )
+    assert event["ok"] is True, event
     return event["scheduler_ack_event"]["scheduler_state"]
 
 
@@ -217,7 +229,9 @@ CADENCE_POLICY_CASES = [
     CADENCE_POLICY_CASES,
     ids=[case["id"] for case in CADENCE_POLICY_CASES],
 )
-def test_scheduler_hint_cadence_policy_decision_table(monkeypatch, case: dict) -> None:
+def test_scheduler_hint_cadence_policy_decision_table(
+    monkeypatch, tmp_path: Path, case: dict
+) -> None:
     now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     if case["decision"] == "agent_wait":
         decision = _agent_wait_decision()
@@ -227,12 +241,13 @@ def test_scheduler_hint_cadence_policy_decision_table(monkeypatch, case: dict) -
         decision = _active_decision()
 
     initial = _hint(monkeypatch, decision, now=now)
-    initial_app = initial["codex_app"]
+    initial_app = initial["app_automation"]
     assert initial_app["example_progression_minutes"] == case["progression"]
     assert initial_app["recommended_rrule"] == case["initial_rrule"]
 
     scheduler_state = _ack_state(
         initial,
+        runtime_root=tmp_path,
         applied_rrule=case["initial_rrule"],
         generated_at=now,
     )
@@ -243,7 +258,7 @@ def test_scheduler_hint_cadence_policy_decision_table(monkeypatch, case: dict) -
         scheduler_state=scheduler_state,
         host_rrule=case["initial_rrule"],
     )
-    after_app = after_interval["codex_app"]
+    after_app = after_interval["app_automation"]
     assert after_app["stateful_backoff"]["progression_index"] == case[
         "expected_index"
     ]
@@ -254,7 +269,9 @@ def test_scheduler_hint_cadence_policy_decision_table(monkeypatch, case: dict) -
         assert after_app["recommended_rrule"] == case["expected_rrule"]
 
 
-def test_monitor_identity_ignores_recommended_action_text_mutation(monkeypatch) -> None:
+def test_monitor_identity_ignores_recommended_action_text_mutation(
+    monkeypatch, tmp_path: Path
+) -> None:
     now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     original = _monitor_decision(
         now=now,
@@ -262,7 +279,12 @@ def test_monitor_identity_ignores_recommended_action_text_mutation(monkeypatch) 
         recommended_action="Monitor the post-merge run.",
     )
     first = _hint(monkeypatch, original, now=now)
-    scheduler_state = _ack_state(first, applied_rrule=HOST_15, generated_at=now)
+    scheduler_state = _ack_state(
+        first,
+        runtime_root=tmp_path,
+        applied_rrule=HOST_15,
+        generated_at=now,
+    )
 
     mutated = _monitor_decision(
         now=now,
@@ -277,21 +299,27 @@ def test_monitor_identity_ignores_recommended_action_text_mutation(monkeypatch) 
         host_rrule=HOST_15,
     )
 
-    assert second["codex_app"]["stateful_backoff"]["state_status"] == "same_identity"
-    assert second["codex_app"]["recommended_rrule"] == HOST_30
+    assert second["app_automation"]["stateful_backoff"]["state_status"] == "same_identity"
+    assert second["app_automation"]["recommended_rrule"] == HOST_30
     assert "recommended_action" not in second["unchanged_identity_keys"]
 
 
 def test_monitor_ack_settles_before_progression_and_avoids_3_6_3_flip(
     monkeypatch,
+    tmp_path: Path,
 ) -> None:
     now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     decision = _monitor_decision(now=now, minutes_until_due=31)
     first = _hint(monkeypatch, decision, now=now)
-    first_app = first["codex_app"]
+    first_app = first["app_automation"]
     assert first_app["recommended_rrule"] == HOST_15
 
-    settled_state = _ack_state(first, applied_rrule=HOST_15, generated_at=now)
+    settled_state = _ack_state(
+        first,
+        runtime_root=tmp_path,
+        applied_rrule=HOST_15,
+        generated_at=now,
+    )
     immediate = _hint(
         monkeypatch,
         decision,
@@ -299,7 +327,7 @@ def test_monitor_ack_settles_before_progression_and_avoids_3_6_3_flip(
         scheduler_state=settled_state,
         host_rrule=HOST_15,
     )
-    immediate_app = immediate["codex_app"]
+    immediate_app = immediate["app_automation"]
     assert immediate_app["stateful_backoff"]["state_status"] == "same_identity"
     assert immediate_app["stateful_backoff"]["current_rrule"] == HOST_15
     assert immediate_app["stateful_backoff"]["apply_needed"] is False
@@ -315,7 +343,7 @@ def test_monitor_ack_settles_before_progression_and_avoids_3_6_3_flip(
         scheduler_state=settled_state,
         host_rrule=HOST_15,
     )
-    near_due_app = near_due["codex_app"]
+    near_due_app = near_due["app_automation"]
     assert near_due_app["example_progression_minutes"] == [15]
     assert near_due_app["stateful_backoff"]["current_rrule"] == HOST_15
     assert near_due_app["stateful_backoff"]["apply_needed"] is False
@@ -327,7 +355,7 @@ def test_monitor_near_due_under_floor_uses_tight_cadence(monkeypatch) -> None:
     decision = _monitor_decision(now=now, minutes_until_due=7, cadence="30m")
     first = _hint(monkeypatch, decision, now=now)
 
-    first_app = first["codex_app"]
+    first_app = first["app_automation"]
     assert first_app["recommended_rrule"] == HOST_7
     assert first_app["example_progression_minutes"] == [7]
     assert first["cadence_class"] == "monitor_wait"
@@ -335,11 +363,17 @@ def test_monitor_near_due_under_floor_uses_tight_cadence(monkeypatch) -> None:
 
 def test_monitor_progression_advances_after_elapsed_interval_and_then_converges(
     monkeypatch,
+    tmp_path: Path,
 ) -> None:
     now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     decision = _monitor_decision(now=now, minutes_until_due=119, cadence="30m")
     first = _hint(monkeypatch, decision, now=now)
-    settled_15 = _ack_state(first, applied_rrule=HOST_15, generated_at=now)
+    settled_15 = _ack_state(
+        first,
+        runtime_root=tmp_path,
+        applied_rrule=HOST_15,
+        generated_at=now,
+    )
 
     early = _hint(
         monkeypatch,
@@ -348,8 +382,8 @@ def test_monitor_progression_advances_after_elapsed_interval_and_then_converges(
         scheduler_state=settled_15,
         host_rrule=HOST_15,
     )
-    assert early["codex_app"]["stateful_backoff"]["current_rrule"] == HOST_15
-    assert early["codex_app"]["stateful_backoff"]["apply_needed"] is False
+    assert early["app_automation"]["stateful_backoff"]["current_rrule"] == HOST_15
+    assert early["app_automation"]["stateful_backoff"]["apply_needed"] is False
 
     elapsed = now + timedelta(minutes=15)
     advance = _hint(
@@ -359,13 +393,18 @@ def test_monitor_progression_advances_after_elapsed_interval_and_then_converges(
         scheduler_state=settled_15,
         host_rrule=HOST_15,
     )
-    advance_app = advance["codex_app"]
+    advance_app = advance["app_automation"]
     assert advance_app["recommended_rrule"] == HOST_30
     assert advance_app["stateful_backoff"]["host_observation"]["status"] == (
         "drift_detected"
     )
 
-    settled_30 = _ack_state(advance, applied_rrule=HOST_30, generated_at=elapsed)
+    settled_30 = _ack_state(
+        advance,
+        runtime_root=tmp_path,
+        applied_rrule=HOST_30,
+        generated_at=elapsed,
+    )
     converged = _hint(
         monkeypatch,
         decision,
@@ -373,7 +412,7 @@ def test_monitor_progression_advances_after_elapsed_interval_and_then_converges(
         scheduler_state=settled_30,
         host_rrule=HOST_30,
     )
-    converged_app = converged["codex_app"]
+    converged_app = converged["app_automation"]
     assert converged_app["stateful_backoff"]["current_rrule"] == HOST_30
     assert converged_app["stateful_backoff"]["apply_needed"] is False
     assert converged_app["stateful_backoff"]["host_observation"]["status"] == (
@@ -384,17 +423,23 @@ def test_monitor_progression_advances_after_elapsed_interval_and_then_converges(
 
 def test_capability_bridge_wait_backs_off_and_material_work_resets(
     monkeypatch,
+    tmp_path: Path,
 ) -> None:
     now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     bridge = _capability_bridge_decision()
 
     first = _hint(monkeypatch, bridge, now=now)
-    first_app = first["codex_app"]
+    first_app = first["app_automation"]
     assert first["action"] == "run_now"
     assert first["cadence_class"] == "active_work"
     assert first_app["recommended_rrule"] == HOST_3
 
-    settled_3 = _ack_state(first, applied_rrule=HOST_3, generated_at=now)
+    settled_3 = _ack_state(
+        first,
+        runtime_root=tmp_path,
+        applied_rrule=HOST_3,
+        generated_at=now,
+    )
     early = _hint(
         monkeypatch,
         bridge,
@@ -402,8 +447,8 @@ def test_capability_bridge_wait_backs_off_and_material_work_resets(
         scheduler_state=settled_3,
         host_rrule=HOST_3,
     )
-    assert early["codex_app"]["stateful_backoff"]["progression_index"] == 0
-    assert "recommended_rrule" not in early["codex_app"]
+    assert early["app_automation"]["stateful_backoff"]["progression_index"] == 0
+    assert "recommended_rrule" not in early["app_automation"]
 
     elapsed_3 = now + timedelta(minutes=3)
     advance_6 = _hint(
@@ -413,12 +458,13 @@ def test_capability_bridge_wait_backs_off_and_material_work_resets(
         scheduler_state=settled_3,
         host_rrule=HOST_3,
     )
-    advance_6_app = advance_6["codex_app"]
+    advance_6_app = advance_6["app_automation"]
     assert advance_6_app["stateful_backoff"]["progression_index"] == 1
     assert advance_6_app["recommended_rrule"] == HOST_6
 
     settled_6 = _ack_state(
         advance_6,
+        runtime_root=tmp_path,
         applied_rrule=HOST_6,
         generated_at=elapsed_3,
     )
@@ -430,7 +476,7 @@ def test_capability_bridge_wait_backs_off_and_material_work_resets(
         scheduler_state=settled_6,
         host_rrule=HOST_6,
     )
-    assert advance_10["codex_app"]["recommended_rrule"] == HOST_10
+    assert advance_10["app_automation"]["recommended_rrule"] == HOST_10
 
     material_work = dict(bridge)
     material_work["effective_action"] = "normal_run"
@@ -451,13 +497,14 @@ def test_capability_bridge_wait_backs_off_and_material_work_resets(
         scheduler_state=settled_6,
         host_rrule=HOST_6,
     )
-    reset_app = reset["codex_app"]
+    reset_app = reset["app_automation"]
     assert reset_app["stateful_backoff"]["state_status"] == "reset_required"
     assert reset_app["stateful_backoff"]["progression_index"] == 0
     assert reset_app["recommended_rrule"] == HOST_3
 
     settled_material = _ack_state(
         reset,
+        runtime_root=tmp_path,
         applied_rrule=HOST_3,
         generated_at=elapsed_6,
     )
@@ -468,5 +515,78 @@ def test_capability_bridge_wait_backs_off_and_material_work_resets(
         scheduler_state=settled_material,
         host_rrule=HOST_3,
     )
-    assert still_active["codex_app"]["stateful_backoff"]["progression_index"] == 0
-    assert "recommended_rrule" not in still_active["codex_app"]
+    assert still_active["app_automation"]["stateful_backoff"]["progression_index"] == 0
+    assert "recommended_rrule" not in still_active["app_automation"]
+
+
+@pytest.mark.parametrize("human_gate", [False, True])
+@pytest.mark.parametrize("host_already_tightened", [False, True])
+def test_monitor_deadline_clamp_resets_progression_before_native_ack(
+    monkeypatch,
+    tmp_path: Path,
+    host_already_tightened: bool,
+    human_gate: bool,
+) -> None:
+    now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    decision = _monitor_decision(now=now, minutes_until_due=55, cadence="60m")
+    if human_gate:
+        decision["effective_action"] = "operator_gate_notify"
+        decision["interaction_contract"]["mode"] = "user_gate"
+        decision["interaction_contract"]["user_channel"] = {
+            "action_required": True,
+            "notify": "NOTIFY",
+        }
+        decision["interaction_contract"]["agent_channel"]["quiet_noop_allowed"] = False
+    decision["agent_todo_summary"]["current_agent_claimed_monitor_items"][0][
+        "last_checked_at"
+    ] = now.isoformat()
+    first = _hint(monkeypatch, decision, now=now)
+    settled_15 = _ack_state(
+        first, runtime_root=tmp_path, applied_rrule=HOST_15, generated_at=now
+    )
+    later = now + timedelta(minutes=15)
+    advance = _hint(
+        monkeypatch, decision, now=later, scheduler_state=settled_15, host_rrule=HOST_15
+    )
+    assert advance["app_automation"]["stateful_backoff"]["progression_index"] == 1
+    settled_30 = _ack_state(
+        advance, runtime_root=tmp_path, applied_rrule=HOST_30, generated_at=later
+    )
+
+    # Elapsed time shortens the same monitor's allowed progression, without a
+    # Todo edit or phase change. A new bucket policy must reset before commit.
+    clamped_at = now + timedelta(minutes=30)
+    clamped = _hint(
+        monkeypatch,
+        decision,
+        now=clamped_at,
+        scheduler_state=settled_30,
+        host_rrule=HOST_15 if host_already_tightened else HOST_30,
+    )
+    app = clamped["app_automation"]
+    backoff = app["stateful_backoff"]
+    assert app["example_progression_minutes"] == [15]
+    assert backoff["current_rrule"] == HOST_15
+    assert backoff["reset_token"] != settled_30["reset_token"]
+    assert backoff["state_status"] == "reset_required"
+    assert backoff["progression_index"] == 0
+    assert backoff["apply_needed"] is not host_already_tightened
+    assert backoff["ack_needed"] is True
+    committed = _ack_state(
+        clamped, runtime_root=tmp_path, applied_rrule=HOST_15, generated_at=clamped_at
+    )
+    assert committed["progression_index"] == 0
+    assert committed["progression_minutes"] == [15]
+
+    unchanged = _hint(
+        monkeypatch,
+        decision,
+        now=clamped_at + timedelta(minutes=1),
+        scheduler_state=committed,
+        host_rrule=HOST_15,
+    )
+    assert (
+        unchanged["app_automation"]["stateful_backoff"]["reset_token"]
+        == backoff["reset_token"]
+    )
+    assert unchanged["app_automation"]["stateful_backoff"]["ack_needed"] is False

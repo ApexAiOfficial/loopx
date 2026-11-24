@@ -24,6 +24,7 @@ contract is active and `quota should-run --agent-id cc` is satisfied.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -36,6 +37,13 @@ DEFAULT_AGENT = "cc"
 # registry-driven context, shared with the hooks/MCP
 sys.path.insert(0, str(HERE.parent / "hooks"))
 from goal_state import goal_context, find_registry, loop_md_path  # noqa: E402
+from stdio_utf8 import pin_utf8_stdio  # noqa: E402
+from loopx.control_plane.heartbeat.rules import (  # noqa: E402
+    HOST_LOOP_SAFETY_RULE,
+    RUNTIME_REPAIR_ROUTING_RULE,
+    SCOPE_BOUNDED_WORK_RULE,
+)
+from loopx.history import load_registry  # noqa: E402
 
 
 def gh_prefix():
@@ -45,7 +53,7 @@ def gh_prefix():
 
 
 def gh(args, cwd=None):
-    return subprocess.run(gh_prefix() + args, cwd=cwd, capture_output=True, text=True, timeout=120)
+    return subprocess.run(gh_prefix() + args, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
 
 
 def slug(name: str) -> str:
@@ -53,7 +61,7 @@ def slug(name: str) -> str:
     return f"cc-{s}"[:48]
 
 
-def loop_md_content(goal_id, agent_id) -> str:
+def loop_execution_content(goal_id, agent_id) -> str:
     """The per-iteration protocol that native `/loop` runs (written to
     .claude/loop.md). loopx's should_run is the deterministic per-tick gate; the
     agent uses the wired loopx MCP tools, never raw CLI guessing.
@@ -66,15 +74,47 @@ def loop_md_content(goal_id, agent_id) -> str:
         f"<!-- loopx:armed {armed} -->\n"
         f"loopx tick — advance goal `{goal_id}` (agent `{agent_id}`). Use the wired loopx MCP\n"
         f"tools; do NOT run `loopx --help` or guess ids.\n\n"
-        f"1. Call `should_run()`. If should_run=false, say why in ONE line and STOP this\n"
-        f"   iteration (do nothing else) — loopx has paused, gated, or converged.\n"
-        f"2. If should_run=true: `claim_task` the next open todo, do ONE bounded segment,\n"
-        f"   then VERIFY it with a real check (build/test) — never claim success from\n"
-        f"   reasoning — and `complete_task(..., agent_id=\"{agent_id}\", evidence=\"<ran + result>\")`.\n"
-        f"3. Stay within the goal's scope; do not start initiatives outside the todos.\n"
-        f"   Irreversible actions (push/delete) only to finish work already authorized.\n"
-        f"4. Re-check `should_run()`; stop when should_run=false or no open todos remain.\n"
+        f"{HOST_LOOP_SAFETY_RULE}\n{RUNTIME_REPAIR_ROUTING_RULE}\n"
+        "Read complete successful `should_run()` JSON each work iteration. Follow its\n"
+        "current `interaction_contract`: selection/re-entry before admitted work,\n"
+        "then validation and settlement. Never infer completion from an empty Todo list.\n"
+        f"{SCOPE_BOUNDED_WORK_RULE}\n"
+        "Honor claim/lease and user/repository authority; claim only when required.\n"
+        "Run real acceptance checks before `complete_task`; supply truthful evidence\n"
+        f"and the bound agent_id=\"{agent_id}\". Complete only finished Todos, not partial work.\n"
+        "That MCP operation owns writeback/spend: use it INSTEAD OF the raw CLI sequence.\n"
+        "Use interaction_contract.mcp_channel for tool ownership and vision input limits.\n"
+        "At material delivery, compare the Goal's vision/acceptance with actual evidence.\n"
+        "Pass the resulting agent_vision or a justified vision_unchanged_reason to\n"
+        "complete_task. If omitted, call review_task_vision with only that Todo and\n"
+        "Agent to read the basis; rejudge, then submit read_context_id with the decision.\n"
+        "Stale/replaced receipts require rereading; lost replies retry the same receipt\n"
+        "and decision. Recovery never spends again. This is not a Goal-stop\n"
+        "shortcut: open acceptance needs replan; vision_closed closes a stage and needs\n"
+        "a successor vision; no_followup requires evidence of no remaining scoped work.\n"
+        "For new replan work not covered by these tools, use the exact live\n"
+        "interaction_contract CLI actions, preserving its binding and settlement order.\n"
+        "Link already planned follow-up via successor_todo_ids; next_agent_todo creates\n"
+        "new work, not a reference to an existing id. Do not duplicate the current plan.\n"
+        "After a lost response, read back or retry the same completion intent; do not\n"
+        "invent a new successor or settlement identity. Recheck `should_run()` afterward.\n"
+        "Continue authorized work while the live contract requires it; notification\n"
+        "silence is not execution silence. Waiting is not completion: follow current\n"
+        "host scheduling guidance without repeated unchanged polling. Terminal\n"
+        "no-follow-up ends this Goal's work; cancel only its own recurring wakeup.\n"
+        "Repair entrypoint errors within authority; an unavailable/incomplete contract\n"
+        "permits neither work nor spending and must not be reported as completion.\n"
     )
+
+
+def loop_md_content(goal_id, agent_id) -> str:
+    from loopx.control_plane.heartbeat.bootstrap_prompt import BOOTSTRAP_INSTRUCTION
+    armed = json.dumps({"goal_id": goal_id, "agent_id": agent_id})
+    return (f"<!-- loopx:armed {armed} -->\nLoopX managed MCP bootstrap v1\n"
+            "Each entry/resume: call the bound LoopX `host_prompt` MCP tool, "
+            "verify its goal_id and agent_id match the armed binding above, "
+            "then read its complete task_body. Do not create another Goal or scheduler.\n"
+            f"{BOOTSTRAP_INSTRUCTION}\n")
 
 
 def write_loop_md(proj: Path, goal_id, agent_id) -> Path:
@@ -93,7 +133,7 @@ def goal_detail(ctx):
     if reg:
         try:
             regp = Path(reg)
-            data = json.loads(regp.read_text(encoding="utf-8"))
+            data = load_registry(regp)
             entry = next((g for g in data.get("goals", []) if g.get("id") == gid), None)
             sf = (entry or {}).get("state_file")
             if sf:
@@ -109,7 +149,8 @@ def goal_detail(ctx):
             ["--format", "json", "quota", "should-run", "--goal-id", gid]
         if agent:
             cmd += ["--agent-id", agent]
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            env={**os.environ, "LOOPX_CONTEXT_DELIVERY": "off"})
         payload = json.loads(out.stdout or "{}")
     except Exception:
         pass
@@ -141,7 +182,8 @@ def print_status(ctx):
         t = (it.get("text") or "").strip()
         if t:
             print(f"   ▸ {t}")
-    armed = "armed (.claude/loop.md present)" if loop_md_path(Path.cwd()).exists() else "not armed (run /loopx to arm)"
+    armed_root = Path(ctx.get("project_root") or Path.cwd())
+    armed = "armed (.claude/loop.md present)" if loop_md_path(armed_root).exists() else "not armed (run /loopx to arm)"
     print(f"loop      : {armed} — drive with native /loop")
 
 
@@ -152,7 +194,9 @@ def main():
 
     # off: remove the loop protocol; native /loop then has nothing to run.
     if first == "off":
-        lp = loop_md_path(proj)
+        reg = find_registry(proj)
+        target_root = reg.parent.parent if reg is not None else proj
+        lp = loop_md_path(target_root)
         if not lp.exists():
             print("goal-mode OFF (no .claude/loop.md here).")
             return
@@ -199,7 +243,7 @@ def main():
         # Claude projects keep goal state under .claude/ (not the Codex-default .codex/)
         state_file = f".claude/goals/{goal_id}/ACTIVE_GOAL_STATE.md"
         r = gh(["bootstrap", "--project", str(proj), "--goal-id", goal_id,
-                "--objective", task, "--state-file", state_file, "--no-onboarding-scan"])
+                "--objective", task, "--state-file", state_file])
         if "ok: `True`" not in r.stdout and "ok=True" not in r.stdout and r.returncode != 0:
             print("[loopx] bootstrap failed:\n" + (r.stdout + r.stderr)[:600])
             sys.exit(1)
@@ -209,10 +253,16 @@ def main():
         sys.exit(1)
 
     # register the default agent (identity contract) and add the task as a todo
-    gh(["--registry", registry, "configure-goal", "--goal-id", goal_id,
-        "--agent-model", "peer_v1", "--registered-agent", DEFAULT_AGENT, "--execute"])
+    cfg = gh(["--registry", registry, "configure-goal", "--goal-id", goal_id,
+              "--agent-model", "peer_v1", "--registered-agent", DEFAULT_AGENT, "--execute"])
+    if cfg.returncode != 0:
+        print("[loopx] configure-goal failed:\n" + (cfg.stdout + cfg.stderr)[:600])
+        sys.exit(1)
     add = gh(["--registry", registry, "--format", "json", "todo", "add",
               "--goal-id", goal_id, "--role", "agent", "--text", task])
+    if add.returncode != 0:
+        print("[loopx] todo add failed:\n" + (add.stdout + add.stderr)[:600])
+        sys.exit(1)
     todo_id = ""
     try:
         todo_id = json.loads(add.stdout).get("todo_id", "")
@@ -230,12 +280,13 @@ def main():
     print(f"  todo_id : {tid}")
     print(f"  scope   : {proj}")
     print(f"  task    : {task}")
-    print(f"  wrote   : .claude/loop.md  (the per-tick protocol)")
+    print("  wrote   : .claude/loop.md  (the per-tick protocol)")
     print()
     print("START WORKING — run native `/loop`  (Claude self-paces)  or  `/loop 10m`  (fixed cadence).")
-    print("Each /loop tick runs: should_run -> claim_task -> ONE bounded verified segment -> complete_task.")
+    print("Each /loop tick follows should_run's current contract; complete_task settles only verified, finished work.")
     print("Stop with Esc or `/loopx off`.")
 
 
 if __name__ == "__main__":
+    pin_utf8_stdio()
     main()

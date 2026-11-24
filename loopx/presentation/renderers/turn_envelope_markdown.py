@@ -1,9 +1,60 @@
 from __future__ import annotations
 
 from typing import Any
+import json
+
+from ..markdown import render_json_object_block
+
+
+def work_context_lines(context: dict[str, Any]) -> list[str]:
+    """Complete source content once; arbitrary source text stays JSON-escaped."""
+    # The machine-only source witness does not add another instruction body.
+    if set(context) <= {"complete", "selected_todo_ref", "selected_todo_authority", "instruction", "selected_todo_text_verified"}:
+        lines = [
+            "- work_context: "
+            f"complete={context.get('complete')} "
+            f"selected_todo_ref={context.get('selected_todo_ref')}"
+            + (f" selected_todo_authority={context['selected_todo_authority']}"
+                if context.get("selected_todo_authority") else "")
+        ]
+        instruction = context.get("instruction")
+        if isinstance(instruction, str) and instruction:
+            lines.append(f"- work_context_instruction: {instruction}")
+        return lines
+    details = {key: value for key, value in context.items() if key != "instruction"}
+    return ["", "## Current work context", "", context.get("instruction", ""),
+        "", "```json", json.dumps(details, ensure_ascii=False, indent=2), "```", ""]
+
+
+def turn_envelope_budget_warning_lines(payload: dict[str, Any]) -> list[str]:
+    compaction = payload.get("compaction") or {}
+    warning = compaction.get("warning") or {}
+    if warning.get("code") != "turn_envelope_budget_exceeded":
+        return []
+    sections = warning.get("section_bytes") or {}
+    return [
+        "- WARNING: TurnEnvelope exceeds its performance target by "
+        f"{warning.get('excess_bytes')} UTF-8 bytes; Turn routing is unchanged.",
+        "- section_bytes: "
+        + ", ".join(f"{key}={value}" for key, value in sections.items()),
+        "- Review over-target sections: "
+        + ", ".join(warning.get("over_target_sections") or []),
+        "- Compress duplicate presentation or move detail to cold reads; "
+        "do not truncate authority or raise the target to hide growth.",
+    ]
+
+
+def render_turn_context_markdown(payload: dict[str, Any]) -> str:
+    """Render the complete carrier or its same-source recovery reference."""
+    return "# LoopX Turn Envelope\n\n" + render_json_object_block(payload)
 
 
 def render_turn_envelope_markdown(payload: dict[str, Any]) -> str:
+    from ...control_plane.effect_program import reject_retired_quota_format
+
+    reject_retired_quota_format(payload)
+    if payload.get("schema_version") == "loopx_turn_envelope_v1":
+        return render_turn_context_markdown(payload)
     action_value = payload.get("action")
     user_value = payload.get("user")
     writeback_value = payload.get("writeback")
@@ -29,5 +80,8 @@ def render_turn_envelope_markdown(payload: dict[str, Any]) -> str:
         f"- scheduler: `{scheduler.get('action')}`",
         f"- envelope_bytes: `{compaction.get('envelope_json_bytes')}`",
         f"- within_budget: `{compaction.get('within_budget')}`",
+        *turn_envelope_budget_warning_lines(payload),
     ]
+    if isinstance(payload.get("work_context"), dict):
+        lines.extend(work_context_lines(payload["work_context"]))
     return "\n".join(lines)

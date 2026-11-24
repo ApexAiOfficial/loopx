@@ -1,183 +1,85 @@
 from __future__ import annotations
 
-import hashlib
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ..todos.contract import (
-    TODO_TASK_CLASS_ADVANCEMENT,
-    TODO_TASK_CLASS_MONITOR,
-    TODO_TASK_CLASS_USER_GATE,
-    normalize_required_capabilities,
-    normalize_todo_action_kind,
-    normalize_todo_continuation_policy,
     normalize_todo_id,
-    normalize_todo_task_repository,
-    resolve_next_user_task_class,
-    resolve_todo_continuation_policy,
 )
-from .monitor_todo import (
-    monitor_next_due_at,
-    monitor_todo_task_class,
-    parse_monitor_counter,
+from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from ..coordination.local_authority import (
+    LocalCoordinationAuthorityRejection,
+    read_canonical_todos_if_promoted,
+    require_canonical_authority,
 )
-
-
-def require_monitor_successor_route(
-    *,
-    next_agent_todo: str | None,
-    next_action_kind: str | None,
-    next_task_repository: str | None,
-    next_required_capabilities: list[str] | None,
-    next_continuation_policy: str | None,
-    next_target_key: str | None,
-) -> None:
-    route_fields = {
-        "--next-action-kind": next_action_kind,
-        "--next-task-repository": next_task_repository,
-        "--next-continuation-policy": next_continuation_policy,
-        "--next-target-key": next_target_key,
-    }
-    if not next_agent_todo:
-        if any(route_fields.values()) or next_required_capabilities:
-            raise ValueError("monitor successor routing options require --next-agent-todo")
-        return
-    if not str(next_action_kind or "").strip():
-        raise ValueError(
-            "`quota monitor-poll --next-agent-todo` requires explicit successor "
-            "action semantics via --next-action-kind"
-        )
-
-
-def _derived_monitor_successor_target_key(*, todo_id: str, result_hash: str) -> str:
-    digest = hashlib.sha256(result_hash.encode("utf-8")).hexdigest()[:16]
-    return f"monitor-successor:{todo_id}:{digest}"
-
-
-def _resolve_monitor_successor_route(
-    *,
-    next_agent_todo: str | None,
-    next_action_kind: str | None,
-    next_task_repository: str | None,
-    next_required_capabilities: list[str] | None,
-    next_continuation_policy: str | None,
-    next_target_key: str | None,
-    source_task_repository: str | None,
-    todo_id: str,
-    result_hash: str,
-) -> dict[str, Any]:
-    if not next_agent_todo:
-        return {}
-    action_kind = normalize_todo_action_kind(next_action_kind)
-    if not action_kind:
-        raise ValueError(
-            "--next-action-kind must be a public-safe token: lowercase letters, "
-            "digits, '_' or '-'"
-        )
-    task_repository = normalize_todo_task_repository(next_task_repository)
-    if next_task_repository and not task_repository:
-        raise ValueError(
-            "--next-task-repository must be a credential-free Git remote or "
-            "canonical git:<host>/<path> identity"
-        )
-    if source_task_repository and not task_repository:
-        raise ValueError(
-            "repository-bound monitor successors require explicit "
-            "--next-task-repository so same-repository and cross-repository "
-            "routing cannot be confused"
-        )
-    required_capabilities = normalize_required_capabilities(
-        next_required_capabilities
-    )
-    if next_required_capabilities and not required_capabilities:
-        raise ValueError(
-            "--next-required-capability must contain public-safe capability tokens"
-        )
-    if next_continuation_policy and not normalize_todo_continuation_policy(
-        next_continuation_policy
-    ):
-        raise ValueError(
-            "--next-continuation-policy must be a supported todo continuation policy"
-        )
-    return {
-        "action_kind": action_kind,
-        "task_repository": task_repository,
-        "required_capabilities": required_capabilities,
-        "continuation_policy": resolve_todo_continuation_policy(
-            next_continuation_policy
-        ).value,
-        "target_key": str(next_target_key or "").strip()
-        or _derived_monitor_successor_target_key(
-            todo_id=todo_id,
-            result_hash=result_hash,
-        ),
-    }
+from ...paths import effective_runtime_root
 
 
 def resolve_monitor_todo_item(
     *,
     registry_path: Path,
     goal_id: str,
+    runtime_root: Path | None = None,
     todo_id: str | None = None,
     target_key: str | None = None,
 ) -> dict[str, Any]:
-    from ...todos import list_goal_todos
-
     normalized_todo_id = normalize_todo_id(todo_id) if todo_id else None
     safe_target_key = str(target_key or "").strip()
     if not normalized_todo_id and not safe_target_key:
         raise ValueError("monitor todo writeback requires --todo-id or --target-key")
-    payload = list_goal_todos(registry_path=registry_path, goal_id=goal_id, role="agent")
-    items = payload.get("todos") if isinstance(payload.get("todos"), list) else []
-    if normalized_todo_id:
-        matches = [
-            item
-            for item in items
-            if isinstance(item, dict)
-            and normalize_todo_id(item.get("todo_id")) == normalized_todo_id
-        ]
-        if not matches:
-            raise ValueError(f"monitor todo_id {normalized_todo_id!r} was not found")
-        if len(matches) > 1:
-            raise ValueError(f"monitor todo_id {normalized_todo_id!r} matched multiple todos")
-        item = matches[0]
-        item_target_key = str(item.get("target_key") or "").strip()
-        if safe_target_key and item_target_key and safe_target_key != item_target_key:
-            raise ValueError(
-                f"monitor todo_id {normalized_todo_id!r} resolves target_key "
-                f"{item_target_key!r}, not {safe_target_key!r}"
-            )
-        if monitor_todo_task_class(item) != TODO_TASK_CLASS_MONITOR:
-            raise ValueError("monitor-poll todo writeback target must be task_class=continuous_monitor")
-        return item
-
-    matches: list[dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        if safe_target_key and str(item.get("target_key") or "").strip() == safe_target_key:
-            matches.append(item)
-    if not matches:
-        target = normalized_todo_id or safe_target_key
-        raise ValueError(f"monitor todo target {target!r} was not found")
-    if len(matches) > 1:
-        raise ValueError(f"monitor target_key {safe_target_key!r} matched multiple todos; pass --todo-id")
-    item = matches[0]
-    if monitor_todo_task_class(item) != TODO_TASK_CLASS_MONITOR:
-        raise ValueError("monitor-poll todo writeback target must be task_class=continuous_monitor")
-    return item
+    authority = read_canonical_todos_if_promoted(
+        runtime_root=effective_runtime_root(
+            registry_path,
+            str(runtime_root) if runtime_root is not None else None,
+        ),
+        goal_id=goal_id,
+    )
+    if authority is None:
+        require_canonical_authority(goal_id=goal_id, operation="monitor_poll")
+    items = [
+        item
+        for item in authority["todos"]
+        if item.get("role") == "agent" and item.get("archive_state") != "archive"
+    ]
+    # DTO only: selectMonitorTodo remains the rule owner. Preserve the complete
+    # candidate set, but keep prose/evidence and schedule fields in the source
+    # snapshot. The selected fact is mapped back to its complete original row.
+    fields = ("todo_id", "target_key", "status", "archive_state", "role", "task_class")
+    facts = [{key: item[key] for key in fields if key in item} for item in items]
+    try:
+        result = effect_runtime_result("scheduler.monitor_target.select", {
+            "schema_version": "loopx_monitor_target_request_v0", "items": facts,
+            "todo_id": normalized_todo_id, "target_key": safe_target_key or None,
+        })
+    except EffectRuntimeRejected as exc:
+        # A source/transport outage is not a definitive target rejection.
+        # Due lookup catches ValueError for semantic misses only.
+        if exc.diagnostic_code != "invalid_request":
+            raise
+        raise ValueError(str(exc)) from exc
+    if not isinstance(result, dict) or result.get("schema_version") != "loopx_monitor_target_result_v0":
+        raise TypeError("TypeScript Monitor target selection shape mismatch")
+    for item, fact in zip(items, facts, strict=True):
+        if fact == result.get("todo"):
+            return deepcopy(item)
+    raise TypeError("TypeScript Monitor target selection does not match its source snapshot")
 
 
 def write_monitor_poll_todo_state(
     *,
     registry_path: Path,
+    runtime_root: Path,
     goal_id: str,
     generated_at: str,
     execute: bool,
+    monitor_effect_id: str | None = None,
     todo_id: str | None = None,
     target_key: str | None = None,
     result_hash: str | None = None,
     material_change: bool = False,
+    material_change_scope: str | None = None,
     cadence: str | None = None,
     next_due_at: str | None = None,
     reason_summary: str | None = None,
@@ -190,162 +92,99 @@ def write_monitor_poll_todo_state(
     next_user_todo: str | None = None,
     next_user_task_class: str | None = None,
     next_claimed_by: str | None = None,
+    next_agent_priority: str | None = None,
+    next_user_priority: str | None = None,
     agent_id: str | None = None,
+    task_lease_idempotency_key: str | None = None,
+    task_lease_expected_version: int | None = None,
+    gate_scope_guard: bool = False,
+    available_capabilities: list[str] | None = None,
+    admitted_resume_when: str | None = None,
+    legacy_batch_version: int | None = None,
 ) -> dict[str, Any] | None:
-    from ...todos import add_goal_todo, update_goal_todo
+    """Route one typed Monitor transaction to its owning storage adapter."""
+    from .monitor_batch_receipts import replay_legacy_monitor_poll
 
+    lease_proof = ({"idempotency_key": task_lease_idempotency_key,
+                    "expected_version": task_lease_expected_version}
+                   if task_lease_idempotency_key is not None or task_lease_expected_version is not None else None)
     if not todo_id and not target_key:
+        if lease_proof is not None:
+            raise ValueError("lease proof requires a Monitor target")
         return None
-    safe_result_hash = str(result_hash or "").strip()
-    if not safe_result_hash:
-        raise ValueError("monitor todo writeback requires --result-hash")
-    effective_next_user_task_class = resolve_next_user_task_class(
-        next_user_todo,
-        next_user_task_class,
+    observation = {"todo_id": todo_id, "target_key": target_key,
+        "result_hash": result_hash, "material_change": material_change,
+        "generated_at": generated_at, "cadence": cadence,
+        "next_due_at": next_due_at, "reason_summary": reason_summary}
+    if material_change_scope is not None:
+        observation["material_change_scope"] = material_change_scope
+    intent = {"next_agent_todo": next_agent_todo, "next_action_kind": next_action_kind,
+        "next_task_repository": next_task_repository,
+        "next_required_capabilities": next_required_capabilities or [],
+        "next_continuation_policy": next_continuation_policy,
+        "next_target_key": next_target_key, "next_claimed_by": next_claimed_by,
+        "next_user_todo": next_user_todo, "next_user_task_class": next_user_task_class}
+    # Omitted additive fields must retain old request hashes during replay.
+    if next_agent_priority is not None:
+        intent["next_agent_priority"] = next_agent_priority
+    if next_user_priority is not None:
+        intent["next_user_priority"] = next_user_priority
+    request = {"schema_version": "loopx_monitor_batch_plan_request_v0",
+        "goal_id": goal_id, "operation_id": monitor_effect_id or f"monitor-poll:{goal_id}:{uuid4().hex}",
+        "actor_agent_id": agent_id, "dry_run": not execute,
+        "observation": observation, "intent": intent,
+        "gate_scope_guard": gate_scope_guard, "legacy_batch_version": legacy_batch_version}
+    from .provider_monitor_poll import (
+        poll_canonical_monitor_if_promoted,
     )
-    require_monitor_successor_route(
-        next_agent_todo=next_agent_todo,
-        next_action_kind=next_action_kind,
-        next_task_repository=next_task_repository,
-        next_required_capabilities=next_required_capabilities,
-        next_continuation_policy=next_continuation_policy,
-        next_target_key=next_target_key,
-    )
-    item = resolve_monitor_todo_item(
-        registry_path=registry_path,
-        goal_id=goal_id,
-        todo_id=todo_id,
-        target_key=target_key,
-    )
-    resolved_todo_id = normalize_todo_id(item.get("todo_id"))
-    if not resolved_todo_id:
-        raise ValueError("resolved monitor todo has no stable todo_id")
-    successor_route = _resolve_monitor_successor_route(
-        next_agent_todo=next_agent_todo,
-        next_action_kind=next_action_kind,
-        next_task_repository=next_task_repository,
-        next_required_capabilities=next_required_capabilities,
-        next_continuation_policy=next_continuation_policy,
-        next_target_key=next_target_key,
-        source_task_repository=str(item.get("task_repository") or "").strip()
-        or None,
-        todo_id=resolved_todo_id,
-        result_hash=safe_result_hash,
-    )
-    safe_target_key = str(target_key or item.get("target_key") or "").strip()
-    effective_cadence = str(cadence or item.get("cadence") or "").strip()
-    effective_next_due_at = monitor_next_due_at(
-        generated_at=generated_at,
-        cadence=effective_cadence,
-        explicit_next_due_at=next_due_at,
-    )
-    if not material_change and not effective_next_due_at:
-        raise ValueError(
-            "unchanged monitor todo writeback requires --next-due-at or a parseable cadence such as 30m/2h/1d"
+
+    # A selected provider must be readable before any historical fallback.
+    # An unmigrated source may still replay its exact business receipt; that
+    # typed readback does not admit a fresh Monitor write or drain old captures.
+    from ..coordination.local_authority import CanonicalAuthorityRequired
+
+    try:
+        authority = read_canonical_todos_if_promoted(
+            runtime_root=runtime_root,
+            goal_id=goal_id,
         )
-    previous_hash = str(item.get("result_hash") or "").strip()
-    previous_no_change = parse_monitor_counter(item.get("consecutive_no_change"))
-    consecutive_no_change = (
-        0
-        if material_change or (previous_hash and previous_hash != safe_result_hash)
-        else previous_no_change + 1
-    )
-    monitor_metadata: dict[str, Any] = {
-        "last_checked_at": generated_at,
-        "result_hash": safe_result_hash,
-        "consecutive_no_change": str(consecutive_no_change),
-        "material_change": "true" if material_change else "false",
-    }
-    if safe_target_key:
-        monitor_metadata["target_key"] = safe_target_key
-    if effective_cadence:
-        monitor_metadata["cadence"] = effective_cadence
-    if effective_next_due_at:
-        monitor_metadata["next_due_at"] = effective_next_due_at
-    update_result = update_goal_todo(
-        registry_path=registry_path,
-        goal_id=goal_id,
-        todo_id=resolved_todo_id,
-        role="agent",
-        reason=reason_summary,
-        monitor_metadata=monitor_metadata,
-        enforce_monitor_boundedness=False,
-        agent_id=agent_id,
-        dry_run=not execute,
-    )
-    next_results: list[dict[str, Any]] = []
-    if material_change and next_agent_todo:
-        next_results.append(
-            add_goal_todo(
-                registry_path=registry_path,
-                goal_id=goal_id,
-                role="agent",
-                text=next_agent_todo,
-                task_class=TODO_TASK_CLASS_ADVANCEMENT,
-                action_kind=successor_route["action_kind"],
-                task_repository=successor_route["task_repository"],
-                continuation_policy=successor_route["continuation_policy"],
-                required_capabilities=successor_route["required_capabilities"],
-                claimed_by=next_claimed_by,
-                unblocks_todo_id=resolved_todo_id,
-                monitor_metadata={"target_key": successor_route["target_key"]},
-                dry_run=not execute,
-            )
+    except CanonicalAuthorityRequired as error:
+        if not execute or not monitor_effect_id or lease_proof is not None:
+            raise CanonicalAuthorityRequired(
+                goal_id=goal_id, operation="monitor_poll", payload=error.payload,
+            ) from error
+        # This explicit original-operation read can only return an immutable
+        # business receipt. Its existing typed owner validates exact intent;
+        # no receipt still refuses below, without reopening the retired writer.
+        authority = None
+    source_error: OSError | ValueError | None = None
+    if monitor_effect_id and lease_proof is None:
+        # Legacy receipts are historical facts even after authority promotion.
+        try:
+            previous = replay_legacy_monitor_poll(registry_path=registry_path, request=request)
+        except (OSError, ValueError) as error:
+            if authority is None:
+                raise
+            # Keep the typed native receipt available when its display is
+            # damaged. v4 forbids planning or committing if that receipt is
+            # absent; a malformed historical source never permits fresh work.
+            previous = None
+            source_error = error
+        if previous is not None:
+            return previous
+    if authority is None:
+        require_canonical_authority(goal_id=goal_id, operation="monitor_poll")
+    try:
+        canonical = poll_canonical_monitor_if_promoted(
+            registry_path=registry_path, runtime_root=runtime_root, goal_id=goal_id,
+            execute=execute, monitor_effect_id=monitor_effect_id, agent_id=agent_id,
+            lease_proof=lease_proof, gate_scope_guard=gate_scope_guard,
+            receipt_only=source_error is not None,
+            available_capabilities=available_capabilities, admitted_resume_when=admitted_resume_when,
+            observation=observation, intent=intent,
         )
-    if material_change and next_user_todo:
-        next_results.append(
-            add_goal_todo(
-                registry_path=registry_path,
-                goal_id=goal_id,
-                role="user",
-                text=next_user_todo,
-                task_class=effective_next_user_task_class,
-                action_kind=(
-                    "gate"
-                    if effective_next_user_task_class == TODO_TASK_CLASS_USER_GATE
-                    else None
-                ),
-                agent_id=agent_id,
-                unblocks_todo_id=(
-                    resolved_todo_id
-                    if effective_next_user_task_class == TODO_TASK_CLASS_USER_GATE
-                    else None
-                ),
-                dry_run=not execute,
-            )
-        )
-    successor_receipts = [
-        {
-            key: result.get(key)
-            for key in (
-                "todo_id",
-                "role",
-                "task_class",
-                "action_kind",
-                "task_repository",
-                "continuation_policy",
-                "required_capabilities",
-                "claimed_by",
-                "unblocks_todo_id",
-                "target_key",
-            )
-            if result.get(key) not in (None, "", [])
-        }
-        for result in next_results
-    ]
-    return {
-        "schema_version": "monitor_poll_todo_writeback_v0",
-        "dry_run": not execute,
-        "goal_id": goal_id,
-        "todo_id": resolved_todo_id,
-        "target_key": safe_target_key or None,
-        "result_hash": safe_result_hash,
-        "material_change": material_change,
-        "consecutive_no_change": consecutive_no_change,
-        "last_checked_at": generated_at,
-        "next_due_at": effective_next_due_at,
-        "cadence": effective_cadence or None,
-        "todo_update": update_result,
-        "next_todos": next_results,
-        "successor_receipts": successor_receipts,
-    }
+    except LocalCoordinationAuthorityRejection as error:
+        if source_error is not None and error.code == "monitor_poll_original_receipt_required":
+            raise source_error from error
+        raise
+    return canonical

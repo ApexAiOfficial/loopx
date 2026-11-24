@@ -5,27 +5,46 @@ cooperating machines that are projected from the same canonical state bodies:
 registry entries, active state, todo metadata, run history, quota events,
 operator gates, scheduler acknowledgements, and projection sinks.
 
-This document is not a new store and not a private incident narrative. It is a
+It is a
 public-safe map over the current repository contracts, especially:
 
 - [`state-definitions.md`](state-definitions.md) for source state bodies and
   derived runtime names;
 - [`interaction-catalog.md`](interaction-catalog.md) for reusable interaction
   patterns;
-- [`loopx/control_plane/todos/contract.py`](https://github.com/huangruiteng/loopx/blob/main/loopx/control_plane/todos/contract.py) for todo status,
+- [`loopx/control_plane/todos/contract.py`](https://github.com/loopx-project/loopx/blob/main/loopx/control_plane/todos/contract.py) for todo status,
   task class, decision scope, resume, claim, and monitor metadata fields;
-- [`loopx/quota.py`](https://github.com/huangruiteng/loopx/blob/main/loopx/quota.py) for `quota should-run`, runtime
+- [`loopx/quota.py`](https://github.com/loopx-project/loopx/blob/main/loopx/quota.py) for `quota should-run`, runtime
   states, `effective_action`, `interaction_contract`, spend, and monitor poll
   contracts;
-- [`loopx/control_plane/scheduler/scheduler_hint.py`](https://github.com/huangruiteng/loopx/blob/main/loopx/control_plane/scheduler/scheduler_hint.py)
+- [`loopx/control_plane/scheduler/scheduler_hint.py`](https://github.com/loopx-project/loopx/blob/main/loopx/control_plane/scheduler/scheduler_hint.py)
   for cadence/backoff/reset-token behavior;
 - [`goal_vision_replan_contract_v0`](../../reference/protocols/goal-vision-replan-contract-v0.md)
   for bounded per-agent vision, replan transitions, and goal-route projection;
 - cross-agent handoff gate states in
-  [`loopx/control_plane/todos/handoff_gate.py`](https://github.com/huangruiteng/loopx/blob/main/loopx/control_plane/todos/handoff_gate.py);
-- [`loopx/project_map.py`](https://github.com/huangruiteng/loopx/blob/main/loopx/project_map.py) and
-  [`loopx/bootstrap.py`](https://github.com/huangruiteng/loopx/blob/main/loopx/bootstrap.py) for project registration,
+  [`loopx/control_plane/todos/handoff_gate.py`](https://github.com/loopx-project/loopx/blob/main/loopx/control_plane/todos/handoff_gate.py);
+- [`loopx/project_map.py`](https://github.com/loopx-project/loopx/blob/main/loopx/project_map.py) and
+  [`loopx/bootstrap.py`](https://github.com/loopx-project/loopx/blob/main/loopx/bootstrap.py) for project registration,
   read-only-map opt-in, global sync, and host-loop activation.
+
+## Composition Contract
+
+The diagrams below are explanatory views over cooperating owners, not one
+executable global state enum. A transition in one machine is input evidence to
+another only through its declared command, observation or receipt boundary.
+Keep domain state, derived decisions, settlement phase and projection conditions
+separate as defined in [the taxonomy](state-definitions.md#state-taxonomy-and-ownership).
+
+A pure decision selects a legal transition from explicit facts; the owning
+authority still revalidates current scope and commits it. Completing a Todo,
+settling a Turn and delivering its result have different commit points. A lost
+response or delayed display must not repeat an already committed effect.
+
+For changes crossing these machines, use the
+[composition verification contract](../../architecture/rfcs/composable-state-machines-recovery-verification-v0.md):
+name the causal receipts, safety invariants, conditional progress assumptions,
+fault sequences and affected real entrypoints. Preserve independent user and
+agent channels: a scoped user gate can coexist with runnable unrelated work.
 
 ## How The Machines Compose
 
@@ -98,7 +117,9 @@ stateDiagram-v2
   Suggested --> Open: promoted / todo add
   Open --> Claimed: claimed_by set
   Claimed --> Running: quota selects this todo
-  Running --> Done: validated evidence or blocker accepted
+  Running --> Done: terminal outcome accepted
+  Running --> Open: in-flight writeback accepted
+  Running --> Blocked: blocker recorded
   Done --> SuccessorOpen: successor or unblock relation exists
   Done --> Archived: no follow-up or archive policy
   Open --> Blocked: status=blocked / blocker reason
@@ -114,7 +135,7 @@ stateDiagram-v2
 | `Suggested` | Suggestion output or planning prompt | Candidate work that has not entered the durable todo list. | Promote to `Open` or drop it. |
 | `Open` | `status=open` or unchecked Markdown item | Durable backlog item. | Claim, block, defer, supersede, or complete. |
 | `Claimed` | `claimed_by=<agent_id>` | Soft ownership/routing signal. It is not a lock. | Run if quota selects it, reassign, block, or complete. |
-| `Running` | Derived from `quota should-run` plus run history | A bounded turn is currently attempting this item. | Write evidence/blocker, then complete or reopen. |
+| `Running` | Derived from `quota should-run` plus run history | A bounded turn is currently attempting this item. | Write back progress or blocker; complete only when the Todo terminal contract is satisfied. |
 | `Done` | `status=done` or checked item plus evidence | The item has a terminal outcome. | Archive, create successor, or expose handoff clearance. |
 | `Blocked` | `status=blocked`, `reason`, capability/gate fields | Known blocker, not vague waiting. | Repair, ask owner, supersede, or reopen. |
 | `Deferred` | `status=deferred`, `resume_when` | Waiting for a concrete condition. | `ResumeReady` when the condition is satisfied. |
@@ -340,7 +361,7 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | `run_now` | `active_work` | 3 / 10 minutes | Work or repair must be attempted. |
 | `backoff_waiting_for_user` | `human_gate` | 30 / 120 minutes | Concrete user/controller action is next. |
-| `backoff_until_reassigned` | `agent_scope_wait` | 10 / 60 minutes, progression 10/20/30/60 | Handoff owner or reassignment may unblock this agent. |
+| `backoff_until_reassigned` | `agent_scope_wait` or `peer_coordination_wait` | 10 / 60 minutes, progression 10/20/30/60 | Handoff owner, peer readiness, coordinator configuration, reassignment, or new local work may unblock this agent. |
 | `backoff_until_material_transition` | `monitor_wait` | 15 / 60 minutes | Monitor-only liveness without compute spend. |
 | `backoff_until_fresh_evidence` | `unchanged_noop` | 60 / 240 minutes | Wait for fresh mapped or post-handoff evidence. |
 | `backoff_until_state_change` | `quiet_wait` | 30 / 120 minutes | No specific user/monitor path is projected. |
@@ -375,10 +396,27 @@ flowchart LR
 | `Projection gap` | Missing concrete todo, stale route, conflicting source, or collapsed user/agent channel. | Repair the source or projection builder before relying on it. |
 | `Write API` | Todo update, gate decision, refresh-state, monitor poll, spend, scheduler ack, or event append. | Append durable facts; do not mutate the sink as truth. |
 
-This machine protects the public/private boundary: a projection may render
-public-safe summaries and evidence refs, but it must not become a dependency on
-private raw docs, transcripts, credentials, local paths, benchmark logs, or
-unredacted connector payloads.
+Build operator-facing sinks from LoopX's public-safe state and projection
+surfaces: todo projections, quota/status contracts, frontstage projections,
+compact run-history events, public-safe evidence pointers and redacted source
+warnings. A generic sink must not depend on the shape of a project-private
+document, planning file, non-public wiki, raw transcript, local path, benchmark
+logs or connector payload. First convert a valuable source into a bounded
+projection with stable ids, source labels, evidence and explicit gates; then
+render that projection.
+
+Public or multi-user sinks consume redacted public-safe evidence. An explicitly
+owner-only operator board may synchronize private planning evidence when the
+user authorizes that boundary, but should still scope rows by `agent_id` and avoid
+credentials or secrets unless the user explicitly requests a credential-handling
+workflow. A display sink does not gain write or publication authority from the
+data it can read.
+
+Projection sinks should preserve row lineage as data rather than ad hoc prose.
+When rows supersede, migrate or retire earlier display rows, use fields such as
+`row_lifecycle`, `supersedes`, `superseded_by`, `source_id` and compact migration
+audit evidence. The sink may render lineage in existing evidence/history fields;
+understanding a row's change must not require reading a project-private document.
 
 ## 8. Agent Onboarding / Automation Enablement Machine
 
@@ -474,12 +512,18 @@ The same ordering applies when an agent records a bounded
 as a goal-frontier `acceptance_gaps[]` entry. If no advancement frontier remains,
 the gap becomes a replan trigger before the lane can quietly back off.
 
-Long runnable lanes also pass through this machine. When the current agent can
-select about 15 advancement todos, or about 20 open todos with advancement work
-still present, quota should trigger a bounded vision replan before continuing
-linearly. The replan reads the agent-scoped evidence log, uses bounded public
+Long runnable lanes also pass through this machine. When the current agent owns
+at least 15 open advancement todos, quota should trigger a bounded vision replan
+before continuing linearly. The replan reads the agent-scoped evidence log, uses bounded public
 research when local evidence is insufficient for a public claim, then groups,
 prunes, or reprioritizes the chain into the next high-value runnable slice.
+Shared unclaimed candidates remain selectable but do not count toward this lane
+threshold. Continuous monitors also do not count: their due schedules and
+no-change review rules remain independent, and the former 20-claimed-open
+threshold no longer creates new Agent-lane obligations. Historical checkpoints
+remain readable. A valid evidence-linked vision path can retain existing runnable
+work and settle the projected Turn without adding another planning Todo. Shared-pool
+churn preserves its obligation identity; owned material changes rearm it.
 
 The same ordering also applies to `vision_checkpoint_v0`: if a role records
 material progress but omits both a vision patch and an unchanged/no-follow-up

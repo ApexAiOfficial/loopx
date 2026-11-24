@@ -5,6 +5,7 @@ from __future__ import annotations
 import shlex
 from typing import Any
 
+from ..agents.profile import AGENT_PROFILE_SCOPE_SUMMARY_MAX_CHARS
 from ..agents.runtime_model import PEER_AGENT_PROFILE_SCHEMA_VERSION
 
 
@@ -12,7 +13,12 @@ def normalize_agent_scope(value: Any) -> str | None:
     candidate = " ".join(str(value or "").strip().split())
     if not candidate:
         return None
-    if len(candidate) > 180 or any(char in candidate for char in "<>"):
+    if len(candidate) > AGENT_PROFILE_SCOPE_SUMMARY_MAX_CHARS:
+        raise ValueError(
+            "agent scope must be at most "
+            f"{AGENT_PROFILE_SCOPE_SUMMARY_MAX_CHARS} characters"
+        )
+    if any(char in candidate for char in "<>"):
         raise ValueError("agent scope must be compact text without angle brackets")
     return candidate
 
@@ -136,16 +142,17 @@ def render_peer_agent_scope_instruction(
         "--claimed-by <agent_id> --agent-id <agent_id>"
     )
     peer_rule = (
-        "You are an equal peer agent: claim or lease in-scope work; use an independent worktree "
-        "for repository writes; follow todo continuation policy. PR review is "
+        "You are an equal peer agent: follow the current quota claim/lease and workspace "
+        "contract plus repository rules; follow todo continuation policy. PR review is "
         "user_action with a runnable successor; gate only exact merge/release/launch "
         "authority. Task-scoped coordination grants no authority over other agents."
     )
     if thin:
         return (
-            f"Equal peer `{identity}` (peer_v1); scope: {scope_text}. Claim/lease first; "
-            "independent repo worktree; todo continuation; no cross-agent authority; "
-            "no scope in todo metadata."
+            f"Equal peer `{identity}` (peer_v1); scope: {scope_text}. Follow the current quota "
+            "claim/lease and workspace contract plus repository rules. Follow todo "
+            "continuation policy. Task-scoped coordination grants no authority over "
+            "other agents. Keep scope in this prompt, not todo metadata."
         )
     if compact:
         return (

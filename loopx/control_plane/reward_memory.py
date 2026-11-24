@@ -1,43 +1,231 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 from collections.abc import Mapping
-from typing import Any
 
 from .todos.contract import normalize_todo_claimed_by
 
 
-def reward_memory_goal_policy(goal: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the provider-neutral opt-in policy for one goal."""
+def reward_memory_automation_enabled(
+    payload: Mapping[str, Any] | None,
+    *,
+    operation: str,
+) -> bool:
+    return operation in enabled_reward_memory_automation(payload, operation)
+
+
+def enabled_reward_memory_automation(
+    payload: Mapping[str, Any] | None,
+    *operations: str,
+    recall: Mapping[str, Any] | None = None,
+) -> frozenset[str]:
+    """Read the owning binding once for the requested operations.
+
+    The experiment resolver owns enablement, config/receipt verification and
+    provider policy. A recall packet's presence or old context is not opt-in.
+    An explicit recall observation stays separate from the governing payload,
+    so its participation check never rewrites a complete source's signed fields.
+    """
+    if not isinstance(payload, Mapping):
+        return frozenset()
+    recall = payload.get("reward_memory_recall") if recall is None else recall
+    experiment = recall.get("experiment") if isinstance(recall, Mapping) else None
+    if (
+        not isinstance(experiment, Mapping)
+        or experiment.get("enabled") is not True
+        or experiment.get("available") is not True
+        or experiment.get("configured_for_agent") is not True
+    ):
+        return frozenset()
+    eligible = frozenset(operation for operation in operations if experiment.get(operation) is True)
+    if not eligible:
+        return eligible
+    envelope = payload.get("turn_envelope")
+    source: Mapping[str, Any] | None
+    if "work_contract" in payload:
+        from .quota.turn_envelope import complete_turn_host_source, turn_plan_host_source
+
+        try:
+            source = complete_turn_host_source(
+                turn_plan_host_source(payload), operation="capability_automation_source",
+            )
+        except (ValueError, RuntimeError):
+            return frozenset()
+        if source is None:
+            return frozenset()
+        boundary = source.get("boundary")
+    elif isinstance(envelope, Mapping):
+        # Retain the recorded legacy Host binding.
+        source = envelope
+        boundary = source.get("boundary")
+    elif "turn_envelope" not in payload:
+        # App guards carry the same verified capability projection directly;
+        # they are not host requests and do not contain a TurnEnvelope.
+        receipt = payload.get("heartbeat_receipt")
+        identity = payload.get("agent_identity")
+        if (
+            payload.get("ok") is not True
+            or payload.get("should_run") is not True
+            or not isinstance(receipt, Mapping)
+            or receipt.get("status") not in {"committed", "replayed"}
+            or not receipt.get("turn_instance_id")
+            or not isinstance(identity, Mapping)
+            or identity.get("registered") is not True
+        ):
+            return frozenset()
+        from .quota.turn_envelope import quota_capability_automation_source
+
+        try:
+            source = quota_capability_automation_source(payload)
+        except (ValueError, RuntimeError):
+            return frozenset()
+        boundary = source.get("boundary")
+    else:
+        return frozenset()
+    capabilities = (
+        boundary.get("capabilities") if isinstance(boundary, Mapping) else None
+    )
+    memory = (
+        capabilities.get("reward_memory") if isinstance(capabilities, Mapping) else None
+    )
+    # Recall resolves the binding again after admission. A stale envelope
+    # must not resurrect a now unavailable or disabled binding.
+    if (
+        not isinstance(memory, Mapping)
+        or not source.get("goal_id")
+        or experiment.get("goal_id") != source.get("goal_id")
+        or not source.get("agent_id")
+        or experiment.get("agent_id") != source.get("agent_id")
+    ):
+        return frozenset()
+    return frozenset(operation for operation in eligible if memory.get(operation) is True)
+
+
+def reward_memory_host_coverage() -> list[dict[str, str]]:
+    """Project source lifecycle wiring, not Agent enablement or provider qualification."""
+
+    return [
+        {
+            "host_id": "codex_cli_turn",
+            "automatic_recall": "connected",
+            "automatic_ingest": "connected_post_settlement",
+        },
+        {
+            "host_id": "generic_cli_turn",
+            "automatic_recall": "connected",
+            "automatic_ingest": "connected_post_settlement",
+        },
+        {
+            "host_id": "dsh_turn",
+            "automatic_recall": "connected",
+            "automatic_ingest": "connected_post_settlement",
+        },
+        {
+            "host_id": "codex_app_quota",
+            "automatic_recall": "connected",
+            "automatic_ingest": "connected_refresh_spend_post_settlement",
+        },
+        {
+            "host_id": "lark",
+            "automatic_recall": "status_projection_only",
+            "automatic_ingest": "uncovered",
+        },
+    ]
+
+
+def reward_memory_goal_policy(
+    goal: Mapping[str, Any], *, agent_id: str | None = None
+) -> dict[str, Any]:
+    """Normalize the binding selected by the typed owner, without provider IO.
+
+    The legacy/default-off path does not cross the effect bridge. Exact Agent
+    overrides are independent policies; even invalid entries cannot fall back.
+    """
 
     control_plane = (
-        goal.get("control_plane")
+        cast(Mapping[str, Any], goal.get("control_plane"))
         if isinstance(goal.get("control_plane"), Mapping)
         else {}
     )
     raw = (
-        control_plane.get("reward_memory")
+        cast(Mapping[str, Any], control_plane.get("reward_memory"))
         if isinstance(control_plane.get("reward_memory"), Mapping)
         else {}
     )
+    binding_agent_id = None
+    binding_revision = None
+    if agent_id is not None and "agent_bindings" in raw:
+        from .effect_runtime import effect_runtime_result
+
+        selected = effect_runtime_result("reward_memory.binding.select", {
+            "policy": dict(raw), "agent_id": agent_id,
+        })
+        raw = selected["policy"]
+        binding_agent_id = selected.get("binding_agent_id")
+        binding_revision = selected.get("binding_revision")
     enabled_agents: list[str] = []
     for value in raw.get("enabled_agents") or []:
-        agent_id = normalize_todo_claimed_by(value)
-        if agent_id and agent_id not in enabled_agents:
-            enabled_agents.append(agent_id)
+        enabled_agent_id = normalize_todo_claimed_by(value)
+        if enabled_agent_id and enabled_agent_id not in enabled_agents:
+            enabled_agents.append(enabled_agent_id)
     experimental = raw.get("experimental") is True
-    return {
+    enablement_receipts: dict[str, dict[str, Any]] = {}
+    raw_receipts = raw.get("enablement_receipts")
+    if isinstance(raw_receipts, Mapping):
+        for agent_id in enabled_agents:
+            receipt = raw_receipts.get(agent_id)
+            if not isinstance(receipt, Mapping):
+                continue
+            enablement_receipts[agent_id] = {
+                key: receipt[key]
+                for key in (
+                    "schema_version",
+                    "status",
+                    "goal_id",
+                    "agent_id",
+                    "config_digest",
+                    "provider_id",
+                    "isolation_mode",
+                    "actor_binding_verified",
+                    "writability_verified",
+                    "exact_readback_verified",
+                    "probe_count",
+                    "write_count",
+                    "external_writes_performed",
+                    "observed_at",
+                    "provider_preflight_performed",
+                    "reason_codes",
+                )
+                if key in receipt
+            }
+    policy = {
         "enabled": raw.get("enabled") is True and experimental,
         "experimental": experimental,
         "config_path": str(raw.get("config_path") or "").strip(),
+        "config_digest": str(raw.get("config_digest") or "").strip(),
         "enabled_agents": enabled_agents,
+        "enablement_receipts": enablement_receipts,
+        "automation": (
+            dict(raw["automation"])
+            if isinstance(raw.get("automation"), Mapping)
+            else {}
+        ),
+        "automation_intent": (
+            dict(raw["automation_intent"])
+            if isinstance(raw.get("automation_intent"), Mapping)
+            else {}
+        ),
     }
+    if binding_agent_id is not None:
+        policy["binding_agent_id"] = binding_agent_id
+        policy["binding_revision"] = binding_revision
+    return policy
 
 
-def reward_memory_goal_policy_summary(goal: Mapping[str, Any]) -> dict[str, Any]:
-    policy = reward_memory_goal_policy(goal)
-    return {
-        "enabled": policy["enabled"],
-        "experimental": policy["experimental"],
-        "config_pointer_registered": bool(policy["config_path"]),
-        "enabled_agents": list(policy["enabled_agents"]),
-    }
+__all__ = [
+    "enabled_reward_memory_automation",
+    "reward_memory_automation_enabled",
+    "reward_memory_goal_policy",
+    "reward_memory_host_coverage",
+]

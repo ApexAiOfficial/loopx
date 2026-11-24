@@ -18,10 +18,11 @@ DELIVERY_BATCH_SCALE_ALIASES: dict[str, DeliveryBatchScale] = {
     "single_segment": DeliveryBatchScale.SINGLE_SURFACE,
     "bounded_segment": DeliveryBatchScale.SINGLE_SURFACE,
 }
-DELIVERY_BATCH_SCALE_INPUT_CHOICES = (
-    *DELIVERY_BATCH_SCALE_CHOICES,
-    *DELIVERY_BATCH_SCALE_ALIASES.keys(),
-)
+# Historical runs used segment-shaped names before scale became a typed write
+# contract.  Readers retain those aliases, but accepting them for new writes
+# silently invents a surface count: in particular, a bounded segment can span
+# one or many surfaces.  New writers must choose the canonical scale explicitly.
+DELIVERY_BATCH_SCALE_INPUT_CHOICES = DELIVERY_BATCH_SCALE_CHOICES
 SMALL_DELIVERY_BATCH_SCALES = frozenset(
     {
         DeliveryBatchScale.TEST_ONLY,
@@ -47,16 +48,17 @@ def normalize_delivery_batch_scale(value: Any) -> DeliveryBatchScale | None:
 
 
 def require_delivery_batch_scale(value: Any) -> DeliveryBatchScale:
+    text = str(value or "").strip()
+    if not isinstance(value, DeliveryBatchScale) and text in DELIVERY_BATCH_SCALE_ALIASES:
+        raise ValueError(
+            f"delivery_batch_scale legacy alias {text!r} is read-only and ambiguous for new "
+            "writes; choose one of: " + ", ".join(DELIVERY_BATCH_SCALE_CHOICES)
+        )
     scale = normalize_delivery_batch_scale(value)
     if scale is None:
-        aliases = ", ".join(
-            f"{alias}={target.value}"
-            for alias, target in DELIVERY_BATCH_SCALE_ALIASES.items()
-        )
         raise ValueError(
             "delivery_batch_scale must be one of: "
             + ", ".join(DELIVERY_BATCH_SCALE_CHOICES)
-            + f" (aliases: {aliases})"
         )
     return scale
 

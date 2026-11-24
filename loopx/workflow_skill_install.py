@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+from typing import Any, Iterator, Mapping, cast
+
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, distribution
 import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
-import shlex
+import sys
 import tempfile
-from typing import Any, Iterator, Mapping
 
+from . import __version__
+from .agy_goal_mode import antigravity_config_home
 from .file_lock import exclusive_file_lock
+from .python_install_owner import interpreter_invocation
 from .skill_install_readback import (
     ARK_MANAGED_AGENT_REQUIRED_SKILL_IDS,
     PACKAGED_HOST_SKILL_IDS,
@@ -18,13 +22,14 @@ from .skill_install_readback import (
     PYTHON_DISTRIBUTION_SKILL_INSTALL_OWNER,
     SKILL_INSTALL_OWNERS,
     SKILL_INSTALL_READBACK_FILENAME,
+    SKILL_VERSION_MARKER_FILENAME,
     hash_skill_tree,
     inspect_skill_install_readback,
-    recorded_skill_hashes,
-    retire_skill_dir,
+    retire_duplicate_managed_skills,
     write_skill_install_readback,
 )
 from .slash_command_install import materialize_loopx_entry_skill
+from .workflow_skills.ego_delivery import reconcile_ego_browser_skill
 
 
 WORKFLOW_SKILL_INSTALL_SCHEMA_VERSION = "loopx_workflow_skill_install_v0"
@@ -43,17 +48,51 @@ _PACKAGED_SKILL_SENTINEL = PurePosixPath(
 _INSTALL_LOCK_STEM = ".loopx-workflow-skills"
 
 
-def _valid_source_root(path: Path) -> bool:
+def _valid_source_root(path: Path, *, require_bundled_scorer: bool = False) -> bool:
     return all(
         (path / skill_id / "SKILL.md").is_file()
         for skill_id in PACKAGED_HOST_SKILL_IDS
-    )
+    ) and (not require_bundled_scorer or
+           (path / "loopx-self-repair/scripts/lexical_retrieval.py").is_file())
 
 
 def resolve_workflow_skill_source() -> dict[str, Any]:
-    """Find the canonical workflow skills in a checkout or installed wheel."""
+    """Find canonical skills belonging to the active runtime installation."""
 
     checkout_root = Path(__file__).resolve().parents[1]
+    # A frozen executable must not borrow skills from an unrelated checkout or
+    # Python installation, even when its own bundle omitted the data files.
+    if getattr(sys, "frozen", False):
+        bundle_root = Path(getattr(sys, "_MEIPASS", checkout_root)).resolve()
+        # Prefer the existing wheel data layout, but preserve the checkout-like
+        # layout that older frozen bundles could already discover.
+        bundled_skills = next(
+            (
+                candidate
+                for candidate in (
+                    bundle_root / "share" / "loopx" / "skills",
+                    bundle_root / "skills",
+                )
+                if _valid_source_root(candidate, require_bundled_scorer=True)
+            ),
+            None,
+        )
+        available = bundled_skills is not None
+        return {
+            "available": available,
+            "kind": "frozen_bundle" if available else "missing",
+            "skills_root": bundled_skills if available else None,
+            "source_root": bundle_root,
+            "distribution_version": __version__ if available else None,
+            "reason": (
+                "workflow skills are available from the frozen application bundle"
+                if available
+                else "the frozen LoopX bundle does not contain the packaged workflow skills; "
+                "rebuild it with the complete share/loopx/skills tree from the same LoopX "
+                "version (PyInstaller --add-data SOURCE:share/loopx/skills)"
+            ),
+        }
+
     checkout_skills = checkout_root / "skills"
     if _valid_source_root(checkout_skills):
         return {
@@ -80,10 +119,26 @@ def resolve_workflow_skill_source() -> dict[str, Any]:
                     "available": True,
                     "kind": "python_distribution",
                     "skills_root": skills_root,
-                    "source_root": Path(installed.locate_file("")).resolve(),
+                    "source_root": Path(cast(Path, installed.locate_file(""))).resolve(),
                     "distribution_version": installed.version,
                     "reason": "workflow skills are available from the installed Python distribution",
                 }
+
+        # Standard pip rewrites wheel ``data_files`` into ``<target>/share``
+        # for ``--target`` installs, but keeps ``../../share`` RECORD rows.
+        # ``importlib.metadata.files`` filters those parent-relative rows, so
+        # validate the public distribution root fallback explicitly.
+        distribution_root = Path(cast(Path, installed.locate_file(""))).resolve()
+        target_skills = distribution_root / "share" / "loopx" / "skills"
+        if _valid_source_root(target_skills):
+            return {
+                "available": True,
+                "kind": "python_distribution",
+                "skills_root": target_skills,
+                "source_root": distribution_root,
+                "distribution_version": installed.version,
+                "reason": "workflow skills are available from the installed Python distribution",
+            }
 
     return {
         "available": False,
@@ -97,7 +152,14 @@ def resolve_workflow_skill_source() -> dict[str, Any]:
     }
 
 
-def default_workflow_skills_dir(env: Mapping[str, str] | None = None) -> Path:
+def default_workflow_skills_dir(
+    env: Mapping[str, str] | None = None,
+    *,
+    host_surface: str | None = None,
+    agy_home: str | None = None,
+) -> Path:
+    if agy_home or host_surface in {"agy", "antigravity-app"}:
+        return antigravity_config_home(agy_home) / "skills"
     source_env = os.environ if env is None else env
     configured = str(source_env.get("CODEX_HOME") or "").strip()
     codex_root = Path(configured).expanduser() if configured else Path.home() / ".codex"
@@ -114,10 +176,27 @@ def _exclusive_install_lock(skills_dir: Path) -> Iterator[None]:
         yield
 
 
-def _install_one_skill(
-    source: Path, target: Path, recorded_hash: str | None = None
-) -> str:
-    if target.is_dir() and hash_skill_tree(source) == hash_skill_tree(target):
+def _install_one_skill(source: Path, target: Path) -> str:
+    # Wheel/frozen skill data already includes this resource. A source install
+    # materializes the same canonical file, then uses the existing hash/atomic
+    # install path so repeated installs and drift readback include the scorer.
+    if source.name == "loopx-self-repair" and not (source / "scripts/lexical_retrieval.py").is_file():
+        with tempfile.TemporaryDirectory(prefix="loopx-repair-skill-") as staging:
+            bundle = Path(staging) / source.name
+            shutil.copytree(source, bundle)
+            shutil.copy2((Path(__file__).parent / "capabilities" / "context_providers"
+                          / "lexical_retrieval.py"),
+                         bundle / "scripts/lexical_retrieval.py")
+            return _install_one_skill(bundle, target)
+    ignored = (SKILL_VERSION_MARKER_FILENAME,)
+    stale_backups = sorted(target.parent.glob(f".{target.name}.previous.*"))
+    if stale_backups:
+        raise RuntimeError(
+            f"workflow skill backup requires inspection: {stale_backups[0]}"
+        )
+    if target.is_dir() and hash_skill_tree(
+        source, ignored_relative_paths=ignored
+    ) == hash_skill_tree(target, ignored_relative_paths=ignored):
         return "unchanged"
 
     temporary = Path(
@@ -129,7 +208,9 @@ def _install_one_skill(
         if target.exists():
             backup = target.with_name(f".{target.name}.previous.{os.getpid()}")
             if backup.exists():
-                shutil.rmtree(backup)
+                raise RuntimeError(
+                    f"workflow skill backup requires inspection: {backup}"
+                )
             target.replace(backup)
         temporary.replace(target)
     except BaseException:
@@ -139,16 +220,8 @@ def _install_one_skill(
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
-        if backup and backup.exists():
-            # The replaced copy is deleted only if it is still the recorded
-            # install output; local edits are moved to the backup root.
-            retire_skill_dir(
-                backup,
-                skills_dir=target.parent,
-                recorded_hash=recorded_hash,
-                reason="replaced by workflow skill install",
-                name=target.name,
-            )
+    if backup and backup.exists():
+        shutil.rmtree(backup)
     return "updated" if backup else "created"
 
 
@@ -216,16 +289,45 @@ def workflow_skill_install(
     uninstall: bool = False,
     cli_bin: str = "loopx",
     host_surface: str | None = None,
+    agy_home: str | None = None,
 ) -> dict[str, Any]:
-    target_root = (skills_dir or default_workflow_skills_dir()).expanduser().resolve()
+    target_root = (
+        skills_dir
+        or default_workflow_skills_dir(
+            host_surface=host_surface,
+            agy_home=agy_home,
+        )
+    ).expanduser().resolve()
     source = resolve_workflow_skill_source()
     source_root = Path(source["source_root"])
+    frozen_source_revision = (
+        str(source["distribution_version"])
+        if source.get("kind") == "frozen_bundle"
+        and source.get("distribution_version")
+        else None
+    )
     before = inspect_skill_install_readback(
         skills_dir=target_root,
         required_skill_ids=ARK_MANAGED_AGENT_REQUIRED_SKILL_IDS,
         source_root=source_root,
+        expected_source_revision_override=frozen_source_revision,
+        expected_loopx_version_override=__version__,
     )
     if uninstall:
+        ego = reconcile_ego_browser_skill(
+            skills_dir=target_root, execute=execute, uninstall=True,
+        )
+        if not ego.get("ok"):
+            return {
+                "ok": False,
+                "schema_version": WORKFLOW_SKILL_INSTALL_SCHEMA_VERSION,
+                "operation": "uninstall" if execute else "uninstall_preview",
+                "skills_dir": str(target_root),
+                "source": _public_source(source),
+                "before": before,
+                "ego_browser": ego,
+                "reason": ego["reason"],
+            }
         result = (
             _uninstall_managed_skills(target_root)
             if execute
@@ -237,13 +339,14 @@ def workflow_skill_install(
             }
         )
         return {
-            "ok": result["ok"],
+            "ok": bool(result["ok"]) and bool(ego.get("ok")),
             "schema_version": WORKFLOW_SKILL_INSTALL_SCHEMA_VERSION,
             "operation": "uninstall" if execute else "uninstall_preview",
             "skills_dir": str(target_root),
             "source": _public_source(source),
             "before": before,
             "result": result,
+            "ego_browser": ego,
         }
 
     if not source.get("available"):
@@ -263,6 +366,18 @@ def workflow_skill_install(
         cli_bin=cli_bin,
         host_surface=host_surface,
     )
+    ego_preview = reconcile_ego_browser_skill(skills_dir=target_root)
+    if not ego_preview.get("ok"):
+        return {
+            "ok": False,
+            "schema_version": WORKFLOW_SKILL_INSTALL_SCHEMA_VERSION,
+            "operation": "install" if execute else "inspect",
+            "skills_dir": str(target_root),
+            "source": _public_source(source),
+            "before": before,
+            "ego_browser": ego_preview,
+            "reason": ego_preview["reason"],
+        }
 
     if not execute:
         install_command = [
@@ -282,12 +397,17 @@ def workflow_skill_install(
             "source": _public_source(source),
             "before": before,
             "entry": entry_preview,
+            "ego_browser": ego_preview,
             "host_surface": host_surface,
             "install_required": (
                 not before.get("ready")
+                or ego_preview.get("status") == "would_refresh"
                 or entry_preview.get("status") != "unchanged"
+                or entry_preview.get("metadata_status") in {
+                    "would_create", "updated", "upgraded_legacy_managed",
+                }
             ),
-            "install_command": shlex.join(install_command),
+            "install_command": interpreter_invocation(install_command[0], install_command[1:]),
         }
 
     if entry_preview["status"] not in MANAGED_ENTRY_PREVIEW_STATUSES:
@@ -304,12 +424,10 @@ def workflow_skill_install(
 
     installed: dict[str, str] = {}
     with _exclusive_install_lock(target_root):
-        recorded = recorded_skill_hashes(target_root)
         for skill_id in PACKAGED_HOST_SKILL_IDS:
             installed[skill_id] = _install_one_skill(
                 Path(source["skills_root"]) / skill_id,
                 target_root / skill_id,
-                recorded.get(skill_id),
             )
         entry = materialize_loopx_entry_skill(
             skills_dir=target_root,
@@ -332,17 +450,26 @@ def workflow_skill_install(
             skills_dir=target_root,
             skill_ids=ARK_MANAGED_AGENT_REQUIRED_SKILL_IDS,
             source_root=source_root,
+            source_kind_override=(
+                "frozen_bundle" if frozen_source_revision else None
+            ),
+            source_revision_override=frozen_source_revision,
             owner=PYTHON_DISTRIBUTION_SKILL_INSTALL_OWNER,
             integration_mode=PYTHON_DISTRIBUTION_SKILL_INSTALL_MODE,
+            loopx_version=__version__,
         )
 
+    reconciliation = retire_duplicate_managed_skills(target_root, execute=True)
+    ego = reconcile_ego_browser_skill(skills_dir=target_root, execute=True)
     after = inspect_skill_install_readback(
         skills_dir=target_root,
         required_skill_ids=ARK_MANAGED_AGENT_REQUIRED_SKILL_IDS,
         source_root=source_root,
+        expected_source_revision_override=frozen_source_revision,
+        expected_loopx_version_override=__version__,
     )
     return {
-        "ok": bool(after.get("ready")),
+        "ok": bool(after.get("ready")) and bool(ego.get("ok")),
         "schema_version": WORKFLOW_SKILL_INSTALL_SCHEMA_VERSION,
         "operation": "install",
         "skills_dir": str(target_root),
@@ -351,9 +478,11 @@ def workflow_skill_install(
         "installed": installed,
         "entry": entry,
         "after": after,
-        "rollback_command": shlex.join(
+        "skill_reconciliation": reconciliation,
+        "ego_browser": ego,
+        "rollback_command": interpreter_invocation(
+            "loopx",
             [
-                "loopx",
                 "workflow-skills",
                 "--uninstall",
                 "--skills-dir",
@@ -374,6 +503,7 @@ def _public_source(source: Mapping[str, Any]) -> dict[str, Any]:
 
 def render_workflow_skill_install_markdown(payload: Mapping[str, Any]) -> str:
     source = payload.get("source") or {}
+    readback = payload.get("after") or payload.get("before") or {}
     lines = [
         "# LoopX Workflow Skills",
         "",
@@ -382,11 +512,17 @@ def render_workflow_skill_install_markdown(payload: Mapping[str, Any]) -> str:
         f"- skills_dir: `{payload.get('skills_dir')}`",
         f"- source: `{source.get('kind')}`",
         f"- ready_before: `{(payload.get('before') or {}).get('ready')}`",
+        f"- installed_loopx_version: `{readback.get('loopx_version')}`",
+        f"- active_loopx_version: `{readback.get('expected_loopx_version')}`",
+        f"- loopx_version_matches: `{readback.get('loopx_version_matches')}`",
     ]
     if payload.get("install_command"):
         lines.append(f"- install: `{payload['install_command']}`")
     if payload.get("rollback_command"):
         lines.append(f"- rollback: `{payload['rollback_command']}`")
+    ego = payload.get("ego_browser") or {}
+    if ego:
+        lines.append(f"- ego_browser: `{ego.get('status')}` — {ego.get('reason')}")
     result = payload.get("result") or {}
     if result:
         lines.extend(

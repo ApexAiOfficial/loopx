@@ -1,0 +1,268 @@
+import assert from "node:assert/strict";
+import { openWorkspacePage } from "./scenario-context.mjs";
+
+// Compiled UI with synthetic HTTP Session storage; native adoption is separately
+// checked against the production HTTP/store and fake app-server protocol.
+export const agentModelSelectionScenario = {
+  id: "agent-model-selection",
+  async run({ browser, collectCoverage, url }) {
+    let createdCount = 0;
+    const requests = [];
+    const settingsRequests = [];
+    let failSave = false;
+    let discoveryCount = 0;
+    const managerBinding = {
+      schema_version: "manager_channel_binding_v0", executor_endpoint: "codex",
+      executor_endpoint_source: "explicit_config", executor_endpoint_default_reason: "",
+      executor_kind: "individual", model: "declared-manager-model", model_source: "executor_configuration",
+      reasoning_effort: "xhigh", selection_policy: "preferred", allocation_reason: "user_explicit",
+      configured_endpoint: "codex", eligible_endpoints: [], allocation_configuration_revision: "fixture-model-selection",
+      credential_env_var: "", operator_credential_configured: false, available: true, unavailable_reason: null,
+    };
+    const context = await openWorkspacePage(browser, url, {
+      apiOptions: { managerChannelBinding: managerBinding },
+      collectCoverage,
+      beforeGoto: async (_api, page) => {
+        await page.route("**/api/chat/agent-model-options", route => { discoveryCount += 1; return route.fulfill({ json: {
+          ok: true, schema_version: "loopx_chat_agent_model_options_v1", agent_id: "codex", supported: true,
+          model: { id: "engine", label: "Model", selected: "safe", options: [
+            { value: "safe", label: "Safe", reasoning_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+            { value: "vendor/model  fast", label: "Fast", reasoning_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+          ] },
+        } }); });
+        await page.route("**/api/chat/sessions", async route => {
+          if (route.request().method() !== "POST") return route.fallback();
+          const body = route.request().postDataJSON();
+          requests.push(body);
+          const runtime = page.__loopxRuntime;
+          const channel = body.context_kind === "manager" ? "manager" : `goal.${body.goal_id}`;
+          const existing = body.mode === "resume_latest" ? [...runtime.sessions.values()].findLast(session =>
+            session.channel_id === channel && session.agent_id === (body.agent_id ?? "codex")) : null;
+          const session = existing ?? {
+            session_id: `model-session-${++createdCount}`, goal_id: body.goal_id || "loopx-manager", agent_id: body.agent_id ?? "codex",
+            agent_model_id: body.agent_model_id ?? "runtime-default", agent_reasoning_effort: body.agent_reasoning_effort ?? "high", agent_service_tier: "priority", adapter_kind: "codex_app_server", channel_id: channel,
+            requested_agent_model_id: body.agent_model_id ?? null, requested_agent_reasoning_effort: body.agent_reasoning_effort ?? null, model_settings_supported: channel !== "manager",
+            status: "ready", active_turn_id: null, last_error_code: null, resumable: true,
+            created_at: "2026-08-13T01:00:00Z", updated_at: "2026-08-13T01:00:00Z",
+          };
+          runtime.sessions.set(session.session_id, session);
+          runtime.messages.set(session.session_id, runtime.messages.get(session.session_id) ?? []);
+          await route.fulfill({ status: existing ? 200 : 201, json: {
+            ok: true, session_id: session.session_id, session, resumed: Boolean(existing), agent_id: session.agent_id,
+          } });
+        });
+        await page.route("**/api/chat/sessions/*/model-settings", async route => {
+          const body = route.request().postDataJSON();
+          const sid = new URL(route.request().url()).pathname.split("/")[4];
+          settingsRequests.push({sessionId: sid, ...body});
+          if (failSave) return route.fulfill({status: 503, json: {ok: false, error: "Settings storage unavailable"}});
+          const previous = page.__loopxRuntime.sessions.get(sid);
+          const session = {...previous, requested_agent_model_id: body.agent_model_id,
+            requested_agent_reasoning_effort: body.agent_reasoning_effort ?? previous.requested_agent_reasoning_effort ?? previous.agent_reasoning_effort,
+            updated_at: "2026-08-13T01:00:02Z"};
+          page.__loopxRuntime.sessions.set(sid, session);
+          return route.fulfill({json: {ok: true, session}});
+        });
+        await page.route("**/api/chat/sessions/*/turns", async route => {
+          if (route.request().method() === "POST") {
+            const sid = new URL(route.request().url()).pathname.split("/")[4];
+            const session = page.__loopxRuntime.sessions.get(sid);
+            if (session) page.__loopxRuntime.sessions.set(sid, {...session,
+              agent_model_id: session.requested_agent_model_id ?? session.agent_model_id,
+              agent_reasoning_effort: session.requested_agent_reasoning_effort ?? session.agent_reasoning_effort});
+          }
+          return route.fallback();
+        });
+      },
+    });
+    const { page, api } = context;
+    try {
+      const assertReadableHeader = async () => {
+        const layout = await page.locator(".personal-channel-header").evaluate(header => {
+          const title = header.querySelector("h1");
+          const runtime = header.querySelector(".personal-runtime-details > summary");
+          const oneLine = node => {
+            if (!node) return false;
+            const text = document.createRange();
+            text.selectNodeContents(node);
+            return text.getBoundingClientRect().height <= parseFloat(getComputedStyle(node).lineHeight) * 1.1;
+          };
+          return { title: oneLine(title), runtime: oneLine(runtime), fits: document.documentElement.scrollWidth <= innerWidth + 1 };
+        });
+        assert.deepEqual(layout, { title: true, runtime: true, fits: true }, "The manager title and runtime label remain readable beside known or unknown model readback");
+      };
+      const managerControl = page.getByRole("button", {name: "调整管家模型与思考深度", exact: true});
+      await managerControl.filter({hasText: managerBinding.model}).waitFor();
+      assert.equal(await page.locator(".personal-chat-model-menu").count(), 0, "The steward has one machine-owned model entry");
+      await page.setViewportSize({width: 390, height: 844});
+      await assertReadableHeader();
+      assert.equal(discoveryCount, 0, "The steward binding does not start optional catalog discovery");
+      await managerControl.click();
+      const settings = page.getByRole("region", {name: "设置", exact: true});
+      await settings.getByRole("heading", {name: "管家", exact: true}).waitFor();
+      assert.equal(await settings.getByRole("radio", {name: "本机设置", exact: true}).isChecked(), true);
+      assert.equal(await settings.locator(".personal-settings-mobile-category select").inputValue(), "steward",
+        "The phone model entry opens the machine-owned steward category");
+      await page.getByRole("button", {name: "返回工作区", exact: true}).click();
+      await page.reload({waitUntil: "networkidle"});
+      await managerControl.filter({hasText: managerBinding.model}).waitFor();
+      assert.equal(await page.locator(".personal-chat-model-menu").count(), 0, "Refresh retains the machine-owned steward entry");
+      await assertReadableHeader();
+      await page.setViewportSize({width: 1512, height: 982});
+      await assertReadableHeader();
+      await page.locator(".personal-goal-link").first().click();
+      await page.getByRole("navigation", { name: "Goal 视图" }).getByRole("button", { name: /^(Chat|对话)$/ }).click();
+      const menu = page.locator(".personal-chat-model-menu");
+      assert.equal(await page.locator(".personal-channel-header .personal-chat-model-menu").count(), 0,
+        "Sending choices leave the reading header");
+      assert.equal(await page.locator(".personal-channel-composer .personal-chat-model-menu").count(), 1,
+        "The one composer owns the existing model control");
+      const draft = page.getByLabel("向 LoopX 发送消息");
+      await draft.fill("这段草稿要保留。中文 / English draft.");
+      const actionTrigger = page.getByLabel("添加附件与快捷操作", {exact: true});
+      const sendsBeforeMenu = api.turnRequests.length;
+      await actionTrigger.click();
+      await page.getByRole("button", {name: "添加附件", exact: true}).waitFor();
+      const actionPanel = await page.locator(".personal-composer-actions-panel").boundingBox();
+      const inputFrame = await page.locator(".personal-channel-composer").boundingBox();
+      assert.ok(actionPanel && inputFrame && actionPanel.y + actionPanel.height <= inputFrame.y + 1,
+        "Optional actions leave the whole draft and Send visible");
+      await page.keyboard.press("Escape");
+      assert.equal(await draft.inputValue(), "这段草稿要保留。中文 / English draft.");
+      assert.equal(await actionTrigger.evaluate(node => node === document.activeElement), true);
+      assert.equal(api.turnRequests.length, sendsBeforeMenu, "Opening and closing actions never submits the draft");
+      await draft.fill("");
+      const modelControl = page.getByRole("combobox", {name: "选择模型"});
+      const openSettings = async () => {
+        if (!(await menu.evaluate(node => node.open))) {
+          // Opening reloads the catalog and replaces its controls. Wait for that
+          // response before accepting an old visible control or measuring it.
+          const [request] = await Promise.all([
+            page.waitForRequest(request => new URL(request.url()).pathname === "/api/chat/agent-model-options"),
+            menu.locator("summary").click(),
+          ]);
+          const catalog = await request.response();
+          assert.ok(catalog, "Opening model settings receives its current catalog response");
+          await catalog.finished();
+        }
+        await modelControl.waitFor();
+        const frame = await page.locator(".personal-channel-composer").boundingBox();
+        const panel = await page.locator(".personal-chat-model-panel").boundingBox();
+        assert.ok(frame && panel && panel.y + panel.height <= frame.y + 1,
+          "The model menu opens above the complete input, retaining the editable draft and Send");
+      };
+      await menu.locator(".personal-model-current").filter({hasText: "runtime-default"}).waitFor();
+      assert.equal(discoveryCount, 0, "Opening an ordinary conversation does not start optional native catalog discovery");
+      await openSettings();
+      await modelControl.filter({hasText: "runtime-default"}).waitFor();
+      assert.equal(requests.at(-1).agent_model_id, undefined, "catalog order never becomes an implicit model choice");
+      await page.reload({waitUntil: "networkidle"});
+      await menu.locator(".personal-model-current").filter({hasText: "runtime-default"}).waitFor();
+      assert.equal(await menu.evaluate(node => node.open), false, "Optional configuration stays collapsed after refresh");
+      await openSettings();
+      await modelControl.filter({hasText: "runtime-default"}).waitFor();
+      assert.equal(requests.at(-1).agent_model_id, undefined, "reading the current model never pins the default on refresh");
+      const selectModel = async label => {
+        await openSettings();
+        await page.getByRole("combobox", { name: "选择模型" }).click();
+        await page.getByRole("option", { name: label, exact: true }).click();
+      };
+      const send = async message => {
+        const count = api.turnRequests.length;
+        await page.getByLabel("向 LoopX 发送消息").fill(message);
+        await page.getByRole("button", { name: "发送", exact: true }).click();
+        const deadline = Date.now() + 5000;
+        while (api.turnRequests.length === count && Date.now() < deadline) await page.waitForTimeout(25);
+        assert.equal(api.turnRequests.length, count + 1);
+        await page.locator(".personal-message-pending").waitFor({ state: "hidden" });
+        return api.turnRequests.at(-1).sessionId;
+      };
+      await selectModel("Safe");
+      await page.getByRole("combobox", { name: "选择思考深度" }).click();
+      await page.getByRole("option", { name: "low", exact: true }).click();
+      const original = await send("解释模型选择如何保持当前对话。");
+      assert.equal(settingsRequests.at(-1).agent_reasoning_effort, "low", "An explicit effort is saved to the existing Session");
+      assert.match(await menu.locator("summary small").innerText(), /low/, "Current effort comes from Session readback");
+      await menu.locator(".personal-model-current").filter({ hasText: "safe" }).waitFor();
+      const before = createdCount;
+      await selectModel("safe");
+      assert.equal(await send("继续同一个对话。"), original);
+      assert.equal(createdCount, before, "reselecting the current model must not create another Session");
+      await selectModel("Fast");
+      await page.getByRole("combobox", { name: "选择思考深度" }).click();
+      await page.getByRole("option", { name: "high", exact: true }).click();
+      const changed = await send("使用新模型继续分析。");
+      assert.equal(changed, original);
+      assert.equal(createdCount, before, "A model change retains exactly the same Session");
+      assert.equal(page.__loopxRuntime.sessions.get(changed).agent_model_id, "vendor/model  fast");
+      assert.ok(page.__loopxRuntime.sessions.has(original), "prior history remains addressable");
+      assert.equal(settingsRequests.at(-1).agent_model_id, "vendor/model  fast", "an explicit choice uses the exact model identifier");
+      await page.setViewportSize({width: 390, height: 844});
+      await openSettings();
+      const inputBounds = await page.locator(".personal-channel-composer").boundingBox();
+      const sendBounds = await page.getByRole("button", {name: "发送", exact: true}).boundingBox();
+      assert.ok(inputBounds && sendBounds && sendBounds.x >= inputBounds.x && sendBounds.x + sendBounds.width <= inputBounds.x + inputBounds.width,
+        "The send action stays in the input frame on a phone");
+      const panel = await page.locator(".personal-chat-model-panel").boundingBox();
+      assert.ok(panel.x >= 0 && panel.x + panel.width <= 390, "The whole model menu stays inside the phone viewport, including its labels and controls");
+      const width = await modelControl.locator(".personal-select-value").evaluate(node => node.clientWidth);
+      assert.ok(width >= 100, "the exact current model remains readable on a phone");
+      const readback = menu.locator("summary small");
+      assert.match(await readback.innerText(), /high · Fast/);
+      assert.ok((await readback.boundingBox()).height < 30, "speed and reasoning do not wrap into a vertical column");
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
+      await page.keyboard.press("Escape");
+      const longDraft = "中文与 English 的长草稿保留。\n".repeat(6);
+      const checkMenuSpace = async selector => {
+        const bounds = await page.locator(selector).boundingBox();
+        const frame = await page.locator(".personal-channel-composer").boundingBox();
+        assert.ok(bounds && frame && bounds.y >= 8 && bounds.y + bounds.height <= frame.y,
+          "A growing draft leaves the complete menu above the input and inside the visible viewport");
+      };
+      await page.setViewportSize({width: 390, height: 568});
+      await draft.fill(longDraft);
+      await openSettings();
+      const effortControl = page.getByRole("combobox", {name: "选择思考深度"});
+      await effortControl.click();
+      await checkMenuSpace(".personal-chat-model-panel");
+      await page.keyboard.press("End");
+      const lastChoice = page.getByRole("option", {name: "ultra", exact: true});
+      await lastChoice.waitFor();
+      assert.ok(await lastChoice.evaluate(node => {
+        const bounds = node.getBoundingClientRect();
+        return bounds.top >= 0 && bounds.bottom <= innerHeight;
+      }), "Keyboard scrolling keeps the last native effort choice reachable");
+      await page.keyboard.press("Escape");
+      assert.equal(await effortControl.evaluate(node => node === document.activeElement), true);
+      assert.equal(await menu.evaluate(node => node.open), true, "Escape first closes the nested choices");
+      await page.setViewportSize({width: 390, height: 480});
+      await checkMenuSpace(".personal-chat-model-panel");
+      await page.keyboard.press("Escape");
+      await actionTrigger.click();
+      await checkMenuSpace(".personal-composer-actions-panel");
+      await page.keyboard.press("Escape");
+      assert.equal(await draft.inputValue(), longDraft, "Menu resize and dismissal retain the complete draft");
+      await page.setViewportSize({width: 390, height: 844});
+      await draft.fill("保存失败也不能丢掉草稿。");
+      await openSettings();
+      failSave = true;
+      await page.getByRole("combobox", {name: "选择思考深度"}).click();
+      await page.getByRole("option", {name: "low", exact: true}).click();
+      await page.getByRole("button", {name: "重试保存", exact: true}).waitFor();
+      assert.equal(await draft.inputValue(), "保存失败也不能丢掉草稿。");
+      assert.equal(page.__loopxRuntime.sessions.get(original).requested_agent_reasoning_effort, "high");
+      failSave = false;
+      const retried = page.waitForResponse(response => response.url().endsWith("/model-settings") && response.status() === 200);
+      await page.getByRole("button", {name: "重试保存", exact: true}).click();
+      await retried;
+      assert.equal(page.__loopxRuntime.sessions.get(original).requested_agent_reasoning_effort, "low");
+      assert.equal(createdCount, before);
+      await page.reload({waitUntil: "networkidle"});
+      await menu.locator("summary small").filter({hasText: "low"}).waitFor();
+      assert.equal(createdCount, before, "Reopening retains the same Session and its saved subsequent choice");
+      return { coverageEntries: context.coverageEntries, note: "Current-Session model/depth changes, failure retry and refresh preserve identity and draft through the compiled UI and synthetic HTTP store; native protocol adoption is qualified separately." };
+    } finally {
+      await context.close();
+    }
+  },
+};

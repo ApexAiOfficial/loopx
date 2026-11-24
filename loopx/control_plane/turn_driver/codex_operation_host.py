@@ -1,0 +1,282 @@
+"""Owned app-server transport for an opt-in, already-admitted Codex Turn.
+
+No new approval, scheduler or execution store. Python owns the subprocess and
+native tool IO; TS owns executor binding, consumption and outcome semantics.
+An attached Desktop conversation is never resumed or impersonated here.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import time
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from ...chat_agent import CodexChatAgentError, CodexChatAgentSession
+from ...extensions.codex_native_child import native_child_observer
+from ..goals.first_party_host_admission import (
+    FirstPartyHostGoalAdmission,
+    FirstPartyHostRuntimeRejected,
+)
+from . import managed_operation_host as operations
+from .codex_cli import (
+    _checked_prompt_context,
+    collaboration_mcp_turn_environment,
+    normalize_codex_stdio_mcp_server,
+    prepare_codex_cli_input,
+    normalize_codex_result,
+)
+from .codex_sessions import _lineage, select_managed_operation_session
+from .host_candidate import assert_turn_host_request_version
+from .host_failure import BuiltInHostError
+from .operation_requests import (
+    operation_request_source, request_reference_instruction,
+)
+
+TRANSPORT = "app-server-operation-tools-v0"
+_RUNNING_GOAL_CHECK_SECONDS = 1.0
+
+
+def run_codex_operation_host(
+    request: Mapping[str, Any],
+    *,
+    runtime_root: Path,
+    registry_path: Path,
+    project: Path,
+    codex_bin: str = "codex",
+    sandbox: str = "read-only",
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    source_route: Mapping[str, str] | None = None,
+    mcp_server: Mapping[str, Any] | None = None,
+    timeout_seconds: float | None = None,
+    goal_admission: FirstPartyHostGoalAdmission | None = None,
+    confirmed_operation_id: str | None = None,
+    operation_request_file: Path | None = None,
+    operation_request_sha256: str | None = None,
+) -> dict[str, Any]:
+    assert_turn_host_request_version(request)
+    if sandbox not in {"read-only", "workspace-write"}:
+        raise ValueError("operation tools require a restricted Codex execution sandbox")
+    if not model or not reasoning_effort:
+        raise ValueError(
+            "managed operation tools require an explicit model and reasoning effort"
+        )
+    # Complete work/Goal preparation must precede process or session effects.
+    # Keep the later prompt preparation as a fresh check after native startup.
+    checked = (_checked_prompt_context(request, include_session_lineage=True)
+               if "work_contract" in request else None)
+    lineage = _lineage(request, checked_lineage=checked["session_lineage"] if checked is not None else None)
+    if not all(lineage.values()):
+        raise ValueError("managed operation tools require a Todo-bound Turn")
+    mcp_server = normalize_codex_stdio_mcp_server(mcp_server)
+    from .codex_worker_identity import load_worker_identity
+
+    worker = load_worker_identity(runtime_root, registry_path)
+    if worker is not None and (sandbox != "read-only" or mcp_server is not None):
+        raise ValueError("isolated managed Codex requires read-only operation tools without a Core-provided MCP server")
+    request_source = operation_request_source(operation_request_file, operation_request_sha256)
+    resolved_bin = shutil.which(codex_bin)
+    if not resolved_bin:
+        raise ValueError("Codex executable is unavailable")
+    with Path(resolved_bin).open("rb") as stream:
+        binary_digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    profile = {
+        "transport": TRANSPORT,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "sandbox": sandbox,
+        "workspace": str(project.resolve()),
+        "codex_home": str(worker.codex_home) if worker is not None else str(
+            Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser().resolve()
+        ),
+        "codex_binary_digest": binary_digest,
+        "mcp_server": mcp_server,
+    }
+    if worker is not None:
+        profile["worker_identity"] = {"uid": worker.uid, "gid": worker.gid}
+    if request_source is not None:
+        profile["operation_request"] = request_source.profile(source_route)
+    admission = goal_admission or FirstPartyHostGoalAdmission.for_plan(
+        registry_path=registry_path,
+        goal_id=lineage["goal_id"], planned_goal_ref=request.get("goal_ref"), agent_id=lineage["agent_id"],
+    )
+    if worker is not None and (admission.legacy_source_admission is not None or admission.registry_path != registry_path):
+        raise ValueError("isolated managed Codex requires the owning project registry")
+    profile_digest = hashlib.sha256(
+        json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    selection = select_managed_operation_session(
+        runtime_root, request=request, lineage=lineage, host="codex-cli",
+        transport=TRANSPORT, profile_digest=profile_digest, model=model,
+        reasoning_effort=reasoning_effort, goal_admission=goal_admission,
+    )
+    binding = selection.binding
+    operations.require_confirmed_operation_resume(
+        runtime_root=runtime_root, registry_path=registry_path, request=request,
+        lineage=lineage, binding=binding, host="codex-cli", profile_digest=profile_digest,
+        model=model, reasoning_effort=reasoning_effort,
+        confirmed_operation_id=confirmed_operation_id,
+    )
+    mcp_turn_environment = collaboration_mcp_turn_environment(
+        mcp_server, turn_key=request["turn_key"], lineage=lineage, project=project,
+    )
+    host_config = (
+        {
+            "mcp_servers": {
+                mcp_server["name"]: {
+                    "command": mcp_server["command"][0],
+                    "args": mcp_server["command"][1:],
+                    **({"env": mcp_turn_environment} if mcp_turn_environment else {}),
+                    "enabled": True,
+                    "required": True,
+                    "default_tools_approval_mode": "approve",
+                    "startup_timeout_sec": 30,
+                    "tool_timeout_sec": 60,
+                }
+            }
+        }
+        if mcp_server
+        else None
+    )
+    session = None
+    native_turn_id = ""
+    try:
+        session = CodexChatAgentSession.start(
+            codex_bin=codex_bin,
+            work_dir=project,
+            goal_id=lineage["goal_id"],
+            objective="One admitted LoopX Turn",
+            execution_mode=True,
+            isolate_process_tree=True,
+            sandbox=sandbox,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            resume_thread_id=binding["session_id"] if binding else None,
+            dynamic_tools=[operations.OPERATION_TOOL],
+            host_config=host_config,
+            **({"worker_identity": worker} if worker is not None else {}),
+            launch_guard=lambda: admission.launch_lifetime(operation="codex_operation_process_launch"),
+            response_timeout_sec=30 if timeout_seconds is None else min(timeout_seconds, 30),
+            hard_timeout_sec=timeout_seconds,
+            idle_timeout_sec=180 if timeout_seconds is None else min(timeout_seconds, 180),
+        )
+
+        selection.store(session.thread_id)
+        session.bound_tool_handler = operations.operation_tool_handler(
+            runtime_root=runtime_root,
+            registry_path=registry_path,
+            lineage=lineage,
+            session_id=session.thread_id,
+            profile_digest=profile_digest,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            source_route=source_route,
+            goal_admission=goal_admission,
+            frozen_request=(request_source.bind(request, lineage=lineage,
+                session_id=session.thread_id, profile_digest=profile_digest)
+                if request_source is not None else None),
+        )
+        route = operations.operation_executor_route(
+            lineage, host="codex-cli", session_id=session.thread_id, profile_digest=profile_digest,
+        )
+        continuations = (
+            operations.operation_continuations(
+                runtime_root=runtime_root, registry_path=registry_path, lineage=lineage,
+                route=route, goal_ref=request.get("goal_ref"),
+            ) if (runtime_root / "chat" / "actions" / "actions.json").is_file() else []
+        )
+
+        def on_event(kind: str, event: dict[str, Any]) -> None:
+            nonlocal native_turn_id
+            if kind != "turn.started":
+                return
+            # Only the authenticated native turn/start response reaches here.
+            started_turn = event.get("upstream_turn_id")
+            if isinstance(started_turn, str):
+                native_turn_id = started_turn
+            try:
+                operations.record_operation_start(
+                    runtime_root=runtime_root, registry_path=registry_path,
+                    continuations=continuations, route=route, model=model,
+                    reasoning_effort=reasoning_effort,
+                    host_turn_id=started_turn, turn_key=request["turn_key"],
+                )
+            except (ValueError, KeyError, TypeError, RuntimeError) as exc:
+                raise BuiltInHostError(
+                    "codex_operation_host_start_unrecorded", failure_kind="unknown",
+                    recovery_kind="resume_session",
+                ) from exc
+
+        child_observer = native_child_observer(request, runtime_root=runtime_root, lineage=lineage,
+            registry_path=goal_admission.registry_path if goal_admission is not None else None)
+
+        def observe_child(item: Mapping[str, Any]) -> None:
+            if child_observer is None:
+                return
+            def record_child() -> None:
+                child_observer.observe(item, session_id=session.thread_id,
+                                       invocation_id=session.current_turn_id)
+
+            if goal_admission is None:
+                record_child()
+            else:
+                goal_admission.accept_result(record_child)
+
+        next_goal_check = 0.0
+
+        def check_running(*, final: bool = False) -> None:
+            nonlocal next_goal_check
+            now = time.monotonic()
+            if not final and now < next_goal_check:
+                return
+            admission.require_running(operation="codex_operation_turn_continue")
+            next_goal_check = time.monotonic() + _RUNNING_GOAL_CHECK_SECONDS
+
+        input_text, result_schema = prepare_codex_cli_input(request)
+        result = session.send(
+            input_text
+            + "\nUse loopx_operation for context/pending/prepare/inspect/consume/report. "
+            "Source conversations are not executor identity. context/pending/inspect do not require consumption. "
+            "When the admitted task authorizes proposal preparation and supplies its terms, prepare may run before human confirmation or consume; "
+            "prepare writes a canonical proposal, not a domain/external effect. execution_allowed=false is expected for prepare, not a reason to refuse it. "
+            "Use pending/inspect to reconcile an existing proposal before preparing another; do not invent missing terms or repeat an already granted preparation approval. "
+            "Only domain/external effects require the first successful consume receipt with execution_allowed=true. "
+            "Preparation or waiting for human confirmation is not task completion. Report outcomes only with original execution evidence. "
+            "Already consumed/unknown effects require evidence reconciliation, never retry. Never treat final-answer prose as an outcome receipt."
+            + request_reference_instruction(request_source is not None)
+            + ("\nCanonical confirmed operation continuations for this exact binding: "
+               + json.dumps(continuations, sort_keys=True)
+               + ". Inspect these locators through loopx_operation and consume once before any effect."
+               if continuations else ""),
+            output_schema=result_schema,
+            on_event=on_event,
+            turn_start_guard=lambda: admission.launch_lifetime(operation="codex_operation_turn_start"),
+            on_native_item=observe_child if child_observer is not None else None,
+            check_running=check_running,
+        )
+        check_running(final=True)
+        return normalize_codex_result(request, result)
+    except FirstPartyHostRuntimeRejected:
+        if session is not None and native_turn_id:
+            try:
+                session.interrupt(native_turn_id)
+            except CodexChatAgentError as exc:
+                raise BuiltInHostError("codex_operation_host_stop_unconfirmed") from exc
+        raise
+    except CodexChatAgentError as exc:
+        raise BuiltInHostError(
+            "codex_operation_host_" + exc.error_code,
+            failure_kind="executor_timeout"
+            if "timeout" in exc.error_code
+            else "unknown",
+            recovery_kind="resume_session" if session else None,
+        ) from exc
+    finally:
+        if session is not None:
+            session.bound_tool_handler = None
+            session.close()

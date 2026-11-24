@@ -7,11 +7,13 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 from loopx.capabilities.issue_fix.github_public import (  # noqa: E402
     GITHUB_PUBLIC_CHANNEL_PROBE_PACKET_SCHEMA_VERSION,
     GITHUB_PUBLIC_REPLY_MONITOR_PACKET_SCHEMA_VERSION,
+    github_public_read_failure_row,
 )
 from loopx.capabilities.value_connectors.install_check import (  # noqa: E402
     VALUE_CONNECTOR_INSTALL_CHECK_PACKET_SCHEMA_VERSION,
@@ -33,6 +36,7 @@ from loopx.capabilities.value_connectors.planner import (  # noqa: E402
 from loopx.capabilities.value_connectors.source_map import (  # noqa: E402
     VALUE_CONNECTOR_SOURCE_MAP_PACKET_SCHEMA_VERSION,
 )
+from tests.control_plane.host_process_fixture import write_python_host_fixture  # noqa: E402
 
 
 PRIVATE_PATTERNS = [
@@ -293,13 +297,16 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         fake_bin = Path(tmpdir)
-        gh = fake_bin / "gh"
-        gh.write_text(
+        marker = fake_bin / "fixture-called"
+        gh = write_python_host_fixture(
+            fake_bin / "gh",
             "\n".join(
                 [
                     "#!/usr/bin/env python3",
                     "import json",
                     "import sys",
+                    "from pathlib import Path",
+                    f"Path({str(marker)!r}).write_text('called', encoding='utf-8')",
                     "argv = sys.argv[1:]",
                     "assert argv[:2] == ['api', '-H'], argv",
                     "assert 'repos/huangruiteng/loopx/issues/670/comments?per_page=100' in argv, argv",
@@ -316,10 +323,11 @@ def main() -> int:
                     "sys.stdout.write('\\n')",
                 ]
             ),
-            encoding="utf-8",
         )
-        gh.chmod(0o755)
-        live_env = {**os.environ, "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+        live_env = {**os.environ, "PATH": os.pathsep.join((str(fake_bin), os.environ.get("PATH", "")))}
+        assert Path(shutil.which("gh", path=live_env["PATH"]) or "").resolve() == gh.resolve(), (
+            "the smoke must resolve its fixture, never an installed GitHub CLI"
+        )
         live_reply_monitor = json.loads(
             run_cli(
                 [
@@ -336,6 +344,7 @@ def main() -> int:
                 env=live_env,
             ).stdout
         )
+        assert marker.read_text(encoding="utf-8") == "called"
     assert live_reply_monitor["ok"] is True, live_reply_monitor
     assert live_reply_monitor["external_reads_performed"] is True, live_reply_monitor
     assert live_reply_monitor["external_writes_performed"] is False, live_reply_monitor
@@ -592,6 +601,30 @@ def main() -> int:
     assert "LoopX GitHub Public Reply Monitor" in reply_markdown, reply_markdown
     assert "recommended_action: `wait_no_bump`" in reply_markdown, reply_markdown
     assert_public_safe(reply_markdown)
+
+    # A failed public read must surface as a typed row instead of the provider's
+    # own text: steward answers used to quote "Cache miss" and
+    # "invalid_arguments" instead of naming what was unread and how to repair
+    # it. The provider message is replaced by its digest.
+    failure = github_public_read_failure_row(RuntimeError("gh request failed: Cache miss"))
+    assert failure["code"] == "provider_tool_unavailable", failure
+    assert failure["source_id"] == "github_public_channel", failure
+    assert "unread" in failure["coverage_effect"], failure
+    assert failure["next_action"], failure
+    assert failure["provider_message_digest"].startswith("sha256:"), failure
+    assert "Cache miss" not in json.dumps(failure), failure
+    assert_public_safe(failure)
+    assert github_public_read_failure_row(subprocess.TimeoutExpired("gh", 5))[
+        "code"
+    ] == "provider_timeout"
+    assert github_public_read_failure_row(
+        URLError("nodename nor servname provided")
+    )["code"] == "provider_network_unavailable"
+    http_failure = github_public_read_failure_row(
+        HTTPError("https://api.github.com/repos/o/r/issues/1", 403, "Forbidden", None, None)
+    )
+    assert http_failure["code"] == "provider_response_rejected", http_failure
+    assert http_failure["provider_status"] == 403, http_failure
 
     print("value-connectors-github-public-probe-smoke: ok")
     return 0

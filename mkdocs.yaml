@@ -1,6 +1,7 @@
 site_name: LoopX
-site_url: https://huangruiteng.github.io/loopx/docs/
-repo_url: https://github.com/huangruiteng/loopx
+site_description: Documentation for the LoopX stateful control plane for long-running AI agents, including installation, runtime integrations, goals, tasks, approval gates and recovery.
+site_url: https://loopx-project.github.io/loopx/docs/
+repo_url: https://github.com/loopx-project/loopx
 edit_uri: edit/main/docs/
 docs_dir: docs
 site_dir: output/docs-site
@@ -69,7 +70,11 @@ markdown_extensions:
   - md_in_html
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.highlight:
@@ -91,18 +96,23 @@ nav:
       - Installation: guides/installing-loopx.md
       - Personal Workspace Guide: guides/personal-workspace-user-guide.md
       - Newcomer Command Path: guides/newcomer-command-path.md
+      - Long-Running Coding Agents: guides/long-running-coding-agents.md
       - Minimal Custom Runtime Example: guides/minimal-custom-runtime-example.md
       - Custom Runner Integration: guides/custom-agent-runner-integration.md
   - Concepts:
       - concepts/README.md
       - Interaction Patterns: concepts/interaction-pattern-catalog.md
+      - Architecture: architecture.md
       - State Interaction Model: state-interaction-model.md
       - Quota Allocation: quota-allocation.md
+      - Project Agent Todo Contract: project-agent-todo-contract.md
   - Operations:
       - operations/README.md
       - Attention Queue: operations/attention-queue.md
       - Long Task Cadence: operations/long-task-cadence-policy.md
       - Authority Sources: operations/authority-source-registration.md
+      - Status Data Contract: status-data-contract.md
+      - Heartbeat Automation Prompt: heartbeat-automation-prompt.md
   - Capabilities:
       - capabilities/README.md
       - Benchmark Toolkit: capabilities/benchmark-toolkit/README.md
@@ -112,7 +122,6 @@ nav:
       - Integration Branch: capabilities/integration-branch/README.md
       - Project Skill Delivery: capabilities/project-skill-delivery/README.md
       - Explore: capabilities/explore/README.md
-      - Auto Research: capabilities/auto-research/README.md
       - Decision Context: capabilities/decision-context/README.md
       - Agent Turn Recall: capabilities/agent-turn-recall/README.md
       - Semantic Preference: capabilities/semantic-preference/README.md
@@ -121,8 +130,10 @@ nav:
       - Periodic Report: capabilities/periodic-report/README.md
       - Content Operations: capabilities/content-ops/README.md
       - Value Connectors: capabilities/value-connectors/README.md
+      - Reliability Diagnostics: capabilities/reliability-diagnostics/README.md
   - Integrations:
       - integrations/README.md
+      - Integration Guide: integration.md
       - Worker Bridge: integrations/worker-bridge-install-contract.md
       - Lark Kanban: integrations/lark-kanban-control-plane-adapter.md
       - Botmux Goal Channel Runtime: integrations/botmux-goal-channel-runtime.md
@@ -139,10 +150,12 @@ nav:
       - Technical Directions: project/technical-directions.md
       - Testing And Quality: development/testing-and-quality.md
       - Documentation Layout: development/documentation-layout.md
+      - Public/Private Boundary: public-private-boundary.md
       - Control Plane Course: development/control-plane-course/README.md
   - Product:
       - product/README.md
       - Vision: product/vision.md
+      - Steward Monitoring: product/periodic-reports.md
       - Release Readiness: product/release-readiness.md
       - Surfaces: product/surfaces/README.md
       - Runtimes: product/runtimes/README.md

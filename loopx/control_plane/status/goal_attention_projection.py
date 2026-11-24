@@ -24,7 +24,10 @@ from ..runtime.status_classifications import (
 )
 from ..work_items.attention_item import attention_item as _attention_item
 from ..work_items.attention_routing import goal_attention as _goal_attention
-from ..work_items.project_asset import build_project_asset
+from .adapter_status_vocabulary import (
+    CONNECTED_ADAPTER_STATUSES,
+    CONNECTED_DELIVERY_ADAPTER_STATUSES,
+)
 from .dreaming_projection import (
     compact_dreaming_lane_badge,
     dreaming_attention_fields,
@@ -34,21 +37,16 @@ from .lifecycle_projection import (
     operator_gate_attention_fields,
     readiness_attention_fields,
 )
+from .monitor_display_projection import (
+    MONITOR_SIGNAL_WAITING_ON,
+    build_project_asset,
+)
 from .run_projection import latest_run
 
 
-MONITOR_SIGNAL_WAITING_ON = "monitor_signal"
 PLANNED_CONTROLLER_OPT_IN_RECOMMENDED_ACTION = (
     "先在 LoopX 完成 operator 判断；同意后项目 Agent 只执行 read-only map dry-run"
 )
-CONNECTED_ADAPTER_STATUSES = {
-    "connected",
-    "connected-read-only",
-    "pre-tick-runnable",
-}
-CONNECTED_DELIVERY_ADAPTER_STATUSES = {
-    "connected-delivery",
-}
 REGISTRY_WAITING_ON_OVERRIDES = {
     "user_or_controller",
     "controller",

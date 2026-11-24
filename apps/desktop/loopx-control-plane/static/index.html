@@ -2,9 +2,46 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <title>LoopX Desktop</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LoopX</title>
+    <link rel="stylesheet" href="boot.css" />
   </head>
   <body>
-    <p>LoopX desktop shell loads the local Chat workspace at /chat/.</p>
+    <main aria-busy="true" aria-live="polite" data-state="loading" role="status">
+      <section class="startup-stage" aria-labelledby="startup-title">
+        <header>
+          <span aria-hidden="true" class="mark">L</span>
+          <h1 id="startup-title">LoopX</h1>
+        </header>
+        <p class="status-line">
+          <span id="status">正在打开 LoopX</span>
+          <span aria-hidden="true" class="status-dots"><i></i><i></i><i></i></span>
+        </p>
+        <div aria-hidden="true" class="progress"></div>
+        <p id="boot-elapsed" class="boot-note" aria-live="off">正在读取启动进度…</p>
+        <p id="boot-detail" class="boot-note">正在准备最新可用版本。</p>
+
+      </section>
+      <details class="recovery">
+        <summary>恢复与更新 / Recovery & updates</summary>
+        <p>重新连接不会执行任务。更新 App 与匹配的运行时可能短暂重启服务。</p>
+        <button id="retry" type="button">立即重试 / Retry now</button>
+        <label>更新通道 <select id="channel"><option value="stable">稳定版 / Stable</option><option value="main">main 开发版</option></select></label>
+        <button id="update" type="button">检查更新 / Check for updates</button>
+        <p id="update-status" role="status"></p>
+        <button id="repair" type="button">修复当前版本 / Repair this version</button>
+        <button id="forget-selection" type="button">清除记住的运行时选择 / Forget runtime choice</button>
+        <button id="rollback" type="button" hidden>恢复上版并准备重启 / Restore previous version</button>
+        <details>
+          <summary>诊断信息 / Diagnostics</summary>
+          <p>复制以下诊断用于问题反馈；不包含消息、环境变量或本机路径。</p>
+          <textarea id="diagnostics" readonly rows="9" aria-label="诊断信息 / Diagnostics"></textarea>
+          <button id="copy-diagnostics" type="button">复制诊断 / Copy diagnostics</button>
+          <p id="copy-status" role="status"></p>
+        </details>
+        <p><code>loopx doctor</code> 只检查终端选中的运行时，不能证明它与 App 匹配。不要删除 Goal 数据。</p>
+      </details>
+    </main>
+    <script src="boot.js"></script>
   </body>
 </html>

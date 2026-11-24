@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import re
-from typing import Any
 
 from ..todos.contract import normalize_todo_claimed_by, normalize_todo_id
-from ..todos.projection import (
+from ..todos.todo_semantics import (
     todo_summary_claim_scope_agent_id,
     todo_summary_has_only_future_scoped_monitor_work,
     todo_summary_monitor_due_count,
@@ -112,7 +113,8 @@ def scoped_monitor_watch_without_advancement(summary: dict[str, Any] | None) -> 
         return False
     if not todo_summary_monitor_items(summary):
         return False
-    return todo_summary_open_task_counts(summary).get("advancement", 0) <= 0
+    counts = todo_summary_open_task_counts(summary)
+    return counts["complete"] is True and counts["advancement"] == 0
 
 
 def _monitor_item_matches_handle(
@@ -176,7 +178,7 @@ def _external_evidence_observation_is_early_future_monitor(
     if not isinstance(observation, dict):
         return False
     handle = (
-        observation.get("monitor_handle")
+        cast(dict[str, Any], observation.get("monitor_handle"))
         if isinstance(observation.get("monitor_handle"), dict)
         else {}
     )
@@ -214,7 +216,7 @@ def build_external_evidence_poll_signal(
             scoped_monitor_handle,
         )
     )
-    project_asset = item.get("project_asset") if isinstance(item.get("project_asset"), dict) else {}
+    project_asset = cast(dict[str, Any], item.get("project_asset")) if isinstance(item.get("project_asset"), dict) else {}
     action_texts = [
         str(value or "").strip()
         for value in (
@@ -306,7 +308,7 @@ def build_external_evidence_poll_signal(
         (text for text in action_texts if text),
         None,
     ) or next((text for text in todo_texts if text), "")
-    signal = {
+    signal: dict[str, Any] = {
         "source": "active_state_or_latest_run",
         "trigger": "implicit_launched_external_poll",
         "observation_target": observation_target,
@@ -362,7 +364,7 @@ def build_external_evidence_observation_obligation(
                     if isinstance(item_value, dict) and str(item_value.get("text") or "").strip():
                         next_todo = str(item_value.get("text") or "").strip()
                         break
-    project_asset = item.get("project_asset") if isinstance(item.get("project_asset"), dict) else {}
+    project_asset = cast(dict[str, Any], item.get("project_asset")) if isinstance(item.get("project_asset"), dict) else {}
     observation_target = next_todo or str(
         project_asset.get("next_action") or item.get("recommended_action") or ""
     ).strip()
@@ -375,7 +377,7 @@ def build_external_evidence_observation_obligation(
         "kind": "external_evidence_monitor" if explicit_wait else "launched_external_work_monitor",
         "trigger": "registry_waiting_on_external_evidence"
         if explicit_wait
-        else poll_signal.get("trigger"),
+        else cast(dict[str, Any], poll_signal).get("trigger"),
         "signal_source": poll_signal.get("source") if poll_signal else "registry",
         "scope": "read_only_observation",
         "must_attempt_observation": True,

@@ -43,6 +43,40 @@ The core repository intentionally avoids domain logic. A data experiment goal,
 a note-maintenance goal, and a harness self-improvement goal should share the
 same runtime and contract, but use different adapters.
 
+## Source content, knowledge and accepted constraints
+
+Repository knowledge and retrieved memory may evolve. A source path, familiar
+filename or `bootstrap --goal-doc` declaration does not make its contents an
+immutable contract, enable architecture scanning, or authorize new obligations.
+Memory providers own retrieval and revision/freshness; existing acceptance and
+authority owners decide which constraints apply. Repository memory and semantic
+preference adapters remain advisory under their existing application contracts.
+
+For an explicitly pinned local source, the existing private Goal registry may
+include `sha256` beside `path` in `authority_sources`. This is the SHA-256 of the
+accepted **file bytes**, distinct from a redacted source-reference hash or the
+registry witness. `loopx check` and the status health collector verify only such
+pins, using the existing Goal diagnostic scope. Changed, missing or unreadable
+content is reported without changing documents, registry locks or memory.
+Unpinned sources retain their previous behavior. Bootstrap never generates a
+pin or discovers authority from specification filenames.
+
+To recover, restore the accepted file bytes, or separately review the source
+change and update its explicit private registry pin under the existing registry
+write authority. Rerun `loopx check` and read back Goal health. Current document
+text, an Agent note or recalled memory cannot approve that update. This bounded
+integrity adapter does not parse source policy, infer approval, freeze knowledge,
+or introduce another memory provider or a new approval workflow.
+
+中文：仓库知识与召回记忆可以持续更新。文件名、来源路径或 `--goal-doc` 声明不会
+自动把正文升级为不可变合同，也不启用架构扫描。检索与新鲜度由既有 memory provider
+负责；哪些约束生效仍归既有验收和权限 owner。只有在私有 Goal registry 的
+`authority_sources` 中显式为 `path` 设置文件字节 `sha256` 时，check/status 才校验该
+固定版本；它与来源引用的脱敏哈希、registry witness 不同。普通来源行为不变，
+bootstrap 不自动加锁或发现权限。校验不修改文件、记忆或摘要。恢复时还原已接受的
+字节，或在既有写入权限下单独评审来源变更并更新 pin，再回读健康状态；当前正文、
+Agent 声明和记忆不能自行批准换锁。此边界不新增 memory provider、源码政策或审批流。
+
 ## Control Plane As Effect Interpreter
 
 The six layers are not only storage surfaces. Together they interpret one
@@ -67,30 +101,56 @@ and
 The public framing comes from 齐梦星空,
 [主线一：Agent Loop 是 effectful program(1)](https://www.xiaohongshu.com/discovery/item/6a01d501000000003700c5de?source=webshare&xhsshare=pc_web&xsec_token=ABqpNuladcxhev099wLKw8M3ilhKBua0BQXNpxnBZEGkc=&xsec_source=pc_share).
 
+## Guided Autonomy, Not Recommendation Lock-In
+
+LoopX separates **hard boundaries** from **steering guidance**. Claims, scope,
+capability readiness, gates, quota, public/private policy, and destructive or
+production-effect rules define what an agent may do. Priorities,
+recommendations, bounded suggestions, and `next_cli_actions` help the agent
+choose efficiently inside that legal set; they do not silently shrink it.
+
+Projections therefore optimize for readability without pretending to be
+exhaustive. An agent may choose a currently authoritative eligible action that was
+not displayed among the first suggestions; a typed discovery route should expose
+the authoritative queue when the bounded view is insufficient. The agent must
+bring that choice back
+through the same typed preflight, receipt binding, validation, writeback, and
+spend path. This preserves process guidance and auditability while keeping the
+agent autonomous where no real boundary requires a single route.
+
+A field that is advisory must say so in its schema. If a controller intends a
+whitelist, exclusive lease, owner gate, or other machine-enforced restriction,
+that restriction belongs in a typed authority or transition contract rather
+than being inferred from list position or prompt wording.
+
 ## Turn Decision Vocabulary
 
 Operator-facing docs and heartbeat prompts often summarize a turn as deliver,
 wait, ask, replan, repair, or stay quiet. That shorthand describes interaction
 intent; it is not the typed packet vocabulary carried by the Turn contracts.
 
-Typed Turn decisions use two enums in `loopx/control_plane/turn_driver/`:
+The executable vocabulary lives with its owning contracts:
 
-| Contract | When | Members |
+| Contract | When | Authoritative definition |
 | --- | --- | --- |
-| `LoopXTurnRoute` | Before host execution | `ready_for_host`, `repair_required`, `replan_required`, `user_action_required`, `wait`, `blocked`, `contract_error` |
-| `LoopXTurnResultKind` | After host execution | `validated_progress`, `validated_completion`, `repair_required`, `replan_required`, `user_action_required`, `wait`, `host_failure`, `validation_failed`, `writeback_failed`, `quota_spend_failed` |
+| `LoopXTurnRoute` | Before host execution | [`driver.py`](../loopx/control_plane/turn_driver/driver.py), enum `LoopXTurnRoute` |
+| `TurnResultKind` | After host execution | [`settlement.ts`](../loopx/control_plane/turn_driver/settlement.ts), `TURN_RESULT_KINDS`; Python adapter: [`transaction.py`](../loopx/control_plane/turn_driver/transaction.py), enum `LoopXTurnResultKind` |
 
-Important distinctions the shorthand erases:
+Read the complete member lists in those definitions; this page explains their
+meaning without maintaining another exhaustive enumeration.
 
-- prose "deliver" splits into `validated_progress` versus `validated_completion`;
-- failure kinds (`host_failure`, `validation_failed`, `writeback_failed`,
-  `quota_spend_failed`) are first-class post-execution results;
-- "stay quiet" is a notification / monitor behavior (for example
+- Prose "deliver" splits into `validated_progress` versus `validated_completion`.
+- Execution failures are first-class typed results. In particular,
+  `terminal_closeout_failed` means terminal closeout failed after durable
+  writeback and quota spend. Recovery retries the same Turn's closeout without
+  repeating those committed effects; it must not treat the failure as unspent.
+  The [Turn executor recovery tests](../tests/test_loopx_turn_executor.py)
+  exercise this boundary.
+- "Stay quiet" is notification / monitor behavior (for example
   `monitor_quiet_skip` or heartbeat `DONT_NOTIFY`), not a member of either enum.
 
 Quota `interaction_contract` and heartbeat guidance may still use the operator
-shorthand. When implementing or reviewing Turn adapters, prefer the enums above
-over the six-verb prose list.
+shorthand. Turn adapters use the executable definitions linked above.
 
 ## Runtime Responsibility Model
 
@@ -146,26 +206,38 @@ claim, gate, monitor, quota, writeback, recovery, and terminal closure. See the
 
 ## Current Dependency Budget
 
-Dependency direction is enforced incrementally while large compatibility
-facades are split. `loopx.control_plane` may not gain dependencies on
-presentation, CLI, capability, or benchmark-adapter layers; the architecture
-test keeps one explicit quota-Markdown migration edge as debt.
+The executable boundary policy lives in
+[`test_control_plane_import_boundaries.py`](../tests/architecture/test_control_plane_import_boundaries.py):
 
-The legacy `loopx.status` facade currently has one additional outward edge, the
-SkillsBench verifier-bootstrap attribution helper. This is migration debt, not
-an extension point. The architecture test records its exact module target so a
-new outward edge fails, and removing the edge requires deleting its stale
-allowlist entry in the same change.
+- `test_control_plane_has_no_unreviewed_outward_dependencies` rejects
+  control-plane imports of presentation, CLI, capability, or benchmark-adapter
+  layers unless the existing maintainability policy records the exact edge,
+  its review reason, and its retirement plan.
+- `test_status_has_no_forbidden_outward_dependencies` rejects status imports of
+  benchmark-adapter or presentation layers.
+- `test_quota_markdown_is_owned_by_the_presentation_layer` protects the renderer
+  ownership and CLI composition boundary.
 
-Each edge should move only after characterization parity exists. Adapter-specific
-enrichment belongs behind application/plugin composition rather than in the
-status core. Status Markdown callers now use the presentation renderer directly;
-the former `loopx.status.render_status_markdown` wrapper was retired after parity
-fixtures and repository callers migrated. The formerly SkillsBench-named solution
-quality helper moved inward after characterization showed that it projects only
-generic compact benchmark fields; its shipped schema remains compatible. Hiding
-an adapter dependency inside a function or dynamic import does not count as
-architectural separation.
+The control-plane check shares
+[`REVIEWED_MAINTAINABILITY_EXCEPTIONS`](../loopx/canary/maintainability_ratchet.py)
+with the maintainability ratchet. Its retained legacy Todo writer bridge keeps
+the existing Explore completion-evidence guard until that writer retires.
+Exceptions match complete source/target identities; neighboring modules and
+targets remain rejected, and a retired edge makes its exception stale. This
+replaces the former unconditional rejection that contradicted the already
+reviewed migration debt. It adds no exception or import to the runtime.
+
+The status and quota-Markdown checks remain zero-exception: their former
+verifier-bootstrap and renderer edges have been removed. Run the linked
+architecture test file for current violations and the ratchet for reviewed
+debt, invalid or stale exceptions, and growth beyond unchanged ceilings.
+
+Adapter-specific enrichment belongs behind application/plugin composition
+rather than in the status core. Move an edge only after characterization
+parity exists. Hiding an adapter dependency inside a function or dynamic import
+does not count as architectural separation; the current AST checks inspect
+static imports, including function-local imports, but do not prove the absence
+of dynamic imports.
 
 ### Status And Quota Facades
 
@@ -306,8 +378,9 @@ The server path should land in layers:
    CLI fallbacks for every write.
 4. **Heartbeat scheduler**: move recurring heartbeat bookkeeping behind the
    coordinator only after quota/spend idempotency is proven. Scheduler output
-   should be the same `quota should-run` / `interaction_contract` /
-   `protocol_action_packet` shape that current automation prompts already use.
+   should consume the structured `quota should-run` / `interaction_contract`
+   output, with `scheduler_hint` owning cadence; historical
+   `protocol_action_packet` summaries are compatibility observations only.
 5. **Planning and dreaming queues**: let background planning produce ranked
    todo proposals, evidence probes, and refactor warnings as advisory records.
    These queues must not execute protected work, read private material, or

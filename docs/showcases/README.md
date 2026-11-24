@@ -60,7 +60,29 @@ scale remain user-reported.
 
 [Read the case and inspect all seven PRs](cases/independent-public-engine-refactor.md).
 
-Open the [hosted Showcase index](https://huangruiteng.github.io/loopx/docs/showcases/index.html)
+### vLLM long-context optimization merged upstream
+
+**Independent user** · public upstream merge · author-reported LoopX workflow
+
+[Zheng Cai's public account](https://x.com/zigzagcai/status/2109952174822408443)
+describes LoopX as the workflow engine for an agent-driven framework that
+profiles vLLM, researches papers and code, tests hypotheses, and measures
+correctness and speed. [vLLM PR #54951](https://github.com/vllm-project/vllm/pull/54951)
+merged a cost-balanced TP row-sharding optimization for sparse-indexer prefill
+on October 11, 2026.
+
+The upstream report shows **32.59% higher total-token throughput** at
+1,000,000 input tokens for GLM-5.3-Flash on 4×H200, TP4, C1, 256 output tokens,
+a 65,536-token batch budget, legacy runner and explicit FA3. Four fresh-process
+paired comparisons exclude warmups. This is a reported result under those
+conditions, not saturated serving throughput or an isolated LoopX uplift.
+The practical value is sustaining exploration and validation until a concrete
+optimization is ready for upstream review, while retaining the developer's
+ownership of validation and maintenance.
+
+[Read the bilingual case, sources, and measurement limits](cases/independent-vllm-long-context-optimization.md).
+
+Open the [hosted Showcase index](https://loopx-project.github.io/loopx/docs/showcases/index.html)
 for the bilingual visual case surface. The
 [feedback coverage map](user-feedback-coverage.md) records every input cluster,
 including useful signals that were deliberately not promoted to success cases.
@@ -84,6 +106,9 @@ The machine-readable catalog lives in
 surfaces should consume that file instead of scraping prose.
 The first frontend surface contract lives in
 [frontend-surface.md](frontend-surface.md).
+Set `frontend_card.show_control_diagram` to `false` when a case's sources do
+not substantiate its internal control-plane path; the HTML case renderer then
+omits the generic sketch instead of illustrating an unverified mechanism.
 Seed-user feedback and case candidates should follow the
 [PoC feedback and case report loop](poc-feedback-case-report-loop.md) before
 they become catalog entries or Frontstage cards.
@@ -108,7 +133,7 @@ npm run export:frontstage-share
 ```
 
 This writes `/tmp/loopx-frontstage-share-bundle` with the static
-[public homepage](https://huangruiteng.github.io/loopx/), compiled dashboard, a
+[public homepage](https://loopx-project.github.io/loopx/), compiled dashboard, a
 sanitized `goal_channel_projection_v0` status fixture, direct `/frontstage/`
 static-route support, and a manifest. GitHub Pages publishes this generated
 artifact, not live registry files or local status exports. The interactive
@@ -129,6 +154,21 @@ the artifact with `python3 examples/showcase-animation-prototype-smoke.py`.
 
 ## Experimental Feature Demos
 
+### DSH × LoopX: Replan a real decision
+
+[![DSH × LoopX recording cover](../assets/showcases/dsh-loopx/dsh-loopx-cover.png)](../assets/showcases/dsh-loopx/dsh-loopx-quickstart-replan.mp4)
+
+The [60-second real DSH recording](../assets/showcases/dsh-loopx/dsh-loopx-quickstart-replan.mp4)
+starts with one explicit `loopx` skill selection, then shows a serverless
+constraint changing a logging-library decision from Pino to Roarr without
+losing the earlier evidence. The public fixture verifies 3/3 behaviors and
+documents why 12 packages became 4.
+
+    python3 examples/dsh-loopx-demo-smoke.py
+
+Read the [case and evidence boundary](cases/dsh-loopx-replan-demo.md), or
+[reproduce the DSH path](../../examples/dsh-loopx-demo/README.md).
+
 ### Start With A Useful Loop
 
 If you want a lightweight first demo before reading the case studies, start
@@ -145,21 +185,6 @@ Daily Triage, Changelog Draft, and PR Watch are beginner report/draft/watch
 paths. CI Sweeper and Dependency Sweeper are visible because they are high-ROI
 maintainer workflows, but they stay opt-in and begin with a dry-run or policy
 report before any isolated worktree patch is attempted.
-
-### Auto Research One-Click Start
-
-The auto-research path is the experimental one-command agent-team demo:
-
-```bash
-loopx auto-research "How should we evaluate whether multi-agent auto research creates value?"
-loopx auto-research start "How should we evaluate whether multi-agent auto research creates value?" --execute
-```
-
-The contract command previews the research brief, evidence boundary, and next
-launch packet. The `start --execute` command opens visible Codex CLI lanes
-through the generic multi-agent kernel; lane-authored evidence still has to be
-written back through LoopX state before the demo can claim progress. See the
-[auto-research command path](../../loopx/capabilities/auto_research/README.md).
 
 ### Review Agent Work
 
@@ -182,9 +207,10 @@ opt-in, and review signals stay separate from execution permission.
 | [13+ hour C++ algorithm accuracy run](cases/independent-cpp-accuracy-long-run.md) | Complex accuracy work risked local thrashing and context loss | Vision-aligned replan triggered public research and a new code-memory method | Improved precision is user-reported; public tool is inspectable |
 | [Four-day unattended agent run](cases/independent-four-day-unattended-agent.md) | Operator needed useful work without repeated prompting | Durable continuation plus a periodic report surface | Four days and usefulness are user-reported |
 | [Public Engine refactor](cases/independent-public-engine-refactor.md) | Monolithic Engine mixed nine responsibility areas | One durable goal became staged, PR-sized component extractions | Seven PRs are public; attribution and token scale are user-reported |
+| [vLLM long-context optimization](cases/independent-vllm-long-context-optimization.md) | Framework optimization requires repeated research, profiling, and validation | Author reports LoopX as the workflow engine for continuous exploration and experiments | Upstream merge is public; 32.59% C1 throughput gain is reported for a specific 1M-token configuration |
 
 The catalog and hosted index keep these external cases first. README files keep
-only the strongest three and link back here; the full inventory stays in this
+four featured independent-user cases and link back here; the full inventory stays in this
 directory.
 
 ## Contributor, Creator, And Demo Cases
@@ -198,6 +224,7 @@ directory.
 | [Blocked P0 safe rotation](cases/0617-blocked-p0-safe-rotation.md) | Reproducible demo | Concrete user gate, safe P1/P2 fallback | Focused synthetic smoke |
 | [PR issue automatic fix](cases/0624-pr-issue-auto-fix.md) | Reproducible demo | Issue-fix workflow, repro, reviewer handoff | Public-safe pattern case |
 | [Agent-to-agent PR comment loop](cases/0623-agent-to-agent-pr-comments.md) | Reproducible demo | Claimed handoff, comment, fix, review packet | Public-safe pattern case |
+| [DSH × LoopX Replan](cases/dsh-loopx-replan-demo.md) | Reproducible recorded demo | Native skill selection, durable Replan, GoalBar closeout | Real DSH recording plus deterministic public fixture |
 
 ## Appendix Cases
 

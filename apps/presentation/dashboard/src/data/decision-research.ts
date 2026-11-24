@@ -46,6 +46,145 @@ const researchMetricSchema = z.object({
   tone: researchToneSchema,
 }).strict();
 
+const sourcePeriodMetricSchema = z.object({
+  metric_id: z.string().min(1),
+  label: z.string().min(1),
+  event_namespace: z.string().min(1),
+  event_id: z.string().min(1),
+  event_at: z.string().min(1),
+  instrument_id: z.string().min(1),
+  scope_id: z.string().min(1),
+  period_start: z.string().min(1),
+  period_end: z.string().min(1),
+  source_state: z.enum(["ok", "error"]),
+  value: z.number().finite().nullable(),
+  unit: z.string().min(1),
+  metric_basis: z.enum([
+    "realized_cash",
+    "period_estimate",
+    "annualized_estimate",
+  ]),
+  metric_semantics: z.enum([
+    "generic",
+    "entry_price",
+    "cash_delta",
+    "cumulative_funding_cost",
+    "fill_fee",
+    "account_nav",
+    "account_component",
+    "withdrawable",
+    "external_asset_coverage",
+  ]),
+  value_origin: z.enum(["source_reported", "derived"]),
+  value_precision: z.enum(["exact", "rounded"]),
+  observation_authority: z.enum([
+    "fill_vwap",
+    "source_reported_exact",
+    "derived_exact",
+    "source_reported_rounded",
+    "rounded_position_entry",
+    "derived_rounded",
+  ]),
+  sign_basis: z.enum([
+    "not_signed",
+    "account_cash_change",
+    "funding_cost",
+    "fee_cost",
+  ]),
+  fee_inclusion: z.enum(["not_applicable", "builder_included"]),
+  account_scope: z.enum([
+    "not_applicable",
+    "product",
+    "venue",
+    "unified_account",
+    "external_asset",
+  ]),
+  account_value_role: z.enum([
+    "not_applicable",
+    "nav_owner",
+    "composition",
+    "reconciliation",
+    "withdrawable",
+    "coverage",
+  ]),
+  includes_isolated_margin: z.boolean(),
+  expected_components: z.array(z.string().min(1)).min(1).max(32),
+  observed_components: z.array(z.string().min(1)).max(32),
+  double_counted_components: z.array(z.string().min(1)).max(32),
+  numerator_scope: z.array(z.string().min(1)).max(32),
+  denominator_scope: z.array(z.string().min(1)).max(32),
+  lineage_id: z.string().min(1),
+  source_ref: z.string().min(1),
+  methodology_state: z.enum([
+    "verified",
+    "declared_only",
+    "unverified",
+    "conflicting",
+  ]),
+  anomaly_state: z.enum(["clear", "unverified", "confirmed"]),
+  event_identity: z.object({
+    namespace: z.string().min(1),
+    source_event_id: z.string().min(1),
+    event_at: z.string().min(1),
+    instrument_id: z.string().min(1),
+    scope_id: z.string().min(1),
+  }).strict(),
+  coverage_state: z.enum(["complete", "partial", "missing", "source_error"]),
+  missing_components: z.array(z.string().min(1)).max(32),
+  lineage_state: z.enum(["primary", "duplicate_upstream"]),
+  duplicate_of: z.string().min(1).nullable(),
+  independent_evidence: z.boolean(),
+  gap_reasons: z.array(z.string().min(1)).max(40),
+  account_nav_treatment: z.enum([
+    "authoritative_total",
+    "composition_only",
+    "reconciliation_only",
+    "venue_liquidity_only",
+    "external_asset_coverage_only",
+    "not_account_value",
+  ]),
+  ready_eligible: z.literal(false),
+  admission_reason: z.literal("source_period_metric_is_evidence_only"),
+}).strict();
+
+const spotMarketIdentitySchema = z.object({
+  pairs: z.array(z.object({
+    name: z.string().min(1),
+    asset_indexes: z.array(z.number().int().nonnegative()).length(2),
+    is_canonical: z.boolean(),
+    source_ref: z.string().min(1),
+  }).strict()).max(64),
+  tokens: z.array(z.object({
+    index: z.number().int().nonnegative(),
+    symbol: z.string().min(1),
+    source_ref: z.string().min(1),
+  }).strict()).max(128),
+  contexts: z.array(z.object({
+    coin: z.string().min(1),
+    observed_at: z.string().min(1),
+    mark_price: z.number().finite().positive().nullable(),
+    source_ref: z.string().min(1),
+  }).strict()).max(64),
+  markets: z.array(z.object({
+    pair_name: z.string().min(1),
+    context_coin: z.string().min(1),
+    base_asset: z.object({
+      index: z.number().int().nonnegative(),
+      symbol: z.string().min(1),
+    }).strict(),
+    quote_asset: z.object({
+      index: z.number().int().nonnegative(),
+      symbol: z.string().min(1),
+    }).strict(),
+    observed_at: z.string().min(1),
+    mark_price: z.number().finite().positive().nullable(),
+    canonicality: z.enum(["canonical_name", "noncanonical_name"]),
+    backing_inference: z.literal("not_inferred"),
+    source_refs: z.array(z.string().min(1)).length(4),
+    ready_eligible: z.literal(false),
+  }).strict()).max(64),
+}).strict();
+
 const researchSummarySchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
@@ -198,6 +337,8 @@ export const decisionResearchViewSchema = z.object({
     confidence: researchConfidenceSchema,
   }).strict(),
   metrics: z.array(researchMetricSchema).min(1).max(12),
+  source_period_metrics: z.array(sourcePeriodMetricSchema).max(24).optional().default([]),
+  spot_market_identity: spotMarketIdentitySchema.optional(),
   dashboard_summaries: z.array(researchSummarySchema).max(3),
   layers: z.array(researchLayerSchema).min(1).max(12),
   entities: z.array(researchEntitySchema).max(24),
@@ -245,6 +386,19 @@ export type PresentationProjectionEnvelope = z.infer<
   typeof presentationProjectionEnvelopeSchema
 >;
 
+/** Lineage comes from the resolved envelope, never the status summary or view. */
+export function publishedResearchLineage(projection?: PresentationProjectionEnvelope | null) {
+  const lineage = projection?.lineage;
+  const source = z.string().min(1).refine(value => value.trim().length > 0).safeParse(lineage?.source_id);
+  const version = z.number().int().positive().safeParse(lineage?.version);
+  const supersedes = z.array(z.string().min(1)).max(20).safeParse(lineage?.supersedes);
+  return {
+    sourceId: source.success ? source.data : null,
+    version: version.success ? version.data : null,
+    supersedes: supersedes.success ? supersedes.data : null,
+  };
+}
+
 export function parsePresentationProjection(
   payload: unknown,
 ): PresentationProjectionEnvelope {
@@ -274,7 +428,14 @@ export async function fetchPresentationProjection(
   target.searchParams.set("payload_sha256", surface.detail_ref.payload_sha256);
   const response = await fetch(target.toString(), { cache: "no-store" });
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status} while loading projection`);
+    let detail = "";
+    try {
+      const failure: unknown = await response.json();
+      if (typeof failure === "object" && failure !== null && "error" in failure && typeof failure.error === "string") {
+        detail = `: ${failure.error.slice(0, 300)}`;
+      }
+    } catch { /* A malformed error response still clears the previous view. */ }
+    throw new Error(`HTTP ${response.status} while loading projection${detail}`);
   }
   const projection = parsePresentationProjection(await response.json());
   const expectedIdentity = surface.detail_ref;
@@ -285,6 +446,9 @@ export async function fetchPresentationProjection(
     || projection.payload_sha256 !== expectedIdentity.payload_sha256
     || projection.view_schema !== surface.view_schema
     || projection.surface_kind !== surface.surface_kind
+    || projection.goal_id !== surface.goal_id
+    || projection.generated_at !== surface.generated_at
+    || projection.review_due_at !== surface.review_due_at
   ) {
     throw new Error("projection response does not match the requested detail_ref");
   }

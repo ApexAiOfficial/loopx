@@ -7,12 +7,13 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .repository_snapshot import _REPO_PATTERN
+
 
 ISSUE_FIX_REPOSITORY_COMMIT_EVIDENCE_SCHEMA_VERSION = (
     "issue_fix_repository_commit_evidence_v0"
 )
 
-_REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _COMMIT_REF_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{3,79}")
 _RECOVERY_REF_PREFIXES = ("refs/heads/", "refs/remotes/", "refs/tags/")
 _GITHUB_REMOTE_PATTERNS = (
@@ -28,7 +29,7 @@ def _run_git(checkout: Path, arguments: list[str], *, operation: str) -> str:
             ["git", *arguments],
             cwd=checkout,
             check=False,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=10,

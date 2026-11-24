@@ -13,6 +13,13 @@ QUOTA_SHOULD_RUN_DETAIL_SECTIONS = (
     "vision",
 )
 QUOTA_MONITOR_POLL_DETAIL_SECTIONS = ("decisions",)
+QUOTA_PLAN_DETAIL_SECTIONS = ("agent-todos", "user-todos")
+QUOTA_COMMAND_DETAIL_SECTIONS = {
+    "status": QUOTA_PLAN_DETAIL_SECTIONS,
+    "plan": QUOTA_PLAN_DETAIL_SECTIONS,
+    "should-run": QUOTA_SHOULD_RUN_DETAIL_SECTIONS,
+    "monitor-poll": QUOTA_MONITOR_POLL_DETAIL_SECTIONS,
+}
 QUOTA_DETAIL_SECTIONS = (
     *QUOTA_SHOULD_RUN_DETAIL_SECTIONS,
     *QUOTA_MONITOR_POLL_DETAIL_SECTIONS,
@@ -22,13 +29,36 @@ QUOTA_DETAIL_SECTIONS = (
 def register_quota_monitor_poll_request_arguments(
     quota_parser: argparse.ArgumentParser,
 ) -> None:
-    quota_parser.add_argument("--todo-id", help="Monitor todo id for `quota monitor-poll` metadata writeback.")
+    quota_parser.add_argument(
+        "--todo-id",
+        help=(
+            "For Codex App `quota should-run`, select one currently projected "
+            "eligible action through typed same-turn qualification. For "
+            "`quota monitor-poll`, name the observed monitor Todo; a committed "
+            "advancement settlement Todo remains separate under the auxiliary "
+            "no-spend observation contract. Otherwise name the accountable "
+            "Todo settlement target."
+        ),
+    )
     quota_parser.add_argument("--target-key", help="Stable monitor target key for `quota monitor-poll` metadata writeback.")
     quota_parser.add_argument("--result-hash", help="Public-safe result hash observed by `quota monitor-poll`.")
     quota_parser.add_argument("--material-change", action="store_true", help="Mark a monitor poll as a material transition instead of unchanged evidence.")
+    quota_parser.add_argument(
+        "--material-change-scope",
+        help=(
+            "Optional public-safe case/run scope for --material-change. Waiting Todos may use "
+            "monitor_changed:<monitor_todo_id>@<scope> so unrelated transitions do not wake them."
+        ),
+    )
     quota_parser.add_argument("--cadence", help="Monitor cadence used to compute the next due timestamp, e.g. 30m, 2h, or 1d.")
     quota_parser.add_argument("--next-due-at", help="Explicit ISO timestamp for the next monitor poll.")
-    quota_parser.add_argument("--next-agent-todo", help="Agent follow-up todo to add when `--material-change` is set.")
+    quota_parser.add_argument(
+        "--next-agent-todo",
+        help=(
+            "Independent runnable advancement_task emitted when a monitor poll "
+            "uses --material-change; the continuous_monitor remains observe-only."
+        ),
+    )
     quota_parser.add_argument(
         "--next-action-kind",
         help="Explicit action kind for a material monitor's --next-agent-todo successor.",
@@ -74,12 +104,68 @@ def register_quota_monitor_poll_request_arguments(
             "that must not block the bound agent lane."
         ),
     )
+    quota_parser.add_argument("--task-lease-idempotency-key",
+        help="Current Monitor execution key for canonical quota monitor-poll; requires --task-lease-expected-version.")
+    quota_parser.add_argument("--task-lease-expected-version", type=int,
+        help="Current Monitor lease version, checked atomically with observation and successors; never renews the lease.")
+    quota_parser.add_argument("--use-current-task-lease", action="store_true",
+        help=("For an executing, turn-scoped monitor-poll with --todo-id, resolve the canonical "
+              "lease proof or replay the exact prior transaction proof. Does not acquire or renew a lease."))
     quota_parser.add_argument("--next-claimed-by", help="Registered agent id to claim the `--next-agent-todo` follow-up.")
+    for role in ("agent", "user"):
+        quota_parser.add_argument(
+            f"--next-{role}-priority", choices=["P0", "P1", "P2", "P3", "P4"],
+            help=(
+                f"Priority of --next-{role}-todo; defaults independently of the monitor. "
+                + ("A user_gate defaults to P0 and user_action to P1."
+                   if role == "user" else "Agent advancement defaults to P1.")
+            ),
+        )
 
 
 def validate_quota_command_request(args: argparse.Namespace) -> None:
     command = args.quota_command
-    if command not in {"status", "plan"} and not args.goal_id:
+    if getattr(args, "material_change_scope", None) and (
+        command != "monitor-poll" or not bool(getattr(args, "material_change", False))
+    ):
+        raise QuotaCommandValidationError(
+            "--material-change-scope requires quota monitor-poll --material-change"
+        )
+    if command != "monitor-poll" and any(
+        getattr(args, f"next_{role}_priority", None) is not None for role in ("agent", "user")
+    ):
+        raise QuotaCommandValidationError("successor priority requires quota monitor-poll")
+    lease_key = getattr(args, "task_lease_idempotency_key", None)
+    lease_version = getattr(args, "task_lease_expected_version", None)
+    use_current_lease = bool(getattr(args, "use_current_task_lease", False))
+    if use_current_lease:
+        if command != "monitor-poll" or not bool(getattr(args, "execute", False)):
+            raise QuotaCommandValidationError("--use-current-task-lease requires executing quota monitor-poll")
+        if (
+            not getattr(args, "todo_id", None)
+            or not getattr(args, "turn_instance_id", None)
+            or not getattr(args, "agent_id", None)
+        ):
+            raise QuotaCommandValidationError(
+                "--use-current-task-lease requires --todo-id, --turn-instance-id, and --agent-id"
+            )
+        if lease_key is not None or lease_version is not None:
+            raise QuotaCommandValidationError(
+                "--use-current-task-lease cannot be combined with explicit task lease proof"
+            )
+    if lease_key is not None or lease_version is not None:
+        if command != "monitor-poll":
+            raise QuotaCommandValidationError("task lease proof is only valid with quota monitor-poll")
+        if not lease_key or lease_version is None or lease_version < 1 or lease_version > 9007199254740991:
+            raise QuotaCommandValidationError("Monitor lease proof requires an execution key and positive safe-integer version")
+        if not (getattr(args, "todo_id", None) or getattr(args, "target_key", None)):
+            raise QuotaCommandValidationError("Monitor lease proof requires --todo-id or --target-key")
+    if getattr(args, "delivery_workspace_path", None) is not None and command != "spend-slot":
+        raise QuotaCommandValidationError(
+            "--delivery-workspace-path is only valid with `loopx quota spend-slot`"
+        )
+    begin_turn = bool(getattr(args, "begin_turn", False))
+    if command not in {"status", "plan"} and not getattr(args, "goal_id", None):
         raise QuotaCommandValidationError(
             f"`loopx quota {command}` requires --goal-id"
         )
@@ -88,33 +174,79 @@ def validate_quota_command_request(args: argparse.Namespace) -> None:
         "scheduler-ack-current",
         "scheduler-fail-current",
     }
-    if command in scheduler_commands and not args.agent_id:
+    if command in scheduler_commands and not getattr(args, "agent_id", None):
         raise QuotaCommandValidationError(
             f"`loopx quota {command}` requires --agent-id"
         )
-    if command == "void-slot" and not args.void_generated_at:
+    if command == "void-slot" and not getattr(args, "void_generated_at", None):
         raise QuotaCommandValidationError(
             "`loopx quota void-slot` requires --void-generated-at"
         )
     if (
+        command == "should-run"
+        and getattr(args, "todo_id", None)
+        and not (getattr(args, "turn_instance_id", None) or begin_turn)
+    ):
+        raise QuotaCommandValidationError(
+            "`loopx quota should-run --todo-id` requires --turn-instance-id or --begin-turn"
+        )
+    if begin_turn and command != "should-run":
+        raise QuotaCommandValidationError(
+            "--begin-turn is only valid with `loopx quota should-run`"
+        )
+    if begin_turn and getattr(args, "turn_instance_id", None):
+        raise QuotaCommandValidationError(
+            "--begin-turn cannot be combined with --turn-instance-id"
+        )
+    if begin_turn and not getattr(args, "agent_id", None):
+        raise QuotaCommandValidationError(
+            "--begin-turn requires exact --agent-id identity"
+        )
+    if (
         command not in {"status", "plan", "should-run"}
-        and args.dry_run
-        and args.execute
+        and bool(getattr(args, "dry_run", False))
+        and bool(getattr(args, "execute", False))
     ):
         raise QuotaCommandValidationError(
             f"`loopx quota {command}` accepts only one of --dry-run or --execute"
         )
 
 
+def validate_scheduler_observation_request(args: argparse.Namespace) -> None:
+    if args.quota_command != "should-run" or args.format != "json" or not args.agent_id:
+        raise QuotaCommandValidationError(
+            "--scheduler-observation requires quota should-run with JSON and --agent-id"
+        )
+    for name in (
+        "begin_turn", "turn_instance_id", "todo_id", "execute", "record_host_poll",
+        "available_capabilities", "decision_output_dir", "decision_output_root",
+        "decision_handoff_socket", "codex_context_dir", "codex_context_root",
+        "context_delivery", "delta_delivery", "include_details",
+        "include_scheduler_detail", "max_page_output_bytes", "prepared_capture_reference",
+        "defer_context_presentation",
+        "capture_file", "decision_file", "outcome_ref", "source_hash",
+        "delivery_workspace_path",
+        "initial_read", "select", "list_fields", "list_depth", "reference_file",
+        "capture_sha256", "selection_sha256", "offset", "page_bytes",
+    ):
+        if getattr(args, name, None):
+            option = {
+                "available_capabilities": "available-capability",
+                "include_details": "include-detail",
+                "list_fields": "list",
+            }.get(name, name.replace("_", "-"))
+            raise QuotaCommandValidationError(
+                f"--scheduler-observation cannot be combined with --{option}"
+            )
+
+
 def quota_detail_sections_from_args(args: argparse.Namespace) -> frozenset[str]:
     sections = set(getattr(args, "include_details", None) or ())
-    if bool(getattr(args, "include_scheduler_detail", False)):
+    if getattr(args, "include_scheduler_detail", False) or getattr(args, "scheduler_observation", False):
         sections.add("scheduler")
     if "all" in sections:
         sections.update(
-            QUOTA_MONITOR_POLL_DETAIL_SECTIONS
-            if args.quota_command == "monitor-poll"
-            else QUOTA_SHOULD_RUN_DETAIL_SECTIONS
+            QUOTA_COMMAND_DETAIL_SECTIONS.get(args.quota_command, ())
         )
         sections.discard("all")
     return frozenset(sections)

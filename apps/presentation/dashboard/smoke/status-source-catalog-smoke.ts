@@ -1,11 +1,14 @@
 import {
   activeStatusSourceForUrl,
   addSshTunnelStatusSource,
+  bindConfiguredSshHostAliases,
+  defaultLocalStatusSourceUrl,
   emptyStatusSourceCatalog,
   loadStatusSourceCatalog,
   localStatusSource,
   projectedStatusSourceForUrl,
   removeStatusSource,
+  runtimeStatusSourceCatalog,
   saveStatusSourceCatalog,
   statusSourceCatalogStorageKey,
   statusSourceForUrl,
@@ -15,6 +18,7 @@ import {
   defaultConfiguredSshHostsUrl,
   parseConfiguredSshHostCatalog,
 } from "../src/data/ssh-host-catalog";
+import {sourceReadApiUrl} from "../src/data/local-status-query";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -43,11 +47,14 @@ class MemoryStorage {
 const baseHref = "http://127.0.0.1:5173/";
 const initial = emptyStatusSourceCatalog();
 deepEqual(initial.sources, [localStatusSource], "the default catalog contains only the local source");
+equal(defaultLocalStatusSourceUrl, "/status.json", "the built-in source stays on the Dashboard origin");
 equal(initial.sources[0].readOnly, false, "the built-in local control plane stays interactive");
+equal(statusSourceForUrl(initial, "/status.json", baseHref)?.id, "local", "the Vite-proxied default resolves to the local source");
 equal(projectedStatusSourceForUrl(initial, "/api/status.json", baseHref).readOnly, false, "a same-origin relative proxy stays local");
 equal(projectedStatusSourceForUrl(initial, "http://127.0.0.1:9999/status.json", baseHref).readOnly, true, "an unregistered loopback port does not inherit local authority");
 
 const added = addSshTunnelStatusSource(initial, {
+  hostAlias: "remote-lab",
   label: "Remote lab",
   statusUrl: "http://localhost:8876/status.json",
 }, baseHref);
@@ -55,6 +62,7 @@ assert("catalog" in added, "a valid tunnel source is accepted");
 equal(added.source.kind, "ssh_tunnel", "the source keeps its typed provider kind");
 equal(added.source.readOnly, true, "a tunneled source cannot inherit local write authority");
 equal(added.source.statusUrl, "http://localhost:8876/status.json", "the tunnel URL is canonicalized");
+equal(added.source.hostAlias, "remote-lab", "a configured source retains its remote write routing identity");
 equal(statusSourceForUrl(added.catalog, added.source.statusUrl, baseHref)?.id, added.source.id, "URL lookup preserves source identity");
 
 const publicSource = addSshTunnelStatusSource(initial, {
@@ -84,6 +92,17 @@ stored.sources[0].readOnly = false;
 storage.setItem(statusSourceCatalogStorageKey, JSON.stringify(stored));
 const restored = loadStatusSourceCatalog(storage, baseHref);
 equal(restored.sources[1].readOnly, true, "persisted input cannot downgrade a tunnel to writable");
+equal(restored.sources[1].hostAlias, "remote-lab", "configured routing identity survives catalog reload");
+
+const legacyStorage = new MemoryStorage();
+legacyStorage.setItem(statusSourceCatalogStorageKey, JSON.stringify({
+  schemaVersion: 1,
+  sources: [{ kind: "ssh_tunnel", label: "remote-lab", statusUrl: "http://127.0.0.1:9076/status.json" }],
+}));
+const migrated = bindConfiguredSshHostAliases(loadStatusSourceCatalog(legacyStorage, baseHref), ["remote-lab"]);
+equal(migrated.sources[1].hostAlias, "remote-lab", "an exact configured alias upgrades an older read-only source for remote Goal lifecycle");
+const unbound = bindConfiguredSshHostAliases(loadStatusSourceCatalog(legacyStorage, baseHref), ["other-host"]);
+equal(unbound.sources[1].hostAlias, undefined, "a display label never gains remote write authority without an exact configured alias");
 
 const withoutTunnel = removeStatusSource(restored, restored.sources[1].id);
 equal(withoutTunnel.sources.length, 2, "removing one tunnel preserves the other named source");
@@ -106,5 +125,37 @@ assert("command" in configuredDraft, "a configured Host and valid local port pro
 equal(configuredDraft.command, "ssh -N -L 8876:127.0.0.1:8766 remote-lab", "the UI generates one exact OpenSSH command");
 equal(configuredDraft.statusUrl, "http://127.0.0.1:8876/status.json", "the selected Host maps to the loopback-only status source");
 assert("error" in configuredSshTunnelDraft("remote-lab", "22"), "privileged local ports fail closed");
+
+const runtimeUrl = "http://127.0.0.1:19801/status.json";
+const runtimeEntries = [
+  {id: "retained", label: "Retained", status_url: runtimeUrl},
+  {id: "fresh", label: "Fresh", status_url: "http://127.0.0.1:19802/status.json"},
+];
+const runtimes = runtimeStatusSourceCatalog(runtimeEntries, runtimeUrl, baseHref);
+assert(runtimes, "an owner-prepared catalog recognizes its current source");
+assert(runtimes.sources.every((s) => s.readOnly && s.kind === "runtime" && !s.hostAlias), "runtime readers never acquire SSH or execution authority");
+equal(statusSourceForUrl(runtimes, "/status.json", "http://127.0.0.1:19801/chat/")?.id, "retained", "a relative entry on the prepared runtime stays scoped and read-only");
+equal(activeStatusSourceForUrl(runtimes, runtimeEntries[1].status_url, runtimeUrl, baseHref).id, "fresh", "a failed or pending same-Goal source selection does not bounce to the loaded runtime");
+equal(runtimeStatusSourceCatalog(undefined, runtimeUrl, baseHref), null, "existing services need no runtime catalog");
+equal(runtimeStatusSourceCatalog(runtimeEntries, "http://127.0.0.1:19803/status.json", baseHref), null, "an unrelated service cannot replace source choices");
+equal(runtimeStatusSourceCatalog([...runtimeEntries, runtimeEntries[0]], runtimeUrl, baseHref), null, "duplicate runtime ids or URLs fail closed");
+equal(runtimeStatusSourceCatalog([{...runtimeEntries[0], status_url: "https://external.example/status.json"}], runtimeUrl, baseHref), null, "runtime readers remain loopback-only");
+const namespace = "a".repeat(64), changedNamespace = "b".repeat(64);
+const pinnedUrl = `${runtimeUrl}?source_namespace=${namespace}`;
+const pinnedEntries = [{...runtimeEntries[0], status_url: pinnedUrl}];
+const pinned = runtimeStatusSourceCatalog(pinnedEntries, "/status.json", "http://127.0.0.1:19801/chat/");
+assert(pinned, "an initial relative entry adopts only its own origin's source identity");
+equal(statusSourceForUrl(pinned, "/status.json", "http://127.0.0.1:19801/chat/")?.statusUrl, pinnedUrl, "the prepared canonical URL retains its namespace");
+equal(runtimeStatusSourceCatalog(pinnedEntries, `${runtimeUrl}?source_namespace=${changedNamespace}`, baseHref), null, "the same port cannot replace a pinned source");
+const historyUrl = new URL(sourceReadApiUrl(pinnedUrl, "/api/chat/explore-results?goal_id=same&cursor=page", baseHref));
+equal(historyUrl.searchParams.get("source_namespace"), namespace, "history requests retain physical source identity");
+equal(historyUrl.searchParams.get("cursor"), "page", "source binding preserves history pagination");
+equal(sourceReadApiUrl(undefined, "/api/chat/research-analysis?goal_id=same", baseHref), "/api/chat/research-analysis?goal_id=same", "ordinary local analysis is unchanged");
+let escaped = false;
+try {sourceReadApiUrl(pinnedUrl, "http://127.0.0.1:19802/api/chat/explore-results", baseHref);} catch {escaped = true;}
+assert(escaped, "a Goal read cannot escape to another source's origin");
+const runtimeStorage = new MemoryStorage();
+saveStatusSourceCatalog(runtimeStorage, runtimes);
+equal(loadStatusSourceCatalog(runtimeStorage, baseHref).sources.length, 1, "ephemeral runtime choices are not persisted as execution or SSH configuration");
 
 console.log("status source catalog smoke: ok");

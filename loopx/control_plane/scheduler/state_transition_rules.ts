@@ -1,4 +1,5 @@
 import type { JsonObject } from "../effect_program.ts";
+import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
 import {
   requireBoolean as requiredBoolean,
   requireInteger as requiredInteger,
@@ -9,6 +10,7 @@ import {
   normalizeSchedulerHostUpdateFailures,
   normalizeSchedulerRrule,
   retainedSchedulerHostUpdateFailures,
+  requireSchedulerTimestampMilliseconds,
   rruleForMinutes,
   schedulerRruleIntervalMinutes,
   schedulerTimestampMilliseconds,
@@ -78,10 +80,148 @@ export interface SchedulerBackoffTransitionResult extends JsonObject {
   repeated_failed_pair: boolean;
 }
 
+export interface SchedulerMonitorScheduleResult extends JsonObject {
+  schema_version: typeof SCHEDULER_STATE_TRANSITION_RESULT_SCHEMA;
+  operation: "monitor_schedule";
+  next_due_at: string | null;
+  schedule_source: "explicit" | "cadence" | "none";
+  cadence_seconds: number | null;
+}
+
+export interface SchedulerSettledReplayResult extends JsonObject {
+  schema_version: typeof SCHEDULER_STATE_TRANSITION_RESULT_SCHEMA;
+  operation: "settled_replay";
+  hint: JsonObject & {
+    action: "preserve_current_schedule";
+    cadence_class: "settled_turn";
+    next_trigger: "fresh_turn_identity";
+    app_automation: JsonObject & {
+      apply: "none";
+      host_action: "none";
+      ack_required: false;
+      observed_host_rrule: string | null;
+    };
+  };
+}
+
 export type SchedulerStateTransitionResult =
   | SchedulerCadenceTransitionResult
   | SchedulerHostTransitionResult
-  | SchedulerBackoffTransitionResult;
+  | SchedulerBackoffTransitionResult
+  | SchedulerMonitorScheduleResult
+  | SchedulerSettledReplayResult;
+
+function projectSettledReplay(request: JsonObject): SchedulerSettledReplayResult {
+  const observedRrule = optionalRequestString(request.observed_host_rrule, "observed_host_rrule");
+  // A closed receipt owns this Turn only. It cannot classify the live frontier
+  // as waiting, reset a scheduler identity, or authorize another host effect.
+  return {
+    schema_version: SCHEDULER_STATE_TRANSITION_RESULT_SCHEMA,
+    operation: "settled_replay",
+    hint: {
+      schema_version: "scheduler_hint_v0",
+      source: "quota.should-run",
+      action: "preserve_current_schedule",
+      cadence_class: "settled_turn",
+      reason_code: "interaction_heartbeat_settled_replay",
+      reason: "This Turn is settled, not the Goal frontier. Preserve the existing schedule and evaluate work under a fresh Turn identity.",
+      spend_policy: "no quota spend for settled Turn replay",
+      next_trigger: "fresh_turn_identity",
+      app_automation: {
+        apply: "none",
+        host_action: "none",
+        ack_required: false,
+        observed_host_rrule: observedRrule || null,
+        no_spend_for_cadence_change: true,
+      },
+      unchanged_poll: {
+        limits: { local_scheduler: null, codex_cli_tui: null, claude_code_loop: null },
+        after_limits: { local_scheduler: "continue", codex_cli_tui: "continue", claude_code_loop: "continue" },
+        final_quota_replan_check_enabled: false,
+        final_quota_replan_check_action: null,
+        spend_policy: "no quota spend for settled Turn replay",
+      },
+    },
+  };
+}
+
+const MONITOR_CADENCE_PATTERN =
+  /^\s*(?<count>[1-9][0-9]{0,4})\s*(?<unit>s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\s*$/i;
+
+function optionalRequestString(value: unknown, label: string): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string") {
+    throw new EffectRuntimeRequestError(`${label} must be a string when present`);
+  }
+  return value.trim();
+}
+
+function monitorCadenceSeconds(value: unknown): number | null {
+  const cadence = optionalRequestString(value, "monitor cadence");
+  if (!cadence) return null;
+  const match = MONITOR_CADENCE_PATTERN.exec(cadence);
+  if (!match?.groups) return null;
+  const count = Number.parseInt(match.groups.count, 10);
+  const unit = match.groups.unit.toLowerCase();
+  const multiplier = unit.startsWith("s")
+    ? 1
+    : unit.startsWith("m")
+    ? 60
+    : unit.startsWith("h")
+    ? 60 * 60
+    : 24 * 60 * 60;
+  return count * multiplier;
+}
+
+function monitorScheduleTimestamp(milliseconds: number): string {
+  return new Date(milliseconds).toISOString().replace(".000Z", "Z");
+}
+
+function evaluateMonitorSchedule(
+  request: JsonObject,
+): SchedulerMonitorScheduleResult {
+  const explicitNextDueAt = optionalRequestString(
+    request.explicit_next_due_at,
+    "explicit_next_due_at",
+  );
+  if (explicitNextDueAt) {
+    if (schedulerTimestampMilliseconds(explicitNextDueAt) === null) {
+      throw new EffectRuntimeRequestError("explicit_next_due_at must be an ISO timestamp");
+    }
+    return {
+      schema_version: SCHEDULER_STATE_TRANSITION_RESULT_SCHEMA,
+      operation: "monitor_schedule",
+      next_due_at: explicitNextDueAt,
+      schedule_source: "explicit",
+      cadence_seconds: monitorCadenceSeconds(request.cadence),
+    };
+  }
+
+  const cadenceSeconds = monitorCadenceSeconds(request.cadence);
+  if (cadenceSeconds === null) {
+    return {
+      schema_version: SCHEDULER_STATE_TRANSITION_RESULT_SCHEMA,
+      operation: "monitor_schedule",
+      next_due_at: null,
+      schedule_source: "none",
+      cadence_seconds: null,
+    };
+  }
+  const generatedAt = requiredString(request.generated_at, "generated_at");
+  const generatedAtMilliseconds = schedulerTimestampMilliseconds(generatedAt);
+  if (generatedAtMilliseconds === null) {
+    throw new EffectRuntimeRequestError("generated_at must be an ISO timestamp");
+  }
+  return {
+    schema_version: SCHEDULER_STATE_TRANSITION_RESULT_SCHEMA,
+    operation: "monitor_schedule",
+    next_due_at: monitorScheduleTimestamp(
+      generatedAtMilliseconds + cadenceSeconds * 1_000,
+    ),
+    schedule_source: "cadence",
+    cadence_seconds: cadenceSeconds,
+  };
+}
 
 function requiredPositiveIntegerList(value: unknown, label: string): number[] {
   if (
@@ -91,7 +231,7 @@ function requiredPositiveIntegerList(value: unknown, label: string): number[] {
       typeof item !== "number" || !Number.isInteger(item) || item <= 0
     )
   ) {
-    throw new Error(`${label} must be a non-empty array of positive integers`);
+    throw new EffectRuntimeRequestError(`${label} must be a non-empty array of positive integers`);
   }
   return [...value] as number[];
 }
@@ -99,7 +239,7 @@ function requiredPositiveIntegerList(value: unknown, label: string): number[] {
 function requestObject(value: unknown): JsonObject {
   const request = requiredObject(value, "scheduler.state_transition params");
   if (request.schema_version !== SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA) {
-    throw new Error("Scheduler state transition request schema mismatch");
+    throw new EffectRuntimeRequestError("Scheduler state transition request schema mismatch");
   }
   return request;
 }
@@ -110,7 +250,7 @@ function evaluateCadence(request: JsonObject): SchedulerCadenceTransitionResult 
     "progression_size",
   );
   if (progressionSize < 1) {
-    throw new Error("scheduler cadence progression must not be empty");
+    throw new EffectRuntimeRequestError("scheduler cadence progression must not be empty");
   }
   if (!requiredBoolean(request.state_present, "state_present")) {
     return {
@@ -220,15 +360,38 @@ function schedulerProgressionIntervalElapsed(
   schedulerState: JsonObject,
   currentTime: string,
 ): boolean {
-  const updatedAt = schedulerTimestampMilliseconds(schedulerState.updated_at);
-  const current = schedulerTimestampMilliseconds(currentTime);
   const appliedInterval = schedulerRruleIntervalMinutes(
     schedulerState.last_applied_rrule,
   );
-  if (updatedAt === null || current === null || appliedInterval === null) {
-    return true;
-  }
+  // Missing interval or blank updated_at stays elapsed. A present illegal
+  // calendar is rejected instead of rolled or treated as elapsed.
+  if (appliedInterval === null) return true;
+  const updatedAt = requireSchedulerTimestampMilliseconds(
+    schedulerState.updated_at,
+    "updated_at",
+  );
+  if (updatedAt === null) return true;
+  const current = requireSchedulerTimestampMilliseconds(
+    currentTime,
+    "current_time",
+  );
+  if (current === null) return true;
   return current >= updatedAt + appliedInterval * 60_000;
+}
+
+// evaluateCadence reads the old clock only after identity matches and the
+// same-identity path is comparing the applied interval. An obsolete receipt
+// must not block identity_reset, an unacknowledged retry, or a held initial.
+function cadenceConsumesAppliedInterval(
+  statePresent: boolean,
+  identityMatches: boolean,
+  hasHostUpdateFailures: boolean,
+  currentCadenceAcknowledged: boolean,
+  advanceSameIdentity: boolean,
+): boolean {
+  if (!statePresent || !identityMatches) return false;
+  if (hasHostUpdateFailures && !currentCadenceAcknowledged) return false;
+  return advanceSameIdentity;
 }
 
 function monitorRruleAppliedWithinStaleTolerance(
@@ -261,13 +424,14 @@ function evaluateBackoff(request: JsonObject): SchedulerBackoffTransitionResult 
     "identity_signature",
   );
   const currentTime = requiredString(request.current_time, "current_time");
+  requireSchedulerTimestampMilliseconds(currentTime, "current_time");
   const cadenceClass = requiredString(request.cadence_class, "cadence_class");
   const staleToleranceMinutes = requiredInteger(
     request.stale_tolerance_minutes,
     "stale_tolerance_minutes",
   );
   if (staleToleranceMinutes < 0) {
-    throw new Error("stale_tolerance_minutes must not be negative");
+    throw new EffectRuntimeRequestError("stale_tolerance_minutes must not be negative");
   }
 
   const allHostUpdateFailures = retainedSchedulerHostUpdateFailures(
@@ -289,23 +453,33 @@ function evaluateBackoff(request: JsonObject): SchedulerBackoffTransitionResult 
     : "";
   const currentCadenceAcknowledged = Boolean(appliedTargetRrule) &&
     normalizeSchedulerRrule(lastAppliedRrule) === appliedTargetRrule;
+  const statePresent = Object.keys(schedulerState).length > 0;
+  const identityMatches = statePresent &&
+    schedulerState.reset_token === resetToken &&
+    schedulerState.identity_signature === identitySignature;
+  const advanceSameIdentity = requiredBoolean(
+    request.advance_same_identity,
+    "advance_same_identity",
+  );
+  const hasHostUpdateFailures = allHostUpdateFailures.length > 0;
+  const appliedIntervalElapsed = cadenceConsumesAppliedInterval(
+    statePresent,
+    identityMatches,
+    hasHostUpdateFailures,
+    currentCadenceAcknowledged,
+    advanceSameIdentity,
+  )
+    ? schedulerProgressionIntervalElapsed(schedulerState, currentTime)
+    : false;
   const cadence = evaluateCadence({
     progression_size: progressionMinutes.length,
-    state_present: Object.keys(schedulerState).length > 0,
-    identity_matches: Object.keys(schedulerState).length > 0 &&
-      schedulerState.reset_token === resetToken &&
-      schedulerState.identity_signature === identitySignature,
+    state_present: statePresent,
+    identity_matches: identityMatches,
     applied_index: appliedIndex,
     current_cadence_acknowledged: currentCadenceAcknowledged,
-    advance_same_identity: requiredBoolean(
-      request.advance_same_identity,
-      "advance_same_identity",
-    ),
-    applied_interval_elapsed: schedulerProgressionIntervalElapsed(
-      schedulerState,
-      currentTime,
-    ),
-    has_host_update_failures: allHostUpdateFailures.length > 0,
+    advance_same_identity: advanceSameIdentity,
+    applied_interval_elapsed: appliedIntervalElapsed,
+    has_host_update_failures: hasHostUpdateFailures,
   });
   const currentIndex = cadence.current_index;
   const currentInterval = progressionMinutes[currentIndex];
@@ -391,5 +565,9 @@ export function evaluateSchedulerStateTransition(
   if (request.operation === "cadence") return evaluateCadence(request);
   if (request.operation === "host") return evaluateHost(request);
   if (request.operation === "backoff") return evaluateBackoff(request);
-  throw new Error("Scheduler state transition operation is unsupported");
+  if (request.operation === "monitor_schedule") {
+    return evaluateMonitorSchedule(request);
+  }
+  if (request.operation === "settled_replay") return projectSettledReplay(request);
+  throw new EffectRuntimeRequestError("Scheduler state transition operation is unsupported");
 }

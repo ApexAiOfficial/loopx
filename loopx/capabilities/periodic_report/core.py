@@ -7,12 +7,14 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from ...control_plane.runtime.public_safety import SECRET_LIKE_SURFACE_PATTERN
+from ...public_safe_text import PUBLIC_SAFE_SLUG_PATTERN
+
 
 REQUEST_SCHEMA = "periodic_report_run_request_v0"
 RUN_SCHEMA = "periodic_report_v0"
 TRIGGER_DECISION_SCHEMA = "periodic_report_trigger_decision_v0"
 
-_TOKEN_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _SOURCE_STATUSES = {"complete", "partial", "failed", "unknown"}
 _ARTIFACT_STATUSES = {"pending", "rendered", "failed", "unknown"}
 _SINK_STATUSES = {"pending", "sent", "failed", "skipped", "unknown"}
@@ -34,12 +36,10 @@ _REPORTABLE_TRIGGER_KINDS = {
     "vision_closed",
 }
 _LOCAL_PATH_SURFACE_PATTERN = re.compile(
-    r"(?<!<)/(?:Users|Volumes|home|var/folders|tmp|private/tmp)/[^\s`'\"<>]+"
-)
-_SECRET_LIKE_SURFACE_PATTERN = re.compile(
-    r"(?i)(?:\bbearer\s+[a-z0-9._~+/=-]{16,}|"
-    r"(?<![a-z0-9_])(?:ak|sk)[-_=:][a-z0-9_=-]{10,}|"
-    r"\b(?:api[_-]?key|password|secret|token)\s*[=:]\s*[^\s`'\"<>]{12,})"
+    # search() can start at the last separator in a run; repeating the prefix
+    # would rescan long non-root runs before the request's length validation.
+    r"(?<!<)[\\/](?:Users|Volumes|home|var[\\/]+folders|tmp|private[\\/]+tmp)"
+    r"[\\/]+[^\s`'\"<>]+"
 )
 _FORBIDDEN_RAW_KEYS = {
     "credential",
@@ -91,7 +91,7 @@ def _optional_text(
 
 def _token(value: object, label: str) -> str:
     token = _text(value, label, maximum=128).lower()
-    if not _TOKEN_RE.fullmatch(token):
+    if not PUBLIC_SAFE_SLUG_PATTERN.fullmatch(token):
         raise ValueError(f"{label} must be a lower-snake-like public token")
     return token
 
@@ -140,7 +140,7 @@ def _reject_raw_keys(value: object, label: str) -> None:
             _reject_raw_keys(item, f"{label}[{index}]")
     elif isinstance(value, str) and (
         _LOCAL_PATH_SURFACE_PATTERN.search(value)
-        or _SECRET_LIKE_SURFACE_PATTERN.search(value)
+        or SECRET_LIKE_SURFACE_PATTERN.search(value)
     ):
         raise ValueError(f"{label} contains a private path or credential-like value")
 
@@ -176,6 +176,29 @@ def _normalize_window(raw: object) -> dict[str, str]:
     if start_value >= end_value:
         raise ValueError("period_window.start_at must be earlier than end_at")
     return {"start_at": start_at, "end_at": end_at}
+
+
+def _validate_report_window_for_trigger(
+    *, generated_at: str, period_window: Mapping[str, str], trigger_receipt: Mapping[str, Any] | None
+) -> None:
+    """Keep cadence digests retrospective while leaving event updates incremental.
+
+    A calendar boundary is an eligibility signal, not permission to report an
+    unfinished interval.  Event-driven updates may still use the same bounded
+    run envelope, but their trigger receipt—not the calendar—defines why the
+    update is being published.
+    """
+
+    if not trigger_receipt or trigger_receipt.get("report_kind") != "cadence_digest":
+        return
+    generated = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    end_at = datetime.fromisoformat(
+        str(period_window["end_at"]).replace("Z", "+00:00")
+    )
+    if end_at > generated:
+        raise ValueError(
+            "cadence_digest period_window.end_at must not be later than generated_at"
+        )
 
 
 def _normalize_profile(raw: object) -> dict[str, str]:
@@ -326,6 +349,45 @@ def _normalize_trigger_receipt(raw: object) -> dict[str, Any] | None:
             maximum=31 * 24 * 60 * 60,
         ),
     }
+    if raw_policy.get("aggregation") is not None:
+        raw_aggregation = _object(
+            raw_policy.get("aggregation"),
+            "trigger_receipt.trigger_policy.aggregation",
+        )
+        aggregation: dict[str, Any] = {
+            "window_seconds": _integer(
+                raw_aggregation.get("window_seconds"),
+                "trigger_receipt.trigger_policy.aggregation.window_seconds",
+                minimum=1,
+                maximum=31 * 24 * 60 * 60,
+            ),
+            "promote_replan": _boolean(
+                raw_aggregation.get("promote_replan"),
+                "trigger_receipt.trigger_policy.aggregation.promote_replan",
+            ),
+            "stage_completion_required": _boolean(
+                raw_aggregation.get("stage_completion_required", True),
+                "trigger_receipt.trigger_policy.aggregation."
+                "stage_completion_required",
+            ),
+        }
+        if raw_aggregation.get("todo_completed_threshold") is not None:
+            aggregation["todo_completed_threshold"] = _integer(
+                raw_aggregation.get("todo_completed_threshold"),
+                "trigger_receipt.trigger_policy.aggregation.todo_completed_threshold",
+                minimum=1,
+                maximum=64,
+            )
+        if (
+            "todo_completed_threshold" not in aggregation
+            and not aggregation["promote_replan"]
+            and not aggregation["stage_completion_required"]
+        ):
+            raise ValueError(
+                "trigger_receipt.trigger_policy.aggregation must enable "
+                "a stage completion, todo threshold, or replan promotion"
+            )
+        trigger_policy["aggregation"] = aggregation
     expected_report_key = _digest(
         {
             "profile": profile,
@@ -621,6 +683,11 @@ def build_periodic_report_run(request: Mapping[str, Any]) -> dict[str, Any]:
     trigger_receipt = _normalize_trigger_receipt(payload.get("trigger_receipt"))
     if trigger_receipt is not None and trigger_receipt["profile"] != profile:
         raise ValueError("trigger_receipt.profile must match the run profile")
+    _validate_report_window_for_trigger(
+        generated_at=generated_at,
+        period_window=period_window,
+        trigger_receipt=trigger_receipt,
+    )
     sources = _normalize_sources(payload.get("source_snapshots"))
     retry_policy = _normalize_retry_policy(payload.get("retry_policy", {}))
     artifact = _normalize_artifact(

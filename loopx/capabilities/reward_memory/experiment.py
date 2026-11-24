@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
+import hashlib
 import json
+import re
+import shlex
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from tempfile import TemporaryDirectory
 
 from ...agent_registry import normalize_registered_agents
-from ...control_plane.reward_memory import reward_memory_goal_policy
+from ...control_plane.reward_memory import (
+    reward_memory_goal_policy,
+    reward_memory_host_coverage,
+)
+from ...control_plane.operator_inbox_binding import local_private_config_digest
 from ...control_plane.todos.contract import normalize_todo_claimed_by
-from .application import normalize_reward_memory_provider_binding
+from ..context_providers import build_context_provider
+from ..context_providers.base import ContextProvider
+from ..context_providers.openviking_scope import classify_openviking_scope
+from .application import TOKEN_RE, normalize_reward_memory_provider_binding
 from .ingestion import normalize_reward_memory_standing_policy
 from .registry import MAX_CORPORA, normalize_reward_memory_corpus
 from .scoped_feedback import SCOPED_FEEDBACK_ADAPTER
@@ -46,10 +59,37 @@ _SURFACE_FIELDS = {
     "corpus_ids",
     "ingest_corpus_id",
     "recall_profile",
+    "destinations",
 }
 _RECALL_PROFILE_FIELDS = {"profile_id", "mode", "max_queries", "limit"}
 _AUTOMATION_FIELDS = {"automatic_recall", "automatic_ingest", "fail_open"}
 _RECALL_MODES = {"function_boundary", "bounded_agentic_search"}
+
+
+def canonical_reward_memory_actor_peer_id(*, goal_id: str, agent_id: str) -> str:
+    """Return one OpenViking-safe actor for a Goal-scoped LoopX Agent.
+
+    LoopX Agent names are only unique inside one Goal. The readable prefixes
+    aid operations while the digest makes normalization collisions and reuse of
+    the same local Agent name across Goals harmless.
+    """
+
+    normalized_agent = normalize_todo_claimed_by(agent_id)
+    goal_value = str(goal_id or "").strip()
+    if not normalized_agent or not goal_value:
+        raise ValueError("goal_id and a registered agent_id are required")
+
+    def segment(value: str, *, fallback: str) -> str:
+        result = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+        return (result or fallback)[:40].rstrip("-")
+
+    digest = hashlib.sha256(
+        f"{goal_value}\0{normalized_agent}".encode("utf-8")
+    ).hexdigest()[:20]
+    return (
+        f"loopx-{segment(goal_value, fallback='goal')}-"
+        f"{segment(normalized_agent, fallback='agent')}-{digest}"
+    )
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -164,6 +204,253 @@ def _materialize_provider_binding(
     }
     raw.update({"corpus_id": corpus["corpus_id"], "scope_ref": scope_ref})
     return normalize_reward_memory_provider_binding(raw, corpus)
+
+
+def validate_reward_memory_goal_agent_scope(
+    config: Mapping[str, Any], *, goal_id: str, agent_id: str
+) -> dict[str, Any]:
+    """Bind private provider storage to the owning Agent and attributed Goal.
+
+    LoopX Agent names are Goal-local. The OpenViking actor peer is therefore a
+    deterministic identity derived from ``(goal_id, agent_id)``, while Goal
+    remains an explicit path/receipt attribution check. Neither value is
+    inferred from the provider URI.
+    """
+
+    normalized_agent = normalize_todo_claimed_by(agent_id)
+    if not normalized_agent:
+        raise ValueError("agent_id must be a public-safe registered agent id")
+    goal_segment = str(goal_id or "").strip()
+    if not goal_segment or "/" in goal_segment:
+        raise ValueError("goal_id must be a safe provider path segment")
+    expected_actor = canonical_reward_memory_actor_peer_id(
+        goal_id=goal_segment,
+        agent_id=normalized_agent,
+    )
+    corpora = config.get("corpora")
+    if not isinstance(corpora, Mapping):
+        raise ValueError("reward-memory config is not normalized")
+    private_count = 0
+    for entry in corpora.values():
+        if not isinstance(entry, Mapping):
+            raise ValueError("reward-memory corpus entry is invalid")
+        corpus = entry.get("corpus")
+        binding = entry.get("provider_binding")
+        if not isinstance(corpus, Mapping) or not isinstance(binding, Mapping):
+            raise ValueError("reward-memory corpus route is incomplete")
+        privacy = corpus.get("privacy")
+        if not isinstance(privacy, Mapping) or privacy.get("visibility") != "private":
+            continue
+        private_count += 1
+        if binding.get("provider_id") != "openviking":
+            raise ValueError(
+                "private Goal/Agent Reward Memory currently requires OpenViking"
+            )
+        peer_ref = str((corpus.get("scope") or {}).get("peer_ref") or "")
+        if peer_ref != f"agent:{normalized_agent}":
+            raise ValueError(
+                "private Reward Memory corpus peer_ref must match the enabled Agent"
+            )
+        if (corpus.get("scope") or {}).get("session_ref"):
+            raise ValueError(
+                "private Goal/Agent Reward Memory cannot be session-scoped"
+            )
+        if binding.get("actor_peer_id") != expected_actor:
+            raise ValueError(
+                "private Reward Memory actor_peer_id must be the canonical "
+                "Goal-scoped Agent actor"
+            )
+        provider_scope = classify_openviking_scope(str(binding.get("scope_ref") or ""))
+        if (
+            provider_scope.visibility != "private"
+            or provider_scope.actor_scope_id != expected_actor
+        ):
+            raise ValueError(
+                "private Reward Memory requires the canonical actor-bound peer scope"
+            )
+        segments = str(binding["scope_ref"]).rstrip("/").split("/")
+        if not any(
+            left == "goals" and right == goal_segment
+            for left, right in zip(segments, segments[1:])
+        ):
+            raise ValueError(
+                "private Reward Memory provider scope must contain the exact Goal segment"
+            )
+    return {
+        "schema_version": "reward_memory_goal_agent_scope_v1",
+        "goal_id": goal_segment,
+        "agent_id": normalized_agent,
+        "isolation_mode": (
+            "goal_scoped_agent_private" if private_count else "explicit_shared"
+        ),
+        "private_corpus_count": private_count,
+        "actor_binding_verified": private_count > 0,
+        "actor_peer_id": expected_actor if private_count else None,
+    }
+
+
+def preflight_reward_memory_experiment_config(
+    config: Mapping[str, Any],
+    *,
+    goal_id: str,
+    agent_ids: Sequence[str],
+    observed_at: str,
+    execute: bool,
+    provider: ContextProvider | None = None,
+) -> dict[str, Any]:
+    """Probe every configured corpus and return a restart-safe public receipt.
+
+    ``execute=False`` performs provider/service and target-access checks only.
+    ``execute=True`` writes a fresh non-memory probe through the exact route,
+    then requires provider exact readback before enablement may commit.
+    """
+
+    corpora = config.get("corpora")
+    if not isinstance(corpora, Mapping):
+        raise ValueError("reward-memory config is not normalized")
+    private_config = any(
+        isinstance(entry, Mapping)
+        and isinstance(entry.get("corpus"), Mapping)
+        and isinstance(entry["corpus"].get("privacy"), Mapping)
+        and entry["corpus"]["privacy"].get("visibility") == "private"
+        for entry in corpora.values()
+    )
+    if private_config and len(agent_ids) != 1:
+        raise ValueError(
+            "one private Reward Memory config must bind exactly one Goal-scoped Agent"
+        )
+    receipts: dict[str, dict[str, Any]] = {}
+    probe_run_id = uuid.uuid4().hex[:16]
+    for raw_agent_id in agent_ids:
+        agent_id = normalize_todo_claimed_by(raw_agent_id)
+        if not agent_id:
+            raise ValueError("reward-memory preflight requires registered Agent ids")
+        isolation = validate_reward_memory_goal_agent_scope(
+            config, goal_id=goal_id, agent_id=agent_id
+        )
+        sync_packets: list[dict[str, Any]] = []
+        with TemporaryDirectory(prefix="loopx-reward-memory-preflight-") as temp_root:
+            for corpus_id, entry in sorted(corpora.items()):
+                if not isinstance(entry, Mapping):
+                    raise ValueError("reward-memory corpus entry is invalid")
+                binding = entry.get("provider_binding")
+                if not isinstance(binding, Mapping):
+                    raise ValueError("reward-memory provider binding is unavailable")
+                digest = hashlib.sha256(
+                    f"{goal_id}\n{agent_id}\n{corpus_id}\n{probe_run_id}".encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:16]
+                filename = f"loopx-writability-probe-{digest}.json"
+                source_path = Path(temp_root) / filename
+                source_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": (
+                                "reward_memory_provider_writability_probe_v0"
+                            ),
+                            "goal_id": goal_id,
+                            "agent_id": agent_id,
+                            "corpus_id": corpus_id,
+                            "recallable": False,
+                            "raw_content_captured": False,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                configured_provider = provider or build_context_provider(
+                    {
+                        "provider": binding["provider_id"],
+                        "provider_binary": binding.get("provider_binary"),
+                        "minimum_provider_version": binding.get(
+                            "minimum_provider_version"
+                        ),
+                        "actor_peer_id": binding.get("actor_peer_id"),
+                    }
+                )
+                sync = configured_provider.sync(
+                    namespace=str(binding["namespace"]),
+                    resources=[
+                        (
+                            str(source_path),
+                            f"{str(binding['scope_ref']).rstrip('/')}/{filename}",
+                        )
+                    ],
+                    timeout_seconds=float(binding["timeout_seconds"]),
+                    observed_at=observed_at,
+                    execute=execute,
+                )
+                sync_packets.append(sync.public_packet())
+        all_verified = bool(sync_packets) and all(
+            packet.get("status") == "completed"
+            and packet.get("writability_verified") is True
+            and int(packet.get("write_count") or 0) == 1
+            for packet in sync_packets
+        )
+        preview_ready = bool(sync_packets) and all(
+            packet.get("status") == "preflight_ready" for packet in sync_packets
+        )
+        status = (
+            "verified"
+            if execute and all_verified
+            else "ready_for_apply"
+            if not execute and preview_ready
+            else "blocked"
+        )
+        receipts[agent_id] = {
+            "schema_version": "reward_memory_enablement_receipt_v0",
+            "status": status,
+            "goal_id": goal_id,
+            "agent_id": agent_id,
+            "provider_id": str(
+                (config.get("project_provider_binding") or {}).get("provider_id") or ""
+            ),
+            "isolation_mode": isolation["isolation_mode"],
+            "actor_binding_verified": isolation["actor_binding_verified"],
+            "writability_verified": all_verified,
+            "exact_readback_verified": all_verified,
+            "probe_count": len(sync_packets),
+            "write_count": sum(
+                int(packet.get("write_count") or 0) for packet in sync_packets
+            ),
+            "external_writes_performed": any(
+                packet.get("external_writes_performed") is True
+                for packet in sync_packets
+            ),
+            "observed_at": observed_at,
+            "probe_records_recallable": False,
+            "provider_preflight_performed": all(
+                packet.get("provider_preflight_performed") is True
+                for packet in sync_packets
+            ),
+            "reason_codes": sorted(
+                {
+                    str(packet["reason_code"])
+                    for packet in sync_packets
+                    if packet.get("reason_code")
+                }
+            ),
+        }
+    expected_status = "verified" if execute else "ready_for_apply"
+    ok = bool(receipts) and all(
+        receipt["status"] == expected_status for receipt in receipts.values()
+    )
+    return {
+        "ok": ok,
+        "schema_version": "reward_memory_enablement_preflight_v0",
+        "status": expected_status if ok else "blocked",
+        "goal_id": goal_id,
+        "agent_count": len(receipts),
+        "agent_receipts": receipts,
+        "external_writes_performed": any(
+            receipt["external_writes_performed"] for receipt in receipts.values()
+        ),
+        "raw_content_captured": False,
+        "raw_provider_payload_captured": False,
+    }
 
 
 def _normalize_v1(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -325,6 +612,61 @@ def _normalize_v1(raw: Mapping[str, Any]) -> dict[str, Any]:
                 ),
             },
         }
+        if "destinations" in surface:
+            if surface_id != "outbound_message.before_send":
+                raise ValueError("destinations require the outbound surface")
+            destinations = {}
+            for destination in _bounded_objects(
+                surface["destinations"], label="destinations", maximum=20
+            ):
+                entry = _strict_object(
+                    destination,
+                    label="destination",
+                    allowed={
+                        "destination_digest",
+                        "query_label",
+                        "required_candidate_refs",
+                    },
+                )
+                digest = str(entry.get("destination_digest") or "")
+                if len(digest) != 64 or any(
+                    c not in "0123456789abcdef" for c in digest
+                ):
+                    raise ValueError("destination_digest must be a SHA-256 hex digest")
+                if digest in destinations:
+                    raise ValueError("destination_digest must be unique")
+                label = entry.get("query_label", "")
+                if not isinstance(label, str) or len(label) > 120:
+                    raise ValueError(
+                        "destination query_label must be at most 120 characters"
+                    )
+                refs = entry.get("required_candidate_refs", [])
+                if (
+                    not isinstance(refs, list)
+                    or len(refs) > 3
+                    or any(
+                        not isinstance(ref, str)
+                        or not ref.startswith("candidate:")
+                        or len(ref) > 100
+                        or any(c.isspace() for c in ref)
+                        # A ref outside the application token charset can never
+                        # match an emitted candidate_ref, so requiring it would
+                        # permanently block every message for this destination.
+                        or TOKEN_RE.fullmatch(ref) is None
+                        for ref in refs
+                    )
+                    or len(set(refs)) != len(refs)
+                ):
+                    raise ValueError(
+                        "required_candidate_refs must contain up to three unique "
+                        "public-safe candidate refs matching the application token "
+                        "charset"
+                    )
+                destinations[digest] = {
+                    "query_label": label,
+                    "required_candidate_refs": refs,
+                }
+            surfaces[surface_id]["destinations"] = destinations
         referenced_corpora.update(corpus_ids)
     if referenced_corpora != set(corpora):
         raise ValueError(
@@ -332,9 +674,13 @@ def _normalize_v1(raw: Mapping[str, Any]) -> dict[str, Any]:
         )
 
     automation = _strict_object(
-        raw.get("automation"), label="automation", allowed=_AUTOMATION_FIELDS
+        raw.get("automation", {}), label="automation", allowed=_AUTOMATION_FIELDS
     )
-    fail_open = _boolean(automation.get("fail_open"), "automation.fail_open")
+    fail_open = (
+        _boolean(automation.get("fail_open"), "automation.fail_open")
+        if "fail_open" in automation
+        else True
+    )
     if not fail_open:
         raise ValueError("reward-memory automation must be fail-open")
     normalized = {
@@ -347,14 +693,29 @@ def _normalize_v1(raw: Mapping[str, Any]) -> dict[str, Any]:
         "corpora": corpora,
         "surfaces": surfaces,
         "automation": {
-            "automatic_recall": _boolean(
-                automation.get("automatic_recall"), "automation.automatic_recall"
+            "automatic_recall": (
+                _boolean(
+                    automation.get("automatic_recall"),
+                    "automation.automatic_recall",
+                )
+                if "automatic_recall" in automation
+                else True
             ),
-            "automatic_ingest": _boolean(
-                automation.get("automatic_ingest"), "automation.automatic_ingest"
+            "automatic_ingest": (
+                _boolean(
+                    automation.get("automatic_ingest"),
+                    "automation.automatic_ingest",
+                )
+                if "automatic_ingest" in automation
+                else True
             ),
             "fail_open": True,
         },
+        "automation_intent": {
+            field: "explicit" if field in automation else "default_enabled_new_config"
+            for field in ("automatic_recall", "automatic_ingest")
+        }
+        | {"fail_open": "explicit" if "fail_open" in automation else "default"},
     }
     return normalized
 
@@ -428,6 +789,59 @@ def resolve_reward_memory_surface_config(
     }
 
 
+def _enablement_repair(
+    *, goal_id: str, agent_ids: Sequence[str], agent_id: str,
+    binding_agent_id: str | None = None,
+) -> dict[str, Any]:
+    """Reuse the configuration owner without publishing its private pointer.
+
+    This is a recovery plan, never authorization to trust a changed binding.
+    Retain every enabled Agent when requalifying a shared corpus.
+    """
+    argv = [
+        "loopx", "--registry", "<invoked-registry>",
+        "configure-goal", "--goal-id", goal_id,
+    ]
+    if binding_agent_id:
+        argv.extend(["--reward-memory-agent-id", binding_agent_id])
+    else:
+        for enabled_agent in agent_ids:
+            argv.extend(["--reward-memory-agent", enabled_agent])
+    return {
+        "schema_version": "reward_memory_enablement_repair_v0",
+        "kind": "requalify_existing_binding",
+        "owner": "configure-goal",
+        "registry_context": "reuse_invoked_registry",
+        "commands_are_templates": True,
+        "required_bindings": {"<invoked-registry>": "invoked_registry_path"},
+        "automatic_apply": False,
+        "instruction": (
+            "Bind <invoked-registry> to the exact registry used for this invocation "
+            "before executing any command; never substitute the default registry. "
+            "Inspect the local configuration change and its existing authorization; "
+            "preview, then apply through configure-goal within that authorization. "
+            "Apply performs provider write/readback and synchronizes the binding. "
+            "Do not copy the new digest into an old receipt. Keep ordinary work running."
+        ),
+        "preview_command": shlex.join(argv),
+        "apply_command": shlex.join([*argv, "--execute"]),
+        "verify_command": shlex.join(
+            [
+                "loopx",
+                "--registry",
+                "<invoked-registry>",
+                "reward-memory",
+                "experiment-status",
+                "--goal-id",
+                goal_id,
+                "--agent-id",
+                agent_id,
+            ]
+        ),
+        "success_status": "available",
+    }
+
+
 def resolve_reward_memory_experiment(
     *, registry_path: Path, goal_id: str, agent_id: str
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -437,7 +851,7 @@ def resolve_reward_memory_experiment(
     if not normalized_agent:
         raise ValueError("agent_id must be a public-safe registered agent id")
     registry = _read_json_object(registry_path)
-    goals = registry.get("goals") if isinstance(registry.get("goals"), list) else []
+    goals = cast(list[Any], registry.get("goals")) if isinstance(registry.get("goals"), list) else []
     goal = next(
         (
             item
@@ -448,6 +862,24 @@ def resolve_reward_memory_experiment(
     )
     if goal is None:
         raise ValueError(f"goal_id not found in registry: {goal_id}")
+    return resolve_goal_reward_memory_experiment(
+        goal=goal,
+        agent_id=normalized_agent,
+        registry_role=str(registry.get("registry_role") or "project-local"),
+    )
+
+
+def resolve_goal_reward_memory_experiment(
+    *, goal: Mapping[str, Any], agent_id: str, registry_role: str = "project-local"
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Resolve an already loaded Goal with the same checks as runtime admission.
+
+    Configuration summaries reuse this read-only owner; no provider is contacted.
+    """
+    goal_id = str(goal.get("id") or "")
+    normalized_agent = normalize_todo_claimed_by(agent_id)
+    if not normalized_agent:
+        raise ValueError("agent_id must be a public-safe registered agent id")
     registered_agents = normalize_registered_agents(
         (goal.get("coordination") or {}).get("registered_agents")
         if isinstance(goal.get("coordination"), Mapping)
@@ -455,8 +887,8 @@ def resolve_reward_memory_experiment(
     )
     if normalized_agent not in registered_agents:
         raise ValueError(f"agent_id is not registered for goal {goal_id}")
-    policy = reward_memory_goal_policy(goal)
-    registry_role = str(registry.get("registry_role") or "project-local").strip()
+    policy = reward_memory_goal_policy(goal, agent_id=normalized_agent)
+    registry_role = str(registry_role or "project-local").strip()
     config_runtime_route = {
         "schema_version": "reward_memory_config_runtime_route_v0",
         "registry_source": "invoked_registry",
@@ -469,6 +901,8 @@ def resolve_reward_memory_experiment(
         "readback_status": "not_attempted",
         "exact_readback_verified": False,
     }
+    if policy.get("binding_agent_id"):
+        config_runtime_route["binding_agent_id"] = policy["binding_agent_id"]
     base = {
         "ok": True,
         "schema_version": "reward_memory_experiment_status_v1",
@@ -483,6 +917,8 @@ def resolve_reward_memory_experiment(
         "fail_open": True,
         "config_runtime_route": config_runtime_route,
         "external_writes_performed": False,
+        "host_coverage": reward_memory_host_coverage(),
+        **({"binding_revision": policy["binding_revision"]} if policy.get("binding_revision") else {}),
     }
     if not policy["enabled"]:
         return base | {"status": "disabled", "available": False}, None
@@ -503,6 +939,79 @@ def resolve_reward_memory_experiment(
             "reason_code": "config_unavailable_or_invalid",
             "config_runtime_route": config_runtime_route
             | {"readback_status": "rejected"},
+        }, None
+    try:
+        isolation = validate_reward_memory_goal_agent_scope(
+            config,
+            goal_id=goal_id,
+            agent_id=normalized_agent,
+        )
+    except ValueError:
+        return base | {
+            "status": "config_invalid",
+            "available": False,
+            "reason_code": "goal_agent_provider_scope_mismatch",
+            "config_runtime_route": config_runtime_route
+            | {"readback_status": "rejected"},
+        }, None
+    actual_digest = local_private_config_digest(
+        project=project,
+        config_path=policy["config_path"],
+    )
+    receipt = policy["enablement_receipts"].get(normalized_agent) or {}
+    digest_matches = bool(actual_digest) and all(
+        value == actual_digest
+        for value in (policy["config_digest"], receipt.get("config_digest"))
+    )
+    if not digest_matches:
+        return base | {
+            "status": "enablement_stale",
+            "available": False,
+            "reason_code": "config_digest_missing_or_drifted",
+            "repair": _enablement_repair(
+                goal_id=goal_id,
+                agent_ids=policy["enabled_agents"],
+                agent_id=normalized_agent,
+                binding_agent_id=policy.get("binding_agent_id"),
+            ),
+            "isolation_mode": isolation["isolation_mode"],
+            "actor_binding_verified": isolation["actor_binding_verified"],
+            "writability_verified": False,
+            "exact_readback_verified": False,
+            "config_runtime_route": config_runtime_route
+            | {"readback_status": "drifted"},
+        }, None
+    private_actor_required = isolation["private_corpus_count"] > 0
+    receipt_verified = (
+        receipt.get("status") == "verified"
+        and receipt.get("goal_id") == goal_id
+        and receipt.get("agent_id") == normalized_agent
+        and receipt.get("provider_id")
+        == config["project_provider_binding"]["provider_id"]
+        and receipt.get("isolation_mode") == isolation["isolation_mode"]
+        and receipt.get("writability_verified") is True
+        and receipt.get("exact_readback_verified") is True
+        and (
+            not private_actor_required or receipt.get("actor_binding_verified") is True
+        )
+    )
+    if not receipt_verified:
+        return base | {
+            "status": "enablement_unverified",
+            "available": False,
+            "reason_code": "provider_write_preflight_missing_or_unverified",
+            "repair": _enablement_repair(
+                goal_id=goal_id,
+                agent_ids=policy["enabled_agents"],
+                agent_id=normalized_agent,
+                binding_agent_id=policy.get("binding_agent_id"),
+            ),
+            "isolation_mode": isolation["isolation_mode"],
+            "actor_binding_verified": isolation["actor_binding_verified"],
+            "writability_verified": False,
+            "exact_readback_verified": False,
+            "config_runtime_route": config_runtime_route
+            | {"readback_status": "unverified"},
         }, None
     corpora = config["corpora"]
     surfaces = config["surfaces"]
@@ -526,6 +1035,7 @@ def resolve_reward_memory_experiment(
         ],
         "automatic_ingest": automation["automatic_ingest"],
         "automatic_recall": automation["automatic_recall"],
+        "automation_intent": dict(config["automation_intent"]),
         "fail_open": automation["fail_open"],
         "config_runtime_route": config_runtime_route
         | {
@@ -533,6 +1043,15 @@ def resolve_reward_memory_experiment(
             "exact_readback_verified": True,
         },
         "raw_content_captured": False,
+        "isolation_mode": isolation["isolation_mode"],
+        "actor_binding_verified": (
+            receipt.get("actor_binding_verified") is True
+            if private_actor_required
+            else isolation["actor_binding_verified"]
+        ),
+        "writability_verified": True,
+        "exact_readback_verified": True,
+        "enablement_receipt_status": "verified",
     }
     if len(surfaces) == 1:
         route = resolve_reward_memory_surface_config(config, next(iter(surfaces)))

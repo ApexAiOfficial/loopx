@@ -1,0 +1,445 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {execFileSync} from "node:child_process";
+import {mkdtemp, rm, mkdir, writeFile, symlink, realpath} from "node:fs/promises";
+import {platform, tmpdir} from "node:os";
+import {join} from "node:path";
+import {canonicalWriteScope, comparisonWriteScopes, decideTaskLeaseAcquire, evaluateTaskLeaseAcquireDecision, evaluateTaskLeaseWriteScopesOverlap} from "../../loopx/control_plane/work_items/task_lease_acquire_decision.ts";
+import {normalizeWriteScopes} from "../../loopx/control_plane/work_items/task_lease_acquire.ts";
+import {canonicalTaskLeaseAcquireFacts} from "../../loopx/control_plane/coordination/task_lease_state.ts";
+import {indexCoordinationProjection} from "../../loopx/control_plane/coordination/coordination_projection.ts";
+import {leaseWorkspace, sameLeaseCheckout, observeLeaseWorktree} from "../../loopx/control_plane/work_items/task_lease_workspace.ts";
+
+const repo = "git:github.com/example/project";
+const workspace = {host: "1".repeat(64), common_directory: "2".repeat(64), worktree: "3".repeat(64), repository: repo};
+test("native observation never interprets a caller path relative to the worker", async () => {
+  await assert.rejects(observeLeaseWorktree(".", () => false), /absolute/);
+});
+
+test("observed Git origins use the Todo repository identity contract", {
+  skip: !["darwin", "linux", "win32"].includes(platform()),
+}, async t => {
+  const temporary = await mkdtemp(join(tmpdir(), "loopx-lease-origin-"));
+  t.after(() => rm(temporary, {recursive: true, force: true}));
+  const main = join(temporary, "main"), worktree = join(temporary, "worktree");
+  const git = (...args: string[]) => execFileSync("git", args, {stdio: "pipe"});
+  git("init", main);
+  git("-C", main, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+    "commit", "--allow-empty", "-m", "fixture");
+  git("-C", main, "worktree", "add", "-b", "fixture", worktree);
+  await mkdir(join(worktree, "docs"));
+  await writeFile(join(worktree, "docs/guide.md"), "public fixture\n");
+  const overlaps = (path: string) => evaluateTaskLeaseWriteScopesOverlap({left: ["docs/**"], right: [path]}).overlap === true;
+  for (const [origin, expected] of [
+    ["https://GITHUB.com:443/example/project.git", repo],
+    ["ssh://git@github.com:22/example/project.git", repo],
+    ["git://github.com:9418/example/project.git", repo],
+    ["git@github.com:example/project.git", repo],
+    ["ssh://git@github.com/example//project.git", repo],
+    ["ssh://git@github.com:2222/example/project.git", "git:github.com:2222/example/project"],
+  ]) {
+    await t.test(origin, async () => {
+      git("-C", main, "config", "remote.origin.url", origin);
+      const observed = await observeLeaseWorktree(worktree, overlaps);
+      assert.equal(observed.repository, expected);
+      const input = request();
+      const decision = evaluateTaskLeaseAcquireDecision({...input, other_leases: [],
+        todo: {...input.todo, task_repository: expected}, command: {...input.command, write_workspace: observed}});
+      assert.equal(decision.outcome, "apply");
+    });
+  }
+  for (const origin of [
+    "https://fixture:fixture@github.com/example/project.git",
+    "https://github.com/example/../project.git",
+    "https://github.com/example\\project.git",
+    "https://github.com/example/project.git?query=fixture",
+    "https://github.com/example/project.git#fragment",
+    "file:///example/project.git",
+    "git:github.com/example/project.git",
+  ]) {
+    await t.test(`reject ${origin}`, async () => {
+      git("-C", main, "config", "remote.origin.url", origin);
+      await assert.rejects(observeLeaseWorktree(worktree, overlaps));
+    });
+  }
+});
+
+// Creating file symlinks needs Developer Mode or administrator rights on
+// Windows; the machine-identity path is covered by the observation test above.
+test("normal executable file links preserve the declared independent checkout", {
+  skip: !["darwin", "linux"].includes(platform()),
+}, async t => {
+  const temporary = await mkdtemp(join(tmpdir(), "loopx-lease-links-"));
+  t.after(() => rm(temporary, {recursive: true, force: true}));
+  const main = join(temporary, "main"), checkout = join(temporary, "worktree");
+  const git = (...args: string[]) => execFileSync("git", args, {stdio: "pipe"});
+  git("init", main);
+  git("-C", main, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+    "commit", "--allow-empty", "-m", "fixture");
+  git("-C", main, "config", "remote.origin.url", "https://github.com/example/project.git");
+  git("-C", main, "worktree", "add", "-b", "fixture", checkout);
+  const worktree = await realpath(checkout);
+  const overlaps = (path: string) => evaluateTaskLeaseWriteScopesOverlap({left: ["src/**"], right: [path]}).overlap === true;
+  const bin = join(worktree, "src/node_modules/.bin/tool");
+  const target = join(worktree, "src/node_modules/tool/bin.mjs");
+  await mkdir(join(worktree, "src/node_modules/.bin"), {recursive: true});
+  await mkdir(join(worktree, "src/node_modules/tool"), {recursive: true});
+  await writeFile(join(worktree, ".gitignore"), "node_modules/\n");
+  await writeFile(target, "export {};\n");
+  const original = await observeLeaseWorktree(worktree, overlaps);
+  for (const link of ["../tool/bin.mjs", target]) {
+    await symlink(link, bin);
+    assert.deepEqual(await observeLeaseWorktree(worktree, overlaps), original);
+    await rm(bin);
+  }
+
+  // Ignored dependencies are still inspected, and the same path must recover
+  // after a rejected redirection without changing scopes or checkout identity.
+  const outside = join(temporary, "outside.mjs");
+  await writeFile(outside, "export {};\n");
+  await symlink(outside, bin);
+  await assert.rejects(observeLeaseWorktree(worktree, overlaps), /file links/);
+  await rm(bin);
+  await symlink("../tool/bin.mjs", bin);
+  assert.deepEqual(await observeLeaseWorktree(worktree, overlaps), original);
+
+  await rm(bin);
+  for (const [name, destination] of [
+    ["directory", "../tool"], ["missing", "../tool/missing.mjs"],
+    ["self cycle", "tool"], ["Git administration", "../../../.git"],
+    ["out of scope", "../../../elsewhere.mjs"],
+  ]) {
+    await t.test(name, async () => {
+      await writeFile(join(worktree, "elsewhere.mjs"), "export {};\n");
+      await symlink(destination, bin);
+      await assert.rejects(observeLeaseWorktree(worktree, overlaps), /file links/);
+      await rm(bin);
+    });
+  }
+  await symlink(target, join(worktree, "src/node_modules/tool/chain.mjs"));
+  await symlink("../tool/chain.mjs", bin);
+  await assert.rejects(observeLeaseWorktree(worktree, overlaps), /file links/);
+  await rm(bin);
+  await symlink(join(worktree, "src/node_modules/tool"), join(worktree, "src/alias"));
+  await symlink(join(worktree, "src/alias/bin.mjs"), bin);
+  await assert.rejects(observeLeaseWorktree(worktree, overlaps), /file links/);
+  await rm(bin);
+  await symlink(join(worktree, "src/node_modules/.bin"), join(worktree, "src/node_modules/alias"));
+  await symlink("../alias/../tool/bin.mjs", bin);
+  await assert.rejects(observeLeaseWorktree(worktree, overlaps), /file links/);
+  await rm(bin);
+  await mkdir(join(temporary, "outside-directory"));
+  await symlink(`${worktree}/../outside-directory/../worktree/src/node_modules/tool/bin.mjs`, bin);
+  await assert.rejects(observeLeaseWorktree(worktree, overlaps), /file links/);
+  await rm(bin);
+
+  // A redirected ancestor is rejected even before its requested leaf exists.
+  await symlink(join(worktree, "src"), join(worktree, "future"));
+  await assert.rejects(observeLeaseWorktree(worktree, path =>
+    evaluateTaskLeaseWriteScopesOverlap({left: ["future/new/file.ts"], right: [path]}).overlap === true), /file links/);
+});
+
+function request(other: unknown = {...workspace, worktree: "4".repeat(64)}) {
+  return {handoff_mode: "hard_lease", registered_agents: ["agent-a", "agent-b"],
+    todo: {todo_id: "todo_a", status: "open", claimed_by: "agent-a", excluded_agents: [], task_repository: repo}, lease: null,
+    other_leases: [{todo_id: "todo_b", active: true, effective: true, write_repository: repo as string | null, write_scopes: ["src/**"], write_workspace: other}],
+    command: {owner: "agent-a", idempotency_key: "work-a", ttl_seconds: 60, expected_version: 0, write_scopes: ["src/main.ts"], write_workspace: workspace}};
+}
+test("verified code-edit worktrees enforce same-checkout exclusivity and admit separate worktrees", () => {
+  const result = evaluateTaskLeaseAcquireDecision(request());
+  assert.equal(result.outcome, "apply");
+  assert.equal(result.overlap_advisory_indexes, undefined);
+  assert.deepEqual(result.next_lease?.write_workspace, workspace);
+  for (const other of [null, {...workspace, host: "5".repeat(64)},
+    {...workspace, common_directory: "6".repeat(64), worktree: "7".repeat(64)}]) {
+    const input = request(other);
+    if (other === null) input.other_leases[0].write_repository = null;
+    const separate = evaluateTaskLeaseAcquireDecision(input);
+    assert.equal(separate.outcome, "apply");
+    assert.equal(separate.overlap_advisory_indexes, undefined);
+    assert.deepEqual(input.other_leases[0].write_workspace, other);
+  }
+  for (const other of [workspace, {...workspace, common_directory: "6".repeat(64)}]) {
+    assert.equal(evaluateTaskLeaseAcquireDecision(request(other)).code, "workspace_lease_conflict");
+    assert.equal(sameLeaseCheckout(workspace, other), true);
+  }
+});
+test("unrelated Todos without a shared physical checkout are not blocked on write_scopes", () => {
+  for (const other of [null, workspace]) {
+    const input = request(other);
+    const exclusive = {...input, command: {...input.command, write_workspace: null}};
+    assert.equal(evaluateTaskLeaseAcquireDecision(exclusive).outcome, "apply");
+  }
+});
+
+test("lexical scope aliases do not block separate Todo leases while keeping stored spellings", () => {
+  const now = new Date("2030-01-01T00:00:00Z");
+  const projection = indexCoordinationProjection({
+    goal_id: "goal-a",
+    todos: [
+      {goal_id: "goal-a", todo_id: "todo_target", archive_state: "active", status: "open", claimed_by: "agent-a"},
+      {goal_id: "goal-a", todo_id: "todo_holder", archive_state: "active", status: "open", claimed_by: "agent-b"},
+    ],
+    leases: [{
+      schema_version: "task_lease_v0", goal_id: "goal-a", todo_id: "todo_holder",
+      owner: "agent-b", idempotency_key: "holder", status: "active", version: 1,
+      lease_epoch: 1, write_scopes: ["src/./main.ts"],
+      expires_at: "2031-01-01T00:00:00Z",
+    }],
+  }, "goal-a");
+  const facts = canonicalTaskLeaseAcquireFacts(
+    projection,
+    "goal-a",
+    "todo_target",
+    ["agent-a", "agent-b"],
+    now,
+  );
+  const decision = decideTaskLeaseAcquire({
+    handoff_mode: "hard_lease",
+    registered_agents: ["agent-a", "agent-b"],
+    ...facts,
+    command: {
+      owner: "agent-a",
+      idempotency_key: "target",
+      ttl_seconds: 60,
+      expected_version: 0,
+      write_scopes: normalizeWriteScopes(["src//main.ts"]),
+    },
+  });
+
+  assert.equal(decision.code, "lease_acquire");
+  assert.deepEqual(facts.other_leases[0].write_scopes, ["src/main.ts"]);
+  assert.deepEqual(projection.leases.get("todo_holder")?.write_scopes, ["src/./main.ts"]);
+});
+
+test("malformed retained scopes stay readable without blocking distinct Todos", () => {
+  for (const holderScope of ["../legacy", "src\\legacy"]) {
+    const now = new Date("2030-01-01T00:00:00Z");
+    const projection = indexCoordinationProjection({
+      goal_id: "goal-a",
+      todos: [
+        {goal_id: "goal-a", todo_id: "todo_target", archive_state: "active", status: "open", claimed_by: "agent-a"},
+        {goal_id: "goal-a", todo_id: "todo_holder", archive_state: "active", status: "open", claimed_by: "agent-b"},
+      ],
+      leases: [{
+        schema_version: "task_lease_v0", goal_id: "goal-a", todo_id: "todo_holder",
+        owner: "agent-b", idempotency_key: "holder", status: "active", version: 1,
+        lease_epoch: 1, write_scopes: [holderScope],
+        expires_at: "2031-01-01T00:00:00Z",
+      }],
+    }, "goal-a");
+    const facts = canonicalTaskLeaseAcquireFacts(
+      projection,
+      "goal-a",
+      "todo_target",
+      ["agent-a", "agent-b"],
+      now,
+    );
+    const decision = decideTaskLeaseAcquire({
+      handoff_mode: "hard_lease",
+      registered_agents: ["agent-a", "agent-b"],
+      ...facts,
+      command: {
+        owner: "agent-a",
+        idempotency_key: "target",
+        ttl_seconds: 60,
+        expected_version: 0,
+        write_scopes: ["docs/next.md"],
+      },
+    });
+
+    assert.equal(decision.code, "lease_acquire");
+    assert.deepEqual(facts.other_leases[0].write_scopes, ["**"]);
+    assert.deepEqual(projection.leases.get("todo_holder")?.write_scopes, [holderScope]);
+  }
+});
+
+test("scope comparison canonicalizes aliases while request identity keeps its spelling", () => {
+  const aliases = ["src//main.ts", "src/./main.ts", "./src/main.ts"];
+  assert.deepEqual(normalizeWriteScopes(aliases), aliases);
+  assert.deepEqual(
+    comparisonWriteScopes(aliases),
+    ["src/main.ts"],
+  );
+  assert.deepEqual(
+    normalizeWriteScopes(["src/[./]/main.ts", "src/[//]/main.ts", "src/"]),
+    ["src/[./]/main.ts", "src/[//]/main.ts", "src/"],
+  );
+  assert.equal(
+    evaluateTaskLeaseWriteScopesOverlap({
+      left: ["src//main.ts"],
+      right: ["src/./main.ts"],
+    }).overlap,
+    true,
+  );
+});
+test("scope comparison folds case aliases without rewriting retained or request spelling", () => {
+  assert.deepEqual(normalizeWriteScopes(["src/Main.ts"]), ["src/Main.ts"]);
+  assert.deepEqual(comparisonWriteScopes(["src/Main.ts"]), ["src/Main.ts"]);
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({
+    left: ["src/Main.ts"],
+    right: ["src/main.ts"],
+  }).overlap, true);
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({
+    left: ["src/[A-Z]ain.ts"],
+    right: ["src/main.ts"],
+  }).overlap, true);
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({
+    left: ["src/[A-z]x"],
+    right: ["src/_x"],
+  }).overlap, true);
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({
+    left: ["src/[A-b]x"],
+    right: ["src/cx"],
+  }).overlap, true);
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({
+    left: ["src/[!A-b]x"],
+    right: ["src/cx"],
+  }).overlap, false);
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({
+    left: ["src/Main/"],
+    right: ["src/main/file.ts"],
+  }).overlap, true);
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({
+    left: ["src/Main/[a-z]*.ts"],
+    right: ["src/main/[A-Z]*.ts"],
+  }).overlap, true);
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({
+    left: ["src/Main.ts"],
+    right: ["docs/main.ts"],
+  }).overlap, false);
+  for (const [left, right] of [
+    ["src/Σ.ts", "src/ς.ts"],
+    ["src/ß.ts", "src/SS.ts"],
+    ["src/Σ/", "src/ς/file.ts"],
+    ["src/ß/*.ts", "src/SS/file.ts"],
+    ["src/[Σ]x", "src/ςx"],
+    ["src/[ς]x", "src/Σx"],
+    ["src/[ß]x", "src/SSx"],
+    ["src/[ς-ς].ts", "src/Σ.ts"],
+    ["src/[ß-ß].ts", "src/SS.ts"],
+    ["src/[!ß]S.ts", "src/SS.ts"],
+    ["src/[ρ-ς].ts", "src/Σ.ts"],
+    ["src/[ρ-ς].ts", "src/σ.ts"],
+    ["src/[ß-à].ts", "src/SS.ts"],
+    // A host character may be spelled by several code points. Glob tokens see
+    // the folded stream, so question, class and literal boundaries compose.
+    ["src/?.ts", "src/SS.ts"],
+    ["src/S?.ts", "src/ß.ts"],
+    ["src/[S]S.ts", "src/ß.ts"],
+    ["src/???.ts", "src/ﬃ.ts"],
+    ["src/[!Σ].ts", "src/SS.ts"],
+    ["src/[!Σ]S.ts", "src/SSS.ts"],
+    // Wide intervals keep their original bounds, so the alias is found inside
+    // the interval instead of by walking or widening it.
+    ["src/[ß-\u20df].ts", "src/SS.ts"],
+    ["src/[ß-\u20df].ts", "src/ẞ.ts"],
+    ["src/[\u212a-\u412a].ts", "src/K.ts"],
+  ]) {
+    assert.equal(evaluateTaskLeaseWriteScopesOverlap({left: [left], right: [right]}).overlap, true, `${left} overlaps ${right}`);
+  }
+  for (const [left, right] of [
+    ["src/[!Σ]x", "src/ςx"],
+    ["src/[!ς]x", "src/Σx"],
+    ["src/[!ß]x", "src/SSx"],
+    ["src/[!ß]S.ts", "src/S.ts"],
+    ["src/[ß-ß].ts", "src/S.ts"],
+    ["src/[!ρ-ς].ts", "src/Σ.ts"],
+    ["src/[!ß-\u20df].ts", "src/SS.ts"],
+    ["src/[\u212a-\u412a].ts", "src/i.ts"],
+    ["src/?.ts", "src/SSS.ts"],
+    ["src/???.ts", "src/ß.ts"],
+    ["src/S?.ts", "src/Σ.ts"],
+    ["src/[S]S.ts", "src/S.ts"],
+    ["src/[!ß].ts", "src/SS.ts"],
+    ["src/[!Σ].ts", "src/Σ.ts"],
+  ]) {
+    assert.equal(evaluateTaskLeaseWriteScopesOverlap({left: [left], right: [right]}).overlap, false, `${left} excludes ${right}`);
+  }
+});
+test("glob matching consumes code points, not UTF-16 code units", () => {
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({
+    left: ["src/?.ts"],
+    right: ["src/\u{1f600}.ts"],
+  }).overlap, true);
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({
+    left: ["src/[\u{1f600}].ts"],
+    right: ["src/\u{1f600}.ts"],
+  }).overlap, true);
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({
+    left: ["src/[\u{10000}-\u{10002}].ts"],
+    right: ["src/\u{10001}.ts"],
+  }).overlap, true);
+});
+test("scope comparison and matching share literal right-bracket character classes", () => {
+  for (const [scope, target] of [
+    ["src/[]/./]x", "src/.x"],
+    ["src/[]/./]x", "src/]x"],
+    ["src/[!]/./]x", "src/ax"],
+  ]) {
+    assert.equal(canonicalWriteScope(scope), scope);
+    assert.equal(evaluateTaskLeaseWriteScopesOverlap({left: [scope], right: [target]}).overlap, true);
+  }
+  assert.equal(evaluateTaskLeaseWriteScopesOverlap({left: ["src/[!]/./]x"], right: ["src/.x"]}).overlap, false);
+});
+test("a known same-checkout collision wins over changed repository metadata", () => {
+  const other = {...workspace, repository: "git:github.com/example/other"};
+  const input = request(other);
+  input.other_leases[0].write_repository = other.repository;
+  assert.equal(evaluateTaskLeaseAcquireDecision(input).code, "workspace_lease_conflict");
+});
+test("worktree identity cannot weaken Todo ownership or repository identity", () => {
+  const input = request();
+  assert.equal(evaluateTaskLeaseAcquireDecision({...input, todo: {...input.todo, claimed_by: "agent-b"}}).outcome, "rejected");
+  assert.equal(evaluateTaskLeaseAcquireDecision({...input, command: {...input.command,
+    write_workspace: {...workspace, repository: "git:github.com/example/other"}}}).code, "lease_workspace_repository_mismatch");
+  assert.throws(() => leaseWorkspace({...workspace, worktree: ""}));
+  assert.throws(() => leaseWorkspace({...workspace, unchecked_path: "/tmp"}));
+});
+
+test("PostgreSQL retains worktree identity and overlap receipts across reload", {skip: !process.env.LOOPX_TEST_POSTGRES_URL}, async () => {
+  const {Pool} = await import("pg");
+  const {randomUUID} = await import("node:crypto");
+  const {PostgreSqlAuthorityStore, installPostgreSqlAuthorityStoreSchema} = await import("../../loopx/control_plane/coordination/postgresql_authority_store.ts");
+  const {executeCanonicalTaskLeaseAcquire} = await import("../../loopx/control_plane/coordination/task_lease_acquire.ts");
+  const {authorityProjectionFixture} = await import("./authority_projection_fixture.ts");
+  const pool = new Pool({connectionString: process.env.LOOPX_TEST_POSTGRES_URL});
+  const database = {connect: async () => {
+    const client = await pool.connect();
+    return {query: async (text: string, values?: readonly unknown[]) => client.query(text, values ? [...values] : undefined),
+      release: () => client.release()};
+  }};
+  const goal = `workspace-${randomUUID()}`, options = {goal_id: goal, tenant_id: `tenant-${randomUUID()}`};
+  try {
+    await installPostgreSqlAuthorityStoreSchema(database, `postgresql:${"b".repeat(32)}`);
+    const store = new PostgreSqlAuthorityStore(database, options);
+    const todos = ["alpha", "beta", "legacy"].map(key => ({todo_id: `todo_${key}`, role: "agent", status: "open", done: false,
+      archive_state: "active", task_class: "advancement_task", text: "Independent code edits", claimed_by: "agent-a", task_repository: repo}));
+    assert.equal((await store.commitAuthority({expected_provider_revision: null, operation_id: "seed", events: [], receipts: [],
+      next_projection: authorityProjectionFixture(goal, todos, [], "native", {handoff_mode: "hard_lease"})})).status, "applied");
+    const command = {goal_id: goal, todo_id: "todo_alpha", owner: "agent-a", idempotency_key: "alpha",
+      expected_version: 0, ttl_seconds: 600, write_scopes: ["src/**"], registered_agents: ["agent-a"], now: new Date(), write_workspace: workspace};
+    const legacyCommand = {...command, todo_id: "todo_legacy", idempotency_key: "legacy", write_workspace: null};
+    const legacy = await executeCanonicalTaskLeaseAcquire(store, legacyCommand);
+    assert.equal(legacy.status, "applied");
+    const first = await executeCanonicalTaskLeaseAcquire(store, command);
+    assert.equal(first.status, "applied");
+    assert.equal(first.integration_overlap_advisories, undefined);
+    const reopened = new PostgreSqlAuthorityStore(database, options);
+    const replay = await executeCanonicalTaskLeaseAcquire(reopened, command);
+    assert.deepEqual(replay.original_receipt, first.original_receipt);
+    assert.deepEqual(replay.lease, first.lease);
+    const second = await executeCanonicalTaskLeaseAcquire(reopened, {...command, todo_id: "todo_beta", idempotency_key: "beta",
+      write_workspace: {...workspace, worktree: "4".repeat(64)}});
+    assert.equal(second.status, "applied");
+    assert.equal(second.integration_overlap_advisories, undefined);
+    const retained = await executeCanonicalTaskLeaseAcquire(reopened, legacyCommand);
+    assert.deepEqual(retained.original_receipt, legacy.original_receipt);
+    assert.deepEqual(retained.lease, legacy.lease);
+  } finally {
+    for (const table of ["authority_receipts", "authority_events", "authority_commits", "authority_heads"]) {
+      await pool.query(`DELETE FROM loopx_control_plane.${table} WHERE tenant_id=$1 AND goal_id=$2`, [options.tenant_id, goal]);
+    }
+    await pool.end();
+  }
+});

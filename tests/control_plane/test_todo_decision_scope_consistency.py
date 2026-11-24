@@ -10,9 +10,9 @@ from loopx.control_plane.testing.quota_fixtures import (
 from loopx.control_plane.todos.decision_scope import (
     build_required_decision_scope_consistency,
     build_required_decision_scope_repair_hint,
-    build_standing_decision_authority,
     standing_decision_authority_for_agent,
 )
+from loopx.control_plane.todos.standing_decision import standing_decision_source_items
 from loopx.quota import build_quota_should_run
 
 AGENT_ID = "codex-quality-qualification"
@@ -22,6 +22,50 @@ SCOPE = {
     "granularity": "action",
     "scope_key": "publish_quality_contract",
 }
+
+
+def project_standing_authority(items, *, legacy_source_order=True, canonical_records=False):
+    """Exercise the production source decoder and composed Todo read transaction."""
+    from loopx.control_plane.todos.goal_todo_projection import source_todo_fields
+
+    return source_todo_fields(
+        [], lineage=[],
+        standing_items=standing_decision_source_items(items, canonical_records=canonical_records),
+        legacy_source_order=legacy_source_order and not canonical_records,
+    ).get("standing_decision_authority")
+
+
+def test_explicit_gate_scope_is_not_cancelled_by_another_claimant() -> None:
+    gate = {"todo_id": "todo_scoped_gate", "status": "open", "task_class": "user_gate",
+            "blocks_agent": AGENT_ID, "claimed_by": "agent-b", "decision_scope": SCOPE}
+    result = build_required_decision_scope_consistency(
+        _agent_summary(), _user_summary(gate), agent_id=AGENT_ID,
+        registered_agent_ids=[AGENT_ID, "agent-b"],
+    )
+    assert result["ok"] is True
+    assert result["errors"] == []
+
+
+def test_exact_link_to_other_work_cannot_satisfy_a_required_scope() -> None:
+    gate = {"todo_id": "todo_scoped_gate", "status": "open", "task_class": "user_gate",
+            "blocks_agent": AGENT_ID, "unblocks_todo_id": "todo_different_work", "decision_scope": SCOPE}
+    result = build_required_decision_scope_consistency(
+        _agent_summary(), _user_summary(gate), agent_id=AGENT_ID,
+    )
+    assert result["ok"] is False
+    assert result["errors"][0]["reason_code"] == "required_decision_scope_target_mismatch"
+    hint = build_required_decision_scope_repair_hint(result)
+    assert "owner intent" in hint["repair_focus"]
+    assert "invent approval" in hint["repair_focus"]
+
+
+def test_standing_scope_legacy_codec_is_retained() -> None:
+    authority = {"entries": [{"active": True, "global_gate": "yes", "decision_scope": "direction:action:publish_quality_contract"}]}
+    scoped = standing_decision_authority_for_agent(authority, agent_id=AGENT_ID)
+    assert scoped["active_count"] == 1
+    assert build_required_decision_scope_consistency(
+        _agent_summary(), {}, agent_id=AGENT_ID, standing_decision_authority=authority,
+    )["standing_authority_match_count"] == 1
 
 
 def _agent_summary() -> dict:
@@ -258,7 +302,7 @@ def test_standing_approval_satisfies_matching_agent_scope() -> None:
         "granularity": "goal",
         "scope_key": "benchmark_pr_self_merge",
     }
-    authority = build_standing_decision_authority(
+    authority = project_standing_authority(
         [
             {
                 "todo_id": "todo_standing_approval",
@@ -305,7 +349,7 @@ def test_latest_rejection_revokes_exact_standing_approval() -> None:
         "blocks_agent": AGENT_ID,
         "decision_scope": "write_scope:goal:benchmark_pr_self_merge",
     }
-    authority = build_standing_decision_authority(
+    authority = project_standing_authority(
         [
             {
                 **base,
@@ -360,7 +404,7 @@ def test_latest_rejection_revokes_exact_standing_approval() -> None:
 def test_non_authoritative_completed_items_do_not_become_standing(
     invalid_item: dict,
 ) -> None:
-    assert build_standing_decision_authority([invalid_item]) is None
+    assert project_standing_authority([invalid_item]) is None
 
 
 @pytest.mark.parametrize("decision_outcome", ["reject", "cancel"])

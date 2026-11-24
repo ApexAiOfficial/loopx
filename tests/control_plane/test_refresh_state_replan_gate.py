@@ -8,21 +8,24 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from canonical_authority_fixture import initialize_canonical_source_fixture
 
 from loopx.cli import main as cli_main
+from loopx.control_plane.effect_runtime import EffectRuntimeRejected
 from loopx.control_plane.status.autonomous_replan_projection import (
     AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD,
+)
+from loopx.control_plane.work_items.autonomous_replan_obligation import (
+    build_autonomous_replan_cli_actions,
 )
 from loopx.control_plane.work_items.semantic_replan_writeback import (
     ReplanWritebackRejected,
     _obligation_was_created_by_current_completion,
+    enforce_open_replan_writeback,
     qualify_replan_writeback,
     project_replan_writeback_rejection,
 )
-from loopx.state_refresh import (
-    enforce_open_replan_writeback,
-    refresh_state_run,
-)
+from loopx.state_refresh import refresh_state_run
 from loopx.todos import add_goal_todo
 
 GOAL_ID = "replan-gate-fixture"
@@ -31,8 +34,8 @@ OTHER_AGENT_ID = "codex-replan-gate-other-agent"
 STATE_TEXT = "# Active Goal State\n"
 
 
-def _completed_advancement_chain_state() -> str:
-    """Five completed slices with explicit lineage and no succession warning.
+def _completed_advancement_chain_state(count: int = 5) -> str:
+    """Completed slices with explicit lineage and no succession warning.
 
     The final non-advancement anchor keeps this fixture focused on the outcome
     checkpoint rule instead of the independent completed-without-successor
@@ -40,10 +43,10 @@ def _completed_advancement_chain_state() -> str:
     """
 
     lines = ["## Agent Todo", ""]
-    for index in range(5):
+    for index in range(count):
         successor_id = (
             f"todo_completed_slice_{index + 1}"
-            if index < 4
+            if index < count - 1
             else "todo_completed_outcome_anchor"
         )
         lines.extend(
@@ -135,9 +138,65 @@ def _current_obligation_id(
     return str(obligation["obligation_id"])
 
 
+def _stride_decision_for_obligation(obligation: dict) -> dict:
+    from loopx.control_plane.work_items.progress_observation import (
+        build_replan_action_packet,
+    )
+
+    packet = build_replan_action_packet(obligation, goal_id=GOAL_ID, agent_id=AGENT_ID)
+    return dict(packet["stride_control"]["minimal_example"])
+
+
+def _stride_vision_for(
+    runs: list[dict],
+    *,
+    state_text: str = STATE_TEXT,
+    outcome: str = "stop",
+    acceptance_summary: str = "Review the open obligation against current evidence.",
+    evidence_ref: str = "evidence:stride-review",
+    registry_goal: dict | None = None,
+) -> dict:
+    obligation, _ = qualify_replan_writeback(
+        newest_first_runs=runs,
+        state_text=state_text,
+        agent_id=AGENT_ID,
+        goal_id=GOAL_ID,
+        registry_goal=registry_goal,
+    )
+    assert obligation is not None
+    path_delta: dict = {
+        "schema_version": "goal_path_delta_v0",
+        "outcome": outcome,
+        "prior_assumption": "Prior slices were still advancing.",
+        "observed_reality": "Review trigger fired under current evidence.",
+        "evidence_refs": [evidence_ref],
+    }
+    if outcome == "stop":
+        path_delta["stopped"] = ["Stop repeating the prior unchanged route."]
+    elif outcome == "continue":
+        path_delta["retained"] = ["Retain the current evidence-backed route."]
+    return {
+        "schema_version": "goal_vision_replan_contract_v0",
+        "agent_id": AGENT_ID,
+        "state": "active",
+        "vision_patch": {"acceptance_summary": acceptance_summary},
+        "path_delta": path_delta,
+        "stride_decision": _stride_decision_for_obligation(obligation),
+    }
+
+
 def test_maintenance_writeback_rejected_when_replan_due() -> None:
+    runs = _durable_runs(AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD)
+    with pytest.raises(ValueError, match="stride_decision"):
+        _call_gate(runs=runs)
     with pytest.raises(ValueError) as exc:
-        _call_gate(runs=_durable_runs(AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD))
+        enforce_open_replan_writeback(
+            newest_first_runs=runs,
+            state_text=STATE_TEXT,
+            agent_id=AGENT_ID,
+            goal_id=GOAL_ID,
+            agent_vision=_stride_vision_for(runs),
+        )
     message = str(exc.value)
     assert "autonomous replan obligation" in message
     assert "typed semantic delta" in message
@@ -145,13 +204,13 @@ def test_maintenance_writeback_rejected_when_replan_due() -> None:
 
 
 def test_typed_surface_delta_satisfies_periodic_obligation() -> None:
+    runs = _durable_runs(AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD)
     semantic_delta = enforce_open_replan_writeback(
-        newest_first_runs=_durable_runs(
-            AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD
-        ),
+        newest_first_runs=runs,
         state_text=STATE_TEXT,
         agent_id=AGENT_ID,
         goal_id=GOAL_ID,
+        agent_vision=_stride_vision_for(runs),
         progress_observation={
             "schema_version": "typed_progress_observation_v0",
             "work_item_id": "todo-replan-slice",
@@ -166,6 +225,53 @@ def test_typed_surface_delta_satisfies_periodic_obligation() -> None:
 
 def test_writeback_allowed_when_replan_not_due() -> None:
     _call_gate(runs=_durable_runs(5))
+
+
+def test_turn_guard_without_replan_target_defers_new_obligation() -> None:
+    runs = _durable_runs(AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD)
+
+    semantic_delta = enforce_open_replan_writeback(
+        newest_first_runs=runs,
+        state_text=STATE_TEXT,
+        agent_id=AGENT_ID,
+        goal_id=GOAL_ID,
+        guard_scoped=True,
+        guard_semantic_replan_obligation_id=None,
+    )
+
+    assert semantic_delta is None
+
+
+def test_turn_guard_keeps_its_exact_replan_target_strict() -> None:
+    runs = _durable_runs(AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD)
+    obligation_id = _current_obligation_id(runs)
+
+    with pytest.raises(ReplanWritebackRejected):
+        enforce_open_replan_writeback(
+            newest_first_runs=runs,
+            state_text=STATE_TEXT,
+            agent_id=AGENT_ID,
+            goal_id=GOAL_ID,
+            guard_scoped=True,
+            guard_semantic_replan_obligation_id=obligation_id,
+        )
+
+
+@pytest.mark.parametrize("run_count", [0, AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD])
+def test_selected_replan_cannot_write_when_its_source_cannot_be_reconstructed(run_count: int) -> None:
+    # Deferring an obligation not selected by an ordinary Turn is legal. Losing
+    # the exact source of an already selected replan must instead fail closed.
+    with pytest.raises(EffectRuntimeRejected, match="identity conflicts"):
+        enforce_open_replan_writeback(
+            newest_first_runs=_durable_runs(run_count), state_text=STATE_TEXT,
+            agent_id=AGENT_ID, goal_id=GOAL_ID, guard_scoped=True,
+            guard_semantic_replan_obligation_id="replan-1111111111111111",
+            progress_observation={
+                "schema_version": "typed_progress_observation_v0",
+                "result_class": "blocked", "work_item_id": "replan-1111111111111111",
+                "blocker_id": "blocker:source-missing", "evidence_ids": ["evidence:source-read"],
+            },
+        )
 
 
 def _typed_repeat_runs() -> list[dict]:
@@ -196,17 +302,26 @@ def _typed_repeat_runs() -> list[dict]:
 
 def test_repair_delta_claim_alone_cannot_close_typed_repeat_obligation() -> None:
     runs = _typed_repeat_runs()
+    stop_vision = _stride_vision_for(runs)
     # Semantic-gate level: a writeback whose progress observation does not
     # carry a NEW typed semantic delta relative to the obligation baseline is
     # rejected. This pins enforce_open_replan_writeback; the full
     # repair-delta command path (blocker todo + --repair-delta-kind blocker)
     # is covered by the refresh_state_run regressions below.
+    with pytest.raises(ValueError, match="stride_decision"):
+        enforce_open_replan_writeback(
+            newest_first_runs=runs,
+            state_text=STATE_TEXT,
+            agent_id=AGENT_ID,
+            goal_id=GOAL_ID,
+        )
     with pytest.raises(ValueError) as exc:
         enforce_open_replan_writeback(
             newest_first_runs=runs,
             state_text=STATE_TEXT,
             agent_id=AGENT_ID,
             goal_id=GOAL_ID,
+            agent_vision=stop_vision,
         )
     message = str(exc.value)
     assert "autonomous replan obligation" in message
@@ -218,6 +333,7 @@ def test_repair_delta_claim_alone_cannot_close_typed_repeat_obligation() -> None
             state_text=STATE_TEXT,
             agent_id=AGENT_ID,
             goal_id=GOAL_ID,
+            agent_vision=stop_vision,
             progress_observation={
                 "schema_version": "typed_progress_observation_v0",
                 "result_class": "blocked",
@@ -237,6 +353,7 @@ def test_atomic_new_blocker_delta_closes_typed_repeat_obligation() -> None:
         state_text=STATE_TEXT,
         agent_id=AGENT_ID,
         goal_id=GOAL_ID,
+        agent_vision=_stride_vision_for(runs),
         progress_observation={
             "schema_version": "typed_progress_observation_v0",
             "result_class": "blocked",
@@ -273,6 +390,7 @@ def _call_refresh_state_run(
     runtime_root: Path,
     project: Path,
     progress_observation: dict | None = None,
+    agent_vision_packet: dict | None = None,
 ) -> dict:
     return refresh_state_run(
         registry_path=registry_path,
@@ -288,9 +406,40 @@ def _call_refresh_state_run(
         autonomous_replan_recorded=True,
         repair_delta_kinds=["blocker"],
         progress_observation=progress_observation,
+        agent_vision_packet=agent_vision_packet,
         dry_run=False,
         sync_global=False,
     )
+
+
+def _replan_gate_stop_vision(registry_path: Path, runtime_root: Path) -> dict:
+    from loopx.quota import build_quota_should_run
+    from loopx.status import collect_status
+
+    status_payload = collect_status(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        goal_id=GOAL_ID,
+        limit=20,
+    )
+    guard = build_quota_should_run(status_payload, goal_id=GOAL_ID, agent_id=AGENT_ID)
+    return {
+        "schema_version": "goal_vision_replan_contract_v0",
+        "agent_id": AGENT_ID,
+        "state": "active",
+        "vision_patch": {"acceptance_summary": "Review the blocked external gate."},
+        "path_delta": {
+            "schema_version": "goal_path_delta_v0",
+            "outcome": "stop",
+            "prior_assumption": "Prior blocker remained active.",
+            "observed_reality": "Reviewing typed blocker delta against baseline.",
+            "stopped": ["Stop repeating the prior blocker claim."],
+            "evidence_refs": ["evidence-external-review"],
+        },
+        "stride_decision": dict(
+            guard["replan_action_packet"]["stride_control"]["minimal_example"]
+        ),
+    }
 
 
 def _replan_gate_tmp_fixture(
@@ -325,6 +474,7 @@ def _replan_gate_tmp_fixture(
         runtime_root / "goals" / GOAL_ID / "runs" / "index.jsonl"
     )
     _write_typed_repeat_runs_index(runs_index)
+    initialize_canonical_source_fixture(runtime_root, GOAL_ID, state_path=state, provider="sqlite")
     return registry_path, project, runtime_root, runs_index
 
 
@@ -343,8 +493,47 @@ def test_refresh_state_run_repair_delta_alone_rejected_without_new_typed_delta(
             registry_path=registry_path,
             runtime_root=runtime_root,
             project=project,
+            agent_vision_packet=_replan_gate_stop_vision(registry_path, runtime_root),
         )
     assert runs_index.read_text().splitlines() == before
+
+
+def test_agent_refresh_uses_indexed_evidence_without_reading_historical_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from loopx.history import load_index
+
+    registry, project, runtime, index = _replan_gate_tmp_fixture(tmp_path)
+    existing = tmp_path / "previous.json"
+    missing = tmp_path / "previous.md"
+    existing.write_text("{}")
+    runs = [json.loads(line) for line in index.read_text().splitlines()]
+    for run in runs:
+        run.update(json_path=str(existing), markdown_path=str(missing))
+    before = "".join(json.dumps(run) + "\n" for run in runs)
+    index.write_text(before)
+    vision = _replan_gate_stop_vision(registry, runtime)
+
+    observed = []
+    exists = Path.exists
+
+    def observe_exists(path, *args, **kwargs):
+        if path in (existing, missing):
+            observed.append(path)
+        return exists(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", observe_exists)
+    with pytest.raises(ValueError, match="typed semantic delta"):
+        _call_refresh_state_run(
+            registry_path=registry, runtime_root=runtime, project=project,
+            agent_vision_packet=vision,
+        )
+    assert index.read_text() == before
+    assert not observed
+
+    records, _ = load_index(index)
+    assert all(row["json_exists"] and not row["markdown_exists"] for row in records)
+    assert set(observed) == {existing, missing}
 
 
 def test_refresh_state_run_atomic_blocker_delta_persists_repair_and_semantic_evidence(
@@ -357,6 +546,7 @@ def test_refresh_state_run_atomic_blocker_delta_persists_repair_and_semantic_evi
         registry_path=registry_path,
         runtime_root=runtime_root,
         project=project,
+        agent_vision_packet=_replan_gate_stop_vision(registry_path, runtime_root),
         progress_observation={
             "schema_version": "typed_progress_observation_v0",
             "result_class": "blocked",
@@ -373,13 +563,13 @@ def test_refresh_state_run_atomic_blocker_delta_persists_repair_and_semantic_evi
     persisted = json.loads(json_path.read_text(encoding="utf-8"))
     ack = persisted.get("autonomous_replan_ack") or {}
     assert ack.get("recorded") is True
-    assert (ack.get("delta_contract") or {}).get("delta_kinds") == ["blocker"]
+    assert "blocker" in (ack.get("delta_contract") or {}).get("delta_kinds", [])
     semantic_delta = ack.get("semantic_delta") or {}
     assert semantic_delta.get("accepted") is True
     assert semantic_delta.get("satisfying_outcomes") == ["new_concrete_blocker"]
 
 
-def test_refresh_state_run_rejects_maintenance_writeback(tmp_path: Path) -> None:
+def test_legacy_material_run_cadence_rejects_maintenance_writeback(tmp_path: Path) -> None:
     project = tmp_path / "project"
     state = (
         project
@@ -398,6 +588,7 @@ def test_refresh_state_run_rejects_maintenance_writeback(tmp_path: Path) -> None
                     {
                         "id": GOAL_ID,
                         "status": "active",
+                        "execution_profile": {"replan_after_completed_todos": 5},
                         "repo": str(project),
                         "state_file": str(state.relative_to(project)),
                         "coordination": {
@@ -423,6 +614,7 @@ def test_refresh_state_run_rejects_maintenance_writeback(tmp_path: Path) -> None
         for run in _durable_runs(AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD):
             handle.write(json.dumps(run) + "\n")
 
+    initialize_canonical_source_fixture(runtime_root, GOAL_ID, state_path=state, provider="sqlite")
     with pytest.raises(ValueError) as exc:
         refresh_state_run(
             registry_path=registry_path,
@@ -440,7 +632,7 @@ def test_refresh_state_run_rejects_maintenance_writeback(tmp_path: Path) -> None
             sync_global=False,
         )
     message = str(exc.value)
-    assert "typed semantic delta" in message
+    assert "stride_decision" in message
 
 
 def _prior_periodic_ack() -> dict:
@@ -625,6 +817,50 @@ def test_rotated_vision_obligation_contains_all_three_acceptance_gaps() -> None:
     assert obligation["triggers"][2]["completed_todo_threshold"] == 5
 
 
+def test_admitted_vision_checkpoint_survives_a_new_periodic_review() -> None:
+    admission_runs = [_open_vision_after_prior_ack()]
+    arguments = {"state_text": STATE_TEXT, "agent_id": AGENT_ID, "goal_id": GOAL_ID}
+    admitted, _ = qualify_replan_writeback(newest_first_runs=admission_runs, **arguments)
+    assert admitted is not None
+    assert [trigger["kind"] for trigger in admitted["triggers"]] == [
+        "vision_acceptance_gap",
+        "vision_outcome_checkpoint_required",
+    ]
+
+    later_runs = [
+        {**run, "generated_at": f"2026-08-13T12:{index:02d}:00+08:00"}
+        for index, run in enumerate(_durable_runs(AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD))
+    ][::-1]
+    current, _ = qualify_replan_writeback(
+        newest_first_runs=[*later_runs, *admission_runs], **arguments,
+    )
+    assert current is not None
+    assert [trigger["kind"] for trigger in current["triggers"]] == ["periodic_review_due"]
+    assert current["obligation_id"] != admitted["obligation_id"]
+
+    bound = {
+        **arguments,
+        "newest_first_runs": [*later_runs, *admission_runs],
+        "guard_scoped": True,
+        "guard_semantic_replan_obligation_id": admitted["obligation_id"],
+        "receipt_bound_guard_recorded_at": "2026-08-13T11:28:00+08:00",
+        "receipt_bound_guard_turn_instance_id": "vision-before-periodic",
+    }
+    with pytest.raises(ReplanWritebackRejected, match="typed semantic delta"):
+        enforce_open_replan_writeback(**bound)
+    delta = enforce_open_replan_writeback(
+        **bound,
+        agent_vision={
+            "vision_patch": {"acceptance_summary": "An independent check supports continuing."},
+            "path_delta": {"outcome": "continue", "evidence_refs": ["evidence:checkpoint-review"]},
+            "stride_decision": _stride_decision_for_obligation(admitted),
+        },
+    )
+    assert delta is not None
+    assert delta["obligation_id"] == admitted["obligation_id"]
+    assert delta["satisfying_outcomes"] == ["fresh_vision_path_outcome"]
+
+
 def test_refresh_state_run_rejects_maintenance_after_vision_obligation_rotation(
     tmp_path: Path,
 ) -> None:
@@ -661,6 +897,7 @@ def test_refresh_state_run_rejects_maintenance_after_vision_obligation_rotation(
         for run in reversed(_rotated_vision_runs()):
             handle.write(json.dumps(run) + "\n")
 
+    initialize_canonical_source_fixture(runtime_root, GOAL_ID, state_path=state, provider="sqlite")
     before = state.read_text(encoding="utf-8")
     with pytest.raises(ValueError, match="required vision outcome"):
         refresh_state_run(
@@ -735,7 +972,8 @@ def test_current_obligation_runnable_successor_is_the_semantic_receipt() -> None
     )
 
     assert after_transition is None
-    assert semantic_delta is None
+    assert semantic_delta["accepted"] is True
+    assert semantic_delta["obligation_id"] == obligation["obligation_id"]
 
 
 def test_rearmed_vision_obligation_accepts_only_its_fresh_successor_id() -> None:
@@ -782,7 +1020,8 @@ def test_rearmed_vision_obligation_accepts_only_its_fresh_successor_id() -> None
 
     assert rearmed_id != original_id
     assert remaining is None
-    assert semantic_delta is None
+    assert semantic_delta["accepted"] is True
+    assert semantic_delta["obligation_id"] == rearmed_id
 
 
 def test_completed_or_wrong_obligation_successor_cannot_close_rotated_duty() -> None:
@@ -809,9 +1048,18 @@ def test_completed_or_wrong_obligation_successor_cannot_close_rotated_duty() -> 
 
 
 def test_rotated_vision_obligation_accepts_fresh_evidence_linked_path() -> None:
+    runs = _rotated_vision_runs()
+    state_text = _completed_advancement_chain_state()
+    obligation, _ = qualify_replan_writeback(
+        newest_first_runs=runs,
+        state_text=state_text,
+        agent_id=AGENT_ID,
+        goal_id=GOAL_ID,
+    )
+    assert obligation is not None
     semantic_delta = enforce_open_replan_writeback(
-        newest_first_runs=_rotated_vision_runs(),
-        state_text=_completed_advancement_chain_state(),
+        newest_first_runs=runs,
+        state_text=state_text,
         agent_id=AGENT_ID,
         goal_id=GOAL_ID,
         agent_vision={
@@ -822,6 +1070,7 @@ def test_rotated_vision_obligation_accepts_fresh_evidence_linked_path() -> None:
                 "outcome": "replan",
                 "evidence_refs": ["evidence:current-outcome"],
             },
+            "stride_decision": _stride_decision_for_obligation(obligation),
         },
     )
     assert semantic_delta is not None
@@ -886,6 +1135,32 @@ def test_rotated_vision_obligation_accepts_terminal_progress(
     assert semantic_delta["satisfying_outcomes"] == [expected_outcome]
 
 
+def test_writeback_gate_rejects_known_blocker_from_projected_history() -> None:
+    observation = {
+        "schema_version": "typed_progress_observation_v0",
+        "result_class": "blocked",
+        "surface_id": "surface-current-path",
+        "work_item_id": "todo-current-path",
+        "blocker_id": "blocker-current-path",
+        "evidence_ids": ["evidence-current-blocker"],
+    }
+    runs = [{
+        "agent_id": AGENT_ID,
+        "generated_at": "2026-08-13T11:28:00+08:00",
+        "progress_observation": observation,
+    }, *_rotated_vision_runs()]
+    with pytest.raises(ReplanWritebackRejected, match="blocker already recorded"):
+        enforce_open_replan_writeback(
+            newest_first_runs=runs,
+            state_text=_completed_advancement_chain_state(),
+            agent_id=AGENT_ID, goal_id=GOAL_ID,
+            progress_observation={
+                **observation, "work_item_id": "replan-0123456789abcdef",
+                "evidence_ids": ["evidence-new-readback"],
+            },
+        )
+
+
 def test_semantic_no_followup_cannot_replace_todo_lifecycle_settlement() -> None:
     with pytest.raises(ValueError, match="first run loopx todo complete"):
         enforce_open_replan_writeback(
@@ -929,13 +1204,16 @@ def test_todo_lifecycle_rejection_projects_exact_direct_settlement() -> None:
     ]
     actions = transition["next_cli_actions"]
     assert "--todo-id todo_unsettled_completion" in actions[0]
-    assert "--turn-instance-id turn-unsettled" in actions[0]
+    assert "--completion-identity-key turn-unsettled" in actions[0]
+    assert "--turn-instance-id" not in actions[0]
     assert "--agent-id codex-replan-gate-agent" in actions[0]
     assert all("refresh-state" not in action for action in actions)
     assert all("spend-slot" not in action for action in actions)
 
 
+@pytest.mark.parametrize("independent_deferred", [False, True])
 def test_todo_complete_then_refresh_cli_projects_direct_settlement(
+    independent_deferred: bool,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -985,6 +1263,21 @@ def test_todo_complete_then_refresh_cli_projects_direct_settlement(
         ),
         encoding="utf-8",
     )
+    from canonical_authority_fixture import initialize_canonical_authority
+    from loopx.control_plane.coordination.runtime_shadow import (
+        build_todo_runtime_shadow_projection,
+    )
+
+    initialize_canonical_authority(
+        runtime_root,
+        GOAL_ID,
+        build_todo_runtime_shadow_projection(
+            goal_id=GOAL_ID,
+            todos=[],
+            handoff_mode="soft_claim",
+        ),
+        state_path=state,
+    )
     assert cli_main(
         [
             "--registry",
@@ -1014,6 +1307,15 @@ def test_todo_complete_then_refresh_cli_projects_direct_settlement(
         )
         for index in (1, 2)
     ]
+
+    independent = None
+    if independent_deferred:
+        independent = add_goal_todo(
+            registry_path=registry_path, goal_id=GOAL_ID, role="agent",
+            text="Evaluate independent work when its window opens.",
+            task_class="advancement_task", claimed_by=AGENT_ID,
+            status="deferred", resume_when="resume_at:2099-01-01T00:00:00Z",
+        )
 
     for todo in todos:
         assert cli_main(
@@ -1088,6 +1390,16 @@ def test_todo_complete_then_refresh_cli_projects_direct_settlement(
     assert all("refresh-state" not in action for action in actions)
     assert all("spend-slot" not in action for action in actions)
 
+    if independent:
+        assert cli_main([
+            "--registry", str(registry_path), "--format", "json", "todo", "complete",
+            "--goal-id", GOAL_ID, "--todo-id", str(todos[0]["todo_id"]),
+            "--agent-id", AGENT_ID, "--successor-todo-id", str(independent["todo_id"]),
+        ]) == 1
+        rejected = json.loads(capsys.readouterr().out)
+        assert "operation id already names a different coordination request" in rejected["error"]
+        assert any("terminal Todo cannot accept new successor links" in action for action in actions)
+
     for action in lifecycle_actions:
         tokens = shlex.split(action)
         loopx_index = tokens.index("loopx")
@@ -1119,12 +1431,38 @@ def test_todo_complete_then_refresh_cli_projects_direct_settlement(
     terminal_quota = json.loads(capsys.readouterr().out)
     assert terminal_exit == 1
     assert terminal_quota["should_run"] is False
-    assert terminal_quota["effective_action"] == "terminal_no_followup"
+    if independent_deferred:
+        assert terminal_quota["effective_action"] != "terminal_no_followup"
+    else:
+        assert terminal_quota["effective_action"] == "terminal_no_followup"
+    if independent:
+        assert cli_main(["--registry", str(registry_path), "--format", "json",
+                         "todo", "list", "--goal-id", GOAL_ID,
+                         "--todo-id", str(independent["todo_id"])]) == 0
+        readback = json.loads(capsys.readouterr().out)
+        # Full readback must keep the independent wait, not merely avoid a
+        # terminal recommendation by replacing it with an invented blocker.
+        retained = readback["todo"]
+        assert retained["todo_id"] == independent["todo_id"]
+        assert retained["status"] == "deferred"
+        assert retained["resume_when"] == "resume_at:2099-01-01T00:00:00Z"
+        assert retained["claimed_by"] == AGENT_ID
 
 
-def test_legacy_unscoped_completion_projects_executable_identity_repair(
+@pytest.mark.parametrize(
+    "stored_completion_key",
+    [
+        None,
+        (
+            f"{GOAL_ID}:{AGENT_ID}:todo_legacy_unscoped:"
+            "guided-start:025d252ade77fd3d202dd29188f5ff0d"
+        ),
+    ],
+)
+def test_completed_todo_identity_repair_preserves_settlement_fence(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    stored_completion_key: str | None,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -1132,6 +1470,7 @@ def test_legacy_unscoped_completion_projects_executable_identity_repair(
     state.write_text(
         "---\n"
         f"goal_id: {GOAL_ID}\n"
+        "handoff_mode: soft_claim\n"
         "updated_at: 2026-08-22T00:00:00+00:00\n"
         "---\n\n"
         "## User Todo / Owner Review Reading Queue\n\n"
@@ -1141,7 +1480,12 @@ def test_legacy_unscoped_completion_projects_executable_identity_repair(
         "task_class=advancement_task "
         f"claimed_by={AGENT_ID} no_followup=false "
         "completion_continuation=active_goal "
-        "completed_at=2026-08-22T00%3A00%3A00%2B00%3A00 -->\n",
+        + (
+            f"completion_turn_key={stored_completion_key} "
+            if stored_completion_key is not None
+            else ""
+        )
+        + "completed_at=2026-08-22T00%3A00%3A00%2B00%3A00 -->\n",
         encoding="utf-8",
     )
     registry_path = tmp_path / "registry.json"
@@ -1168,6 +1512,30 @@ def test_legacy_unscoped_completion_projects_executable_identity_repair(
             }
         ),
         encoding="utf-8",
+    )
+    from canonical_authority_fixture import initialize_canonical_authority
+    from loopx.control_plane.coordination.authority_source_capture import (
+        build_runtime_shadow_source_snapshot,
+    )
+    from loopx.history import load_registry
+
+    runtime_root = tmp_path / "runtime"
+    goal = next(
+        goal
+        for goal in load_registry(registry_path)["goals"]
+        if goal["id"] == GOAL_ID
+    )
+    projection, _ = build_runtime_shadow_source_snapshot(
+        goal=goal,
+        runtime_root=runtime_root,
+        state_path=state,
+        registry_path=registry_path,
+    )
+    initialize_canonical_authority(
+        runtime_root,
+        GOAL_ID,
+        projection,
+        state_path=state,
     )
 
     assert cli_main(
@@ -1201,17 +1569,34 @@ def test_legacy_unscoped_completion_projects_executable_identity_repair(
             "completion_turn_key": transition["triggers"][0][
                 "completion_turn_key"
             ],
-            "completion_identity_source": "unscoped_completion",
+            "completion_identity_source": (
+                "turn_settlement"
+                if stored_completion_key is not None
+                else "unscoped_completion"
+            ),
         }
     ]
     completion_key = transition["triggers"][0]["completion_turn_key"]
-    assert str(completion_key).startswith("local_completion_")
+    if stored_completion_key is None:
+        assert str(completion_key).startswith("local_completion_")
+    else:
+        assert completion_key == stored_completion_key
     action = next(
         item for item in transition["next_cli_actions"] if "loopx todo complete" in item
     )
+    assert "--completion-identity-key" in action
+    assert "--turn-instance-id" not in action
     action_tokens = shlex.split(action)
     loopx_index = action_tokens.index("loopx")
-    assert cli_main(
+    from loopx.control_plane.coordination.local_authority import (
+        read_canonical_todos_if_promoted,
+    )
+
+    before_state = state.read_bytes()
+    before_authority = read_canonical_todos_if_promoted(
+        runtime_root=runtime_root, goal_id=GOAL_ID,
+    )
+    exit_code = cli_main(
         [
             "--registry",
             str(registry_path),
@@ -1219,9 +1604,23 @@ def test_legacy_unscoped_completion_projects_executable_identity_repair(
             "json",
             *action_tokens[loopx_index + 1 :],
         ]
-    ) == 0
+    )
     repaired = json.loads(capsys.readouterr().out)
+    if stored_completion_key is not None:
+        # An imported scoped identity is not proof of its original settlement.
+        # Real settled-turn success/replay is covered by the declared terminal
+        # settlement CLI journey; this fixture deliberately has no receipts.
+        assert exit_code == 1, repaired
+        assert repaired["error_code"] == "invalid_todo_completion_transaction"
+        assert "original quota identity and settled receipts" in repaired["error"]
+        assert state.read_bytes() == before_state
+        assert read_canonical_todos_if_promoted(
+            runtime_root=runtime_root, goal_id=GOAL_ID,
+        ) == before_authority
+        assert not (runtime_root / "goals" / GOAL_ID / "runs" / "index.jsonl").exists()
+        return
 
+    assert exit_code == 0, repaired
     assert repaired["completion_continuation"] == "no_followup"
     assert repaired["completion_recovery"] == (
         "lifecycle_reentry_terminal_closeout"
@@ -1314,3 +1713,111 @@ def test_matching_non_successor_ack_clears_rotated_vision_obligation(
     )
 
     assert remaining is None
+
+
+def test_later_exact_ack_repairs_older_receipt_without_replaying_work() -> None:
+    runs = _durable_runs(AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD)
+    obligation_id = _current_obligation_id(runs)
+    semantic_delta = {
+        "schema_version": "replan_semantic_delta_v0",
+        "accepted": True,
+        "outcomes": ["fresh_vision_path_outcome"],
+        "satisfying_outcomes": ["fresh_vision_path_outcome"],
+        "obligation_id": obligation_id,
+    }
+    later_ack = {
+        "goal_id": GOAL_ID,
+        "agent_id": AGENT_ID,
+        "turn_instance_id": "guided-start:later",
+        "generated_at": "2026-08-13T12:00:02+00:00",
+        "classification": "bounded_replan_progress",
+        "autonomous_replan_ack": {
+            "schema_version": "autonomous_replan_ack_v0",
+            "recorded": True,
+            "source": "refresh_state",
+            "semantic_delta": semantic_delta,
+        },
+    }
+    malformed_exact_ack = {
+        **later_ack,
+        "turn_instance_id": "guided-start:malformed",
+        "generated_at": "2026-08-13T12:00:03+00:00",
+        "autonomous_replan_ack": {
+            **later_ack["autonomous_replan_ack"],
+            "schema_version": "wrong",
+        },
+    }
+    newer_unrelated_ack = {
+        **later_ack,
+        "turn_instance_id": "guided-start:unrelated",
+        "generated_at": "2026-08-13T12:00:04+00:00",
+        "autonomous_replan_ack": {
+            **later_ack["autonomous_replan_ack"],
+            "semantic_delta": {
+                **semantic_delta,
+                "obligation_id": "replan-ffffffffffffffff",
+            },
+        },
+    }
+
+    remaining, recovered_delta = qualify_replan_writeback(
+        newest_first_runs=[newer_unrelated_ack, malformed_exact_ack, later_ack, *runs],
+        state_text=STATE_TEXT,
+        agent_id=AGENT_ID,
+        goal_id=GOAL_ID,
+        guard_scoped=True,
+        guard_semantic_replan_obligation_id=obligation_id,
+        receipt_bound_guard_recorded_at="2026-08-13T12:00:01+00:00",
+        receipt_bound_guard_turn_instance_id="guided-start:original",
+    )
+
+    assert remaining is None
+    assert recovered_delta == semantic_delta
+
+
+def test_historical_ack_closeout_does_not_request_new_semantic_evidence() -> None:
+    actions = build_autonomous_replan_cli_actions(
+        {
+            "replan_action_packet": {
+                "writeback_contract": {
+                    "preferred_input": "exact_historical_ack",
+                    "cli_semantic_args": "--vision-unchanged-reason wrong",
+                }
+            }
+        },
+        goal_id=GOAL_ID,
+        settlement_args=" --todo-id todo-original",
+        scoped_cli_args=(
+            f" --agent-id {AGENT_ID} --turn-instance-id guided-start:original"
+        ),
+        quota_spend_action="loopx quota spend",
+        settlement_chain_ready=True,
+    )
+
+    assert len(actions) == 2
+    assert "--vision-" not in actions[0]
+    assert "--progress-result-class" not in actions[0]
+    assert "--todo-id todo-original" in actions[0]
+    assert "--turn-instance-id guided-start:original" in actions[0]
+
+
+@pytest.mark.parametrize("threshold", [2, 3])
+def test_writeback_uses_configured_completion_cadence(threshold: int) -> None:
+    state = _completed_advancement_chain_state(threshold)
+    arguments = {
+        "newest_first_runs": [], "state_text": state,
+        "agent_id": AGENT_ID, "goal_id": GOAL_ID,
+    }
+    default_obligation, _ = qualify_replan_writeback(**arguments)
+    assert default_obligation is None
+    goal = {"execution_profile": {"replan_after_completed_todos": threshold}}
+    obligation, _ = qualify_replan_writeback(**arguments, registry_goal=goal)
+    assert obligation is not None
+    assert any(
+        trigger.get("kind") == "vision_outcome_checkpoint_required"
+        and trigger.get("completed_todo_count") == threshold
+        and trigger.get("completed_todo_threshold") == threshold
+        for trigger in obligation["triggers"]
+    )
+    with pytest.raises(ReplanWritebackRejected):
+        enforce_open_replan_writeback(**arguments, registry_goal=goal)

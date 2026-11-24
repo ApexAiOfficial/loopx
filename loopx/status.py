@@ -1,27 +1,50 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-import re
-from typing import Any
+from typing import cast
+
+from .control_plane.work_items.replan_history_codec import (
+    REPLAN_HISTORY_NEUTRAL_CLASSIFICATIONS as _REPLAN_HISTORY_NEUTRAL_CLASSIFICATIONS,
+)
 
 from .control_plane import compact_control_plane_policy
+from .control_plane.coordination.local_authority import CanonicalTodoSnapshot as _CanonicalTodoSnapshot
+from .control_plane.effect_runtime import effect_runtime_request_scope
+from .control_plane.status.adapter_status_vocabulary import (
+    CONNECTED_ADAPTER_STATUSES as CONNECTED_ADAPTER_STATUSES,
+    CONNECTED_DELIVERY_ADAPTER_STATUSES as CONNECTED_DELIVERY_ADAPTER_STATUSES,
+)
+from .control_plane.status.autonomous_replan_projection import (
+    AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD as AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD,
+    DEAD_MONITOR_REPEAT_THRESHOLD as DEAD_MONITOR_REPEAT_THRESHOLD,
+)
 from .control_plane.status.collection import (
     StatusCollectionContext,
     collect_status as _collect_status_read_model,
+)
+from .control_plane.status.goal_attention_projection import (
+    # Read, not only re-exported, by this facade, so this stays a plain import and
+    # the name is absent from the identity-alias allowlist below.
+    LEGACY_EXTERNAL_EVIDENCE_CLASSIFICATION_PREFIXES,
+    PLANNED_CONTROLLER_OPT_IN_RECOMMENDED_ACTION as PLANNED_CONTROLLER_OPT_IN_RECOMMENDED_ACTION,
+    REGISTRY_WAITING_ON_OVERRIDES as REGISTRY_WAITING_ON_OVERRIDES,
+)
+from .control_plane.status.monitor_display_projection import (
+    MONITOR_SIGNAL_WAITING_ON,
+    build_project_asset,
+)
+from .control_plane.status.registry_health_projection import (
+    SOURCE_REGISTRY_SHADOW_FINDINGS,
+)
+from .control_plane.status.run_projection import (
+    AGENT_LANE_PROGRESS_SCOPE,
 )
 from .control_plane.status.runtime_summaries import (
     StatusRuntimeSummaryContext,
     build_status_runtime_summaries as _build_status_runtime_summaries_read_model,
 )
 from .contract import check_contract
-from .control_plane.work_items.delivery_batch_scale import (
-    SMALL_DELIVERY_BATCH_SCALES as STRUCTURED_SMALL_DELIVERY_BATCH_SCALES,
-    UNKNOWN_DELIVERY_BATCH_SCALE,
-)
-from .control_plane.work_items.delivery_outcome import (
-    DELIVERY_OUTCOME_NOT_CONFIGURED,
-    delivery_turn_kind_for_run,
-)
 from .doctor import (
     PROMOTION_READINESS_CLASSIFICATIONS,
     PROMOTION_READINESS_FRESHNESS_HOURS,
@@ -37,11 +60,15 @@ from .extensions.lark.goal_channel_notification import (
     build_goal_channel_notification_projection,
 )
 from .handoff_budget import handoff_budget_contract
-from .history import collect_history, load_registry
+from .history import collect_status_history, load_registry
 from .history import STATUS_NEUTRAL_CLASSIFICATIONS as HISTORY_STATUS_NEUTRAL_CLASSIFICATIONS
 from .interface_budget import interface_budget_cadence_for_runs
 from .long_task_cadence import build_long_task_cadence_hint
 from .orchestration import compact_orchestration_policy
+from .capabilities.multi_subagent.native_child_receipts import (
+    latest_native_child_activity,
+    load_native_child_activity,
+)
 from .paths import resolve_runtime_root
 from .control_plane.work_items.task_graph import (
     build_task_graph_projection as _build_task_graph_projection_read_model,
@@ -50,7 +77,6 @@ from .control_plane.work_items.project_asset import (
     TODO_PROJECTION_DETAIL_POINTER_SCHEMA_VERSION as TODO_PROJECTION_DETAIL_POINTER_SCHEMA_VERSION,
     TODO_PROJECTION_VIEW_SCHEMA_VERSION as TODO_PROJECTION_VIEW_SCHEMA_VERSION,
     attach_active_state_project_asset_fields as _attach_active_state_project_asset_fields,
-    build_project_asset,
     enrich_project_asset as _enrich_project_asset_read_model,
     project_asset_handoff_check_projection,
     project_asset_latest_validation,
@@ -71,12 +97,13 @@ from .control_plane.work_items.autonomous_candidates import (
 from .control_plane.goals.active_state_metadata import (
     parse_state_frontmatter,
 )
-from .control_plane.todos.active_state_todos import (
-    MONITOR_WRITEBACK_CONTRACT_SCHEMA_VERSION as _MONITOR_WRITEBACK_CONTRACT_SCHEMA_VERSION,
-    active_state_todo_fields as _active_state_todo_fields_read_model,
-)
+# Existing source/fixture callers retain the parser; ordinary status obtains
+# Task authority through the canonical read model.
 from .control_plane.todos.active_state_todo_parser import (
-    parse_active_state_todos,
+    parse_active_state_todos as parse_active_state_todos,
+)
+from .control_plane.todos.active_state_todos import (
+    active_state_todo_fields as _active_state_todo_fields_read_model,
 )
 from .control_plane.work_items.attention_item import (
     attention_item as _attention_item_read_model,
@@ -86,7 +113,7 @@ from .control_plane.work_items.attention_queue import (
     build_attention_queue as _build_attention_queue_read_model,
 )
 from .control_plane.work_items.autonomous_replan_ack import (
-    AUTONOMOUS_REPLAN_ACK_MATERIAL_RUN_WINDOW,
+    AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK as _AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK,
     compact_autonomous_replan_ack,
 )
 from .control_plane.work_items.autonomous_replan_obligation import (
@@ -96,14 +123,7 @@ from .control_plane.work_items.autonomous_replan_obligation import (
 from .control_plane.work_items.backlog_hygiene import (
     MAX_BACKLOG_HYGIENE_EVIDENCE_ITEMS as _MAX_BACKLOG_HYGIENE_EVIDENCE_ITEMS_READ_MODEL,
 )
-from .control_plane.work_items.delivery_signals import (
-    classification_contains_any as _classification_contains_any_read_model,
-    delivery_batch_scale_for_run as _delivery_batch_scale_for_run_read_model,
-    delivery_outcome_for_run as _delivery_outcome_for_run_read_model,
-    outcome_floor_configured as _outcome_floor_configured_read_model,
-    outcome_gap_streak as _outcome_gap_streak_read_model,
-    small_delivery_batch_scale_streak as _small_delivery_batch_scale_streak_read_model,
-)
+from .control_plane.work_items.delivery_history import compact_delivery_binding, project_delivery_history
 from .control_plane.runtime.run_compaction import (
     RUN_BASE_COMPACT_FIELDS,
     attach_run_summary_projections as _attach_run_summary_projections_read_model,
@@ -159,7 +179,7 @@ from .control_plane.agents.subagent_activity import (
 from .control_plane.agents.management_projection import (
     build_agent_management_projection as _build_agent_management_projection_read_model,
 )
-from .control_plane.runtime.agent_scoped_evidence_log import (
+from .control_plane.runtime.agent_evidence_history import (
     MAX_PROJECTED_READ_RECEIPTS,
     project_evidence_log_read_receipts,
 )
@@ -175,24 +195,20 @@ from .control_plane.todos.todo_summary import (
     MAX_STATUS_TODOS_PER_ROLE as _TODO_SUMMARY_MAX_STATUS_TODOS_PER_ROLE,
     MAX_TODO_VISIBILITY_LANE_ITEMS as _TODO_SUMMARY_MAX_TODO_VISIBILITY_LANE_ITEMS,
     active_state_todo_attention_item as _active_state_todo_attention_item_read_model,
-    active_next_action_todo_ids,
     attach_dependency_blockers,
-    claimed_visibility_items as claimed_visibility_items,
     compact_todo_group as compact_todo_group,
     compact_todo_item as compact_todo_item,
     first_open_todo_text,
-    open_todo_items,
+    open_todo_items as open_todo_items,
     project_asset_todo_summary,
     sync_connected_attention_action_from_todos as _sync_connected_attention_action_from_todos_read_model,
     todo_lane_items as todo_lane_items,
     todo_item_is_deferred as todo_item_is_deferred,
-    todo_item_is_due_monitor as todo_item_is_due_monitor,
-    todo_item_missing_monitor_schedule as todo_item_missing_monitor_schedule,
-    todo_item_next_due_at as todo_item_next_due_at,
-    todo_item_task_class,
+    todo_item_task_class as todo_item_task_class,
     todo_projection_sort_key as todo_projection_sort_key,
 )
 from .control_plane.todos.todo_index import (
+    EventsForGoal,
     MAX_TODO_INDEX_ITEMS,
     MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL,
 )
@@ -205,64 +221,47 @@ from .state_projection import (
     state_projection_gap_warning,
 )
 from .control_plane.todos.contract import (
-    TODO_STATUS_OPEN,
-    TODO_TASK_CLASS_USER_GATE,
-    normalize_todo_status,
     normalize_todo_task_class as normalize_todo_task_class,
-    todo_done_for_status,
 )
-from .control_plane.todos.projection import (
+from .control_plane.todos.todo_semantics import (
     todo_item_is_expired_monitor as todo_item_is_expired_monitor,
 )
 
 
 _PUBLIC_COMPAT_REEXPORTS = {
+    "parse_active_state_todos": "loopx.control_plane.todos.active_state_todo_parser",
     "DREAMING_ADVISORY_CLASSIFICATIONS": "loopx.control_plane.runtime.status_classifications",
     "TODO_PROJECTION_DETAIL_POINTER_SCHEMA_VERSION": "loopx.control_plane.work_items.project_asset",
     "TODO_PROJECTION_VIEW_SCHEMA_VERSION": "loopx.control_plane.work_items.project_asset",
     "project_asset_summary_is_public_safe": "loopx.control_plane.work_items.project_asset",
-    "claimed_visibility_items": "loopx.control_plane.todos.todo_summary",
     "compact_todo_group": "loopx.control_plane.todos.todo_summary",
     "compact_todo_item": "loopx.control_plane.todos.todo_summary",
+    "open_todo_items": "loopx.control_plane.todos.todo_summary",
+    "todo_item_task_class": "loopx.control_plane.todos.todo_summary",
     "todo_lane_items": "loopx.control_plane.todos.todo_summary",
     "todo_item_is_deferred": "loopx.control_plane.todos.todo_summary",
-    "todo_item_is_due_monitor": "loopx.control_plane.todos.todo_summary",
-    "todo_item_missing_monitor_schedule": "loopx.control_plane.todos.todo_summary",
-    "todo_item_next_due_at": "loopx.control_plane.todos.todo_summary",
     "todo_projection_sort_key": "loopx.control_plane.todos.todo_summary",
     "normalize_todo_task_class": "loopx.control_plane.todos.contract",
-    "todo_item_is_expired_monitor": "loopx.control_plane.todos.projection",
+    "todo_item_is_expired_monitor": "loopx.control_plane.todos.todo_semantics",
+    "PLANNED_CONTROLLER_OPT_IN_RECOMMENDED_ACTION": "loopx.control_plane.status.goal_attention_projection",
+    # Refs #4447: the facade restated three carriers its own projections already
+    # own - the autonomous-replan and dead-monitor thresholds and the goal-attention
+    # override set. Each is now defined once by the projection that feeds it to a
+    # read model.
+    "AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD": "loopx.control_plane.status.autonomous_replan_projection",
+    "DEAD_MONITOR_REPEAT_THRESHOLD": "loopx.control_plane.status.autonomous_replan_projection",
+    "REGISTRY_WAITING_ON_OVERRIDES": "loopx.control_plane.status.goal_attention_projection",
+    # Refs #4447: the connected-adapter sets were defined here and in both status
+    # projections that pass them to the same injected read-model parameters. The
+    # status package now owns each set once; the facade keeps exporting the
+    # established names for callers that reach them as attributes of `loopx.status`.
+    "CONNECTED_ADAPTER_STATUSES": "loopx.control_plane.status.adapter_status_vocabulary",
+    "CONNECTED_DELIVERY_ADAPTER_STATUSES": "loopx.control_plane.status.adapter_status_vocabulary",
 }
 
 
 STATUS_NEUTRAL_CLASSIFICATIONS = HISTORY_STATUS_NEUTRAL_CLASSIFICATIONS
-STATE_EVENT_LOG_BASENAME = "events.jsonl"
 STATUS_CONTROL_PLANE_CONTEXT_LIMIT = 20
-AGENT_LANE_PROGRESS_SCOPE = "agent_lane"
-REGISTRY_WAITING_ON_OVERRIDES = {
-    "user_or_controller",
-    "controller",
-    "codex",
-    "external_evidence",
-}
-LEGACY_EXTERNAL_EVIDENCE_CLASSIFICATION_PREFIXES = (
-    "await_",
-    "external_evidence_observation_",
-)
-MONITOR_SIGNAL_WAITING_ON = "monitor_signal"
-MONITOR_DISPLAY_SCHEMA_VERSION = "monitor_quiet_display_v0"
-MONITOR_DISPLAY_STOP_CONDITION = (
-    "stop until a material monitor transition, regression, or concrete blocker appears"
-)
-MONITOR_DISPLAY_FALLBACK_ACTION = (
-    "No immediate agent work; keep the monitor quiet until a material monitor "
-    "transition, regression, or concrete blocker appears."
-)
-STATUS_CONTRACT_SCHEMA_VERSION = 2
-MINIMUM_DASHBOARD_STATUS_CONTRACT_SCHEMA_VERSION = 2
-STATUS_CONTRACT_RELOAD_HINT = "scripts/macos-dashboard-launchagent.sh restart"
-STATUS_CONTRACT_SIGNAL_LIMIT = 3
-MONITOR_WRITEBACK_CONTRACT_SCHEMA_VERSION = _MONITOR_WRITEBACK_CONTRACT_SCHEMA_VERSION
 EVENT_LEDGER_DECISION_CLASSIFICATIONS = USER_OR_CONTROLLER_CLASSIFICATIONS | {
     "operator_gate_approved",
 }
@@ -293,45 +292,6 @@ EVENT_LEDGER_EVIDENCE_HINTS = (
 )
 
 
-DELIVERY_BATCH_SCALE_TEST_ONLY_CLASSIFICATION_HINTS = (
-    "_test",
-    "_smoke",
-    "readiness_test",
-    "integrity_test",
-)
-DELIVERY_BATCH_SCALE_MULTI_SURFACE_CLASSIFICATION_HINTS = (
-    "batch",
-    "cross_benchmark",
-    "downstream_pack",
-    "matrix",
-    "owner_handoff_consumer",
-)
-DELIVERY_BATCH_SCALE_IMPLEMENTATION_CLASSIFICATION_HINTS = (
-    "adapter",
-    "builder",
-    "consumer",
-    "implementation",
-    "runner",
-)
-SMALL_DELIVERY_BATCH_SCALES = {
-    *(scale.value for scale in STRUCTURED_SMALL_DELIVERY_BATCH_SCALES),
-    UNKNOWN_DELIVERY_BATCH_SCALE,
-}
-CONNECTED_ADAPTER_STATUSES = {
-    "connected",
-    "connected-read-only",
-    "pre-tick-runnable",
-}
-CONNECTED_DELIVERY_ADAPTER_STATUSES = {
-    "connected-delivery",
-}
-SOURCE_REGISTRY_SHADOW_FINDINGS = {
-    "source_registry_missing",
-    "stale_source_registry",
-}
-PLANNED_CONTROLLER_OPT_IN_RECOMMENDED_ACTION = (
-    "先在 LoopX 完成 operator 判断；同意后项目 Agent 只执行 read-only map dry-run"
-)
 RUN_COMPACT_FIELDS = RUN_BASE_COMPACT_FIELDS
 LIFECYCLE_PRIORITY = (
     "controller_ready",
@@ -347,7 +307,6 @@ LIFECYCLE_PRIORITY = (
     "planned",
     "run_recorded",
 )
-SECTION_HEADING_PATTERN = re.compile(r"^##+\s+(.+?)\s*$")
 MAX_STATUS_TODOS_PER_ROLE = _TODO_SUMMARY_MAX_STATUS_TODOS_PER_ROLE
 MAX_ACTIVE_DONE_TODOS_BEFORE_ARCHIVE = MAX_STATUS_TODOS_PER_ROLE
 MAX_PROJECT_ASSET_TODO_ITEMS = _TODO_SUMMARY_MAX_PROJECT_ASSET_TODO_ITEMS
@@ -360,52 +319,15 @@ MAX_AUTONOMOUS_BACKLOG_CANDIDATES = _MAX_AUTONOMOUS_TODO_CANDIDATES
 MAX_BACKLOG_HYGIENE_EVIDENCE_ITEMS = _MAX_BACKLOG_HYGIENE_EVIDENCE_ITEMS_READ_MODEL
 MAX_AUTONOMOUS_REPLAN_TRIGGERS = _MAX_AUTONOMOUS_REPLAN_TRIGGERS_READ_MODEL
 AUTONOMOUS_REPLAN_STALL_THRESHOLD = _AUTONOMOUS_REPLAN_STALL_THRESHOLD_READ_MODEL
-DEAD_MONITOR_REPEAT_THRESHOLD = 6
-AUTONOMOUS_REPLAN_PERIODIC_RUN_THRESHOLD = AUTONOMOUS_REPLAN_ACK_MATERIAL_RUN_WINDOW
-AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK = 30
-BACKLOG_HYGIENE_SECTION_HEADINGS = ("Next Action", "Operating Lessons")
-BACKLOG_HYGIENE_BULLET_PATTERN = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+(.+?)\s*$")
-BACKLOG_HYGIENE_HINT_PATTERN = re.compile(
-    r"(?i)(?:\[p[0-4]\]|todo|backlog|follow[- ]?up|queue|audit|regression|smoke|cadence|mirror|monitor|sub-?agent|待办|回归|审计|修复|检查|推进)"
+AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK = _AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK
+# Refs #4447: one definition for this vocabulary, owned by the control-plane
+# codec that now feeds the replan history policy across status and quota. The
+# facade keeps exporting the established public name for existing callers as an
+# identity alias instead of restating the values, which also keeps the audited
+# import-only export allowlist unchanged.
+AUTONOMOUS_RUN_HISTORY_NEUTRAL_CLASSIFICATIONS = (
+    _REPLAN_HISTORY_NEUTRAL_CLASSIFICATIONS
 )
-AUTONOMOUS_REPLAN_SCHEMA_VERSION = "autonomous_replan_obligation_v0"
-DEAD_MONITOR_REPEAT_SCHEMA_VERSION = "dead_monitor_repeat_v0"
-AUTONOMOUS_RUN_HISTORY_NEUTRAL_CLASSIFICATIONS = {
-    "quota_slot_spent",
-    "quota_slot_voided",
-    "delivery_completion_spend_accounted_v0",
-}
-
-
-
-
-def state_event_log_candidates(goal: dict[str, Any], *, state_path: Path) -> list[Path]:
-    from .control_plane.status.active_state_projection import (
-        state_event_log_candidates as _state_event_log_candidates,
-    )
-
-    return _state_event_log_candidates(goal, state_path=state_path)
-
-
-def active_state_event_projection_fields(
-    goal: dict[str, Any],
-    *,
-    state_path: Path,
-    preferred_todo_ids: set[str] | None = None,
-    rollout_events: list[dict[str, Any]] | None = None,
-    item_limit: int | None = MAX_STATUS_TODOS_PER_ROLE,
-) -> dict[str, Any]:
-    from .control_plane.status.active_state_projection import (
-        active_state_event_projection_fields as _active_state_event_projection_fields,
-    )
-
-    return _active_state_event_projection_fields(
-        goal,
-        state_path=state_path,
-        preferred_todo_ids=preferred_todo_ids,
-        rollout_events=rollout_events,
-        item_limit=item_limit,
-    )
 
 
 def active_state_sections(state_text: str, headings: tuple[str, ...]) -> dict[str, list[str]]:
@@ -416,7 +338,7 @@ def active_state_sections(state_text: str, headings: tuple[str, ...]) -> dict[st
     return _active_state_sections(state_text, headings)
 
 
-def parse_issue_meta_surface(state_text: str) -> dict[str, Any] | None:
+def parse_issue_meta_surface(state_text: str) -> dict[str, object] | None:
     from .control_plane.status.active_state_projection import (
         parse_issue_meta_surface as _parse_issue_meta_surface,
     )
@@ -432,7 +354,7 @@ def active_state_section_entries(lines: list[str]) -> list[str]:
     return _active_state_section_entries(lines)
 
 
-def backlog_hygiene_warning(state_text: str, *, agent_todos: dict[str, Any] | None) -> dict[str, Any] | None:
+def backlog_hygiene_warning(state_text: str, *, agent_todos: dict[str, object] | None) -> dict[str, object] | None:
     from .control_plane.status.active_state_projection import (
         backlog_hygiene_warning as _backlog_hygiene_warning,
     )
@@ -441,10 +363,10 @@ def backlog_hygiene_warning(state_text: str, *, agent_todos: dict[str, Any] | No
 
 
 def build_autonomous_replan_obligation(
-    evidence: list[dict[str, Any]],
+    evidence: list[dict[str, object]],
     *,
-    agent_todos: dict[str, Any] | None,
-) -> dict[str, Any] | None:
+    agent_todos: dict[str, object] | None,
+) -> dict[str, object] | None:
     from .control_plane.status.autonomous_replan_projection import (
         build_autonomous_replan_obligation as _build_autonomous_replan_obligation,
     )
@@ -456,7 +378,7 @@ def build_autonomous_replan_obligation(
 
 
 def run_history_monitor_wait_already_acknowledged(
-    latest_runs: list[dict[str, Any]] | None,
+    latest_runs: list[dict[str, object]] | None,
     *,
     signal_count: int,
 ) -> bool:
@@ -471,8 +393,8 @@ def run_history_monitor_wait_already_acknowledged(
 
 
 def latest_autonomous_replan_ack_for_projection(
-    latest_runs: list[dict[str, Any]] | None,
-) -> dict[str, Any] | None:
+    latest_runs: list[dict[str, object]] | None,
+) -> dict[str, object] | None:
     from .control_plane.status.autonomous_replan_projection import (
         latest_autonomous_replan_ack_for_projection as _latest_autonomous_replan_ack_for_projection,
     )
@@ -481,10 +403,10 @@ def latest_autonomous_replan_ack_for_projection(
 
 
 def autonomous_replan_periodic_review_from_runs(
-    latest_runs: list[dict[str, Any]] | None,
+    latest_runs: list[dict[str, object]] | None,
     *,
-    agent_todos: dict[str, Any] | None,
-) -> dict[str, Any] | None:
+    agent_todos: dict[str, object] | None,
+) -> dict[str, object] | None:
     from .control_plane.status.autonomous_replan_projection import (
         autonomous_replan_periodic_review_from_runs as _autonomous_replan_periodic_review_from_runs,
     )
@@ -496,11 +418,13 @@ def autonomous_replan_periodic_review_from_runs(
 
 
 def autonomous_replan_obligation_from_runs(
-    latest_runs: list[dict[str, Any]] | None,
+    latest_runs: list[dict[str, object]] | None,
     *,
-    agent_todos: dict[str, Any] | None,
+    agent_todos: dict[str, object] | None,
     agent_id: str | None = None,
-) -> dict[str, Any] | None:
+    external_progress_review: dict[str, object] | None = None,
+    effective_turn_cadence: dict[str, object] | None = None,
+) -> dict[str, object] | None:
     from .control_plane.status.autonomous_replan_projection import (
         autonomous_replan_obligation_from_runs as _autonomous_replan_obligation_from_runs,
     )
@@ -509,14 +433,29 @@ def autonomous_replan_obligation_from_runs(
         latest_runs,
         agent_todos=agent_todos,
         agent_id=agent_id,
+        external_progress_review=external_progress_review,
+        effective_turn_cadence=effective_turn_cadence,
     )
 
 
+def external_progress_review_context(
+    goal: dict[str, object],
+    runtime_root: Path | None,
+) -> dict[str, object] | None:
+    """Status reads the sentinel context through the capability-owned loader."""
+
+    from .capabilities.progress_review.context import (
+        external_progress_review_context as _load_external_progress_review_context,
+    )
+
+    return _load_external_progress_review_context(goal, runtime_root)
+
+
 def autonomous_backlog_candidates(
-    items: list[dict[str, Any]],
+    items: list[dict[str, object]],
     *,
     limit: int = MAX_AUTONOMOUS_BACKLOG_CANDIDATES,
-) -> dict[str, Any] | None:
+) -> dict[str, object] | None:
     from .control_plane.status.attention_projection import (
         autonomous_backlog_candidates as _autonomous_backlog_candidates,
     )
@@ -525,10 +464,10 @@ def autonomous_backlog_candidates(
 
 
 def autonomous_monitor_candidates(
-    items: list[dict[str, Any]],
+    items: list[dict[str, object]],
     *,
     limit: int = MAX_AUTONOMOUS_BACKLOG_CANDIDATES,
-) -> dict[str, Any] | None:
+) -> dict[str, object] | None:
     from .control_plane.status.attention_projection import (
         autonomous_monitor_candidates as _autonomous_monitor_candidates,
     )
@@ -538,11 +477,11 @@ def autonomous_monitor_candidates(
 
 def build_attention_queue_projection(
     *,
-    items: list[dict[str, Any]],
+    items: list[dict[str, object]],
     goal_id_filter: str | None,
-    autonomous_backlog_candidates: dict[str, Any] | None,
-    autonomous_monitor_candidates: dict[str, Any] | None,
-) -> dict[str, Any]:
+    autonomous_backlog_candidates: dict[str, object] | None,
+    autonomous_monitor_candidates: dict[str, object] | None,
+) -> dict[str, object]:
     from .control_plane.status.attention_projection import (
         build_attention_queue_projection as _build_attention_queue_projection,
     )
@@ -555,7 +494,7 @@ def build_attention_queue_projection(
     )
 
 
-def active_state_projection_warning(goal: dict[str, Any], current_run: dict[str, Any] | None) -> dict[str, Any] | None:
+def active_state_projection_warning(goal: dict[str, object], current_run: dict[str, object] | None) -> dict[str, object] | None:
     return _stale_latest_run_projection_warning_read_model(
         goal,
         current_run,
@@ -570,7 +509,7 @@ def active_state_projection_warning(goal: dict[str, Any], current_run: dict[str,
     )
 
 
-def is_handoff_ready_run(run: dict[str, Any]) -> bool:
+def is_handoff_ready_run(run: dict[str, object]) -> bool:
     return _is_handoff_ready_run_read_model(
         run,
         handoff_ready_classifications=HANDOFF_READY_CLASSIFICATIONS,
@@ -578,7 +517,7 @@ def is_handoff_ready_run(run: dict[str, Any]) -> bool:
     )
 
 
-def run_has_external_evidence_watch_signal(run: dict[str, Any]) -> bool:
+def run_has_external_evidence_watch_signal(run: dict[str, object]) -> bool:
     """Return true only for explicit external-evidence watch state.
 
     Feature names may legitimately start with words such as "monitor"; routing
@@ -592,7 +531,7 @@ def run_has_external_evidence_watch_signal(run: dict[str, Any]) -> bool:
     )
 
 
-def is_custom_post_handoff_work_run(run: dict[str, Any]) -> bool:
+def is_custom_post_handoff_work_run(run: dict[str, object]) -> bool:
     return _is_custom_post_handoff_work_run_read_model(
         run,
         is_status_neutral_run=is_status_neutral_run,
@@ -604,79 +543,51 @@ def is_custom_post_handoff_work_run(run: dict[str, Any]) -> bool:
     )
 
 
-def delivery_batch_scale_for_run(run: dict[str, Any]) -> str:
-    return _delivery_batch_scale_for_run_read_model(
-        run,
-        test_only_hints=DELIVERY_BATCH_SCALE_TEST_ONLY_CLASSIFICATION_HINTS,
-        multi_surface_hints=DELIVERY_BATCH_SCALE_MULTI_SURFACE_CLASSIFICATION_HINTS,
-        implementation_hints=DELIVERY_BATCH_SCALE_IMPLEMENTATION_CLASSIFICATION_HINTS,
-    )
+def compact_post_handoff_run(run: dict[str, object], profile: dict[str, object] | None = None) -> dict[str, object]:
+    return cast(dict[str, object], project_post_handoff_history([run], profile)["post_handoff_latest_run"])
 
 
-def _classification_contains_any(classification: str, hints: list[Any]) -> bool:
-    return _classification_contains_any_read_model(classification, hints)
-
-
-def delivery_outcome_for_run(run: dict[str, Any], profile: dict[str, Any] | None = None) -> str:
-    return _delivery_outcome_for_run_read_model(
-        run,
-        profile,
-        execution_profile_outcome_floor=execution_profile_outcome_floor,
-    )
-
-
-def outcome_floor_configured(profile: dict[str, Any] | None) -> bool:
-    return _outcome_floor_configured_read_model(
-        profile,
-        execution_profile_outcome_floor=execution_profile_outcome_floor,
-    )
-
-
-def outcome_gap_streak(runs: list[dict[str, Any]], profile: dict[str, Any] | None = None) -> int:
-    return _outcome_gap_streak_read_model(
-        runs,
-        profile,
-        delivery_outcome_for_run=delivery_outcome_for_run,
-        outcome_floor_configured=outcome_floor_configured,
-    )
-
-
-def compact_post_handoff_run(run: dict[str, Any], profile: dict[str, Any] | None = None) -> dict[str, Any]:
-    compact: dict[str, Any] = {}
-    for field in ("generated_at", "classification", "health_check", "json_exists", "markdown_exists"):
-        if field in run:
-            compact[field] = run[field]
-    compact["delivery_batch_scale"] = delivery_batch_scale_for_run(run)
-    outcome = delivery_outcome_for_run(run, profile)
-    if outcome != DELIVERY_OUTCOME_NOT_CONFIGURED:
-        compact["delivery_outcome"] = outcome
-    compact["delivery_turn_kind"] = delivery_turn_kind_for_run(
-        run,
-        delivery_outcome=outcome,
-    )
-    return _attach_run_summary_projections_read_model(
-        compact,
-        run,
-        compact_session_runtime_projection_from_run=(
-            compact_session_runtime_projection_from_run
-        ),
-    )
-
-
-def small_delivery_batch_scale_streak(runs: list[dict[str, Any]]) -> int:
-    return _small_delivery_batch_scale_streak_read_model(
-        runs,
-        delivery_batch_scale_for_run=delivery_batch_scale_for_run,
-        small_delivery_batch_scales=SMALL_DELIVERY_BATCH_SCALES,
-    )
+def project_post_handoff_history(
+    runs: list[dict[str, object]], profile: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if not runs:
+        return {}
+    floor = execution_profile_outcome_floor(profile)
+    floor_configured = bool(floor.get("outcome_markers") or floor.get("surface_only_hints"))
+    projection = project_delivery_history(runs, outcome_floor_configured=floor_configured)
+    compact_runs: list[dict[str, object]] = []
+    for run, signal in zip(runs, projection["runs"], strict=True):
+        compact: dict[str, object] = {field: run[field] for field in (
+            "generated_at", "classification", "health_check", "json_exists", "markdown_exists",
+            "progress_scope",
+        ) if field in run}
+        compact.update({field: signal[field] for field in ("delivery_batch_scale", "delivery_turn_kind")})
+        if signal.get("delivery_claim_conflicts"):
+            compact["delivery_claim_conflicts"] = signal["delivery_claim_conflicts"]
+        if signal["delivery_turn_kind"] == "blocker_writeback":
+            compact.update(compact_delivery_binding(run))
+        if signal["delivery_outcome"] != "not_configured":
+            compact["delivery_outcome"] = signal["delivery_outcome"]
+        compact_runs.append(_attach_run_summary_projections_read_model(
+            compact, run,
+            compact_session_runtime_projection_from_run=compact_session_runtime_projection_from_run,
+        ))
+    result: dict[str, object] = {
+        "post_handoff_latest_run": compact_runs[0],
+        "post_handoff_recent_runs": compact_runs,
+        "post_handoff_small_scale_streak": projection["small_scale_streak"],
+    }
+    if floor_configured:
+        result["post_handoff_outcome_gap_streak"] = projection["outcome_gap_streak"]
+    return result
 
 
 def project_asset_handoff_state(
     *,
     ready: bool,
-    project_asset: dict[str, Any],
-    latest_runs: list[dict[str, Any]] | None,
-) -> dict[str, Any]:
+    project_asset: dict[str, object],
+    latest_runs: list[dict[str, object]] | None,
+) -> dict[str, object]:
     return _project_asset_handoff_state_read_model(
         ready=ready,
         project_asset=project_asset,
@@ -686,18 +597,15 @@ def project_asset_handoff_state(
         is_handoff_ready_run=is_handoff_ready_run,
         is_custom_post_handoff_work_run=is_custom_post_handoff_work_run,
         is_status_neutral_run=is_status_neutral_run,
-        compact_post_handoff_run=compact_post_handoff_run,
-        small_delivery_batch_scale_streak=small_delivery_batch_scale_streak,
-        outcome_floor_configured=outcome_floor_configured,
-        outcome_gap_streak=outcome_gap_streak,
+        project_delivery_history=project_post_handoff_history,
     )
 
 
 def project_asset_handoff_readiness(
-    item: dict[str, Any],
+    item: dict[str, object],
     *,
-    latest_runs: list[dict[str, Any]] | None = None,
-) -> dict[str, Any] | None:
+    latest_runs: list[dict[str, object]] | None = None,
+) -> dict[str, object] | None:
     return _project_asset_handoff_readiness_read_model(
         item,
         latest_runs=latest_runs,
@@ -708,17 +616,17 @@ def project_asset_handoff_readiness(
 
 
 def enrich_project_asset(
-    item: dict[str, Any],
+    item: dict[str, object],
     *,
-    user_todos: dict[str, Any] | None = None,
-    agent_todos: dict[str, Any] | None = None,
-    quota: dict[str, Any] | None = None,
-    latest_validation: dict[str, Any] | None = None,
-    latest_runs: list[dict[str, Any]] | None = None,
-    execution_profile: dict[str, Any] | None = None,
-    orchestration: dict[str, Any] | None = None,
-    subagent_activity: dict[str, Any] | None = None,
-    interface_budget_cadence: dict[str, Any] | None = None,
+    user_todos: dict[str, object] | None = None,
+    agent_todos: dict[str, object] | None = None,
+    quota: dict[str, object] | None = None,
+    latest_validation: dict[str, object] | None = None,
+    latest_runs: list[dict[str, object]] | None = None,
+    execution_profile: dict[str, object] | None = None,
+    orchestration: dict[str, object] | None = None,
+    subagent_activity: dict[str, object] | None = None,
+    interface_budget_cadence: dict[str, object] | None = None,
 ) -> None:
     _enrich_project_asset_read_model(
         item,
@@ -744,21 +652,26 @@ def enrich_project_asset(
 
 
 def active_state_todo_fields(
-    goal: dict[str, Any],
+    goal: dict[str, object],
     *,
     runtime_root: Path | None = None,
-) -> dict[str, Any]:
+    registry_path: Path | None = None,
+    todo_snapshot: _CanonicalTodoSnapshot | None = None,
+    include_agent_next_actions: bool = False,
+    rollout_events: Sequence[Mapping[str, object]] | None = None,
+) -> dict[str, object]:
     return _active_state_todo_fields_read_model(
         goal,
         runtime_root=runtime_root,
+        registry_path=registry_path,
+        todo_snapshot=todo_snapshot,
+        include_agent_next_actions=include_agent_next_actions,
+        rollout_events=rollout_events,
         resolve_goal_local_path=resolve_goal_local_path,
         active_state_next_action_entries=active_state_next_action_entries,
-        active_next_action_todo_ids=active_next_action_todo_ids,
         load_rollout_events=load_rollout_events,
         rollout_event_log_path=rollout_event_log_path,
         max_todo_index_rollout_events_per_goal=MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL,
-        active_state_event_projection_fields=active_state_event_projection_fields,
-        parse_active_state_todos=parse_active_state_todos,
         parse_issue_meta_surface=parse_issue_meta_surface,
         backlog_hygiene_warning=backlog_hygiene_warning,
         completed_todo_archive_warning=completed_todo_archive_warning,
@@ -781,11 +694,11 @@ def attention_item(
     next_handoff_condition: str | None = None,
     lifecycle_phase: str | None = None,
     lifecycle_flags: list[str] | None = None,
-    user_todos: dict[str, Any] | None = None,
-    agent_todos: dict[str, Any] | None = None,
+    user_todos: dict[str, object] | None = None,
+    agent_todos: dict[str, object] | None = None,
     todo_state_file: str | None = None,
-    dreaming_proposal: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    dreaming_proposal: dict[str, object] | None = None,
+) -> dict[str, object]:
     return _attention_item_read_model(
         goal_id=goal_id,
         status=status,
@@ -809,7 +722,7 @@ def attention_item(
     )
 
 
-def sync_connected_attention_action_from_todos(item: dict[str, Any]) -> None:
+def sync_connected_attention_action_from_todos(item: dict[str, object]) -> None:
     _sync_connected_attention_action_from_todos_read_model(
         item,
         first_open_todo_text=first_open_todo_text,
@@ -817,10 +730,10 @@ def sync_connected_attention_action_from_todos(item: dict[str, Any]) -> None:
 
 
 def active_state_todo_attention_item(
-    goal: dict[str, Any],
-    fields: dict[str, Any],
-    current_run: dict[str, Any] | None,
-) -> dict[str, Any] | None:
+    goal: dict[str, object],
+    fields: dict[str, object],
+    current_run: dict[str, object] | None,
+) -> dict[str, object] | None:
     return _active_state_todo_attention_item_read_model(
         goal,
         fields,
@@ -833,7 +746,7 @@ def active_state_todo_attention_item(
     )
 
 
-def todo_summary_open_count(summary: dict[str, Any] | None) -> int:
+def todo_summary_open_count(summary: dict[str, object] | None) -> int:
     from .control_plane.status.monitor_display_projection import (
         todo_summary_open_count as _todo_summary_open_count,
     )
@@ -841,7 +754,7 @@ def todo_summary_open_count(summary: dict[str, Any] | None) -> int:
     return _todo_summary_open_count(summary)
 
 
-def todo_summary_lane_items(summary: dict[str, Any] | None, lane: str) -> list[dict[str, Any]]:
+def todo_summary_lane_items(summary: dict[str, object] | None, lane: str) -> list[dict[str, object]]:
     from .control_plane.status.monitor_display_projection import (
         todo_summary_lane_items as _todo_summary_lane_items,
     )
@@ -849,7 +762,7 @@ def todo_summary_lane_items(summary: dict[str, Any] | None, lane: str) -> list[d
     return _todo_summary_lane_items(summary, lane)
 
 
-def attention_item_is_monitor_quiet_display_candidate(item: dict[str, Any]) -> bool:
+def attention_item_is_monitor_quiet_display_candidate(item: dict[str, object]) -> bool:
     from .control_plane.status.monitor_display_projection import (
         attention_item_is_monitor_quiet_display_candidate as _attention_item_is_monitor_quiet_display_candidate,
     )
@@ -865,7 +778,7 @@ def quiet_monitor_display_action(raw_action: str | None) -> str:
     return _quiet_monitor_display_action(raw_action)
 
 
-def normalize_monitor_quiet_attention_display(item: dict[str, Any]) -> None:
+def normalize_monitor_quiet_attention_display(item: dict[str, object]) -> None:
     from .control_plane.status.monitor_display_projection import (
         normalize_monitor_quiet_attention_display as _normalize_monitor_quiet_attention_display,
     )
@@ -875,9 +788,9 @@ def normalize_monitor_quiet_attention_display(item: dict[str, Any]) -> None:
 
 def merge_global_registry_attention_findings(
     *,
-    health_items: list[dict[str, Any]],
-    history_items: list[dict[str, Any]],
-    findings: list[Any],
+    health_items: list[dict[str, object]],
+    history_items: list[dict[str, object]],
+    findings: list[object],
     goal_id_filter: str | None,
 ) -> None:
     from .control_plane.status.registry_health_projection import (
@@ -896,8 +809,8 @@ def collect_global_registry_health(
     *,
     registry_path: Path,
     runtime_root: Path,
-    current_registry: dict[str, Any],
-) -> dict[str, Any]:
+    current_registry: dict[str, object],
+) -> dict[str, object]:
     from .control_plane.status.registry_health_projection import (
         collect_global_registry_health as _collect_global_registry_health,
     )
@@ -909,7 +822,7 @@ def collect_global_registry_health(
     )
 
 
-def is_status_neutral_run(run: dict[str, Any]) -> bool:
+def is_status_neutral_run(run: dict[str, object]) -> bool:
     from .control_plane.status.run_projection import (
         is_status_neutral_run as _is_status_neutral_run,
     )
@@ -917,7 +830,7 @@ def is_status_neutral_run(run: dict[str, Any]) -> bool:
     return _is_status_neutral_run(run)
 
 
-def latest_agent_lane_run(goal: dict[str, Any]) -> dict[str, Any] | None:
+def latest_agent_lane_run(goal: dict[str, object]) -> dict[str, object] | None:
     from .control_plane.status.run_projection import (
         latest_agent_lane_run as _latest_agent_lane_run,
     )
@@ -925,7 +838,7 @@ def latest_agent_lane_run(goal: dict[str, Any]) -> dict[str, Any] | None:
     return _latest_agent_lane_run(goal)
 
 
-def compact_agent_lane_recommendation(run: dict[str, Any] | None) -> dict[str, Any] | None:
+def compact_agent_lane_recommendation(run: dict[str, object] | None) -> dict[str, object] | None:
     from .control_plane.status.run_projection import (
         compact_agent_lane_recommendation as _compact_agent_lane_recommendation,
     )
@@ -935,9 +848,9 @@ def compact_agent_lane_recommendation(run: dict[str, Any] | None) -> dict[str, A
 
 def latest_run_recommended_action_for_projection(
     *,
-    current_status_run: dict[str, Any] | None,
-    agent_lane_recommendation: dict[str, Any] | None,
-    active_state_next_action: Any = None,
+    current_status_run: dict[str, object] | None,
+    agent_lane_recommendation: dict[str, object] | None,
+    active_state_next_action: object = None,
     preferred_agent_id: str | None = None,
     limit: int = 320,
 ) -> tuple[str | None, str | None]:
@@ -954,7 +867,7 @@ def latest_run_recommended_action_for_projection(
     )
 
 
-def latest_run(goal: dict[str, Any]) -> dict[str, Any] | None:
+def latest_run(goal: dict[str, object]) -> dict[str, object] | None:
     from .control_plane.status.run_projection import (
         latest_run as _latest_run,
     )
@@ -978,7 +891,7 @@ def primary_lifecycle_phase(flags: list[str], fallback: str = "registered") -> s
     return _primary_lifecycle_phase(flags, fallback=fallback)
 
 
-def run_lifecycle_flags(run: dict[str, Any] | None) -> list[str]:
+def run_lifecycle_flags(run: dict[str, object] | None) -> list[str]:
     from .control_plane.status.lifecycle_projection import (
         run_lifecycle_flags as _run_lifecycle_flags,
     )
@@ -986,7 +899,7 @@ def run_lifecycle_flags(run: dict[str, Any] | None) -> list[str]:
     return _run_lifecycle_flags(run)
 
 
-def run_lifecycle_phase(run: dict[str, Any] | None) -> str:
+def run_lifecycle_phase(run: dict[str, object] | None) -> str:
     from .control_plane.status.lifecycle_projection import (
         run_lifecycle_phase as _run_lifecycle_phase,
     )
@@ -994,7 +907,7 @@ def run_lifecycle_phase(run: dict[str, Any] | None) -> str:
     return _run_lifecycle_phase(run)
 
 
-def goal_lifecycle_fields(goal: dict[str, Any], current_run: dict[str, Any] | None) -> dict[str, Any]:
+def goal_lifecycle_fields(goal: dict[str, object], current_run: dict[str, object] | None) -> dict[str, object]:
     from .control_plane.status.lifecycle_projection import (
         goal_lifecycle_fields as _goal_lifecycle_fields,
     )
@@ -1002,7 +915,7 @@ def goal_lifecycle_fields(goal: dict[str, Any], current_run: dict[str, Any] | No
     return _goal_lifecycle_fields(goal, current_run)
 
 
-def readiness_attention_fields(run: dict[str, Any] | None) -> dict[str, Any]:
+def readiness_attention_fields(run: dict[str, object] | None) -> dict[str, object]:
     from .control_plane.status.lifecycle_projection import (
         readiness_attention_fields as _readiness_attention_fields,
     )
@@ -1010,7 +923,7 @@ def readiness_attention_fields(run: dict[str, Any] | None) -> dict[str, Any]:
     return _readiness_attention_fields(run)
 
 
-def operator_gate_attention_fields(run: dict[str, Any] | None) -> dict[str, Any]:
+def operator_gate_attention_fields(run: dict[str, object] | None) -> dict[str, object]:
     from .control_plane.status.lifecycle_projection import (
         operator_gate_attention_fields as _operator_gate_attention_fields,
     )
@@ -1018,7 +931,7 @@ def operator_gate_attention_fields(run: dict[str, Any] | None) -> dict[str, Any]
     return _operator_gate_attention_fields(run)
 
 
-def compact_server_planning_contract(value: Any) -> dict[str, Any]:
+def compact_server_planning_contract(value: object) -> dict[str, object]:
     from .control_plane.status.dreaming_projection import (
         compact_server_planning_contract as _compact_server_planning_contract,
     )
@@ -1026,7 +939,7 @@ def compact_server_planning_contract(value: Any) -> dict[str, Any]:
     return _compact_server_planning_contract(value)
 
 
-def compact_dreaming_proposal(run: dict[str, Any] | None) -> dict[str, Any] | None:
+def compact_dreaming_proposal(run: dict[str, object] | None) -> dict[str, object] | None:
     from .control_plane.status.dreaming_projection import (
         compact_dreaming_proposal as _compact_dreaming_proposal,
     )
@@ -1034,7 +947,7 @@ def compact_dreaming_proposal(run: dict[str, Any] | None) -> dict[str, Any] | No
     return _compact_dreaming_proposal(run)
 
 
-def compact_dreaming_lane_badge(proposal: dict[str, Any] | None) -> dict[str, Any] | None:
+def compact_dreaming_lane_badge(proposal: dict[str, object] | None) -> dict[str, object] | None:
     from .control_plane.status.dreaming_projection import (
         compact_dreaming_lane_badge as _compact_dreaming_lane_badge,
     )
@@ -1042,7 +955,7 @@ def compact_dreaming_lane_badge(proposal: dict[str, Any] | None) -> dict[str, An
     return _compact_dreaming_lane_badge(proposal)
 
 
-def dreaming_attention_fields(run: dict[str, Any] | None) -> dict[str, Any]:
+def dreaming_attention_fields(run: dict[str, object] | None) -> dict[str, object]:
     from .control_plane.status.dreaming_projection import (
         dreaming_attention_fields as _dreaming_attention_fields,
     )
@@ -1051,10 +964,10 @@ def dreaming_attention_fields(run: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def legacy_runtime_goal_attention(
-    goal: dict[str, Any],
-    current_run: dict[str, Any] | None,
-    readiness_fields: dict[str, Any],
-) -> dict[str, Any] | None:
+    goal: dict[str, object],
+    current_run: dict[str, object] | None,
+    readiness_fields: dict[str, object],
+) -> dict[str, object] | None:
     from .control_plane.status.goal_attention_projection import (
         legacy_runtime_goal_attention as _legacy_runtime_goal_attention,
     )
@@ -1066,7 +979,7 @@ def legacy_runtime_goal_attention(
     )
 
 
-def goal_attention(goal: dict[str, Any]) -> dict[str, Any] | None:
+def goal_attention(goal: dict[str, object]) -> dict[str, object] | None:
     from .control_plane.status.goal_attention_projection import (
         goal_attention as _goal_attention,
     )
@@ -1075,32 +988,26 @@ def goal_attention(goal: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def build_task_graph_projection(
-    item: dict[str, Any],
+    item: dict[str, object],
     *,
-    goal: dict[str, Any],
-    goal_latest_runs: list[dict[str, Any]] | None = None,
-) -> dict[str, Any] | None:
+    goal: dict[str, object],
+    goal_latest_runs: list[dict[str, object]] | None = None,
+) -> dict[str, object] | None:
     return _build_task_graph_projection_read_model(
         item,
         goal=goal,
         goal_latest_runs=goal_latest_runs,
         public_safe_compact_text=public_safe_compact_text,
-        normalize_todo_status=normalize_todo_status,
-        todo_done_for_status=todo_done_for_status,
-        todo_status_open=TODO_STATUS_OPEN,
-        open_todo_items=open_todo_items,
         max_status_todos_per_role=MAX_STATUS_TODOS_PER_ROLE,
-        todo_item_task_class=todo_item_task_class,
-        user_gate_task_class=TODO_TASK_CLASS_USER_GATE,
-        todo_summary_open_count=todo_summary_open_count,
         latest_run=latest_run,
     )
 
+
 def attach_goal_channel_projection(
-    item: dict[str, Any],
+    item: dict[str, object],
     *,
-    goal: dict[str, Any],
-    goal_latest_runs: list[dict[str, Any]],
+    goal: dict[str, object],
+    goal_latest_runs: list[dict[str, object]],
     runtime_root: Path | None = None,
 ) -> None:
     _attach_goal_channel_projection_read_model(
@@ -1114,19 +1021,50 @@ def attach_goal_channel_projection(
 
 def build_attention_queue(
     *,
-    contract: dict[str, Any],
-    history: dict[str, Any],
-    global_registry: dict[str, Any],
+    contract: dict[str, object],
+    history: dict[str, object],
+    global_registry: dict[str, object],
     runtime_root: Path | None = None,
     include_task_graph: bool = False,
     goal_id_filter: str | None = None,
-) -> dict[str, Any]:
+    include_stopped_goal_context: bool = False,
+    events_for_goal: EventsForGoal | None = None,
+    todo_snapshot: _CanonicalTodoSnapshot | None = None,
+    current_registry: dict[str, object] | None = None,
+    registry_path: Path | None = None,
+    include_goal_channel_projection: bool = True,
+    tolerate_malformed_settlement_history: bool = False,
+    agent_lane_id: str | None = None,
+) -> dict[str, object]:
+    def request_active_state_todo_fields(
+        goal: dict[str, object],
+        *,
+        runtime_root: Path | None = None,
+    ) -> dict[str, object]:
+        goal_id = str(goal.get("id") or "").strip()
+        supplied_events = (
+            events_for_goal(
+                goal_id,
+                limit=MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL,
+            )
+            if events_for_goal is not None and runtime_root is not None and goal_id
+            else None
+        )
+        return active_state_todo_fields(
+            goal,
+            runtime_root=runtime_root,
+            include_agent_next_actions=include_task_graph,
+            registry_path=registry_path,
+            rollout_events=supplied_events,
+            todo_snapshot=todo_snapshot,
+        )
+
     queue = _build_attention_queue_read_model(
         contract=contract,
         history=history,
         global_registry=global_registry,
         context=AttentionQueueContext(
-            active_state_todo_fields=active_state_todo_fields,
+            active_state_todo_fields=request_active_state_todo_fields,
             active_state_todo_attention_item=active_state_todo_attention_item,
             latest_run=latest_run,
             goal_attention=goal_attention,
@@ -1157,10 +1095,18 @@ def build_attention_queue(
             autonomous_replan_obligation_from_runs=autonomous_replan_obligation_from_runs,
             source_registry_shadow_findings=SOURCE_REGISTRY_SHADOW_FINDINGS,
             monitor_signal_waiting_on=MONITOR_SIGNAL_WAITING_ON,
+            external_progress_review_context=external_progress_review_context,
+            registry_path=registry_path,
+            tolerate_malformed_settlement_history=(
+                tolerate_malformed_settlement_history
+            ),
         ),
         runtime_root=runtime_root,
         include_task_graph=include_task_graph,
         goal_id_filter=goal_id_filter,
+        include_stopped_goal_context=include_stopped_goal_context,
+        include_goal_channel_projection=include_goal_channel_projection,
+        agent_lane_id=agent_lane_id,
     )
     if runtime_root is not None:
         for item in queue.get("items") or []:
@@ -1169,19 +1115,71 @@ def build_attention_queue(
             goal_id = str(item.get("goal_id") or "").strip()
             if not goal_id:
                 continue
-            receipts = project_evidence_log_read_receipts(
-                load_rollout_events(
+            events = (
+                events_for_goal(
+                    goal_id,
+                    limit=MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL,
+                )
+                if events_for_goal is not None
+                else load_rollout_events(
                     rollout_event_log_path(runtime_root, goal_id),
                     limit=MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL,
-                ),
+                )
+            )
+            receipts = project_evidence_log_read_receipts(
+                events,
                 limit=MAX_PROJECTED_READ_RECEIPTS,
             )
             if receipts:
                 item["evidence_log_read_receipts"] = receipts
+            project_asset = item.get("project_asset")
+            if not isinstance(project_asset, dict):
+                continue
+            orchestration = project_asset.get("orchestration")
+            if not isinstance(orchestration, dict) or not (
+                orchestration.get("mode") == "multi_subagent"
+                and orchestration.get("spawn_allowed") is True
+                and int(orchestration.get("max_children") or 0) > 0
+            ):
+                continue
+            goal_ref = None
+            if (current_registry or {}).get("profile_id") == "source_session_v1":
+                raw_goals = (current_registry or {}).get("goals")
+                matches = [
+                    goal
+                    for goal in (raw_goals if isinstance(raw_goals, list) else ())
+                    if isinstance(goal, dict)
+                    and goal.get("id") == goal_id
+                    and goal.get("status") == "active"
+                    and isinstance(goal.get("goal_instance_id"), str)
+                ]
+                if len(matches) == 1:
+                    goal_ref = {
+                        "goal_id": goal_id,
+                        "goal_instance_id": matches[0]["goal_instance_id"],
+                    }
+            native_activity = latest_native_child_activity(
+                events, goal_id=goal_id,
+                configured_limit=int(orchestration["max_children"]),
+                goal_ref=goal_ref,
+            )
+            if native_activity:
+                # The shared status snapshot is bounded for Todo work. Once it
+                # reveals a native event, read its exact Turn before showing
+                # counts, so older stages falling outside that window cannot
+                # silently undercount the activity.
+                project_asset["native_child_activity"] = load_native_child_activity(
+                    runtime_root, goal_id=goal_id,
+                    agent_id=native_activity["agent_id"],
+                    turn_instance_id=native_activity["turn_instance_id"],
+                    configured_limit=int(orchestration["max_children"]),
+                    goal_ref=goal_ref,
+                    registry_path=registry_path,
+                )
     return queue
 
 
-def compact_run(run: dict[str, Any]) -> dict[str, Any]:
+def compact_run(run: dict[str, object]) -> dict[str, object]:
     compact = _compact_run_base_read_model(
         run,
         run_compact_fields=RUN_COMPACT_FIELDS,
@@ -1204,7 +1202,7 @@ def compact_run(run: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def build_status_contract() -> dict[str, Any]:
+def build_status_contract() -> dict[str, object]:
     from .control_plane.status.contract_projection import (
         build_status_contract as _build_status_contract,
     )
@@ -1212,7 +1210,7 @@ def build_status_contract() -> dict[str, Any]:
     return _build_status_contract()
 
 
-def build_contract_health_projection(contract: dict[str, Any]) -> dict[str, Any]:
+def build_contract_health_projection(contract: dict[str, object]) -> dict[str, object]:
     from .control_plane.status.contract_projection import (
         build_contract_health_projection as _build_contract_health_projection,
     )
@@ -1248,13 +1246,16 @@ def build_status_runtime_summary_context() -> StatusRuntimeSummaryContext:
 
 def build_status_runtime_summaries(
     *,
-    history: dict[str, Any],
-    queue: dict[str, Any],
+    history: dict[str, object],
+    queue: dict[str, object],
     runtime_root: Path,
     goal_id_filter: str | None,
     display_limit: int,
     todo_index_limit: int,
-) -> dict[str, Any]:
+    recent_run_limit: int | None = None,
+    include_goal_subagent_configuration: bool = False,
+    events_for_goal: EventsForGoal | None = None,
+) -> dict[str, object]:
     return _build_status_runtime_summaries_read_model(
         history=history,
         queue=queue,
@@ -1262,16 +1263,24 @@ def build_status_runtime_summaries(
         goal_id_filter=goal_id_filter,
         display_limit=display_limit,
         todo_index_limit=todo_index_limit,
+        recent_run_limit=recent_run_limit,
+        include_goal_subagent_configuration=(
+            include_goal_subagent_configuration
+        ),
+        events_for_goal=events_for_goal,
         context=build_status_runtime_summary_context(),
     )
 
 
-def build_status_collection_context() -> StatusCollectionContext:
+def build_status_collection_context(
+    *,
+    tolerate_malformed_settlement_history: bool = False,
+) -> StatusCollectionContext:
     return StatusCollectionContext(
         load_registry=load_registry,
         resolve_runtime_root=resolve_runtime_root,
         collect_global_registry_health=collect_global_registry_health,
-        collect_history=collect_history,
+        collect_status_history=collect_status_history,
         check_contract=check_contract,
         build_attention_queue=build_attention_queue,
         build_runtime_summaries=build_status_runtime_summaries,
@@ -1282,6 +1291,9 @@ def build_status_collection_context() -> StatusCollectionContext:
         build_goal_channel_notification_projection=build_goal_channel_notification_projection,
         status_control_plane_context_limit=STATUS_CONTROL_PLANE_CONTEXT_LIMIT,
         max_todo_index_items=MAX_TODO_INDEX_ITEMS,
+        tolerate_malformed_settlement_history=(
+            tolerate_malformed_settlement_history
+        ),
     )
 
 
@@ -1289,21 +1301,39 @@ def collect_status(
     *,
     registry_path: Path,
     runtime_root_override: str | None,
-    scan_roots: list[Path],
     limit: int,
     include_task_graph: bool = False,
     goal_id: str | None = None,
-    available_capabilities: Any = None,
-    include_public_boundary_scan: bool = True,
-) -> dict[str, Any]:
-    return _collect_status_read_model(
-        registry_path=registry_path,
-        runtime_root_override=runtime_root_override,
-        scan_roots=scan_roots,
-        limit=limit,
-        include_task_graph=include_task_graph,
-        goal_id=goal_id,
-        available_capabilities=available_capabilities,
-        include_public_boundary_scan=include_public_boundary_scan,
-        context=build_status_collection_context(),
-    )
+    available_capabilities: object = None,
+    recent_run_limit: int | None = None,
+    include_goal_subagent_configuration: bool = False,
+    include_zcode_goal_eligibility: bool = False,
+    activation_state_filter: str | None = None,
+    agent_lane_id: str | None = None,
+    allow_missing_registry: bool = False,
+    include_presentation_projections: bool = True,
+    tolerate_malformed_settlement_history: bool = False,
+) -> dict[str, object]:
+    with effect_runtime_request_scope():
+        return _collect_status_read_model(
+            registry_path=registry_path,
+            allow_missing_registry=allow_missing_registry,
+            runtime_root_override=runtime_root_override,
+            limit=limit,
+            include_task_graph=include_task_graph,
+            goal_id=goal_id,
+            available_capabilities=available_capabilities,
+            recent_run_limit=recent_run_limit,
+            include_goal_subagent_configuration=(
+                include_goal_subagent_configuration
+            ),
+            include_zcode_goal_eligibility=include_zcode_goal_eligibility,
+            activation_state_filter=activation_state_filter,
+            agent_lane_id=agent_lane_id,
+            include_presentation_projections=include_presentation_projections,
+            context=build_status_collection_context(
+                tolerate_malformed_settlement_history=(
+                    tolerate_malformed_settlement_history
+                ),
+            ),
+        )

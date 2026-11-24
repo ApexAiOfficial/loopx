@@ -1,0 +1,342 @@
+"""Generated resume accepts planning copy while preserving execution proof fences."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import shlex
+
+import pytest
+
+from canonical_authority_fixture import (
+    initialize_canonical_authority,
+    isolate_sqlite_runtime,
+)
+from loopx.cli import main as cli_main
+from loopx.rollout_event_log import load_rollout_events, rollout_event_log_path
+from loopx.control_plane.coordination.runtime_shadow import (
+    build_todo_runtime_shadow_projection,
+)
+from loopx.control_plane.quota.turn_envelope import compose_turn_decision
+from loopx.control_plane.scheduler.execution_context import scheduler_execution_context_for_runtime_profile
+from loopx.control_plane.todos.active_state_todo_parser import parse_active_state_todos
+from loopx.control_plane.todos.todo_summary import (
+    canonical_todo_read_record,
+    structured_todo_item,
+)
+from loopx.control_plane.turn_driver.decision_capture import write_decision_capture
+from tests.control_plane.codex_checkpoint_fixture import selected_context_values
+from test_quota_settlement_cli import (
+    AGENT_ID,
+    GOAL_ID,
+    TODO_ID,
+    _spend_run_count,
+    _write_fixture,
+)
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("host_args", [("--codex-app",), ("--runtime-profile", "generic_cli")])
+def test_generated_deferred_resume_keeps_proof_fences_with_planning_note(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    provider: str,
+    fallback: bool,
+    host_args: tuple[str, ...],
+) -> None:
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    # This fixture authors the deferred claim below; start from an unclaimed row.
+    project, runtime, registry = _write_fixture(tmp_path, claimed=False)
+    peer = "registered-peer"
+    registry_data = json.loads(registry.read_text())
+    registry_data["goals"][0]["coordination"]["registered_agents"].append(peer)
+    registry_data["goals"][0]["spawn_policy"] = {
+        "mode": "multi_subagent", "allowed": True, "max_children": 2,
+    }
+    registry.write_text(json.dumps(registry_data))
+    state = project / f".codex/goals/{GOAL_ID}/ACTIVE_GOAL_STATE.md"
+    text = (
+        state.read_text()
+        .replace("- [ ] [P1]", "- [-] [P1]")
+        .replace(
+            "status=open task_class=advancement_task action_kind=validate",
+            "status=deferred task_class=advancement_task action_kind=validate "
+            f"claimed_by={AGENT_ID} resume_when=resume_at:2000-01-01T00:00:00Z "
+            "continuation_policy=same_agent_non_delivery required_capabilities=shell%2Cfilesystem_read",
+        )
+    )
+    if fallback:
+        text += (
+            "\n- [ ] [P2] Validate independent retained work.\n"
+            f"  <!-- loopx:todo todo_id=todo_fallback status=open claimed_by={AGENT_ID} "
+            "task_class=advancement_task action_kind=validate "
+            "continuation_policy=same_agent_non_delivery "
+            "required_capabilities=shell%2Cfilesystem_read -->\n"
+        )
+    state.write_text(text)
+    todos = parse_active_state_todos(text, item_limit=None)["agent_todos"]["items"]
+    initialize_canonical_authority(
+        runtime,
+        GOAL_ID,
+        build_todo_runtime_shadow_projection(
+            goal_id=GOAL_ID,
+            todos=[
+                canonical_todo_read_record(
+                    structured_todo_item(
+                        row,
+                        role="agent",
+                        source_section="Agent Todo",
+                    )
+                )
+                for row in todos
+            ],
+            handoff_mode="hard_lease",
+            leases=[],
+        ),
+        state_path=state,
+        provider=provider,
+    )
+
+    def cli(*args: str) -> tuple[int, dict]:
+        if ("quota", "should-run") in zip(args, args[1:]):
+            args = (*args, "--context-delivery", "off")
+        with monkeypatch.context() as context:
+            context.chdir(project)
+            rc = cli_main(
+                [
+                    "--registry",
+                    str(registry),
+                    "--runtime-root",
+                    str(runtime),
+                    "--format",
+                    "json",
+                    *args,
+                ]
+            )
+            return rc, json.loads(capsys.readouterr().out)
+
+    rc, guard = cli(
+        "quota",
+        "should-run",
+        *host_args,
+        "--goal-id",
+        GOAL_ID,
+        "--agent-id",
+        AGENT_ID,
+        "--turn-instance-id",
+        "resume-command-turn",
+    )
+    assert rc == 0 and guard["effective_action"] == "successor_replan_required", guard
+    assert guard["selected_todo"]["todo_id"] == TODO_ID
+    # Replay the signed capture through the same saved-project entrypoint used
+    # by native hosts. It must expose the real action before evidence paging.
+    profile = "codex_app_heartbeat" if host_args == ("--codex-app",) else "generic_cli"
+    complete = compose_turn_decision(guard,
+        scheduler_execution_context=scheduler_execution_context_for_runtime_profile(profile))
+    capture = tmp_path / "resume-decision.json"
+    digest = write_decision_capture(capture, complete)
+    before_context = state.read_bytes()
+    capture_args = ("quota", "context-project", *host_args, "--goal-id", GOAL_ID,
+        "--agent-id", AGENT_ID, "--capture-file", str(capture), "--capture-sha256", digest)
+    bound = (*capture_args, "--turn-instance-id", "resume-command-turn")
+    native = ("--context-delivery", "on", "--codex-context-dir", str(tmp_path / "context"),
+        "--initial-read", "--max-page-output-bytes", "64000")
+    with monkeypatch.context() as context:
+        context.setenv("LOOPX_CONTEXT_DELIVERY", "on")
+        context.setenv("LOOPX_EXECUTION_MODE", "heartbeat")
+        rc, opening = cli(*bound, *native)
+        wrong_rc, wrong = cli(*capture_args, "--turn-instance-id", "other-turn", *native)
+    assert wrong_rc != 0 and wrong["ok"] is False and "exact Goal, Agent and Turn" in wrong["reason"]
+    off_rc, off = cli(*bound, "--context-delivery", "off")
+    assert off_rc == 0 and off["mode"] == "full" and off["recovery"]["sha256"] == digest
+    assert rc == 0 and opening["eof"], opening
+    selected = selected_context_values(opening["content"])
+    pointers = list(selected)
+    cli_path = "/interaction_contract/cli_channel"
+    actions_path = cli_path + "/next_cli_actions"
+    settlement_path = cli_path + "/settlement_plan"
+    work_path = "/interaction_contract/agent_channel/work_context/user_todos"
+    assert pointers.index(actions_path) < pointers.index(work_path)
+    actions = selected[actions_path]
+    assert actions == guard["interaction_contract"]["cli_channel"]["next_cli_actions"]
+    rc, full = cli("quota", "context-read", "--capture-file", str(capture),
+        "--capture-sha256", digest, "--select", settlement_path)
+    assert rc == 0 and full["eof"], full
+    plan = complete["interaction_contract"]["cli_channel"]["settlement_plan"]
+    assert json.loads(full["content"])["selections"][0]["value"] == plan
+
+    # The literal reader also serves historical captures with compatible step
+    # fields. Keep this example separate from the validated current Turn.
+    validation_index = next(
+        index for index, step in enumerate(plan["ordered_steps"]) if step["kind"] == "validation"
+    )
+    required_control = {"required": True, "instruction": "Check the recorded owner stop before reopening."}
+    plan["ordered_steps"][validation_index]["required_control"] = required_control
+    compatibility_capture = tmp_path / "resume-compatible-decision.json"
+    compatibility_digest = write_decision_capture(compatibility_capture, complete)
+    rc, compatible = cli("quota", "context-read", "--capture-file", str(compatibility_capture),
+        "--capture-sha256", compatibility_digest, "--initial-read", "--max-page-output-bytes", "64000")
+    assert rc == 0 and compatible["eof"], compatible
+    compatible_values = selected_context_values(compatible["content"])
+    control_path = f"{settlement_path}/ordered_steps/{validation_index}/required_control"
+    assert compatible_values[control_path] == required_control
+    assert list(compatible_values).index(control_path) < list(compatible_values).index(work_path)
+    assert state.read_bytes() == before_context and _spend_run_count(runtime) == 0
+    generated = actions[0]
+    assert generated.startswith("loopx ")
+    resume = shlex.split(
+        generated.replace(
+            "<public-safe successor replan reason>",
+            "Original gate is satisfied; resume unchanged work before acquiring a fresh lease.",
+        )
+    )[1:]
+    # The fixture's global runtime options are already passed by cli().
+    if "--runtime-root" in resume:
+        index = resume.index("--runtime-root")
+        del resume[index : index + 2]
+    before = state.read_bytes()
+
+    rc, premature = cli(
+        "task-lease",
+        "acquire",
+        "--goal-id",
+        GOAL_ID,
+        "--todo-id",
+        TODO_ID,
+        "--owner",
+        AGENT_ID,
+        "--idempotency-key",
+        "fresh-after-resume",
+    )
+    assert rc == 1 and premature["error_code"] == "todo_not_open", premature
+    for extra, actor in (
+        ([], peer),
+        (
+            [
+                "--task-lease-idempotency-key",
+                "old-proof",
+                "--task-lease-expected-version",
+                "1",
+            ],
+            AGENT_ID,
+        ),
+    ):
+        narrow = [
+            "todo",
+            "update",
+            "--goal-id",
+            GOAL_ID,
+            "--todo-id",
+            TODO_ID,
+            "--agent-id",
+            actor,
+            "--status",
+            "open",
+            "--clear-resume-when",
+            "--reason",
+            "Resume original work.",
+            *extra,
+        ]
+        rc, rejected = cli(*narrow)
+        assert rc == 1 and rejected["ok"] is False, rejected
+        assert state.read_bytes() == before
+
+    # A caller may retain planning context alongside the generated transition;
+    # neither the note nor resume can substitute for the next execution grant.
+    note = "Retain the planning context while resuming unchanged work."
+    rc, resumed = cli(*resume, "--note", note)
+    assert rc == 0 and resumed["status"] == "applied", json.dumps(resumed, indent=2)
+    assert "--reason" in resume and "--note" not in resume
+    transition = resumed["deferred_resume_transition"]
+    assert transition["execution_authority_granted"] is False
+    assert transition["next_execution"] == "acquire_fresh_lease"
+    rc, current = cli("todo", "list", "--goal-id", GOAL_ID, "--todo-id", TODO_ID)
+    assert rc == 0 and current["todo"]["note"] == note, current
+    rc, absent = cli(
+        "task-lease", "inspect", "--goal-id", GOAL_ID, "--todo-id", TODO_ID
+    )
+    assert rc == 0 and absent["active"] is False, absent
+    # Execute the delivered continuation instead of constructing a successful
+    # guard that the consumer was never shown. No new Turn or premature spend.
+    reentry_args = shlex.split(actions[1])[1:]
+    assert reentry_args[reentry_args.index("--turn-instance-id") + 1] == "resume-command-turn"
+    assert reentry_args[reentry_args.index("--todo-id") + 1] == TODO_ID
+    assert not any("refresh-state" in action or "spend-slot" in action for action in actions)
+    rc, waiting = cli(*reentry_args)
+    assert rc == 0 and not waiting["normal_delivery_allowed"], waiting
+    assert waiting["heartbeat_receipt"]["event_id"] == guard["heartbeat_receipt"]["event_id"]
+    preparation = waiting["execution_preparation"]
+    assert preparation["state"] == "claim_required"
+    rc, acquired = cli(*preparation["claim"]["cli_args"])
+    assert rc == 0 and acquired["execution_managed"] is True, acquired
+
+    rc, reentry = cli(*reentry_args)
+    assert rc == 0 and reentry["normal_delivery_allowed"], reentry
+    lease_proof = reentry["execution_preparation"]["lease_proof"]
+    assert (
+        reentry["heartbeat_receipt"]["settlement_identity"]
+        == guard["heartbeat_receipt"]["settlement_identity"]
+    )
+    assert reentry["heartbeat_receipt"]["status"] == "upgraded"
+    assert reentry["heartbeat_receipt"]["event_id"] != guard["heartbeat_receipt"]["event_id"]
+    log_path = rollout_event_log_path(runtime, GOAL_ID)
+    events = load_rollout_events(log_path)
+    original = next(row for row in events if row["event_id"] == guard["heartbeat_receipt"]["event_id"])
+    assert original["details"]["delivery_allowed"] is False
+    qualified = next(row for row in events if row["event_id"] == reentry["heartbeat_receipt"]["event_id"])
+    assert qualified["causality"]["source_event_id"] == original["event_id"]
+    assert qualified["details"]["delivery_allowed"] is True
+    rc, cold = cli("quota", "should-run", *host_args, "--goal-id", GOAL_ID,
+        "--agent-id", AGENT_ID, "--turn-instance-id", "resume-command-turn",
+        "--todo-id", TODO_ID, )
+    assert rc == 0 and cold["heartbeat_receipt"]["status"] == "replayed", cold
+    assert cold["heartbeat_receipt"]["event_id"] == qualified["event_id"]
+    assert load_rollout_events(log_path) == events
+    artifact = project / "verified-result.txt"
+    artifact.write_text(str(17 * 23))
+    assert artifact.read_text() == "391"
+    child = ("native-child", "--goal-id", GOAL_ID, "--agent-id", AGENT_ID,
+             "--turn-instance-id", "resume-command-turn")
+    rc, decision = cli(*child, "record", "--operation-id", "resumed-audit",
+        "--stage", "decision", "--operation", "followup", "--outcome", "started",
+        "--entrypoint-id", "generic_host", "--execute")
+    assert rc == 0 and decision["appended"], decision
+    rc, replay = cli(*child, "record", "--operation-id", "resumed-audit",
+        "--stage", "decision", "--operation", "followup", "--outcome", "started",
+        "--entrypoint-id", "generic_host", "--execute")
+    assert rc == 0 and not replay["appended"]
+    rc, result = cli(*child, "record", "--operation-id", "resumed-audit",
+        "--stage", "result", "--outcome", "completed", "--execute")
+    assert rc == 0 and result["appended"], result
+    rc, reviewed = cli(*child, "record", "--operation-id", "resumed-audit",
+        "--stage", "review", "--outcome", "accepted", "--evidence-ref", "synthetic-audit",
+        "--validation-ref", "synthetic-validation", "--execute")
+    assert rc == 0 and reviewed["native_child_activity"]["parent_accepted_count"] == 1
+    assert _spend_run_count(runtime) == 0
+    vision = project / "vision.json"
+    vision.write_text(json.dumps({
+        "schema_version": "goal_vision_replan_contract_v0", "state": "vision_patch_proposed",
+        "vision_patch": {"acceptance_summary": "Verify the retained arithmetic result."},
+        "path_delta": {"outcome": "continue", "prior_assumption": "The work waits for its scheduled time.",
+            "observed_reality": "The wait resolved and the resumed work produced the verified result 391.",
+            "retained": ["Original acceptance and execution budget."],
+            "evidence_refs": ["artifact:verified-result"]},
+    }))
+    settlement = ("refresh-state", "--goal-id", GOAL_ID, "--agent-id", AGENT_ID,
+        "--todo-id", TODO_ID, "--turn-instance-id", "resume-command-turn",
+        "--classification", "resumed_work_verified", "--delivery-batch-scale", "single_surface",
+        "--delivery-outcome", "outcome_progress", "--agent-vision-json", str(vision),
+        "--task-lease-idempotency-key", lease_proof["idempotency_key"],
+        "--task-lease-expected-version", str(lease_proof["expected_version"]),
+        "--no-global-sync", "--suppress-external-sinks", "--settle-turn")
+    for _ in range(2):
+        rc, settled = cli(*settlement)
+        assert rc == 0 and settled["settlement_progress"]["state"] == "settled", json.dumps(settled)
+        assert settled["settlement_identity"] == guard["heartbeat_receipt"]["settlement_identity"]
+        assert _spend_run_count(runtime) == 1
+    rc, ended = cli(*reentry_args)
+    assert rc == 0 and ended["effective_action"] == "heartbeat_settled_skip", ended
+    assert artifact.read_text() == "391"

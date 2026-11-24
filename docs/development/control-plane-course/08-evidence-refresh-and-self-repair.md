@@ -15,7 +15,7 @@
 1. 区分 artifact、validation、writeback、refresh、spend 五个步骤。
 2. 使用 authoritative evidence 判断 acceptance，而不是依赖 todo status。
 3. 解释 projection gap、outcome floor、vision checkpoint 和 repair delta。
-4. 在连续 no-progress 时执行 self-repair，而不是降低 gate。
+4. 在连续 no-progress 时执行 self-repair。
 5. 为 public/private evidence 设计安全边界和 compact lineage。
 
 ## 本讲技术契约
@@ -122,6 +122,10 @@ Acceptance 证据应来自能直接证明结果的对象：
 - assistant 的完成声明；
 - 没有 acceptance evidence 的 `no_followup`。
 
+Checkpoint 证明的对象必须明确：来源与阶段一致性不等于业务结论正确，
+续跑 journal 也不等于回滚 workspace。已有机制与剩余边界见
+[Agent 失败控制与恢复](../../architecture/agent-failure-containment-and-recovery.zh-CN.md)。
+
 一个好的 evidence ref 足够紧凑，可以恢复判断，又不复制 raw log：
 
 ```text
@@ -190,7 +194,7 @@ loopx refresh-state \
   --vision-unchanged-reason "课程目标和验收标准未改变，本轮完成讲义内容交付"
 ```
 
-Refresh 不是“刷新页面”，而是一次有语义的状态 transaction：
+Refresh 是一次有语义的状态 transaction：
 
 - 写 run classification；
 - 标记 delivery scale/outcome；
@@ -256,7 +260,7 @@ last patch
 todo delta
 ```
 
-它不是另一份大计划，而是回答：
+它是回答：
 
 - 这个 peer 在长期目标中负责什么？
 - 什么证据说明它的 lane 可以关闭？
@@ -281,7 +285,6 @@ Vision
 
 这条链解释了为什么 Vision 应相对稳定，却不能永久冻结：用户方向变化、验收标准
 被证伪、长期 frontier 耗尽或持续局部最优时，需要一个有明确 delta 的 patch。
-反过来，新增一个 todo 不等于 Vision 已变化。
 
 `loopx/control_plane/goals/goal_vision.py::normalize_goal_vision_packet`
 把这种边界编码成 compact、public-safe、agent-scoped packet：
@@ -337,11 +340,9 @@ signal
   -> explicit priority, gate, or vision writeback
 ```
 
-这是管理面整理 signal 的分析顺序，不是 LoopX 中另一套独立状态机。持久化和执行
+这是管理面整理 signal 的分析顺序。持久化和执行
 权限仍由现有 Core State 合同负责：
 
-- 外部消息到达不等于用户已授权执行；
-- 被认为“有价值”的 signal 不等于已进入 runnable frontier；
 - raw feedback 不直接覆盖 Vision，必须形成明确 source、scope 和 delta；
 - performance review 可以影响下一轮优先级，但仍要通过 todo/gate/vision API 写回。
 
@@ -382,7 +383,7 @@ Replan 是当前目标图或覆盖账本上的机器可见语义变化：
 
 Dreaming 是探索未来可能性，可以产生 proposal，但不能替代当前 runnable frontier。
 
-quota 会把 evidence-log 压成 host-projected coverage ledger，并给出当前
+quota 会把当前 Agent 的 compact run history 压成 host-projected coverage ledger，并给出当前
 `obligation_id`。新 surface / hypothesis / probe 用 typed observation 写回；如果
 replan 的结果是下一条 runnable direction，则 Todo 本身就是原子语义 receipt：
 
@@ -451,7 +452,7 @@ classification 或 caller 自报 repair kind 都不能关闭新 obligation。
 
 ## 两轮无推进后的 Self-Repair
 
-规则不是“第二轮就随便换方向”，而是系统性审计：
+规则是系统性审计：
 
 ```text
 1. 重新读 exact quota interaction_contract
@@ -507,7 +508,7 @@ closeout_allowed_without_evidence = false
   "9 讲课程目标、受众与验收未改变；本轮完成全部讲义并以当前 CLI/smoke 交叉验证"
 ```
 
-这条回放说明 vision checkpoint 是长期 acceptance 的闭环，不是形式化打勾。
+这条回放说明 vision checkpoint 是长期 acceptance 的闭环。
 
 ## 多 Monitor 交错时的停滞证据
 
@@ -529,8 +530,7 @@ material change on M2 -> reset M2 only
 
 Quota 从 `monitor_open_items` 读取每条 lane 的 durable counter。任一 lane 达到阈值且
 没有 same-agent runnable advancement 时，`monitor_no_change_streak` 形成 replan 证据；
-replan 应选择 watch expiry、明确 blocker、supersede monitor 或创建 runnable successor，
-而不是再做一次 quiet poll。若存在 same-agent runnable advancement，advancement 优先，
+replan 应选择 watch expiry、明确 blocker、supersede monitor 或创建 runnable successor。若存在 same-agent runnable advancement，advancement 优先，
 但 blocked advancement 不能冒充可执行工作来压掉 replan。
 
 这个例子同时说明了三件事：evidence 必须归属稳定 identity；聚合 read model 不能覆盖
@@ -695,16 +695,24 @@ work effect
 
 ### 1. Replan 不能靠 classification 或 ACK，必须带 typed semantic delta
 
-`loopx/control_plane/work_items/progress_observation.py` 从显式 enum 与稳定 ID
-推导语义变化，不从 prose 猜测：
+`loopx/control_plane/work_items/progress_delta.ts` 从显式 enum、稳定 ID 与完整
+证据窗口推导语义变化，再由既有 replan owner 判断是否满足当前义务。Python
+facade 保留输入与历史 codec；调用完整资格入口，不能用预计算 outcome 代替：
 
 ```python
-observation = normalize_progress_observation(progress_observation)
-delta = semantic_progress_delta(
-    observation,
-    baseline=obligation.get("progress_baseline"),
+from loopx.control_plane.work_items.progress_observation import semantic_delta_from_writeback
+
+delta = semantic_delta_from_writeback(
+    obligation=obligation,
+    progress_observation=progress_observation,
+    history_runs=newest_first_runs,
 )
+if not delta["accepted"]:
+    print(delta["reason"])
 ```
+
+旧 blocker 不因更换 work item 而成为新结果。
+若 context 已截断 coverage，必须提供完整历史，缺失时资格入口拒绝写回。
 
 成功 receipt 必须携带当前 `obligation_id`，且 outcome 属于该 obligation 的
 `required_any_of`。`new_runnable_successor` 不走 `refresh-state` 的 successor 声明；
@@ -769,7 +777,7 @@ if normalized_progress_scope == "agent_lane":
 
 ### 4. Projection gap 把 prose 漂移升级成 repair
 
-`loopx/control_plane/quota/projection_repair.py::build_state_projection_gap_repair_hint` 的输入来自第 4 讲的 status projection。当 active prose 看起来可执行、结构化 agent todo 却为零时，它返回 self-repair hint，而不是让 quota 安静等待。
+`loopx/control_plane/quota/projection_repair.py::build_state_projection_gap_repair_hint` 的输入来自第 4 讲的 status projection。当 active prose 看起来可执行、结构化 agent todo 却为零时，它返回 self-repair hint。
 
 领读时追这条反向路径：
 
@@ -778,7 +786,7 @@ ACTIVE_GOAL_STATE.md prose
   -> state_projection_gap_warning
   -> status.project_asset.state_projection_gap
   -> build_state_projection_gap_repair_hint
-  -> quota effective_action=self_repair
+  -> quota effective_action=state_projection_gap_repair
   -> 写回 concrete todo / user gate / successor
 ```
 
@@ -857,9 +865,9 @@ CLI/status/quota 并补 smoke；只更新文档不会改变机器的下一次决
 
 - `examples/state-projection-gap-smoke.py`
 - `examples/project/goal-vision-replan-contract-smoke.py`
-- `examples/control_plane/agent-scoped-evidence-log-smoke.py`
+- `tests/control_plane/test_replan_context_evidence.py`
 - `examples/outcome-followthrough-policy-smoke.py`
-- `examples/control_plane/monitor-poll-policy-smoke.py`
+- `tests/control_plane_ts/quota_monitor_poll_commit.test.ts`
 
 ## 课后检查
 

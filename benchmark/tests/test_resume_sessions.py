@@ -1,0 +1,488 @@
+"""Conversation continuity contracts, including the native exec transport."""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+from benchmark.runtime.worker import run_once
+from benchmark.tests.test_shared_codex_runtime import worker_env
+from loopx.control_plane.turn_driver.codex_sessions import load_codex_cli_session
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX owned Host process groups")
+def test_launch_admission_exit_interrupt_reaps_started_host(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    import subprocess
+    import sys
+
+    from benchmark.runtime import worker
+
+    class Admission:
+        @contextmanager
+        def launch_lifetime(self, *, operation):
+            yield
+            raise KeyboardInterrupt("interrupted while releasing launch admission")
+
+    children = []
+    popen = subprocess.Popen
+
+    def record_child(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        children.append(process)
+        return process
+
+    monkeypatch.setattr(worker.subprocess, "Popen", record_child)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="releasing launch admission"):
+            with worker.child_process(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                env={**os.environ, "LOOPX_PROJECT": str(tmp_path)},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                goal_admission=Admission(),
+            ):
+                pytest.fail("interrupted admission must not yield the Host")
+        assert len(children) == 1
+        assert children[0].poll() is not None
+        with pytest.raises(ProcessLookupError):
+            os.killpg(children[0].pid, 0)
+    finally:
+        for process in children:
+            worker._reap_child_process(process)
+            process.stdin.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX owned Host process groups")
+@pytest.mark.parametrize("member_state", ["absent", "zombie", "live"])
+def test_reaped_native_group_permission_error_requires_no_live_descendant(monkeypatch, member_state):
+    from types import SimpleNamespace
+    from benchmark.runtime import worker
+    from loopx.extensions import process_runtime
+
+    # Reproduce Darwin refusing signals after the leader exited. Another
+    # group is always visible so an unavailable snapshot cannot prove absence.
+    process = SimpleNamespace(pid=12345, poll=lambda: 0, wait=lambda timeout: 0)
+    snapshot = "  900 S\n" + {"absent": "", "zombie": "12345 Z\n", "live": "12345 S\n"}[member_state]
+    def refused(group, number):
+        raise PermissionError("signal refused")
+    monkeypatch.setattr(worker.os, "killpg", refused)
+    monkeypatch.setattr(process_runtime.sys, "platform", "darwin")
+    monkeypatch.setattr(process_runtime.subprocess, "run", lambda *args, **kwargs:
+                        SimpleNamespace(returncode=0, stdout=snapshot))
+    if member_state == "live":
+        with pytest.raises(PermissionError, match="signal refused"):
+            worker._reap_child_process(process)
+    else:
+        worker._reap_child_process(process)
+
+
+@pytest.mark.parametrize("existing", ["valid", "malformed", "dangling"])
+def test_absent_only_session_admission_preserves_every_existing_binding(tmp_path, existing):
+    """The no-replacement condition is checked under the session owner's lock."""
+    from loopx.control_plane.turn_driver.codex_sessions import _session_path, _store_codex_cli_session
+
+    lineage = {"goal_id": "continuation-fixture", "agent_id": "continuation-agent"}
+    path = _session_path(tmp_path, lineage, "agent")
+    path.parent.mkdir(parents=True)
+    if existing == "valid":
+        _store_codex_cli_session(tmp_path, lineage=lineage, session_scope="agent", session_id="original-session")
+    elif existing == "malformed":
+        path.write_bytes(b"unconfirmed original binding")
+    else:
+        path.symlink_to(path.with_name("unavailable-original"))
+    before = path.readlink() if path.is_symlink() else path.read_bytes()
+    with pytest.raises(ValueError, match="already exists"):
+        _store_codex_cli_session(tmp_path, lineage=lineage, session_scope="agent", session_id="replacement-session",
+                                require_absent=True)
+    assert (path.readlink() if path.is_symlink() else path.read_bytes()) == before
+    if existing == "valid":
+        # Ordinary native observation retains its existing default behavior.
+        _store_codex_cli_session(tmp_path, lineage=lineage, session_scope="agent", session_id="observed-session")
+        assert load_codex_cli_session(tmp_path, lineage=lineage, session_scope="agent")["session_id"] == "observed-session"
+
+
+@pytest.mark.parametrize("replacement", [None, "session", "profile", "lifetime"])
+def test_checkpoint_provenance_belongs_only_to_original_binding(tmp_path, replacement):
+    from loopx.control_plane.turn_driver.codex_sessions import _session_path, _store_codex_cli_session
+
+    args = dict(lineage={"goal_id": "branch", "agent_id": "actor"}, session_scope="agent",
+                session_id="original", session_profile_digest="profile", goal_ref={"goal_id": "branch"})
+    _store_codex_cli_session(tmp_path, **args, checkpoint_artifact_sha256="a" * 64, require_absent=True)
+    path = _session_path(tmp_path, args["lineage"], "agent")
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match="cannot change"):
+        _store_codex_cli_session(tmp_path, **args, checkpoint_artifact_sha256="b" * 64)
+    assert path.read_bytes() == original
+    if replacement == "session":
+        args["session_id"] = "replacement"
+    elif replacement == "profile":
+        args["session_profile_digest"] = "changed"
+    elif replacement == "lifetime":
+        args["goal_ref"] = {"goal_id": "branch", "goal_instance_id": "replacement"}
+    _store_codex_cli_session(tmp_path, **args)
+    value = load_codex_cli_session(tmp_path, lineage=args["lineage"], session_scope="agent")
+    if replacement is None:
+        assert path.read_bytes() == original
+        assert value["checkpoint_artifact_sha256"] == "a" * 64
+    else:
+        assert "checkpoint_artifact_sha256" not in value
+    # A never-enabled ordinary record retains exactly the original field shape.
+    plain = dict(args, session_id="ordinary")
+    _store_codex_cli_session(tmp_path, **plain)
+    assert set(load_codex_cli_session(tmp_path, lineage=args["lineage"], session_scope="agent")) == {
+        "schema_version", "host", "goal_id", "agent_id", "session_scope", "session_id",
+        "session_profile_digest", "goal_ref"}
+
+
+def resume_env(tmp_path, monkeypatch):
+    env = worker_env(tmp_path)
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    env.update(
+        LOOPX_EXECUTION_MODE="heartbeat",
+        # These legacy resume fixtures pin their original transport treatment.
+        LOOPX_CONTEXT_DELIVERY="off",
+        LOOPX_ITERATION_CONTEXT="resume",
+        LOOPX_RUNTIME_ROOT=str(tmp_path / "runtime"),
+        LOOPX_REGISTRY=str(tmp_path / "registry.json"),
+        LOOPX_GOAL_ID="fixture-goal",
+        LOOPX_AGENT_ID="fixture-agent",
+        LOOPX_SHARED_SKILLS=str(skills),
+        LOOPX_CLI="loopx",
+    )
+    Path(env["LOOPX_REGISTRY"]).write_text(json.dumps({
+        "schema_version": "0.2", "projects": [], "goals": [{
+            "id": env["LOOPX_GOAL_ID"], "status": "active", "repo": str(tmp_path),
+            "coordination": {"registered_agents": [env["LOOPX_AGENT_ID"]]},
+        }],
+    }))
+    monkeypatch.setattr(
+        "benchmark.runtime.worker.heartbeat_body",
+        lambda *a, **kw: "Current Todo input.",
+    )
+    # This fixture isolates native conversation/lifetime transport, including
+    # deliberately unregistered identities and lifecycle-only source profiles.
+    # Real current quota/health qualification is exercised by the CLI-backed
+    # test_benchmark_current_admission and checkpoint_admission integration tests.
+    monkeypatch.setattr("benchmark.runtime.worker.heartbeat_launch_check", lambda *a, **kw: None)
+    Path(env["CODEX_BIN"]).write_text(
+        f"#!{__import__('sys').executable}\n"
+        + """
+import json, os, pathlib, sys, time, uuid
+args = sys.argv[1:]
+body = sys.stdin.read()
+session = args[-2] if "resume" in args else str(uuid.uuid4())
+if os.environ.get("FORK_SESSION"):
+    session = str(uuid.uuid4())
+home = pathlib.Path(os.environ["CODEX_HOME"]) / "sessions"
+home.mkdir(exist_ok=True)
+with (home / (session + ".jsonl")).open("a") as stream:
+    stream.write(json.dumps({"body": body}) + "\\n")
+print(json.dumps({"type": "thread.started", "thread_id": session}), flush=True)
+print(json.dumps({"argv": args}), flush=True)
+if os.environ.get("HOLD_SESSION"):
+    time.sleep(60)
+if "--output-last-message" in args:
+    pathlib.Path(args[args.index("--output-last-message") + 1]).write_text('{"marker":"planning-ack"}')
+"""
+    )
+    return env
+
+
+def plan_stage(env, monkeypatch):
+    from benchmark.runtime import planning
+
+    schema = {
+        "type": "object",
+        "properties": {"marker": {"type": "string"}},
+        "required": ["marker"],
+        "additionalProperties": False,
+    }
+    monkeypatch.setattr(
+        planning,
+        "task_plan_packet",
+        lambda *a: {"result_schema": schema, "marker": "planning-input"},
+    )
+    monkeypatch.setattr(planning, "validate_plan_readback", lambda *a: {"ok": True})
+    return env | {
+        "LOOPX_TASK_ENTRY": "loopx-planned",
+        "LOOPX_TASK_STAGE": "plan",
+        "LOOPX_PHASE_DEADLINE_EPOCH": env.get("LOOPX_PHASE_DEADLINE_EPOCH", str(time.time() + 600)),
+        "LOOPX_PLANNING_RESULT": str(Path(env["LOOPX_PROJECT"]) / "planning.json"),
+    }
+
+
+def binding(env):
+    return load_codex_cli_session(
+        Path(env["LOOPX_RUNTIME_ROOT"]),
+        lineage={"goal_id": env["LOOPX_GOAL_ID"], "agent_id": env["LOOPX_AGENT_ID"]},
+        session_scope="agent",
+    )
+
+
+@pytest.mark.parametrize("planning_mode", ["heartbeat", "turn"])
+@pytest.mark.parametrize("context", [None, "resume"])
+def test_planning_heartbeat_and_turn_share_one_binding(
+    tmp_path, monkeypatch, planning_mode, context
+):
+    env = resume_env(tmp_path, monkeypatch)
+    if context is None:
+        env.pop("LOOPX_ITERATION_CONTEXT")
+    plan_env = plan_stage(env, monkeypatch) | {"LOOPX_EXECUTION_MODE": planning_mode}
+    if planning_mode == "turn":
+        plan_env["LOOPX_VALIDATION_COMMAND_JSON"] = '["true"]'
+    first = run_once(plan_env)
+    second = run_once(env)
+    third = run_once(env)
+    assert first["ok"] and second["ok"] and third["ok"]
+    assert first["session"]["action"] == "start_new"
+    assert second["session"]["action"] == third["session"]["action"] == "resume"
+    assert len({r["session"]["session_id"] for r in (first, second, third)}) == 1
+    assert binding(env)["session_id"] == first["session"]["session_id"]
+    assert len(list((tmp_path / "logs/sessions").glob("*.jsonl"))) == 1
+
+
+def test_timeout_keeps_the_observed_session_for_next_heartbeat(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    import subprocess
+    from benchmark.runtime import worker
+
+    env = resume_env(tmp_path, monkeypatch)
+    real_child_process = worker.child_process
+    observed_sessions = []
+
+    @contextmanager
+    def timeout_after_session_event(command, *, env, stdout, stderr, goal_admission=None,
+                                    check_current_launch=None):
+        with real_child_process(command, env=env, stdout=stdout, stderr=stderr,
+                goal_admission=goal_admission, check_current_launch=check_current_launch) as process:
+            def communicate(*, input, timeout):
+                assert timeout == 1
+                # Inject the timeout after the real child publishes its native
+                # identity, rather than racing interpreter startup against 1s.
+                process.stdin.write(input)
+                process.stdin.close()
+                deadline = time.monotonic() + 15
+                while process.poll() is None and time.monotonic() < deadline:
+                    line, complete, _ = Path(stdout.name).read_text().partition("\n")
+                    if complete:
+                        event = json.loads(line)
+                        assert event["type"] == "thread.started"
+                        observed_sessions.append(event["thread_id"])
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    time.sleep(0.01)
+                raise AssertionError("fixture did not publish a session before timeout injection")
+
+            process.communicate = communicate
+            yield process
+
+    with monkeypatch.context() as fault:
+        fault.setattr(worker, "child_process", timeout_after_session_event)
+        first = run_once(env | {"HOLD_SESSION": "1", "LOOPX_CODEX_TURN_TIMEOUT_SEC": "1"})
+    assert first["timed_out"] and not first["ok"]
+    assert observed_sessions == [first["session"]["session_id"]]
+    second = run_once(env)
+    assert second["ok"] and second["session"]["action"] == "resume"
+    assert second["session"]["session_id"] == first["session"]["session_id"]
+
+
+@pytest.mark.parametrize("change", ["stop", "replace"])
+@pytest.mark.parametrize("profile", ["legacy", "source"])
+def test_heartbeat_rechecks_selected_session_at_native_launch(tmp_path, monkeypatch, change, profile):
+    from benchmark.runtime import worker
+    from loopx.control_plane.goals.first_party_host_admission import FirstPartyHostRuntimeRejected
+    from loopx.control_plane.projects.registry_codec import project_registry_transaction, source_session_registry_transaction
+    from tests.test_loopx_turn_codex_cli import _source_admission
+
+    env = resume_env(tmp_path, monkeypatch)
+    if profile == "source":
+        admission = _source_admission(tmp_path)
+        env["LOOPX_REGISTRY"] = str(admission.registry_path)
+    registry_path = Path(env["LOOPX_REGISTRY"])
+    registry_transaction = source_session_registry_transaction if profile == "source" else project_registry_transaction
+    first = run_once(env)
+    original_binding = binding(env)
+    history = next((tmp_path / "logs/sessions").glob("*.jsonl"))
+    original_history = history.read_bytes()
+    native_command = worker.native_command
+
+    def changed_after_selection(*args, **kwargs):
+        command = native_command(*args, **kwargs)
+        with registry_transaction(
+            registry_path, operation="fixture_stop_before_native_launch",
+        ) as transaction:
+            registry = transaction.payload_copy()
+            if change == "replace":
+                if profile == "source":
+                    registry["goals"][0]["goal_instance_id"] = "ginst_" + "b" * 32
+                else:
+                    registry["goals"][0]["repo"] = str(tmp_path / "replacement")
+            else:
+                registry["goals"][0]["activation"] = {
+                    "schema_version": "loopx_goal_activation_v1", "state": "stopped",
+                    "updated_at": "2026-10-10T12:00:00Z", "reason": "Owner stopped this Goal",
+                }
+            transaction.commit(registry)
+        return command
+
+    monkeypatch.setattr(worker, "native_command", changed_after_selection)
+    with pytest.raises(FirstPartyHostRuntimeRejected) as error:
+        run_once(env)
+    assert error.value.code == ("goal_stopped" if change == "stop" else
+                                "stale_goal_instance" if profile == "source" else "stale_goal_authority")
+    receipt = json.loads(sorted((tmp_path / "logs/wakes").glob("*/receipt.json"))[-1].read_bytes())
+    assert receipt["host_invoked"] is False and not receipt["ok"]
+    assert receipt["error_kind"] == "FirstPartyHostRuntimeRejected"
+    assert receipt["session"]["session_id"] == first["session"]["session_id"]
+    assert binding(env) == original_binding and history.read_bytes() == original_history
+
+
+@pytest.mark.parametrize("mutation", ["corrupt", "home", "fork"])
+def test_resume_refuses_silent_replacement(tmp_path, monkeypatch, mutation):
+    env = resume_env(tmp_path, monkeypatch)
+    first = run_once(env)
+    if mutation == "corrupt":
+        next((tmp_path / "runtime").glob("goals/*/turn-sessions/*.json")).write_text(
+            "invalid"
+        )
+    elif mutation == "home":
+        env["LOOPX_CODEX_HOME"] = str(tmp_path / "other-home")
+    else:
+        env["FORK_SESSION"] = "1"
+    with pytest.raises((ValueError, RuntimeError)):
+        run_once(env)
+    receipt = json.loads(
+        sorted((tmp_path / "logs/wakes").glob("*/receipt.json"))[-1].read_text()
+    )
+    assert not receipt["ok"]
+    if mutation == "fork":
+        assert binding(env)["session_id"] == first["session"]["session_id"]
+
+
+@pytest.mark.parametrize("field", ["LOOPX_GOAL_ID", "LOOPX_AGENT_ID"])
+def test_another_identity_starts_an_independent_conversation(
+    tmp_path, monkeypatch, field
+):
+    env = resume_env(tmp_path, monkeypatch)
+    first = run_once(env)
+    if field == "LOOPX_GOAL_ID":
+        from loopx.control_plane.projects.registry_codec import project_registry_transaction
+
+        with project_registry_transaction(Path(env["LOOPX_REGISTRY"]), operation="fixture_second_goal") as transaction:
+            payload = transaction.payload_copy()
+            payload["goals"].append({**payload["goals"][0], "id": "another-identity"})
+            transaction.commit(payload)
+    second = run_once(env | {field: "another-identity"})
+    assert second["session"]["action"] == "start_new"
+    assert second["session"]["session_id"] != first["session"]["session_id"]
+
+
+def test_explicit_fresh_replaces_corrupt_shared_binding(tmp_path, monkeypatch):
+    env = resume_env(tmp_path, monkeypatch)
+    first = run_once(env)
+    next((tmp_path / "runtime").glob("goals/*/turn-sessions/*.json")).write_text(
+        "invalid"
+    )
+    second = run_once(env | {"LOOPX_ITERATION_CONTEXT": "fresh"})
+    third = run_once(env)
+    assert second["session"]["session_id"] != first["session"]["session_id"]
+    assert third["session"]["session_id"] == second["session"]["session_id"]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("LOOPX_TEST_CODEX_BIN"), reason="native Codex binary required"
+)
+@pytest.mark.parametrize("context", [None, "resume"])
+def test_native_codex_resume_keeps_planning_history(tmp_path, monkeypatch, context):
+    """Exercise installed Codex against a disposable local Responses endpoint."""
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            requests.append(json.loads(raw))
+            text = (
+                '{"marker":"planning-ack"}' if len(requests) == 1 else "execution-ack"
+            )
+            message = {
+                "id": "msg_fixture",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+            response = {
+                "id": f"resp_{len(requests)}",
+                "object": "response",
+                "model": "gpt-5.4",
+                "status": "completed",
+                "output": [message],
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            }
+            events = [
+                {
+                    "type": "response.created",
+                    "response": response | {"status": "in_progress", "output": []},
+                },
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": message,
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "item_id": message["id"],
+                    "delta": text,
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": message,
+                },
+                {"type": "response.completed", "response": response},
+            ]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for event in events:
+                self.wfile.write(("data: " + json.dumps(event) + "\n\n").encode())
+            self.wfile.flush()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        env = resume_env(tmp_path, monkeypatch) | {
+            "CODEX_BIN": os.environ["LOOPX_TEST_CODEX_BIN"],
+            "MODEL_NAME": "gpt-5.4",
+            "OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
+            "LOOPX_CODEX_TURN_TIMEOUT_SEC": "30",
+            "LOOPX_PHASE_DEADLINE_EPOCH": str(time.time() + 600),
+        }
+        if context is None:
+            env.pop("LOOPX_ITERATION_CONTEXT")
+        first = run_once(plan_stage(env, monkeypatch))
+        second = run_once(env)
+        assert first["ok"] and second["ok"]
+        assert first["session"]["session_id"] == second["session"]["session_id"]
+        assert len(requests) == 2
+        history = json.dumps(requests[1]["input"])
+        assert "planning-input" in history and "planning-ack" in history
+        assert "Host execution window" not in history
+        assert "Existing execution reserve" not in history
+        assert env["LOOPX_PHASE_DEADLINE_EPOCH"] not in history
+        assert "Current Todo input." in history
+        assert len(list((tmp_path / "logs/sessions").rglob("*.jsonl"))) == 1
+    finally:
+        server.shutdown()
+        server.server_close()

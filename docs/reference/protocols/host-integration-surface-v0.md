@@ -27,7 +27,48 @@ before ordinary chat, then hands off to the same CLI-backed lifecycle.
 | Loopback server adapter | Provide compact status and controlled write endpoints for local dashboards or host runtimes. | Bind remotely by default, publish private state, or make browser/frontstage/server writes authoritative without CLI-equivalent dry-run. |
 | CLI fallback | Preserve a deterministic path for every read and write when the hook/MCP/server layer is absent or unhealthy. | Become a hidden headless execution path for TUI-first bootstrap unless the user explicitly opted in. |
 
+## Codex Ordinary Project Git Writes
+
+An ordinary project with the Core `workspace_write` grant adds its physical
+`.git` directory to the native workspace policy's explicit write roots. When
+both `.codex` and `.codex/skills` are physical directories, it also adds only
+the project skills subtree, so an authorized checkout or merge can update
+repository skills. Codex otherwise protects `.codex` recursively even inside
+a writable workspace. Project configuration, other protected directories and
+the account's native store gain no write root.
+
+Start and resume require native readback of every added root; subsequent Turns
+retain the same thread policy. Existing host network, temporary-directory
+settings and approved write roots are preserved. This changes the ordinary
+project default for project skills; it does not select full access.
+
+Read-only projects and workspace-only community isolation keep their existing
+policies. A symlinked `.git` or a linked worktree's external Git directory gains
+no extra write root. Symlinked `.codex` or `skills` directories also gain no
+additional root. The ordinary project's account, tools and network policy
+remain under their existing owners; this is filesystem execution support,
+not authorization to publish or perform destructive Git operations.
+
 ## Thin Hook Activation
+
+### Separately installed generic-cli transports
+
+Python Turn host providers use `loopx.extensions.turn_host` for signed request
+extraction, prompt/candidate conversion, exact GoalRef validation and candidate
+validation. This supported facade forwards the existing owners. It does not
+perform artifact acceptance or grant claim, lease, writeback or quota authority.
+Private provider-state locks and atomic writes use the existing public
+`loopx.file_lock` API; providers must not import kernel-private executors.
+
+For a local stdio tool whose SDK detaches its child process, pass its argv
+through `supervised_stdio_command` before giving it to the SDK. The raw relay
+retains the existing TypeScript process supervisor until the owned tool group
+is drained, including parent EOF and cancellation. It forwards stream bytes
+without interpreting MCP or tool permissions. POSIX process-group cleanup and
+Windows best-effort tree cleanup retain their existing platform boundary.
+This is not a sandbox for deliberately detached or externally managed tools.
+
+### Lifecycle activation
 
 A host hook may only activate the current LoopX lifecycle. It should:
 
@@ -77,7 +118,7 @@ no-clone path is:
 
 ```bash
 curl -fsSL \
-  https://huangruiteng.github.io/loopx/install.sh \
+  https://loopx-project.github.io/loopx/install.sh \
   | env LOOPX_SKILLS_DIR=<PROJECT_WORKSPACE>/.agents/skills \
       LOOPX_ENTRY_HOST_SURFACE=ark-managed-agent \
       LOOPX_INSTALL_SLASH_COMMANDS=0 bash
@@ -209,6 +250,39 @@ Optional projections such as `task_graph_projection_v0`,
 inputs to a host integration. They do not add graph write authority, launch
 workers, change quota gates, or create a new source of truth.
 
+### Managed Node startup diagnostics
+
+The Effect transport's version probe and process readiness each have a bounded
+15-second budget; the version probe previously allowed only 2 seconds. This
+changes cold startup tolerance and the worst-case failed-probe wait, not work
+Turn deadlines or the Node.js 22.22.3 compatibility floor. Warm requests reuse
+the serving runtime without a new version probe. `loopx doctor` still observes
+the current launcher independently, so replacing PATH is visible immediately.
+
+Startup, doctor and guided start-goal share the same probe diagnosis:
+
+A successful initial doctor check does not guarantee a later cold-start probe
+will succeed. Deep doctor preserves the later probe's diagnostic and recovery
+below, with host-permission recovery taking precedence. Other runtime startup
+failures retain their existing recovery advice.
+
+| Diagnostic code | Observation | Recovery |
+| --- | --- | --- |
+| `node_unavailable` | Node missing or a parsed version below the floor | Install or activate a qualified Node on PATH |
+| `node_probe_timeout` | No completed version observation within the budget | Check host load and the launcher; compatibility remains unknown |
+| `node_probe_launch_failed` | The launcher could not be executed | Repair the launcher on PATH |
+| `node_probe_exit_failed` | The probe exited unsuccessfully | Repair the launcher on PATH |
+| `node_probe_invalid_version` | Successful exit without a valid version | Verify the launcher's version output |
+| `runtime_host_permission_denied` | Host denied the probe | Retry through host-approved runtime access |
+
+After recovery, run `loopx doctor --deep` and retry the original request. Failed
+probes do not dispatch semantic work, grant capability authority, rewrite Goal
+state or publish raw output, stderr or executable paths. Timeout and cancellation
+kill and reap the probe child; cancellation propagates to the caller.
+The request transport does not automatically repeat a failed Node probe before
+the caller can recover. Existing retries for other startup and safe transport
+failures remain in place.
+
 ## Controlled Writes
 
 Writes must be CLI-equivalent, idempotent where possible, and fail closed when
@@ -272,6 +346,48 @@ ledger, todos, gates, quota, and optional task leases remain authoritative. A
 host may consume task graph or cadence projections, but those projections
 remain derived read-only facts and never grant write authority.
 
+### Bounded local Codex activity reads
+
+The local Codex provider verifies the rollout's session header against the
+exact thread selected from the authorized home's read-only store. Activity
+comes from completed host records, not a file's modification time or a Todo
+claim. A recorded open turn is distinct from current liveness: existing event
+freshness rules still apply when the host exits or stops producing events.
+
+Long turns use a resumable reverse search for the nearest start/end marker and
+a forward cursor for newly appended records. Each observation has an 8 MiB
+rollout-read budget, including source checks; initial recovery can require
+multiple observations and stays unknown until the relevant interval is read.
+Giant JSONL records are validated in bounded chunks without retaining message
+strings. Incomplete trailing records are ignored until their newline arrives.
+An end appended during observation cannot certify the earlier open snapshot.
+
+The Chat service keeps optional observation hints beneath its existing runtime
+root, in `observation-cache/codex-activity`. At most 256 fixed slots contain
+hashed source bindings, file identity, byte positions and whitelisted event
+facts. They contain no transcript, raw thread id or source path. Cached facts
+are checked against the source; header mismatch, truncation, replacement,
+changed anchors, malformed records and unavailable stores remain unknown or
+trigger recovery. This assumes the host's JSONL is append-only between such
+source changes; it does not authenticate arbitrary edits to the host store.
+Cache loss or denied cache writes do not grant permissions or prevent a fresh
+bounded read. The provider never writes into the Codex home.
+
+On Windows, the rollout reader requests read access with read/write/delete
+sharing, allowing the host to rename its log or replace it with the native
+`ReplaceFile` operation while an observation is open. The reader cannot write,
+create or delete the source. Existing file-identity checks keep a mid-read
+replacement unknown until a subsequent observation recovers the new source.
+Windows `os.replace` uses a different operation that cannot overwrite an open
+destination even with delete sharing; the native rotation fixture uses
+[`ReplaceFile`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew).
+Visible conversation paging and content reads reuse the same read-only transport.
+An in-progress read retains its opened snapshot; the next page detects the new
+source identity and resets its cursor, while old content references are rejected.
+
+These are provider IO/cache changes under the existing host activity contract,
+not a new execution authority, scheduler, model call or configurable capability.
+
 ## CLI Fallback
 
 Every host integration must document the CLI fallback for the same operation.
@@ -280,7 +396,7 @@ Minimum fallback set:
 ```bash
 loopx doctor
 loopx --format json status --agent-id <agent-id>
-loopx --format json --registry "$HOME/.codex/loopx/registry.global.json" quota should-run --goal-id <goal-id> --agent-id <agent-id>
+loopx --format json --registry "$HOME/.loopx/registry.global.json" quota should-run --goal-id <goal-id> --agent-id <agent-id>
 loopx todo claim --goal-id <goal-id> --todo-id <todo_id> --claimed-by <agent-id>
 loopx todo complete --goal-id <goal-id> --todo-id <todo_id> --claimed-by <agent-id> --evidence "<public-safe evidence>"
 loopx refresh-state --goal-id <goal-id> --agent-id <agent-id>
@@ -288,8 +404,18 @@ loopx quota spend-slot --goal-id <goal-id> --todo-id <selected-todo-id> --slots 
 ```
 
 When a host explicitly advertises `task_lease_v0`, it must also expose the
-equivalent CLI fallback. Acquiring a hard lease does not replace todo claim,
-quota, capability, write-scope, or workspace guards:
+equivalent CLI fallback. After canonical authority promotion, a `hard_lease`
+host can acquire the lease and claim atomically; LoopX derives write scopes
+from the canonical Todo:
+
+```bash
+loopx todo claim --goal-id <goal-id> --todo-id <todo_id> --claimed-by <agent-id> --agent-id <agent-id> --claim-operation-id <operation-id> --task-lease-idempotency-key <turn-key> --task-lease-expected-version <lease-version>
+```
+
+The atomic options fail closed before promotion. The existing two-command
+fallback remains available where the lease is acquired separately. Acquiring
+a hard lease does not replace quota, capability, write-scope, or workspace
+guards:
 
 ```bash
 loopx task-lease acquire --goal-id <goal-id> --todo-id <todo_id> --owner <agent-id> --idempotency-key <turn-key> --write-scope <scope>
@@ -310,6 +436,44 @@ If the host adapter is unavailable, the user or automation can run those
 commands and preserve the same state transitions. If a host offers an operation
 without a CLI fallback, that operation is experimental and must not be used as
 the default project control path.
+
+## Native Chat startup from a trusted launcher
+
+The native CLI and locally reviewed Chat launchers share
+`loopx.cli_commands.support_control_chat.chat_server_options`. Use the parser
+and builder from the same installed LoopX release instead of copying option
+conversion into a launcher:
+
+```python
+from pathlib import Path
+import sys
+
+from loopx.cli import build_parser
+from loopx.cli_commands.support_control_chat import chat_server_options
+from loopx.chat_server import serve_chat
+
+args = build_parser().parse_args(sys.argv[1:])
+options = chat_server_options(args, registry_path=Path(args.registry).expanduser())
+serve_chat(**options)
+```
+
+Invoke the launcher with the ordinary `chat` arguments, including `--no-open`
+when it runs under a supervisor. A trusted launcher can pass its locally
+reviewed `external_conversation_factories` tuple separately to `serve_chat`;
+HTTP requests and IM messages cannot select factory code.
+
+The builder accepts only the `chat` command and has no server-start, replacement,
+listener or grant effects. The CLI retains ownership of its explicit
+replacement operation. It preserves workspace grants, filesystem restrictions,
+reaction settings, registry selection and scan paths. An omitted startup timeout
+remains `None` for the native adapter defaults; an explicit timeout retains its
+existing lower clamp and upper-bound meaning.
+
+After an upgrade, check the supervised process and `/healthz`, then verify the
+configured transport's listener, original Session and actual message return.
+HTTP health alone does not establish message delivery. This startup helper
+does not admit missed messages or replay existing Turns; outage catch-up retains
+the original source, audience and idempotency requirements of its owning transport.
 
 ## Public/Private Boundary
 

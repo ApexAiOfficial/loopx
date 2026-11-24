@@ -15,8 +15,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from ...file_lock import exclusive_file_lock
+from ...file_lock import LockAcquireTimeoutError, exclusive_file_lock
+from ...file_lock import lock_timeout_error_fields
 from ...paths import registry_project_root
+from ...public_safe_text import OPAQUE_ID_PATTERN as _SAFE_TOKEN
 from ...registry import registry_goals
 
 
@@ -27,7 +29,6 @@ BOTMUX_DEFAULT_ENDPOINT = "http://127.0.0.1:7891"
 BOTMUX_DEFAULT_TOKEN_ENV = "BOTMUX_DASHBOARD_TOKEN"
 BOTMUX_HTTP_TIMEOUT_SECONDS = 4.0
 
-_SAFE_TOKEN = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PRIVATE_PACKET_KEYS = {
     "bot_id",
@@ -162,7 +163,9 @@ def _write_private_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
+        # Windows has no fchmod; mkstemp already created the file for this user only.
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(dict(payload), handle, ensure_ascii=False, indent=2)
             handle.write("\n")
@@ -499,6 +502,23 @@ def _assert_public_packet(packet: Mapping[str, Any]) -> None:
     visit(packet)
 
 
+def _lock_timeout_packet(
+    *, goal_id: str, operation: str, execute: bool, error: LockAcquireTimeoutError
+) -> dict[str, Any]:
+    packet = _operation_packet(
+        ok=False,
+        goal_id=goal_id,
+        operation=operation,
+        execute=execute,
+        status="blocked",
+        blocker="botmux_runtime_lock_timeout",
+        public_summary="the botmux runtime binding is busy; inspect the lock holder and retry",
+    )
+    packet.update(lock_timeout_error_fields(error))
+    _assert_public_packet(packet)
+    return packet
+
+
 def _probe_botmux(
     *,
     binding: Mapping[str, Any],
@@ -721,67 +741,61 @@ def doctor_botmux_runtime(
     binding_path: Path,
     requester: JsonRequester = _request_json,
 ) -> dict[str, Any]:
-    binding = botmux_binding_for_goal(
-        read_botmux_runtime_binding(binding_path),
-        goal_id,
-    )
-    if binding is None or binding.get("enabled") is not True:
-        return _operation_packet(
-            ok=False,
-            goal_id=goal_id,
-            operation="runtime_doctor",
-            execute=False,
-            status="blocked",
-            blocker="botmux_binding_missing",
-            public_summary="configure a botmux runtime binding for this goal",
-        )
     try:
-        probe = _probe_botmux(binding=binding, requester=requester)
-    except ValueError as exc:
-        blocker = (
-            "botmux_auth_unavailable"
-            if "token is unavailable" in str(exc)
-            else "botmux_configuration_invalid"
+        with exclusive_file_lock(binding_path, operation="botmux_runtime_doctor"):
+            binding = botmux_binding_for_goal(
+                read_botmux_runtime_binding(binding_path),
+                goal_id,
+            )
+            if binding is None or binding.get("enabled") is not True:
+                return _operation_packet(
+                    ok=False,
+                    goal_id=goal_id,
+                    operation="runtime_doctor",
+                    execute=False,
+                    status="blocked",
+                    blocker="botmux_binding_missing",
+                    public_summary="configure a botmux runtime binding for this goal",
+                )
+            try:
+                probe = _probe_botmux(binding=binding, requester=requester)
+            except (ValueError, BotmuxApiError, BotmuxTransportError) as exc:
+                if isinstance(exc, ValueError):
+                    blocker = (
+                        "botmux_auth_unavailable"
+                        if "token is unavailable" in str(exc)
+                        else "botmux_configuration_invalid"
+                    )
+                    summary = "the botmux runtime binding is not ready"
+                elif isinstance(exc, BotmuxApiError):
+                    blocker = "botmux_api_rejected"
+                    summary = "botmux rejected the runtime readiness probe"
+                else:
+                    blocker = "botmux_unreachable"
+                    summary = "the configured botmux daemon is unreachable"
+                return _operation_packet(
+                    ok=False,
+                    goal_id=goal_id,
+                    operation="runtime_doctor",
+                    execute=False,
+                    status="blocked",
+                    blocker=blocker,
+                    public_summary=summary,
+                )
+            return _operation_packet(
+                ok=True,
+                goal_id=goal_id,
+                operation="runtime_doctor",
+                execute=False,
+                status="ready",
+                public_summary="the botmux runtime binding is ready",
+                readback_verified=True,
+                details=probe,
+            )
+    except LockAcquireTimeoutError as exc:
+        return _lock_timeout_packet(
+            goal_id=goal_id, operation="runtime_doctor", execute=False, error=exc
         )
-        return _operation_packet(
-            ok=False,
-            goal_id=goal_id,
-            operation="runtime_doctor",
-            execute=False,
-            status="blocked",
-            blocker=blocker,
-            public_summary="the botmux runtime binding is not ready",
-        )
-    except BotmuxApiError:
-        return _operation_packet(
-            ok=False,
-            goal_id=goal_id,
-            operation="runtime_doctor",
-            execute=False,
-            status="blocked",
-            blocker="botmux_api_rejected",
-            public_summary="botmux rejected the runtime readiness probe",
-        )
-    except BotmuxTransportError:
-        return _operation_packet(
-            ok=False,
-            goal_id=goal_id,
-            operation="runtime_doctor",
-            execute=False,
-            status="blocked",
-            blocker="botmux_unreachable",
-            public_summary="the configured botmux daemon is unreachable",
-        )
-    return _operation_packet(
-        ok=True,
-        goal_id=goal_id,
-        operation="runtime_doctor",
-        execute=False,
-        status="ready",
-        public_summary="the botmux runtime binding is ready",
-        readback_verified=True,
-        details=probe,
-    )
 
 
 def _disable_botmux_runtime(
@@ -1147,7 +1161,30 @@ def _status_botmux_runtime(
     session = dict(binding.get("session") or {})
     session_id = str(session.get("session_id") or "").strip()
     dispatch_key = str(session.get("active_dispatch_key") or "").strip()
-    if not session_id or not dispatch_key:
+    # A reused session's trigger-result describes its latest *accepted* turn.
+    # A dispatch the provider never accepted cannot be vouched for by it:
+    # ATTEMPTING and REJECTED never became one, and an UNKNOWN that was never
+    # QUEUED (an interrupted attempt, a transport failure or an unverifiable
+    # receipt) is not one either, so a repeated status must not adopt the
+    # previous turn's result for it. Resolve these from the local receipt alone.
+    # An UNKNOWN that was QUEUED and only lost its status read still recovers
+    # through the provider.
+    local_receipts = binding.get("receipts")
+    local_receipt = (
+        local_receipts.get(dispatch_key) if isinstance(local_receipts, Mapping) else None
+    )
+    local_state = _dispatch_state(
+        local_receipt.get("state") if isinstance(local_receipt, Mapping) else None
+    )
+    unaccepted_dispatch = bool(dispatch_key) and (
+        local_state in {BotmuxDispatchState.ATTEMPTING, BotmuxDispatchState.REJECTED}
+        or (
+            local_state == BotmuxDispatchState.UNKNOWN
+            and isinstance(local_receipt, Mapping)
+            and not local_receipt.get("queued_at")
+        )
+    )
+    if not session_id or not dispatch_key or unaccepted_dispatch:
         active = _active_dispatch_receipt(binding)
         if active is not None:
             active_key, receipt = active
@@ -1206,16 +1243,32 @@ def _status_botmux_runtime(
             public_summary="no botmux runtime turn has been dispatched for this goal",
             details={"dispatch_state": "idle", "output_available": False},
         )
+    # The session's trigger-result without a trigger id is its latest turn,
+    # which another client may have started. Ask for the id this receipt was
+    # queued under, and promote nothing the provider does not attribute to it.
+    stored_trigger_id = (
+        str(local_receipt.get("trigger_id") or "").strip()
+        if isinstance(local_receipt, Mapping)
+        else ""
+    )
     try:
-        result = requester(
-            endpoint=_validated_endpoint(str(binding.get("endpoint") or "")),
-            path=(
-                "/api/sessions/"
-                f"{quote(_validated_private_id(session_id, 'session id'), safe='')}"
-                "/trigger-result"
-            ),
-            dashboard_auth=_dashboard_auth_for_binding(binding),
-        )
+        pinned_trigger_id: str | None = _validated_private_id(stored_trigger_id, "trigger id")
+    except ValueError:
+        pinned_trigger_id = None
+    session_level_missing = False
+    try:
+        if pinned_trigger_id is None:
+            result = {"state": BotmuxDispatchState.UNKNOWN.value}
+        else:
+            result = requester(
+                endpoint=_validated_endpoint(str(binding.get("endpoint") or "")),
+                path=(
+                    "/api/sessions/"
+                    f"{quote(_validated_private_id(session_id, 'session id'), safe='')}"
+                    f"/trigger-result?triggerId={quote(pinned_trigger_id, safe='')}"
+                ),
+                dashboard_auth=_dashboard_auth_for_binding(binding),
+            )
     except ValueError:
         return _operation_packet(
             ok=False,
@@ -1232,6 +1285,15 @@ def _status_botmux_runtime(
             or exc.payload.get("state") == "not_found"
         ):
             result = {"state": "not_found"}
+            echoed_trigger_id = str(exc.payload.get("triggerId") or "").strip()
+            if echoed_trigger_id:
+                result["triggerId"] = echoed_trigger_id
+            # Only an explicit "this session is gone" that names no turn cannot
+            # be attributed to another one. A generic 404, or one that names a
+            # turn, is checked like any other response.
+            session_level_missing = (
+                exc.payload.get("error") == "unknown_session" and not echoed_trigger_id
+            )
         else:
             return _operation_packet(
                 ok=False,
@@ -1283,6 +1345,15 @@ def _status_botmux_runtime(
         BotmuxDispatchState.NOT_FOUND,
     }:
         provider_state = BotmuxDispatchState.UNKNOWN
+    identity_unverified = pinned_trigger_id is None
+    if (
+        pinned_trigger_id is not None
+        and not session_level_missing
+        and str(result.get("triggerId") or "").strip() != pinned_trigger_id
+    ):
+        # The provider answered for a different turn, or did not say which.
+        provider_state = BotmuxDispatchState.UNKNOWN
+        identity_unverified = True
     latest_payload = read_botmux_runtime_binding(binding_path)
     latest_binding = botmux_binding_for_goal(latest_payload, goal_id) or binding
     latest_receipts = latest_binding.get("receipts")
@@ -1301,12 +1372,14 @@ def _status_botmux_runtime(
     )
     state = local_state if provider_observation_ignored else provider_state
     output = result.get("output")
-    output_available = bool(
+    output_available = not identity_unverified and bool(
         isinstance(output, Mapping) and str(output.get("content") or "").strip()
     )
     local_receipt_updated = execute
     if execute:
         updates = None
+        if identity_unverified and state == BotmuxDispatchState.UNKNOWN:
+            updates = {"unknown_reason": "trigger_identity_unverified"}
         if provider_observation_ignored:
             updates = {
                 "provider_observation": provider_state.value,
@@ -1455,19 +1528,25 @@ def status_botmux_runtime(
     execute: bool = False,
     requester: JsonRequester = _request_json,
 ) -> dict[str, Any]:
-    if not execute:
-        return _status_botmux_runtime(
-            goal_id=goal_id,
-            binding_path=binding_path,
-            execute=False,
-            requester=requester,
-        )
-    with exclusive_file_lock(binding_path, operation="botmux_runtime_status"):
-        return _status_botmux_runtime(
-            goal_id=goal_id,
-            binding_path=binding_path,
-            execute=True,
-            requester=requester,
+    if execute:
+        with exclusive_file_lock(binding_path, operation="botmux_runtime_status"):
+            return _status_botmux_runtime(
+                goal_id=goal_id,
+                binding_path=binding_path,
+                execute=True,
+                requester=requester,
+            )
+    try:
+        with exclusive_file_lock(binding_path, operation="botmux_runtime_status"):
+            return _status_botmux_runtime(
+                goal_id=goal_id,
+                binding_path=binding_path,
+                execute=False,
+                requester=requester,
+            )
+    except LockAcquireTimeoutError as exc:
+        return _lock_timeout_packet(
+            goal_id=goal_id, operation="runtime_status", execute=False, error=exc
         )
 
 

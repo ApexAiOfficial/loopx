@@ -1,0 +1,62 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const source = (name) => readFileSync(new URL(name, import.meta.url), "utf8");
+const page = source("./personal-workspace-page.tsx");
+const settings = source("./workspace-settings-page.tsx");
+const select = source("./workspace-select.tsx");
+const shell = source("./workspace-shell.tsx");
+const styles = source("./personal-workspace.css");
+const theme = source("./workspace-theme.ts");
+const i18n = source("./i18n.tsx");
+const header = source("./channel-header.tsx");
+const statusSource = source("./status-source-switcher.tsx");
+
+assert.match(theme, /export type WorkspaceTheme = "loopx" | "paper" | "brutal"/, "All supported themes share one stable type");
+assert.match(theme, /defaultWorkspaceTheme: WorkspaceTheme = "loopx"/, "LoopX standard is the default theme");
+assert.match(theme, /stored === "loopx" || stored === "paper" || stored === "brutal"/, "Saved legacy themes remain valid");
+assert.ok(theme.includes("localStorage.setItem(workspaceThemeStorageKey, theme)"), "Theme selection persists locally");
+assert.ok(page.includes("useState<WorkspaceTheme>(readWorkspaceTheme)"), "Workspace reads the canonical theme preference");
+assert.ok(page.includes("writeWorkspaceTheme(next)"), "Workspace writes the canonical theme preference");
+assert.match(shell, /theme = "loopx"/, "Workspace shell defaults to LoopX standard");
+assert.ok(settings.includes('onThemeChange("loopx")'), "Settings expose LoopX standard");
+assert.ok(settings.includes('onThemeChange("paper")'), "Settings retain Paper");
+assert.ok(settings.includes('onThemeChange("brutal")'), "Settings retain High contrast");
+assert.match(styles, /data-pw-theme="loopx"/, "LoopX standard owns scoped styles");
+assert.match(styles, /--pw-bg: #fafafa/, "LoopX standard uses the design-system canvas");
+assert.match(styles, /--pw-text: #171717/, "LoopX standard uses the design-system ink");
+assert.match(styles, /--pw-line: #ebebeb/, "LoopX standard uses the design-system hairline");
+assert.ok(styles.includes('[data-pw-theme="loopx"] .personal-goal-mark { border: 1px solid #ebebeb; border-radius: 8px; background: #fff; color: #171717; }'), "LoopX standard removes decorative Goal tile colors");
+// Home now presents Goal rows. Actual desktop/narrow geometry, long labels and
+// preserved counts are exercised by goal-activity and confirmed-operations.
+assert.match(styles, /personal-channel-composer { border-radius: 6px/, "LoopX standard uses the control radius for the composer");
+assert.match(styles, /personal-channel-composer \.personal-composer-send,[\s\S]*background: #171717/, "LoopX standard uses an ink command button");
+assert.match(styles, /personal-quick-prompts button {[^}]*background: #fff/, "Shortcut actions keep one neutral chip style");
+assert.match(styles, /personal-goal-draft-status { border-color: #dedede; border-radius: 6px; background: #f2f2f2/, "LoopX standard keeps Goal draft guidance neutral");
+assert.ok(!styles.includes("personal-prompt-badge"), "Shortcut actions carry no draft/immediate badge");
+assert.match(styles, /personal-select-trigger[^}]*font-size: var\(--text-body\)/, "Workspace selects use the readable Body M control scale");
+assert.match(styles, /personal-select-option[^}]*min-height: 32px[^}]*font-size: var\(--text-body\)/, "Workspace select options share the trigger type size");
+assert.ok(styles.includes('.personal-goal-tabs button[aria-current="page"]::after'), "Goal views use a restrained active underline");
+assert.match(styles, /personal-message.is-user[\s\S]*background: #f2f2f2/, "LoopX Chat uses a neutral owner message");
+assert.match(styles, /personal-task-kanban { gap: 0; border-block: 1px solid #ebebeb/, "LoopX Tasks uses continuous lane dividers");
+assert.match(styles, /personal-task-card > button > strong { font-size: var\(--text-body\); font-weight: 500; line-height: var\(--leading-body\)/, "LoopX task titles use the Body M scale in every lane");
+assert.match(styles, /personal-task-lane-scroll > button, \.personal-task-card { flex: 0 0 auto;/, "Task cards do not shrink below their content height");
+assert.match(styles, /personal-files-list { border-radius: 12px/, "LoopX Files uses the standard card radius");
+assert.match(styles, /personal-icon-button {[^}]*flex: 0 0 36px;[^}]*min-width: 36px;[^}]*min-height: 36px;/, "Header icon buttons keep a stable square footprint");
+// The packaged craft smoke checks actual desktop wrapping, overflow and the
+// mobile action that opens the complete Goal when its compact title is clipped.
+assert.match(styles, /personal-channel-header\[data-goal-selected="true"\] \.personal-channel-title h1 {[^}]*overflow: visible;[^}]*white-space: normal;[^}]*overflow-wrap: anywhere;/, "Long desktop Goal titles wrap within the header");
+assert.doesNotMatch(header, /personal-live-indicator/, "The Goal header omits the misleading live-status badge");
+assert.match(styles, /@media \(max-width: 720px\) {[\s\S]*personal-home-lane,[\s\S]*personal-task-kanban \.personal-object-list { border-left: 0; border-top: 1px solid #ebebeb;/, "Mobile LoopX lanes use horizontal rather than vertical separators");
+assert.match(styles, /personal-select-listbox[\s\S]*border-radius: 12px/, "Workspace select menus use the card radius");
+assert.match(styles, /personal-channel-title h1 { font-size: var\(--text-heading\)/, "LoopX standard uses the panel heading size");
+assert.match(select, /aria-haspopup="listbox"/, "Workspace select exposes combobox semantics");
+assert.match(select, /event.key === "ArrowDown"/, "Workspace select supports arrow-key navigation");
+assert.match(select, /event.key === "Escape"/, "Workspace select supports keyboard dismissal");
+assert.doesNotMatch(header, /<select/, "The chat runtime selector is not browser-native");
+assert.doesNotMatch(statusSource, /<select/, "The primary control-plane selector is not browser-native");
+assert.match(statusSource, /<WorkspaceSelect/, "The control-plane selector uses the shared menu");
+assert.match(i18n, /"settings.themeLoopx": "LoopX standard"/, "English theme label is present");
+assert.match(i18n, /"settings.themeLoopx": "LoopX 标准"/, "Chinese theme label is present");
+
+console.log("workspace-theme contract: ok");

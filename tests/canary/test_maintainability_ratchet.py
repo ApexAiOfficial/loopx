@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import subprocess
 
 from loopx.canary.maintainability_ratchet import (
+    MODULE_LINE_LIMIT,
     MODULE_METRIC_BASELINE_SCHEMA_VERSION,
     build_control_plane_maintainability_report,
     collect_dependency_debt,
     collect_module_metric_findings,
     collect_oversized_decision_functions,
+    diff_scoped_module_ceiling_violations,
     evaluate_maintainability_findings,
+    module_metric_baseline,
     module_metrics,
     render_control_plane_maintainability_report,
 )
@@ -22,36 +28,76 @@ def test_current_repository_debt_is_reviewed_without_line_count_pins() -> None:
 
     assert report["ok"] is True, render_control_plane_maintainability_report(report)
     assert report["policy"]["freezes_exact_line_counts"] is False
-    assert (
-        "does not retain a coarse all-file hotspot limit"
-        in report["policy"]["repository_scope_decision"]
-    )
+    assert "coarse 2000-line default hotspot limit" in report["policy"][
+        "repository_scope_decision"
+    ]
     assert report["unreviewed_count"] == 0
     assert report["stale_exception_count"] == 0
-    assert set(report["category_counts"]) == {"compatibility_facade"}
+    assert report["category_counts"] == {"compatibility_facade": 2}
     assert report["category_counts"].get("oversized_decision_function", 0) == 0
     assert report["reviewed_exception_count"] == report["finding_count"]
-
-
-def test_current_module_metric_budget_keeps_existing_modules_grandfathered() -> None:
-    report = build_control_plane_maintainability_report(REPOSITORY_ROOT)
-
-    assert report["ok"] is True, render_control_plane_maintainability_report(report)
-    assert report["policy"]["module_line_limit"] == 1500
+    # One scan of the immutable checkout owns both debt and metric assertions.
+    # Mutated temporary repositories below must still be evaluated afresh.
+    assert report["policy"]["module_line_limit"] == 2000
     assert report["policy"]["module_any_limit"] == 300
     assert report["policy"]["module_dict_any_limit"] == 300
     assert report["category_counts"].get("module_metric_budget", 0) == 0
-    assert report["unreviewed_count"] == 0
+
+    baseline = module_metric_baseline(
+        REPOSITORY_ROOT / "loopx" / "canary" / "module_metric_baseline.json"
+    )
+    assert "lines" not in baseline["loopx/canary/planner.py"]
+    assert baseline["loopx/heartbeat_prompt.py"]["lines"] == 1199
+    for relative_path, ceilings in baseline.items():
+        if ceilings.get("lines", MODULE_LINE_LIMIT) > MODULE_LINE_LIMIT:
+            assert module_metrics(REPOSITORY_ROOT / relative_path)["lines"] > (
+                MODULE_LINE_LIMIT
+            )
+
+
+def test_module_metric_baseline_rejects_stale_runtime_defaults(tmp_path: Path) -> None:
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(
+        json.dumps(
+            {
+                "schema_version": MODULE_METRIC_BASELINE_SCHEMA_VERSION,
+                "default_limits": {
+                    "lines": 1500,
+                    "any_count": 300,
+                    "dict_any_count": 300,
+                },
+                "module_metric_ceilings": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        module_metric_baseline(baseline_path)
+    except ValueError as error:
+        assert "default_limits must match runtime defaults" in str(error)
+    else:
+        raise AssertionError("stale default_limits must be rejected")
 
 
 def test_module_metric_ratchet_detects_new_oversized_module(tmp_path: Path) -> None:
     module_path = tmp_path / "loopx" / "sample.py"
     module_path.parent.mkdir(parents=True)
     module_path.write_text(
-        "\n".join(["# padding"] * 1501),
+        "\n".join(["# padding"] * 2000),
         encoding="utf-8",
     )
     tracked_paths = {module_path}
+
+    assert collect_module_metric_findings(
+        tmp_path,
+        tracked_paths=tracked_paths,
+    ) == []
+
+    module_path.write_text(
+        "\n".join(["# padding"] * 2001),
+        encoding="utf-8",
+    )
 
     findings = collect_module_metric_findings(
         tmp_path,
@@ -61,8 +107,8 @@ def test_module_metric_ratchet_detects_new_oversized_module(tmp_path: Path) -> N
     assert len(findings) == 1
     assert findings[0]["category"] == "module_metric_budget"
     assert findings[0]["path"] == "loopx/sample.py"
-    assert findings[0]["metrics"]["lines"] == 1501
-    assert findings[0]["regressions"] == {"lines": 1501}
+    assert findings[0]["metrics"]["lines"] == 2001
+    assert findings[0]["regressions"] == {"lines": 2001}
 
 
 def test_module_metric_ratchet_rejects_growth_above_checked_in_baseline(
@@ -81,7 +127,7 @@ def test_module_metric_ratchet_rejects_growth_above_checked_in_baseline(
         (
             '{"schema_version": "'
             + MODULE_METRIC_BASELINE_SCHEMA_VERSION
-            + '", "default_limits": {"lines": 1500, "any_count": 300, '
+            + '", "default_limits": {"lines": 2000, "any_count": 300, '
             '"dict_any_count": 300}, "module_metric_ceilings": {'
             '"loopx/sample.py": {"lines": 2, "any_count": 1, "dict_any_count": 1}}}'
         ),
@@ -97,6 +143,55 @@ def test_module_metric_ratchet_rejects_growth_above_checked_in_baseline(
     assert len(findings) == 1
     assert findings[0]["regressions"] == {"lines": 3}
     assert module_metrics(module_path)["any_count"] == 1
+
+
+def test_module_metric_debt_names_the_reviewed_ledger_to_refresh(
+    tmp_path: Path,
+) -> None:
+    """Module metric growth is settled in the checked-in ledger, not by exception."""
+
+    module_path = tmp_path / "loopx" / "sample.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text("\n".join(["# padding"] * 2001), encoding="utf-8")
+
+    payload = evaluate_maintainability_findings(
+        collect_module_metric_findings(tmp_path, tracked_paths={module_path}),
+        reviewed_exceptions={},
+    )
+    rendered = render_control_plane_maintainability_report(
+        {
+            **payload,
+            "policy": {
+                "module_metric_baseline_path": "loopx/canary/module_metric_baseline.json"
+            },
+        }
+    )
+
+    assert payload["ok"] is False
+    assert "module metric debt" in rendered
+    assert "loopx/canary/module_metric_baseline.json" in rendered
+
+
+def test_review_without_module_metric_debt_keeps_the_report_unchanged() -> None:
+    finding = {
+        "id": "compatibility_facade:loopx.sample",
+        "category": "compatibility_facade",
+        "path": "loopx/sample.py",
+    }
+
+    rendered = render_control_plane_maintainability_report(
+        evaluate_maintainability_findings(
+            [finding],
+            reviewed_exceptions={
+                finding["id"]: {
+                    "reason": "A public compatibility window still exists.",
+                    "retirement_plan": "Delete the edge after the window closes.",
+                }
+            },
+        )
+    )
+
+    assert "module metric debt" not in rendered
 
 
 def test_reviewed_exception_lifecycle_rejects_new_debt_and_stale_entries() -> None:
@@ -293,3 +388,111 @@ def test_decision_ratchet_covers_quota_cli_orchestration(tmp_path: Path) -> None
             },
         }
     ]
+
+
+def _git(repo: Path, args: list[str]) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.com",
+        },
+    )
+
+
+def _write_baseline(repo: Path, ceilings: dict[str, dict[str, int]]) -> None:
+    (repo / "loopx" / "canary" / "module_metric_baseline.json").write_text(
+        json.dumps(
+            {
+                "schema_version": MODULE_METRIC_BASELINE_SCHEMA_VERSION,
+                "default_limits": {"lines": 2000, "any_count": 300, "dict_any_count": 300},
+                "module_metric_ceilings": ceilings,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_module_ceiling_growth_must_settle_in_the_same_diff(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "loopx" / "canary").mkdir(parents=True)
+    (repo / "loopx" / "grown.py").write_text("\n".join(["# x"] * 5) + "\n", encoding="utf-8")
+    _write_baseline(
+        repo,
+        {"loopx/grown.py": {"lines": 10, "any_count": 0, "dict_any_count": 0}},
+    )
+    _git(repo, ["init", "-q"])
+    _git(repo, ["add", "."])
+    _git(repo, ["commit", "-q", "-m", "base"])
+
+    # Grow past the inherited ceiling (10) without settling the ledger here.
+    (repo / "loopx" / "grown.py").write_text("\n".join(["# x"] * 20) + "\n", encoding="utf-8")
+    violations = diff_scoped_module_ceiling_violations(
+        repo, ["loopx/grown.py"], base_ref="HEAD"
+    )
+    assert [item["path"] for item in violations] == ["loopx/grown.py"]
+    assert violations[0]["base_lines"] == 5
+    assert violations[0]["base_ceiling"] == 10
+    assert violations[0]["head_lines"] == 20
+
+    # Settling the ceiling in the same tree clears the violation.
+    _write_baseline(
+        repo,
+        {"loopx/grown.py": {"lines": 20, "any_count": 0, "dict_any_count": 0}},
+    )
+    assert (
+        diff_scoped_module_ceiling_violations(
+            repo, ["loopx/grown.py"], base_ref="HEAD"
+        )
+        == []
+    )
+
+
+def test_module_ceiling_growth_below_ceiling_does_not_require_settlement(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "loopx" / "canary").mkdir(parents=True)
+    (repo / "loopx" / "grown.py").write_text("\n".join(["# x"] * 5) + "\n", encoding="utf-8")
+    _write_baseline(
+        repo,
+        {"loopx/grown.py": {"lines": 100, "any_count": 0, "dict_any_count": 0}},
+    )
+    _git(repo, ["init", "-q"])
+    _git(repo, ["add", "."])
+    _git(repo, ["commit", "-q", "-m", "base"])
+
+    # Growth that stays under the inherited ceiling needs no ledger change.
+    (repo / "loopx" / "grown.py").write_text("\n".join(["# x"] * 50) + "\n", encoding="utf-8")
+    assert (
+        diff_scoped_module_ceiling_violations(
+            repo, ["loopx/grown.py"], base_ref="HEAD"
+        )
+        == []
+    )
+
+
+def test_module_ceiling_colocation_ignores_non_python_and_deleted_files(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "loopx" / "canary").mkdir(parents=True)
+    _write_baseline(repo, {})
+    _git(repo, ["init", "-q"])
+    _git(repo, ["add", "."])
+    _git(repo, ["commit", "-q", "-m", "base"])
+
+    assert (
+        diff_scoped_module_ceiling_violations(
+            repo,
+            ["loopx/README.md", "loopx/removed.py", "docs/notes.py"],
+            base_ref="HEAD",
+        )
+        == []
+    )

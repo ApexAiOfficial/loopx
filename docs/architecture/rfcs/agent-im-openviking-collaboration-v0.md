@@ -1,6 +1,7 @@
 # RFC: Agent IM, LoopX, And OpenViking Collaboration v0
 
-- Status: Draft
+- Status: Accepted
+- Supersedes / closes: none
 - Scope: multi-host, multi-runtime agent collaboration
 - Decision type: architecture and staged integration contract
 
@@ -111,6 +112,21 @@ Both ingress paths use the same transition contract:
 - idempotency key;
 - command-specific evidence;
 - an accepted, rejected, conflict, or already-applied receipt.
+
+Use the [shared ingress policies](desktop-execution-frontends-v0.md#agent-scoped-bot-ingress-modes)
+for Agent messages as well as human-origin events: inbox persists for explicit
+drain, queue schedules subsequent input, and steer targets a supported safe
+point in the active execution. Preserve requested/effective mode, dedupe and
+consumption readback; an IM acknowledgement is not work adoption. Pending tools
+do not permit fabricated results or silent interrupt-as-steer fallback.
+
+The [session RFC](agent-session-execution-modes-v0.md#reusable-agent-operations-and-continuation-ownership)
+owns creation/attachment and one continuation owner per binding. Any authorized
+peer may coordinate another level through the handoff contract; IM topology
+grants neither extra permission nor a fresh team budget. A scoped facade to one
+supported local authority can precede shared-service deployment; it is not
+independent multi-host authority qualification. The direct Agent work path and
+the three-plane ownership model above remain unchanged.
 
 ## Projection Contract
 

@@ -63,6 +63,10 @@ def validate_merged_pr_collection(module) -> None:
 
 
 def validate_compact_ranking(module) -> None:
+    # Pinned once, here, as the canonical address the generator must publish.
+    # Every other expectation in this smoke composes from ``module.PULL_URL`` so a
+    # future repository move cannot silently re-break a hand-copied bullet.
+    assert module.PULL_URL == "https://github.com/loopx-project/loopx/pull"
     commits = [
         module.Commit("a", "docs: explain issue-fix", 40),
         module.Commit("b", "fix: preserve issue-fix evidence", 39),
@@ -72,7 +76,7 @@ def validate_compact_ranking(module) -> None:
     ranked = grouped["Issue-fix workflow"]
     assert [item.pr_number for item in ranked] == [38, 39, 40], ranked
     bullets = module.bulletize(ranked, limit=2)
-    assert bullets[0].startswith("- [#38](https://github.com/huangruiteng/loopx/pull/38)"), bullets
+    assert bullets[0] == f"- [#38]({module.PULL_URL}/38) feat: add issue-fix lifecycle"
     assert bullets[-1] == "- ...and 1 more merged PR in this theme.", bullets
     note = module.render_note(
         module.Window(module.parse_date("2026-07-01"), module.parse_date("2026-07-14")),

@@ -1,0 +1,328 @@
+import { settlementIdentity, type SettlementIdentity } from "../effect_program.ts";
+import { jsonObject } from "../runtime_decode.ts";
+import { parseTodoTimestampMicros } from "../runtime_timestamp.ts";
+import { isCanonicalTodoId } from "../todos/identity.ts";
+import { blockedResumeInstant, isBlockedLifecycleWait, isCausalBlockedWait, isMonitorUnavailableWait } from "./blocked_wait.ts";
+import {isExecutionLossCloseout} from "./execution_loss_closeout_record.ts";
+import { isTurnScopedSettlementOutcome } from "../work_items/delivery_outcome.ts";
+
+function retryDelayIsBounded(seconds: number): boolean {
+  return Number.isFinite(seconds) && seconds >= 60 && seconds <= 30 * 60;
+}
+
+/** Historical entry point for blocked no-spend qualification: an advancement
+ * retry/causal wait, blocked lifecycle or a Monitor unavailable attempt.
+ * A lifecycle/Monitor closeout creates no retry clock or execution grant. */
+export function isBoundedBlockedRetry(value: unknown, todoId: string | null): boolean {
+  if (isExecutionLossCloseout(value, todoId)) return true;
+  if (isCausalBlockedWait(value, todoId)) return true;
+  if (isBlockedLifecycleWait(value, todoId)) return true;
+  if (isMonitorUnavailableWait(value, todoId)) return true;
+  const retry = jsonObject(value);
+  if (!retry || retry.schema_version !== "quota_blocked_retry_v0" ||
+      (retry.source !== "todo" && retry.source !== "turn_settlement") ||
+      typeof todoId !== "string" || retry.todo_id !== todoId ||
+      typeof retry.observed_at !== "string" || typeof retry.due_at !== "string" ||
+      retry.resume_when !== `resume_at:${retry.due_at}`) return false;
+  const observed = blockedResumeInstant(retry.observed_at);
+  const due = blockedResumeInstant(retry.due_at);
+  if (observed === null || due === null) return false;
+  const delay = (due - observed) / 1000;
+  return retryDelayIsBounded(delay);
+}
+
+/** The replan owner has already qualified the blocker/path and its evidence.
+ * Verify that exact observation and semantic checkpoint, rather than inventing
+ * a Todo binding or retry clock for this administrative no-debit closeout.
+ * The caller must verify the guard and durable writeback receipts first. */
+export function isAcceptedBlockedReplanWriteback(
+  value: unknown, identity: SettlementIdentity, selectedObligation: unknown,
+): boolean {
+  const run = jsonObject(value), ack = jsonObject(run?.autonomous_replan_ack);
+  const delta = jsonObject(ack?.semantic_delta), progress = jsonObject(run?.progress_observation);
+  const checkpoint = jsonObject(run?.vision_checkpoint);
+  const outcomes = delta?.outcomes, satisfying = delta?.satisfying_outcomes;
+  return identity.binding_kind === "autonomous_replan" && identity.replan_obligation_id !== null
+    && selectedObligation === identity.replan_obligation_id
+    && !!run && run.goal_id === identity.goal_id && run.agent_id === identity.agent_id
+    && run.turn_instance_id === identity.turn_instance_id && run.replan_obligation_id === identity.replan_obligation_id
+    && run.delivery_outcome === "outcome_gap"
+    && isTurnScopedSettlementOutcome(run.delivery_outcome, progress, identity.replan_obligation_id)
+    && ack?.schema_version === "autonomous_replan_ack_v0" && ack.recorded === true
+    && delta?.schema_version === "replan_semantic_delta_v0" && delta.accepted === true
+    && delta.obligation_id === identity.replan_obligation_id
+    && typeof progress?.fingerprint === "string" && progress.fingerprint.length > 0
+    && delta.observation_fingerprint === progress.fingerprint
+    && Array.isArray(outcomes) && Array.isArray(satisfying) && satisfying.some(outcome =>
+      outcomes.includes(outcome) && (outcome === "new_concrete_blocker" || outcome === "fresh_vision_path_outcome"))
+    && checkpoint?.schema_version === "vision_checkpoint_v0" && checkpoint.agent_id === identity.agent_id
+    && checkpoint.satisfied === true && checkpoint.delivery_boundary === "semantic_closeout"
+    && Array.isArray(checkpoint.triggers) && checkpoint.triggers.some(value => {
+      const trigger = jsonObject(value);
+      return trigger?.kind === "material_delivery_outcome" && trigger.delivery_outcome === "outcome_gap";
+    });
+}
+
+/** A legacy observation may need qualification, never acceptance by inference.
+ * Callers separately prove its guard/writeback receipts and absence of debit. */
+export function isUnqualifiedBlockedReplanWriteback(value: unknown, identity: SettlementIdentity): boolean {
+  const run = jsonObject(value);
+  return identity.binding_kind === "autonomous_replan" && identity.replan_obligation_id !== null &&
+    !!run && run.goal_id === identity.goal_id && run.agent_id === identity.agent_id &&
+    run.turn_instance_id === identity.turn_instance_id && run.replan_obligation_id === identity.replan_obligation_id &&
+    run.delivery_outcome === "outcome_gap" &&
+    isTurnScopedSettlementOutcome(run.delivery_outcome, run.progress_observation, identity.replan_obligation_id) &&
+    jsonObject(run.autonomous_replan_ack)?.recorded !== true;
+}
+
+/** Classify persisted Run facts for history selection, without granting a
+ * settlement, debit or execution right. Reuse the settlement owner's exact
+ * semantic qualification; a caller-supplied "administrative" flag is no proof.
+ * One batch keeps history reads independent of per-Run bridge latency. */
+export function acceptedBlockedReplanHistoryIndexes(runs: unknown[]): number[] {
+  const accepted: number[] = [];
+  runs.forEach((value, index) => {
+    const run = jsonObject(value);
+    if (!run || run.todo_id != null ||
+        ![run.goal_id, run.agent_id, run.turn_instance_id, run.replan_obligation_id]
+          .every(value => typeof value === "string" && value.trim().length > 0)) return;
+    const identity = settlementIdentity({
+      goal_id: run.goal_id as string, agent_id: run.agent_id as string,
+      turn_instance_id: run.turn_instance_id as string,
+      replan_obligation_id: run.replan_obligation_id as string,
+    });
+    const persisted = jsonObject(run.settlement_identity);
+    if (run.settlement_identity != null && (!persisted ||
+        Object.entries(identity).some(([key, value]) =>
+          (value === null ? persisted[key] ?? null : persisted[key]) !== value))) return;
+    // compact_vision_checkpoint omits the historical default boundary. Decode
+    // that existing representation here; live settlement still requires its
+    // explicit committed checkpoint and independently verified receipts.
+    const checkpoint = jsonObject(run.vision_checkpoint);
+    const decoded = checkpoint && checkpoint.delivery_boundary === undefined
+      ? {...run, vision_checkpoint: {...checkpoint, delivery_boundary: "semantic_closeout"}}
+      : run;
+    if (isAcceptedBlockedReplanWriteback(decoded, identity, run.replan_obligation_id)) accepted.push(index);
+  });
+  return accepted;
+}
+
+/** Read-only history facts. Administrative closeout and a pending retry are
+ * independent dimensions; neither is a new effect, lease or completion grant.
+ * Use the same retry bound as settlement, with the aware historical codec so
+ * expiry keeps microseconds and supported ISO offsets across runtime changes. */
+export function qualifySettlementHistory(runs: unknown[], observedAt: string | null): {
+  accepted_indexes: number[]; active_retry_indexes: number[];
+} {
+  const active: number[] = [];
+  const now = observedAt === null ? null : parseTodoTimestampMicros(observedAt, true);
+  if (now !== null) runs.forEach((value, index) => {
+    const run = jsonObject(value), retry = jsonObject(run?.blocked_retry);
+    const progress = jsonObject(run?.progress_observation);
+    const todoId = typeof run?.todo_id === "string" ? run.todo_id.trim().toLowerCase() : "";
+    if (!isCanonicalTodoId(todoId) || !retry || retry.schema_version !== "quota_blocked_retry_v0"
+      || retry.source !== "turn_settlement" || retry.todo_id !== todoId
+      || run?.delivery_outcome !== "outcome_gap" || progress?.result_class !== "blocked"
+      || typeof run?.turn_instance_id !== "string" || !run.turn_instance_id.trim()
+      || typeof retry.observed_at !== "string" || typeof retry.due_at !== "string"
+      || retry.resume_when !== `resume_at:${retry.due_at}`) return;
+    const observed = parseTodoTimestampMicros(retry.observed_at, true);
+    const due = parseTodoTimestampMicros(retry.due_at, true);
+    if (observed !== null && due !== null && due > now
+      && retryDelayIsBounded(Number(due - observed) / 1_000_000)) active.push(index);
+  });
+  return {accepted_indexes: acceptedBlockedReplanHistoryIndexes(runs), active_retry_indexes: active};
+}
+
+/** A service-qualified capability duty can retire its exact admitted Turn.
+ * The caller first verifies the durable writeback receipt. No Task/Goal
+ * completion, progress or debit follows from this lifecycle evidence. */
+export function isCapabilityRetirementWriteback(value: unknown, identity: SettlementIdentity, selectedGuard: unknown): boolean {
+  const run = jsonObject(value), guard = jsonObject(selectedGuard);
+  const ack = jsonObject(run?.autonomous_replan_ack), delta = jsonObject(ack?.semantic_delta);
+  const retirement = jsonObject(delta?.retirement), original = jsonObject(retirement?.original_guard);
+  const deltaGuard = jsonObject(delta?.capability_guard), progress = jsonObject(run?.progress_observation);
+  const sameGuard = (candidate: Record<string, unknown> | null) => !!guard && !!candidate
+    && candidate.schema_version === "semantic_replan_capability_guard_v0"
+    && candidate.capability_id === guard.capability_id && candidate.gap_id === guard.gap_id
+    && candidate.frontier_revision === guard.frontier_revision;
+  return identity.binding_kind === "autonomous_replan" && identity.replan_obligation_id !== null
+    && !!run && run.goal_id === identity.goal_id && run.agent_id === identity.agent_id
+    && run.turn_instance_id === identity.turn_instance_id && run.replan_obligation_id === identity.replan_obligation_id
+    && run.delivery_outcome === "outcome_gap" && ack?.recorded === true
+    && delta?.schema_version === "replan_semantic_delta_v0" && delta.accepted === true
+    && delta.obligation_id === identity.replan_obligation_id
+    && JSON.stringify(delta.outcomes) === '["capability_duty_retired"]'
+    && JSON.stringify(delta.satisfying_outcomes) === '["capability_duty_retired"]'
+    && retirement?.schema_version === "capability_obligation_retirement_v0" && retirement.disposition === "invalidated"
+    && retirement.obligation_id === identity.replan_obligation_id && retirement.capability_id === guard?.capability_id
+    && ["source_disabled", "source_ineligible", "source_revision_changed"].includes(String(retirement.reason_code))
+    && retirement.blocking_todo_count === 0 && Array.isArray(retirement.blocking_todo_ids) && retirement.blocking_todo_ids.length === 0
+    && typeof retirement.current_revision === "string" && retirement.current_revision.length > 0
+    && sameGuard(original) && sameGuard(deltaGuard)
+    && progress?.schema_version === "typed_progress_observation_v0" && progress.result_class === "blocked"
+    && progress.work_item_id === identity.replan_obligation_id
+    && typeof progress.blocker_id === "string" && progress.blocker_id.length > 0
+    && typeof progress.fingerprint === "string" && progress.fingerprint.length > 0
+    && retirement.progress_fingerprint === progress.fingerprint
+    && jsonObject(retirement.progress_observation)?.blocker_id === progress.blocker_id
+    && jsonObject(retirement.progress_observation)?.work_item_id === identity.replan_obligation_id
+    && jsonObject(retirement.progress_observation)?.result_class === "blocked"
+    && jsonObject(retirement.progress_observation)?.schema_version === "typed_progress_observation_v0"
+    && JSON.stringify(jsonObject(retirement.progress_observation)?.evidence_ids) === JSON.stringify(progress.evidence_ids)
+    && JSON.stringify(progress.evidence_ids) === JSON.stringify([retirement.current_revision]);
+}
+
+/** The committed checkpoint accepts progress for a Turn, not Todo completion.
+ * The caller must first verify this writeback's exact durable receipt. */
+export function isAcceptedProgressWriteback(
+  value: unknown,
+  identity: SettlementIdentity,
+): boolean {
+  const run = jsonObject(value);
+  const checkpoint = jsonObject(run?.vision_checkpoint);
+  if (identity.binding_kind !== "todo" || identity.todo_id === null ||
+      !run || run.goal_id !== identity.goal_id ||
+      run.agent_id !== identity.agent_id || run.todo_id !== identity.todo_id ||
+      run.turn_instance_id !== identity.turn_instance_id ||
+      run.delivery_outcome !== "outcome_progress" ||
+      !checkpoint || checkpoint.schema_version !== "vision_checkpoint_v0" ||
+      checkpoint.agent_id !== identity.agent_id ||
+      checkpoint.satisfied !== true || !Array.isArray(checkpoint.triggers)) {
+    return false;
+  }
+  return checkpoint.triggers.some((value) => {
+    const trigger = jsonObject(value);
+    if (checkpoint.delivery_boundary === "in_flight_continuation") {
+      return trigger?.kind === "in_flight_continuation" &&
+        trigger.todo_id === identity.todo_id;
+    }
+    // A semantic checkpoint can close a bounded segment while the Todo waits
+    // or remains open. Its accepted outcome, not the current frontier or Todo
+    // completion, owns replay of the exact paid Turn.
+    return checkpoint.delivery_boundary === "semantic_closeout" &&
+      trigger?.kind === "material_delivery_outcome" &&
+      trigger.delivery_outcome === run.delivery_outcome;
+  });
+}
+
+/** A path replan may be qualified during work, without a preselected obligation.
+ * As with spend validation, only its exact, verified durable writeback is proof.
+ * This closes the Turn binding, never the Todo or its completion validation. */
+export function isAcceptedReplanWriteback(
+  value: unknown,
+  identity: SettlementIdentity,
+): boolean {
+  const run = jsonObject(value);
+  if (identity.binding_kind !== "todo" || identity.todo_id === null ||
+      !run || run.goal_id !== identity.goal_id ||
+      run.agent_id !== identity.agent_id || run.todo_id !== identity.todo_id ||
+      run.turn_instance_id !== identity.turn_instance_id) return false;
+  const ack = jsonObject(run.autonomous_replan_ack);
+  if (!ack || ack.schema_version !== "autonomous_replan_ack_v0" ||
+      ack.recorded !== true) return false;
+  const semantic = jsonObject(ack.semantic_delta);
+  const repair = jsonObject(ack.delta_contract);
+  return (semantic?.schema_version === "replan_semantic_delta_v0" &&
+      semantic.accepted === true) ||
+    (repair?.schema_version === "repair_delta_contract_v0" &&
+      repair.delta_present === true);
+}
+
+/** Both same-Turn readback and prior-Turn recovery accept the shipped effect identities. */
+export function isCommittedMonitorPollEffect(
+  effectId: unknown,
+  identity: Pick<SettlementIdentity, "goal_id" | "agent_id" | "turn_instance_id" | "todo_id">,
+): boolean {
+  if (!identity.todo_id) return false;
+  const base = `quota-monitor-poll:${identity.goal_id}:${identity.agent_id}:${identity.turn_instance_id}`;
+  return effectId === base || effectId === `${base}:todo:${identity.todo_id}`;
+}
+
+export const RECEIPT_BOUND_MONITOR_PHASES = [
+  "poll_due",
+  "settlement_pending",
+  "settled",
+] as const;
+export type ReceiptBoundMonitorPhase =
+  (typeof RECEIPT_BOUND_MONITOR_PHASES)[number];
+
+export interface ReceiptBoundMonitorSettlementState {
+  poll_present: boolean;
+  material_change: boolean;
+  durable_writeback_present: boolean;
+  quota_spend_present: boolean;
+  /** Exact typed unavailable writeback, verified by the settlement owner. */
+  unavailable_attempt_present?: boolean;
+}
+
+export function receiptBoundMonitorPhase(
+  state: ReceiptBoundMonitorSettlementState,
+): ReceiptBoundMonitorPhase {
+  if (!state.poll_present && !state.unavailable_attempt_present) return "poll_due";
+  // The committed monitor-poll is the durable no-spend closeout for this
+  // monitor Turn. A material observation may atomically release an independent
+  // successor, but it never upgrades the observe-only monitor into an
+  // accountable delivery or quota-spend identity. Keep the extra inputs in the
+  // cross-runtime request for compatibility with older callers; they no longer
+  // decide this phase.
+  return "settled";
+}
+
+export const RECEIPT_BOUND_REPLAY_PHASES = [
+  "open",
+  "settlement_pending",
+  "settled",
+] as const;
+export type ReceiptBoundReplayPhase =
+  (typeof RECEIPT_BOUND_REPLAY_PHASES)[number];
+
+export interface ReceiptBoundReplaySettlementState {
+  binding_kind?: "todo" | "autonomous_replan" | "request" | "unbound";
+  /** A validated writeback discharges the binding without Todo completion. */
+  writeback_completes_binding?: boolean;
+  completion_receipt_present: boolean;
+  /** Retirement closes its original Turn, not the replacement or Goal. */
+  supersede_receipt_present?: boolean;
+  durable_writeback_present: boolean;
+  quota_spend_present: boolean;
+  /** Exact typed blocked writeback closes a Turn without a quota debit. */
+  no_spend_closeout_present?: boolean;
+}
+
+export function receiptBoundReplayPhase(
+  state: ReceiptBoundReplaySettlementState,
+): ReceiptBoundReplayPhase {
+  const bindingComplete = state.binding_kind === "autonomous_replan" || state.binding_kind === "request" ||
+      state.writeback_completes_binding === true
+    ? state.durable_writeback_present
+    : state.completion_receipt_present ||
+      (state.binding_kind === "todo" && state.supersede_receipt_present === true);
+  if (!bindingComplete) return "open";
+  return state.durable_writeback_present &&
+      (state.quota_spend_present || state.no_spend_closeout_present === true)
+    ? "settled"
+    : "settlement_pending";
+}
+
+// Compatibility aliases for callers that predate ordinary-completion replay.
+// New quota code must use the replay contract so a Todo successor cannot make
+// the original turn look open after its settlement chain has committed.
+export const RECEIPT_BOUND_TERMINAL_PHASES = RECEIPT_BOUND_REPLAY_PHASES;
+export type ReceiptBoundTerminalPhase = ReceiptBoundReplayPhase;
+
+export interface ReceiptBoundTerminalSettlementState {
+  terminal_closeout_present: boolean;
+  durable_writeback_present: boolean;
+  quota_spend_present: boolean;
+}
+
+export function receiptBoundTerminalPhase(
+  state: ReceiptBoundTerminalSettlementState,
+): ReceiptBoundTerminalPhase {
+  return receiptBoundReplayPhase({
+    completion_receipt_present: state.terminal_closeout_present,
+    durable_writeback_present: state.durable_writeback_present,
+    quota_spend_present: state.quota_spend_present,
+  });
+}

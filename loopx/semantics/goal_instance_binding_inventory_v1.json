@@ -1,0 +1,258 @@
+{
+  "schema_version": "loopx_goal_instance_binding_inventory_v1",
+  "scope": {
+    "baseline": "M1 characterization",
+    "claim": "first_party_goal_binding_owner_families",
+    "excludes": [
+      "goal_instance_id_minting",
+      "identity_enforcement",
+      "orphan_mutation",
+      "registry_envelope_v2"
+    ]
+  },
+  "owners": [
+    {
+      "owner_id": "attached_host_chat_session",
+      "locator": "<runtime_root>/chat/sessions/<session_id>/session.json",
+      "revision_signal": "last_activity_at",
+      "content_digest_signal": "none",
+      "observed_reference": "goal_id + goal_instance_id",
+      "producer_sites": [
+        "loopx/attached_session.py::bind_attached_agent_session",
+        "loopx/attached_session.py::enqueue_attached_agent_turn",
+        "loopx/chat_store.py::ChatSessionStore.create_session",
+        "loopx/control_plane/goals/chat_session_lifecycle.ts::decideChatSessionLifecycle"
+      ],
+      "consumer_sites": [
+        "loopx/attached_session.py::claim_attached_agent_turn",
+        "loopx/attached_session.py::complete_attached_agent_turn",
+        "loopx/chat/session_open.py::ChatSessionLifecycleMixin.resume_session"
+      ],
+      "effect_boundary": "loopx/control_plane/goals/chat_session_lifecycle.ts::decideChatSessionLifecycle",
+      "authority_role": "runtime_session_binding",
+      "current_identity_strength": "exact_goal_ref_enforced",
+      "cleanup_support": "historical_completion_and_session_close",
+      "m1_disposition": "m3_qualified",
+      "target_milestone": "M3"
+    },
+    {
+      "owner_id": "first_party_host_runtime",
+      "locator": "<runtime_root>/goals/<goal_id>/sessions and host runtime state; <registry_dir>/.loopx/lifecycle/goal-instance/turn-settlement/<goal_alias_digest>/{gate.json,admissions/*.json}",
+      "revision_signal": "turn_instance_id",
+      "content_digest_signal": "turn_key",
+      "observed_reference": "goal_id + goal_instance_id for source_session_v1; goal_id otherwise",
+      "producer_sites": [
+        "loopx/control_plane/goals/first_party_host_admission.py::capture_first_party_host_goal_ref",
+        "loopx/control_plane/goals/source_session_recreation.py::recreate_goal_instance",
+        "loopx/control_plane/goals/source_session_turn_effects.py::drain_releasable_source_turn_effects",
+        "loopx/control_plane/goals/source_session_turn_effects.py::prepare_source_turn_effect",
+        "loopx/control_plane/goals/source_session_turn_effects.py::release_source_turn_effect",
+        "loopx/control_plane/goals/source_session_turn_effects.py::write_source_turn_effect_gate_locked",
+        "loopx/control_plane/turn_driver/codex_sessions.py::codex_cli_session_binding",
+        "loopx/control_plane/turn_driver/driver.py::build_loopx_turn_plan",
+        "loopx/control_plane/turn_driver/settlement.py::TurnSettlementJournalAdapter.hold_tail",
+        "loopx/control_plane/turn_driver/settlement.py::TurnSettlementJournalAdapter.release_tail"
+      ],
+      "consumer_sites": [
+        "loopx/control_plane/goals/first_party_host_runtime.ts::decideFirstPartyHostRuntime",
+        "loopx/control_plane/goals/source_session_recreation.py::recreate_goal_instance",
+        "loopx/control_plane/goals/source_session_turn_effects.py::decide_source_turn_effect_close_locked",
+        "loopx/control_plane/goals/source_session_turn_effects.py::decide_source_turn_effect_publish_locked",
+        "loopx/control_plane/goals/source_session_turn_effects.py::decide_source_turn_effect_repair_locked",
+        "loopx/control_plane/goals/source_session_turn_effects.py::drain_releasable_source_turn_effects",
+        "loopx/control_plane/goals/source_session_turn_effects.py::prepare_source_turn_effect",
+        "loopx/control_plane/goals/source_session_turn_effects.py::release_source_turn_effect",
+        "loopx/control_plane/goals/source_session_turn_effects.py::source_turn_effect_allows_absent_reexecute",
+        "loopx/control_plane/turn_driver/executor.py::run_loopx_turn_once",
+        "loopx/control_plane/turn_driver/settlement.py::TurnSettlementJournalAdapter.hold_tail",
+        "loopx/control_plane/turn_driver/settlement.py::TurnSettlementJournalAdapter.release_tail",
+        "loopx/dsh_goal_mode/turn_host_adapter.py::run_dsh_host",
+        "loopx/kunluncode_goal_mode/runtime.py::run_native_goal"
+      ],
+      "effect_boundary": "loopx/control_plane/goals/source_session_turn_effects.py::prepare_source_turn_effect",
+      "authority_role": "host_execution_binding",
+      "current_identity_strength": "source_exact_partial",
+      "cleanup_support": "host_session_discard_and_source_turn_effect_drain",
+      "m1_disposition": "source_exact_partial_enforcement",
+      "target_milestone": "M3"
+    },
+    {
+      "owner_id": "global_goal_projection",
+      "locator": "<runtime_root>/registry.global.json#goals[]",
+      "revision_signal": "synced_at",
+      "content_digest_signal": "source registry SHA-256 at action projection",
+      "observed_reference": "goal_id + optional goal_instance_id",
+      "producer_sites": [
+        "loopx/global_registry.py::sync_project_registry_to_global"
+      ],
+      "consumer_sites": [
+        "loopx/control_plane/goals/operator_actions.py::build_goal_action_catalog"
+      ],
+      "effect_boundary": "loopx/control_plane/goals/operator_actions.py::build_goal_action_catalog",
+      "authority_role": "derived_projection",
+      "current_identity_strength": "optional_instance_observation",
+      "cleanup_support": "global_goal_retirement",
+      "m1_disposition": "observed",
+      "target_milestone": "M2"
+    },
+    {
+      "owner_id": "goal_channel_lark",
+      "locator": "<project_registry_dir>/goal-channel.json#bindings",
+      "revision_signal": "connection_id",
+      "content_digest_signal": "goal_channel_binding_digest",
+      "observed_reference": "goal_id",
+      "producer_sites": [
+        "loopx/extensions/lark/goal_channel_contracts.py::save_goal_binding"
+      ],
+      "consumer_sites": [
+        "loopx/extensions/lark/goal_channel_message_delivery.py::resolve_bound_goal_channel"
+      ],
+      "effect_boundary": "loopx/extensions/lark/goal_channel_operation.py::deliver_goal_channel_operation_card",
+      "authority_role": "external_channel_binding",
+      "current_identity_strength": "goal_alias_only",
+      "cleanup_support": "binding_replacement_and_retirement",
+      "m1_disposition": "alias_only_inventory",
+      "target_milestone": "M3"
+    },
+    {
+      "owner_id": "handoff_inbox_outbox",
+      "locator": "<runtime_root>/goals/<goal_id>/shadow/outbox and collaboration inbox",
+      "revision_signal": "outbox sequence and handoff id",
+      "content_digest_signal": "outbox entry source digest",
+      "observed_reference": "goal_id + goal_instance_id",
+      "producer_sites": [
+        "loopx/control_plane/todos/handoff_note.py::attach_todo_handoff_note"
+      ],
+      "consumer_sites": [
+        "loopx/control_plane/collaboration/peers.py::read_inbox",
+        "loopx/control_plane/coordination/local_authority_shadow_adapter.py::drain_local_authority_shadow_outbox"
+      ],
+      "effect_boundary": "loopx/control_plane/coordination/local_authority_shadow_adapter.py::drain_local_authority_shadow_outbox",
+      "authority_role": "delivery_and_handoff_binding",
+      "current_identity_strength": "exact_goal_ref_enforced",
+      "cleanup_support": "outbox_drain_and_handoff_closeout",
+      "m1_disposition": "m3_qualified",
+      "target_milestone": "M3"
+    },
+    {
+      "owner_id": "heartbeat_automation",
+      "locator": "<runtime_root>/goals/<goal_id>/runs/index.jsonl#heartbeat_receipt",
+      "revision_signal": "turn_instance_id and effect_id",
+      "content_digest_signal": "rollout event record",
+      "observed_reference": "goal_id",
+      "producer_sites": [
+        "loopx/control_plane/quota/heartbeat_receipt.py::ensure_turn_heartbeat_settlement_receipt"
+      ],
+      "consumer_sites": [
+        "loopx/control_plane/quota/heartbeat_receipt.py::find_heartbeat_receipt"
+      ],
+      "effect_boundary": "loopx/control_plane/scheduler/heartbeat_commit.ts::evaluateSchedulerHeartbeatCommit",
+      "authority_role": "scheduler_receipt_binding",
+      "current_identity_strength": "goal_alias_only",
+      "cleanup_support": "receipt_failure_and_terminalization",
+      "m1_disposition": "alias_only_inventory",
+      "target_milestone": "M3"
+    },
+    {
+      "owner_id": "project_registry_goal",
+      "locator": "<project_root>/.loopx/registry.json#goals[]",
+      "revision_signal": "registry updated_at",
+      "content_digest_signal": "source registry SHA-256 at action projection",
+      "observed_reference": "goal_id + optional goal_instance_id",
+      "producer_sites": [
+        "loopx/control_plane/projects/registry.py::register_project_goal"
+      ],
+      "consumer_sites": [
+        "loopx/control_plane/goals/operator_actions.py::build_goal_action_catalog"
+      ],
+      "effect_boundary": "loopx/control_plane/goals/operator_actions.py::build_goal_action_catalog",
+      "authority_role": "source_authority",
+      "current_identity_strength": "optional_instance_observation",
+      "cleanup_support": "source_registry_transactional_delete",
+      "m1_disposition": "observed",
+      "target_milestone": "M2"
+    },
+    {
+      "owner_id": "project_session_binding",
+      "locator": "<project_root>/.loopx/registry.json#session_bindings[]",
+      "revision_signal": "registry updated_at",
+      "content_digest_signal": "registry envelope payload_sha256 when present",
+      "observed_reference": "foreground_goal_id",
+      "producer_sites": [
+        "loopx/control_plane/projects/registry.py::bind_session"
+      ],
+      "consumer_sites": [
+        "loopx/control_plane/projects/registry.py::resolve_project"
+      ],
+      "effect_boundary": "loopx/control_plane/projects/registry.py::resolve_project",
+      "authority_role": "project_session_binding",
+      "current_identity_strength": "goal_alias_only",
+      "cleanup_support": "exact_session_unbind",
+      "m1_disposition": "alias_only_inventory",
+      "target_milestone": "M2"
+    },
+    {
+      "owner_id": "quota_settlement",
+      "locator": "<runtime_root>/goals/<goal_id>/runs/index.jsonl#quota_event",
+      "revision_signal": "run_generated_at and effect_id",
+      "content_digest_signal": "quota accounting artifact digest",
+      "observed_reference": "goal_id + goal_instance_id for source_session_v1; goal_id otherwise",
+      "producer_sites": [
+        "loopx/control_plane/quota/accounting_admission.py::quota_accounting_admission",
+        "loopx/control_plane/quota/spend_commit.py::record_quota_slot_spend_from_preview",
+        "loopx/control_plane/quota/void_commit.py::commit_quota_slot_void"
+      ],
+      "consumer_sites": [
+        "loopx/control_plane/quota/ledger_readback.py::net_quota_slot_spend",
+        "loopx/control_plane/quota/settlement_readback.ts::readQuotaSettlement",
+        "loopx/control_plane/quota/slot_accounting.py::_latest_unspent_turn_settlement_run"
+      ],
+      "effect_boundary": "loopx/control_plane/quota/accounting_artifact_transaction.ts::commitQuotaAccountingArtifactTransaction",
+      "authority_role": "quota_accounting_ledger",
+      "current_identity_strength": "exact_goal_ref_enforced",
+      "cleanup_support": "typed_quota_void",
+      "m1_disposition": "m3_qualified",
+      "target_milestone": "M3"
+    },
+    {
+      "owner_id": "todo_coordination_lease",
+      "locator": "<runtime_root>/goals/<goal_id>/coordination and task leases",
+      "revision_signal": "provider revision and lease version",
+      "content_digest_signal": "authority commit digest",
+      "observed_reference": "goal_id",
+      "producer_sites": [
+        "loopx/control_plane/coordination/todo_claim.ts::executeCoordinationTodoClaim"
+      ],
+      "consumer_sites": [
+        "loopx/control_plane/coordination/todo_lifecycle_decision.ts::evaluateCoordinationTodoMutationDecision"
+      ],
+      "effect_boundary": "loopx/control_plane/coordination/todo_terminal_lifecycle.ts::executeCoordinationTodoTerminalLifecycle",
+      "authority_role": "coordination_authority",
+      "current_identity_strength": "goal_alias_only",
+      "cleanup_support": "todo_archive_and_lease_release",
+      "m1_disposition": "alias_only_inventory",
+      "target_milestone": "M3"
+    },
+    {
+      "owner_id": "turn_journal",
+      "locator": "<runtime_root>/goals/<goal_id>/turns/<turn_key>.json",
+      "revision_signal": "turn_key, turn_instance_id, and exact GoalRef",
+      "content_digest_signal": "turn key SHA-256",
+      "observed_reference": "goal_id + goal_instance_id for source_session_v1; goal_id otherwise",
+      "producer_sites": [
+        "loopx/control_plane/goals/first_party_host_admission.py::FirstPartyHostGoalAdmission.source_journal_admission",
+        "loopx/control_plane/turn_driver/turn_journal_runtime.py::write_turn_journal"
+      ],
+      "consumer_sites": [
+        "loopx/control_plane/turn_driver/journal_store.py::load_loopx_turn_plan_from_journal",
+        "loopx/control_plane/turn_driver/turn_journal.ts::parseTurnJournalGoalBinding"
+      ],
+      "effect_boundary": "loopx/control_plane/turn_driver/turn_journal_effects.ts::commitTurnJournal",
+      "authority_role": "turn_execution_journal",
+      "current_identity_strength": "exact_goal_ref_enforced",
+      "cleanup_support": "journal_recovery_and_terminal_closeout",
+      "m1_disposition": "m3_qualified",
+      "target_milestone": "M3"
+    }
+  ]
+}

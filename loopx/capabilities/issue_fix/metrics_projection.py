@@ -3,9 +3,23 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+# Refs #4447: one definition for this vocabulary. The supplement builds and
+# validates these fields and carries the schema name this projection compares
+# against, so it owns both; `repository_snapshot` already imports the schema
+# name from there rather than restating it. `PROJECTION_SCHEMA_VERSION` below is
+# a different document's version that happens to share a name prefix, so it stays.
+# The same rule runs the other way for the snapshot name: `repository_snapshot`
+# builds and stamps those payloads and this file only compares against them, so
+# the value is imported rather than restated here. The supplement also owns the
+# issue-close event-type set: it filters activity by `_ISSUE_CLOSE_EVENT_TYPES`
+# and this projection only validates the compacted rows against that same set.
+from .metrics_supplement import (
+    _ISSUE_CLOSE_EVENT_TYPES,
+    _SUPPLEMENT_FIELDS,
+    SUPPLEMENT_SCHEMA_VERSION,
+)
+from .repository_snapshot import SNAPSHOT_SCHEMA_VERSION
 
-SNAPSHOT_SCHEMA_VERSION = "issue_fix_repository_reporting_snapshot_v0"
-SUPPLEMENT_SCHEMA_VERSION = "issue_fix_metrics_supplement_v0"
 PROJECTION_SCHEMA_VERSION = "issue_fix_metrics_projection_v0"
 
 _FLOW_FIELDS = (
@@ -14,27 +28,6 @@ _FLOW_FIELDS = (
     "pull_requests_opened",
     "pull_requests_closed",
     "pull_requests_merged",
-)
-_SUPPLEMENT_FIELDS = (
-    "human_interventions",
-    "automatic_terminal_closeouts",
-    "duplicate_external_writes",
-    "loopx_capability_gaps_found",
-    "loopx_capability_gaps_fixed",
-    "loopx_capability_gaps_real_callsite_verified",
-    "memory_retrievals",
-    "memory_verified_decision_influence",
-    "memory_verified_patch_influence",
-    "memory_stale_results",
-    "useful_public_comments",
-    "triage_outcomes",
-    "issues_screened",
-    "issue_close_recommendations",
-    "issue_close_requests_published",
-    "issue_closes_observed",
-    "issue_reopens_observed",
-    "first_push_ci_passed",
-    "first_push_ci_total",
 )
 
 
@@ -265,12 +258,6 @@ def _issue_close_activity(
     if not isinstance(raw_activity, list):
         raise ValueError("supplement.issue_close_activity must be a list")
 
-    known_types = {
-        "issue_close_recommended",
-        "issue_close_request_published",
-        "issue_closed_observed",
-        "issue_reopened_observed",
-    }
     seen_issue_refs: set[str] = set()
     seen_event_ids: set[str] = set()
     activity: list[dict[str, Any]] = []
@@ -307,7 +294,7 @@ def _issue_close_activity(
             if (
                 not event_id
                 or event_id in seen_event_ids
-                or event_type not in known_types
+                or event_type not in _ISSUE_CLOSE_EVENT_TYPES
             ):
                 raise ValueError(
                     "issue close activity requires unique event_id values and known event types"

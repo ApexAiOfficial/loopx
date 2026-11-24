@@ -1,0 +1,377 @@
+import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+
+import {
+  NoKVAuthorityStore,
+  NoKVTransportProtocolError,
+  NoKVTransportUnavailableError,
+} from "../../loopx/control_plane/coordination/nokv_authority_store.ts";
+import { NoKVHelperOpenRefusedError, NoKVJsonLinesTransport } from "../../loopx/control_plane/coordination/nokv_jsonl_transport.ts";
+import { registerAuthorityStoreConformance } from "./authority_store_conformance.ts";
+import { resolveTestPython } from "../../scripts/test-python.mjs";
+
+const PYTHON = resolveTestPython();
+const FAULT_HELPER = fileURLToPath(
+  new URL("../fixtures/nokv_jsonl_fake_helper.py", import.meta.url),
+);
+const SDK_HELPER = fileURLToPath(
+  new URL("../../loopx/control_plane/coordination/nokv_jsonl_helper.py", import.meta.url),
+);
+const FAKE_SDK_ROOT = fileURLToPath(
+  new URL("../fixtures/nokv_fake_sdk", import.meta.url),
+);
+
+const ETCD_ROUTING = {
+  kind: "etcd",
+  endpoints: ["http://127.0.0.1:2379"],
+  key_prefix: "/nokv/control",
+  lease_ttl_seconds: 10,
+};
+// Seed routing names serving owners directly; it is the routing kind of the
+// NoKV metadata-runtimes line, which drops the etcd constructor.
+const SEEDS_ROUTING = { kind: "seeds", endpoints: ["127.0.0.1:7750"] };
+
+const FAKE_INCARNATION = "a".repeat(32);
+
+async function openSdkHelper(
+  routing: Record<string, unknown> = ETCD_ROUTING,
+  fakeSdkShape?: "0.11.0" | "0.11.1-unfenced",
+  extraEnv: Record<string, string> = {},
+) {
+  return await NoKVJsonLinesTransport.open({
+    argv: [PYTHON, SDK_HELPER],
+    config: {
+      root_id: "0".repeat(32),
+      routing,
+      object_store: { kind: "memory" },
+    },
+    env: {
+      ...process.env,
+      ...extraEnv,
+      PYTHONPATH: process.env.PYTHONPATH
+        ? `${FAKE_SDK_ROOT}:${process.env.PYTHONPATH}`
+        : FAKE_SDK_ROOT,
+      ...(fakeSdkShape === undefined ? {} : { LOOPX_FAKE_NOKV_SDK_SHAPE: fakeSdkShape }),
+    },
+  });
+}
+
+async function openFaultHelper(mode: string, maxResponseBytes?: number) {
+  return await NoKVJsonLinesTransport.open({
+    argv: [PYTHON, FAULT_HELPER, mode],
+    config: {},
+    max_response_bytes: maxResponseBytes,
+  });
+}
+
+test("JSON-lines transport cannot bypass its open handshake", () => {
+  let processStarted = false;
+  const DirectTransport = NoKVJsonLinesTransport as unknown as new (
+    options: {
+      argv: readonly string[];
+      config: Record<string, never>;
+      process_factory: () => never;
+    },
+    constructionToken: symbol,
+  ) => NoKVJsonLinesTransport;
+
+  assert.throws(
+    () =>
+      new DirectTransport(
+        {
+          argv: ["injected-helper"],
+          config: {},
+          process_factory: () => {
+            processStarted = true;
+            throw new Error("constructor reached process creation");
+          },
+        },
+        Symbol("caller-token"),
+      ),
+    /must be created with open\(\)/,
+  );
+  assert.equal(processStarted, false);
+});
+
+registerAuthorityStoreConformance("NoKV JSON-lines process", async (t) => {
+  const transport = await openSdkHelper();
+  t.after(async () => await transport.close());
+  return {
+    store: new NoKVAuthorityStore(transport, {
+      tenant_id: "tenant-a",
+      goal_id: "goal-a",
+      workbench: "authority-workbench",
+    }),
+    contender: new NoKVAuthorityStore(transport, {
+      tenant_id: "tenant-a",
+      goal_id: "goal-a",
+      workbench: "authority-workbench",
+    }),
+  };
+});
+
+test("JSON-lines transport starts once and reuses the helper process", async (t) => {
+  const transport = await openSdkHelper();
+  t.after(async () => await transport.close());
+
+  assert.deepEqual(await transport.storeIdentity("authority-workbench"), {
+    status: "available",
+    store_identity: `nokv:authority-workbench:${"a".repeat(32)}`,
+  });
+  assert.deepEqual(
+    await transport.readBlob("authority-workbench", "metadata/head.json"),
+    { status: "missing" },
+  );
+  assert.deepEqual(
+    await transport.casPublishBlob({
+      workbench: "authority-workbench",
+      path: "metadata/head.json",
+      expected_generation: null,
+      expected_workspace_incarnation_id: FAKE_INCARNATION,
+      bytes: Buffer.from("payload", "utf8"),
+      operation_id: "a".repeat(32),
+      artifact_revision_id: "b".repeat(32),
+    }),
+    { status: "applied", generation: 1 },
+  );
+  const loaded = await transport.readBlob("authority-workbench", "metadata/head.json");
+  assert.equal(loaded.status, "loaded");
+  if (loaded.status === "loaded") {
+    assert.equal(Buffer.from(loaded.bytes).toString("utf8"), "payload");
+    assert.equal(loaded.generation, 1);
+  }
+});
+
+test("JSON-lines transport decodes a UTF-8 request with a non-ASCII path on a byte codec", async (t) => {
+  // The helper pins its own streams to UTF-8. A two-byte host codec such as
+  // `gbk` pairs this request's trailing name with the closing quote into an
+  // invalid sequence, so an unpinned child dies before the open handshake.
+  const transport = await NoKVJsonLinesTransport.open({
+    argv: [PYTHON, SDK_HELPER],
+    config: {
+      root_id: "0".repeat(32),
+      workbench_root: "/tmp/Users-黄江南",
+      routing: ETCD_ROUTING,
+      object_store: { kind: "memory" },
+    },
+    env: {
+      ...process.env,
+      PYTHONPATH: FAKE_SDK_ROOT,
+      PYTHONIOENCODING: "gbk",
+      PYTHONUTF8: "0",
+    },
+  });
+  t.after(async () => await transport.close());
+
+  assert.deepEqual(await transport.storeIdentity("authority-workbench"), {
+    status: "available",
+    store_identity: `nokv:authority-workbench:${"a".repeat(32)}`,
+  });
+});
+
+test("JSON-lines helper refuses a stale incarnation fence typed and leaves the generation unchanged", async (t) => {
+  const transport = await openSdkHelper();
+  t.after(async () => await transport.close());
+  assert.deepEqual(
+    await transport.casPublishBlob({
+      workbench: "authority-workbench",
+      path: "metadata/head.json",
+      expected_generation: null,
+      expected_workspace_incarnation_id: FAKE_INCARNATION,
+      bytes: Buffer.from("generation one", "utf8"),
+      operation_id: "c".repeat(32),
+      artifact_revision_id: "d".repeat(32),
+    }),
+    { status: "applied", generation: 1 },
+  );
+
+  assert.deepEqual(
+    await transport.casPublishBlob({
+      workbench: "authority-workbench",
+      path: "metadata/head.json",
+      expected_generation: 1,
+      expected_workspace_incarnation_id: "b".repeat(32),
+      bytes: Buffer.from("stale incarnation", "utf8"),
+      operation_id: "e".repeat(32),
+      artifact_revision_id: "f".repeat(32),
+    }),
+    {
+      status: "failed",
+      reason_code: "store_identity_mismatch",
+      reason: "NoKV workbench incarnation does not match the expected incarnation",
+    },
+  );
+  const loaded = await transport.readBlob("authority-workbench", "metadata/head.json");
+  assert.equal(loaded.status, "loaded");
+  if (loaded.status === "loaded") {
+    assert.equal(Buffer.from(loaded.bytes).toString("utf8"), "generation one");
+    assert.equal(loaded.generation, 1);
+  }
+});
+
+test("JSON-lines helper refuses the 0.11.0 wheel by its version pin", async () => {
+  await assert.rejects(
+    openSdkHelper(ETCD_ROUTING, "0.11.0"),
+    (error: unknown) => {
+      assert.ok(error instanceof NoKVTransportProtocolError);
+      assert.match(error.message, /must be version 0\.11\.1/);
+      return true;
+    },
+  );
+});
+
+test("JSON-lines helper refuses a 0.11.1-labelled wheel without the publication fence", async () => {
+  await assert.rejects(
+    openSdkHelper(ETCD_ROUTING, "0.11.1-unfenced"),
+    (error: unknown) => {
+      assert.ok(error instanceof NoKVTransportProtocolError);
+      assert.match(error.message, /does not fence publication/);
+      assert.match(error.message, /expected_workspace_incarnation_id/);
+      return true;
+    },
+  );
+});
+
+test("JSON-lines helper disconnect is typed unavailable", async (t) => {
+  const transport = await openFaultHelper("disconnect");
+  t.after(async () => await transport.close());
+
+  await assert.rejects(
+    transport.readBlob("authority-workbench", "metadata/head.json"),
+    (error: unknown) => {
+      assert.ok(error instanceof NoKVTransportUnavailableError);
+      assert.doesNotMatch(error.message, /provider-private-diagnostic/);
+      assert.match(error.message, /code=17/);
+      return true;
+    },
+  );
+});
+
+test("JSON-lines synchronous start failure is typed and sanitized", async () => {
+  await assert.rejects(
+    NoKVJsonLinesTransport.open({
+      argv: ["injected-helper"],
+      config: {},
+      process_factory: () => {
+        throw new Error("private helper path and provider detail");
+      },
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof NoKVTransportUnavailableError);
+      assert.equal(error.message, "NoKV helper failed to start");
+      return true;
+    },
+  );
+});
+
+test("JSON-lines invalid response is a protocol failure", async (t) => {
+  const transport = await openFaultHelper("invalid");
+  t.after(async () => await transport.close());
+
+  await assert.rejects(
+    transport.readBlob("authority-workbench", "metadata/head.json"),
+    NoKVTransportProtocolError,
+  );
+});
+
+test("JSON-lines response limit fails closed as a protocol error", async (t) => {
+  const transport = await openFaultHelper("oversized", 256);
+  t.after(async () => await transport.close());
+
+  await assert.rejects(
+    transport.readBlob("authority-workbench", "metadata/head.json"),
+    (error: unknown) => {
+      assert.ok(error instanceof NoKVTransportProtocolError);
+      assert.match(error.message, /max_response_bytes/);
+      return true;
+    },
+  );
+});
+
+test("NoKV AuthorityStore preserves helper protocol failure as failed, not missing", async (t) => {
+  const transport = await openFaultHelper("invalid");
+  t.after(async () => await transport.close());
+  const store = new NoKVAuthorityStore(transport, {
+    tenant_id: "tenant-a",
+    goal_id: "goal-a",
+    workbench: "authority-workbench",
+  });
+
+  const loaded = await store.loadAuthority();
+  assert.equal(loaded.status, "failed");
+  if (loaded.status === "failed") {
+    assert.equal(loaded.reason_code, "provider_protocol_violation");
+  }
+});
+
+test("JSON-lines transport opens the real helper with seed routing", async () => {
+  const transport = await openSdkHelper(SEEDS_ROUTING);
+  try {
+    const identity = await transport.storeIdentity("authority-workbench");
+    assert.equal(identity.status, "available");
+    if (identity.status !== "available") throw new Error("unreachable");
+    assert.equal(identity.store_identity, `nokv:authority-workbench:${"a".repeat(32)}`);
+  } finally {
+    await transport.close();
+  }
+});
+
+test("JSON-lines transport retains the SDK schema from the exact ready handshake", async () => {
+  const unknown = await openSdkHelper();
+  try {
+    assert.equal(unknown.sdkProtocolSchema, null);
+  } finally {
+    await unknown.close();
+  }
+  const declared = await openSdkHelper(SEEDS_ROUTING, undefined, {
+    LOOPX_FAKE_NOKV_PROTOCOL_SCHEMA: "nokv.workspace.rpc.v10",
+  });
+  try {
+    assert.equal(declared.sdkProtocolSchema, "nokv.workspace.rpc.v10");
+  } finally {
+    await declared.close();
+  }
+});
+
+test("a missing SDK routing constructor returns a typed open refusal", async () => {
+  await assert.rejects(
+    openSdkHelper(SEEDS_ROUTING, undefined, {LOOPX_FAKE_NOKV_RELEASE_SHAPE: "1"}),
+    (error: unknown) => error instanceof NoKVHelperOpenRefusedError
+      && error.reasonCode === "nokv_sdk_capability_mismatch"
+      && /RoutingConfig\.seeds/.test(error.message),
+  );
+  const supported = await openSdkHelper(ETCD_ROUTING, undefined,
+    {LOOPX_FAKE_NOKV_RELEASE_SHAPE: "1"});
+  await supported.close();
+});
+
+test("JSON-lines transport surfaces an unknown routing kind as a typed protocol failure", async () => {
+  await assert.rejects(
+    openSdkHelper({ kind: "gossip", endpoints: ["127.0.0.1:7750"] }),
+    (error: unknown) =>
+      error instanceof NoKVTransportProtocolError && /routing kind/.test(error.message),
+  );
+});
+
+test("a stalled helper request expires at the transport deadline and fences later requests", { timeout: 10_000 }, async t => {
+  const transport = await openFaultHelper("unresponsive");
+  t.after(async () => { t.mock.timers.reset(); await transport.close(); });
+  // Start the real process before controlling time: process startup is not the
+  // request deadline under test. No wall-clock scheduling budget is asserted.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let settled = false;
+  const pending = transport.readBlob("authority-workbench", "metadata/head.json");
+  const rejected = assert.rejects(pending, error => {
+    settled = true;
+    assert.ok(error instanceof NoKVTransportUnavailableError);
+    assert.match(error.message, /read_blob timed out/);
+    return true;
+  });
+  t.mock.timers.tick(29_999);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  t.mock.timers.tick(1);
+  await rejected;
+  await assert.rejects(transport.storeIdentity("authority-workbench"), /read_blob timed out/);
+});

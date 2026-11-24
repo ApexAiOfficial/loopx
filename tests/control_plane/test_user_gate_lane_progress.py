@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import pytest
+
+from loopx.control_plane.todos.user_gate import apply_scoped_user_gate_fallback_projection
+from loopx.control_plane.quota.scheduler_ack import (
+    record_quota_scheduler_ack_for_decision,
+)
 from loopx.control_plane.quota.stall_repair import (
     build_runtime_capability_user_gate_repair_hint,
 )
 from loopx.control_plane.quota.turn_envelope import build_turn_envelope
 from loopx.control_plane.scheduler import scheduler_hint as scheduler_hint_module
-from loopx.control_plane.scheduler.ack import build_codex_app_scheduler_ack_event
 from loopx.control_plane.scheduler.execution_context import (
     scheduler_execution_context_for_runtime_profile,
 )
-from loopx.control_plane.scheduler.scheduler_hint import build_scheduler_hint
+from tests.control_plane.scheduler_arbitration_fixture import build_native_scheduler_hint as build_scheduler_hint
 from loopx.control_plane.scheduler.state import (
     SCHEDULER_HOST_UPDATE_FAILURE_SCHEMA_VERSION,
 )
@@ -22,7 +28,6 @@ from loopx.control_plane.testing.quota_fixtures import (
 )
 from loopx.quota import build_quota_should_run
 
-
 GOAL_ID = "user-gate-lane-progress-fixture"
 AGENT_ID = "codex-main-control"
 APP_CONTEXT = scheduler_execution_context_for_runtime_profile(
@@ -30,7 +35,54 @@ APP_CONTEXT = scheduler_execution_context_for_runtime_profile(
 )
 
 
-def _status_payload(*, gate_action_kind: str) -> dict:
+@pytest.mark.parametrize("action", ["quota_skip", "monitor_quiet_skip", None])
+def test_runnable_user_gate_fallback_replaces_a_canonical_skip_action(action):
+    original = {"decision": "skip", "should_run": False, "effective_action": action}
+    result = apply_scoped_user_gate_fallback_projection(
+        original, fallback={"recommended_action": "advance non-gated work"},
+        replan_decision_allowed=False,
+    )
+    assert result["effective_action"] == "scoped_user_gate_fallback"
+    assert result["should_run"] is True
+    assert original["should_run"] is False
+
+
+def test_user_gate_fallback_preserves_repair_and_replan_precedence():
+    original = {"decision": "run", "should_run": True, "effective_action": "capability_bridge_repair"}
+    fallback = {"recommended_action": "advance non-gated work"}
+    result = apply_scoped_user_gate_fallback_projection(
+        original, fallback=fallback, replan_decision_allowed=False,
+    )
+    assert result["effective_action"] == "capability_bridge_repair"
+    assert apply_scoped_user_gate_fallback_projection(
+        original, fallback=fallback, replan_decision_allowed=True,
+    ) is original
+
+
+def test_independent_fallback_keeps_workspace_repair_obligation_without_write_grant():
+    original = {
+        "decision": "workspace_guard", "should_run": True,
+        "effective_action": "agent_workspace_repair",
+        "normal_delivery_allowed": False, "workspace_repair_allowed": True,
+        "execution_obligation": {
+            "kind": "agent_workspace_repair", "must_attempt_work": True,
+            "delivery_allowed": False, "minimum": "move_to_independent_worktree",
+        },
+    }
+    fallback = {"selected_executable": {"todo_id": "todo_independent"}}
+    result = apply_scoped_user_gate_fallback_projection(
+        original, fallback=fallback, replan_decision_allowed=False,
+    )
+    assert result == {**original, "scoped_user_gate_fallback": fallback}
+    assert "scoped_user_gate_fallback" not in original
+
+
+def _status_payload(
+    *,
+    gate_action_kind: str,
+    blocks_deferred: bool = False,
+    include_gated_agent: bool = False,
+) -> dict:
     completed = quota_todo_item(
         todo_id="todo_prerequisite",
         status="done",
@@ -46,8 +98,16 @@ def _status_payload(*, gate_action_kind: str) -> dict:
         resume_when="todo_done:todo_prerequisite",
         done=True,
     )
+    gated_agent = quota_todo_item(
+        todo_id="todo_first_screen",
+        status="open",
+        text="[P0] Publish the gated product first screen.",
+        claimed_by=AGENT_ID,
+        action_kind="publish_product_first_screen",
+        required_write_scopes=["docs/**"],
+    )
     agent_todos = quota_todo_summary(
-        [completed, deferred],
+        [completed, deferred, *([gated_agent] if include_gated_agent else [])],
         role="agent",
         claim_scope_agent_id=AGENT_ID,
     )
@@ -59,6 +119,7 @@ def _status_payload(*, gate_action_kind: str) -> dict:
         text="[P2-user] Review the product first screen.",
         action_kind=gate_action_kind,
         blocks_agent=AGENT_ID,
+        unblocks_todo_id="todo_ready_deferred" if blocks_deferred else "todo_first_screen",
     )
     return quota_status_payload(
         goal_id=GOAL_ID,
@@ -71,6 +132,17 @@ def _status_payload(*, gate_action_kind: str) -> dict:
         coordination={
             "agent_model": "peer_v1",
             "registered_agents": [AGENT_ID],
+        },
+        item_extra={
+            "long_task_cadence_hint": {
+                "schema_version": "cadence_hint_v0",
+                "signal": "blocked",
+                "recommendation": "wait",
+                "reason_codes": [
+                    "quota_state_operator_gate",
+                    "open_user_todos_visible",
+                ],
+            }
         },
     )
 
@@ -98,7 +170,10 @@ def _quality_vision_run() -> dict:
 
 def test_unrelated_user_gate_allows_ready_deferred_successor_replan() -> None:
     payload = build_quota_should_run(
-        _status_payload(gate_action_kind="approve_product_first_screen"),
+        _status_payload(
+            gate_action_kind="approve_product_first_screen",
+            include_gated_agent=True,
+        ),
         goal_id=GOAL_ID,
         agent_id=AGENT_ID,
         scheduler_execution_context=APP_CONTEXT,
@@ -108,6 +183,10 @@ def test_unrelated_user_gate_allows_ready_deferred_successor_replan() -> None:
     selected = fallback["selected_executable"]
     assert selected["todo_id"] == "todo_ready_deferred"
     assert selected["fallback_kind"] == "deferred_successor_replan"
+    assert payload["decision"] == "successor_replan_required"
+    assert payload["effective_action"] == "successor_replan_required"
+    assert payload["should_run"] is True
+    assert payload["selected_todo"]["todo_id"] == "todo_ready_deferred"
     assert payload["interaction_contract"]["mode"] == "scoped_user_gate_fallback"
     assert payload["interaction_contract"]["agent_channel"]["must_attempt"] is True
     assert payload["interaction_contract"]["agent_channel"]["delivery_allowed"] is True
@@ -117,6 +196,60 @@ def test_unrelated_user_gate_allows_ready_deferred_successor_replan() -> None:
         "agent_channel"
     ]["primary_action"]
     assert payload["scheduler_hint"]["cadence_class"] == "active_work"
+    assert payload["long_task_cadence_hint"] == {
+        "schema_version": "cadence_hint_v0",
+        "signal": "active_work",
+        "recommendation": "keep",
+        "reason_codes": ["final_agent_scoped_active_work"],
+        "authority": "final_agent_scoped_interaction_and_scheduler",
+        "superseded": {
+            "signal": "blocked",
+            "recommendation": "wait",
+            "reason_codes": [
+                "quota_state_operator_gate",
+                "open_user_todos_visible",
+            ],
+        },
+    }
+
+
+def test_ready_deferred_successor_replan_preempts_workspace_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guarded_todo_ids: list[str | None] = []
+
+    def _record_workspace_guard_selection(
+        *args: object,
+        selected_todo: dict | None = None,
+        **kwargs: object,
+    ) -> dict:
+        guarded_todo_ids.append((selected_todo or {}).get("todo_id"))
+        return {
+            "schema_version": "agent_workspace_guard_v1",
+            "reason": "delivery would require another workspace",
+            "required_action": "move to the delivery workspace",
+        }
+
+    monkeypatch.setattr(
+        "loopx.control_plane.quota.should_run.build_agent_workspace_guard",
+        _record_workspace_guard_selection,
+    )
+
+    payload = build_quota_should_run(
+        _status_payload(
+            gate_action_kind="approve_product_first_screen",
+            include_gated_agent=True,
+        ),
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+        scheduler_execution_context=APP_CONTEXT,
+    )
+
+    assert payload["decision"] == "successor_replan_required"
+    assert payload["effective_action"] == "successor_replan_required"
+    assert payload["selected_todo"]["todo_id"] == "todo_ready_deferred"
+    assert "workspace_guard" not in payload
+    assert guarded_todo_ids == []
 
 
 def test_consumed_review_gate_exposes_quality_vision_replan() -> None:
@@ -175,13 +308,15 @@ def test_consumed_review_gate_exposes_quality_vision_replan() -> None:
 
 def test_blocking_user_gate_backs_off_instead_of_polling_as_active_work() -> None:
     payload = build_quota_should_run(
-        _status_payload(gate_action_kind="refine_benchmark_treatment"),
+        _status_payload(gate_action_kind="refine_benchmark_treatment", blocks_deferred=True),
         goal_id=GOAL_ID,
         agent_id=AGENT_ID,
         scheduler_execution_context=APP_CONTEXT,
     )
 
     assert "scoped_user_gate_fallback" not in payload
+    assert payload["should_run"] is False
+    assert payload["effective_action"] == "operator_gate_notify"
     assert payload["interaction_contract"]["mode"] == "user_gate"
     assert payload["interaction_contract"]["agent_channel"]["must_attempt"] is False
     expected_response_plan = {
@@ -199,9 +334,18 @@ def test_blocking_user_gate_backs_off_instead_of_polling_as_active_work() -> Non
         "turn_envelope_action_dimensions_v1"
     )
     assert payload["scheduler_hint"]["cadence_class"] == "human_gate"
-    assert payload["scheduler_hint"]["codex_app"]["recommended_interval_minutes"] == 30
+    assert payload["scheduler_hint"]["app_automation"]["recommended_interval_minutes"] == 30
+    assert payload["long_task_cadence_hint"] == {
+        "schema_version": "cadence_hint_v0",
+        "signal": "blocked",
+        "recommendation": "wait",
+        "reason_codes": [
+            "quota_state_operator_gate",
+            "open_user_todos_visible",
+        ],
+    }
 
-    initial_backoff = payload["scheduler_hint"]["codex_app"]["stateful_backoff"]
+    initial_backoff = payload["scheduler_hint"]["app_automation"]["stateful_backoff"]
     next_hint = build_scheduler_hint(
         payload,
         user_action_required=True,
@@ -216,10 +360,10 @@ def test_blocking_user_gate_backs_off_instead_of_polling_as_active_work() -> Non
     )
 
     assert next_hint["cadence_class"] == "human_gate"
-    assert next_hint["codex_app"]["recommended_interval_minutes"] == 60
-    assert next_hint["codex_app"]["stateful_backoff"]["progression_index"] == 1
-    assert next_hint["codex_app"]["stateful_backoff"]["apply_needed"] is True
-    assert next_hint["codex_app"]["recommended_rrule"] == "FREQ=MINUTELY;INTERVAL=60"
+    assert next_hint["app_automation"]["recommended_interval_minutes"] == 60
+    assert next_hint["app_automation"]["stateful_backoff"]["progression_index"] == 1
+    assert next_hint["app_automation"]["stateful_backoff"]["apply_needed"] is True
+    assert next_hint["app_automation"]["recommended_rrule"] == "FREQ=MINUTELY;INTERVAL=60"
 
 
 def _runtime_recovery_gate_status(
@@ -361,16 +505,17 @@ def test_runtime_recovery_gate_with_owner_capability_remains_owner_gate() -> Non
 
 def test_acked_human_gate_advances_despite_unrelated_historical_host_failure(
     monkeypatch,
+    tmp_path: Path,
 ) -> None:
     now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(scheduler_hint_module, "now_utc", lambda: now)
     payload = build_quota_should_run(
-        _status_payload(gate_action_kind="refine_benchmark_treatment"),
+        _status_payload(gate_action_kind="refine_benchmark_treatment", blocks_deferred=True),
         goal_id=GOAL_ID,
         agent_id=AGENT_ID,
         scheduler_execution_context=APP_CONTEXT,
     )
-    first_rrule = payload["scheduler_hint"]["codex_app"]["stateful_backoff"][
+    first_rrule = payload["scheduler_hint"]["app_automation"]["stateful_backoff"][
         "current_rrule"
     ]
     historical_failure = {
@@ -397,17 +542,25 @@ def test_acked_human_gate_advances_despite_unrelated_historical_host_failure(
         codex_app_current_rrule=first_rrule,
         scheduler_execution_context=APP_CONTEXT,
     )
-    matched_app = host_matched["codex_app"]
+    matched_app = host_matched["app_automation"]
     assert matched_app["stateful_backoff"]["apply_needed"] is False
     assert matched_app["stateful_backoff"]["ack_needed"] is True
     assert matched_app["ack_hint"]["after"] == "matching_host_rrule_observed"
 
-    fallback_ack = build_codex_app_scheduler_ack_event(
+    backoff = matched_app["stateful_backoff"]
+    fallback_ack = record_quota_scheduler_ack_for_decision(
         {"goal_id": GOAL_ID, "scheduler_hint": host_matched},
+        runtime_root=tmp_path,
+        goal_id=GOAL_ID,
         agent_id=AGENT_ID,
+        execute=True,
         applied_rrule=first_rrule,
+        reset_token=backoff["reset_token"],
+        identity_signature=backoff["identity_signature"],
+        host_match_observed=True,
         generated_at=now.isoformat(),
     )
+    assert fallback_ack["ok"] is True, fallback_ack
     settled_state = fallback_ack["scheduler_ack_event"]["scheduler_state"]
     assert settled_state["last_applied_rrule"] == first_rrule
     assert settled_state["host_update_failures"] == [historical_failure]
@@ -422,7 +575,7 @@ def test_acked_human_gate_advances_despite_unrelated_historical_host_failure(
         scheduler_execution_context=APP_CONTEXT,
     )
 
-    next_app = next_hint["codex_app"]
+    next_app = next_hint["app_automation"]
     assert next_app["stateful_backoff"]["progression_index"] == 1
     assert next_app["recommended_rrule"] == "FREQ=MINUTELY;INTERVAL=60"
     assert next_app["stateful_backoff"]["apply_needed"] is True

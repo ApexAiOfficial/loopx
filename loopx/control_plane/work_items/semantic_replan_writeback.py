@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import shlex
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 
 from ...agent_registry import registered_agent_ids_for_goal
 from ..agents.agent_scope import agent_scope_item_matches_agent_or_unclaimed
@@ -12,25 +14,58 @@ from ..agents.identity import build_quota_agent_identity
 from ..goals.goal_frontier import (
     build_goal_frontier_projection_context_from_status,
 )
+from ..goals.goal_frontier.semantic_history import (
+    latest_autonomous_replan_ack_from_status_payload,
+)
 from ..status.autonomous_replan_projection import (
     AUTONOMOUS_RUN_HISTORY_NEUTRAL_CLASSIFICATIONS,
     autonomous_replan_obligation_from_runs,
 )
 from ..todos.active_state_todo_parser import parse_active_state_todos
 from ..todos.quota_summary import (
-    select_quota_todo_source_items,
-    select_quota_todo_summary,
+    select_quota_todo_summaries_with_terminal,
 )
 from ..todos.succession_warning import todo_succession_gap_items
+from .autonomous_replan_ack import (
+    drop_unowned_recorded_replan_acks,
+    historical_ack_candidates_with_writeback_order,
+    latest_monitor_replan_frontier_identity,
+    watch_lane_continuation_todo_ids,
+)
 from .autonomous_replan_obligation import (
     build_autonomous_replan_cli_actions,
     project_todo_lifecycle_settlement_reentry,
 )
-from .progress_observation import semantic_delta_from_writeback
+from .progress_observation import guarded_replan_transition_delta, semantic_delta_from_writeback
+from .lifecycle_recovery import attach_receipt_replan_context
+from .replan_semantics_codec import project_replan_semantics
+from ..effect_runtime import effect_runtime_request_scope
+from .repair_delta import (
+    build_repair_delta_contract,
+    repair_delta_kinds_have_accountable_progress,
+)
 from .work_lane_context import build_work_lane_context_contract
 
 
 REPLAN_WRITEBACK_REJECTION_SCHEMA_VERSION = "replan_writeback_rejection_v0"
+
+
+@dataclass(frozen=True)
+class CapabilityReplanEvidence:
+    """Composition-root supplied facts and their capability-owned qualifier."""
+    frontier: dict[str, Any]
+    qualify: Callable[[Mapping[str, Any], str, dict[str, Any] | None, list[dict[str, Any]]],
+                      tuple[dict[str, Any], dict[str, Any]]]
+
+
+@dataclass(frozen=True)
+class RefreshReplanQualification:
+    repair_delta_contract: dict[str, Any] | None
+    semantic_delta: dict[str, Any] | None
+    frontier_identity: str | None
+    classification: str
+    delivery_outcome: str | None
+    autonomous_replan_recorded: bool
 
 
 class ReplanWritebackRejected(ValueError):
@@ -53,6 +88,7 @@ def project_replan_writeback_rejection(
     *,
     goal_id: str,
     agent_id: str | None,
+    runtime_root: str | None = None,
 ) -> dict[str, Any]:
     """Project exact recovery actions without weakening the writeback gate."""
 
@@ -64,7 +100,10 @@ def project_replan_writeback_rejection(
     compact_triggers = [
         {
             key: trigger.get(key)
-            for key in ("kind", "todo_id", "completion_turn_key")
+            for key in (
+                "kind", "todo_id", "completion_turn_key",
+                "reason_code", "component_checks", "resolution_hint",
+            )
             if trigger.get(key) is not None
         }
         for trigger in obligation.get("triggers") or []
@@ -75,6 +114,7 @@ def project_replan_writeback_rejection(
         goal_id=goal_id,
         lifecycle_actor_args=scoped_cli_args,
         scoped_cli_args=scoped_cli_args,
+        runtime_root=runtime_root,
     )
     triggers = (
         lifecycle_reentry["triggers"]
@@ -92,21 +132,36 @@ def project_replan_writeback_rejection(
             quota_spend_action="",
             settlement_chain_ready=False,
             lifecycle_actor_args=scoped_cli_args,
+            runtime_root=runtime_root,
         )
     )
+    capability_guard = obligation.get("capability_guard")
+    if isinstance(capability_guard, Mapping) and rejection.semantic_delta.get("readback_actions"):
+        next_cli_actions = rejection.semantic_delta["readback_actions"]
+    context_recovery = rejection.semantic_delta.get("context_recovery")
+    if isinstance(context_recovery, Mapping):
+        # TS owns the mismatch classification and complete review basis. Reading
+        # that basis precedes retry; the generic unbound writeback command would
+        # merely repeat the rejection and can lose the original Turn identity.
+        next_cli_actions = []
     return {
         "schema_version": REPLAN_WRITEBACK_REJECTION_SCHEMA_VERSION,
         "required": True,
         "host_action": (
-            "settle_todo_lifecycle"
-            if lifecycle_reentry is not None
+            "read_current_replan_context" if isinstance(context_recovery, Mapping)
+            else "settle_todo_lifecycle" if lifecycle_reentry is not None
+            else "read_current_capability_evidence" if capability_guard
             else "write_typed_semantic_delta"
         ),
         "obligation_id": obligation.get("obligation_id"),
         "resolution_mode": obligation.get("resolution_mode"),
+        **({"retirement_contract": rejection.semantic_delta["retirement_contract"]}
+           if rejection.semantic_delta.get("retirement_contract") else {}),
         "reason_code": rejection.semantic_delta.get("reason_code"),
         "triggers": triggers,
         "next_cli_actions": next_cli_actions,
+        **({"context_recovery": dict(context_recovery)} if isinstance(context_recovery, Mapping) else {}),
+        **({"capability_guard": dict(capability_guard)} if isinstance(capability_guard, Mapping) else {}),
     }
 
 
@@ -160,6 +215,94 @@ def _obligation_was_created_by_current_completion(
     )
 
 
+def _build_writeback_projection_context(
+    *,
+    goal_id: str,
+    safe_agent_id: str,
+    owned_history: list[dict[str, Any]],
+    registry_goal: dict[str, Any] | None,
+    replan_source_route: Mapping[str, Any] | None,
+    guard_scoped: bool,
+    guard_semantic_replan_obligation_id: str | None,
+    receipt_bound_guard_recorded_at: str | None,
+    receipt_bound_guard_turn_instance_id: str | None,
+    goal_ref: Mapping[str, Any] | None,
+    admission_event_id: str | None,
+    capability_evidence: CapabilityReplanEvidence | None,
+    replan_explore_reader: Callable[[str, str | None], Mapping[str, Any] | None] | None,
+    run_obligation: Mapping[str, Any] | None,
+    agent_identity: Mapping[str, object] | None,
+    user_todos: dict[str, object] | None,
+    agent_todos: dict[str, object] | None,
+    agent_todo_source_items: list[dict[str, object]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build status payload and goal-frontier context for replan writeback."""
+
+    status_payload: dict[str, Any] = {
+        **dict(replan_source_route or {}),
+        "run_history": {
+            "goals": [
+                {
+                    **(registry_goal or {}),
+                    "id": goal_id,
+                    "latest_runs": owned_history,
+                }
+            ]
+        },
+    }
+    projected_ack = (
+        latest_autonomous_replan_ack_from_status_payload(
+            status_payload,
+            goal_id=goal_id,
+            agent_id=safe_agent_id,
+            neutral_classifications=AUTONOMOUS_RUN_HISTORY_NEUTRAL_CLASSIFICATIONS,
+        )
+        if guard_scoped and guard_semantic_replan_obligation_id
+        else None
+    )
+    status_payload["receipt_bound_replan_ack_candidates"] = historical_ack_candidates_with_writeback_order(
+        owned_history, goal_id=goal_id, agent_id=safe_agent_id,
+        obligation_id=guard_semantic_replan_obligation_id, guard_scoped=guard_scoped,
+        source_route=replan_source_route,
+        guard_recorded_at=receipt_bound_guard_recorded_at,
+        guard_turn_instance_id=receipt_bound_guard_turn_instance_id,
+        goal_ref=goal_ref, admission_event_id=admission_event_id,
+    )
+    if capability_evidence is not None:
+        status_payload["bounded_research_frontier"] = capability_evidence.frontier
+    context = build_goal_frontier_projection_context_from_status(
+        replan_explore_reader=replan_explore_reader,
+        goal_id=goal_id,
+        agent_id=safe_agent_id,
+        status_payload=status_payload,
+        item={
+            **({"autonomous_replan_obligation": run_obligation} if run_obligation else {}),
+            **({"autonomous_replan_ack": projected_ack} if projected_ack is not None else {}),
+        },
+        project_asset={"execution_profile": (registry_goal or {}).get("execution_profile")},
+        user_todo_summary=user_todos,
+        agent_todo_summary=agent_todos,
+        agent_todo_source_items=agent_todo_source_items,
+        fallback_todo_source_items=agent_todo_source_items,
+        work_lane_contract=build_work_lane_context_contract(
+            {"progress_scope": "primary_goal"},
+            agent_todo_summary=agent_todos,
+        ),
+        neutral_replan_ack_classifications=AUTONOMOUS_RUN_HISTORY_NEUTRAL_CLASSIFICATIONS,
+        registered_agent_ids=list(cast(dict[str, Any], agent_identity)["registered_agents"]),
+        goal_status=str((registry_goal or {}).get("status") or "active"),
+        receipt_bound_replan_obligation_id=(guard_semantic_replan_obligation_id if guard_scoped else None),
+        receipt_bound_guard_recorded_at=receipt_bound_guard_recorded_at,
+        agent_profile=(
+            cast(dict[str, Any], cast(dict[str, Any], agent_identity).get("agent_profile"))
+            if isinstance(cast(dict[str, Any], agent_identity).get("agent_profile"), dict)
+            else None
+        ),
+    )
+    return status_payload, context
+
+
+@effect_runtime_request_scope()
 def qualify_replan_writeback(
     *,
     newest_first_runs: list[dict[str, Any]] | None,
@@ -171,21 +314,40 @@ def qualify_replan_writeback(
     agent_vision: dict[str, Any] | None = None,
     completion_todo_id: str | None = None,
     completion_turn_key: str | None = None,
+    todo_fields: dict[str, Any] | None = None,
+    external_progress_review: Mapping[str, Any] | None = None,
+    effective_turn_cadence: dict[str, Any] | None = None,
+    guard_scoped: bool = False,
+    guard_semantic_replan_obligation_id: str | None = None,
+    capability_evidence: CapabilityReplanEvidence | None = None,
+    guard_capability: Mapping[str, Any] | None = None,
+    receipt_bound_guard_recorded_at: str | None = None,
+    receipt_bound_guard_turn_instance_id: str | None = None,
+    receipt_bound_replan_review: Mapping[str, Any] | None = None,
+    admission_event_id: str | None = None,
+    replan_source_route: Mapping[str, Any] | None = None,
+    replan_explore_reader: Callable[[str, str | None], Mapping[str, Any] | None] | None = None,
+    goal_ref: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Return the shared open obligation and the writeback's typed delta.
 
     The write path deliberately reuses quota's goal-frontier reducer. It does
     not classify maintenance from prose and therefore sees obligations derived
     from run history, agent vision, and final-outcome checkpoints alike.
+    Nested decisions share one runtime code revision for this qualification;
+    source and provider reads remain fresh, without caching decision facts.
     """
 
     safe_agent_id = str(agent_id or "").strip()
     if not safe_agent_id:
         return None, None
-    todo_projection = parse_active_state_todos(state_text, item_limit=None)
+    todo_projection = todo_fields if todo_fields is not None else parse_active_state_todos(
+        state_text, item_limit=None,
+        goal={**(registry_goal or {}), "latest_runs": list(newest_first_runs or [])},
+    )
     registered_agent_ids = registered_agent_ids_for_goal(registry_goal)
     agent_identity = (
-        build_quota_agent_identity(registry_goal, agent_id=safe_agent_id)
+        build_quota_agent_identity(cast(dict[str, Any], registry_goal), agent_id=safe_agent_id)
         if registered_agent_ids
         else {
             "agent_id": safe_agent_id,
@@ -194,20 +356,8 @@ def qualify_replan_writeback(
     )
     raw_user_todos = todo_projection.get("user_todos")
     raw_agent_todos = todo_projection.get("agent_todos")
-    user_todos = select_quota_todo_summary(
-        raw_user_todos,
-        None,
-        agent_identity=agent_identity,
-        filter_user_gate_blocks_agent=True,
-    )
-    agent_todos = select_quota_todo_summary(
-        raw_agent_todos,
-        None,
-        agent_identity=agent_identity,
-    )
-    agent_todo_source_items = select_quota_todo_source_items(
-        raw_agent_todos,
-        None,
+    user_todos, agent_todos, agent_todo_source_items = select_quota_todo_summaries_with_terminal(
+        raw_user_todos, raw_agent_todos, agent_identity=agent_identity,
     )
     agent_todo_completion_items = (
         [
@@ -218,53 +368,103 @@ def qualify_replan_writeback(
         if isinstance(raw_agent_todos, dict)
         else []
     )
+    owned_history, _ = drop_unowned_recorded_replan_acks(
+        list(newest_first_runs or []), goal_id=goal_id, goal_ref=goal_ref,
+    )
     run_obligation = autonomous_replan_obligation_from_runs(
-        newest_first_runs,
+        owned_history,
         agent_todos=agent_todos,
         agent_id=safe_agent_id,
+        external_progress_review=external_progress_review,
+        effective_turn_cadence=effective_turn_cadence,
     )
-    status_payload = {
-        "run_history": {
-            "goals": [
-                {
-                    "id": goal_id,
-                    "latest_runs": list(newest_first_runs or []),
-                }
-            ]
-        }
-    }
-    context = build_goal_frontier_projection_context_from_status(
+    status_payload, context = _build_writeback_projection_context(
         goal_id=goal_id,
-        agent_id=safe_agent_id,
-        status_payload=status_payload,
-        item={
-            **(
-                {"autonomous_replan_obligation": run_obligation}
-                if run_obligation
-                else {}
-            )
-        },
-        project_asset=None,
-        user_todo_summary=user_todos,
-        agent_todo_summary=agent_todos,
+        safe_agent_id=safe_agent_id,
+        owned_history=owned_history,
+        registry_goal=registry_goal,
+        replan_source_route=replan_source_route,
+        guard_scoped=guard_scoped,
+        guard_semantic_replan_obligation_id=guard_semantic_replan_obligation_id,
+        receipt_bound_guard_recorded_at=receipt_bound_guard_recorded_at,
+        receipt_bound_guard_turn_instance_id=receipt_bound_guard_turn_instance_id,
+        goal_ref=goal_ref,
+        admission_event_id=admission_event_id,
+        capability_evidence=capability_evidence,
+        replan_explore_reader=replan_explore_reader,
+        run_obligation=run_obligation,
+        agent_identity=agent_identity,
+        user_todos=user_todos,
+        agent_todos=agent_todos,
         agent_todo_source_items=agent_todo_source_items,
-        work_lane_contract=build_work_lane_context_contract(
-            {"progress_scope": "primary_goal"},
-            agent_todo_summary=agent_todos,
-        ),
-        neutral_replan_ack_classifications=(
-            AUTONOMOUS_RUN_HISTORY_NEUTRAL_CLASSIFICATIONS
-        ),
-        registered_agent_ids=list(agent_identity["registered_agents"]),
-        goal_status=str((registry_goal or {}).get("status") or "active"),
-        agent_profile=(
-            agent_identity.get("agent_profile")
-            if isinstance(agent_identity.get("agent_profile"), dict)
-            else None
-        ),
     )
     obligation = context.get("replan_obligation")
+    selected_capability = guard_capability if guard_scoped else (obligation or {}).get("capability_guard")
+    if selected_capability is not None:
+        if capability_evidence is None:
+            raise ValueError("selected capability writeback owner is not available")
+        selected_id = guard_semantic_replan_obligation_id if guard_scoped else (obligation or {}).get("obligation_id")
+        return capability_evidence.qualify(selected_capability, str(selected_id), progress_observation,
+            [run for run in newest_first_runs or [] if run.get("agent_id") == safe_agent_id])
+    if guard_scoped and guard_semantic_replan_obligation_id:
+        transition_delta = guarded_replan_transition_delta(
+            guard_scoped=guard_scoped,
+            selected_obligation_id=guard_semantic_replan_obligation_id,
+            transition_candidates=context.get("replan_transition_candidates", []),
+            goal_id=goal_id,
+            agent_id=safe_agent_id,
+            guard_recorded_at=receipt_bound_guard_recorded_at,
+            guard_turn_instance_id=receipt_bound_guard_turn_instance_id,
+        )
+        if transition_delta is not None:
+            # This closes only the selected Turn obligation. The freshly
+            # derived frontier obligation remains visible to the next guard.
+            return None, transition_delta
+    lifecycle = next((candidate for candidate in context.get("replan_transition_candidates", [])
+        if (candidate.get("source_obligation") or {}).get("resolution_mode") == "todo_lifecycle_settlement" and
+        (candidate.get("obligation") or {}).get("obligation_id") == guard_semantic_replan_obligation_id), None)
+    obligation = lifecycle["obligation"] if guard_scoped and lifecycle else context.get("replan_obligation")
+    if not obligation and guard_scoped and guard_semantic_replan_obligation_id:
+        # A now-unclaimed successor may keep the ordinary frontier runnable,
+        # but cannot discharge its former owner's admitted review. Retain the
+        # exact reconstructed source so stale unchanged writeback is refused.
+        obligation = next((candidate["obligation"] for candidate in
+            context.get("replan_transition_candidates", [])
+            if isinstance(candidate.get("obligation"), dict) and
+            candidate["obligation"].get("obligation_id") == guard_semantic_replan_obligation_id), None)
+    # Every selected replan retains its exact receipt-bound source. A missing
+    # reconstruction must not fall through as an unselected future obligation
+    # and commit an unqualified writeback. Plain outcome reviews additionally
+    # carry a scalar source; lifecycle/transition reviews need the same owner.
+    if guard_scoped and guard_semantic_replan_obligation_id:
+        obligation = project_replan_semantics({
+            "operation": "receipt_bound_obligation", "guard_scoped": True,
+            "selected_obligation_id": guard_semantic_replan_obligation_id,
+            "agent_id": safe_agent_id, "replay_phase": "open",
+            "current_obligation": obligation,
+            "receipt_review": receipt_bound_replan_review,
+            "transition_candidates": context.get("replan_transition_candidates", []),
+            "goal_id": goal_id,
+            "guard_recorded_at": receipt_bound_guard_recorded_at,
+            "guard_turn_instance_id": receipt_bound_guard_turn_instance_id,
+        })["obligation"]
+        if obligation and not obligation.get("replan_context") and not obligation.get("settlement_action_packet"):
+            obligation = attach_receipt_replan_context(
+                obligation, None, goal_id=goal_id, agent_id=safe_agent_id,
+                source_status=status_payload,
+                explore_reader=replan_explore_reader,
+                goal_acceptance_contract=(
+                    contract if isinstance(contract := (agent_todos or {}).get("goal_acceptance_contract"), Mapping) else None
+                ),
+                todo_items=agent_todo_source_items,
+            )
     if not obligation:
+        # A validated Todo transition can discharge the read-model obligation
+        # before refresh. Preserve that evidence in this run so periodic review
+        # starts a new window rather than counting the same history again.
+        transition_ack = context.get("replan_transition_ack") or {}
+        if transition_ack.get("recorded") is True:
+            return None, transition_ack.get("semantic_delta")
         return None, None
     if _obligation_was_created_by_current_completion(
         obligation,
@@ -278,6 +478,7 @@ def qualify_replan_writeback(
         obligation=obligation,
         progress_observation=progress_observation,
         agent_vision=agent_vision,
+        history_runs=newest_first_runs,
     )
     if (
         "coverage_backed_no_followup"
@@ -309,8 +510,29 @@ def enforce_open_replan_writeback(
     agent_vision: dict[str, Any] | None = None,
     completion_todo_id: str | None = None,
     completion_turn_key: str | None = None,
+    guard_scoped: bool = False,
+    guard_semantic_replan_obligation_id: str | None = None,
+    receipt_bound_guard_recorded_at: str | None = None,
+    receipt_bound_guard_turn_instance_id: str | None = None,
+    receipt_bound_replan_review: Mapping[str, Any] | None = None,
+    admission_event_id: str | None = None,
+    todo_fields: dict[str, Any] | None = None,
+    external_progress_review: Mapping[str, Any] | None = None,
+    capability_evidence: CapabilityReplanEvidence | None = None,
+    guard_capability: Mapping[str, Any] | None = None,
+    effective_turn_cadence: dict[str, Any] | None = None,
+    replan_source_route: Mapping[str, Any] | None = None,
+    replan_explore_reader: Callable[[str, str | None], Mapping[str, Any] | None] | None = None,
+    goal_ref: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Fail closed unless concrete typed evidence satisfies the open replan."""
+    """Fail closed unless concrete typed evidence satisfies the selected replan.
+
+    An exact Turn guard is the authority for work admitted in that Turn. When
+    ``guard_scoped`` is true, a replan obligation applies only if that guard
+    selected its exact generation. A different or newly derived obligation is
+    preserved for the next Turn instead of retroactively rejecting authorized
+    delivery.
+    """
 
     obligation, semantic_delta = qualify_replan_writeback(
         newest_first_runs=newest_first_runs,
@@ -319,11 +541,33 @@ def enforce_open_replan_writeback(
         goal_id=goal_id,
         progress_observation=progress_observation,
         registry_goal=registry_goal,
+        external_progress_review=external_progress_review,
+        effective_turn_cadence=effective_turn_cadence,
         agent_vision=agent_vision,
         completion_todo_id=completion_todo_id,
         completion_turn_key=completion_turn_key,
+        todo_fields=todo_fields,
+        guard_scoped=guard_scoped,
+        guard_semantic_replan_obligation_id=guard_semantic_replan_obligation_id,
+        capability_evidence=capability_evidence,
+        guard_capability=guard_capability,
+        receipt_bound_guard_recorded_at=receipt_bound_guard_recorded_at,
+        receipt_bound_guard_turn_instance_id=receipt_bound_guard_turn_instance_id,
+        receipt_bound_replan_review=receipt_bound_replan_review,
+        admission_event_id=admission_event_id,
+        replan_source_route=replan_source_route, replan_explore_reader=replan_explore_reader,
+        goal_ref=goal_ref,
     )
     if not obligation:
+        if isinstance(semantic_delta, dict) and semantic_delta.get("accepted") is True:
+            if not guard_scoped or semantic_delta.get("obligation_id") == (
+                guard_semantic_replan_obligation_id
+            ):
+                return semantic_delta
+        return None
+    if guard_scoped and str(obligation.get("obligation_id") or "").strip() != str(
+        guard_semantic_replan_obligation_id or ""
+    ).strip():
         return None
     if isinstance(semantic_delta, dict) and semantic_delta.get("accepted") is True:
         return semantic_delta
@@ -343,4 +587,128 @@ def enforce_open_replan_writeback(
         ),
         obligation=obligation,
         semantic_delta=semantic_delta,
+    )
+
+
+def qualify_refresh_replan_writeback(
+    *,
+    autonomous_replan_recorded: bool,
+    requested_delta_kinds: list[str],
+    active_state_next_action_update: dict[str, Any] | None,
+    agent_vision: dict[str, Any] | None,
+    existing_agent_vision: dict[str, Any] | None,
+    agent_id: str,
+    dry_run: bool,
+    settlement_todo_id: str | None,
+    settlement_guard_scoped: bool,
+    settlement_guard_semantic_replan_obligation_id: str | None,
+    receipt_bound_guard_recorded_at: str | None = None,
+    receipt_bound_guard_turn_instance_id: str | None = None,
+    receipt_bound_replan_review: Mapping[str, Any] | None = None,
+    admission_event_id: str | None = None,
+    newest_first_runs: list[dict[str, Any]],
+    state_text: str,
+    goal_id: str,
+    progress_observation: dict[str, Any] | None,
+    registry_goal: dict[str, Any] | None,
+    external_progress_review: Mapping[str, Any] | None = None,
+    effective_turn_cadence: dict[str, Any] | None = None,
+    completion_todo_id: str | None,
+    completion_turn_key: str | None,
+    classification: str,
+    delivery_outcome: str | None,
+    todo_fields: dict[str, Any] | None = None,
+    replan_source_route: Mapping[str, Any] | None = None,
+    replan_explore_reader: Callable[[str, str | None], Mapping[str, Any] | None] | None = None,
+    capability_evidence: CapabilityReplanEvidence | None = None,
+    guard_capability: Mapping[str, Any] | None = None,
+    goal_ref: Mapping[str, Any] | None = None,
+) -> RefreshReplanQualification:
+    """Qualify one refresh's replan delta and accountable settlement outcome."""
+
+    requested_classification = classification
+    requested_delivery_outcome = delivery_outcome
+    repair_delta_contract = None
+    frontier_identity = None
+    effective_recorded = bool(autonomous_replan_recorded)
+    if autonomous_replan_recorded:
+        repair_delta_contract = build_repair_delta_contract(
+            requested_delta_kinds=requested_delta_kinds,
+            active_state_next_action_update=active_state_next_action_update,
+            agent_vision=agent_vision,
+            existing_agent_vision=existing_agent_vision,
+            agent_todo_summary=(
+                todo_fields if todo_fields is not None
+                else parse_active_state_todos(state_text, item_limit=None)
+            ).get("agent_todos"),
+            agent_id=agent_id or None,
+            dry_run=dry_run,
+            selected_todo_id=settlement_todo_id,
+            newest_first_runs=newest_first_runs,
+        )
+        validated_delta_kinds = list(repair_delta_contract.get("delta_kinds") or [])
+        if not repair_delta_contract["delta_present"]:
+            normalized = str(classification or "").strip().lower()
+            classification = (
+                "repair_noop"
+                if "repair" in normalized and "replan" not in normalized
+                else "replan_noop"
+            )
+            effective_recorded = False
+            if delivery_outcome in {"outcome_progress", "primary_goal_outcome"}:
+                delivery_outcome = "outcome_gap"
+        elif (
+            delivery_outcome in {"outcome_progress", "primary_goal_outcome"}
+            and not repair_delta_kinds_have_accountable_progress(
+                validated_delta_kinds
+            )
+        ):
+            delivery_outcome = "outcome_gap"
+        if effective_recorded and agent_id:
+            frontier_identity = latest_monitor_replan_frontier_identity(
+                newest_first_runs,
+                agent_id=agent_id,
+                watch_todo_ids=watch_lane_continuation_todo_ids(
+                    repair_delta_contract
+                ),
+            )
+
+    semantic_delta = enforce_open_replan_writeback(
+        capability_evidence=capability_evidence, guard_capability=guard_capability,
+        newest_first_runs=newest_first_runs,
+        state_text=state_text,
+        agent_id=agent_id,
+        goal_id=goal_id,
+        progress_observation=progress_observation,
+        registry_goal=registry_goal,
+        external_progress_review=external_progress_review,
+        effective_turn_cadence=effective_turn_cadence,
+        agent_vision=agent_vision,
+        completion_todo_id=completion_todo_id,
+        completion_turn_key=completion_turn_key,
+        guard_scoped=settlement_guard_scoped,
+        todo_fields=todo_fields,
+        guard_semantic_replan_obligation_id=(
+            settlement_guard_semantic_replan_obligation_id
+        ),
+        receipt_bound_guard_recorded_at=receipt_bound_guard_recorded_at,
+        receipt_bound_guard_turn_instance_id=receipt_bound_guard_turn_instance_id,
+        receipt_bound_replan_review=receipt_bound_replan_review,
+        admission_event_id=admission_event_id,
+        replan_source_route=replan_source_route, replan_explore_reader=replan_explore_reader,
+        goal_ref=goal_ref,
+    )
+    if semantic_delta:
+        if semantic_delta.get("retirement") and delivery_outcome != "outcome_gap":
+            raise ValueError("capability duty retirement requires outcome_gap; it is not delivery progress")
+        effective_recorded = True
+        classification = requested_classification
+        delivery_outcome = requested_delivery_outcome
+    return RefreshReplanQualification(
+        repair_delta_contract=repair_delta_contract,
+        semantic_delta=semantic_delta,
+        frontier_identity=frontier_identity,
+        classification=classification,
+        delivery_outcome=delivery_outcome,
+        autonomous_replan_recorded=effective_recorded,
     )

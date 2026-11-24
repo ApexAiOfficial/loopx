@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -9,10 +10,25 @@ from .replay_runtime import ReplayFidelity, fidelity_meets
 from .trace_runtime import TraceLog, require_nonempty_text
 
 
+def _finite(
+    value: float, field_name: str, requirement: str = "finite number"
+) -> float:
+    message = f"{field_name} must be a {requirement}"
+    if isinstance(value, bool):
+        raise ValueError(message)
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(normalized):
+        raise ValueError(message)
+    return normalized
+
+
 def _nonnegative(value: float, field_name: str) -> float:
-    normalized = float(value)
+    normalized = _finite(value, field_name, "finite non-negative number")
     if normalized < 0:
-        raise ValueError(f"{field_name} must be non-negative")
+        raise ValueError(f"{field_name} must be a finite non-negative number")
     return normalized
 
 
@@ -86,9 +102,9 @@ class FailureReplayObservation:
         )
         if self.minimum_fidelity == ReplayFidelity.NON_REPLAYABLE:
             raise ValueError("failure observations require replayable fidelity")
-        normalized_weight = float(self.weight)
+        normalized_weight = _finite(self.weight, "weight", "finite positive number")
         if normalized_weight <= 0:
-            raise ValueError("weight must be positive")
+            raise ValueError("weight must be a finite positive number")
         object.__setattr__(self, "weight", normalized_weight)
 
 
@@ -161,7 +177,7 @@ def plan_adaptive_replay_points(
         raise TypeError("observations must contain FailureReplayObservation values")
     if int(max_proposals) <= 0:
         raise ValueError("max_proposals must be positive")
-    threshold = float(minimum_score_minutes)
+    threshold = _finite(minimum_score_minutes, "minimum_score_minutes")
     for candidate in normalized_candidates:
         _validate_position(trace, candidate)
     for observation in normalized_observations:
@@ -194,6 +210,9 @@ def plan_adaptive_replay_points(
             )
         if eligible_weight == 0:
             continue
+        _finite(eligible_weight, "eligible_observation_weight")
+        _finite(expected_saved, "expected_saved_minutes")
+        _finite(weighted_suffix_events, "weighted_suffix_events")
         score = expected_saved - candidate.capture_minutes
         if score < threshold:
             continue

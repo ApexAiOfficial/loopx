@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from copy import deepcopy
+import json
+
+import pytest
+
 from loopx.control_plane.effect_program import interpret_quota_should_run_packet
 from loopx.control_plane.quota.cli_projection import (
     compact_quota_should_run_cli_payload,
@@ -13,12 +18,142 @@ from loopx.control_plane.testing.quota_fixtures import (
     quota_status_payload,
     quota_todo_item,
 )
+from loopx.control_plane.work_items.autonomous_replan_obligation import (
+    build_autonomous_replan_obligation_payload,
+)
+from loopx.control_plane.testing.action_portfolio_scenarios import (
+    accepted_replan_successor_status,
+    ACTUAL_DEFAULT_MODEL_BEHAVIOR_FIXTURE_AGENT_ID as REPLAN_AGENT,
+    ACTUAL_DEFAULT_MODEL_BEHAVIOR_FIXTURE_GOAL_ID as REPLAN_GOAL,
+)
+
+
+def test_accepted_replan_promotes_the_new_route_and_keeps_explicit_choice() -> None:
+    status = accepted_replan_successor_status()
+    packet = build_quota_should_run(status, goal_id=REPLAN_GOAL, agent_id=REPLAN_AGENT)
+    assert packet["selected_todo"]["todo_id"] == "todo_replan_successor"
+    assert packet["agent_lane_next_action"]["todo_id"] == "todo_replan_successor"
+    assert packet["recommended_action"] == packet["agent_lane_next_action"]["text"]
+    portfolio = packet["action_portfolio"]
+    assert portfolio["primary"]["todo_id"] == "todo_replan_successor"
+    assert [
+        (row["todo_id"], row["selection_role"])
+        for row in portfolio["suggested_actions"]
+    ] == [("todo_replan_successor", "recommended"), ("todo_prior_plan", "alternative")]
+    assert portfolio["selection_policy"]["recommendation_role"] == "default_not_binding"
+    compact = compact_quota_should_run_cli_payload(packet)
+    assert compact["action_portfolio"]["primary"]["todo_id"] == "todo_replan_successor"
+    envelope = build_turn_envelope(packet)
+    assert (
+        envelope["action"]["action_portfolio"]["primary"]["todo_id"]
+        == "todo_replan_successor"
+    )
+    from loopx.control_plane.turn_driver.host_candidate import extract_turn_authority, render_prompt
+
+    authority = extract_turn_authority({"turn_envelope": envelope})
+    prompt = render_prompt(authority)
+    delivered, _ = json.JSONDecoder().raw_decode(prompt.split("Turn authority JSON:\n", 1)[1])
+    assert delivered["action"]["action_portfolio"] == portfolio
+    assert delivered["action"]["action_portfolio"]["selection_policy"]["recommendation_role"] == "default_not_binding"
+    assert delivered["selected_todo"]["todo_id"] == "todo_replan_successor"
+    chosen = build_quota_should_run(
+        status,
+        goal_id=REPLAN_GOAL,
+        agent_id=REPLAN_AGENT,
+        requested_action_todo_id="todo_prior_plan",
+    )
+    assert chosen["action_selection_qualification"]["state"] == "qualified"
+    assert chosen["selected_todo"]["todo_id"] == "todo_prior_plan"
+    bound = build_quota_should_run(
+        status,
+        goal_id=REPLAN_GOAL,
+        agent_id=REPLAN_AGENT,
+        receipt_bound_todo_id="todo_prior_plan",
+    )
+    assert bound["selected_todo"]["todo_id"] == "todo_prior_plan"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["peer_ack", "newer_plan", "wrong_origin", "blocked", "missing_capability"],
+)
+def test_invalid_or_superseded_replan_keeps_the_existing_default(mutation: str) -> None:
+    status = deepcopy(accepted_replan_successor_status())
+    latest = status["run_history"]["goals"][0]["latest_runs"][0]
+    if mutation == "peer_ack":
+        latest["agent_id"] = "another-agent"
+    elif mutation == "newer_plan":
+        latest["autonomous_replan_ack"]["semantic_delta"] = {
+            "accepted": True,
+            "outcomes": ["fresh_vision_path_outcome"],
+        }
+    else:
+        for summary in [
+            status["attention_queue"]["items"][0]["agent_todos"],
+            status["attention_queue"]["items"][0]["project_asset"]["agent_todos"],
+        ]:
+            for value in summary.values():
+                if isinstance(value, list):
+                    for row in value:
+                        if (
+                            isinstance(row, dict)
+                            and row.get("todo_id") == "todo_replan_successor"
+                        ):
+                            if mutation == "wrong_origin":
+                                row["replan_obligation_id"] = "replan-fedcba9876543210"
+                            elif mutation == "blocked":
+                                row["status"] = "blocked"
+                            else:
+                                row["required_capabilities"] = [
+                                    "unavailable_fixture_capability"
+                                ]
+    packet = build_quota_should_run(
+        status, goal_id=REPLAN_GOAL, agent_id=REPLAN_AGENT, available_capabilities=[]
+    )
+    assert packet["selected_todo"]["todo_id"] == "todo_prior_plan"
 
 
 GOAL_ID = "action-portfolio-fixture"
 AGENT_ID = "codex-main"
 PRIMARY_ID = "todo_primary001"
 FALLBACK_ID = "todo_fallback001"
+
+
+def test_periodic_replan_keeps_recommendations_unbound_before_selection() -> None:
+    status = _legacy_future_primary_status()
+    obligation = build_autonomous_replan_obligation_payload(
+        schema_version="autonomous_replan_obligation_v0",
+        stall_threshold=2,
+        trigger_count=1,
+        triggers=[{"kind": "periodic_review_due", "source": "fixture"}],
+        guidance_actions=["create_successor"],
+        todo_actions=[],
+        stop_condition="stop on owner-only authority",
+        recommended_action="Review the current route before delivery.",
+        agent_id=AGENT_ID,
+        include_agent_id=True,
+    )
+    item = status["attention_queue"]["items"][0]
+    item["autonomous_replan_obligation"] = obligation
+    item["project_asset"]["autonomous_replan_obligation"] = obligation
+    packet = build_quota_should_run(
+        status, goal_id=GOAL_ID, agent_id=AGENT_ID,
+        turn_instance_id="turn-periodic-selection",
+        available_capabilities=["fallback_runner"],
+    )
+    assert packet["effective_action"] == "autonomous_replan_required"
+    assert packet["autonomous_replan_obligation"]["required"] is True
+    assert packet["normal_delivery_allowed"] is False
+    assert packet["action_portfolio"]["selection_policy"][
+        "requires_explicit_turn_binding"
+    ] is True
+    cli = packet["interaction_contract"]["cli_channel"]
+    assert cli["selection_required"] is True
+    assert "settlement_plan" not in cli
+    assert cli["next_cli_actions"] == []
+    assert "--turn-instance-id turn-periodic-selection" in cli[
+        "selection_command"
+    ]["command_args_template"]
 
 
 def _legacy_future_primary_status() -> dict:
@@ -28,6 +163,9 @@ def _legacy_future_primary_status() -> dict:
         priority="P2",
         title="Advance the independent fallback slice.",
         claimed_by=AGENT_ID,
+        required_capabilities=["fallback_runner"],
+        required_write_scopes=["artifacts/fallback/**"],
+        note="Start from the independent fallback validation boundary.",
     )
     primary = quota_todo_item(
         todo_id=PRIMARY_ID,
@@ -36,6 +174,7 @@ def _legacy_future_primary_status() -> dict:
         title="Run the Monday-only primary operation after its window opens.",
         claimed_by=AGENT_ID,
         action_kind="monitor",
+        note="Do not poll before the scheduled primary window.",
     )
     return quota_status_payload(
         goal_id=GOAL_ID,
@@ -62,38 +201,108 @@ def _legacy_future_primary_status() -> dict:
     )
 
 
-def test_sticky_primary_exposes_bounded_fallback_on_every_hot_path() -> None:
+def test_sticky_primary_exposes_bounded_agent_selection_on_every_hot_path() -> None:
     packet = build_quota_should_run(
         _legacy_future_primary_status(),
         goal_id=GOAL_ID,
         agent_id=AGENT_ID,
+        turn_instance_id="turn-portfolio-001",
+        available_capabilities=["fallback_runner"],
     )
 
     assert packet["selected_todo"]["todo_id"] == PRIMARY_ID
     portfolio = packet["action_portfolio"]
     assert portfolio["primary"]["todo_id"] == PRIMARY_ID
-    assert [item["todo_id"] for item in portfolio["fallback_actions"]] == [
-        FALLBACK_ID
+    assert "fallback_actions" not in portfolio
+    assert "fallback_policy" not in portfolio
+    assert portfolio["selection_policy"] == {
+        "decision_owner": "agent",
+        "mode": "explicit_turn_binding",
+        "recommendation_role": "default_not_binding",
+        "requires_explicit_turn_binding": True,
+        "direct_delivery_before_selection": False,
+        "max_alternative_actions": 2,
+        "candidate_scope": "current_authoritative_eligible_todos",
+        "suggestions_exhaustive": False,
+    }
+    assert [item["todo_id"] for item in portfolio["suggested_actions"]] == [
+        PRIMARY_ID,
+        FALLBACK_ID,
     ]
-    assert portfolio["fallback_policy"]["trigger"] == (
-        "primary_unavailable_at_execution"
-    )
+    assert portfolio["suggested_actions"][1]["required_capabilities"] == [
+        "fallback_runner"
+    ]
+    assert "required_write_scopes" not in portfolio["suggested_actions"][1]
     assert packet["interaction_contract"]["agent_channel"][
         "action_portfolio_ref"
     ] == "$.action_portfolio"
+    assert packet["interaction_contract"]["agent_channel"][
+        "selection_required"
+    ] is True
+    assert packet["interaction_contract"]["agent_channel"][
+        "delivery_allowed"
+    ] is False
+    cli_channel = packet["interaction_contract"]["cli_channel"]
+    assert cli_channel["selection_required"] is True
+    assert cli_channel["spend_after_validation"] is False
+    assert cli_channel["next_cli_actions"] == []
+    selection_command = cli_channel["selection_command"]
+    assert selection_command["route_prefix"] == "loopx --format json"
+    assert "--todo-id '{todo_id}'" in selection_command["command_args_template"]
+    assert "--turn-instance-id turn-portfolio-001" in (
+        selection_command["command_args_template"]
+    )
+    assert selection_command["candidate_discovery_args"].startswith("todo list")
+    assert "settlement_plan" not in cli_channel
 
     compact = compact_quota_should_run_cli_payload(packet)
+    assert compact["action_portfolio"]["selection_policy"] == (
+        portfolio["selection_policy"]
+    )
+    # A selectable alternative's full requirements and text remain decision
+    # context, rather than a 180-character view with a partial summary pointer.
     assert compact["action_portfolio"] == portfolio
+    assert compact["capability_gate"] == packet["capability_gate"]
+    compact_candidates = compact["agent_todo_summary"]["first_executable_items"]
+    assert compact_candidates[1]["required_capabilities"] == ["fallback_runner"]
+    assert "required_write_scopes" not in compact_candidates[1]
     effect_turn = interpret_quota_should_run_packet(packet)
     assert effect_turn.observation.action_portfolio == portfolio
 
     envelope = build_turn_envelope(packet)
     assert envelope["action"]["action_portfolio"] == portfolio
+    assert envelope["writeback"]["selection_required"] is True
+    assert envelope["writeback"]["suggested_todo_ids"] == [
+        PRIMARY_ID,
+        FALLBACK_ID,
+    ]
+    assert envelope["writeback"]["selection_command_ref"] == (
+        "full_decision.interaction_contract.cli_channel.selection_command"
+    )
+    assert "next_cli_actions" not in envelope["writeback"]
     assert envelope["action_signature"]["coverage"] == (
         ACTION_SIGNATURE_COVERAGE_V2
     )
     assert envelope["action_signature"]["matches"] is True
     assert envelope["compaction"]["within_budget"] is True
+
+
+def test_explicit_action_selection_preserves_runtime_root_route() -> None:
+    packet = build_quota_should_run(
+        _legacy_future_primary_status(),
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+        turn_instance_id="turn-portfolio-002",
+        available_capabilities=["fallback_runner"],
+        runtime_root="/tmp/loopx runtime",
+    )
+
+    selection_command = packet["interaction_contract"]["cli_channel"][
+        "selection_command"
+    ]
+    assert selection_command["route_prefix"] == (
+        "loopx --runtime-root '/tmp/loopx runtime' --format json"
+    )
 
 
 def test_typed_future_monitor_selects_ready_work_and_preserves_priority() -> None:
@@ -142,6 +351,79 @@ def test_typed_future_monitor_selects_ready_work_and_preserves_priority() -> Non
     assert unavailable[0]["todo_id"] == PRIMARY_ID
     assert unavailable[0]["availability_reason"] == "scheduled_for_future"
     assert unavailable[0]["next_due_at"] == "2099-01-01T00:00:00Z"
+
+
+def test_typed_external_wait_selects_ready_work_and_preserves_wait_context() -> None:
+    waiting = quota_todo_item(
+        todo_id=PRIMARY_ID,
+        index=1,
+        priority="P0",
+        title="Resume the validated slice after external state changes.",
+        claimed_by=AGENT_ID,
+        resume_when="monitor_changed:todo_monitor001",
+        resume_monitor_generation=4,
+        successor_todo_ids=[FALLBACK_ID],
+        note="Do not poll here; wait for the typed monitor transition.",
+    )
+    fallback = quota_todo_item(
+        todo_id=FALLBACK_ID,
+        index=2,
+        priority="P1",
+        title="Advance the independent fallback slice.",
+        claimed_by=AGENT_ID,
+        note="Implement the bounded fallback and run its focused validation.",
+    )
+    monitor = quota_todo_item(
+        todo_id="todo_monitor001",
+        index=3,
+        priority="P2",
+        title="Observe the external state for a material change.",
+        claimed_by=AGENT_ID,
+        task_class="continuous_monitor",
+        action_kind="monitor",
+        target_key="fixture-external-state",
+        cadence="daily",
+        next_due_at="2099-01-01T00:00:00Z",
+        watch_only=True,
+        material_change_generation=4,
+    )
+    status = quota_status_payload(
+        goal_id=GOAL_ID,
+        status="active",
+        agent_todo_items=[waiting, fallback, monitor],
+        recommended_action=waiting["text"],
+        next_action=waiting["text"],
+        coordination={
+            "agent_model": "peer_v1",
+            "registered_agents": [AGENT_ID],
+        },
+        claim_scope_agent_id=AGENT_ID,
+    )
+
+    packet = build_quota_should_run(
+        status,
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+    )
+
+    assert packet["selected_todo"]["todo_id"] == FALLBACK_ID
+    assert packet["recommended_action"] == fallback["text"]
+    unavailable = packet["action_portfolio"]["unavailable_higher_priority"]
+    assert unavailable[0]["todo_id"] == PRIMARY_ID
+    assert unavailable[0]["availability_reason"] == "resume_condition_pending"
+    wait_visibility = packet["agent_todo_summary"]["resume_blocked_items"][0]
+    assert wait_visibility["todo_id"] == PRIMARY_ID
+    assert wait_visibility["resume_ready"] is False
+    assert wait_visibility["resume_condition"]["baseline_generation"] == 4
+    assert wait_visibility["resume_condition"]["material_change_generation"] == 4
+
+    compact = compact_quota_should_run_cli_payload(packet)
+    selected_action = compact["action_portfolio"]["suggested_actions"][0]
+    assert selected_action["todo_id"] == FALLBACK_ID
+    assert selected_action["text"] == fallback["text"]
+    assert selected_action["continuation_hint"] == (
+        "Implement the bounded fallback and run its focused validation."
+    )
 
 
 def test_receipt_bound_turn_cannot_switch_to_a_fallback_todo() -> None:

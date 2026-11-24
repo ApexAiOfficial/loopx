@@ -1,0 +1,521 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { EffectRuntimeRequestError } from "../../loopx/control_plane/effect_runtime_errors.ts";
+import {
+  TODO_EXTERNAL_WAIT_REQUEST_SCHEMA_VERSION,
+  TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+  TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION,
+  evaluateTodoResumeConditions,
+  compactTodoResumeMergeEvidence,
+  diagnoseTodoResumeCondition,
+  normalizeTodoResumeWhen,
+  planTodoExternalWaitTransition,
+  resumeConditionHasKnownPendingTarget,
+} from "../../loopx/control_plane/todos/resume_condition.ts";
+import {
+  monitorChangeScopeDigest,
+} from "../../loopx/control_plane/todos/monitor_scope.ts";
+
+function todo(
+  todoId: string,
+  status: string,
+  taskClass = "advancement_task",
+  extra: Record<string, unknown> = {},
+) {
+  return {
+    todo_id: todoId,
+    role: "agent",
+    status,
+    task_class: taskClass,
+    ...extra,
+  };
+}
+
+test("resume syntax is normalized by the typed Todo boundary", () => {
+  assert.equal(normalizeTodoResumeWhen({
+    schema_version: TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION,
+    resume_when: " Monitor_Changed:TODO_WATCH001 ",
+  }), "monitor_changed:todo_watch001");
+  assert.equal(normalizeTodoResumeWhen({
+    schema_version: TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION,
+    resume_when: " Monitor_Changed:TODO_WATCH001@CASE-A/RUN-7 ",
+  }), "monitor_changed:todo_watch001@case-a/run-7");
+  assert.equal(normalizeTodoResumeWhen({
+    schema_version: TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION,
+    resume_when: "note_contains:approved",
+  }), null);
+  assert.equal(normalizeTodoResumeWhen({
+    schema_version: TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION,
+    resume_when: "resume_at:2026-09-14T09:30:00+08:00",
+  }), "resume_at:2026-09-14T01:30:00Z");
+  for (const resume_when of [
+    "resume_at:2026-09-14T09:30:00",
+    "resume_at:2026-02-30T09:30:00+08:00",
+    "resume_at:2026-09-14T09:30:00+08:60",
+    "resume_at:2026-09-14T09:30:00+15:00",
+    "resume_at:1000-01-01T00:00:00+14:00",
+    "resume_at:9999-12-31T23:59:59-14:00",
+  ]) assert.equal(normalizeTodoResumeWhen({
+    schema_version: TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION,
+    resume_when,
+  }), null, resume_when);
+});
+
+test("an active blocked completion target is a known pending dependency", () => {
+  const waiting = todo("todo_waiting", "deferred", "advancement_task", {
+    resume_when: "todo_done:todo_dependency",
+  });
+  const evaluate = (source: Record<string, unknown>[]) => (evaluateTodoResumeConditions({
+    schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+    items: [waiting], source_items: source,
+  }).conditions as Array<{condition: Record<string, unknown>}>)[0].condition;
+  for (const status of ["open", "deferred", "blocked"]) {
+    const condition = evaluate([todo("todo_dependency", status, "advancement_task", {
+      archive_state: "active", claimed_by: "agent-peer",
+    })]);
+    assert.equal(condition.satisfied, false);
+    assert.equal(resumeConditionHasKnownPendingTarget(condition, waiting), true, status);
+  }
+  for (const source of [
+    [], [todo("todo_dependency", "done")], [todo("todo_dependency", "unknown")],
+    [todo("todo_dependency", "blocked", "advancement_task", {archive_state: "archived"})],
+    [todo("todo_dependency", "blocked", "continuous_monitor")],
+  ]) assert.equal(resumeConditionHasKnownPendingTarget(evaluate(source), waiting), false);
+});
+
+test("resume_at emits one stable due receipt across repeated ticks and restart", () => {
+  const item = todo("todo_scheduled", "deferred", "advancement_task", {
+    resume_when: "resume_at:2026-09-14T09:30:00+08:00",
+  });
+  const evaluate = (evaluated_at: string) => {
+    const result = evaluateTodoResumeConditions({
+      schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+      items: [item],
+      source_items: [],
+      rollout_events: [],
+      evaluated_at,
+    });
+    return (result.conditions as Array<{ condition: Record<string, unknown> }>)[0].condition;
+  };
+
+  const pending = evaluate("2026-09-14T01:29:59Z");
+  assert.equal(pending.satisfied, false);
+  assert.equal(pending.material_change_generation, 0);
+  assert.equal(pending.resume_receipt, null);
+
+  const firstDue = evaluate("2026-09-14T01:30:00Z");
+  const replayed = evaluate("2026-09-15T00:00:00Z");
+  assert.equal(firstDue.satisfied, true);
+  assert.equal(firstDue.material_change_generation, 1);
+  assert.equal(firstDue.availability_reason, "resume_condition_satisfied");
+  assert.deepEqual(firstDue.resume_receipt, replayed.resume_receipt);
+  assert.match(
+    String((firstDue.resume_receipt as Record<string, unknown>).receipt_id),
+    /^resume_at_[a-f0-9]{24}$/,
+  );
+  assert.throws(() => evaluateTodoResumeConditions({
+    schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+    items: [item],
+    source_items: [],
+    rollout_events: [],
+  }), /evaluated_at must be a timezone-aware RFC3339 timestamp/);
+});
+
+test("receipt clock precision preserves the last microsecond before due", () => {
+  for (const date of ["1969-12-31", "2030-01-01"]) {
+    const resume_when = `resume_at:${date}T08:00:00.123456+08:00`;
+    const item = todo("todo_scheduled", "open", "advancement_task", {resume_when});
+    const evaluate = (fraction: string) => {
+      const result = evaluateTodoResumeConditions({
+        schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+        items: [item], source_items: [], evaluated_at: `${date}T00:00:00.${fraction}Z`,
+      });
+      return (result.conditions as Array<{condition: Record<string, unknown>}>)[0].condition;
+    };
+    assert.equal(normalizeTodoResumeWhen({
+      schema_version: TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION, resume_when,
+    }), `resume_at:${date}T00:00:00.123456Z`);
+    const before = evaluate("123455");
+    assert.equal(before.satisfied, false);
+    assert.equal(before.scheduled_for, `${date}T00:00:00.123456Z`);
+    assert.equal(before.evaluated_at, `${date}T00:00:00.123455Z`);
+    assert.equal(before.resume_receipt, null);
+    assert.equal(resumeConditionHasKnownPendingTarget(before, item), true);
+    const due = evaluate("123456");
+    assert.equal(due.satisfied, true);
+    assert.equal(resumeConditionHasKnownPendingTarget(due, item), false);
+    assert.deepEqual(due.resume_receipt, evaluate("123457").resume_receipt);
+  }
+  for (const fraction of ["123", "123000", "123450", "000001"]) {
+    const canonical = fraction === "123000" ? "123" : fraction.replace(/0+$/, "");
+    assert.equal(normalizeTodoResumeWhen({
+      schema_version: TODO_RESUME_NORMALIZE_REQUEST_SCHEMA_VERSION,
+      resume_when: `resume_at:2030-01-01T00:00:00.${fraction}Z`,
+    }), `resume_at:2030-01-01T00:00:00.${canonical}Z`);
+  }
+});
+
+test("live monitor completion is invalid, but historical completion remains satisfied", () => {
+  for (const status of ["open", "blocked", "deferred", "done"]) {
+    const result = evaluateTodoResumeConditions({
+      schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+      items: [todo("todo_waiting", "open", "advancement_task", { resume_when: "todo_done:todo_monitor" })],
+      source_items: [todo("todo_monitor", status, "continuous_monitor", { archive_state: "archived" })],
+    });
+    const condition = (result.conditions as Array<{ condition: Record<string, unknown> }>)[0].condition;
+    assert.equal(condition.satisfied, status === "done");
+    assert.equal(condition.availability_reason, status === "done" ? "resume_condition_satisfied" : "resume_condition_invalid");
+    assert.equal(condition.invalid_state, status === "done" ? undefined : "monitor_completion_requires_replan");
+  }
+});
+
+test("self-dependency is not satisfied even when a stale completed row says done", () => {
+  for (const kind of ["todo_done", "monitor_changed"]) {
+    const result = evaluateTodoResumeConditions({
+      schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+      items: [todo("todo_waiting", "done", "continuous_monitor", {
+        resume_when: `${kind}:todo_waiting`, resume_monitor_generation: 1, material_change_generation: 2,
+      })], source_items: [],
+    });
+    const condition = (result.conditions as Array<{ condition: Record<string, unknown> }>)[0].condition;
+    assert.equal(condition.satisfied, false);
+    assert.equal(condition.invalid_state, "dependency_self_reference");
+  }
+});
+
+test("missing completion target stays pending rather than claiming proof of invalidity", () => {
+  const result = evaluateTodoResumeConditions({
+    schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+    items: [todo("todo_waiting", "open", "advancement_task", { resume_when: "todo_done:todo_missing" })],
+    source_items: [],
+  });
+  const condition = (result.conditions as Array<{ condition: Record<string, unknown> }>)[0].condition;
+  assert.equal(condition.availability_reason, "resume_condition_pending");
+  assert.equal(condition.invalid_state, undefined);
+});
+
+test("legacy compact diagnosis infers only typed resume syntax, not prose or another kind", () => {
+  const legacy = { resume_when: "todo_done:todo_monitor", satisfied: false,
+    target_status: "open", target_task_class: "continuous_monitor" };
+  assert.deepEqual(diagnoseTodoResumeCondition(legacy), {
+    kind: "todo_done", state: "invalid", reason: "monitor_completion_requires_replan",
+  });
+  for (const kind of ["monitor_changed", "capacity_available", "pr_merged"]) {
+    assert.equal(diagnoseTodoResumeCondition({ ...legacy, kind }).state, "pending");
+  }
+});
+
+test("one reducer evaluates Todo, PR, capacity, monitor, and date resume conditions", () => {
+  const result = evaluateTodoResumeConditions({
+    schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+    items: [
+      todo("todo_wait_done", "open", "advancement_task", {
+        resume_when: "todo_done:todo_dependency",
+      }),
+      todo("todo_wait_pr", "deferred", "advancement_task", {
+        resume_when: "pr_merged:#42",
+        task_repository: "git:github.com/example/loopx",
+      }),
+      todo("todo_wait_capacity", "deferred", "advancement_task", {
+        resume_when: "capacity_available:shell",
+      }),
+      todo("todo_wait_monitor", "open", "advancement_task", {
+        resume_when: "monitor_changed:todo_watch001",
+        resume_monitor_generation: 3,
+      }),
+      todo("todo_wait_date", "deferred", "advancement_task", {
+        resume_when: "resume_at:2026-09-14T09:30:00+08:00",
+      }),
+    ],
+    source_items: [
+      todo("todo_dependency", "done"),
+      todo("todo_watch001", "open", "continuous_monitor", {
+        material_change_generation: 4,
+      }),
+    ],
+    rollout_events: [{
+      event_id: "event-merge-42",
+      event_kind: "pr_merge",
+      code_refs: { pr_ref: "example/loopx#42" },
+      recorded_at: "2026-08-25T00:00:00Z",
+    }],
+    available_capabilities: ["shell"],
+    evaluated_at: "2026-09-14T01:30:00Z",
+  });
+  const conditions = Object.fromEntries(
+    (result.conditions as Array<Record<string, unknown>>).map((row) => [
+      row.todo_id,
+      row.condition,
+    ]),
+  ) as Record<string, Record<string, unknown>>;
+  assert.equal(conditions.todo_wait_done.satisfied, true);
+  assert.equal(
+    conditions.todo_wait_done.availability_reason,
+    "resume_condition_satisfied",
+  );
+  assert.equal(conditions.todo_wait_pr.matched_pr_ref, "example/loopx#42");
+  assert.equal(conditions.todo_wait_capacity.provider_required, false);
+  assert.equal(conditions.todo_wait_capacity.satisfied, true);
+  assert.equal(conditions.todo_wait_monitor.baseline_generation, 3);
+  assert.equal(conditions.todo_wait_monitor.material_change_generation, 4);
+  assert.equal(conditions.todo_wait_monitor.satisfied, true);
+  assert.equal(
+    conditions.todo_wait_monitor.availability_reason,
+    "resume_condition_satisfied",
+  );
+  assert.equal(conditions.todo_wait_date.satisfied, true);
+  assert.equal(conditions.todo_wait_date.material_change_generation, 1);
+});
+
+test("PR merge source aliases bridge a repository redirect without weakening repository binding", () => {
+  const request = {
+    schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+    items: [
+      todo("todo_old_repo", "deferred", "advancement_task", {
+        resume_when: "pr_merged:#4344",
+        task_repository: "git:github.com/huangruiteng/loopx",
+      }),
+      todo("todo_unrelated_repo", "deferred", "advancement_task", {
+        resume_when: "pr_merged:#4344",
+        task_repository: "git:github.com/example/loopx",
+      }),
+    ],
+    source_items: [],
+    rollout_events: [{
+      event_id: "event-redirected-merge-4344",
+      event_kind: "pr_merge",
+      pr_ref: "loopx-project/loopx#4344",
+      source_refs: [
+        {kind: "pull_request", ref: "huangruiteng/loopx#4344"},
+        {kind: "pull_request", ref: "example/loopx#9999"},
+      ],
+      recorded_at: "2026-09-13T13:45:34Z",
+    }],
+    available_capabilities: [],
+    evaluated_at: "2026-09-20T00:00:00Z",
+  };
+  const result = evaluateTodoResumeConditions(request);
+  const conditions = Object.fromEntries(
+    (result.conditions as Array<Record<string, unknown>>).map((row) => [
+      row.todo_id,
+      row.condition,
+    ]),
+  ) as Record<string, Record<string, unknown>>;
+  assert.equal(conditions.todo_old_repo.satisfied, true);
+  assert.equal(
+    conditions.todo_old_repo.matched_pr_ref,
+    "huangruiteng/loopx#4344",
+  );
+  assert.equal(conditions.todo_unrelated_repo.satisfied, false);
+});
+
+test("monitor resume is generation-fenced and fail-closed without a baseline", () => {
+  const result = evaluateTodoResumeConditions({
+    schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+    items: [
+      todo("todo_same_generation", "open", "advancement_task", {
+        resume_when: "monitor_changed:todo_watch001",
+        resume_monitor_generation: 7,
+      }),
+      todo("todo_missing_baseline", "open", "advancement_task", {
+        resume_when: "monitor_changed:todo_watch001",
+      }),
+    ],
+    source_items: [
+      todo("todo_watch001", "open", "continuous_monitor", {
+        material_change_generation: 7,
+      }),
+    ],
+    rollout_events: [],
+  });
+  const conditions = (result.conditions as Array<Record<string, unknown>>).map(
+    (row) => row.condition as Record<string, unknown>,
+  );
+  assert.equal(conditions[0].satisfied, false);
+  assert.equal(conditions[0].availability_reason, "resume_condition_pending");
+  assert.equal(conditions[1].satisfied, false);
+  assert.equal(conditions[1].invalid_state, "baseline_generation_missing");
+  assert.equal(conditions[1].availability_reason, "resume_condition_invalid");
+});
+
+test("scoped monitor resume ignores unrelated material transitions", () => {
+  const scope = "case-a/run-1";
+  const digest = monitorChangeScopeDigest(scope);
+  const waiting = todo("todo_scoped_wait", "open", "advancement_task", {
+    resume_when: `monitor_changed:todo_watch001@${scope}`,
+    resume_monitor_generation: 3,
+  });
+  const evaluate = (scopedGeneration: number, globalGeneration: number) => {
+    const result = evaluateTodoResumeConditions({
+      schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+      items: [waiting],
+      source_items: [todo("todo_watch001", "open", "continuous_monitor", {
+        material_change_generation: globalGeneration,
+        material_change_scope_generations: `${digest}:${scopedGeneration}`,
+      })],
+    });
+    return (result.conditions as Array<{condition: Record<string, unknown>}>)[0].condition;
+  };
+  const unrelated = evaluate(3, 11);
+  assert.equal(unrelated.satisfied, false);
+  assert.equal(unrelated.material_change_generation, 11);
+  assert.equal(unrelated.scoped_material_change_generation, 3);
+  assert.equal(unrelated.monitor_change_scope, scope);
+  assert.equal(resumeConditionHasKnownPendingTarget(unrelated, waiting), true);
+  const matched = evaluate(12, 12);
+  assert.equal(matched.satisfied, true);
+  assert.equal(matched.scoped_material_change_generation, 12);
+});
+
+test("scoped external wait captures its own scope generation", () => {
+  const scope = "case-a/run-1";
+  const result = planTodoExternalWaitTransition({
+    schema_version: TODO_EXTERNAL_WAIT_REQUEST_SCHEMA_VERSION,
+    todo_id: "todo_waiting001",
+    resume_when: `monitor_changed:todo_watch001@${scope}`,
+    successor_todo_ids: ["todo_fallback001"],
+    items: [
+      todo("todo_waiting001", "open"),
+      todo("todo_watch001", "open", "continuous_monitor", {
+        material_change_generation: 9,
+        material_change_scope_generations: `${monitorChangeScopeDigest(scope)}:4`,
+      }),
+      todo("todo_fallback001", "open"),
+    ],
+  });
+  assert.equal(result.baseline_generation, 4);
+  assert.deepEqual(result.metadata_updates, {
+    resume_when: `monitor_changed:todo_watch001@${scope}`,
+    resume_monitor_generation: 4,
+  });
+});
+
+test("external wait atomically binds a monitor baseline and runnable successor", () => {
+  const result = planTodoExternalWaitTransition({
+    schema_version: TODO_EXTERNAL_WAIT_REQUEST_SCHEMA_VERSION,
+    todo_id: "todo_waiting001",
+    resume_when: "monitor_changed:todo_watch001",
+    successor_todo_ids: ["todo_fallback001"],
+    items: [
+      todo("todo_waiting001", "open"),
+      todo("todo_watch001", "open", "continuous_monitor", {
+        material_change_generation: 9,
+      }),
+      todo("todo_fallback001", "open"),
+    ],
+  });
+  assert.equal(result.state, "waiting");
+  assert.equal(result.baseline_generation, 9);
+  assert.deepEqual(result.metadata_updates, {
+    resume_when: "monitor_changed:todo_watch001",
+    resume_monitor_generation: 9,
+  });
+  assert.deepEqual(result.successor_todo_ids, ["todo_fallback001"]);
+});
+
+test("external wait rejects monitor completion and non-runnable fallbacks", () => {
+  const items = [
+    todo("todo_waiting001", "open"),
+    todo("todo_watch001", "open", "continuous_monitor"),
+    todo("todo_fallback001", "blocked"),
+  ];
+  assert.throws(() => planTodoExternalWaitTransition({
+    schema_version: TODO_EXTERNAL_WAIT_REQUEST_SCHEMA_VERSION,
+    todo_id: "todo_waiting001",
+    resume_when: "todo_done:todo_watch001",
+    successor_todo_ids: ["todo_fallback001"],
+    items,
+  }), /use monitor_changed/);
+  assert.throws(() => planTodoExternalWaitTransition({
+    schema_version: TODO_EXTERNAL_WAIT_REQUEST_SCHEMA_VERSION,
+    todo_id: "todo_waiting001",
+    resume_when: "monitor_changed:todo_watch001",
+    successor_todo_ids: ["todo_fallback001"],
+    items,
+  }), /successor must be an open advancement_task/);
+});
+
+test("external wait rejection codes identify status and successor faults", () => {
+  const commonItems = [
+    todo("todo_waiting001", "blocked"),
+    todo("todo_watch001", "open", "continuous_monitor"),
+    todo("todo_fallback001", "open"),
+  ];
+  assert.throws(
+    () => planTodoExternalWaitTransition({
+      schema_version: TODO_EXTERNAL_WAIT_REQUEST_SCHEMA_VERSION,
+      todo_id: "todo_waiting001",
+      resume_when: "monitor_changed:todo_watch001",
+      successor_todo_ids: ["todo_fallback001"],
+      items: commonItems,
+    }),
+    (error: unknown) =>
+      error instanceof EffectRuntimeRequestError &&
+      error.code === "external_wait_todo_status_must_remain_open" &&
+      /must remain status=open/.test(error.message),
+  );
+  assert.throws(
+    () => planTodoExternalWaitTransition({
+      schema_version: TODO_EXTERNAL_WAIT_REQUEST_SCHEMA_VERSION,
+      todo_id: "todo_waiting001",
+      resume_when: "monitor_changed:todo_watch001",
+      successor_todo_ids: [],
+      items: [
+        todo("todo_waiting001", "open"),
+        todo("todo_watch001", "open", "continuous_monitor"),
+      ],
+    }),
+    (error: unknown) =>
+      error instanceof EffectRuntimeRequestError &&
+      error.code === "external_wait_successor_required",
+  );
+});
+
+test("a satisfied monitor fence must be cleared before it can be re-armed", () => {
+  assert.throws(() => planTodoExternalWaitTransition({
+    schema_version: TODO_EXTERNAL_WAIT_REQUEST_SCHEMA_VERSION,
+    todo_id: "todo_waiting001",
+    resume_when: "monitor_changed:todo_watch001",
+    successor_todo_ids: ["todo_fallback001"],
+    items: [
+      todo("todo_waiting001", "open", "advancement_task", {
+        resume_when: "monitor_changed:todo_watch001",
+        resume_monitor_generation: 2,
+      }),
+      todo("todo_watch001", "open", "continuous_monitor", {
+        material_change_generation: 3,
+      }),
+      todo("todo_fallback001", "open"),
+    ],
+  }), /clear the satisfied resume_when/);
+});
+
+test("complete PR evidence keeps every exact dependency and original alias proof", () => {
+  const items = Array.from({length: 300}, (_, index) => todo(`todo_wait_${index}`, "open", "advancement_task",
+    {resume_when: `pr_merged:owner/repo#${index + 1}`}));
+  const events = items.map((_, index) => ({event_kind: "pr_merge", event_id: `first-${index}`,
+    pr_ref: `owner/repo#${index + 1}`, recorded_at: "2026-10-01T00:00:00Z"}));
+  const evidence = compactTodoResumeMergeEvidence(items, [...events,
+    ...events.map(row => ({...row, event_id: `repeat-${row.event_id}`})),
+    {event_kind: "validation", pr_ref: "owner/repo#301"}]);
+  assert.equal(evidence.length, 300);
+  assert.equal(evidence[0].event_id, "first-0");
+  const result = evaluateTodoResumeConditions({schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+    items, source_items: [], rollout_events: evidence});
+  assert.ok((result.conditions as Array<{condition: Record<string, unknown>}>).every(row => row.condition.satisfied));
+
+  const waits = [todo("todo_alias", "open", "advancement_task", {resume_when: "pr_merged:old/repo#42"}),
+    todo("todo_wrong", "open", "advancement_task", {resume_when: "pr_merged:unrelated/repo#42"}),
+    todo("todo_missing", "open", "advancement_task", {resume_when: "pr_merged:#42"})];
+  const facts = compactTodoResumeMergeEvidence(waits, [{event_kind: "PR_MERGE", event_id: "alias-proof",
+    pr_ref: "new/repo#42", source_refs: [{kind: "pr", ref: "https://github.com/old/repo/pull/42"}]}]);
+  const aliases = evaluateTodoResumeConditions({schema_version: TODO_RESUME_EVALUATION_REQUEST_SCHEMA_VERSION,
+    items: waits, source_items: [], rollout_events: facts});
+  const conditions = (aliases.conditions as Array<{condition: Record<string, unknown>}>).map(row => row.condition);
+  assert.equal(conditions[0].matched_event_id, "alias-proof");
+  assert.equal(conditions[0].satisfied, true);
+  assert.equal(conditions[1].satisfied, false);
+  assert.equal(conditions[2].satisfied, false);
+  assert.equal(conditions[2].repository_binding_state, "ambiguous");
+});

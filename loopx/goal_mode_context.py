@@ -6,9 +6,10 @@ goal contract without reading another host's private state.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
+
+from .history import load_registry
 
 
 REGISTRY_DIRS = (".loopx", ".goal-harness")
@@ -67,8 +68,8 @@ def resolve_goal_context(
     if registry is None:
         return None
     try:
-        data = json.loads(registry.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = load_registry(registry)
+    except (OSError, ValueError):
         return None
     goals = [goal for goal in data.get("goals") or [] if isinstance(goal, dict)]
     if not goals:

@@ -11,8 +11,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from loopx.control_plane.todos.decision_scope import todo_gate_relation  # noqa: E402
+from loopx.control_plane.todos.decision_scope import todo_gate_relations  # noqa: E402
 from loopx.control_plane.scheduler.execution_context import (  # noqa: E402
+    GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     scheduler_execution_context_for_runtime_profile,
 )
 from loopx.control_plane.testing.quota_fixtures import (  # noqa: E402
@@ -46,6 +47,7 @@ def todo_item(
     role: str = "agent",
     task_class: str = "advancement_task",
     claimed_by: str | None = None,
+    bound_agent: str | None = None,
     action_kind: str | None = None,
     blocks_agent: str | None = None,
     global_gate: bool = False,
@@ -61,6 +63,7 @@ def todo_item(
             "next_due_at": next_due_at,
             "target_key": target_key,
             "global_gate": True if global_gate else None,
+            "bound_agent": bound_agent,
         }.items()
         if value is not None
     }
@@ -245,7 +248,7 @@ def other_agent_gate_with_current_user_action_payload() -> dict:
         role="user",
         task_class="user_action",
         action_kind="review_handoff_material",
-        claimed_by="codex-value-explorer",
+        bound_agent=VALUE_AGENT,
         priority="P1",
     )
     value_agent_todo = todo_item(
@@ -276,6 +279,7 @@ def assert_other_agent_user_gate_does_not_block_current_agent() -> None:
         status_payload(),
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert payload["should_run"] is True, payload
     assert payload["normal_delivery_allowed"] is True, payload
@@ -307,13 +311,16 @@ def assert_current_user_action_does_not_preserve_other_agent_operator_gate() -> 
         other_agent_gate_with_current_user_action_payload(),
         goal_id=GOAL_ID,
         agent_id=VALUE_AGENT,
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert payload["decision"] == "run", payload
     assert payload["state"] == "eligible", payload
     assert payload["should_run"] is True, payload
     assert payload["normal_delivery_allowed"] is True, payload
-    assert payload["requires_user_action"] is True, payload
-    assert payload["notify_user_on_open_todo"] is True, payload
+    # A routed user_action is a non-blocking notice while live work proceeds;
+    # the foreign user_gate must not turn that notice into an execution gate.
+    assert payload["requires_user_action"] is False, payload
+    assert "notify_user_on_open_todo" not in payload, payload
     assert "notify_user_on_gate" not in payload, payload
 
     summary = payload["user_todo_summary"]
@@ -331,9 +338,13 @@ def assert_current_user_action_does_not_preserve_other_agent_operator_gate() -> 
     assert "scoped_user_gate_fallback" not in payload, payload
 
     contract = payload["interaction_contract"]
-    assert contract["mode"] == "bounded_delivery_with_user_notice", contract
-    assert contract["user_channel"]["action_required"] is True, contract
+    assert contract["mode"] == "bounded_delivery", contract
+    assert contract["user_channel"]["action_required"] is False, contract
+    assert contract["user_channel"]["non_blocking"] is True, contract
     assert contract["user_channel"]["notify"] == "NOTIFY", contract
+    assert contract["user_channel"]["actions"] == [
+        "Review the value-lane handoff material when convenient."
+    ], contract
     assert contract["agent_channel"]["must_attempt"] is True, contract
     assert contract["agent_channel"]["delivery_allowed"] is True, contract
 
@@ -343,6 +354,7 @@ def assert_other_agent_user_gate_does_not_notify_non_due_monitor_lane() -> None:
         other_agent_gate_with_non_due_monitor_payload(),
         goal_id=GOAL_ID,
         agent_id="codex-value-explorer",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert payload["decision"] == "skip", payload
     assert payload["effective_action"] == "monitor_quiet_skip", payload
@@ -369,6 +381,7 @@ def assert_target_agent_still_blocks_on_its_user_gate() -> None:
         status_payload(),
         goal_id=GOAL_ID,
         agent_id="codex-product-capability",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert payload["should_run"] is False, payload
     assert payload["normal_delivery_allowed"] is False, payload
@@ -389,6 +402,7 @@ def assert_unscoped_user_gate_requires_projection_repair() -> None:
         status_payload(blocks_agent=None),
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert payload["decision"] == "self_repair", payload
     assert payload["should_run"] is True, payload
@@ -412,6 +426,7 @@ def assert_explicit_global_gate_blocks_goal() -> None:
         status_payload(blocks_agent=None, global_gate=True),
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert payload["should_run"] is False, payload
     assert payload["requires_user_action"] is True, payload
@@ -463,6 +478,7 @@ def assert_unrelated_user_gate_allows_feishu_fallback() -> None:
         unrelated_gate_status_payload(),
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert payload["should_run"] is True, payload
     assert payload["decision"] == "safe_bypass_user_gate_fallback", payload
@@ -715,6 +731,7 @@ def assert_exact_todo_gate_only_blocks_target_todo() -> None:
         exact_todo_gate_status_payload(),
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert payload["should_run"] is True, payload
     assert payload["decision"] == "safe_bypass_user_gate_fallback", payload
@@ -730,7 +747,7 @@ def assert_exact_todo_gate_only_blocks_target_todo() -> None:
     assert lane_action["source"] == "scoped_user_gate_fallback.selected_executable", lane_action
     assert lane_action["selected_by"] == "scoped_user_gate_fallback", lane_action
     assert lane_action["replaces_gated_goal_next_action"] is True, lane_action
-    assert "todo_benchmark_ledger_cleanup" in payload["protocol_action_packet"]["summary"], payload
+    assert "protocol_action_packet" not in payload, payload
     monitor_ids = {
         item["todo_id"]
         for item in payload["agent_todo_summary"]["first_open_items"]
@@ -742,6 +759,7 @@ def assert_exact_todo_gate_only_blocks_target_todo() -> None:
         exact_todo_gate_status_payload(include_fallback=False),
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert blocked_payload["should_run"] is False, blocked_payload
     assert blocked_payload["interaction_contract"]["mode"] == "user_gate", blocked_payload
@@ -778,12 +796,12 @@ def assert_scoped_gate_rejects_capability_ineligible_only_fallback() -> None:
     scheduler = payload["scheduler_hint"]
     assert scheduler["action"] == "backoff_waiting_for_user", scheduler
     assert scheduler["cadence_class"] == "human_gate", scheduler
-    assert scheduler["codex_app"]["example_progression_minutes"] == [
+    assert scheduler["app_automation"]["example_progression_minutes"] == [
         30,
         60,
     ], scheduler
-    assert scheduler["codex_app"]["max_interval_minutes"] == 60, scheduler
-    assert scheduler["codex_app"]["recommended_interval_minutes"] == 30, scheduler
+    assert scheduler["app_automation"]["max_interval_minutes"] == 60, scheduler
+    assert scheduler["app_automation"]["recommended_interval_minutes"] == 30, scheduler
 
 
 def assert_exact_todo_gate_survives_decision_scope_migration() -> None:
@@ -791,6 +809,7 @@ def assert_exact_todo_gate_survives_decision_scope_migration() -> None:
         exact_todo_gate_with_decision_scope_migration_payload(),
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert payload["should_run"] is True, payload
     assert payload["decision"] == "safe_bypass_user_gate_fallback", payload
@@ -819,6 +838,7 @@ def assert_exact_todo_gate_allows_independent_due_monitor() -> None:
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
         available_capabilities=["network", "external_write"],
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert payload["should_run"] is True, payload
     assert payload["decision"] == "safe_bypass_user_gate_fallback", payload
@@ -842,6 +862,7 @@ def assert_exact_todo_gate_allows_independent_due_monitor() -> None:
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
         available_capabilities=["network"],
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert blocked_payload["should_run"] is False, blocked_payload
     assert "scoped_user_gate_fallback" not in blocked_payload, blocked_payload
@@ -888,6 +909,7 @@ def assert_monitor_debt_yields_to_equal_priority_advancement() -> None:
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
         available_capabilities=["network", "external_write"],
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     arbitration = payload["monitor_debt_arbitration"]
     assert arbitration["active"] is True, arbitration
@@ -909,6 +931,7 @@ def assert_monitor_debt_yields_to_equal_priority_advancement() -> None:
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
         available_capabilities=["network", "external_write"],
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert "monitor_debt_arbitration" not in terminal_transition, terminal_transition
     terminal_fallback = terminal_transition["scoped_user_gate_fallback"]
@@ -944,7 +967,7 @@ def assert_conflicting_exact_and_decision_scope_requires_projection_repair() -> 
             }
         ],
     }
-    relation = todo_gate_relation(gate, agent_item)
+    relation = todo_gate_relations([gate], [agent_item])[0][0]
     assert relation["source"] == "unblocks_todo_id+decision_scope", relation
     assert relation["state"] == "projection_repair_required", relation
     assert relation["reason"] == (
@@ -959,6 +982,7 @@ def assert_decision_scope_overrides_shared_action_kind_tokens() -> None:
         decision_scope_status_payload(),
         goal_id=GOAL_ID,
         agent_id="codex-main-control",
+        scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
     )
     assert payload["should_run"] is True, payload
     assert payload["decision"] == "safe_bypass_user_gate_fallback", payload
@@ -1005,11 +1029,11 @@ def assert_agent_without_advancement_candidate_and_only_monitor_work_stays_quiet
     scheduler = payload["scheduler_hint"]
     assert scheduler["schema_version"] == "scheduler_hint_v0", scheduler
     assert scheduler["action"] == "backoff_until_material_transition", scheduler
-    assert scheduler["codex_app"]["recommended_interval_minutes"] == 15, scheduler
-    assert scheduler["codex_app"]["recommended_rrule"] == "FREQ=MINUTELY;INTERVAL=15", scheduler
+    assert scheduler["app_automation"]["recommended_interval_minutes"] == 15, scheduler
+    assert scheduler["app_automation"]["recommended_rrule"] == "FREQ=MINUTELY;INTERVAL=15", scheduler
     # A far-future monitor keeps the host floor at 15m, but may back off more
     # coarsely until the scheduled window gets near.
-    progression = scheduler["codex_app"]["example_progression_minutes"]
+    progression = scheduler["app_automation"]["example_progression_minutes"]
     assert progression == [15, 30, 60], scheduler
     assert scheduler["unchanged_poll"]["limits"]["codex_cli_tui"] == 3, scheduler
     assert scheduler["unchanged_poll"]["final_quota_replan_check_enabled"] is True, scheduler
@@ -1022,9 +1046,9 @@ def assert_agent_without_advancement_candidate_and_only_monitor_work_stays_quiet
     reset = scheduler["reset_policy"]
     assert isinstance(reset["reset_token"], str) and len(reset["reset_token"]) == 16, reset
     assert reset["host_state_key"] == "scheduler_hint.reset_policy.reset_token", reset
-    assert reset["codex_app_initial_interval_minutes"] == 15, reset
-    assert reset["codex_app_initial_rrule"] == "FREQ=MINUTELY;INTERVAL=15", reset
-    assert scheduler["codex_app"]["max_interval_minutes"] == 60, scheduler
+    assert reset["app_automation_initial_interval_minutes"] == 15, reset
+    assert reset["app_automation_initial_rrule"] == "FREQ=MINUTELY;INTERVAL=15", reset
+    assert scheduler["app_automation"]["max_interval_minutes"] == 60, scheduler
     assert len(reset["identity_signature"]) == 12, reset
     assert "identity_snapshot" not in reset, reset
     assert "profile_snapshot" not in reset, reset
@@ -1032,7 +1056,8 @@ def assert_agent_without_advancement_candidate_and_only_monitor_work_stays_quiet
     assert "profile_signature" not in reset, reset
     assert "reset_condition_summary" not in reset, reset
     assert "no_spend_for_reset" not in reset, reset
-    assert "scheduler=backoff_until_material_transition" in payload["protocol_action_packet"]["summary"], payload
+    assert payload["scheduler_hint"]["action"] == "backoff_until_material_transition", payload
+    assert "protocol_action_packet" not in payload, payload
 
 
 def main() -> int:

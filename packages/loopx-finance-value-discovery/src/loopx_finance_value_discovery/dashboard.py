@@ -3,13 +3,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 import re
-from typing import Any
+from typing import Any, cast
 
 from .presentation_compat import require_presentation_api
 
 require_presentation_api()
 
+from .presentation_validation import contains_local_path  # noqa: E402
 from .presentation_view import validate_decision_research_view  # noqa: E402
+from .source_coverage import SOURCE_PERIOD_METRIC_FIELDS  # noqa: E402
 
 
 FINANCE_RESEARCH_DASHBOARD_INPUT_SCHEMA_VERSION = "finance_research_dashboard_input_v0"
@@ -19,10 +21,6 @@ FINANCE_RESEARCH_DASHBOARD_PACKET_SCHEMA_VERSION = (
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _MARKUP_RE = re.compile(r"<[^>]*>|javascript:", re.IGNORECASE)
-_LOCAL_PATH_RE = re.compile(
-    r"(?:^|[\s(])(?:~[/\\]|/+(?:Users|home|tmp|private|var|etc|opt)/|"
-    r"[A-Za-z]:[\\/])"
-)
 _CREDENTIAL_RE = re.compile(
     r"(?:bearer\s+[A-Za-z0-9._~+/=-]{8,}|"
     r"(?:api[_ -]?key|access[_ -]?token|secret|password)\s*[:=]\s*\S+)",
@@ -113,7 +111,7 @@ def _text(
         raise ValueError(f"{context} must contain at most {maximum} characters")
     if _MARKUP_RE.search(text):
         raise ValueError(f"{context} must not contain markup")
-    if _LOCAL_PATH_RE.search(text):
+    if contains_local_path(text):
         raise ValueError(f"{context} must not contain a local path")
     if _CREDENTIAL_RE.search(text):
         raise ValueError(f"{context} must not contain credential material")
@@ -130,7 +128,7 @@ def _identifier(value: Any, *, context: str) -> str:
 def _integer(value: Any, *, context: str, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{context} must be an integer >= {minimum}")
-    return value
+    return cast(int, value)
 
 
 def _iso(
@@ -545,9 +543,7 @@ def _artifacts(value: Any) -> list[dict[str, Any]]:
     if value is None:
         return []
     rows: list[dict[str, Any]] = []
-    for index, item in enumerate(
-        _list(value, context="input.artifacts", maximum=20)
-    ):
+    for index, item in enumerate(_list(value, context="input.artifacts", maximum=20)):
         context = f"input.artifacts[{index}]"
         record = _record(
             item,
@@ -717,6 +713,20 @@ def build_finance_research_dashboard_packet(
     """Validate Finance semantics and map them to the generic research view."""
 
     _reject_forbidden_material(payload)
+    from .funding_presentation import (
+        FINANCE_FUNDING_RESEARCH_INPUT_SCHEMA_VERSION,
+        build_funding_event_research_packet,
+    )
+
+    if payload.get("schema_version") == FINANCE_FUNDING_RESEARCH_INPUT_SCHEMA_VERSION:
+        return build_funding_event_research_packet(payload)
+    from .quantity_presentation import (
+        FINANCE_QUANTITY_RESEARCH_INPUT_SCHEMA_VERSION,
+        build_quantity_research_packet,
+    )
+
+    if payload.get("schema_version") == FINANCE_QUANTITY_RESEARCH_INPUT_SCHEMA_VERSION:
+        return build_quantity_research_packet(payload)
     record = _record(
         payload,
         context="input",
@@ -734,6 +744,8 @@ def build_finance_research_dashboard_packet(
             "subtitle",
             "adjudication",
             "metrics",
+            "source_period_metrics",
+            "spot_market_identity",
             "dashboard_summaries",
             "research_layers",
             "entities",
@@ -789,6 +801,23 @@ def build_finance_research_dashboard_packet(
                 allowed={"id", "label", "value", "detail", "tone"},
                 minimum=1,
                 maximum=12,
+            ),
+            **(
+                {
+                    "source_period_metrics": _simple_records(
+                        record.get("source_period_metrics"),
+                        context="input.source_period_metrics",
+                        allowed=SOURCE_PERIOD_METRIC_FIELDS,
+                        maximum=24,
+                    )
+                }
+                if "source_period_metrics" in record
+                else {}
+            ),
+            **(
+                {"spot_market_identity": record.get("spot_market_identity")}
+                if "spot_market_identity" in record
+                else {}
             ),
             "dashboard_summaries": _simple_records(
                 record.get("dashboard_summaries"),

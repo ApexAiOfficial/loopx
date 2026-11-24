@@ -1,0 +1,281 @@
+from __future__ import annotations
+
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
+
+from ...agent_registry import registered_agent_ids_for_goal
+from ...file_lock import exclusive_cross_runtime_file_lock
+from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from ..goals.activation import goal_is_stopped
+from ..goals.source_session_registry_state import exact_goal_ref, guard_path
+from ..projects.registry_codec import (
+    SOURCE_SESSION_PROFILE_ID,
+    load_project_registry,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CollaborationGoalScope:
+    registry_path: Path
+    goal_id: str
+    goal: dict[str, Any]
+    profile_id: str | None
+    caller_goal_ref: dict[str, str] | None
+    current_goal_ref: dict[str, str] | None
+
+    @property
+    def exact(self) -> bool:
+        return self.profile_id == SOURCE_SESSION_PROFILE_ID
+
+    def target(self, agent_id: str) -> dict[str, Any]:
+        if self.exact:
+            return {
+                "goal_ref": dict(self.caller_goal_ref or {}),
+                "agent_id": agent_id,
+            }
+        return {"goal_id": self.goal_id, "agent_id": agent_id}
+
+    def record_identity(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"goal_id": self.goal_id}
+        if self.exact:
+            result["goal_ref"] = dict(self.caller_goal_ref or {})
+        return result
+
+
+def goal_accepts_collaboration(goal: dict[str, Any]) -> bool:
+    return not goal_is_stopped(goal) and goal.get("status") not in {
+        "stopped",
+        "archived",
+    }
+
+
+def _registered_goal(
+    registry: dict[str, Any],
+    *,
+    goal_id: str,
+    agents: tuple[str, ...],
+    require_active: bool,
+) -> dict[str, Any]:
+    goal = next(
+        (
+            candidate
+            for candidate in registry.get("goals", [])
+            if isinstance(candidate, dict) and candidate.get("id") == goal_id
+        ),
+        None,
+    )
+    if goal is None or any(
+        agent not in registered_agent_ids_for_goal(goal) for agent in agents
+    ):
+        raise ValueError("collaboration requires registered Agents of the same Goal")
+    if require_active and not goal_accepts_collaboration(goal):
+        raise ValueError("collaboration Goal is stopped or archived")
+    return goal
+
+
+def _source_goal_ref(goal_id: str, goal: dict[str, Any]) -> dict[str, str]:
+    instance_id = goal.get("goal_instance_id")
+    if not isinstance(instance_id, str):
+        raise ValueError("source-session Goal is missing goal_instance_id")
+    return exact_goal_ref(goal_id, instance_id)
+
+
+def _caller_ref(
+    *,
+    goal_id: str,
+    requested: dict[str, str] | None,
+    current: dict[str, str],
+) -> dict[str, str]:
+    if requested is None:
+        return dict(current)
+    return exact_goal_ref(
+        str(requested.get("goal_id") or goal_id),
+        str(requested.get("goal_instance_id") or ""),
+    )
+
+
+@contextmanager
+def collaboration_goal_scope(
+    registry_path: Path,
+    *,
+    goal_id: str,
+    agents: tuple[str, ...],
+    caller_goal_ref: dict[str, str] | None = None,
+    require_active: bool = False,
+    lock_registry: bool = False,
+) -> Iterator[CollaborationGoalScope]:
+    """Hold the alias lifetime guard while one collaboration operation commits."""
+
+    registry_path = Path(registry_path).expanduser().resolve()
+    with ExitStack() as guards:
+        guards.enter_context(
+            exclusive_cross_runtime_file_lock(
+                guard_path(registry_path, goal_id),
+                operation="collaboration_goal_lifetime",
+            )
+        )
+        if lock_registry:
+            # Same lock as thread binding transactions, held through the
+            # downstream commit. Order: Goal lifetime -> registry -> work store.
+            guards.enter_context(
+                exclusive_cross_runtime_file_lock(
+                    registry_path,
+                    operation="collaboration_registry_snapshot",
+                )
+            )
+        registry = load_project_registry(registry_path)
+        goal = _registered_goal(
+            registry,
+            goal_id=goal_id,
+            agents=agents,
+            require_active=require_active,
+        )
+        profile = registry.get("profile_id")
+        if profile != SOURCE_SESSION_PROFILE_ID:
+            yield CollaborationGoalScope(
+                registry_path=registry_path,
+                goal_id=goal_id,
+                goal=goal,
+                profile_id=None,
+                caller_goal_ref=None,
+                current_goal_ref=None,
+            )
+            return
+        current = _source_goal_ref(goal_id, goal)
+        yield CollaborationGoalScope(
+            registry_path=registry_path,
+            goal_id=goal_id,
+            goal=goal,
+            profile_id=SOURCE_SESSION_PROFILE_ID,
+            caller_goal_ref=_caller_ref(
+                goal_id=goal_id,
+                requested=caller_goal_ref,
+                current=current,
+            ),
+            current_goal_ref=current,
+        )
+
+
+def capture_collaboration_goal_ref(
+    registry_path: Path,
+    *,
+    goal_id: str,
+    agent_id: str,
+) -> dict[str, str] | None:
+    with collaboration_goal_scope(
+        registry_path,
+        goal_id=goal_id,
+        agents=(agent_id,),
+    ) as scope:
+        return (
+            dict(scope.caller_goal_ref or {})
+            if scope.exact
+            else None
+        )
+
+
+def scope_for_caller_goal_ref(
+    scope: CollaborationGoalScope,
+    caller_goal_ref: dict[str, str] | None,
+) -> CollaborationGoalScope:
+    """Bind one entry's caller_goal_ref under an already-held Goal lifetime scope."""
+
+    if not scope.exact:
+        return scope
+    if caller_goal_ref is not None and not isinstance(caller_goal_ref, dict):
+        raise TypeError("source-session caller_goal_ref must be a mapping")
+    if scope.current_goal_ref is None:
+        raise ValueError("source-session Goal scope requires current_goal_ref")
+    return replace(
+        scope,
+        caller_goal_ref=_caller_ref(
+            goal_id=scope.goal_id,
+            requested=caller_goal_ref,
+            current=scope.current_goal_ref,
+        ),
+    )
+
+
+class CollaborationLifecycleRejected(ValueError):
+    """Retain the typed refusal for authorized diagnostic readers."""
+
+    def __init__(self, decision: dict[str, Any]):
+        self.decision = decision
+        super().__init__(f"collaboration lifecycle rejected: {decision.get('code')}")
+
+
+def _lifecycle_scope_facts(scope: CollaborationGoalScope) -> dict[str, Any]:
+    return {
+        "profile_id": scope.profile_id,
+        "caller_goal_ref": scope.caller_goal_ref,
+        "current_goal_ref": scope.current_goal_ref,
+    }
+
+
+def decide_collaboration_lifecycle(
+    scope: CollaborationGoalScope,
+    *,
+    operation: str,
+    record: dict[str, Any] | None = None,
+    route: dict[str, Any] | None = None,
+    initial_delivery: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not scope.exact and operation not in {"original_return_admit", "original_return_settle", "original_request_inspect"}:
+        return {"kind": "legacy"}
+    result = effect_runtime_result(
+        "collaboration.goal_instance.decide",
+        {
+            **_lifecycle_scope_facts(scope),
+            "operation": operation,
+            "record_goal_ref": (
+                record.get("goal_ref") if isinstance(record, dict) else None
+            ),
+            "route_goal_ref": (
+                route.get("goal_ref") if isinstance(route, dict) else None
+            ),
+            "initial_delivery": initial_delivery,
+        },
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("collaboration lifecycle decision must be an object")
+    if result.get("kind") == "reject":
+        raise CollaborationLifecycleRejected(result)
+    return result
+
+
+def inspect_original_request_batch(
+    scope: CollaborationGoalScope, deliveries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Read independent decisions while the caller holds the existing batch guards."""
+    if not deliveries:
+        return []
+    scope_facts = _lifecycle_scope_facts(scope)
+    items = [{
+        "record_goal_ref": delivery["request"].get("goal_ref"),
+        "route_goal_ref": delivery["route"].get("goal_ref"),
+        "initial_delivery": delivery,
+    } for delivery in deliveries]
+    try:
+        result = effect_runtime_result(
+            "collaboration.goal_instance.inspect_original_requests",
+            {**scope_facts, "items": items},
+        )
+        decisions = result.get("items") if isinstance(result, dict) else None
+    except EffectRuntimeRejected as error:
+        if error.diagnostic_code != "request_too_large":
+            raise
+        # Large historical proofs that fit individually keep the ordinary wire.
+        decisions = [
+            effect_runtime_result("collaboration.goal_instance.decide", {
+                **scope_facts, **item, "operation": "original_request_inspect",
+            }) for item in items
+        ]
+    if not isinstance(decisions, list) or len(decisions) != len(items) or any(
+        not isinstance(decision, dict) or decision.get("kind") not in {"allow", "legacy", "reject"}
+        for decision in decisions
+    ):
+        raise RuntimeError("original request inspection count or decision is invalid")
+    return decisions

@@ -188,7 +188,7 @@ class KunlunAppServerClient:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             bufsize=1,
         )
         if self.process.stdout is None or self.process.stderr is None:

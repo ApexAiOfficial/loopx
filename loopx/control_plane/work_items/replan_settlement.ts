@@ -1,5 +1,12 @@
 import type { JsonObject } from "../effect_program.ts";
 import {
+  REPLAN_SETTLEMENT_LIFECYCLE_REENTRY_REQUEST_SCHEMA,
+  REPLAN_SETTLEMENT_LIFECYCLE_REENTRY_RESULT_SCHEMA,
+  REPLAN_SETTLEMENT_REQUEST_SCHEMA as GENERATED_REPLAN_SETTLEMENT_REQUEST_SCHEMA,
+  REPLAN_SETTLEMENT_RESULT_SCHEMA,
+} from "../coordination/coordination_state_contract.generated.ts";
+import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
+import {
   optionalNonEmptyString,
   requireJsonObject,
   requireNonEmptyString,
@@ -9,13 +16,57 @@ import {
 } from "../todos/completion_fence.ts";
 
 export const REPLAN_SETTLEMENT_REQUEST_SCHEMA =
-  "loopx_replan_settlement_request_v0";
+  GENERATED_REPLAN_SETTLEMENT_REQUEST_SCHEMA;
 export const REPLAN_SETTLEMENT_CONTRACT_SCHEMA =
-  "replan_settlement_contract_v0";
+  REPLAN_SETTLEMENT_RESULT_SCHEMA;
 export const TODO_LIFECYCLE_REENTRY_REQUEST_SCHEMA =
-  "loopx_todo_lifecycle_reentry_request_v0";
+  REPLAN_SETTLEMENT_LIFECYCLE_REENTRY_REQUEST_SCHEMA;
 export const TODO_LIFECYCLE_REENTRY_SCHEMA =
-  "todo_lifecycle_settlement_reentry_v0";
+  REPLAN_SETTLEMENT_LIFECYCLE_REENTRY_RESULT_SCHEMA;
+
+interface TodoSettlementBinding extends JsonObject {
+  kind: "todo";
+  id: string;
+  cli_argument: "--todo-id";
+}
+
+interface DirectReplanSettlementBinding extends JsonObject {
+  kind: "autonomous_replan";
+  id: string;
+  cli_argument: "--replan-obligation-id";
+}
+
+interface TodoBoundSemanticObligation extends JsonObject {
+  kind: "autonomous_replan";
+  id: string;
+  settlement_bound: false;
+  discharge: "todo_bound_writeback";
+}
+
+interface DirectSemanticObligation extends JsonObject {
+  kind: "autonomous_replan";
+  id: string;
+  settlement_bound: true;
+  discharge: "direct_settlement";
+}
+
+interface TodoBoundReplanSettlementContract extends JsonObject {
+  schema_version: typeof REPLAN_SETTLEMENT_CONTRACT_SCHEMA;
+  single_binding_required: true;
+  settlement_binding: TodoSettlementBinding;
+  semantic_obligation: TodoBoundSemanticObligation;
+}
+
+interface DirectReplanSettlementContract extends JsonObject {
+  schema_version: typeof REPLAN_SETTLEMENT_CONTRACT_SCHEMA;
+  single_binding_required: true;
+  settlement_binding: DirectReplanSettlementBinding;
+  semantic_obligation: DirectSemanticObligation;
+}
+
+export type ReplanSettlementContract =
+  | TodoBoundReplanSettlementContract
+  | DirectReplanSettlementContract;
 
 function shellArgument(value: string): string {
   if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
@@ -31,7 +82,7 @@ function argumentSuffix(values: readonly string[]): string {
 function lifecycleTrigger(value: unknown, index: number): JsonObject {
   const trigger = requireJsonObject(value, `triggers[${index}]`);
   if (trigger.kind !== "completed_advancement_without_successor") {
-    throw new Error(`triggers[${index}].kind is unsupported`);
+    throw new EffectRuntimeRequestError(`triggers[${index}].kind is unsupported`);
   }
   return {
     kind: trigger.kind,
@@ -52,11 +103,15 @@ export function projectTodoLifecycleSettlementReentry(value: unknown): JsonObjec
     "work_item.replan_settlement.reentry params",
   );
   if (request.schema_version !== TODO_LIFECYCLE_REENTRY_REQUEST_SCHEMA) {
-    throw new Error("Todo lifecycle reentry request schema mismatch");
+    throw new EffectRuntimeRequestError("Todo lifecycle reentry request schema mismatch");
   }
   const goalId = requireNonEmptyString(request.goal_id, "goal_id");
+  const runtimeRoot = optionalNonEmptyString(request.runtime_root, "runtime_root");
+  const commandPrefix = runtimeRoot === null
+    ? "loopx"
+    : `loopx --runtime-root ${shellArgument(runtimeRoot)}`;
   if (!Array.isArray(request.triggers) || request.triggers.length === 0) {
-    throw new Error("triggers must be a non-empty array");
+    throw new EffectRuntimeRequestError("triggers must be a non-empty array");
   }
   const triggers = request.triggers.slice(0, 3).map(lifecycleTrigger).map(
     (trigger) => {
@@ -86,27 +141,46 @@ export function projectTodoLifecycleSettlementReentry(value: unknown): JsonObjec
       requireNonEmptyString(item, `quota_scoped_args[${index}]`)
     )
     : [];
+  let quotaGuardArgv: string[] | null = null;
+  if (request.quota_guard_argv !== undefined) {
+    if (!Array.isArray(request.quota_guard_argv) || request.quota_guard_argv.length === 0) {
+      throw new EffectRuntimeRequestError("quota_guard_argv must be a non-empty array");
+    }
+    // The interaction owner supplies its already-scoped guard. The old Todo's
+    // completion identity must never be substituted for the active Turn.
+    quotaGuardArgv = request.quota_guard_argv.map((item, index) =>
+      requireNonEmptyString(item, `quota_guard_argv[${index}]`)
+    );
+  }
   const nextCliActions = triggers.map((trigger) => {
     const todoId = String(trigger.todo_id);
     const completionIdentityKey = String(trigger.completion_turn_key);
-    const completionIdentityArgs =
-      trigger.completion_identity_source === "unscoped_completion"
-        ? ["--completion-identity-key", completionIdentityKey]
-        : ["--turn-instance-id", completionIdentityKey];
+    const completionIdentityArgs = [
+      "--completion-identity-key",
+      completionIdentityKey,
+    ];
+    // Reentry closes continuation only; it must not replace completion prose.
     return (
       `when no real successor remains for completed Todo ${todoId}: ` +
-      `loopx todo complete --goal-id ${shellArgument(goalId)} ` +
+      `${commandPrefix} todo complete --goal-id ${shellArgument(goalId)} ` +
       `--todo-id ${shellArgument(todoId)}` +
       argumentSuffix(completionIdentityArgs) +
       argumentSuffix(lifecycleActorArgs) +
-      " --no-follow-up --note '<public-safe no-follow-up rationale>'"
+      " --no-follow-up"
     );
   });
   nextCliActions.push(
-    "otherwise link or create one real runnable successor for the exact " +
-      "completed Todo; do not create lifecycle-only filler",
-    `loopx --format json quota should-run --goal-id ${shellArgument(goalId)}` +
-      argumentSuffix(quotaScopedArgs),
+    "A terminal Todo cannot accept new successor links through complete or update. " +
+      "For genuine dependent work, author its dependency on the mutable successor " +
+      "(resume_when=todo_done:<completed-id>) only when that is its real readiness condition; " +
+      "preserve existing deferral, claims and gates. Independent work needs no artificial edge: " +
+      "when this completed scope has no remaining follow-up, use its original completion identity " +
+      "with --no-follow-up above. This closes only that scope, not the Goal or other Todos. " +
+      "Do not create lifecycle-only filler",
+    quotaGuardArgv === null
+      ? `${commandPrefix} --format json quota should-run --goal-id ${shellArgument(goalId)}` +
+        argumentSuffix(quotaScopedArgs)
+      : quotaGuardArgv.map(shellArgument).join(" "),
   );
   return {
     schema_version: TODO_LIFECYCLE_REENTRY_SCHEMA,
@@ -116,10 +190,12 @@ export function projectTodoLifecycleSettlementReentry(value: unknown): JsonObjec
   };
 }
 
-export function projectReplanSettlementContract(value: unknown): JsonObject {
+export function projectReplanSettlementContract(
+  value: unknown,
+): ReplanSettlementContract {
   const request = requireJsonObject(value, "work_item.replan_settlement params");
   if (request.schema_version !== REPLAN_SETTLEMENT_REQUEST_SCHEMA) {
-    throw new Error("Replan settlement request schema mismatch");
+    throw new EffectRuntimeRequestError("Replan settlement request schema mismatch");
   }
   const selectedTodoId = optionalNonEmptyString(
     request.selected_todo_id,
@@ -129,29 +205,37 @@ export function projectReplanSettlementContract(value: unknown): JsonObject {
     request.semantic_replan_obligation_id,
     "semantic_replan_obligation_id",
   );
-  const semanticObligationSettlementBound = selectedTodoId === null;
-  const settlementBindingKind = semanticObligationSettlementBound
-    ? "autonomous_replan"
-    : "todo";
-  const settlementBindingId = selectedTodoId ?? semanticObligationId;
+  if (selectedTodoId !== null) {
+    return {
+      schema_version: REPLAN_SETTLEMENT_CONTRACT_SCHEMA,
+      single_binding_required: true,
+      settlement_binding: {
+        kind: "todo",
+        id: selectedTodoId,
+        cli_argument: "--todo-id",
+      },
+      semantic_obligation: {
+        kind: "autonomous_replan",
+        id: semanticObligationId,
+        settlement_bound: false,
+        discharge: "todo_bound_writeback",
+      },
+    };
+  }
 
   return {
     schema_version: REPLAN_SETTLEMENT_CONTRACT_SCHEMA,
     single_binding_required: true,
     settlement_binding: {
-      kind: settlementBindingKind,
-      id: settlementBindingId,
-      cli_argument: semanticObligationSettlementBound
-        ? "--replan-obligation-id"
-        : "--todo-id",
+      kind: "autonomous_replan",
+      id: semanticObligationId,
+      cli_argument: "--replan-obligation-id",
     },
     semantic_obligation: {
       kind: "autonomous_replan",
       id: semanticObligationId,
-      settlement_bound: semanticObligationSettlementBound,
-      discharge: semanticObligationSettlementBound
-        ? "direct_settlement"
-        : "todo_bound_writeback",
+      settlement_bound: true,
+      discharge: "direct_settlement",
     },
   };
 }

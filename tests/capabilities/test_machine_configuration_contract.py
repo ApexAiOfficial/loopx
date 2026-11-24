@@ -1,0 +1,471 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from pathlib import Path
+import subprocess
+import sys
+from typing import Any
+
+import pytest
+
+from loopx.capabilities.machine_configuration.builtins import (
+    build_builtin_machine_configuration_registry,
+)
+
+from loopx.capabilities.machine_configuration.contract import (
+    MachineConfigurationNamespace,
+    MachineConfigurationRegistry,
+    merge_machine_configuration_namespace,
+    normalize_machine_configuration,
+    project_machine_configuration,
+    remove_machine_configuration_namespace,
+)
+
+
+def _normalize_example(value: Mapping[str, Any]) -> dict[str, Any]:
+    unknown = sorted(set(value) - {"schema_version", "enabled", "secret"})
+    if unknown:
+        raise ValueError("example contains unsupported fields: " + ", ".join(unknown))
+    if not isinstance(value.get("enabled"), bool):
+        raise TypeError("example.enabled must be a boolean")
+    return dict(value)
+
+
+def _normalize_required_input(value: Mapping[str, Any]) -> dict[str, Any]:
+    if not value.get("path"):
+        raise ValueError("path is required")
+    return dict(value)
+
+
+def _apply_example_public_update(
+    current: Mapping[str, Any] | None,
+    update: Mapping[str, Any],
+) -> dict[str, Any]:
+    unknown = sorted(set(update) - {"schema_version", "enabled"})
+    if unknown:
+        raise ValueError(
+            "example public update contains unsupported fields: " + ", ".join(unknown)
+        )
+    return {**dict(current or {}), **dict(update)}
+
+
+def _example_namespace(**overrides: Any) -> MachineConfigurationNamespace:
+    fields: dict[str, Any] = {
+        "namespace": "example",
+        "schema_versions": frozenset({"example_v0"}),
+        "normalize": _normalize_example,
+        "project_public": lambda value: {
+            key: item for key, item in value.items() if key != "secret"
+        },
+        "apply_public_update": _apply_example_public_update,
+        "title": "Example defaults",
+        "description": "Example machine-level defaults.",
+        "default_configuration": {
+            "schema_version": "example_v0",
+            "enabled": False,
+            "secret": "hidden",
+        },
+    }
+    return MachineConfigurationNamespace(**{**fields, **overrides})
+
+
+def _registry() -> MachineConfigurationRegistry:
+    return MachineConfigurationRegistry().register(_example_namespace())
+
+
+def _config() -> dict[str, Any]:
+    return {
+        "schema_version": "loopx_machine_configuration_v0",
+        "namespaces": {
+            "example": {
+                "schema_version": "example_v0",
+                "enabled": True,
+                "secret": "redacted",
+            }
+        },
+    }
+
+
+def test_registered_namespace_is_normalized_and_publicly_projected() -> None:
+    assert normalize_machine_configuration(_config(), registry=_registry()) == _config()
+    assert project_machine_configuration(_config(), registry=_registry()) == {
+        "schema_version": "loopx_machine_configuration_v0",
+        "namespaces": {"example": {"schema_version": "example_v0", "enabled": True}},
+    }
+
+
+def test_unknown_namespace_and_unknown_envelope_field_fail_closed() -> None:
+    config = _config()
+    config["namespaces"] = {"unknown": {"schema_version": "unknown_v0"}}
+    with pytest.raises(ValueError, match="unsupported machine-configuration namespace"):
+        normalize_machine_configuration(config, registry=_registry())
+
+    config = _config()
+    config["arbitrary"] = True
+    with pytest.raises(ValueError, match="unsupported fields"):
+        normalize_machine_configuration(config, registry=_registry())
+
+
+def test_read_scope_uses_only_its_registered_owner_and_leaves_siblings_opaque(tmp_path):
+    import json
+    from loopx.capabilities.machine_configuration.store import (
+        configure_machine_configuration, read_machine_configuration,
+    )
+
+    config = _config()
+    config["namespaces"]["future_setting"] = {"schema_version": "unrecognized_v1"}
+    path = tmp_path / "machine/configuration.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps(config))
+    before = path.read_bytes()
+    selected = read_machine_configuration(tmp_path, registry=_registry(), namespace_ids=("example",))
+    assert selected == _config()
+    assert path.read_bytes() == before
+    with pytest.raises(ValueError, match="unsupported machine-configuration namespace"):
+        read_machine_configuration(tmp_path, registry=_registry())
+    with pytest.raises(ValueError, match="unsupported machine-configuration namespace"):
+        configure_machine_configuration(runtime_root=tmp_path, configuration=config, registry=_registry())
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("schema_version", "example_v1", ValueError),
+    ("enabled", "false", TypeError),
+    ("surprise", True, ValueError),
+])
+def test_scoped_read_still_rejects_an_invalid_selected_owner(field, value, error):
+    config = _config()
+    config["namespaces"]["example"][field] = value
+    with pytest.raises(error):
+        normalize_machine_configuration(config, registry=_registry(), namespace_ids=("example",))
+
+
+def test_known_absent_read_owner_is_absent_without_certifying_an_unknown_sibling():
+    config = {"schema_version": "loopx_machine_configuration_v0", "namespaces": {"future": None}}
+    assert normalize_machine_configuration(config, registry=_registry(), namespace_ids=("example",)) == {
+        "schema_version": "loopx_machine_configuration_v0", "namespaces": {},
+    }
+    for scope in ((), ("unregistered_owner",)):
+        with pytest.raises(ValueError):
+            normalize_machine_configuration(config, registry=_registry(), namespace_ids=scope)
+
+
+@pytest.mark.parametrize("change", [
+    {"arbitrary": True}, {"schema_version": "unrecognized_v1"},
+    {"namespaces": []}, {"namespaces": {}},
+])
+def test_read_scope_cannot_hide_a_malformed_machine_envelope(change):
+    with pytest.raises((ValueError, TypeError)):
+        normalize_machine_configuration({**_config(), **change}, registry=_registry(), namespace_ids=("example",))
+
+
+def test_consumer_schema_version_and_fields_are_enforced() -> None:
+    config = _config()
+    config["namespaces"]["example"]["schema_version"] = "example_v1"
+    with pytest.raises(ValueError, match="unsupported schema_version"):
+        normalize_machine_configuration(config, registry=_registry())
+
+    config = _config()
+    config["namespaces"]["example"]["surprise"] = True
+    with pytest.raises(ValueError, match="example contains unsupported fields"):
+        normalize_machine_configuration(config, registry=_registry())
+
+
+def test_removing_the_last_namespace_returns_document_absence() -> None:
+    assert (
+        remove_machine_configuration_namespace(
+            _config(), namespace="example", registry=_registry()
+        )
+        is None
+    )
+
+
+def test_removing_an_unknown_namespace_fails_closed() -> None:
+    with pytest.raises(ValueError, match="unsupported machine-configuration namespace"):
+        remove_machine_configuration_namespace(
+            _config(), namespace="unknown", registry=_registry()
+        )
+
+
+def test_registry_catalog_is_public_and_supplies_an_editable_default() -> None:
+    assert _registry().public_catalog() == {
+        "schema_version": "machine_configuration_catalog_v0",
+        "namespaces": [
+            {
+                "namespace": "example",
+                "title": "Example defaults",
+                "description": "Example machine-level defaults.",
+                "schema_versions": ["example_v0"],
+                "configuration_template": {
+                    "schema_version": "example_v0",
+                    "enabled": False,
+                },
+                "template_status": "ready",
+            }
+        ],
+    }
+
+
+def test_registry_catalog_keeps_namespaces_without_defaults_discoverable() -> None:
+    registry = MachineConfigurationRegistry().register(
+        MachineConfigurationNamespace(
+            namespace="required_input",
+            schema_versions=frozenset({"required_input_v0"}),
+            normalize=_normalize_required_input,
+            project_public=lambda value: dict(value),
+            apply_public_update=lambda _current, update: dict(update),
+        )
+    )
+
+    descriptor = registry.public_catalog()["namespaces"][0]
+    assert descriptor["configuration_template"] == {
+        "schema_version": "required_input_v0"
+    }
+    assert descriptor["template_status"] == "schema_only"
+
+
+def test_registry_rejects_an_invalid_provider_template_before_effects() -> None:
+    with pytest.raises(TypeError, match="example.enabled must be a boolean"):
+        MachineConfigurationRegistry().register(
+            MachineConfigurationNamespace(
+                namespace="example",
+                schema_versions=frozenset({"example_v0"}),
+                normalize=_normalize_example,
+                project_public=lambda value: dict(value),
+                apply_public_update=lambda _current, update: dict(update),
+                default_configuration={"schema_version": "example_v0"},
+            )
+        )
+
+
+def test_namespace_merge_preserves_siblings_and_validates_the_patch() -> None:
+    registry = _registry().register(
+        MachineConfigurationNamespace(
+            namespace="second",
+            schema_versions=frozenset({"second_v0"}),
+            normalize=lambda value: dict(value),
+            project_public=lambda value: dict(value),
+            apply_public_update=lambda _current, update: dict(update),
+        )
+    )
+    current = _config()
+
+    merged = merge_machine_configuration_namespace(
+        current,
+        namespace="second",
+        namespace_configuration={"schema_version": "second_v0", "limit": 4},
+        registry=registry,
+    )
+
+    assert merged["namespaces"]["example"] == current["namespaces"]["example"]
+    assert merged["namespaces"]["second"] == {
+        "schema_version": "second_v0",
+        "limit": 4,
+    }
+
+
+def test_namespace_merge_delegates_public_updates_and_preserves_private_fields() -> None:
+    merged = merge_machine_configuration_namespace(
+        _config(),
+        namespace="example",
+        namespace_configuration={"schema_version": "example_v0", "enabled": False},
+        registry=_registry(),
+    )
+
+    assert merged["namespaces"]["example"] == {
+        "schema_version": "example_v0",
+        "enabled": False,
+        "secret": "redacted",
+    }
+
+
+def test_namespace_merge_rejects_private_fields_in_a_public_update() -> None:
+    with pytest.raises(ValueError, match="public update contains unsupported fields"):
+        merge_machine_configuration_namespace(
+            _config(),
+            namespace="example",
+            namespace_configuration={
+                "schema_version": "example_v0",
+                "enabled": False,
+                "secret": "replacement",
+            },
+            registry=_registry(),
+        )
+
+
+def test_deferred_owner_loads_once_on_first_resolution() -> None:
+    loads: list[str] = []
+
+    def load() -> MachineConfigurationNamespace:
+        loads.append("example")
+        return _example_namespace()
+
+    registry = MachineConfigurationRegistry().register_deferred("example", load)
+
+    assert registry.namespace_ids == ("example",)
+    assert loads == []
+    assert normalize_machine_configuration(_config(), registry=registry) == _config()
+    assert registry.public_catalog() == _registry().public_catalog()
+    assert loads == ["example"]
+
+
+def test_deferred_owner_template_is_validated_before_it_can_be_used() -> None:
+    registry = MachineConfigurationRegistry().register_deferred(
+        "example",
+        lambda: _example_namespace(default_configuration={"schema_version": "example_v0"}),
+    )
+
+    for _attempt in range(2):
+        with pytest.raises(TypeError, match="example.enabled must be a boolean"):
+            normalize_machine_configuration(_config(), registry=registry)
+    with pytest.raises(TypeError, match="example.enabled must be a boolean"):
+        registry.public_catalog()
+
+
+def test_deferred_owner_must_declare_its_registered_namespace() -> None:
+    registry = MachineConfigurationRegistry().register_deferred(
+        "other", _example_namespace
+    )
+
+    with pytest.raises(ValueError, match="owner declares another id: other"):
+        registry.resolve("other")
+    with pytest.raises(ValueError, match="unsupported machine-configuration namespace"):
+        registry.resolve("example")
+
+
+def test_deferred_and_eager_owners_share_one_namespace_reservation() -> None:
+    with pytest.raises(ValueError, match="already registered: example"):
+        _registry().register_deferred("example", _example_namespace)
+    with pytest.raises(ValueError, match="already registered: example"):
+        MachineConfigurationRegistry().register_deferred(
+            "example", _example_namespace
+        ).register(_example_namespace())
+    with pytest.raises(ValueError, match="namespace is invalid"):
+        MachineConfigurationRegistry().register_deferred("Example", _example_namespace)
+
+
+def test_builtin_catalog_lists_every_owner_in_namespace_order() -> None:
+    registry = build_builtin_machine_configuration_registry()
+
+    assert registry.namespace_ids == (
+        "change_quality_qualification",
+        "codex_chat",
+        "context_delivery",
+        "explore_harness",
+        "goal_closeout",
+        "goal_storage",
+        "manager_runtime",
+        "periodic_report",
+        "pull_request_review",
+        "steward_executor",
+        "steward_memory",
+        "todo_replan_cadence",
+    )
+    assert [
+        descriptor["namespace"]
+        for descriptor in registry.public_catalog()["namespaces"]
+    ] == list(registry.namespace_ids)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_retired_setting_decodes_without_an_active_owner(enabled: bool) -> None:
+    registry = build_builtin_machine_configuration_registry()
+    configuration = {
+        "schema_version": "loopx_machine_configuration_v0",
+        "namespaces": {"compaction_memory": {
+            "schema_version": "compaction_memory_machine_defaults_v0", "enabled": enabled,
+        }},
+    }
+    assert normalize_machine_configuration(configuration, registry=registry) == configuration
+    assert project_machine_configuration(configuration, registry=registry)["namespaces"] == {}
+    with pytest.raises(ValueError, match="unsupported machine-configuration namespace"):
+        registry.resolve("compaction_memory")
+    for invalid in ("true", 1, None):
+        configuration["namespaces"]["compaction_memory"]["enabled"] = invalid
+        with pytest.raises(ValueError, match="boolean enabled"):
+            normalize_machine_configuration(configuration, registry=registry)
+    with pytest.raises(ValueError, match="unsupported machine-configuration namespace"):
+        normalize_machine_configuration({
+            "schema_version": "loopx_machine_configuration_v0",
+            "namespaces": {"unregistered": {"schema_version": "future_v0"}},
+        }, registry=registry)
+
+
+def test_retired_decoders_share_the_active_namespace_reservation() -> None:
+    with pytest.raises(ValueError, match="already registered: example"):
+        _registry().register_retired("example", _normalize_example)
+    registry = MachineConfigurationRegistry().register_retired("example", _normalize_example)
+    with pytest.raises(ValueError, match="already registered: example"):
+        registry.register(_example_namespace())
+    with pytest.raises(ValueError, match="already registered: example"):
+        registry.register_deferred("example", _example_namespace)
+
+
+def test_builtin_registry_still_fails_closed_on_an_invalid_stored_sibling() -> None:
+    configuration = {
+        "schema_version": "loopx_machine_configuration_v0",
+        "namespaces": {
+            "context_delivery": {
+                "schema_version": "context_delivery_machine_defaults_v0",
+                "mode": "on",
+            },
+            "periodic_report": {"schema_version": "unknown_v0"},
+        },
+    }
+
+    with pytest.raises(ValueError, match="unsupported schema_version"):
+        normalize_machine_configuration(
+            configuration, registry=build_builtin_machine_configuration_registry()
+        )
+
+
+def test_builtin_registry_loads_only_the_owners_a_reader_resolves() -> None:
+    script = """
+import sys
+
+from loopx.capabilities.machine_configuration.builtins import (
+    build_builtin_machine_configuration_registry,
+)
+from loopx.capabilities.machine_configuration.contract import (
+    normalize_machine_configuration,
+)
+
+normalize_machine_configuration(
+    {
+        "schema_version": "loopx_machine_configuration_v0",
+        "namespaces": {
+            "context_delivery": {
+                "schema_version": "context_delivery_machine_defaults_v0",
+                "mode": "on",
+            }
+        },
+    },
+    registry=build_builtin_machine_configuration_registry(),
+)
+unrelated = sorted(
+    module
+    for module in (
+        "loopx.capabilities.change_quality.machine_defaults",
+        "loopx.capabilities.explore.machine_defaults",
+        "loopx.capabilities.manager_runtime.machine_profile",
+        "loopx.capabilities.native_chat.machine_defaults",
+        "loopx.capabilities.periodic_report.machine_defaults",
+        "loopx.capabilities.pr_review_queue.machine_defaults",
+        "loopx.capabilities.steward_executor.machine_defaults",
+        "loopx.capabilities.steward_memory.machine_defaults",
+        "loopx.capabilities.todo_replan_cadence.machine_defaults",
+    )
+    if module in sys.modules
+)
+assert unrelated == [], unrelated
+assert "loopx.capabilities.machine_configuration.context_delivery" in sys.modules
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr

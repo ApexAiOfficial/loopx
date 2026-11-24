@@ -1,0 +1,1160 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import test from "node:test";
+import {
+  AUTONOMOUS_REPLAN_DEFAULT_STOP_CONDITION,
+  AUTONOMOUS_REPLAN_DEFAULT_STOP_CONTRACT_ID,
+  projectReplanSemantics,
+  requiredSemanticOutcomes,
+} from "../../loopx/control_plane/work_items/replan_semantics.ts";
+
+test("capability evidence is not a default exit or a generic progress claim", () => {
+  for (const outcome of ["capability_evidence_observed", "capability_duty_retired"]) {
+  assert.equal(requiredSemanticOutcomes({triggers: [{kind: "no_progress_streak"}]}).includes("capability_evidence_observed"), false);
+  assert.throws(() => requiredSemanticOutcomes({satisfying_semantic_outcomes: ["capability_evidence_observed"]}), /bound owning capability/);
+  const obligation = {satisfying_semantic_outcomes: [outcome],
+    capability_guard: {schema_version: "semantic_replan_capability_guard_v0", capability_id: "explore"}};
+  assert.deepEqual(requiredSemanticOutcomes(obligation), [outcome]);
+  assert.throws(() => projectReplanSemantics({operation: "qualify", obligation,
+    observation_delta: {delta_kinds: [outcome]}}), /owning capability, not generic progress/);
+  }
+});
+import { visionAuthoringContract } from "../../loopx/control_plane/goals/vision_checkpoint.ts";
+import type { JsonObject } from "../../loopx/control_plane/effect_program.ts";
+
+const defaultObligationId = "replan-1111111111111111";
+const defaultContextId = "replan-context-" + "1".repeat(24);
+const obligation = {obligation_id: defaultObligationId, triggers: [{kind: "required_agent_vision_missing"}]};
+const strideDecision = (obligationId = defaultObligationId, contextId = defaultContextId) => ({
+  schema_version: "stride_decision_v2", strategy_version: "evidence_conditioned_v1",
+  reference_context_id: contextId, reference_obligation_id: obligationId,
+  basis: "unexplained_gap", action: "switch", axes: {
+    work_slice: {plan: "Compare the bounded alternative.", reason: "Current evidence leaves the gap open."},
+    route_distance: {plan: "Test a distinct mechanism.", reason: "Local tuning did not close the gap."},
+    validation_scope: {plan: "Compare on the same inputs.", reason: "Controlled comparison separates mechanisms."}},
+  next_probe: {
+    scope: "Run one bounded comparison.", prediction: "Alternative explains the gap.",
+    adoption_criterion: "Keep verified gain.", cost_bound: "One bounded run.",
+    minimum_evidence: "Executed controlled comparison."}});
+const vision = {vision_patch: {acceptance_summary: "Observed permission boundary"},
+  path_delta: {outcome: "continue", evidence_refs: ["evidence-permission"]},
+  stride_decision: strideDecision()};
+const strideStopVision = {vision_patch: {acceptance_summary: "Recorded stride review boundary"},
+  path_delta: {outcome: "stop", evidence_refs: ["evidence-permission"]},
+  stride_decision: strideDecision()};
+
+test("open-work review guidance does not require configured checks or outcome declarations", () => {
+  for (const kind of ["typed_progress_repeat", "periodic_review_due", "goal_outcome_uncovered"]) {
+    for (const stride_strategy of ["off", "evidence_conditioned_v1"]) {
+      const source = {obligation_id: "replan-1111111111111111", triggers: [{kind}],
+        replan_context: {stride_strategy}};
+      const project = (current: boolean | null) => projectReplanSemantics({operation: "requirements", obligation: {
+        ...source, replan_context: {...source.replan_context, core_goal: {acceptance_contract: current === null ? null : {
+          outcome_requirements: {current_lifetime: current, outcomes: [], acceptance_gaps: []}}}}}});
+      const ordinary = project(null), retired = project(false), current = project(true);
+      assert.deepEqual(retired, ordinary);
+      assert.deepEqual(current, ordinary, "default review and its authority do not depend on an outcome declaration");
+      const guidance = (ordinary.planning_guidance as string[]).join(" ");
+      for (const clause of ["even with open Todos",
+        "Todo order and provisional agent-created candidate rules are revisable",
+        "A due review can keep the path or reorder or replace unfinished work", "never forces a pivot"]) {
+        assert.ok(guidance.includes(clause), clause);
+      }
+    }
+  }
+});
+
+test("autonomous checkpoints reuse owner review while ordinary checkpoints keep continuation guidance", () => {
+  assert.equal(typeof visionAuthoringContract().continuation_review, "string");
+  assert.equal(Object.hasOwn(visionAuthoringContract(true), "continuation_review"), false);
+  for (const kind of ["vision_acceptance_gap", "periodic_review_due", "external_progress_review_drift"]) {
+    for (const stride_strategy of ["off", "evidence_conditioned_v1"]) {
+      const projection = projectReplanSemantics({operation: "requirements", obligation: {
+        obligation_id: "replan-1111111111111111", triggers: [{kind}], replan_context: {stride_strategy},
+      }});
+      const authoring = (projection.writeback_contract as JsonObject).vision_authoring as JsonObject;
+      assert.deepEqual(authoring, visionAuthoringContract(true));
+      const guidance = (projection.planning_guidance as string[]).join(" ");
+      for (const clause of ["original intent", "every requirement", "full marginal cost",
+        "Before no_followup, review unmet acceptance", "reasonable in-scope next step remains, continue or replan",
+        "existing Vision/path_delta for evidence, judgment and justified no-change", "budget or stops", "planning grant no authority",
+        "direct user changes to this Goal's purpose or lasting duties", "Keep commitments. Reconcile its Todos.",
+        "Explicit new Goals use creation", "Distinguish scope conflicts, evidence gaps and stale display",
+        "Read only missing context", "No polls or per-Turn revision receipts",
+        "Continue authorized work. Proposing forces no question", "owner apply and each peer's adoption",
+        "Proposals and adoption grant no authority",
+        "never forces a pivot", "do not invent work or consume budget merely to stay active"]) {
+        assert.ok(guidance.includes(clause), clause);
+      }
+      const review = (projection.stride_control as JsonObject).decision_value_review as JsonObject;
+      const advice = Object.values(review).join(" ");
+      for (const clause of ["feasible alternative", "complete experiment", "headroom",
+        "artifact version, input conditions and original budget", "budget, feedback and permission limits"]) {
+        assert.ok(advice.includes(clause), clause);
+      }
+    }
+  }
+});
+
+test("a revalidated successor receipt settles only its exact original Turn guard", () => {
+  const id = "replan-1111111111111111";
+  const delta = {schema_version: "replan_semantic_delta_v0", accepted: true,
+    obligation_id: id, successor_todo_id: "todo_independent_successor",
+    outcomes: ["new_runnable_successor"], satisfying_outcomes: ["new_runnable_successor"]};
+  const ack = {schema_version: "autonomous_replan_ack_v0", recorded: true,
+    source: "todo_replan_successor_transition", semantic_delta: delta};
+  const source = {obligation_id: id};
+  const request = {operation: "turn_transition", guard_scoped: true,
+    selected_obligation_id: id, transition_candidates: [{obligation: source, ack: null},
+      {obligation: source, ack}]};
+  assert.deepEqual(projectReplanSemantics(request).semantic_delta, delta);
+  for (const guard of [{guard_scoped: false}, {selected_obligation_id: null},
+    {selected_obligation_id: "replan-2222222222222222"}]) {
+    assert.equal(projectReplanSemantics({...request, ...guard}).semantic_delta, null);
+  }
+  for (const invalid of [{recorded: false}, {source: "prose_claim"},
+    {schema_version: "unknown"}, {semantic_delta: {...delta, accepted: false}},
+    {semantic_delta: {...delta, satisfying_outcomes: []}},
+    {semantic_delta: {...delta, successor_todo_id: null}}]) {
+    assert.equal(projectReplanSemantics({...request, transition_candidates: [
+      {obligation: source, ack: {...ack, ...invalid}}]}).semantic_delta, null);
+  }
+  const next = {...ack, semantic_delta: {...delta, obligation_id: "replan-2222222222222222"}};
+  assert.deepEqual(projectReplanSemantics({...request, transition_candidates: [
+    {obligation: source, ack: next}, {obligation: source, ack}]}).semantic_delta, delta);
+  assert.throws(() => projectReplanSemantics({...request, transition_candidates: undefined}), /source-bound/);
+  assert.throws(() => projectReplanSemantics({...request, selected_obligation_id: "malformed"}), /malformed/);
+});
+
+test("receipt-bound reentry keeps original canonical proof separate from the next frontier", () => {
+  const id = "replan-1111111111111111";
+  const original = {required: true, obligation_id: id, triggers: [{kind: "long_todo_chain"}]};
+  const current = {...original, obligation_id: "replan-2222222222222222", triggers: [{kind: "vision_acceptance_gap"}]};
+  const delta = {schema_version: "replan_semantic_delta_v0", accepted: true,
+    obligation_id: id, successor_todo_id: "todo_independent_successor",
+    outcomes: ["new_runnable_successor"], satisfying_outcomes: ["new_runnable_successor"]};
+  const ack = {schema_version: "autonomous_replan_ack_v0", recorded: true,
+    source: "todo_replan_successor_transition", semantic_delta: delta};
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true,
+    replay_phase: "open", selected_obligation_id: id, current_obligation: current,
+    transition_candidates: [{obligation: original, ack}]};
+  const projected = projectReplanSemantics(request).obligation as JsonObject;
+  assert.equal(projected.obligation_id, id);
+  assert.deepEqual(projected.triggers, original.triggers);
+  assert.equal(projected.selection_binding, "heartbeat_receipt");
+  assert.equal(projected.resolution_mode, "receipt_bound_replan_settlement");
+  assert.deepEqual(projected.todo_actions, []);
+  const packet = projected.settlement_action_packet as JsonObject;
+  assert.equal(packet.settlement_only, true);
+  assert.equal(packet.successor_todo_id, delta.successor_todo_id);
+  assert.equal((packet.writeback_contract as JsonObject).preferred_input, "canonical_successor_transition");
+  assert.equal(current.obligation_id, "replan-2222222222222222");
+  for (const invalid of [{guard_scoped: false}, {transition_candidates: []},
+    {selected_obligation_id: "replan-3333333333333333"},
+    {transition_candidates: [{obligation: current, ack}]},
+    {transition_candidates: [{obligation: original, ack: {...ack, recorded: false}}]},
+    {transition_candidates: [{obligation: {...original, satisfying_semantic_outcomes: ["fresh_vision_path_outcome"]}, ack}]}]) {
+    assert.throws(() => projectReplanSemantics({...request, ...invalid}), /identity conflicts/);
+  }
+  const unchanged = projectReplanSemantics({...request, current_obligation: original,
+    transition_candidates: []}).obligation as JsonObject;
+  assert.equal(unchanged.selection_binding, "heartbeat_receipt");
+  assert.equal(unchanged.resolution_mode, undefined);
+  // A receipt admitted without replan work cannot adopt a later frontier.
+  assert.equal(projectReplanSemantics({...request, selected_obligation_id: null}).obligation, null);
+  // A fresh, unguarded read still exposes that current frontier for admission.
+  assert.equal(projectReplanSemantics({...request, guard_scoped: false,
+    selected_obligation_id: null}).obligation, current);
+});
+
+test("verified original writeback projects only its outstanding debit even after frontier drift", () => {
+  const result = projectReplanSemantics({operation: "receipt_bound_obligation", guard_scoped: true,
+    replay_phase: "settlement_pending", selected_obligation_id: "replan-1111111111111111",
+    current_obligation: null, transition_candidates: []}).obligation as JsonObject;
+  assert.equal(result.obligation_id, "replan-1111111111111111");
+  const packet = result.settlement_action_packet as JsonObject;
+  assert.equal(packet.decision, "settlement_pending");
+  assert.equal(packet.semantic_delta, null);
+  assert.equal((packet.writeback_contract as JsonObject).preferred_input, "verified_replan_writeback");
+  assert.throws(() => projectReplanSemantics({operation: "receipt_bound_obligation", guard_scoped: true,
+    replay_phase: "settled", selected_obligation_id: "replan-1111111111111111",
+    current_obligation: null, transition_candidates: []}), /malformed/);
+});
+
+test("an open Vision reconstruction must come from the exact scoped receipt source", () => {
+  const id = "replan-1111111111111111";
+  const original = {schema_version: "autonomous_replan_obligation_v0", required: true,
+    obligation_id: id, agent_id: "reviewer", triggers: [{kind: "vision_outcome_checkpoint_required"}]};
+  const candidate = {obligation: original, ack: null, reconstructed_vision_review: true};
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true,
+    replay_phase: "open", selected_obligation_id: id, agent_id: "reviewer",
+    current_obligation: null, transition_candidates: [candidate]};
+  assert.deepEqual(projectReplanSemantics(request).obligation,
+    {...original, selection_binding: "heartbeat_receipt"});
+  for (const changes of [
+    {guard_scoped: false}, {agent_id: "peer"}, {selected_obligation_id: "replan-2222222222222222"},
+    {transition_candidates: [{...candidate, reconstructed_vision_review: false}]},
+    {transition_candidates: [{...candidate, obligation: {...original,
+      triggers: [...original.triggers, {kind: "periodic_review_due"}]}}]},
+    {transition_candidates: [{...candidate, obligation: {...original,
+      capability_guard: {schema_version: "semantic_replan_capability_guard_v0"}}}]},
+  ]) {
+    assert.throws(() => projectReplanSemantics({...request, ...changes}), /identity conflicts/);
+  }
+});
+
+test("scalar and digest review sources exclude evidence windows and restricted duties", () => {
+  const source = {schema_version: "autonomous_replan_obligation_v0", required: true,
+    obligation_id: "replan-1111111111111111", agent_id: "reviewer", trigger_count: 1,
+    stop_condition: "Stop at owner-only decisions.",
+    triggers: [{kind: "goal_outcome_uncovered", text: "Private Goal prose stays outside telemetry"}],
+    replan_context: {context_id: "old-acceptance-basis"}};
+  const request = {operation: "receipt_review_source", agent_id: "reviewer", obligation: source};
+  assert.deepEqual(projectReplanSemantics(request), {review_source: {
+    kind: "goal_outcome_uncovered", stop_condition: source.stop_condition}});
+  assert.deepEqual(projectReplanSemantics({...request, obligation: {...source,
+    stop_condition: "s".repeat(241), triggers: [{kind: "periodic_review_due"}]}}), {review_source: {
+    kind: "periodic_review_due", stop_condition: "s".repeat(241)}});
+  for (const patch of [{required: false}, {schema_version: "unknown"}, {agent_id: "another-agent"},
+    {triggers: []}, {trigger_count: 2}, {trigger_count: undefined},
+    {triggers: [{kind: "goal_outcome_uncovered"}, {kind: "external_progress_review_drift"}]},
+    {trigger_count: 2, triggers: [{kind: "vision_acceptance_gap"}, {kind: "periodic_review_due"}]},
+    {trigger_count: 2, triggers: [{kind: "vision_acceptance_gap"}, {kind: "external_progress_review_drift"}]},
+    {trigger_count: 2, triggers: [{kind: "vision_acceptance_gap"}, {kind: "goal_acceptance_stale"}]},
+    {satisfying_semantic_outcomes: ["new_runnable_successor"]},
+    {progress_baseline: {}}, {progress_window: []},
+    {triggers: [{kind: "goal_outcome_uncovered", progress_baseline: {}}]},
+    {triggers: [{kind: "goal_outcome_uncovered", progress_window: []}]},
+    {stop_condition: null},
+    {resolution_mode: "todo_lifecycle_settlement"},
+    {capability_guard: {schema_version: "semantic_replan_capability_guard_v0"}}]) {
+    assert.deepEqual(projectReplanSemantics({...request, obligation: {...source, ...patch}}), {review_source: null});
+  }
+});
+
+test("a digest-bound review keeps its receipt id across equivalent frontier regeneration", () => {
+  const originalId = "replan-1111111111111111";
+  const currentId = "replan-2222222222222222";
+  const stop = "Review current acceptance evidence before changing the route. ".repeat(6).trim();
+  const digest = createHash("sha256").update(stop, "utf8").digest("hex");
+  const current = {schema_version: "autonomous_replan_obligation_v0", required: true,
+    obligation_id: currentId, agent_id: "reviewer", trigger_count: 1,
+    triggers: [{kind: "periodic_review_due"}], stop_condition: stop,
+    replan_context: {context_id: "latest-review-context"}};
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true,
+    replay_phase: "open", selected_obligation_id: originalId, agent_id: "reviewer",
+    current_obligation: current, transition_candidates: [], receipt_review: {
+      kind: "periodic_review_due", stop_condition_sha256: digest}};
+  const recovered = projectReplanSemantics(request).obligation as JsonObject;
+  assert.equal(recovered.obligation_id, originalId);
+  assert.equal(recovered.stop_condition, stop);
+  assert.equal(recovered.replan_context, undefined,
+    "the caller must rebuild current context under the retained settlement id");
+  assert.equal(recovered.selection_binding, "heartbeat_receipt");
+  for (const patch of [
+    {receipt_review: {...request.receipt_review, kind: "vision_acceptance_gap"}},
+    {receipt_review: {...request.receipt_review, stop_condition_sha256: "0".repeat(64)}},
+    {current_obligation: {...current, stop_condition: `${stop} changed`}},
+    {current_obligation: {...current, triggers: [{kind: "goal_outcome_uncovered"}]}},
+    {current_obligation: {...current, agent_id: "another-agent"}},
+  ]) {
+    assert.throws(() => projectReplanSemantics({...request, ...patch}), /identity conflicts/);
+  }
+});
+
+test("a canonical periodic review reconstructs after its live frontier disappears", () => {
+  const originalId = "replan-1111111111111111";
+  const digest = createHash("sha256").update(
+    AUTONOMOUS_REPLAN_DEFAULT_STOP_CONDITION, "utf8").digest("hex");
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true,
+    replay_phase: "open", selected_obligation_id: originalId, agent_id: "reviewer",
+    current_obligation: null, transition_candidates: [], receipt_review: {
+      kind: "periodic_review_due", stop_condition_sha256: digest,
+      stop_contract_id: AUTONOMOUS_REPLAN_DEFAULT_STOP_CONTRACT_ID}};
+  assert.deepEqual(projectReplanSemantics(request).obligation, {
+    schema_version: "autonomous_replan_obligation_v0", required: true,
+    obligation_id: originalId, agent_id: "reviewer",
+    stop_condition: AUTONOMOUS_REPLAN_DEFAULT_STOP_CONDITION,
+    triggers: [{kind: "periodic_review_due"}], selection_binding: "heartbeat_receipt"});
+  for (const receipt_review of [
+    {...request.receipt_review, stop_condition_sha256: "0".repeat(64)},
+    {...request.receipt_review, stop_contract_id: "unknown"},
+    {...request.receipt_review, kind: "external_progress_review_drift"},
+  ]) {
+    assert.throws(() => projectReplanSemantics({...request, receipt_review}), /identity conflicts/);
+  }
+});
+
+test("mixed vision/outcome recovery preserves the dominant policy without discharging review", () => {
+  for (const triggers of [[{kind: "vision_acceptance_gap"}],
+    [{kind: "goal_outcome_uncovered"}, {kind: "vision_acceptance_gap"}],
+    [{kind: "vision_acceptance_gap"}, {kind: "goal_outcome_uncovered"}]]) {
+    const source = {schema_version: "autonomous_replan_obligation_v0", required: true,
+      obligation_id: "replan-1111111111111111", agent_id: "reviewer", triggers,
+      trigger_count: triggers.length, stop_condition: "Stop at owner-only decisions."};
+    const review = projectReplanSemantics({operation: "receipt_review_source", agent_id: "reviewer",
+      obligation: source}).review_source;
+    assert.deepEqual(review, {kind: "vision_acceptance_gap", stop_condition: source.stop_condition});
+    const recovered = projectReplanSemantics({operation: "receipt_bound_obligation", guard_scoped: true,
+      replay_phase: "open", selected_obligation_id: source.obligation_id, current_obligation: null,
+      transition_candidates: [], agent_id: "reviewer", receipt_review: review}).obligation as JsonObject;
+    assert.equal(recovered.obligation_id, source.obligation_id);
+    assert.deepEqual(requiredSemanticOutcomes(recovered), requiredSemanticOutcomes(source));
+    assert.equal(recovered.selection_binding, "heartbeat_receipt");
+    assert.equal(recovered.replan_context, undefined);
+    assert.equal(recovered.settlement_action_packet, undefined);
+    assert.equal(projectReplanSemantics({operation: "qualify", obligation: recovered}).accepted, false);
+    assert.equal(projectReplanSemantics({operation: "qualify", obligation: recovered,
+      observation_delta: {delta_kinds: ["new_surface"]}}).accepted, false);
+    assert.equal(projectReplanSemantics({operation: "qualify", obligation: recovered,
+      agent_vision: vision}).accepted, true);
+  }
+});
+
+test("Monitor lifecycle changes retain the admitted review without discharging it", () => {
+  const kind = "monitor_no_change_streak";
+  const source = {schema_version: "autonomous_replan_obligation_v0", required: true,
+    obligation_id: "replan-1111111111111111", agent_id: "reviewer", trigger_count: 1,
+    triggers: [{kind, todo_id: "todo_monitor", run_count: 5, threshold: 5}],
+    stop_condition: "Stop at owner-only decisions."};
+  const review = projectReplanSemantics({operation: "receipt_review_source", agent_id: "reviewer",
+    obligation: source}).review_source;
+  assert.deepEqual(review, {kind, stop_condition: source.stop_condition});
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true,
+    replay_phase: "open", selected_obligation_id: source.obligation_id, current_obligation: null,
+    transition_candidates: [], agent_id: "reviewer", receipt_review: review};
+  const recovered = projectReplanSemantics(request).obligation as JsonObject;
+  assert.equal(recovered.obligation_id, source.obligation_id);
+  assert.equal(recovered.selection_binding, "heartbeat_receipt");
+  assert.deepEqual(recovered.triggers, [{kind}]);
+  assert.deepEqual(requiredSemanticOutcomes(recovered), requiredSemanticOutcomes(source));
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: recovered}).accepted, false);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: recovered,
+    observation_delta: {delta_kinds: ["new_surface"]}}).accepted, true);
+  assert.throws(() => projectReplanSemantics({...request, guard_scoped: false}), /identity conflicts/);
+  for (const restriction of [{progress_baseline: {}}, {progress_window: []},
+    {capability_guard: {}}, {resolution_mode: "todo_lifecycle_settlement"},
+    {satisfying_semantic_outcomes: ["new_runnable_successor"]}]) {
+    assert.equal(projectReplanSemantics({operation: "receipt_review_source", agent_id: "reviewer",
+      obligation: {...source, ...restriction}}).review_source, null);
+  }
+});
+
+test("Monitor receipt recovery preserves mixed-review precedence and the complete stop contract", () => {
+  const monitor = {kind: "monitor_no_change_streak", todo_id: "todo_monitor", run_count: 5, threshold: 5};
+  const cases: [JsonObject[], string, boolean][] = [
+    [[monitor], "monitor_no_change_streak", true],
+    [[monitor, {kind: "goal_outcome_uncovered"}], "goal_outcome_uncovered", true],
+    [[monitor, {kind: "vision_acceptance_gap"}], "vision_acceptance_gap", false],
+    [[{kind: "vision_acceptance_gap"}, monitor], "vision_acceptance_gap", false],
+  ];
+  for (const [triggers, kind, acceptsProgress] of cases) {
+    const source = {schema_version: "autonomous_replan_obligation_v0", required: true,
+      obligation_id: "replan-1111111111111111", agent_id: "reviewer",
+      trigger_count: triggers.length, triggers, stop_condition: AUTONOMOUS_REPLAN_DEFAULT_STOP_CONDITION};
+    assert.deepEqual(projectReplanSemantics({operation: "receipt_review_source", agent_id: "reviewer",
+      obligation: source}).review_source, {kind, stop_condition: source.stop_condition});
+    const recovered = projectReplanSemantics({operation: "receipt_bound_obligation", guard_scoped: true,
+      replay_phase: "open", selected_obligation_id: source.obligation_id, agent_id: "reviewer",
+      current_obligation: null, transition_candidates: [], receipt_review: {kind,
+        stop_condition_sha256: createHash("sha256").update(source.stop_condition, "utf8").digest("hex"),
+        stop_contract_id: AUTONOMOUS_REPLAN_DEFAULT_STOP_CONTRACT_ID}}).obligation as JsonObject;
+    assert.equal(recovered.obligation_id, source.obligation_id);
+    assert.equal(recovered.stop_condition, source.stop_condition);
+    assert.deepEqual(recovered.triggers, [{kind}]);
+    assert.equal(projectReplanSemantics({operation: "qualify", obligation: recovered}).accepted, false);
+    assert.equal(projectReplanSemantics({operation: "qualify", obligation: recovered,
+      observation_delta: {delta_kinds: ["new_surface"]}}).accepted, acceptsProgress);
+  }
+});
+
+test("a recorded outcome review survives work-link refinement without cached context or discharge", () => {
+  const id = "replan-1111111111111111";
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true,
+    replay_phase: "open", selected_obligation_id: id, current_obligation: null,
+    transition_candidates: [], agent_id: "reviewer", receipt_review: {
+      kind: "goal_outcome_uncovered", stop_condition: "Stop at owner-only decisions."}};
+  const recovered = projectReplanSemantics(request).obligation as JsonObject;
+  assert.equal(recovered.obligation_id, id);
+  assert.equal(recovered.agent_id, "reviewer");
+  assert.equal(recovered.stop_condition, request.receipt_review.stop_condition);
+  assert.deepEqual(recovered.triggers, [{kind: "goal_outcome_uncovered"}]);
+  assert.equal(recovered.selection_binding, "heartbeat_receipt");
+  assert.equal(recovered.replan_context, undefined);
+  assert.equal(recovered.settlement_action_packet, undefined);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: recovered}).accepted, false);
+  for (const invalid of [{guard_scoped: false}, {agent_id: null},
+    {receipt_review: null}, {receipt_review: {kind: "periodic_review_due"}},
+    {receipt_review: {kind: "goal_outcome_uncovered"}}]) {
+    assert.throws(() => projectReplanSemantics({...request, ...invalid}), /identity conflicts/);
+  }
+  assert.equal(projectReplanSemantics({...request, selected_obligation_id: null}).obligation, null);
+});
+
+test("obligation source governs both authoring projection and semantic discharge", () => {
+  const projection = projectReplanSemantics({operation: "requirements", obligation});
+  assert.match(String(projection.cli_semantic_args), /--agent-vision-json/);
+  assert.deepEqual((projection.writeback_contract as Record<string, unknown>).vision_authoring, visionAuthoringContract(true));
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation,
+    observation_delta: {delta_kinds: ["new_surface"]}}).accepted, false);
+  const delta = projectReplanSemantics({operation: "qualify", obligation, agent_vision: vision});
+  assert.equal(delta.accepted, true);
+  assert.deepEqual(delta.required_any_of, projection.required_any_of);
+  assert.deepEqual(delta.satisfying_outcomes, ["fresh_vision_path_outcome"]);
+});
+
+test("missing evidence or acceptance cannot manufacture a fresh path outcome", () => {
+  for (const agentVision of [
+    {...vision, vision_patch: {}}, {...vision, path_delta: {outcome: "continue"}},
+    {...vision, path_delta: {outcome: "wait", evidence_refs: ["evidence-permission"]}},
+  ]) {
+    assert.equal(projectReplanSemantics({operation: "qualify", obligation, agent_vision: agentVision}).accepted, false);
+  }
+});
+
+for (const reviewKind of ["long_todo_chain", "periodic_review_due"]) {
+  test(`${reviewKind} accepts its evidence-linked vision route and retains progress exits`, () => {
+    const chain = {obligation_id: defaultObligationId, triggers: [{kind: reviewKind}],
+      replan_context: {context_id: defaultContextId}};
+    const requiresStride = reviewKind === "periodic_review_due";
+    const projection = projectReplanSemantics({operation: "requirements", obligation: chain});
+    assert.match(String(projection.cli_semantic_args), /--agent-vision-json/);
+    assert.equal(projectReplanSemantics({operation: "qualify", obligation: chain,
+      agent_vision: vision}).accepted, true);
+    // Reusing applicable work evidence can keep the route without inventing
+    // another probe or Todo; a current evidence-linked decision is still needed.
+    assert.equal(projectReplanSemantics({operation: "qualify", obligation: chain,
+      agent_vision: {...vision, path_delta: {...vision.path_delta, outcome: "no_change"}},
+      observation_delta: {delta_kinds: [], evidence_novel: false}}).accepted, true);
+    assert.match(String((projection.writeback_contract as JsonObject).rule), /First reuse observed evidence valid for current source\/acceptance/);
+    for (const outcome of ["new_surface", "new_hypothesis", "new_probe_family", "new_runnable_successor"]) {
+      if (requiresStride) {
+        assert.equal(projectReplanSemantics({operation: "qualify", obligation: chain,
+          observation_delta: {delta_kinds: [outcome]}}).reason_code, "stride_decision_required");
+        assert.equal(projectReplanSemantics({operation: "qualify", obligation: chain,
+          agent_vision: strideStopVision, observation_delta: {delta_kinds: [outcome]}}).accepted, true);
+      } else {
+        assert.equal(projectReplanSemantics({operation: "qualify", obligation: chain,
+          observation_delta: {delta_kinds: [outcome]}}).accepted, true);
+      }
+    }
+    for (const incomplete of [{vision_patch: vision.vision_patch},
+      {...vision, path_delta: {outcome: "replan", evidence_refs: []}},
+      {...vision, vision_patch: {}}, {...vision, path_delta: {outcome: "wait", evidence_refs: ["evidence"]}}]) {
+      assert.equal(projectReplanSemantics({operation: "qualify", obligation: chain,
+        agent_vision: incomplete}).accepted, false);
+    }
+    // A stricter source, mixed vision duty or unrelated trigger keeps its policy.
+    for (const restricted of [
+      {...chain, satisfying_semantic_outcomes: ["new_runnable_successor"]},
+      {...chain, triggers: [...chain.triggers, {kind: "goal_acceptance_unbound"}]},
+      {...chain, triggers: [{kind: "monitor_no_change_streak", text: reviewKind}]},
+    ]) {
+      assert.equal(projectReplanSemantics({operation: "qualify", obligation: restricted,
+        agent_vision: vision}).accepted, false);
+    }
+    assert.equal(projectReplanSemantics({operation: "qualify",
+      obligation: {...chain, triggers: [...chain.triggers, ...obligation.triggers]},
+      observation_delta: {delta_kinds: ["new_surface"]}}).accepted, false);
+  });
+
+}
+
+test("explicit outcome restriction remains authoritative; trigger prose is not", () => {
+  assert.deepEqual(requiredSemanticOutcomes({satisfying_semantic_outcomes: ["new_runnable_successor", "new_runnable_successor"]}), ["new_runnable_successor"]);
+  assert.throws(() => requiredSemanticOutcomes({satisfying_semantic_outcomes: ["unrecognized"]}), /unknown typed outcome/);
+  const prose = {obligation_id: defaultObligationId, replan_context: {context_id: defaultContextId},
+    triggers: [{kind: "typed_progress_repeat", text: "required_agent_vision_missing"}]};
+  assert.equal(requiredSemanticOutcomes(prose).includes("new_surface"), true);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: prose,
+    agent_vision: strideStopVision, observation_delta: {delta_kinds: ["new_surface"]}}).accepted, true);
+});
+
+test("stale Goal Acceptance cannot be discharged by unrelated progress or a vision patch", () => {
+  const stale = {triggers: [{kind: "goal_acceptance_stale", vision_todo_ids: ["todo_stale"]}],
+    satisfying_semantic_outcomes: ["new_runnable_successor", "new_concrete_blocker"]};
+  assert.deepEqual(requiredSemanticOutcomes(stale), ["new_runnable_successor", "new_concrete_blocker"]);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: stale,
+    observation_delta: {delta_kinds: ["new_surface"]}}).accepted, false);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: stale, agent_vision: vision}).accepted, false);
+  for (const outcome of ["new_runnable_successor", "new_concrete_blocker"]) {
+    assert.equal(projectReplanSemantics({operation: "qualify", obligation: stale,
+      observation_delta: {delta_kinds: [outcome]}}).accepted, true);
+  }
+});
+
+test("no-followup cannot hide an inconsistent vision behind another accepted outcome", () => {
+  const request = {operation: "qualify", obligation,
+    observation_delta: {delta_kinds: ["coverage_backed_no_followup", "new_concrete_blocker"]}};
+  assert.equal(projectReplanSemantics({...request, agent_vision: vision}).reason_code, "no_followup_vision_path_inconsistent");
+  const valid = projectReplanSemantics({...request, agent_vision: {state: "no_followup", path_delta: {outcome: "stop"}}});
+  assert.equal(valid.accepted, true);
+});
+
+test("terminal input projection supplies coverage and vision without widening restricted exits", () => {
+  const result = projectReplanSemantics({operation: "requirements", obligation});
+  const contract = result.writeback_contract as JsonObject;
+  const terminal = contract.no_followup_requirements as JsonObject;
+  assert.deepEqual(terminal.cli_args, ["--progress-result-class", "no_followup",
+    "--progress-coverage-scope-id", "<coverage-scope-id>", "--progress-evidence-id", "<evidence-id>",
+    "--agent-vision-json", "<file>"]);
+  assert.deepEqual(terminal.vision_fields, {state: "no_followup", "path_delta.outcome": "stop"});
+  assert.deepEqual(terminal.preserve, ["vision_patch"]);
+  const restricted = projectReplanSemantics({operation: "requirements", obligation: {
+    ...obligation, satisfying_semantic_outcomes: ["new_concrete_blocker"],
+  }});
+  assert.equal((restricted.writeback_contract as JsonObject).no_followup_requirements, undefined);
+});
+
+test("external progress review: renamed identifiers discharge only behind new evidence; the plan may stand on evidence", () => {
+  const review = {obligation_id: defaultObligationId, replan_context: {context_id: defaultContextId},
+    triggers: [{kind: "external_progress_review_drift", model_authority: "none"}]};
+  const projection = projectReplanSemantics({operation: "requirements", obligation: review});
+  const required = projection.required_any_of as string[];
+  assert.equal(required.includes("fresh_vision_path_outcome"), true);
+  for (const outcome of ["new_surface", "new_hypothesis", "new_probe_family", "new_concrete_blocker", "coverage_backed_no_followup"]) {
+    assert.equal(required.includes(outcome), true, outcome);
+  }
+  assert.match(String(projection.cli_semantic_args), /--agent-vision-json/);
+  const contract = projection.writeback_contract as Record<string, unknown>;
+  assert.equal(contract.identity_outcomes_require_new_evidence, true);
+  assert.match(String(contract.alternative_cli_semantic_args), /--agent-vision-json/);
+  assert.deepEqual(contract.vision_authoring, visionAuthoringContract(true));
+
+  const qualify = (observation_delta?: Record<string, unknown>, agent_vision: Record<string, unknown> = strideStopVision) =>
+    projectReplanSemantics({operation: "qualify", obligation: review, observation_delta, agent_vision});
+  for (const identity of ["new_surface", "new_hypothesis", "new_probe_family"]) {
+    const refused = qualify({delta_kinds: [identity], evidence_novel: false});
+    assert.equal(refused.accepted, false, identity);
+    assert.equal(refused.reason_code, "progress_identity_without_new_evidence");
+    assert.deepEqual(refused.outcomes, []);
+    assert.equal(qualify({delta_kinds: [identity]}).accepted, false, `${identity} without the novelty fact`);
+    const accepted = qualify({delta_kinds: [identity], evidence_novel: true});
+    assert.equal(accepted.accepted, true, identity);
+    assert.deepEqual(accepted.satisfying_outcomes, [identity]);
+  }
+  // Substantive outcomes do not depend on the novelty fact, and a refused
+  // rename beside an accepted blocker leaves no reason code behind.
+  assert.equal(qualify({delta_kinds: ["new_concrete_blocker"], evidence_novel: false}).accepted, true);
+  const mixed = qualify({delta_kinds: ["new_hypothesis", "new_concrete_blocker"], evidence_novel: false});
+  assert.equal(mixed.accepted, true);
+  assert.deepEqual(mixed.satisfying_outcomes, ["new_concrete_blocker"]);
+  assert.equal("reason_code" in mixed, false);
+  // A claim already made while the obligation formed cannot supply any
+  // progress outcome, including blocker and coverage-backed terminal exits.
+  for (const outcome of ["new_surface", "new_hypothesis", "new_probe_family", "new_runnable_successor",
+    "new_concrete_blocker", "coverage_backed_exploration_exhausted", "coverage_backed_no_followup"]) {
+    const replayed = qualify({delta_kinds: [outcome], evidence_novel: true, observation_repeated: true});
+    assert.equal(replayed.accepted, false, outcome);
+    assert.equal(replayed.reason_code, "progress_observation_replayed", outcome);
+    assert.deepEqual(replayed.outcomes, [], outcome);
+  }
+  const replayedWithBlocker = qualify({delta_kinds: ["new_hypothesis", "new_concrete_blocker"], evidence_novel: true, observation_repeated: true});
+  assert.equal(replayedWithBlocker.accepted, false);
+  assert.deepEqual(replayedWithBlocker.satisfying_outcomes, []);
+  assert.equal(replayedWithBlocker.reason_code, "progress_observation_replayed");
+  assert.equal(qualify({delta_kinds: ["new_hypothesis"], evidence_novel: true, observation_repeated: false}).accepted, true);
+  assert.equal(qualify({delta_kinds: ["new_concrete_blocker"], evidence_novel: false, observation_repeated: false}).accepted, true);
+  // Keeping the plan on evidence is a legal exit for this source.
+  const kept = qualify(undefined, vision);
+  assert.equal(kept.accepted, true);
+  assert.deepEqual(kept.satisfying_outcomes, ["fresh_vision_path_outcome"]);
+  const replayedWithVision = qualify({delta_kinds: ["coverage_backed_no_followup"], observation_repeated: true}, vision);
+  assert.equal(replayedWithVision.accepted, true);
+  assert.deepEqual(replayedWithVision.satisfying_outcomes, ["fresh_vision_path_outcome"]);
+  assert.equal(qualify(undefined, {...vision, path_delta: {outcome: "wait", evidence_refs: ["e"]}}).accepted, false);
+  assert.equal(qualify({delta_kinds: ["new_hypothesis"], evidence_novel: false}, vision).accepted, true);
+});
+
+test("known blockers cannot discharge any replan source; independent vision evidence can", () => {
+  for (const kind of ["vision_acceptance_gap", "typed_progress_repeat", "external_progress_review_drift"]) {
+    const request = {operation: "qualify", obligation: {obligation_id: defaultObligationId,
+        replan_context: {context_id: defaultContextId}, triggers: [{kind}]},
+      agent_vision: strideStopVision,
+      observation_delta: {delta_kinds: ["new_concrete_blocker"], blocker_repeated: true,
+        evidence_novel: true, observation_repeated: false}};
+    const rejected = projectReplanSemantics(request);
+    assert.equal(rejected.accepted, false, kind);
+    assert.equal(rejected.reason_code, "progress_observation_replayed", kind);
+    assert.deepEqual(rejected.outcomes, []);
+    assert.equal(projectReplanSemantics({...request,
+      observation_delta: {...request.observation_delta, blocker_repeated: false}}).accepted, true);
+    const kept = projectReplanSemantics({...request, agent_vision: vision});
+    assert.equal(kept.accepted, true);
+    assert.deepEqual(kept.satisfying_outcomes, ["fresh_vision_path_outcome"]);
+  }
+});
+
+test("the identity rule is scoped to the external review source", () => {
+  const fuse = {obligation_id: defaultObligationId, replan_context: {context_id: defaultContextId},
+    triggers: [{kind: "typed_progress_repeat"}]};
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: fuse,
+    agent_vision: strideStopVision,
+    observation_delta: {delta_kinds: ["new_hypothesis"], evidence_novel: false}}).accepted, true);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: fuse,
+    agent_vision: strideStopVision,
+    observation_delta: {delta_kinds: ["new_hypothesis"], observation_repeated: true}}).accepted, true);
+  assert.equal((projectReplanSemantics({operation: "requirements", obligation: fuse}).required_any_of as string[])
+    .includes("fresh_vision_path_outcome"), true);
+  // A vision duty on the same obligation keeps the stricter vision policy.
+  const withVision = {obligation_id: defaultObligationId, replan_context: {context_id: defaultContextId},
+    triggers: [{kind: "external_progress_review_drift"}, {kind: "required_agent_vision_missing"}]};
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: withVision,
+    agent_vision: strideStopVision,
+    observation_delta: {delta_kinds: ["new_hypothesis"], evidence_novel: true}}).accepted, false);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: withVision, agent_vision: vision}).accepted, true);
+  // An explicit outcome restriction stays authoritative over the source default.
+  const restricted = {obligation_id: defaultObligationId, replan_context: {context_id: defaultContextId},
+    triggers: [{kind: "external_progress_review_drift"}], satisfying_semantic_outcomes: ["new_concrete_blocker"]};
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: restricted,
+    agent_vision: strideStopVision,
+    observation_delta: {delta_kinds: ["new_hypothesis"], evidence_novel: true}}).accepted, false);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: restricted, agent_vision: vision}).accepted, false);
+  // Trigger prose cannot opt into the external review policy.
+  const prose = {obligation_id: defaultObligationId, replan_context: {context_id: defaultContextId},
+    triggers: [{kind: "typed_progress_repeat", text: "external_progress_review_drift"}]};
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: prose,
+    agent_vision: strideStopVision,
+    observation_delta: {delta_kinds: ["new_hypothesis"], evidence_novel: false}}).accepted, true);
+});
+
+
+test("acceptance holds use one typed recovery policy even without a projected outcome list", () => {
+  for (const kind of ["goal_acceptance_unbound", "goal_acceptance_stale"]) {
+    const held = {triggers: [{kind}]};
+    assert.deepEqual(requiredSemanticOutcomes(held), ["new_runnable_successor", "new_concrete_blocker"]);
+    assert.throws(() => requiredSemanticOutcomes({...held, satisfying_semantic_outcomes: ["fresh_vision_path_outcome"]}), /cannot widen/);
+    assert.equal(projectReplanSemantics({operation: "qualify", obligation: held, agent_vision: vision}).accepted, false);
+    assert.equal(projectReplanSemantics({operation: "qualify", obligation: held,
+      observation_delta: {delta_kinds: ["new_surface"]}}).accepted, false);
+  }
+});
+
+
+test("planning advice cannot discharge a replan or widen source-specific exits", () => {
+  for (const kind of ["typed_progress_repeat", "vision_acceptance_gap", "long_todo_chain",
+    "external_progress_review_drift", "goal_acceptance_stale", "vision_successor_required"]) {
+    const source = {triggers: [{kind}]};
+    const projection = projectReplanSemantics({operation: "requirements", obligation: source});
+    const guidance = projection.planning_guidance as string[];
+    assert.ok(guidance.length > 0 && guidance.length <= 3);
+    assert.ok(guidance.join(" ").length < 3000, "boundaries replace the long method checklist");
+    const refusal = projectReplanSemantics({operation: "qualify", obligation: source,
+      planning_guidance: projection.planning_guidance});
+    assert.equal(refusal.accepted, false);
+    assert.deepEqual(refusal.required_any_of, requiredSemanticOutcomes(source));
+    assert.equal(refusal.planning_guidance, undefined);
+  }
+});
+
+
+test("stride format is unconditional across plain and historical off contexts and never discharges a semantic review", () => {
+  const plain = {triggers: [{kind: "typed_progress_repeat"}]};
+  const base = projectReplanSemantics({operation: "requirements", obligation: plain});
+  const off = projectReplanSemantics({operation: "requirements", obligation: {
+    ...plain, replan_context: {stride_strategy: "off"}}});
+  const enabled = {...plain, replan_context: {stride_strategy: "evidence_conditioned_v1"}};
+  const withStrategy = projectReplanSemantics({operation: "requirements", obligation: enabled});
+  assert.deepEqual(off, base);
+  assert.deepEqual(withStrategy, base);
+  assert.ok(base.stride_control);
+  assert.equal((base.required_any_of as string[]).includes("fresh_vision_path_outcome"), true);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: enabled,
+    planning_guidance: withStrategy.planning_guidance}).accepted, false);
+  for (const version of ["future_v2", null, 1]) {
+    assert.throws(() => projectReplanSemantics({operation: "requirements", obligation: {
+      ...plain, replan_context: {stride_strategy: version}}}), /stride_strategy/);
+  }
+});
+
+test("vision ACK freshness covers its durable run, never later gaps or unknown timestamps", () => {
+  const at = "2026-08-13T09:00:00+08:00";
+  const ack = {recorded: true, generated_at: at,
+    semantic_delta: {accepted: true, outcomes: ["fresh_vision_path_outcome"]},
+    delta_contract: {delta_kinds: ["goal_vision_patch"]}};
+  const request = {operation: "vision_ack", ack, acceptance_gaps: [{generated_at: at}]};
+  assert.equal(projectReplanSemantics(request).acknowledged, true);
+  assert.equal(projectReplanSemantics({...request, acceptance_gaps: [{generated_at: "2026-08-13T01:00:00Z"}]}).acknowledged, true);
+  for (const generated_at of ["2026-08-13T09:01:00+08:00", null, "invalid", "2026-08-13T09:00:00"]) {
+    assert.equal(projectReplanSemantics({...request, acceptance_gaps: [{generated_at: at}, {generated_at}]}).acknowledged, false);
+  }
+  for (const invalid of [{recorded: false}, {generated_at: null},
+    {semantic_delta: {accepted: false, outcomes: ["fresh_vision_path_outcome"]}},
+    {semantic_delta: {accepted: true, outcomes: ["new_surface"]}},
+    {semantic_delta: {accepted: true, outcomes: []}}]) {
+    assert.equal(projectReplanSemantics({...request, ack: {...ack, ...invalid}}).acknowledged, false);
+  }
+  assert.equal(projectReplanSemantics({...request, acceptance_gaps: []}).acknowledged, false);
+  const completion = {kind: "vision_outcome_checkpoint_required",
+    source: "recent_completed_advancement_todo", completed_at: at};
+  assert.equal(projectReplanSemantics({...request, acceptance_gaps: [completion]}).acknowledged, true);
+  assert.equal(projectReplanSemantics({...request, acceptance_gaps: [{...completion,
+    completed_at: "2026-08-13T09:01:00+08:00"}]}).acknowledged, false);
+  assert.equal(projectReplanSemantics({...request, acceptance_gaps: [{completed_at: at}]}).acknowledged, false);
+});
+
+test("vision ACK compares strict calendar timestamps at microsecond precision", () => {
+  const at = "2026-08-01T00:30:00.000100Z";
+  const ack = {recorded: true, generated_at: at,
+    semantic_delta: {accepted: true, outcomes: ["fresh_vision_path_outcome"]}};
+  for (const completed of [false, true]) {
+    const gap = (timestamp: string) => completed
+      ? {kind: "vision_outcome_checkpoint_required", source: "recent_completed_advancement_todo",
+        completed_at: timestamp}
+      : {generated_at: timestamp};
+    for (const [timestamp, covered] of [
+      [at, true], ["2026-08-01T08:30:00.000100+08:00", true],
+      ["2026-08-01T00:30:00.000900Z", false], ["2026-02-30T00:00:00Z", false],
+    ] as const) {
+      assert.equal(projectReplanSemantics({operation: "vision_ack", ack,
+        acceptance_gaps: [gap(timestamp)]}).acknowledged, covered);
+    }
+    assert.equal(projectReplanSemantics({operation: "vision_ack",
+      ack: {...ack, generated_at: "2026-02-30T00:00:00Z"},
+      acceptance_gaps: [gap("2026-02-28T00:00:00Z")]}).acknowledged, false);
+  }
+});
+
+test("outcome blocker ACK covers only its exact current agent checkpoint", () => {
+  const gap = {kind: "goal_outcome_uncovered", source: "goal_acceptance_contract",
+    agent_id: "author", frontier_revision: "a".repeat(64)};
+  const delta = {accepted: true, obligation_id: "replan-1111111111111111",
+    trigger_kinds: [gap.kind], trigger_checkpoints: [{kind: gap.kind, frontier_revision: gap.frontier_revision}],
+    outcomes: ["new_concrete_blocker"], satisfying_outcomes: ["new_concrete_blocker"]};
+  const ack = {recorded: true, agent_id: "author", generated_at: "2026-08-01T00:00:00Z", semantic_delta: delta};
+  const accepts = (changes: JsonObject = {}, gaps: JsonObject[] = [gap]) => projectReplanSemantics({
+    operation: "vision_ack", ack: {...ack, ...changes}, acceptance_gaps: gaps}).acknowledged;
+  assert.equal(accepts(), true, "an accepted blocker needs no read-time timestamp to settle the same source");
+  for (const changes of [{agent_id: "other"}, {agent_id: null}, {recorded: false}, {generated_at: null},
+    {semantic_delta: {...delta, accepted: false}}, {semantic_delta: {...delta, obligation_id: "unknown"}},
+    {semantic_delta: {...delta, trigger_kinds: []}}, {semantic_delta: {...delta, trigger_checkpoints: []}},
+    {semantic_delta: {...delta, satisfying_outcomes: []}}, {semantic_delta: {...delta, outcomes: ["new_surface"]}}]) {
+    assert.equal(accepts(changes), false);
+  }
+  for (const change of [{source: "agent_claim"}, {agent_id: "other"}, {frontier_revision: "b".repeat(64)},
+    {frontier_revision: "unknown"}, {kind: "goal_acceptance_unbound"}]) {
+    assert.equal(accepts({}, [{...gap, ...change}]), false);
+  }
+  assert.equal(accepts({}, [gap, {generated_at: "2026-08-01T00:00:01Z"}]), false,
+    "an outcome checkpoint cannot acknowledge later ordinary Vision evidence");
+  assert.equal(accepts({}, [gap, {generated_at: ack.generated_at}]), true);
+});
+
+test("a formal acceptance-hold ACK covers its exact owner basis after display updates", () => {
+  for (const kind of ["goal_acceptance_stale", "goal_acceptance_unbound"]) {
+    const revision = "a".repeat(64);
+    const gap = {kind, source: "goal_acceptance_contract", frontier_revision: revision,
+      generated_at: "2026-09-23T08:04:00Z"};
+    const delta = {accepted: true, obligation_id: "replan-1111111111111111",
+      outcomes: ["new_concrete_blocker"], satisfying_outcomes: ["new_concrete_blocker"],
+      trigger_kinds: [kind], trigger_checkpoints: [{kind, frontier_revision: revision}]};
+    const ack = {recorded: true, generated_at: "2026-09-23T08:03:00Z", semantic_delta: delta};
+    const request = {operation: "vision_ack", acceptance_gaps: [gap], ack};
+    assert.equal(projectReplanSemantics(request).acknowledged, true);
+    for (const changed of [
+      {...gap, frontier_revision: "b".repeat(64)},
+      {...gap, kind: "vision_acceptance_gap"},
+      {...gap, source: "unconfirmed_display"},
+    ]) assert.equal(projectReplanSemantics({...request, acceptance_gaps: [changed]}).acknowledged, false);
+    for (const changed of [
+      {recorded: false}, {generated_at: "2026-02-30T08:03:00Z"}, {generated_at: "2026-09-23T08:03:00"},
+      {semantic_delta: {...delta, accepted: false}}, {semantic_delta: {...delta, outcomes: []}},
+      {semantic_delta: {...delta, satisfying_outcomes: []}},
+      {semantic_delta: {...delta, trigger_kinds: ["vision_acceptance_gap"]}},
+      {semantic_delta: {...delta, trigger_checkpoints: [{kind, frontier_revision: "other"}]}},
+      {semantic_delta: {...delta, obligation_id: null}},
+    ]) assert.equal(projectReplanSemantics({...request, ack: {...ack, ...changed}}).acknowledged, false);
+    // A newly observed independent gap still requires its own current evidence.
+    assert.equal(projectReplanSemantics({...request,
+      acceptance_gaps: [gap, {kind: "vision_acceptance_gap", generated_at: gap.generated_at}]}).acknowledged, false);
+    assert.equal(projectReplanSemantics({...request,
+      acceptance_gaps: [gap, {kind: "vision_acceptance_gap", generated_at: ack.generated_at}]}).acknowledged, true);
+    // Historical ACKs without an obligation identity retain their old freshness rule.
+    assert.equal(projectReplanSemantics({...request, acceptance_gaps: [{...gap, generated_at: ack.generated_at}],
+      ack: {...ack, semantic_delta: {...delta, obligation_id: null}}}).acknowledged, true);
+  }
+});
+
+test("old hold checkpoints require exact source digest and original timestamp coverage", () => {
+  const kind = "goal_acceptance_unbound", old = "b".repeat(64);
+  const gap = {kind, source: "goal_acceptance_contract", frontier_revision: "a".repeat(64),
+    legacy_frontier_revision: old, generated_at: "2026-09-23T08:02:00Z"};
+  const delta = {accepted: true, obligation_id: "replan-1111111111111111",
+    outcomes: ["new_concrete_blocker"], satisfying_outcomes: ["new_concrete_blocker"],
+    trigger_kinds: [kind], trigger_checkpoints: [{kind, frontier_revision: old}]};
+  const ack = {recorded: true, generated_at: "2026-09-23T08:03:00Z", semantic_delta: delta};
+  const request = {operation: "vision_ack", acceptance_gaps: [gap], ack};
+  assert.equal(projectReplanSemantics(request).acknowledged, true);
+  for (const change of [{legacy_frontier_revision: "c".repeat(64)}, {source: "other"},
+    {generated_at: "2026-09-23T08:04:00Z"}, {generated_at: null}]) {
+    assert.equal(projectReplanSemantics({...request, acceptance_gaps: [{...gap, ...change}]}).acknowledged, false);
+  }
+});
+
+test("only a bound original receipt can select the source-derived legacy obligation", () => {
+  const original = "replan-1111111111111111";
+  const current = {obligation_id: "replan-2222222222222222", legacy_obligation_id: original,
+    triggers: [{kind: "goal_acceptance_unbound", frontier_revision: "a".repeat(64)}]};
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true,
+    selected_obligation_id: original, current_obligation: current, replay_phase: "open", transition_candidates: []};
+  const bound = projectReplanSemantics(request).obligation as Record<string, unknown>;
+  assert.equal(bound.obligation_id, original);
+  assert.equal(bound.selection_binding, "heartbeat_receipt");
+  assert.equal(Object.hasOwn(bound, "settlement_action_packet"), false);
+  for (const changed of [{...request, guard_scoped: false},
+    {...request, current_obligation: {...current, legacy_obligation_id: "replan-3333333333333333"}},
+    {...request, current_obligation: {...current, triggers: [{kind: "periodic_review"}]}}]) {
+    assert.throws(() => projectReplanSemantics(changed), /identity conflicts/);
+  }
+  assert.deepEqual(projectReplanSemantics({...request, selected_obligation_id: null}).obligation, null);
+});
+
+test("a later durable exact ACK settles only its original receipt-bound Turn", () => {
+  const id = "replan-1111111111111111", goal = "goal-a", agent = "synthetic-agent";
+  const guardTurn = "guided-start:original", laterTurn = "guided-start:later";
+  const delta = {schema_version: "replan_semantic_delta_v0", accepted: true,
+    obligation_id: id, outcomes: ["fresh_vision_path_outcome"],
+    satisfying_outcomes: ["fresh_vision_path_outcome"]};
+  const historicalAck = {schema_version: "autonomous_replan_ack_v0", recorded: true,
+    goal_id: goal, agent_id: agent, turn_instance_id: laterTurn,
+    generated_at: "2026-08-01T00:00:02Z", semantic_delta: delta};
+  const candidate = {historical_ack: historicalAck};
+  const request = {guard_scoped: true, selected_obligation_id: id,
+    transition_candidates: [candidate], goal_id: goal, agent_id: agent,
+    guard_recorded_at: "2026-08-01T00:00:01Z", guard_turn_instance_id: guardTurn};
+  const settled = (current: typeof request) => {
+    assert.deepEqual(projectReplanSemantics({operation: "turn_transition", ...current}).semantic_delta, delta);
+    const obligation = projectReplanSemantics({operation: "receipt_bound_obligation", ...current,
+      current_obligation: null, replay_phase: "open"}).obligation as JsonObject;
+    assert.equal(obligation.obligation_id, id);
+    assert.equal(obligation.resolution_mode, "receipt_bound_replan_settlement");
+    const packet = obligation.settlement_action_packet as JsonObject;
+    assert.equal(packet.decision, "historical_ack_recorded");
+    assert.equal(packet.settlement_only, true);
+    assert.equal(packet.required_outcome, "durable_writeback_receipt");
+    assert.deepEqual(packet.semantic_delta, delta);
+    assert.equal((packet.writeback_contract as JsonObject).preferred_input, "exact_historical_ack");
+  };
+  const rejected = (current: typeof request) => {
+    assert.equal(projectReplanSemantics({operation: "turn_transition", ...current}).semantic_delta, null);
+    assert.throws(() => projectReplanSemantics({operation: "receipt_bound_obligation", ...current,
+      current_obligation: null, replay_phase: "open"}), /identity conflicts/);
+  };
+  settled(request);
+
+  const pending = projectReplanSemantics({operation: "receipt_bound_obligation", ...request,
+    current_obligation: null, replay_phase: "settlement_pending"}).obligation as JsonObject;
+  const remaining = pending.settlement_action_packet as JsonObject;
+  assert.equal(remaining.required_outcome, "quota_spend_receipt");
+  assert.equal(remaining.semantic_delta, null);
+  assert.equal(remaining.successor_todo_id, null);
+
+  for (const missingGuard of [{guard_scoped: false}, {goal_id: null}, {agent_id: null},
+    {guard_recorded_at: null}, {guard_turn_instance_id: null}]) {
+    rejected({...request, ...missingGuard});
+  }
+
+  // The whole-second run clock cannot order two writes inside the admission
+  // second. A bound refresh_state event whose recorded time and log position
+  // are both after admission can. The later Turn keeps its own turn id.
+  const boundWriteback = (generated_at: string, writeback_recorded_at: string, follows = true) => ({
+    historical_ack: {...historicalAck, generated_at, writeback_recorded_at,
+      writeback_follows_admission: follows, writeback_goal_id: goal, writeback_agent_id: agent,
+      writeback_turn_instance_id: laterTurn, writeback_obligation_id: id},
+  });
+  for (const guard_recorded_at of [
+    "2026-08-01T00:00:01Z", "2026-08-01T00:00:01.500Z", "2026-08-01T00:00:01.123456Z",
+  ]) {
+    for (const generated_at of ["2026-08-01T00:00:01Z", "2026-08-01T08:00:01+08:00"]) {
+      settled({...request, guard_recorded_at, transition_candidates: [
+        boundWriteback(generated_at, "2026-08-01T00:00:01.900000Z")]});
+      rejected({...request, guard_recorded_at, transition_candidates: [
+        {historical_ack: {...historicalAck, generated_at}}]});
+    }
+  }
+  const fractionalAdmission = {...request, guard_recorded_at: "2026-08-01T00:00:01.500Z"};
+  const sameSecondAck = boundWriteback("2026-08-01T00:00:01Z", "2026-08-01T00:00:01.900000Z");
+  rejected({...fractionalAdmission, transition_candidates: [
+    boundWriteback("2026-08-01T00:00:01Z", "2026-08-01T00:00:01.100Z")]});
+  rejected({...fractionalAdmission, transition_candidates: [
+    boundWriteback("2026-08-01T00:00:01Z", "2026-08-01T00:00:01.900000Z", false)]});
+  for (const broken of [
+    {writeback_goal_id: "goal-b"}, {writeback_agent_id: "peer"},
+    {writeback_turn_instance_id: guardTurn}, {writeback_obligation_id: "replan-2222222222222222"},
+  ]) {
+    rejected({...fractionalAdmission, transition_candidates: [
+      {historical_ack: {...sameSecondAck.historical_ack, ...broken}}]});
+  }
+  // A fractional ACK earlier in the admission second, and a previous whole
+  // second, stay pending even when a later event is attached.
+  for (const generated_at of ["2026-08-01T00:00:01.100Z", "2026-08-01T00:00:00Z"]) {
+    rejected({...fractionalAdmission, transition_candidates: [
+      boundWriteback(generated_at, "2026-08-01T00:00:01.900000Z")]});
+  }
+
+  const invalid = [
+    {historical_ack: {...historicalAck, schema_version: "wrong"}},
+    {historical_ack: {...historicalAck, recorded: false}},
+    {historical_ack: {...historicalAck, goal_id: "goal-b"}},
+    {historical_ack: {...historicalAck, agent_id: "peer"}},
+    {historical_ack: {...historicalAck, turn_instance_id: guardTurn}},
+    {historical_ack: {...historicalAck, turn_instance_id: null}},
+    {historical_ack: {...historicalAck, generated_at: "2026-08-01T00:00:00Z"}},
+    {historical_ack: {...historicalAck, generated_at: "invalid"}},
+    {historical_ack: {...historicalAck, semantic_delta: {...delta, schema_version: "wrong"}}},
+    {historical_ack: {...historicalAck, semantic_delta: {...delta, accepted: false}}},
+    {historical_ack: {...historicalAck, semantic_delta: {...delta, obligation_id: "replan-2222222222222222"}}},
+    {historical_ack: {...historicalAck, semantic_delta: {...delta, satisfying_outcomes: []}}},
+    {historical_ack: {...historicalAck, semantic_delta: {...delta, outcomes: ["unregistered"], satisfying_outcomes: ["unregistered"]}}},
+    {historical_ack: {...historicalAck, semantic_delta: {...delta, satisfying_outcomes: ["new_surface"]}}},
+  ];
+  for (const badCandidate of invalid) {
+    rejected({...request, transition_candidates: [badCandidate]});
+  }
+});
+
+
+test("a review-bound dependency authored after admission preserves the original lifecycle source", () => {
+  const id = "replan-1111111111111111", agent = "synthetic-agent";
+  const row = {todo_id: "todo_original", status: "done", done: true,
+    task_class: "advancement_task", claimed_by: agent, last_actor_agent_id: agent,
+    completed_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z",
+    completion_turn_key: "original-completion"};
+  const source = {operation: "lifecycle_source", selected_obligation_id: id,
+    agent_id: agent, guard_recorded_at: "2026-08-01T00:00:01.500Z"};
+  const original = {required: true, obligation_id: id, resolution_mode: "todo_lifecycle_settlement",
+    triggers: [{kind: "completed_advancement_without_successor", todo_id: row.todo_id,
+      completion_turn_key: row.completion_turn_key, agent_id: agent}]};
+  for (const edge of [{resume_when: `todo_done:${row.todo_id}`}, {unblocks_todo_id: row.todo_id}]) {
+    // Canonical Todo updates truncate to whole seconds. A review-bound
+    // successor stored as 01Z after admission at 01.500Z is post-admission,
+    // as is one stored on the next second.
+    for (const updated_at of ["2026-08-01T00:00:02Z", "2026-08-01T00:00:01Z"]) {
+      const successor = {todo_id: "todo_successor", status: "open", done: false,
+        task_class: "advancement_task", last_actor_agent_id: agent, claimed_by: agent,
+        replan_obligation_id: id, updated_at, ...edge};
+      const items = [row, successor], before = structuredClone(items);
+      assert.deepEqual(projectReplanSemantics({...source, items}), {items: [row], settled: false});
+      // Recovering the original review preserves its identity, not an ACK or a
+      // grant to dispatch this successor before the original Turn is settled.
+      const recovered = projectReplanSemantics({operation: "receipt_bound_obligation",
+        guard_scoped: true, replay_phase: "open", selected_obligation_id: id,
+        agent_id: agent, current_obligation: null, transition_candidates: [{
+          obligation: original, source_obligation: original, items,
+          guard_recorded_at: source.guard_recorded_at, lifecycle_settled: false,
+        }]}).obligation as JsonObject;
+      assert.equal(recovered.obligation_id, id);
+      assert.equal(recovered.resolution_mode, "todo_lifecycle_settlement");
+      const ack = {schema_version: "autonomous_replan_ack_v0", recorded: true,
+        source: "todo_replan_successor_transition", semantic_delta: {
+          schema_version: "replan_semantic_delta_v0", accepted: true, obligation_id: id,
+          outcomes: ["new_runnable_successor"], satisfying_outcomes: ["new_runnable_successor"],
+          successor_todo_id: successor.todo_id,
+        }};
+      const settlement = projectReplanSemantics({operation: "receipt_bound_obligation",
+        guard_scoped: true, replay_phase: "open", selected_obligation_id: id,
+        agent_id: agent, current_obligation: null, transition_candidates: [{
+          obligation: original, source_obligation: original, items, ack,
+          guard_recorded_at: source.guard_recorded_at, lifecycle_settled: false,
+        }]}).obligation as JsonObject;
+      assert.equal(settlement.obligation_id, id);
+      assert.equal(settlement.resolution_mode, "receipt_bound_replan_settlement");
+      assert.equal((settlement.settlement_action_packet as JsonObject).successor_todo_id, successor.todo_id);
+      // An invalid transition retains the pending lifecycle; it cannot turn into
+      // an ACK, discard its original completion identity or release the next task.
+      const invalid = projectReplanSemantics({operation: "receipt_bound_obligation",
+        guard_scoped: true, replay_phase: "open", selected_obligation_id: id,
+        agent_id: agent, current_obligation: null, transition_candidates: [{
+          obligation: original, source_obligation: original, items,
+          ack: {...ack, recorded: false},
+          guard_recorded_at: source.guard_recorded_at, lifecycle_settled: false,
+        }]}).obligation as JsonObject;
+      assert.equal(invalid.resolution_mode, "todo_lifecycle_settlement");
+      assert.deepEqual(items, before);
+    }
+    const successor = {todo_id: "todo_successor", status: "open", done: false,
+      task_class: "advancement_task", last_actor_agent_id: agent, claimed_by: agent,
+      replan_obligation_id: id, updated_at: "2026-08-01T00:00:02Z", ...edge};
+    for (const change of [{replan_obligation_id: "replan-2222222222222222"},
+      {last_actor_agent_id: "peer"}, {claimed_by: "peer"}, {updated_at: "2026-08-01T00:00:00Z"},
+      {updated_at: "invalid"}, {updated_at: null}]) {
+      assert.deepEqual(projectReplanSemantics({...source, items: [row, {...successor, ...change}]}),
+        {items: [], settled: false});
+    }
+    assert.deepEqual(projectReplanSemantics({...source, selected_obligation_id: undefined, items: [row, successor]}),
+      {items: [], settled: false});
+  }
+});
+
+for (const recovery of ["same_turn_terminal_closeout", "lifecycle_reentry_terminal_closeout"]) {
+test(`${recovery} restores only its exact admitted review and still owes Vision`, () => {
+  const id = "replan-1111111111111111", agent = "synthetic-agent";
+  const row = {todo_id: "todo_original", text: "Verify independent source", status: "done", done: true,
+    task_class: "advancement_task", claimed_by: agent, last_actor_agent_id: agent,
+    completed_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:01Z",
+    completion_turn_key: "original-completion", no_followup: true, completion_continuation: "no_followup",
+    completion_recovery: recovery};
+  const original = {required: true, obligation_id: id, resolution_mode: "todo_lifecycle_settlement",
+    triggers: [{kind: "completed_advancement_without_successor", todo_id: row.todo_id,
+      completion_turn_key: row.completion_turn_key, agent_id: agent}]};
+  const candidate = {obligation: original, source_obligation: original, lifecycle_settled: true,
+    guard_recorded_at: "2026-08-01T00:00:01.123456Z", items: [row]};
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true, replay_phase: "open",
+    selected_obligation_id: id, agent_id: agent, current_obligation: null, transition_candidates: [candidate]};
+  const result = projectReplanSemantics(request).obligation as JsonObject;
+  assert.equal(result.obligation_id, id);
+  assert.equal(result.resolution_mode, "receipt_bound_replan_settlement");
+  assert.deepEqual(result.todo_actions, []);
+  const packet = result.settlement_action_packet as JsonObject;
+  assert.equal(packet.settlement_only, true);
+  assert.equal(packet.semantic_delta, null);
+  const writeback = packet.writeback_contract as JsonObject;
+  assert.match(String(writeback.rule), /Reassess the original acceptance with evidence.*do not repeat the original work/);
+  assert.deepEqual(writeback.vision_authoring, visionAuthoringContract(true));
+  assert.equal(Object.hasOwn(writeback.vision_authoring as JsonObject, "continuation_review"), false);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: result}).accepted, false);
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: result, agent_vision: vision}).accepted, true);
+  // The same lifecycle evidence still exists after writeback. Reentry follows
+  // the verified settlement phase while leaving the next frontier unselected.
+  const pending = projectReplanSemantics({...request, replay_phase: "settlement_pending",
+    current_obligation: {obligation_id: "replan-2222222222222222"}}).obligation as JsonObject;
+  assert.equal(pending.obligation_id, id);
+  assert.deepEqual(pending.todo_actions, []);
+  const remaining = pending.settlement_action_packet as JsonObject;
+  assert.equal(remaining.decision, "settlement_pending");
+  assert.equal(remaining.required_outcome, "quota_spend_receipt");
+  const historical = {...row, todo_id: "todo_historical", completion_turn_key: "historical-completion",
+    completed_at: "2026-07-31T23:59:00Z", updated_at: "2026-07-31T23:59:01Z"};
+  for (const items of [[historical, row], [row, historical]]) {
+    assert.equal((projectReplanSemantics({...request,
+      transition_candidates: [{...candidate, items}]}).obligation as JsonObject).obligation_id, id);
+  }
+  // A whole-second timestamp cannot prove which side of admission this row
+  // closed on. The exact trigger/digest check still rejects the ambiguous source.
+  assert.throws(() => projectReplanSemantics({...request, transition_candidates: [{...candidate,
+    items: [row, {...historical, updated_at: row.updated_at}]}]}), /identity conflicts/);
+  for (const change of [{status: "open"}, {done: false}, {claimed_by: "peer"}, {last_actor_agent_id: "peer"},
+    {no_followup: false}, {completion_continuation: "active_goal"}, {completion_recovery: null},
+    {completion_turn_key: "changed"}, {completed_at: "2026-08-01T00:00:02Z"},
+    {successor_todo_ids: ["todo_new"]}, {archive_state: "archived"},
+    {updated_at: "2026-08-01T00:00:00Z"}, {updated_at: "2026-02-30T00:00:02Z"}, {updated_at: null}]) {
+    assert.throws(() => projectReplanSemantics({...request,
+      transition_candidates: [{...candidate, items: [{...row, ...change}]}]}), /identity conflicts/);
+  }
+  assert.throws(() => projectReplanSemantics({...request, guard_scoped: false}), /identity conflicts/);
+  assert.throws(() => projectReplanSemantics({...request,
+    selected_obligation_id: "replan-2222222222222222"}), /identity conflicts/);
+});
+}
+
+test("lifecycle reconstruction restores completion order before its trigger bound", () => {
+  const agent = "synthetic-agent";
+  const rows = [1, 2, 3, 4].map(index => ({todo_id: `todo_${index}`, index,
+    status: "done", done: true, task_class: "advancement_task", claimed_by: agent,
+    last_actor_agent_id: agent, completed_at: `2026-08-01T00:00:0${index}Z`,
+    updated_at: "2026-08-01T00:00:10Z", completion_turn_key: `completion-${index}`,
+    no_followup: true, completion_continuation: "no_followup",
+    completion_recovery: "lifecycle_reentry_terminal_closeout"}));
+  const facts = projectReplanSemantics({operation: "lifecycle_source", agent_id: agent,
+    guard_recorded_at: "2026-08-01T00:00:05Z", items: rows});
+  assert.deepEqual((facts.items as JsonObject[]).map(item => item.todo_id),
+    ["todo_4", "todo_3", "todo_2", "todo_1"]);
+  assert.equal(facts.settled, true);
+  const ties = rows.map(item => ({...item, completed_at: "2026-08-01T00:00:01Z"}));
+  assert.deepEqual((projectReplanSemantics({operation: "lifecycle_source", agent_id: agent,
+    guard_recorded_at: "2026-08-01T00:00:05Z", items: ties}).items as JsonObject[])
+    .map(item => item.todo_id), ["todo_4", "todo_3", "todo_2", "todo_1"]);
+});
+
+test("lifecycle reconstruction excludes rows closed by an inferred successor", () => {
+  const agent = "synthetic-agent", id = "replan-1111111111111111";
+  const row = {todo_id: "todo_settled", status: "done", done: true, task_class: "advancement_task",
+    claimed_by: agent, last_actor_agent_id: agent, completed_at: "2026-08-01T00:00:00Z",
+    updated_at: "2026-08-01T00:00:10Z", completion_turn_key: "settled-completion",
+    no_followup: true, completion_continuation: "no_followup",
+    completion_recovery: "lifecycle_reentry_terminal_closeout"};
+  // The admitted summary had no gap for this older row: a later row resumes on it.
+  const resumed = {...row, todo_id: "todo_resumed", completed_at: "2026-07-31T00:00:00Z",
+    updated_at: "2026-07-31T00:00:00Z", completion_turn_key: "resumed-completion",
+    no_followup: null, completion_continuation: "active_goal", completion_recovery: null};
+  const resumer = {...resumed, todo_id: "todo_resumer", completion_turn_key: "resumer-completion",
+    successor_todo_ids: [resumed.todo_id], resume_when: `todo_done:${resumed.todo_id}`};
+  const original = {required: true, obligation_id: id, resolution_mode: "todo_lifecycle_settlement",
+    triggers: [{kind: "completed_advancement_without_successor", todo_id: row.todo_id,
+      completion_turn_key: row.completion_turn_key, agent_id: agent}]};
+  const candidate = {obligation: original, source_obligation: original, lifecycle_settled: true,
+    guard_recorded_at: "2026-08-01T00:00:05.123456Z", items: [row, resumed, resumer]};
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true, replay_phase: "open",
+    selected_obligation_id: id, agent_id: agent, current_obligation: null, transition_candidates: [candidate]};
+  assert.deepEqual((projectReplanSemantics({operation: "lifecycle_source", agent_id: agent,
+    guard_recorded_at: candidate.guard_recorded_at, items: candidate.items}).items as JsonObject[])
+    .map(item => item.todo_id), [row.todo_id]);
+  const result = projectReplanSemantics(request).obligation as JsonObject;
+  assert.equal(result.obligation_id, id);
+  assert.equal(result.resolution_mode, "receipt_bound_replan_settlement");
+  // An unblock edge closes the gap the same way. A non-advancement resumer
+  // infers no edge, so the row stays and the exact trigger check still fails.
+  const unblocker = {...resumer, resume_when: null, unblocks_todo_id: resumed.todo_id};
+  assert.equal((projectReplanSemantics({...request, transition_candidates: [{...candidate,
+    items: [row, resumed, unblocker]}]}).obligation as JsonObject).obligation_id, id);
+  assert.throws(() => projectReplanSemantics({...request, transition_candidates: [{...candidate,
+    items: [row, resumed, {...resumer, task_class: "continuous_monitor"}]}]}), /identity conflicts/);
+});
+
+
+test("pending lifecycle survives a new frontier without granting settlement or successor work", () => {
+  const agent = "synthetic-agent", id = "replan-1111111111111111";
+  const row = {todo_id: "todo_pending", status: "done", done: true,
+    task_class: "advancement_task", claimed_by: agent, last_actor_agent_id: agent,
+    completed_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z",
+    completion_turn_key: "original-completion", completion_continuation: "active_goal"};
+  const original = {required: true, obligation_id: id, resolution_mode: "todo_lifecycle_settlement",
+    todo_actions: ["Settle the original completed Todo"],
+    triggers: [{kind: "completed_advancement_without_successor", todo_id: row.todo_id,
+      completion_turn_key: row.completion_turn_key, agent_id: agent}]};
+  const candidate = {obligation: original, source_obligation: original, lifecycle_settled: false,
+    guard_recorded_at: "2026-08-01T00:00:01Z", items: [row]};
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true, replay_phase: "open",
+    selected_obligation_id: id, agent_id: agent,
+    current_obligation: {obligation_id: "replan-2222222222222222"}, transition_candidates: [candidate]};
+  const recovered = projectReplanSemantics(request).obligation as JsonObject;
+  assert.deepEqual(recovered, {...original, selection_binding: "heartbeat_receipt"});
+  assert.equal(projectReplanSemantics({operation: "qualify", obligation: recovered,
+    agent_vision: vision}).accepted, false);
+  for (const change of [{status: "open"}, {done: false}, {claimed_by: "peer"},
+    {last_actor_agent_id: "peer"}, {completion_turn_key: "changed"},
+    {completed_at: "2026-08-01T00:00:02Z"}, {successor_todo_ids: ["todo_new"]},
+    {superseded_by: "todo_new"}, {archive_state: "archived"}]) {
+    assert.throws(() => projectReplanSemantics({...request,
+      transition_candidates: [{...candidate, items: [{...row, ...change}]}]}), /identity conflicts/);
+  }
+  assert.throws(() => projectReplanSemantics({...request, guard_scoped: false}), /identity conflicts/);
+  assert.throws(() => projectReplanSemantics({...request,
+    transition_candidates: [{...candidate, lifecycle_settled: true}]}), /identity conflicts/);
+});
+
+test("an admitted lifecycle trigger with a null completion key matches a Todo row without one", () => {
+  const agent = "synthetic-agent", id = "replan-1111111111111111";
+  // A Todo completed without a completion turn key: the row has no such field,
+  // while the admitted trigger carries the key as null.
+  const row = {todo_id: "todo_unkeyed", status: "done", done: true,
+    task_class: "advancement_task", claimed_by: agent, last_actor_agent_id: agent,
+    completed_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z",
+    completion_continuation: "active_goal"};
+  const original = {required: true, obligation_id: id, resolution_mode: "todo_lifecycle_settlement",
+    triggers: [{kind: "completed_advancement_without_successor", todo_id: row.todo_id,
+      completion_turn_key: null, agent_id: agent}]};
+  const candidate = {obligation: original, source_obligation: original, lifecycle_settled: false,
+    guard_recorded_at: "2026-08-01T00:00:01Z", items: [row]};
+  const request = {operation: "receipt_bound_obligation", guard_scoped: true, replay_phase: "open",
+    selected_obligation_id: id, agent_id: agent,
+    current_obligation: {obligation_id: "replan-2222222222222222"}, transition_candidates: [candidate]};
+  assert.deepEqual(projectReplanSemantics(request).obligation, {...original, selection_binding: "heartbeat_receipt"});
+  // A key that appears on either side after admission is still a different completion.
+  assert.throws(() => projectReplanSemantics({...request,
+    transition_candidates: [{...candidate, items: [{...row, completion_turn_key: "later-completion"}]}]}),
+  /identity conflicts/);
+  const keyed = {...original, triggers: [{...original.triggers[0], completion_turn_key: "original-completion"}]};
+  assert.throws(() => projectReplanSemantics({...request,
+    transition_candidates: [{...candidate, obligation: keyed, source_obligation: keyed}]}), /identity conflicts/);
+});

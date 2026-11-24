@@ -1,92 +1,299 @@
-import { Bot, ChevronDown, Eye, Info, Menu, RefreshCw } from "lucide-react";
+import { List, Bot, Eye, FolderOpen, LoaderCircle, Menu, RefreshCw, SlidersHorizontal } from "lucide-react";
+import { GoalLifecycleControl, GoalMastheadIdentity } from "./goal-masthead";
 
+import { useWorkspaceI18n } from "./i18n";
+import type { ManagerChannelBinding, ManagerRuntimeSessionReadback } from "../../data/chat";
 import type { WorkspaceAgentOption, WorkspaceGoal, WorkspaceGoalTab } from "./personal-workspace-model";
-import { goalUsageLabel } from "./personal-workspace-model";
+import { WorkspaceSelect } from "./workspace-select";
+import { ContextHelp } from "./context-help";
+import type {ReactNode} from "react";
 
 export function ChannelHeader({
   agents,
+  agentWorkActive = false,
+  conversationScope,
+  conversationRunning = false,
+  goalLifecycleBusy,
+  managerChannelBinding,
   managerChatOpen,
+  managerRuntime,
   mobileNavigationOpen,
-  onOpenGoalDetail,
+  onOpenGoalCapabilities,
+  onOpenGoalDetails,
+  onOpenAllWork,
+  allWorkOpen,
   onOpenManagerChat,
+  onOpenManagerSettings,
+  onOpenWorkspace,
   onRefresh,
+  onRequestGoalLifecycle,
   onOpenNavigation,
   onSelectGoalTab,
   onSelectAgent,
   onReturnManagerHome,
   refreshState,
   readOnlySourceLabel,
+  resumeReviewed,
   selectedAgentId,
   selectedGoal,
   selectedGoalTab,
+  scopeUnavailable = false,
+  workspaceGrantLabel,
+  originalConversationTitle,
+  requestInventory,
+  researchControl,
+  composerVisible = true,
 }: {
   agents: WorkspaceAgentOption[];
+  agentWorkActive?: boolean;
+  conversationRunning?: boolean;
+  /** Steward conversation scope; absent when the host grants no workspace. */
+  conversationScope?: { options: { disabled?: boolean; label: string; value: string }[]; value: string; onChange: (value: string) => void } | null;
+  goalLifecycleBusy?: boolean;
+  /** Set while the steward conversation is scoped to a workspace. */
+  workspaceGrantLabel?: string | null;
+  originalConversationTitle?: string;
+  requestInventory?: ReactNode;
+  researchControl?: ReactNode;
+  composerVisible?: boolean;
+  managerChannelBinding?: ManagerChannelBinding | null;
   managerChatOpen?: boolean;
+  managerRuntime?: ManagerRuntimeSessionReadback | null;
   mobileNavigationOpen?: boolean;
-  onOpenGoalDetail?: () => void;
+  onOpenGoalCapabilities?: () => void;
+  onOpenGoalDetails?: () => void;
+  onOpenAllWork?: () => void;
+  allWorkOpen?: boolean;
   onOpenManagerChat?: () => void;
+  onOpenManagerSettings?: () => void;
+  onOpenWorkspace?: () => void;
   onRefresh?: () => void;
+  /** Absent when the selected source does not authorize Goal lifecycle changes. */
+  onRequestGoalLifecycle?: (operation: "stop" | "resume") => void;
   onOpenNavigation?: () => void;
   onSelectGoalTab: (tab: WorkspaceGoalTab) => void;
   onSelectAgent: (agentId: string) => void;
   onReturnManagerHome?: () => void;
   refreshState?: "idle" | "loading" | "done" | "error";
   readOnlySourceLabel?: string;
+  /** Resume opens the owner's reviewed preview instead of a local confirmation. */
+  resumeReviewed?: boolean;
   selectedAgentId: string;
   selectedGoal: WorkspaceGoal | null;
   selectedGoalTab: WorkspaceGoalTab;
+  /** A requested Goal scope failed; do not present the steward as its fallback. */
+  scopeUnavailable?: boolean;
 }) {
+  const { locale, t } = useWorkspaceI18n();
+  const statusOnly = selectedAgentId === "status-only";
+  const chatLabel = <>{t("header.chat")}{conversationRunning ? (
+    <span aria-label={t("conversation.replying")} className="personal-chat-activity" role="status">
+      <LoaderCircle aria-hidden className="is-spinning" size={12} />
+    </span>
+  ) : null}</>;
+  const ordinaryConversation = Boolean(selectedGoal || workspaceGrantLabel);
+  // The chip reports the selected executor, whose credential pays for it, and
+  // the resolved model, so an executor and a model that disagree are visible
+  // instead of arriving as one silent configuration.
+  const managerExecutionKindLabel = managerChannelBinding
+    ? managerChannelBinding.executor_kind === "individual"
+      ? t("header.managerExecutorKindIndividual")
+      : managerChannelBinding.executor_kind === "managed"
+        ? t("header.managerExecutorKindManaged")
+        : t("header.managerExecutorKindRegistered")
+    : null;
+  const managerExecutionUnavailable = managerChannelBinding?.available === false;
+  const managerOutputTokenBudget = managerChannelBinding?.output_token_budget;
+  const managerOutputTokenBudgetLabel = managerOutputTokenBudget?.scope === "per_model_request"
+    && managerOutputTokenBudget.valid
+    && typeof managerOutputTokenBudget.max_tokens === "number"
+    ? t("header.managerOutputTokenBudget", {
+      tokens: new Intl.NumberFormat(locale).format(managerOutputTokenBudget.max_tokens),
+    })
+    : null;
+  // Name the reason instead of one hardcoded host: the channel can hold the
+  // managed host through its segment transport now, so "this channel needs
+  // codex" would be both wrong and unactionable. An unknown reason stays
+  // unclaimed rather than being rendered as a reason this build invented.
+  const managerExecutionUnavailableReason = managerChannelBinding?.available === false
+    ? managerChannelBinding.unavailable_reason
+    : null;
+  const managerExecutionUnavailableKey = managerExecutionUnavailableReason === "operator_credential_unconfigured"
+    ? "header.managerExecutionUnavailableCredential"
+    : managerExecutionUnavailableReason === "dsh_runtime_unavailable"
+      ? "header.managerExecutionUnavailableRuntime"
+      : managerExecutionUnavailableReason === "invalid_reasoning_effort"
+        ? "header.managerExecutionUnavailableEffort"
+        : managerExecutionUnavailableReason === "invalid_output_token_limit"
+          ? "header.managerExecutionUnavailableOutputBudget"
+        : "header.managerExecutionUnavailable";
+  // The shipped default is one endpoint, so the chip names it and the one way
+  // to move it; without this a steward the operator selected looks identical to
+  // the one every machine runs, and the reason stays in the binding's typed
+  // field instead of being invented here.
+  const managerExecutionDefaultReason = managerChannelBinding
+    && managerChannelBinding.executor_endpoint_source === "product_default"
+    && managerChannelBinding.executor_endpoint_default_reason === "steward_channel_default"
+    ? "header.managerEndpointStewardDefault"
+    : null;
+  const managerSelectionPolicyLabel = managerChannelBinding
+    ? t(managerChannelBinding.selection_policy === "pinned"
+      ? "header.managerSelectionPinned"
+      : managerChannelBinding.selection_policy === "flexible"
+        ? "header.managerSelectionFlexible"
+        : "header.managerSelectionPreferred")
+    : null;
+  const managerAllocationReasonLabel = managerChannelBinding?.allocation_reason
+    ? t(managerChannelBinding.allocation_reason === "user_explicit"
+      ? "header.managerAllocationUser"
+      : managerChannelBinding.allocation_reason === "pinned_configuration"
+        ? "header.managerAllocationPinned"
+        : managerChannelBinding.allocation_reason === "flexible_availability_fallback"
+          ? "header.managerAllocationFallback"
+          : managerChannelBinding.allocation_reason === "flexible_pool_unavailable"
+            ? "header.managerAllocationUnavailable"
+            : managerChannelBinding.allocation_reason === "flexible_primary_available"
+              ? "header.managerAllocationPrimary"
+              : managerChannelBinding.allocation_reason === "product_default"
+                ? "header.managerAllocationProductDefault"
+                : managerChannelBinding.allocation_reason === "service_override"
+                  ? "header.managerAllocationService"
+                  : "header.managerAllocationConfigured")
+    : null;
+
+  // The Goal title already names the source, so the persistent badge must not
+  // repeat it; only its disclosure panel explains that same source.
+  const sourceNamedByTitle = selectedGoal?.title === readOnlySourceLabel;
+  const runtimeControl = scopeUnavailable || agentWorkActive ? null : readOnlySourceLabel ? (
+    <div className="personal-read-only-source">
+      <ContextHelp icon={Eye} label={sourceNamedByTitle ? t("header.readOnlySourceHelp") : `${readOnlySourceLabel} · ${t("common.readOnly")}`}><p>{t("header.readOnlySourceDescription", { source: readOnlySourceLabel })}</p>{selectedGoal?.sourceAccess?.original_goal_id ? <p>{locale === "zh-CN" ? "原始 Goal：" : "Original Goal: "}<code>{selectedGoal.sourceAccess.original_goal_id}</code></p> : null}</ContextHelp>
+      {sourceNamedByTitle ? null : <span className="personal-read-only-source-label">{readOnlySourceLabel}</span>}
+      <small>{t("common.readOnly")}</small>
+    </div>
+  ) : selectedGoal && !composerVisible ? null : <>
+    {agents.some((agent) => agent.agentId === "status-only") ? <button type="button" className="personal-icon-button personal-status-mode"
+      aria-pressed={statusOnly} aria-label={`${t("header.statusOnlyAgent")} · ${t("header.statusOnlyDescription")}`} title={`${t("header.statusOnlyAgent")} · ${t("header.statusOnlyDescription")}`}
+      onClick={() => statusOnly ? onSelectAgent(!ordinaryConversation && managerChannelBinding
+        ? managerChannelBinding.executor_endpoint
+        : agents.find((agent) => agent.agentId !== "status-only" && agent.available)?.agentId ?? "status-only") : onSelectAgent("status-only")}>
+      <Eye size={16} />{statusOnly ? t("header.statusOnlyAgent") : null}
+    </button> : null}
+  </>;
+
+  const executionChipClass = managerExecutionUnavailable
+    ? "personal-execution-chip is-unavailable" : "personal-execution-chip";
+  const executionChipContent = managerChannelBinding ? <>
+    <span className="personal-execution-chip-endpoint">{managerChannelBinding.executor_endpoint}</span>
+    {managerExecutionKindLabel ? <span className="personal-execution-chip-kind">{managerExecutionKindLabel}</span> : null}
+    <span className="personal-execution-chip-model">{managerChannelBinding.model}</span>
+    {managerChannelBinding.reasoning_effort ? <span className="personal-execution-chip-model">{managerChannelBinding.reasoning_effort}</span> : null}
+    {managerOutputTokenBudgetLabel ? <span className="personal-execution-chip-budget">{managerOutputTokenBudgetLabel}</span> : null}
+    {onOpenManagerSettings ? <SlidersHorizontal aria-hidden size={12} /> : null}
+  </> : null;
+
+  // The steward channel binding describes the steward executor; a workspace
+  // conversation runs on the selected runtime instead.
+  const stewardBindingVisible = !scopeUnavailable && !selectedGoal && !workspaceGrantLabel && !originalConversationTitle;
+  const scopeControl = !scopeUnavailable && !selectedGoal && managerChatOpen && conversationScope && !readOnlySourceLabel ? (
+    <WorkspaceSelect
+      ariaLabel={t("header.conversationScope")}
+      className="personal-agent-select personal-scope-select"
+      icon={<FolderOpen size={16} />}
+      onChange={conversationScope.onChange}
+      options={conversationScope.options}
+      prefixLabel={t("header.conversationScope")}
+      value={conversationScope.value}
+    />
+  ) : null;
+  // Source continuation reports its immutable executor; ordinary conversation
+  // configuration remains with its own controls.
+  const sourceRuntimeControl = !originalConversationTitle || scopeUnavailable || agentWorkActive || readOnlySourceLabel
+    ? runtimeControl : <>
+      <span className="personal-read-only-source"><Bot size={15} />{selectedAgentId}</span>
+    </>;
+
   return (
-    <header className="personal-channel-header">
-      <button aria-expanded={mobileNavigationOpen ?? false} aria-label="打开 Goal 导航" className="personal-icon-button personal-mobile-menu" onClick={onOpenNavigation} type="button"><Menu size={18} /></button>
+    <header className="personal-channel-header" data-goal-selected={Boolean(selectedGoal)} data-workspace-scope={workspaceGrantLabel ? "true" : undefined}>
+      <button aria-expanded={mobileNavigationOpen ?? false} aria-label={t("header.openGoalNavigation")} className="personal-icon-button personal-mobile-menu" onClick={onOpenNavigation} type="button"><Menu size={18} /></button>
       <div className="personal-channel-title">
-        <h1>{selectedGoal?.title ?? "LoopX 管家"}</h1>
-        <p>{selectedGoal
-          ? `${selectedGoal.agentLabel ?? selectedGoal.agentId} · ${selectedGoal.state}${goalUsageLabel(selectedGoal.usage) ? ` · ${goalUsageLabel(selectedGoal.usage)}` : ""} · ${selectedGoal.nextSentence}`
-          : "跨 Goal 的个人工作入口"}</p>
+        {selectedGoal ? <GoalMastheadIdentity goal={selectedGoal} onOpenDetails={onOpenGoalDetails} onOpenWorkspace={onOpenWorkspace ?? (() => undefined)} /> : <h1>{originalConversationTitle ?? t(scopeUnavailable ? "header.goalView" : "header.manager")}</h1>}
+        {workspaceGrantLabel ? <p className="personal-channel-activity">{t("workspace.conversation", { grant: workspaceGrantLabel })}</p> : null}
+        <div className="personal-manager-context">
+        {stewardBindingVisible && managerChannelBinding ? (
+          <p className="personal-manager-execution">
+            {onOpenManagerSettings ? <button aria-label={t("header.managerModelSettings")} title={t("header.managerModelSettings")}
+              className={executionChipClass} onClick={onOpenManagerSettings} type="button">{executionChipContent}</button>
+              : <span className={executionChipClass}>{executionChipContent}</span>}
+            {managerExecutionUnavailable ? (
+              <span className="personal-execution-note">
+                {t(managerExecutionUnavailableKey, {
+                  executor: managerChannelBinding.executor_endpoint,
+                  credential: managerChannelBinding.credential_env_var,
+                })}
+              </span>
+            ) : null}
+          </p>
+        ) : null}
+        {stewardBindingVisible && (managerRuntime || managerExecutionDefaultReason) ? <details className="personal-runtime-details" open={managerRuntime != null && managerRuntime.status !== "ready" ? true : undefined}><summary>{locale === "zh-CN" ? "运行环境" : "Execution environment"}</summary>
+        {!selectedGoal && managerRuntime ? (
+          <p>{managerRuntime.status === "ready"
+            ? t(managerRuntime.runtime_profile === "trusted_owner"
+              ? "header.managerRuntimeTrusted"
+              : "header.managerRuntimeRestricted")
+            : t("header.managerRuntimeFallback", {
+              profile: managerRuntime.runtime_profile,
+              sandbox: managerRuntime.sandbox,
+            })}</p>
+        ) : null}
+            {managerSelectionPolicyLabel && managerAllocationReasonLabel && managerChannelBinding ? (
+              <p>{t("header.managerAllocation", {
+                policy: managerSelectionPolicyLabel,
+                reason: managerAllocationReasonLabel,
+              })}</p>
+            ) : null}
+            {managerExecutionDefaultReason && managerChannelBinding ? (
+              <span className="personal-execution-rule-note">
+                {t(managerExecutionDefaultReason, { executor: managerChannelBinding.executor_endpoint })}
+              </span>
+            ) : null}
+        </details> : null}
+        </div>
+        {selectedGoal?.loadState ? <p role="status">{t(selectedGoal.loadState === "error" ? "startup.goalError" : "startup.goalLoading")}</p> : null}
       </div>
       {selectedGoal ? (
-        <nav aria-label="Goal 视图" className="personal-goal-tabs">
-          <button aria-current={selectedGoalTab === "chat" ? "page" : undefined} onClick={() => onSelectGoalTab("chat")} type="button">Chat</button>
-          <button aria-current={selectedGoalTab === "tasks" ? "page" : undefined} onClick={() => onSelectGoalTab("tasks")} type="button">Tasks</button>
-          <button aria-current={selectedGoalTab === "files" ? "page" : undefined} onClick={() => onSelectGoalTab("files")} type="button">Files</button>
+        <div className="personal-goal-navigation">
+        <nav aria-label={t("header.goalView")} className="personal-goal-tabs">
+          <button aria-current={selectedGoalTab === "overview" ? "page" : undefined} onClick={() => onSelectGoalTab("overview")} type="button">{t("header.overview")}</button>
+          <button aria-current={selectedGoalTab === "tasks" ? "page" : undefined} onClick={() => onSelectGoalTab("tasks")} type="button">{t("header.tasks")}</button>
+          <button aria-current={selectedGoalTab === "research" ? "page" : undefined} onClick={() => onSelectGoalTab("research")} type="button">{t("header.research")}</button>
+          <button aria-current={selectedGoalTab === "chat" ? "page" : undefined} aria-label={t("header.chat")} onClick={() => onSelectGoalTab("chat")} type="button">{chatLabel}</button>
+          <button aria-current={selectedGoalTab === "files" ? "page" : undefined} onClick={() => onSelectGoalTab("files")} type="button">{t("header.files")}</button>
         </nav>
-      ) : (
-        <nav aria-label="管家视图" className="personal-goal-tabs">
-          <button aria-current={!managerChatOpen ? "page" : undefined} onClick={onReturnManagerHome} type="button">总览</button>
-          <button aria-current={managerChatOpen ? "page" : undefined} onClick={onOpenManagerChat} type="button">Chat</button>
+        {researchControl}
+        {runtimeControl}
+        </div>
+      ) : !scopeUnavailable ? (
+        <nav aria-label={t("header.managerView")} className="personal-goal-tabs">
+          <button aria-current={!managerChatOpen ? "page" : undefined} onClick={onReturnManagerHome} type="button">{t("header.managerOverview")}</button>
+          <button aria-current={managerChatOpen ? "page" : undefined} aria-label={t("header.chat")} onClick={onOpenManagerChat} type="button">{chatLabel}</button>
         </nav>
-      )}
-      {selectedGoal && onOpenGoalDetail ? (
-        <button aria-label="Goal 详情" className="personal-icon-button" onClick={onOpenGoalDetail} title="Goal 详情" type="button">
-          <Info size={17} />
-        </button>
       ) : null}
       <div className="personal-channel-actions">
-        {readOnlySourceLabel ? (
-          <span className="personal-read-only-source" title={`${readOnlySourceLabel} 通过 SSH 隧道只读展示`}><Eye size={15} />{readOnlySourceLabel}<small>只读</small></span>
-        ) : (
-          <label className="personal-agent-select">
-            <Bot size={16} />
-            <select
-              aria-label="选择 Agent"
-              onChange={(event) => onSelectAgent(event.target.value)}
-              value={selectedAgentId}
-            >
-              {agents.map((agent) => (
-                <option disabled={!agent.available} key={agent.agentId} value={agent.agentId}>
-                  {agent.label}{agent.available ? "" : " · 不可用"}
-                </option>
-              ))}
-            </select>
-            <ChevronDown aria-hidden size={14} />
-          </label>
-        )}
-        <span className="personal-live-indicator"><i />实时</span>
+        {requestInventory}
+        {selectedGoal && onOpenAllWork ? <button type="button" className="personal-icon-button goal-all-work-trigger" aria-label={locale === "zh-CN" ? "打开全部工作" : "Open all work"} aria-expanded={allWorkOpen} aria-haspopup="dialog" onClick={onOpenAllWork}><List size={17} aria-hidden/></button> : null}
+        {selectedGoal && !selectedGoal.loadState && onRequestGoalLifecycle ? (
+          <GoalLifecycleControl busy={goalLifecycleBusy ?? false} goal={selectedGoal} onRequest={onRequestGoalLifecycle} resumeReviewed={resumeReviewed ?? true} />
+        ) : null}
+        {selectedGoal && onOpenGoalCapabilities ? (
+          <button aria-label={t("header.goalSettings")} title={t("header.goalSettingsDescription")} className="personal-icon-button personal-goal-settings-action" onClick={onOpenGoalCapabilities} type="button"><SlidersHorizontal aria-hidden size={17} /></button>
+        ) : null}
+        {scopeControl}
+        {!selectedGoal ? sourceRuntimeControl : null}
         {onRefresh ? (
           <span className={`personal-refresh-control is-${refreshState ?? "idle"}`}>
-            {refreshState === "loading" ? <small>刷新中</small> : refreshState === "done" ? <small>刚刚更新</small> : refreshState === "error" ? <small>刷新失败</small> : null}
-            <button aria-label={refreshState === "loading" ? "正在刷新" : "刷新状态"} className="personal-icon-button" disabled={refreshState === "loading"} onClick={onRefresh} type="button">
+            {refreshState === "loading" ? <small>{t("header.refreshing")}</small> : refreshState === "error" ? <small>{t("header.refreshFailed")}</small> : null}
+            <span className="personal-sr-only" role="status">{refreshState === "done" ? t("header.refreshDone") : null}</span>
+            <button aria-label={refreshState === "loading" ? t("header.refreshing") : t("header.refresh")} className="personal-icon-button" disabled={refreshState === "loading"} onClick={onRefresh} type="button">
               <RefreshCw className={refreshState === "loading" ? "is-spinning" : undefined} size={17} />
             </button>
           </span>

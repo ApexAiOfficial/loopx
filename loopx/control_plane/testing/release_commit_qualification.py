@@ -1,12 +1,21 @@
 from __future__ import annotations
 
-import ast
 import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .release_evaluation_gate import (
+    RELEASE_EVALUATION_GATE_RECEIPT_SCHEMA_VERSION,
+    classify_semver_transition,
+    parse_semver_tuple,
+    validate_evaluation_document,
+    validate_evaluation_ledger_tree,
+    validate_release_evaluation_gate,
+)
+from .release_metadata import checkout_release_metadata
+from ..content_digest import ENVELOPED_SHA256_PATTERN
 from ..runtime.public_safety import public_safe_compact_text
 from .actual_default_model_behavior_portfolio import (
     ACTUAL_DEFAULT_MODEL_BEHAVIOR_CONTRAST_COUNT,
@@ -14,6 +23,23 @@ from .actual_default_model_behavior_portfolio import (
     ACTUAL_DEFAULT_MODEL_BEHAVIOR_SCENARIO_COUNT,
 )
 
+
+__all__ = [
+    "EXACT_RELEASE_CHECK_RECEIPT_SCHEMA_VERSION",
+    "EXACT_RELEASE_COMMIT_MANIFEST_SCHEMA_VERSION",
+    "EXACT_RELEASE_COMMIT_RECEIPT_SCHEMA_VERSION",
+    "EXPECTED_RESULT_SCHEMA_BY_QUALIFICATION",
+    "RELEASE_EVALUATION_GATE_RECEIPT_SCHEMA_VERSION",
+    "REQUIRED_QUALIFICATION_IDS",
+    "build_exact_release_commit_qualification",
+    "classify_semver_transition",
+    "collect_release_source_identity",
+    "parse_semver_tuple",
+    "render_exact_release_commit_qualification_markdown",
+    "validate_evaluation_document",
+    "validate_evaluation_ledger_tree",
+    "validate_release_evaluation_gate",
+]
 
 EXACT_RELEASE_COMMIT_MANIFEST_SCHEMA_VERSION = (
     "exact_release_commit_qualification_manifest_v0"
@@ -39,13 +65,12 @@ EXPECTED_RESULT_SCHEMA_BY_QUALIFICATION = {
     "mypy": "mypy_summary_v0",
     "risk_canary": "loopx_premerge_validation_gate_v0",
     "full_public": "smoke_fleet_health_v0",
-    "install_upgrade_host": "release_install_upgrade_host_summary_v0",
+    "install_upgrade_host": "release_install_upgrade_host_summary_v1",
     "public_boundary": "loopx_public_boundary_check_v0",
     "doubao_actual_default": "actual_default_model_behavior_portfolio_v0",
 }
 
 _HEX_ID_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
-_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[A-Za-z0-9.+-]*)?$")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,159}$")
 
@@ -91,7 +116,7 @@ def _hex_id(value: Any, *, field: str) -> str:
 
 def _digest(value: Any, *, field: str) -> str:
     text = str(value or "").strip().lower()
-    if not _DIGEST_RE.fullmatch(text):
+    if not ENVELOPED_SHA256_PATTERN.fullmatch(text):
         raise ValueError(f"{field} must be a sha256 digest")
     return text
 
@@ -242,11 +267,11 @@ def _validate_install_upgrade_host(value: Any) -> tuple[dict[str, Any], list[str
     summary = _summary(
         value,
         qualification_id="install_upgrade_host",
-        allowed={"install_passed", "upgrade_passed", "host_passed"},
+        allowed={"install_passed", "upgrade_passed", "host_passed", "packaged_frontend_passed"},
     )
     normalized = {
         field: _boolean(summary.get(field), field=f"install_upgrade_host.{field}")
-        for field in ("install_passed", "upgrade_passed", "host_passed")
+        for field in ("install_passed", "upgrade_passed", "host_passed", "packaged_frontend_passed")
     }
     issues = [] if all(normalized.values()) else ["install_upgrade_host_failed"]
     return normalized, issues
@@ -416,6 +441,11 @@ def build_exact_release_commit_qualification(
     manifest: Mapping[str, Any],
     *,
     observed_source: Mapping[str, Any] | None = None,
+    evaluations_dir: Path | None = None,
+    prior_stable_version: str | None = None,
+    evaluation_json: Path | None = None,
+    repo_root: Path | None = None,
+    verify_git_tags: bool = False,
 ) -> dict[str, Any]:
     """Validate exact-source release evidence without executing checks or publishing."""
 
@@ -463,16 +493,32 @@ def build_exact_release_commit_qualification(
     if candidate["git_dirty"]:
         source_mismatches.append("candidate:git_dirty")
 
-    ready = not missing and not failures and not source_mismatches
+    evaluation_gate: dict[str, Any] | None = None
+    if evaluations_dir is not None:
+        evaluation_gate = dict(
+            validate_release_evaluation_gate(
+                evaluations_dir=evaluations_dir,
+                candidate_source=candidate,
+                prior_stable_version=prior_stable_version,
+                evaluation_json=evaluation_json,
+                repo_root=repo_root,
+                verify_git_tags=verify_git_tags,
+            )
+        )
+
+    evaluation_ready = evaluation_gate is None or evaluation_gate.get("ready") is True
+    ready = not missing and not failures and not source_mismatches and evaluation_ready
     if source_mismatches:
         decision = "hold_source_mismatch"
     elif missing:
         decision = "hold_missing_qualification"
     elif failures:
         decision = "hold_failed_qualification"
+    elif not evaluation_ready:
+        decision = "hold_evaluation_gate_failed"
     else:
         decision = "ready_for_owner_release"
-    return {
+    receipt: dict[str, Any] = {
         "schema_version": EXACT_RELEASE_COMMIT_RECEIPT_SCHEMA_VERSION,
         "ready_for_release": ready,
         "decision": decision,
@@ -496,6 +542,9 @@ def build_exact_release_commit_qualification(
             "local_paths_recorded": False,
         },
     }
+    if evaluation_gate is not None:
+        receipt["evaluation_gate"] = evaluation_gate
+    return receipt
 
 
 def _git(repo_root: Path, *args: str) -> str:
@@ -503,7 +552,7 @@ def _git(repo_root: Path, *args: str) -> str:
         ["git", "-C", str(repo_root), *args],
         check=False,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     if completed.returncode != 0:
         raise ValueError("release source identity is unavailable from Git")
@@ -512,25 +561,9 @@ def _git(repo_root: Path, *args: str) -> str:
 
 def _checkout_package_version(repo_root: Path) -> str:
     try:
-        init_module = ast.parse(
-            (repo_root / "loopx" / "__init__.py").read_text(encoding="utf-8")
-        )
-    except (OSError, SyntaxError) as exc:
+        module_version = checkout_release_metadata(repo_root)["version"]
+    except (OSError, SyntaxError, ValueError) as exc:
         raise ValueError("release package version is unavailable from the checkout") from exc
-
-    module_version = None
-    for statement in init_module.body:
-        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
-            continue
-        target = statement.targets[0]
-        if (
-            isinstance(target, ast.Name)
-            and target.id == "__version__"
-            and isinstance(statement.value, ast.Constant)
-            and isinstance(statement.value.value, str)
-        ):
-            module_version = statement.value.value
-            break
     if not isinstance(module_version, str) or not _VERSION_RE.fullmatch(module_version):
         raise ValueError("release package version is invalid in the checkout")
     return module_version
@@ -582,6 +615,22 @@ def render_exact_release_commit_qualification_markdown(payload: dict[str, Any]) 
         if values:
             lines.extend(["", f"## {title}"])
             lines.extend(f"- `{value}`" for value in values)
+    eval_gate = payload.get("evaluation_gate")
+    if isinstance(eval_gate, dict):
+        lines.extend(
+            [
+                "",
+                "## Release Evaluation Gate",
+                f"- ready: `{eval_gate.get('ready')}`",
+                f"- transition_kind: `{eval_gate.get('transition_kind')}`",
+                f"- a_scale_score: `{eval_gate.get('a_scale_score')}`",
+                f"- b_scale_score: `{eval_gate.get('b_scale_score')}`",
+            ]
+        )
+        if eval_gate.get("inherited_from"):
+            lines.append(f"- inherited_from: `{eval_gate.get('inherited_from')}`")
+        for issue in eval_gate.get("issues") or []:
+            lines.append(f"- issue: `{issue}`")
     lines.extend(
         [
             "",

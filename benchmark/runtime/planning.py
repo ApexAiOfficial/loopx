@@ -1,0 +1,114 @@
+"""Consume the product task-planning checkpoint and verify its state readback."""
+
+from __future__ import annotations
+
+import json
+import math
+import subprocess
+from pathlib import Path
+
+
+def render_planning_prompt(packet: dict, env: dict[str, str]) -> str:
+    """Deliver the Core packet and explicitly selected observation tool context.
+
+    The worker calls this only for its explicit loopx-planned task entry. Core
+    Goal/CLI planning and plain native benchmark workers do not use this wrapper.
+    """
+    if "LOOPX_PLANNING_TIMEOUT_SEC" in env:
+        raise ValueError(
+            "Remove LOOPX_PLANNING_TIMEOUT_SEC; planning uses LOOPX_PHASE_DEADLINE_EPOCH"
+        )
+    key = "LOOPX_PHASE_DEADLINE_EPOCH"
+    if key in env:
+        value = float(env[key])
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{key} must be finite and positive")
+    from .research_probe import runtime_execution_guidance
+
+    batch = ""
+    if env.get("LOOPX_TASK_STAGE") == "plan":
+        from .planning_batch import planning_batch_guidance
+
+        batch = planning_batch_guidance()
+    return ("$loopx\n\n"
+            + runtime_execution_guidance(env)
+            + batch
+            + "Host-supplied planning checkpoint:\n" + json.dumps(packet, ensure_ascii=False))
+
+
+def task_plan_packet(env: dict[str, str], cli: list[str]) -> dict:
+    command = cli + [
+        "todo",
+        "plan",
+        "--goal-id",
+        env["LOOPX_GOAL_ID"],
+        "--agent-id",
+        env["LOOPX_AGENT_ID"],
+        "--project",
+        env["LOOPX_PROJECT"],
+        "--text",
+        Path(env["LOOPX_TASK_DOC"]).read_text(encoding="utf-8"),
+    ]
+    response = subprocess.run(
+        command,
+        cwd=env["LOOPX_PROJECT"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+    packet = json.loads(response.stdout)
+    if (
+        packet.get("ok") is not True
+        or packet.get("schema_version") != "loopx_task_planning_v0"
+        or packet.get("goal_id") != env["LOOPX_GOAL_ID"]
+        or packet.get("agent_id") != env["LOOPX_AGENT_ID"]
+        or packet.get("execution_handoff", {}).get("owner") != "caller"
+    ):
+        raise ValueError("product planning packet does not match the caller binding")
+    return packet
+
+
+def validate_plan_readback(result: dict, before: dict, after: dict) -> dict:
+    if (
+        result.get("input_digest") != before["input_digest"]
+        or after["input_digest"] != before["input_digest"]
+    ):
+        raise ValueError("planning input changed before readback")
+    status = result.get("status")
+    ids = result.get("todo_ids")
+    if (
+        status not in {"ready", "blocked"}
+        or not isinstance(ids, list)
+        or not ids
+        or any(not isinstance(item, str) for item in ids)
+        or len(set(ids)) != len(ids)
+    ):
+        raise ValueError(
+            "planning result requires unique actual Todo ids and a typed status"
+        )
+    todos = {item["todo_id"]: item for item in after["existing_todos"]}
+    if any(todo_id not in todos for todo_id in ids):
+        raise ValueError("planning referenced a missing or unrelated Todo")
+    if status == "ready" and not set(ids).issubset(after["runnable_todo_ids"]):
+        raise ValueError("planning referenced non-runnable or unclaimed work")
+    if status == "blocked" and not set(ids).issubset(after["blocking_todo_ids"]):
+        raise ValueError("blocked planning result requires unresolved blocking Todos")
+    requirements = after.get("goal_acceptance", {}).get("planning_requirements", {})
+    if status == "ready" and (
+        requirements.get("agent_id") != after["agent_id"]
+        or requirements.get("declaration_current") is not True
+        or not set(ids).issubset(requirements.get("linked_todo_ids", []))
+    ):
+        raise ValueError("ready planning requires canonical overall requirements linked to its Todos")
+    return {
+        "input_digest": before["input_digest"],
+        "status": status,
+        "todo_ids": ids,
+        "goal_id": after["goal_id"],
+        "agent_id": after["agent_id"],
+        "state_readback_verified": True,
+        **({"goal_requirements_readback": requirements} if status == "ready" else {}),
+        "execution_owner": "caller",
+    }

@@ -2,7 +2,8 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Draft，等待维护者评审 |
+| 状态 | 已接受 |
+| 替代 / 关闭 | 无 |
 | 日期 | 2026-08-13 |
 | 作者 | LoopX maintainers |
 | 范围 | 研究证据、覆盖、组合前沿、replan 集成、执行交接与资格验证 |
@@ -121,19 +122,21 @@ hypothesis”或“新 probe family”。它无法持久表达：A 和 B 都已�
 | 空转检测 | 连续且物质等价的 typed observation 可以派生 replan trigger。 |
 | Semantic replan closure | 新类型化维度、grounded successor、concrete blocker 或 coverage-backed terminal result 可以关闭当前 obligation。 |
 | Host-delivered context | Quota 可以投影 compact coverage ledger 与 uncovered frontier，不要求手动 evidence-read 仪式。 |
-| Explore evidence | Explore 拥有 append-only node、edge、finding 与有界 public-safe projection。 |
+| Explore evidence 与普通捕获 | Explore 拥有 append-only node/edge/finding。现有结果附件在主工作提交前验证，再幂等投递 finding 与 Todo 关联；部分关联失败保留已提交工作，沿原操作重放。有界 turn context 返回范围明确的证据。这是捕获/回读，不是 §11.5 的决策采用门。 |
+| Research evidence 与 cold shadow | [Research observation v0](../../reference/protocols/research-observation-v0.zh-CN.md) 组合 generic progress、typed closure 和 explicit binary candidate。CLI summary 与 Lark node summary 共用只读投影，精确 experiment input fingerprint 防止过期结果继续有效。 |
+| 显式 M3 组合门禁 | [PR #5280](https://github.com/loopx-project/loopx/pull/5280) 已于 2026-10-12 作为 `1e6cae19f` 合入。可选启用的 Goal-frontier、Todo、experiment 和 input lineage 在 File/SQLite 中共用 typed write-time qualification；陈旧或无关证据不能解除当前义务。仍由既有 Goal 能力编辑器和 CLI 负责启用。规则已集成，不等于科学结果获接受或自然宿主已验收。 |
 | Explore planning | 可选 branch planner 保持只读，并把执行交还 quota、Todo、claim 和 lease。 |
+| Turn context 中的证据 | Planning 模式的 turn-start 读取保留有界的显式 Todo/节点证据诊断与既有 exploring 前沿节点。关联证据先分类再裁剪详情：输入投影中的全部 finding 和相关边参与诊断计数与风险判断，逐行详情仍保持有界。显式选择的任务先保留来源新近排序及预留反证，再处理无关 planner 关联；版本化测量和重放使用同一范围。[#7053](https://github.com/loopx-project/loopx/pull/7053)、[#7077](https://github.com/loopx-project/loopx/pull/7077)。Turn context 报告省略详情数。这交付决策输入，不代表 §11.5 adoption gate 或模型行为已经验证。 |
 | Model behavior qualification | 真实 function-tool 对话可以验证模型是否读取真实 packet 并选择真实 semantic writeback。 |
 
 ### 5.2 还缺什么
 
 | 缺口 | 后果 |
 |---|---|
-| 没有 typed closure basis | Terminal 结论无法脱离 prose 说明究竟是哪项 constraint 使其成立。 |
-| 没有 composition candidate | 分别研究过的节点之间的关系无法持久化。 |
-| 没有 composition experiment identity | Replay 可能重复调度 joint probe，或把 Todo 错当成实验结果。 |
-| 没有 composition gap projection | Goal-frontier 无法区分 atomic exhaustion 和未验证 interaction。 |
-| 没有研究专用 qualification matrix | 测试尚未证明 candidate→gap→experiment→result 的因果链。 |
+| 已集成的 M3 行为尚缺完整远端资格验证 | PR #5280 有精确 head 的批准评审，以及本地 File/SQLite、默认关闭和打包配置旅程证据。最终 head 的 CI 未全绿：合入时多项任务被取消，Stage2c 汇总因矩阵结果为 `cancelled` 而失败。这不证明 Stage2c 测试本身失败，也不构成远端浏览器验收。独立的浏览器 CI 源码安装和输入框焦点 PR #6287/#6282 均关闭且未合入；其未完成的检查与 M3 本地证据分开。 |
+| 实际 experiment-result adoption 仍未验收 | 已有捕获、当前任务证据交付和可恢复阅读，但不能证明下一绑定决策使用了结果的 scope、validity 与 uncertainty。先按 §11.5 验证影子采用，再考虑增加强制；已合入的 PR #5280 未强制该决策义务。 |
+| 执行 attribution 不是 effect 权限 | 精确 Todo/experiment/input receipt 不授予 task lease、effect 权限或已接受的 Goal closure。 |
+| Live qualification 不完整 | Deterministic 与真实 CLI/file-log 测试证明状态语义，不证明 model selection 质量或科学结论；projection 测试不构成 live Lark sync 资格。 |
 | inferred combination 没有 promotion evidence | 共享 constraint 的精度还不足以直接触发 obligation。 |
 
 ## 6. 研究状态模型
@@ -205,8 +208,10 @@ A、B 之间的 `joint_probe` 直连边会把 candidate、execution 和 result �
 
 ## 7. Typed contract 方向
 
-以下 schema 是设计目标，而非已经发布的 protocol。最终 wire form 必须连同
-active caller、protocol reference 和 focused validation 一起引入。
+Research envelope 与 closure basis 已有真实 CLI caller 和
+[版本化证据协议](../../reference/protocols/research-observation-v0.zh-CN.md)。
+Opt-in M3 开发路径已实现精确 execution lineage 和共享 write gate。下文 model
+selection 仍为设计目标；有界 retirement 已实现，cold shadow 不会激活门禁。
 
 ### 7.1 组合，而不是静默修改 v0
 
@@ -549,6 +554,174 @@ Host 应投影：
 满足协议仪式。Delivery receipt 证明 context 到达；observation 证明下一步是否
 真正使用了 context。
 
+### 11.5 由证据驱动的实验决策（修订提案）
+
+这项 2026-10-04 提案细化 M3，先于 M4 portfolio selection；不代表实验控制器
+已交付，不改变普通 replan 默认行为。
+[决策 checkpoint](hierarchical-agent-stride-control-v0.zh-CN.md#75-长作业与决策-checkpoint修订提案)
+决定何时关注结果，本节定义研究决策应保留什么。最近的 capability owner 是
+Explore；原生测量、统计解释和 job/artifact 处理留在 domain/benchmark provider。
+Generic kernel 不解释分数，也不从 Todo 更新推断研究真相。
+
+#### 已集成输入与下一资格验证
+
+在 main `5550e91bab`（2026-10-23），有范围的证据排序与比较版本身份已集成，
+Research 阅读入口也能通过 [#7084](https://github.com/loopx-project/loopx/pull/7084)
+恢复分页结论并读取完整关联任务。开始该试点不需要重建捕获、排序或另一证据收件箱。
+这些修复验证的是交付／回读边界；页面可读或引用 finding 都不能证明实际决策采用。
+
+选择一项既有、获授权的待决问题，保留确切 incumbent、candidate/input/result
+revision、适用反证与剩余预算。观察正常准入的下一动作是否使用这些证据，再检查
+实际产物和 provider 结果。在相同条件下对照仅交付证据的情况，分别报告合理接续、
+改变方法、前置无效及结果不确定。依照[测量／重规划研究](long-horizon-harness-benchmark-research-program-v0.zh-CN.md#82-evidence空转检测与-semantic-replan)
+把晚期已验证提升保留为支持接续的积极证据。下一次复核评估结果质量及含控制、验证
+在内的完整边际成本。引用、新标识或强制换路都不是验收 oracle。这是既有路径的
+下一影子资格验证，不代表实验已启动、默认行为改变或 M3/M4 完成。
+
+#### 绑定问题与证据适用范围
+
+普通范围内的 finding 已经通过[工作回写](../../../loopx/capabilities/explore/README.md#results-from-ordinary-work-writeback)
+使用 `explore_result_attachment_v0` 或既有 `explore_result_from_path_delta_v0`。
+复用这条捕获/重放路径。首个 §11.5 caller 应明确还缺哪些 result-validity 和
+decision-adoption 事实，只为现有合同缺少的事实扩展注册契约；不另建结果日志，
+不向 research observation v0 偷加字段。剩余决策合同所需概念数据如下：
+
+| 数据 | 所属语义 |
+|---|---|
+| Hypothesis 与已声明 mechanism family | 稳定 Explore node/revision，显式关联 family node。相似名字/prose 不证明等价；family 是有范围的机制假设，不是 kernel 推断的分类。 |
+| Probe 与 applicability | 计划 intervention、candidate/input fingerprint、比较对象、环境/数据/evaluator revision、scope、资源/停止边界。Provider 声明什么支持、反驳或不能确定该假设。 |
+| Result 与 validity | 精确 provider result revision/evidence、比较和 uncertainty/guardrail assessment。失败、缺失、不可比的测量与有效负证据区分。 |
+| Decision 与 adoption | 精确 input/result fingerprint，现有 `continue`/`no_change`/`replan` path outcome、evidence ref 与绑定 task step 或 grounded successor。重复 probe 要有新的判别问题，或明确的 replication/uncertainty 理由和预算。 |
+
+这是额外决策合同的设计清单，不表示通用结果捕获尚不存在，也不是已接受 wire schema
+或新 global enum。其 TS codec/reducer 归 Explore；compute/capture provider 适配，
+不新增平行决策源。复用 node、finding、
+`supports`/`refutes`、closure 和 input-fingerprint 语义。Versioned decision
+attachment 与现有 Goal path delta、Todo-bound recommendation receipt 组合，
+不新增 Next Action 或 settlement store。ML adapter 可映射已有 hypothesis ledger
+的 weakened/retired 状态，但这套词表不成为 generic progress result class。
+
+| 证据 | 合法决策依据 |
+|---|---|
+| 构建或测量失败 | 修复前置条件或记录 blocker，不声称科学假设被反驳。 |
+| 一个有效 candidate 更差 | 保留 incumbent，证据绑定该 candidate/probe scope。带理由选择其他 probe、复验或 replan，不自动退休整个 family。 |
+| 效果处于 uncertainty 内或测量冲突 | 保留 unresolved/contradictory evidence，选择有界判别 probe 或有依据复验。小幅掉分不是 drift。 |
+| 已声明 coverage 反驳 hypothesis | 以 closure basis 关闭/修订精确假设；successor 引用排除结论与改变之处。针对未覆盖条件的同机制 probe 仍合法。 |
+| Coverage 支持退休 family | 只退休有 attributable evidence 的已声明 family/scope。新的 input、evaluator 或 applicability 可重开调查；退休不直接 settle Goal acceptance。 |
+
+否定一个参数仍可保留 family；在覆盖条件内证明不能满足已声明 constraint，
+才可能支持换 family。Kernel 验证 attribution 与 transition，不认证因果真相或
+实验质量。仅重命名 identifier 或为未变测量分配新 evidence id 不是 novelty。
+不用固定失败次数强制 pivot。
+
+#### 在现有决策边界让 adoption 可观察
+
+1. 在精确 experiment node 记录/读回 validated result，保留 provider provenance
+   与当前 input fingerprint。Launch receipt 单独不是 research evidence。
+2. 显式 per-Goal opt-in 时，为绑定 experiment/Todo 投影紧凑 pending decision：
+   问题、incumbent、适用 exclusion、uncertainty/invalidity、input/result ref 和
+   剩余预算。限制交付包而不截断源事实；分别测源日志验证、索引和跨语言成本。
+   当前有界视图可能读取完整日志，投影本身不需要新增 reasoning 调用。
+3. 由正常获准 Agent 决策。继续合法，但须说明下一 probe 要获得什么新信息，
+   以及 exclusion 为什么尚未回答该问题。Pivot 指出改变的问题/机制与证据，
+   使用已有 grounded successor 路径。
+4. Explore typed reducer 验证 decision attachment。Shared write gate 关联
+   精确 Todo/replan/Turn 与当前 input revision，随普通 task-step/successor
+   receipt 提交。Generic replan 保留已有合法 outcome。Record/read、stale
+   citation 或无关 Todo 不能解除 opt-in decision duty。
+5. Crash 后重交 pending result，仅 durable adoption 后确认消费。Replay 恢复
+   原 decision receipt；同一 Turn 的结算重放幂等，新获准 recovery Turn 仍正常
+   结算。Input/result 改变使 pending decision 失效，历史事实继续保留。
+
+要求的是 **result -> interpretation -> adopted action**。绑定不证明质量。
+Operational validity、新研究信息、原生结果提升和 Goal acceptance 是不同
+observation。有效负实验可以是合法交付而没有涨分；连续负实验仍须暴露知识
+变化与剩余 frontier。
+
+渐进读取证据已经有生产回写消费者：当前来源会重放声明的 Explore result page，
+再准入首屏省略的 finding 引用。复用[Stride §7.6](hierarchical-agent-stride-control-v0.zh-CN.md#76-研究范围与证据驱动控制)
+的 page/basis 与恢复规则，不另建分页合同或 adoption receipt。页引用资格、显式
+委托结果使用和模型实际采用分别证明不同事实。验收顺序为 **provider 结果 → 当前
+来源回读 → 获准工作 → 可归属产物 → 独立结果 → 下一次复核**；覆盖来源不可用、
+有效但不适用的 finding、有范围负证据，以及支持保留现有方案的结果。复制 finding
+或填入引用不能单独证明采用；有依据的 no-change 仍然合法。历史增长时检查被省略
+反证，并分别测源扫描、排序、hash、序列化与交付上下文成本。
+
+#### 按能改变的决定选择调查
+
+初始未知、新机会、明确用户方向或反证都可以支持探索；重复失败不是必要条件，也不
+自动要求换方法。选择源码阅读、外部研究或实验流程前，说明问题、保持的约束、判别
+证据、预算和停止条件。这是普通工作选择，不是新的 skill router 或固定技能流水线；
+并行分支需要不同且有用的问题，并遵循既有容量和权限。
+
+技能报告和子任务完成只是候选证据。捕获时保留来源、适用范围、测试版本和未解决
+矛盾，不解析任意报告文案来自动认定 finding。下一获准决策可以采用、暂缓、有范围
+地复验或保留现有方案；通过既有 owner 记录确切任务/步骤或结果关系，并观察实际
+工作后再声称采用。不换路也可能有价值；普通工作没有可复用发现时无需空附件。
+捕获、模型使用、独立结果和完整成本分别验收。
+
+#### 最小有用路径与资格验证
+
+先接现有 **benchmark-toolkit admitted-run monitor/closeout** seam，与 Explore
+experiment node 组合。其
+[`benchmark_runtime_observation_v0` 与 continuity reducer](../../../loopx/capabilities/benchmark_toolkit/README.md)
+已有 runtime liveness、可归属 terminal result 和 launch generation 的区分。
+它们分类 provider fact，不运行实验，也不认证 result validity。受控 provider
+须实际执行/恢复一次有界 build/evaluation trial、验证结果、交付 pending decision、
+adopt 带证据 continuation/successor 并读回。先使用完整 trial result；训练中间
+checkpoint 要另有 provider postcondition 与资格验证。Preview-only domain pack
+不是 execution backend。
+有界 M3 prerequisite 不必等待 inferred composition、新 multi-agent scheduler
+或 M4 排序，也不关闭 M3 剩余 composition 工作。
+
+先 shadow capture：按 negative、inconclusive、failed、invalidated input 评估
+实际决策，不改变 scheduling。Enforcement 是现有 Explore configuration owner
+中的独立、可回滚 per-Goal opt-in；默认关闭时共享 surface 保持当前行为。
+关闭停止派生新 decision duty，保留 evidence 并完成 owed settlement，不删除
+job/result history，不豁免已有 replan/authority obligation。
+
+Enforcing slice 包含现有 frontend task/Explore 旅程：问题、candidate/incumbent、
+waiting/result state、有范围负证据、拟议 next action 与理由；已授权决策和
+readback，包含 stale-result recovery。Optional Lark 消费同源 projection/authority。
+CLI-only prerequisite 在 packaged interaction 验证前仍是 partial。
+
+资格验证覆盖真实 provider process 与 canonical state、revision/lease fence、
+重复/丢失交付、stop/revocation、缺失/冲突结果、无依据 replay/改名、过度退休、
+input 改变后重开 scope、合法同 family probe 与 default-off parity。随后在
+matched 总预算下独立验证模型 adoption 和科学效用；降低控制成本不能靠隐藏
+有效负证据。
+
+### 11.6 共享 replan 边界的研究范围复盘
+
+[执行、探索与纠偏集成指南](../long-running-execution-exploration-and-correction.zh-CN.md)
+说明如何选择研究方法、通过既有 Explore 附件返回证据，并验证它对后续工作的影响。
+指南复用本 RFC 的归属，不将探索变成普通执行的必经步骤。
+
+[步幅控制闭环](hierarchical-agent-stride-control-v0.zh-CN.md#76-研究范围与证据驱动控制)
+补充结果采用：下一实验应改变机制、验证覆盖，还是需要解决的不确定性？更多
+正确测试和更多命名假设不证明研究更广。原生/provider outcome、噪声与收益空间
+仍是领域证据，不成为 kernel 分类。在原目标内改变方法不要求新的 user gate；
+题目、验收、权限、反馈与预算变更仍由既有 owner 决定。
+
+有界源码前置切片复用已接受的 `goal_path_delta_v0` 与后续 typed progress，在既有
+复盘入口投递 `replan_context.decision_followthrough`。不增加强制 Explore 附件或
+capture，独立于 Explore 是否启用，也不能满足或解除额外义务。Progress 是记录
+证据，不是执行/采用或科学创新的裁决。§11.5 的 opt-in 结果采用门禁与 composition
+lineage 仍是独立、未资格化的工作。
+
+Agent 应保留已资格化 incumbent、指出未解释的目标缺口，并比较判别性替代、
+原路线接续与有理由的重复测量。所选探针的预测、采用条件及成本绑定正常 task/
+Vision continuation，下次复盘检查实际候选执行与结果。输入变化可重新打开有范围
+负 finding；不变条件下重复要说明理由。没有按已过小时数或退步分数强制转向、
+退休 family 的规则。
+
+通过[同起点接续实验](hierarchical-agent-stride-control-v0.zh-CN.md#77-研究状态分支与匹配接续)
+资格化干预，保留会话、负证据、代码/incumbent 与反馈机会。观察下一探针是否
+解决不确定性、结果是否进入实际采用的产物，再比较原生目标结果和完整成本。
+打开 session、path 写回与 context 送达都是前置事实，不证明研究效果。自动排序/
+enforcement 在特定 profile 验证前保持 default-off；此输入切片或 blog 声明都不
+闭合 M3/M4。
+
 ## 12. 写时强制
 
 Write gate 必须复用 quota 所用的同一 current goal-frontier 与 Explore gap
@@ -731,14 +904,31 @@ promotion。
 scheduler/harness、matched starting state、repeated arm、事先声明的 stopping
 rule，以及 model variance 与 control-plane failure 的分离。
 
+### 研究片段与面向人的进展阅读（提案）
+
+[benchmark 计量细化](long-horizon-harness-benchmark-research-program-v0.zh-CN.md#基于证据的研究片段评估拟议细化)
+提出跨 Turn 的分析单位，分开原生结果、信息、判别力、实际采用、重复、成本与覆盖。
+片段分组和语义评估输出只是只读标注，不能创建合法 Explore 边、关闭 composition gap、
+接受实验、改变可执行 frontier 或解除 replan 义务。复用 §7 与 §11.5 已有 typed evidence/
+relationship 与 result-adoption owner。
+
+缺元数据或尚无后续采用机会保留未知，不判负向进展。有依据的负结果可收窄下一次具体
+实验，不能据此排除整个方法族。来源版本检查和接收方实际采用是不同事实；时间相邻或
+摘要不构成因果关联。产品只接收获准安全投影；隐藏 evaluator 分析须同时满足 solver
+终止且评分完成，不能成为 solver 反馈。
+
+[产品阅读旅程](../../product/use-cases/auto-research/long-horizon-progress-design.zh-CN.md)
+复用 Goal/团队实时工作区展示 owner。科学切分与评估器校准、打包证据阅读、用户理解各有
+独立验收。本设计不提高下列实现里程碑，不新增自动评估、干预、图权威或实验单元。
+
 ## 16. Milestone
 
 | Milestone | 交付物 | Promotion gate | 状态 |
 |---|---|---|---|
-| M0 | RFC、current-state inventory 与显式 ownership decision | Maintainer review；无 runtime behavior | Draft |
-| M1 | Characterization fixture，以及 Explore 中的 typed research observation 与 closure contract | Deterministic normalization、privacy、compatibility 与 negative test | 未开始 |
-| M2 | Explicit-only composition candidate、canonical gap projection 与 read-only status shadow | 不做 pairwise inference；packet 有界；projection parity | 部分实现（#3173：显式 experiment 投影与 successor binding） |
-| M3 | Goal-frontier obligation、精确 Todo/experiment lineage 与共享 write-time gate | State/replay matrix 与 premerge canary 通过 | 未开始 |
+| M0 | RFC、current-state inventory 与显式 ownership decision | Maintainer review；无 runtime behavior | 已接受的设计 |
+| M1 | Characterization fixture，以及 Explore 中的 typed research observation 与 closure contract | Deterministic normalization、privacy、compatibility 与 negative test | Evidence/CLI 切片已实现；真实研究 qualification 独立保留 |
+| M2 | Explicit-only composition candidate、canonical gap projection 与 read-only status shadow | 不做 pairwise inference；packet 有界；projection parity | #3173 legacy quota/successor 与 CLI/Lark projection 的 canonical binary cold shadow 已交付；hot status/frontier adoption 随 M3 合入，live Lark qualification 仍未完成 |
+| M3 | Goal-frontier obligation、精确 Todo/experiment lineage、共享 write-time gate；§11.5 提议 single-experiment result/adoption prerequisite | State/replay matrix、真实 provider/state readback、default-off parity；enforcement 前验证 packaged journey | 显式门禁已在 #5280 作为 `1e6cae19f` 合入，并有精确 head 的批准评审。集成源码的本地验证通过：67 项聚焦 Python、37 项聚焦 TypeScript、control-plane typecheck、打包 Explore 配置旅程及 19/19 风险 canary。最终 head 的 CI 如 §5.2 所述被取消/汇总失败，远端和已安装宿主验收仍未证明。§11.5 结果采用仍是设计提案，不是已交付 runtime。 |
 | M4 | 有界 multi-candidate card、`composition_selection_v0`、真实 model-tool behavior qualification 与重复 live shadow | 模型从交付 candidate set 中自主选择合法 semantic action；选择质量不劣于 declared fallback；只保留 compact receipt | 未开始 |
 | M5 | Shared-constraint candidate 在 shadow mode 中排序 | 有 precision/cost evidence；不自动触发 | 未开始 |
 | M6 | 可选 inferred trigger | 显式 maintainer decision 与量化 promotion threshold | 延后 |
@@ -746,17 +936,51 @@ rule，以及 model variance 与 control-plane failure 的分离。
 
 ### 16.1 最小有用实现切片
 
-M1 与 M2 是第一组可评审切片：
+M1/M2 evidence 切片交付：
 
 - 不增加 scheduler 或 executor；
 - composition gap 保持 read-only、default-off；
 - 只接受显式 candidate；
 - 修改 Explore projection 前先 characterization；
 - 证明 public safety、canonical identity 与 bounded projection；
-- 在 status 中展示 candidate 与 gap，但暂不阻止 writeback。
+- 在 Explore summary 与既有 Lark node projection 展示 candidate/gap，保持 #3173
+  quota 行为。已合入的 M3 门禁与 status 共用 live frontier；远端和自然宿主
+  读回仍需独立 qualification。
 
-M3 是第一个 behavior-changing slice。它应单独成 PR，使 obligation 与 write gate
+验证入口为 `tests/control_plane_ts/explore_research.test.ts`、
+`tests/capabilities/test_explore_research_evidence.py` 与既有 composition-frontier/
+result-layer 检查。覆盖反向配对 canonical identity、terminal coverage、attribution、
+replay、input invalidation、stale experiment lineage 和真实 CLI/file-log 读回。
+Projection 测试不证明 live remote effect 或模型自主研究行为。交付继续由
+[#5214](https://github.com/loopx-project/loopx/issues/5214) 记录，该 issue 已关闭。
+关闭不补齐缺失的 live M3 qualification。后续研究方向由
+[#4391](https://github.com/loopx-project/loopx/issues/4391) 与
+[#3243](https://github.com/loopx-project/loopx/issues/3243) 跟踪；本 RFC 保留明确
+milestone gap，不另建平行 task tree。
+
+M3 是第一个 behavior-changing slice。PR #5280 使 obligation 与 write gate
 能够独立于 evidence schema 评审和回滚。
+
+M3 开发边界在 typed Explore owner 中连接当前同一 Agent 的 Todo、experiment
+和 input 事实。Goal policy 显式限定范围且默认关闭；既有能力编辑器与 CLI 共享
+配置 owner。Quota 与 refresh 复用同一 live frontier，原 duty 通过 rollout 标量
+字段和两端 receipt adapter 固定。真实 CLI 测试拒绝无关/延期 successor 与失效
+writeback，再通过精确 successor 结算原 Turn。File/SQLite 测试区分 canonical
+Todo 与陈旧显示行；打包 UI 验证策略预览、启用、关闭、读回和窄屏。Native actor/lease 与 CAS admission
+仍强制执行；固定 IO host 锁定图，typed owner 校验并持久化 completion evidence。
+真实 File/SQLite 与 legacy 测试覆盖缺少证据、direct IPC 自报 approval、terminal
+verb 绕过、保留 archive lineage 和不可变 completion 回放。Agent 范围的 status、
+Explore 与既有 Lark Summary 字段使用同一 live fact。Typed candidate dismissal
+允许 scoped terminal retirement；新 canonical blocker 与通用 Todo resume condition
+使 gap 暂缓，但不关闭。真实 CLI 通过原 Turn 校验 observed/dismissed/blocked 的
+精确 progress source；File/SQLite 独立验证 lease-safe wait/resume。
+输入/scope/activation 失效时，为原 duty 生成 source-qualified retirement。
+通用 readback 保留原 guard 与历史 debit，无支出关闭该 Turn，同时保持当前
+frontier 与 runnable/paused work 可见。IO 装配保留在既有 CLI/refresh composition
+root；共享门禁消费传入的 capability fact，typed owner 始终只有一个。
+本地 state/replay matrix 与 19 项 standard 风险验证通过。两个既有 scheduler ACK
+测试在相同本地 runtime、未修改 base 上也以相同方式失败；保留为 baseline 限制，
+不称为 green。Maintainer review 集成与独立 live qualification 仍未完成。
 
 ## 17. 被拒绝的替代方案
 
@@ -835,10 +1059,23 @@ evidence-backed terminal result。
 |---|---|
 | 2026-08-13 | 采用 Explore 作为 canonical research-topology owner；v0 选择 explicit-only composition candidate；joint work 表示为 experiment node；shared-constraint inference 延后到 shadow qualification。 |
 | 2026-08-13 | 将 eligibility 与 ranking 分离：控制面拥有合法、有界 candidate set，模型在多个 eligible candidate 中自主择优；selection receipt 只证明调度选择，不构成 research truth。该协议延后到 M4，不进入 #3173 的首期 runtime。 |
+| 2026-10-04 | 提议 §11.5 作为有界 M3 prerequisite：精确 result -> 有范围 interpretation -> adopted task step/successor。复用 Explore 和 task/replan receipt；Turn settlement、原生评分与科学资格独立。本次 RFC 更新不交付自动策略。 |
+
+探索 Harness 的产品入口现在将仅证据和证据加规划模式统一到既有 `explore`
+能力。类型化配置 owner 保留旧存储和 flag；规划配套图谱，但不授予 spawn 或外部
+发布权限。轮次开始 hook 通过既有 hook 契约请求有界证据和分支上下文。这是 M3
+入口与采纳的前置条件，不是实验选择、结果解释或科学收益的验收。
+CLI/File 状态与打包设置验证模式切换、过期预览恢复和关闭态行为；真实长程轨迹
+仍须验证模型实际采纳和后续推进。模式词汇仅属于 Explore 配置，不是新的 kernel
+生命周期或调度契约。
+
+结论阅读器区分来源的暂定判断与排队检查。写回模板要求明确选择结论状态，
+保留独立于结论状态的可选问题收束。这改善填写和回读；正确解读、实际收束与
+模型采纳仍须证据证明。历史记录、CLI 默认值与执行权限保持不变。
 
 ## 20. RFC 验收标准
 
-满足以下条件后，RFC 可从 Draft 转为 Accepted：
+RFC 合入即接受设计依据。实现资格仍需要以下证据：
 
 - ownership boundary 不创建第二份 research graph 或 executor；
 - 第一切片不依赖 inferred pair generation 也有独立价值；

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
 
 from loopx.control_plane import effect_runtime
+from loopx.control_plane.runtime import node_probe
 from loopx.doctor import collect_doctor, render_doctor_markdown
 
 
@@ -15,35 +18,278 @@ class _Completed:
         self.returncode = returncode
 
 
+def test_source_snapshot_observes_each_selected_file_metadata_once(tmp_path, monkeypatch):
+    names = ["first.ts", "nested/data.json", "....json", "folder.ts/child.ts"]
+    for name in [*names, ".json", ".ts", "ignored.py", "UPPER.TS"]:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    for name in names:
+        os.utime(tmp_path / name, ns=(1_000_000_000, 1_000_000_000))
+    selected = {tmp_path / name for name in names}
+    expected = []
+    for name in sorted(names):
+        metadata = (tmp_path / name).stat()
+        expected.append((name, metadata.st_mtime_ns, metadata.st_ctime_ns, metadata.st_size))
+    observed: list[Path] = []
+    original_stat = Path.stat
+
+    def observe_stat(path, *args, **kwargs):
+        if path in selected:
+            observed.append(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", observe_stat)
+    assert effect_runtime._runtime_source_snapshot(tmp_path) == tuple(expected)
+    assert sorted(observed) == sorted(selected)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires filesystem symlinks")
+def test_source_snapshot_follows_file_links_and_ignores_directory_or_broken_links(tmp_path):
+    root = tmp_path / "package"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "actual.ts"
+    target.write_text("export {};", encoding="utf-8")
+    (root / "alias.ts").symlink_to(target)
+    (root / "directory").symlink_to(outside, target_is_directory=True)
+    (root / "missing.ts").symlink_to(outside / "missing.ts")
+    (root / "loop.ts").symlink_to(root / "loop.ts")
+    metadata = target.stat()
+    assert effect_runtime._runtime_source_snapshot(root) == (
+        ("alias.ts", metadata.st_mtime_ns, metadata.st_ctime_ns, metadata.st_size),
+    )
+
+
+def test_source_snapshot_keeps_pathlib_policy_for_nonencodable_entries(tmp_path, monkeypatch):
+    source = tmp_path / "source.ts"
+    source.write_text("export {};", encoding="utf-8")
+    original_stat = Path.stat
+
+    def nonencodable_stat(path, *args, **kwargs):
+        if path == source:
+            raise ValueError("non-encodable path")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", nonencodable_stat)
+    assert effect_runtime._runtime_source_snapshot(tmp_path) == ()
+
+
 def test_runtime_fingerprint_rotates_when_any_owned_source_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_root = Path(effect_runtime.__file__).resolve().parent
-    for relative in effect_runtime._SOURCE_FILES:
+    source_files = effect_runtime._runtime_source_files(source_root)
+    assert "effect_runtime_server.ts" in source_files
+    assert "runtime_decode.ts" in source_files
+    assert "runtime/private_permissions.py" in source_files
+    assert "turn_transaction_contract.json" in source_files
+    for relative in source_files:
         source = source_root / relative
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source.read_bytes())
     monkeypatch.setattr(effect_runtime, "_control_plane_root", lambda: tmp_path)
 
-    effect_runtime._runtime_fingerprint.cache_clear()
     original = effect_runtime._runtime_fingerprint()
-    for index, relative in enumerate(effect_runtime._SOURCE_FILES):
+    for index, relative in enumerate(source_files):
         target = tmp_path / relative
         original_bytes = target.read_bytes()
         target.write_bytes(original_bytes + f"\n// fingerprint-{index}\n".encode())
-        effect_runtime._runtime_fingerprint.cache_clear()
         assert effect_runtime._runtime_fingerprint() != original
         target.write_bytes(original_bytes)
-    effect_runtime._runtime_fingerprint.cache_clear()
     assert effect_runtime._runtime_fingerprint() == original
+
+
+def test_runtime_fingerprint_reuses_hash_until_source_snapshot_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "runtime_decode.ts").write_text("export {};\n", encoding="utf-8")
+    (tmp_path / "turn_transaction_contract.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(effect_runtime, "_control_plane_root", lambda: tmp_path)
+    # Some filesystems preserve directory metadata across rapid entry changes.
+    # The source inventory must not rely on that metadata to discover new files.
+    monkeypatch.setattr(
+        effect_runtime,
+        "_runtime_directory_snapshot",
+        lambda *_args: (("", 0, 0),),
+        raising=False,
+    )
+    original_read_bytes = Path.read_bytes
+    reads: list[Path] = []
+
+    def counted_read_bytes(path: Path) -> bytes:
+        reads.append(path)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+
+    original = effect_runtime._runtime_fingerprint()
+    assert len(reads) == 2
+    assert effect_runtime._runtime_fingerprint() == original
+    assert len(reads) == 2
+
+    added = tmp_path / "new_runtime_dependency.ts"
+    added.write_text("export const added = true;\n", encoding="utf-8")
+    expanded = effect_runtime._runtime_fingerprint()
+    assert expanded != original
+    assert len(reads) == 5
+
+    added.unlink()
+    assert effect_runtime._runtime_fingerprint() == original
+    assert len(reads) == 5
+
+
+def test_runtime_fingerprint_rescans_when_a_discovered_file_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kept = tmp_path / "kept.ts"
+    removed = tmp_path / "removed.ts"
+    kept.write_text("export const kept = true;\n", encoding="utf-8")
+    removed.write_text("export const removed = true;\n", encoding="utf-8")
+    original_scan = effect_runtime._scan_runtime_source_snapshot
+    scans: list[tuple[str, ...]] = []
+
+    def scan_then_remove(root: Path) -> effect_runtime._RuntimeSourceSnapshot:
+        files = original_scan(root)
+        scans.append(tuple(row[0] for row in files))
+        if len(scans) == 1:
+            removed.unlink()
+        return files
+
+    monkeypatch.setattr(effect_runtime, "_scan_runtime_source_snapshot", scan_then_remove)
+
+    monkeypatch.setattr(effect_runtime, "_control_plane_root", lambda: tmp_path)
+
+    assert len(effect_runtime._runtime_fingerprint()) == 64
+    assert scans == [
+        ("kept.ts", "removed.ts"),
+        ("kept.ts",),
+        ("kept.ts",),
+    ]
+
+
+def test_runtime_fingerprint_rescans_when_a_snapshotted_file_disappears_while_reading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first.ts"
+    later = tmp_path / "later.ts"
+    first.write_text("export const first = true;\n", encoding="utf-8")
+    later.write_text("export const later = true;\n", encoding="utf-8")
+    original_read_bytes = Path.read_bytes
+    reads: list[str] = []
+    first_read = Event()
+
+    def remove_first_after_reading_last(path: Path) -> bytes:
+        content = original_read_bytes(path)
+        if path == first:
+            reads.append(path.name)
+            first_read.set()
+        else:
+            if first.exists():
+                assert first_read.wait(timeout=5)
+                first.unlink()
+            reads.append(path.name)
+        return content
+
+    monkeypatch.setattr(effect_runtime, "_control_plane_root", lambda: tmp_path)
+    monkeypatch.setattr(Path, "read_bytes", remove_first_after_reading_last)
+
+    assert len(effect_runtime._runtime_fingerprint()) == 64
+    assert reads == ["first.ts", "later.ts", "later.ts"]
+
+
+def _install_persistent_stat_read_churn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, ...]]:
+    first = tmp_path / "first.ts"
+    later = tmp_path / "later.ts"
+    first.write_text("export const first = true;\n", encoding="utf-8")
+    later.write_text("export const later = true;\n", encoding="utf-8")
+    original_scan = effect_runtime._scan_runtime_source_snapshot
+    original_read_bytes = Path.read_bytes
+    scans: list[tuple[str, ...]] = []
+    first_read = Event()
+    later_reads = 0
+
+    def record_scan(root: Path) -> effect_runtime._RuntimeSourceSnapshot:
+        files = original_scan(root)
+        scans.append(tuple(row[0] for row in files))
+        return files
+
+    def churn_after_each_later_read(path: Path) -> bytes:
+        nonlocal later_reads
+        content = original_read_bytes(path)
+        if path == first:
+            first_read.set()
+        elif path == later:
+            later_reads += 1
+            if later_reads == 1:
+                assert first_read.wait(timeout=5)
+                first.unlink()
+            elif later_reads == 2:
+                first.write_text("export const first = true;\n", encoding="utf-8")
+        return content
+
+    monkeypatch.setattr(effect_runtime, "_control_plane_root", lambda: tmp_path)
+    monkeypatch.setattr(effect_runtime, "_scan_runtime_source_snapshot", record_scan)
+    monkeypatch.setattr(Path, "read_bytes", churn_after_each_later_read)
+    return scans
+
+
+def test_runtime_source_churn_has_a_stable_readiness_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scans = _install_persistent_stat_read_churn(tmp_path, monkeypatch)
+    monkeypatch.setattr(node_probe.shutil, "which", lambda _name: "node")
+    monkeypatch.setattr(
+        effect_runtime.subprocess,
+        "run",
+        lambda *_args, **_kwargs: _Completed(stdout="v22.22.3\n"),
+    )
+    result = effect_runtime.collect_effect_runtime_readiness()
+
+    assert result["status"] == "package_invalid"
+    assert result["ready"] is False
+    assert (
+        result["runtime_lifecycle"]["diagnostic_code"]
+        == "packaged_runtime_source_unstable"
+    )
+    assert scans == [
+        ("first.ts", "later.ts"),
+        ("later.ts",),
+        ("first.ts", "later.ts"),
+    ]
+
+
+def test_runtime_request_source_churn_raises_a_stable_startup_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scans = _install_persistent_stat_read_churn(tmp_path, monkeypatch)
+
+    with pytest.raises(effect_runtime.EffectRuntimeStartupError) as error:
+        effect_runtime.effect_runtime_request("runtime.ping", {})
+
+    assert error.value.diagnostic_code == "packaged_runtime_source_unstable"
+    assert scans == [
+        ("first.ts", "later.ts"),
+        ("later.ts",),
+        ("first.ts", "later.ts"),
+    ]
 
 
 def test_missing_node_blocks_the_typescript_control_plane_and_is_actionable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(effect_runtime.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(node_probe.shutil, "which", lambda _name: None)
 
     result = effect_runtime.collect_effect_runtime_readiness()
 
@@ -51,23 +297,39 @@ def test_missing_node_blocks_the_typescript_control_plane_and_is_actionable(
     assert result["ready"] is False
     assert result["default_cli_blocking"] is True
     assert result["required_for"] == ["control_plane"]
-    assert "Node.js 22.6.0 or newer" in str(result["recommended_action"])
+    assert "Node.js 22.22.3 or newer" in str(result["recommended_action"])
 
 
-def test_old_node_is_reported_without_running_semantic_probe(
+def test_missing_node_request_raises_startup_diagnostic(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(effect_runtime.shutil, "which", lambda _name: "node")
+    monkeypatch.setattr(effect_runtime, "_runtime_dir", lambda: tmp_path)
+    monkeypatch.setattr(node_probe.shutil, "which", lambda _name: None)
+
+    with pytest.raises(effect_runtime.EffectRuntimeStartupError) as error:
+        effect_runtime.effect_runtime_result("runtime.ping", {})
+
+    assert error.value.diagnostic_code == "node_unavailable"
+    assert "Node.js 22.22.3 or newer" in str(error.value)
+
+
+@pytest.mark.parametrize("version", ["20.19.5", "22.18.0", "22.22.2"])
+def test_old_node_is_reported_without_running_semantic_probe(
+    version: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(node_probe.shutil, "which", lambda _name: "node")
     monkeypatch.setattr(
         effect_runtime.subprocess,
         "run",
-        lambda *_args, **_kwargs: _Completed(stdout="v20.19.5\n"),
+        lambda *_args, **_kwargs: _Completed(stdout=f"v{version}\n"),
     )
 
     result = effect_runtime.collect_effect_runtime_readiness(deep=True)
 
     assert result["status"] == "unsupported"
-    assert result["detected_node_version"] == "20.19.5"
+    assert result["detected_node_version"] == version
     assert result["semantic_probe"] == "not_run"
 
 
@@ -76,11 +338,11 @@ def test_current_node_standard_probe_does_not_execute_rule(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(effect_runtime, "_runtime_dir", lambda: tmp_path)
-    monkeypatch.setattr(effect_runtime.shutil, "which", lambda _name: "node")
+    monkeypatch.setattr(node_probe.shutil, "which", lambda _name: "node")
     monkeypatch.setattr(
         effect_runtime.subprocess,
         "run",
-        lambda *_args, **_kwargs: _Completed(stdout="v22.6.0\n"),
+        lambda *_args, **_kwargs: _Completed(stdout="v22.22.3\n"),
     )
 
     result = effect_runtime.collect_effect_runtime_readiness()
@@ -96,6 +358,8 @@ def test_current_node_standard_probe_does_not_execute_rule(
         "restart_policy": "automatic_on_next_control_plane_request",
         "idle_shutdown": True,
         "diagnostic_code": None,
+        "locator_state": "missing",
+        "recorded_pid_alive": None,
     }
 
 
@@ -103,7 +367,7 @@ def test_deep_probe_executes_packaged_semantics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(effect_runtime.shutil, "which", lambda _name: "node")
+    monkeypatch.setattr(node_probe.shutil, "which", lambda _name: "node")
     monkeypatch.setattr(
         effect_runtime.subprocess,
         "run",
@@ -137,11 +401,11 @@ def test_deep_probe_executes_packaged_semantics(
 def test_deep_probe_failure_is_public_safe_and_actionable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(effect_runtime.shutil, "which", lambda _name: "node")
+    monkeypatch.setattr(node_probe.shutil, "which", lambda _name: "node")
     monkeypatch.setattr(
         effect_runtime.subprocess,
         "run",
-        lambda *_args, **_kwargs: _Completed(stdout="v22.6.0\n"),
+        lambda *_args, **_kwargs: _Completed(stdout="v22.22.3\n"),
     )
 
     def failed(*_args: object, **_kwargs: object) -> dict[str, object]:
@@ -178,6 +442,8 @@ def test_doctor_markdown_projects_runtime_lifecycle_for_app_health() -> None:
                 "runtime_lifecycle": {
                     "state": "unavailable",
                     "diagnostic_code": "runtime_exited_before_ready",
+                    "locator_state": "missing",
+                    "recorded_pid_alive": None,
                 },
             },
             "checks": [],
@@ -185,6 +451,8 @@ def test_doctor_markdown_projects_runtime_lifecycle_for_app_health() -> None:
     )
 
     assert "typescript_runtime_state: `unavailable`" in rendered
+    assert "typescript_runtime_locator_state: `missing`" in rendered
+    assert "typescript_runtime_recorded_pid_alive: `None`" in rendered
     assert (
         "typescript_runtime_diagnostic: `runtime_exited_before_ready`" in rendered
     )
@@ -199,7 +467,7 @@ def test_missing_required_runtime_fails_doctor_health(
         "status": "ready",
         "required_for": ["control_plane"],
         "default_cli_blocking": True,
-        "minimum_node_version": "22.6.0",
+        "minimum_node_version": "22.22.3",
         "detected_node_version": "24.1.0",
         "semantic_probe": "not_requested",
         "recommended_action": None,
@@ -209,7 +477,7 @@ def test_missing_required_runtime_fails_doctor_health(
         "ready": False,
         "status": "missing",
         "detected_node_version": None,
-        "recommended_action": "Install Node.js 22.6.0 or newer.",
+        "recommended_action": "Install Node.js 22.22.3 or newer.",
     }
     monkeypatch.setattr(
         effect_runtime,
@@ -249,7 +517,7 @@ def test_deep_doctor_fails_when_present_runtime_cannot_execute_semantics(
         "status": "probe_failed",
         "required_for": ["control_plane"],
         "default_cli_blocking": True,
-        "minimum_node_version": "22.6.0",
+        "minimum_node_version": "22.22.3",
         "detected_node_version": "24.1.0",
         "semantic_probe": "failed",
         "recommended_action": "Reinstall LoopX.",

@@ -1,9 +1,24 @@
 from __future__ import annotations
 
 from typing import Any
+import shlex
 
+from .zcode_goal_mode import native_goal_activation
 from .agent_registry import normalize_registered_agents
+from .agy_goal_mode import (
+    AGY_ACCEPTED_INPUTS,
+    ANTIGRAVITY_APP_AGENT_TYPE_CATALOG_ENTRY,
+)
 from .control_plane.scheduler.execution_context import SchedulerRuntimeProfile
+from .hosts.skill_facade import (
+    agy_cli_activation,
+    antigravity_app_activation,
+    cursor_agent_activation,
+    gemini_cli_activation,
+    kiro_cli_activation,
+    zcode_activation,
+)
+from .kiro_cli_goal_mode import KIRO_CLI_AGENT_TYPE_CATALOG_ENTRY
 from .control_plane.todos.contract import (
     normalize_required_capabilities,
     normalize_todo_claimed_by,
@@ -11,16 +26,18 @@ from .control_plane.todos.contract import (
 from .project_prompt import (
     render_heartbeat_prompt_command,
     render_heartbeat_prompt_json_command,
-    shell_arg,
+    render_register_agent_command,
 )
 
 SCHEMA_VERSION = "loopx_host_loop_activation_v1"
 AGENT_TYPE_CATALOG_SCHEMA_VERSION = "loopx_agent_type_catalog_v0"
 IDENTITY_SELECTION_SCHEMA_VERSION = "loopx_host_loop_identity_selection_v0"
+PI_OPTIONAL_COMPAT_ECHO = "optional compatibility echo; host authority derives the value"
 HOST_MANAGED_SKILL_AGENT_TYPES = frozenset(
     {
         "ark-managed-agent",
         "deepseek-harness-native",
+        "trae_app",
         "traex-cli",
         "other-agent",
     }
@@ -37,6 +54,7 @@ def scheduler_command_binding_for_agent_type(
         "codex-app-ssh": SchedulerRuntimeProfile.CODEX_APP_SSH_VISIBLE,
         "codex-cli": SchedulerRuntimeProfile.CODEX_CLI_VISIBLE,
         "codex-ide-plugin": SchedulerRuntimeProfile.CODEX_CLI_VISIBLE,
+        "trae_app": SchedulerRuntimeProfile.TRAE_APP,
         "claude-code": SchedulerRuntimeProfile.CLAUDE_CODE_VISIBLE,
         "kunluncode": SchedulerRuntimeProfile.KUNLUNCODE_VISIBLE,
         "opencode": SchedulerRuntimeProfile.GENERIC_CLI_AGENT_LOOP,
@@ -45,6 +63,10 @@ def scheduler_command_binding_for_agent_type(
         "pi": SchedulerRuntimeProfile.GENERIC_CLI_AGENT_LOOP,
         "gemini-cli": SchedulerRuntimeProfile.GENERIC_CLI_AGENT_LOOP,
         "cursor-agent": SchedulerRuntimeProfile.GENERIC_CLI_AGENT_LOOP,
+        "zcode": SchedulerRuntimeProfile.GENERIC_CLI_AGENT_LOOP,
+        "agy": SchedulerRuntimeProfile.GENERIC_CLI_AGENT_LOOP,
+        "antigravity-app": SchedulerRuntimeProfile.ANTIGRAVITY_APP,
+        "kiro-cli": SchedulerRuntimeProfile.KIRO_CLI_VISIBLE,
         "deepseek-harness": SchedulerRuntimeProfile.GENERIC_CLI_AGENT_LOOP,
         "deepseek-harness-native": SchedulerRuntimeProfile.GENERIC_CLI_AGENT_LOOP,
     }.get(canonical)
@@ -63,6 +85,7 @@ SUPPORTED_AGENT_TYPES = [
     "codex-app-ssh",
     "codex-ide-plugin",
     "codex-cli",
+    "trae_app",
     "claude-code",
     "kunluncode",
     "opencode",
@@ -71,6 +94,10 @@ SUPPORTED_AGENT_TYPES = [
     "pi",
     "gemini-cli",
     "cursor-agent",
+    "zcode",
+    "agy",
+    "antigravity-app",
+    "kiro-cli",
     "deepseek-harness",
     "deepseek-harness-native",
     "manual",
@@ -122,6 +149,14 @@ AGENT_TYPE_CATALOG: dict[str, dict[str, Any]] = {
             "codex-cli-tui",
             "codex_cli_tui",
             "codex tui",
+        ],
+    },
+    "trae_app": {
+        "display_name": "Trae App",
+        "host_loop": "Trae App heartbeat automation",
+        "entry": "$loopx <task> or the explicit LoopX skill from /skills",
+        "accepted_inputs": [
+            "trae_app",
         ],
     },
     "codex-ide-plugin": {
@@ -236,6 +271,25 @@ AGENT_TYPE_CATALOG: dict[str, dict[str, Any]] = {
             "cursor cli",
         ],
     },
+    "zcode": {
+        "display_name": "ZCode",
+        "host_loop": "agent-driven ZCode loop gated by LoopX quota should-run",
+        "entry": "$loopx <task> or the LoopX skill from ZCODE_HOME/skills",
+        "accepted_inputs": [
+            "zcode",
+            "z_code",
+            "z code",
+            "z-code",
+        ],
+    },
+    "agy": {
+        "display_name": "Antigravity CLI",
+        "host_loop": "Antigravity CLI native /goal loop with schedule self-wakes (LoopX quota pacing is advisory)",
+        "entry": "the LoopX skill installed in ~/.gemini/antigravity-cli/skills",
+        "accepted_inputs": list(AGY_ACCEPTED_INPUTS),
+    },
+    "antigravity-app": ANTIGRAVITY_APP_AGENT_TYPE_CATALOG_ENTRY,
+    "kiro-cli": KIRO_CLI_AGENT_TYPE_CATALOG_ENTRY,
     "deepseek-harness": {
         "display_name": "DeepSeek Harness",
         "host_loop": "DeepSeek Harness headless/automation loop gated by LoopX quota",
@@ -290,6 +344,7 @@ AGENT_TYPE_ALIASES = {
     _agent_type_key(alias): canonical
     for canonical, metadata in AGENT_TYPE_CATALOG.items()
     for alias in metadata["accepted_inputs"]
+    if alias != canonical
 }
 
 
@@ -318,6 +373,7 @@ HOST_SURFACE_TO_AGENT_TYPE = {
     "codex-app": "codex-app",
     "codex-app-ssh": "codex-app-ssh",
     "chat-box": "codex-app",
+    "trae_app": "trae_app",
     "codex-ide-plugin": "codex-ide-plugin",
     "codex-ide": "codex-ide-plugin",
     "codex-cli-tui": "codex-cli",
@@ -335,6 +391,17 @@ HOST_SURFACE_TO_AGENT_TYPE = {
     "gemini": "gemini-cli",
     "cursor-agent": "cursor-agent",
     "cursor": "cursor-agent",
+    "zcode": "zcode",
+    "z-code": "zcode",
+    "agy": "agy",
+    "antigravity": "agy",
+    "antigravity-cli": "agy",
+    "antigravity-app": "antigravity-app",
+    "antigravity_app": "antigravity-app",
+    "agy-app": "antigravity-app",
+    "agy_app": "antigravity-app",
+    "kiro-cli": "kiro-cli",
+    "kiro": "kiro-cli",
     "deepseek-harness": "deepseek-harness",
     "dsh": "deepseek-harness",
     "deepseek-harness-native": "deepseek-harness-native",
@@ -414,6 +481,9 @@ def render_agent_type_catalog_markdown(payload: dict[str, Any]) -> str:
 
 
 def normalize_agent_type(value: str | None) -> str:
+    canonical = (value or "").strip().lower()
+    if canonical in AGENT_TYPE_CATALOG:
+        return canonical
     key = _agent_type_key(value)
     if not key:
         raise AgentTypeError(
@@ -453,12 +523,15 @@ def _heartbeat_commands(
     goal_id: str,
     agent_type: str,
     cli_bin: str,
+    runtime_root: str | None = None,
+    registry: str | None = None,
     agent_id: str | None,
     available_capabilities: list[str] | None = None,
 ) -> dict[str, str]:
     scope_by_type = {
         "ark-managed-agent": "Ark Managed Agent one-shot Goal activation",
         "codex-app": "Codex App heartbeat automation",
+        "trae_app": "Trae App heartbeat automation",
         "codex-app-ssh": "Codex App SSH /goal visible task loop",
         "codex-ide-plugin": "Codex IDE plugin /goal visible task loop",
         "codex-cli": "Codex CLI /goal visible TUI loop",
@@ -469,6 +542,10 @@ def _heartbeat_commands(
         "pi": "Pi visible goal loop gated by LoopX",
         "gemini-cli": "Gemini CLI agent loop gated by LoopX",
         "cursor-agent": "Cursor Agent CLI loop gated by LoopX",
+        "zcode": "ZCode agent loop gated by LoopX",
+        "agy": "Antigravity CLI agent loop with advisory LoopX quota pacing",
+        "antigravity-app": "Antigravity App schedule timer & sidecar heartbeat loop",
+        "kiro-cli": "Kiro CLI native /goal loop with advisory LoopX quota pacing",
         "deepseek-harness": "DeepSeek Harness automation loop gated by LoopX",
         "deepseek-harness-native": "DeepSeek Harness same-session plugin loop gated by LoopX",
         "manual": "External scheduler or manual shell LoopX poll",
@@ -476,15 +553,13 @@ def _heartbeat_commands(
     }
     agent_scope = scope_by_type.get(agent_type, scope_by_type["other-agent"])
     scheduler_binding = scheduler_command_binding_for_agent_type(agent_type)
-    renderer_binding = (
-        {"visible_goal_host": "traex-cli"}
-        if agent_type == "traex-cli"
-        else {}
-    )
+    renderer_binding: dict[str, Any] = {"visible_goal_host": "traex-cli"} if agent_type == "traex-cli" else {}
     commands = {
         "heartbeat_prompt_json": render_heartbeat_prompt_json_command(
             goal_id,
             cli_bin=cli_bin,
+            runtime_root=runtime_root,
+            registry_path=registry,
             agent_id=agent_id,
             agent_scope=agent_scope,
             available_capabilities=available_capabilities,
@@ -494,6 +569,8 @@ def _heartbeat_commands(
         "heartbeat_prompt": render_heartbeat_prompt_command(
             goal_id,
             cli_bin=cli_bin,
+            runtime_root=runtime_root,
+            registry_path=registry,
             agent_id=agent_id,
             agent_scope=agent_scope,
             available_capabilities=available_capabilities,
@@ -501,6 +578,9 @@ def _heartbeat_commands(
             **renderer_binding,
         ),
     }
+    if agent_type in {"codex-app", "trae_app", "codex-app-ssh", "codex-cli", "codex-ide-plugin",
+                      "ark-managed-agent"}:
+        commands = {key: command + " --bootstrap" for key, command in commands.items()}
     if renderer_binding:
         commands["visible_goal_prompt_json"] = commands["heartbeat_prompt_json"]
     return commands
@@ -714,12 +794,43 @@ def _codex_app_activation(commands: dict[str, str]) -> dict[str, Any]:
         },
         "activation_steps": [
             "Run the heartbeat-prompt JSON command after project state and todos are written.",
-            "Read task_body from the JSON payload.",
-            "Create or update a Codex App heartbeat automation starting at 3 minutes.",
+            "Require ok=true; save the v2 bootstrap task_body through automation_update.",
+            "Read commands.automation_cadence_json before choosing a schedule; for an existing automation also read its automation-id scope.",
+            "New heartbeat: use max(3 minutes, configured minimum). Existing: preserve schedule unless it violates the configured minimum; preserve status, prompt and task binding.",
+            "Apply through automation_update, then view the automation and verify its actual RRULE. If the host rejects the required interval, hold the affected automation; never shorten the owner minimum.",
             "On later ticks, follow quota should-run scheduler_hint for backoff, reset, and scheduler-ack.",
         ],
         "success_criteria": [
             "A Codex App heartbeat automation exists for this goal and uses the generated task_body.",
+            "The next wakeup starts from LoopX quota/status/state, not stale chat memory.",
+        ],
+    }
+
+
+def _trae_app_activation(commands: dict[str, str]) -> dict[str, Any]:
+    return {
+        "host_surface": "trae_app",
+        "entry_command_hint": "$loopx <task> or the explicit LoopX skill from /skills",
+        "activation_method": "create_or_update_trae_app_automation",
+        "activation_input_command": commands["heartbeat_prompt_json"],
+        "host_mutation": {
+            "owner": "Trae App host",
+            "preferred_tool": "automation_update",
+            "cli_can_mutate_directly": False,
+            "missing_host_tool_gate": (
+                "Trae App automation_update is unavailable; surface a pasteable "
+                "heartbeat task_body gate instead of claiming autonomous setup."
+            ),
+        },
+        "activation_steps": [
+            "Run the heartbeat-prompt JSON command after project state and todos are written.",
+            "Read task_body from the JSON payload.",
+            "Create or update a Trae App heartbeat automation starting at 3 minutes.",
+            "On later ticks, follow quota should-run scheduler_hint for backoff, reset, and scheduler-ack.",
+        ],
+        "success_criteria": [
+            "A Trae App heartbeat automation exists for this goal and uses the generated task_body.",
+            "A settled non-terminal turn leaves the automation active for a fresh successor turn.",
             "The next wakeup starts from LoopX quota/status/state, not stale chat memory.",
         ],
     }
@@ -857,11 +968,12 @@ def _pi_activation(commands: dict[str, str], cli_bin: str) -> dict[str, Any]:
             "owner": "Pi LoopX goal extension",
             "host_tool": "loopx_goal_activate",
             "tool_argument_mapping": {
-                "goalId": "heartbeat_prompt.goal_id",
+                "activationToken": "pi_session_authority.token from the host startup/session packet",
+                "goalId": PI_OPTIONAL_COMPAT_ECHO,
                 "objective": "heartbeat_prompt.task_body",
-                "agentId": "heartbeat_prompt.agent_id when present",
-                "registryPath": "explicit registry path when present",
-                "availableCapabilities": "declared host capabilities when present",
+                "agentId": PI_OPTIONAL_COMPAT_ECHO,
+                "registryPath": PI_OPTIONAL_COMPAT_ECHO,
+                "availableCapabilities": PI_OPTIONAL_COMPAT_ECHO,
             },
             "cli_can_mutate_directly": False,
             "missing_host_tool_gate": (
@@ -873,7 +985,7 @@ def _pi_activation(commands: dict[str, str], cli_bin: str) -> dict[str, Any]:
         "activation_steps": [
             "Install or refresh the LoopX Pi surface when needed.",
             "Run the heartbeat-prompt JSON command after project state and todos are written.",
-            "Call loopx_goal_activate with goalId from goal_id, objective from task_body, and optional agentId, registryPath, or availableCapabilities when those values are present.",
+            "Call loopx_goal_activate with the activationToken from the host startup/session packet and objective from task_body; authority fields are host-derived and must not be changed by the model.",
             "Let the extension gate every settled continuation and timer wake through LoopX quota should-run.",
         ],
         "success_criteria": [
@@ -1007,125 +1119,38 @@ def _traex_activation(commands: dict[str, str]) -> dict[str, Any]:
         "host_mutation": {
             "owner": "TraeX CLI TUI",
             "host_command": "/goal <task_body>",
+            "preferred_tool": "create_goal",
             "cli_can_mutate_directly": False,
             "requires_host_feature_flag": "[features] goals = true in ~/.trae/traecli.toml",
             "missing_host_tool_gate": (
-                "TraeX /goal is unavailable; if goal mode is disabled, show the exact "
+                "Native Goal tools and active Goal context are unavailable; show the exact "
                 "`/goal <task_body>` text for the user to paste after enabling "
-                "`[features] goals = true`. Do not claim another host-loop surface "
+                "`[features] goals = true` if goal mode is disabled. Do not claim another host-loop surface "
                 "without a verified LoopX adapter."
             ),
         },
         "activation_steps": [
             "Run the visible-goal prompt JSON command after project state and todos are written.",
             "Read task_body from the JSON payload.",
-            "Set the visible TraeX goal to `/goal <task_body>`; enable `[features] goals = true` first if goal mode is off.",
+            "Read the current native Goal with get_goal when available, otherwise use the current host-provided Goal context. Tool availability is an observation, not permission to change a Goal.",
+            "For continuation inside the verified same-thread LoopX Goal/Agent binding, retain the active native Goal and its original objective. Do not call create_goal or replace that objective with task_body. Preserve paused, blocked and completed states; never resume them without user direction.",
+            "For an authorized fresh start, when the host confirms no native Goal exists, call create_goal with objective=task_body if available, then verify the Goal with get_goal or current host context. If native tools and active Goal context are unavailable, use the missing_host_tool_gate manual /goal path; enable `[features] goals = true` only if goal mode is off.",
             "Keep delivery in the visible TUI turn; gate each continuation through LoopX quota should-run and do not switch to hidden headless execution.",
         ],
         "success_criteria": [
-            "The visible TraeX TUI has `/goal <task_body>` active for this goal.",
+            "The visible TraeX TUI has a verified active native Goal for this work: retain its original objective on continuation, or verify task_body after fresh activation. A preview is not activation or model adoption.",
             "Future goal turns enter through LoopX quota/status/state before delivery work.",
         ],
     }
-
-
-def _skill_facade_cli_activation(
-    commands: dict[str, str],
-    cli_bin: str,
-    *,
-    host_label: str,
-    host_surface: str,
-    install_surface: str,
-    skills_root: str,
-    extra_host_mutation: dict[str, Any] | None = None,
-    extra_activation_steps: list[str] | None = None,
-) -> dict[str, Any]:
-    """Activation for a CLI host that LoopX reaches through a skill facade only.
-
-    Gemini CLI and cursor-agent have no goal primitive to bind: no `/goal` to
-    set, no extension tool to call, no host automation to schedule. What they do
-    have is skill discovery, so the loop driver is the agent's own turn loop and
-    LoopX gates it the only way it can — every continuation has to enter through
-    quota should-run. That is a weaker guarantee than a host-owned loop and is
-    stated as such, because claiming autonomous heartbeat support these hosts
-    cannot deliver is worse than admitting the agent drives itself.
-    """
-    return {
-        "host_surface": host_surface,
-        "entry_command_hint": f"the LoopX skill installed in {skills_root}",
-        "activation_method": "run_agent_cli_loop_gated_by_quota",
-        "activation_input_command": commands["heartbeat_prompt_json"],
-        "setup_command": (
-            f"{cli_bin} slash-commands --install --surface {install_surface}"
-        ),
-        "host_mutation": {
-            "owner": f"{host_label} session",
-            "host_loop_primitive": None,
-            "cli_can_mutate_directly": False,
-            "loop_driver": "agent_cli_turn_loop",
-            "missing_host_tool_gate": (
-                f"{host_label} exposes no goal or automation primitive for LoopX to "
-                "bind. If the session cannot keep entering through quota should-run, "
-                "show the exact heartbeat-prompt command for the user to run and do "
-                "not claim autonomous heartbeat support."
-            ),
-            **(extra_host_mutation or {}),
-        },
-        "activation_steps": [
-            f"Install or refresh the LoopX {host_label} surface when needed.",
-            "Run the heartbeat-prompt JSON command after project state and todos are written.",
-            "Read task_body from the JSON payload and carry it as the session objective.",
-            *(extra_activation_steps or []),
-            "Start every following turn with quota should-run and stop when it says stop; "
-            "there is no host scheduler to fall back on.",
-        ],
-        "success_criteria": [
-            f"The {host_label} session has the LoopX skill facade installed and the "
-            "generated task_body as its objective.",
-            "Each continuation enters through LoopX quota/status/state, and a stop "
-            "decision ends the session loop instead of free-running.",
-        ],
-    }
-
-
-def _gemini_cli_activation(commands: dict[str, str], cli_bin: str) -> dict[str, Any]:
-    return _skill_facade_cli_activation(
-        commands,
-        cli_bin,
-        host_label="Gemini CLI",
-        host_surface="gemini_cli_agent_loop",
-        install_surface="gemini",
-        skills_root="GEMINI_HOME/skills",
-    )
-
-
-def _cursor_agent_activation(commands: dict[str, str], cli_bin: str) -> dict[str, Any]:
-    return _skill_facade_cli_activation(
-        commands,
-        cli_bin,
-        host_label="Cursor Agent CLI",
-        host_surface="cursor_agent_loop",
-        install_surface="cursor",
-        skills_root="CURSOR_HOME/skills",
-        extra_host_mutation={
-            # The MCP server is how a cursor-agent session reads LoopX state
-            # without shelling out; the loop is still the agent's own turns.
-            "host_mcp_server": "loopx",
-            "host_mcp_config": "CURSOR_HOME/mcp.json",
-        },
-        extra_activation_steps=[
-            "Confirm the `loopx` MCP server is enabled in this session "
-            "(`cursor-agent mcp`); it is registered by the surface installer.",
-        ],
-    )
 
 
 def _deepseek_harness_activation(commands: dict[str, str]) -> dict[str, Any]:
     return {
         "host_surface": "deepseek_harness_automation_loop",
         "entry_command_hint": (
-            "loopx turn run-once with loopx.dsh_goal_mode "
-            "(python -m loopx.dsh_goal_mode; compat: scripts/dsh_turn_host_adapter.py)"
+            "loopx turn run-once --host dsh "
+            "(compat: --host generic-cli with python -m loopx.dsh_goal_mode or "
+            "scripts/dsh_turn_host_adapter.py)"
         ),
         "activation_method": "external_loop_driver",
         "activation_input_command": commands["heartbeat_prompt_json"],
@@ -1143,13 +1168,13 @@ def _deepseek_harness_activation(commands: dict[str, str]) -> dict[str, Any]:
             "Install the optional DeepSeek Harness SDK (`loopx[deepseek-harness]`).",
             "Prepare a dsh cordis.yml and any DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL settings.",
             "Run the heartbeat-prompt JSON command after project state and todos are written.",
-            "Wire `loopx turn run-once` with `--host generic-cli` and the "
-            "`loopx.dsh_goal_mode` host adapter (`python -m loopx.dsh_goal_mode`; "
-            "the legacy `scripts/dsh_turn_host_adapter.py` launcher still works).",
+            "Run `loopx turn run-once --host dsh`; use the generic-cli adapter "
+            "command only as a compatibility or rollback path.",
             "Start every automatic tick from quota should-run and stop when it says stop.",
         ],
         "success_criteria": [
             "The DeepSeek Harness adapter returns a typed loopx_turn_result_v0.",
+            "Structured dsh failures reach the Turn journal without provider prose.",
             "Independent validation passes before LoopX writes state or spends quota.",
             "Opaque dsh session roots stay outside public LoopX evidence.",
         ],
@@ -1218,6 +1243,9 @@ def build_host_loop_activation_packet(
     agent_type: str,
     goal_id: str,
     cli_bin: str = "loopx",
+    runtime_root: str | None = None,
+    registry: str | None = None,
+    identity_runtime_root: str | None = None,
     agent_id: str | None = None,
     registered_agents: list[str] | None = None,
     available_capabilities: list[str] | None = None,
@@ -1241,6 +1269,8 @@ def build_host_loop_activation_packet(
             goal_id=goal_id,
             agent_type=canonical,
             cli_bin=cli_bin,
+            runtime_root=runtime_root,
+            registry=registry,
             agent_id=str(selected_agent_id) if selected_agent_id else None,
             available_capabilities=normalized_available_capabilities,
         )
@@ -1251,10 +1281,22 @@ def build_host_loop_activation_packet(
             "visible_goal_prompt_json": None,
         }
     )
+    if canonical == "codex-app" and activation_allowed:
+        cadence_args = [cli_bin, "--format", "json"]
+        if runtime_root:
+            cadence_args.extend(["--runtime-root", runtime_root])
+        if registry:
+            cadence_args.extend(["--registry", registry])
+        cadence_args.extend(["automation-cadence", "--goal-id", goal_id])
+        if selected_agent_id:
+            cadence_args.extend(["--agent-id", str(selected_agent_id)])
+        commands["automation_cadence_json"] = shlex.join(cadence_args)
     if canonical == "ark-managed-agent":
         surface = _ark_managed_agent_activation(commands)
     elif canonical == "codex-app":
         surface = _codex_app_activation(commands)
+    elif canonical == "trae_app":
+        surface = _trae_app_activation(commands)
     elif canonical == "codex-app-ssh":
         surface = _codex_app_ssh_activation(commands)
     elif canonical == "codex-ide-plugin":
@@ -1274,9 +1316,29 @@ def build_host_loop_activation_packet(
     elif canonical == "pi":
         surface = _pi_activation(commands, cli_bin)
     elif canonical == "gemini-cli":
-        surface = _gemini_cli_activation(commands, cli_bin)
+        surface = gemini_cli_activation(commands, cli_bin)
     elif canonical == "cursor-agent":
-        surface = _cursor_agent_activation(commands, cli_bin)
+        surface = cursor_agent_activation(commands, cli_bin)
+    elif canonical == "zcode":
+        surface = zcode_activation(commands, cli_bin)
+        surface["native_goal_provider"] = native_goal_activation(
+            cli_bin=cli_bin, runtime_root=runtime_root, goal_id=goal_id,
+            agent_id=selected_agent_id,
+            activation_allowed=activation_allowed and selected_agent_id in identity["registered_agents"],
+        )
+    elif canonical == "agy":
+        surface = agy_cli_activation(commands, cli_bin)
+    elif canonical == "antigravity-app":
+        surface = antigravity_app_activation(
+            commands,
+            cli_bin,
+            goal_id=goal_id,
+            agent_id=str(selected_agent_id) if selected_agent_id else None,
+            runtime_root=runtime_root,
+            registry=registry,
+        )
+    elif canonical == "kiro-cli":
+        surface = kiro_cli_activation(commands, cli_bin)
     elif canonical == "deepseek-harness":
         surface = _deepseek_harness_activation(commands)
     elif canonical == "deepseek-harness-native":
@@ -1294,6 +1356,8 @@ def build_host_loop_activation_packet(
                 goal_id=goal_id,
                 agent_type=canonical,
                 cli_bin=cli_bin,
+                runtime_root=runtime_root,
+                registry=registry,
                 agent_id=candidate,
                 available_capabilities=normalized_available_capabilities,
             )
@@ -1322,14 +1386,12 @@ def build_host_loop_activation_packet(
             )
             choices.append(choice)
         requested_agent_id = identity.get("requested_agent_id")
-        fresh_agent_id = (
-            str(requested_agent_id)
-            if requested_agent_id
-            else "<new-public-safe-agent-id>"
-        )
-        register_command = (
-            f"{shell_arg(cli_bin)} register-agent --goal-id {shell_arg(goal_id)} "
-            f"--agent-id {shell_arg(fresh_agent_id)} --require-new"
+        fresh_agent_id = str(requested_agent_id or "<new-public-safe-agent-id>")
+        register_command = render_register_agent_command(
+            goal_id,
+            agent_id=fresh_agent_id,
+            cli_bin=cli_bin,
+            runtime_root=identity_runtime_root or runtime_root,
         )
         fresh_registration = (
             {

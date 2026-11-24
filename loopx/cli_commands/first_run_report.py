@@ -15,7 +15,7 @@ PrintPayload = Callable[
     None,
 ]
 
-FIRST_RUN_ISSUE_URL = "https://github.com/huangruiteng/loopx/issues/new"
+FIRST_RUN_ISSUE_URL = "https://github.com/loopx-project/loopx/issues/new"
 FIRST_RUN_ISSUE_TEMPLATE = "first_run.yml"
 
 

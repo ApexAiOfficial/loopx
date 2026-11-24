@@ -1,4 +1,25 @@
-import { isStringLiteral } from "./runtime_decode.ts";
+import {assertActionSelectionConsistency} from "./work_items/action_selection_admission.ts";
+import { EffectRuntimeRequestError } from "./effect_runtime_errors.ts";
+import { isStringLiteral, pythonString, type JsonObject } from "./runtime_decode.ts";
+import { decodeInteractionContract } from "./work_items/interaction_contract.ts";
+import { EffectiveAction } from "./quota/effective_action.generated.ts";
+import {BARE_SHA256_PATTERN} from "./content_digest.ts";
+import {canonicalAuthoritySha256} from "./coordination/authority_store_codec.ts";
+
+export {
+  RECEIPT_BOUND_MONITOR_PHASES,
+  RECEIPT_BOUND_REPLAY_PHASES,
+  RECEIPT_BOUND_TERMINAL_PHASES,
+  receiptBoundMonitorPhase,
+  receiptBoundReplayPhase,
+  receiptBoundTerminalPhase,
+  type ReceiptBoundMonitorPhase,
+  type ReceiptBoundMonitorSettlementState,
+  type ReceiptBoundReplayPhase,
+  type ReceiptBoundReplaySettlementState,
+  type ReceiptBoundTerminalPhase,
+  type ReceiptBoundTerminalSettlementState,
+} from "./quota/settlement_phase.ts";
 
 export const SETTLEMENT_IDENTITY_SCHEMA_VERSION =
   "quota_settlement_identity_v0";
@@ -8,7 +29,7 @@ export const SETTLEMENT_PLAN_SCHEMA_VERSION = "quota_settlement_plan_v1";
 export const SETTLEMENT_RECEIPT_SCHEMA_VERSION =
   "quota_settlement_receipt_v1";
 
-export type JsonObject = Record<string, unknown>;
+export type {JsonObject} from "./runtime_decode.ts";
 
 export interface EffectRequest<Context> {
   kind: string;
@@ -27,12 +48,16 @@ export interface EffectInterpretation {
   cadence_class: string | null;
 }
 
-export interface EffectObservation<Decision extends string> {
+export interface EffectObservation<
+  Decision extends string,
+  Action extends string | null = string,
+> {
   decision: Decision;
   should_run: boolean;
-  effective_action: string;
+  effective_action: Action;
   recommended_action: string;
   action_portfolio: JsonObject | null;
+  planning_horizon: JsonObject | null;
   protocol_summary: string | null;
 }
 
@@ -45,10 +70,14 @@ export interface EffectNext {
   failure_cli_args: readonly string[];
 }
 
-export interface EffectTurn<Context, Decision extends string> {
+export interface EffectTurn<
+  Context,
+  Decision extends string,
+  Action extends string | null = string,
+> {
   request: EffectRequest<Context>;
   interpretation: EffectInterpretation;
-  observation: EffectObservation<Decision>;
+  observation: EffectObservation<Decision, Action>;
   next_effect: EffectNext;
 }
 
@@ -72,10 +101,15 @@ export const SETTLEMENT_STEP_KINDS = [
   "terminal_closeout",
 ] as const;
 export type SettlementStepKind = (typeof SETTLEMENT_STEP_KINDS)[number];
+export type TurnProviderStepKind = Exclude<SettlementStepKind, "validation">;
+export const TURN_PROVIDER_STEP_KINDS = SETTLEMENT_STEP_KINDS.filter(
+  (kind): kind is TurnProviderStepKind => kind !== "validation",
+);
 
 export const SETTLEMENT_BINDING_KINDS = [
   "todo",
   "autonomous_replan",
+  "request",
   "unbound",
 ] as const;
 export type SettlementBindingKind = (typeof SETTLEMENT_BINDING_KINDS)[number];
@@ -83,6 +117,7 @@ export type SettlementBindingKind = (typeof SETTLEMENT_BINDING_KINDS)[number];
 export const SETTLEMENT_FAILURE_KINDS = [
   "invalid_identity",
   "receipt_missing",
+  "receipt_unbound",
   "identity_mismatch",
   "writeback_missing",
   "writeback_rejected",
@@ -95,69 +130,51 @@ export const SETTLEMENT_FAILURE_KINDS = [
 ] as const;
 export type SettlementFailureKind = (typeof SETTLEMENT_FAILURE_KINDS)[number];
 
-export const RECEIPT_BOUND_MONITOR_PHASES = [
-  "poll_due",
-  "settlement_pending",
-  "settled",
-] as const;
-export type ReceiptBoundMonitorPhase =
-  (typeof RECEIPT_BOUND_MONITOR_PHASES)[number];
-
-export interface ReceiptBoundMonitorSettlementState {
-  poll_present: boolean;
-  material_change: boolean;
-  durable_writeback_present: boolean;
-  quota_spend_present: boolean;
-}
-
-export function receiptBoundMonitorPhase(
-  state: ReceiptBoundMonitorSettlementState,
-): ReceiptBoundMonitorPhase {
-  if (!state.poll_present) return "poll_due";
-  if (!state.material_change) return "settled";
-  return state.durable_writeback_present && state.quota_spend_present
-    ? "settled"
-    : "settlement_pending";
-}
-
-export const RECEIPT_BOUND_TERMINAL_PHASES = [
-  "open",
-  "settlement_pending",
-  "settled",
-] as const;
-export type ReceiptBoundTerminalPhase =
-  (typeof RECEIPT_BOUND_TERMINAL_PHASES)[number];
-
-export interface ReceiptBoundTerminalSettlementState {
-  terminal_closeout_present: boolean;
-  durable_writeback_present: boolean;
-  quota_spend_present: boolean;
-}
-
-export function receiptBoundTerminalPhase(
-  state: ReceiptBoundTerminalSettlementState,
-): ReceiptBoundTerminalPhase {
-  if (!state.terminal_closeout_present) return "open";
-  return state.durable_writeback_present && state.quota_spend_present
-    ? "settled"
-    : "settlement_pending";
-}
-
 export interface SettlementIdentityInput {
   goal_id: string;
   agent_id: string;
   todo_id?: string | null;
   turn_instance_id: string;
   replan_obligation_id?: string | null;
+  request_subject?: ExecutionRequestSubject | null;
 }
 
-export interface SettlementIdentity extends SettlementIdentityInput {
-  todo_id: string | null;
-  replan_obligation_id: string | null;
-  binding_kind: SettlementBindingKind;
-  binding_id: string;
-  effect_id: string;
+/** Identity of already admitted work, never an execution or permission grant. */
+export interface ExecutionRequestSubject extends JsonObject {
+  request_id: string;
+  request_revision: number;
+  request_digest: string;
+  execution_scope_sha256: string;
 }
+
+export function executionRequestSubject(value: unknown): ExecutionRequestSubject | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value))
+    throw new EffectRuntimeRequestError("request subject must be an object");
+  const subject = value as JsonObject;
+  const digests = ["request_id", "request_digest", "execution_scope_sha256"];
+  if (Object.keys(subject).length !== 4 || !digests.every(key =>
+    typeof subject[key] === "string" && BARE_SHA256_PATTERN.test(subject[key] as string))
+    || !Number.isSafeInteger(subject.request_revision) || Number(subject.request_revision) < 1)
+    throw new EffectRuntimeRequestError("request subject requires exact request/revision/digest/scope identity");
+  return {request_id: subject.request_id as string, request_revision: subject.request_revision as number,
+    request_digest: subject.request_digest as string, execution_scope_sha256: subject.execution_scope_sha256 as string};
+}
+
+export type SettlementIdentity = Readonly<{
+  goal_id: string;
+  agent_id: string;
+  turn_instance_id: string;
+  effect_id: string;
+  request_subject?: ExecutionRequestSubject | null;
+} & (
+  | { binding_kind: "todo"; binding_id: string; todo_id: string; replan_obligation_id: null }
+  | { binding_kind: "autonomous_replan"; binding_id: string; todo_id: null; replan_obligation_id: string }
+  | { binding_kind: "request"; binding_id: string; todo_id: null; replan_obligation_id: null }
+  | { binding_kind: "unbound"; binding_id: ""; todo_id: null; replan_obligation_id: null }
+)>;
+
+export type BoundSettlementIdentity = Exclude<SettlementIdentity, { binding_kind: "unbound" }>;
 
 export interface SettlementReceipt {
   step_kind: SettlementStepKind;
@@ -196,12 +213,17 @@ export interface SettlementStep {
   idempotency_key_ref: string;
   expected_receipt: string;
   command_template?: string;
+  /** Same admitted writeback, with the existing semantic boundary selected. */
+  semantic_closeout_command_template?: string;
+  command_condition?: "todo_deliverable_complete";
+  vision_authoring?: JsonObject;
   conditional?: true;
 }
 
 export interface SettlementPlan {
   identity: SettlementIdentity;
   steps: readonly SettlementStep[];
+  goal_ref?: JsonObject;
 }
 
 export type SettlementBindGate<Value = unknown> =
@@ -236,13 +258,6 @@ function asObject(value: unknown): JsonObject {
     : {};
 }
 
-function pythonString(value: unknown): string {
-  if (value === null || value === undefined) return "None";
-  if (value === true) return "True";
-  if (value === false) return "False";
-  return String(value);
-}
-
 function truthyString(value: unknown): string {
   return value ? pythonString(value) : "";
 }
@@ -260,7 +275,7 @@ function stringArray(value: unknown): string[] {
 function requireStepKind(value: unknown): SettlementStepKind {
   const rendered = pythonString(value);
   if (!isStringLiteral(rendered, SETTLEMENT_STEP_KINDS)) {
-    throw new Error(`unsupported settlement step kind: ${rendered}`);
+    throw new EffectRuntimeRequestError("unsupported settlement step kind");
   }
   return rendered;
 }
@@ -268,7 +283,7 @@ function requireStepKind(value: unknown): SettlementStepKind {
 function requireFailureKind(value: unknown): SettlementFailureKind {
   const rendered = pythonString(value);
   if (!isStringLiteral(rendered, SETTLEMENT_FAILURE_KINDS)) {
-    throw new Error(`unsupported settlement failure kind: ${rendered}`);
+    throw new EffectRuntimeRequestError("unsupported settlement failure kind");
   }
   return rendered;
 }
@@ -276,6 +291,7 @@ function requireFailureKind(value: unknown): SettlementFailureKind {
 export function effectProgramFromOrderedSteps(
   orderedSteps: unknown,
   executionMode: unknown = null,
+  includeRaw = true,
 ): EffectProgram {
   const steps: EffectStep[] = [];
   if (Array.isArray(orderedSteps)) {
@@ -295,7 +311,7 @@ export function effectProgramFromOrderedSteps(
         kind: nullableTruthyString(step.kind),
         command: nullableTruthyString(commandValue),
         purpose: nullableTruthyString(step.purpose),
-        raw: { ...step },
+        raw: includeRaw ? { ...step } : {},
       });
     }
   }
@@ -303,6 +319,18 @@ export function effectProgramFromOrderedSteps(
     steps,
     execution_mode: nullableTruthyString(executionMode),
   };
+}
+
+/** The retired summary format is not an execution or signature input.
+ * Presence (including empty/null) is explicit unsupported input, never a cue
+ * to strip a signed dimension and reinterpret the remaining record.
+ */
+export function assertSupportedQuotaPacket(packet: JsonObject): void {
+  for (const source of [packet, asObject(packet.contract_capsule)]) {
+    if (Object.hasOwn(source, "protocol_action_packet")) {
+      throw new EffectRuntimeRequestError("unsupported format: protocol_action_packet; use a fresh typed quota decision");
+    }
+  }
 }
 
 export function interpretQuotaShouldRunPacket(
@@ -314,7 +342,9 @@ export function interpretQuotaShouldRunPacket(
   } = {},
 ): EffectTurn<JsonObject, string> {
   const packet = asObject(packetValue);
-  const interaction = asObject(packet.interaction_contract);
+  assertSupportedQuotaPacket(packet);
+  const interaction = decodeInteractionContract(packet.interaction_contract);
+  assertActionSelectionConsistency(packet, interaction);
   const lane = asObject(packet.work_lane_contract);
   const scheduler = asObject(packet.scheduler_hint);
   const codexApp = asObject(scheduler.codex_app);
@@ -322,8 +352,8 @@ export function interpretQuotaShouldRunPacket(
   const failureHint = asObject(codexApp.failure_hint);
   const cliChannel = asObject(interaction.cli_channel);
   const gate = asObject(packet.capability_gate);
-  const protocol = asObject(packet.protocol_action_packet);
   const actionPortfolio = asObject(packet.action_portfolio);
+  const planningHorizon = asObject(packet.planning_horizon);
   return {
     request: {
       kind: "quota_should_run",
@@ -348,7 +378,9 @@ export function interpretQuotaShouldRunPacket(
       recommended_action: truthyString(packet.recommended_action),
       action_portfolio:
         Object.keys(actionPortfolio).length > 0 ? actionPortfolio : null,
-      protocol_summary: nullableTruthyString(protocol.summary),
+      planning_horizon:
+        Object.keys(planningHorizon).length > 0 ? planningHorizon : null,
+      protocol_summary: null,
     },
     next_effect: {
       cli_actions: stringArray(cliChannel.next_cli_actions),
@@ -370,7 +402,7 @@ export function interpretTurnResultPacket(
     agent_id?: string | null;
     capabilities?: readonly string[];
   } = {},
-): EffectTurn<JsonObject, string> {
+): EffectTurn<JsonObject, string, null> {
   const packet = asObject(packetValue);
   const scheduler = asObject(packet.scheduler_hint);
   const codexApp = asObject(scheduler.codex_app);
@@ -403,10 +435,13 @@ export function interpretTurnResultPacket(
     observation: {
       decision: resultKind,
       should_run: false,
-      effective_action: truthyString(packet.effective_action) || resultKind,
+      // A host result carries a verdict, not a new quota decision. Ignore any
+      // host-supplied action and keep the no-action wire representation explicit.
+      effective_action: null,
       recommended_action:
         truthyString(packet.recommended_action) || "settle the turn receipt",
       action_portfolio: null,
+      planning_horizon: null,
       protocol_summary: nullableTruthyString(packet.summary),
     },
     next_effect: {
@@ -428,34 +463,52 @@ export function settlementIdentity(
   const todoId = truthyString(input.todo_id).trim() || null;
   const replanObligationId =
     truthyString(input.replan_obligation_id).trim() || null;
-  if (todoId && replanObligationId) {
-    throw new Error(
-      "settlement identity cannot bind both todo_id and replan_obligation_id",
+  const requestSubject = executionRequestSubject(input.request_subject);
+  if ([todoId, replanObligationId, requestSubject].filter(Boolean).length > 1) {
+    throw new EffectRuntimeRequestError(
+      requestSubject ? "settlement identity requires one Todo, replan obligation or request subject"
+        : "settlement identity cannot bind both todo_id and replan_obligation_id",
     );
   }
-  const bindingKind: SettlementBindingKind = todoId
-    ? "todo"
-    : replanObligationId
-      ? "autonomous_replan"
-      : "unbound";
-  const bindingId = todoId ?? replanObligationId ?? "";
-  let effectId: string;
-  if (todoId) {
-    effectId = `${input.goal_id}:${input.agent_id}:${todoId}:${input.turn_instance_id}`;
-  } else if (replanObligationId) {
-    effectId = `${input.goal_id}:${input.agent_id}:autonomous_replan:${replanObligationId}:${input.turn_instance_id}`;
-  } else {
-    effectId = `${input.goal_id}:${input.agent_id}::${input.turn_instance_id}`;
-  }
-  return {
+  const common = {
     goal_id: input.goal_id,
     agent_id: input.agent_id,
-    todo_id: todoId,
     turn_instance_id: input.turn_instance_id,
-    replan_obligation_id: replanObligationId,
-    binding_kind: bindingKind,
-    binding_id: bindingId,
-    effect_id: effectId,
+    ...(requestSubject ? {request_subject: requestSubject} : {}),
+  };
+  if (todoId) {
+    return {
+      ...common,
+      todo_id: todoId,
+      replan_obligation_id: null,
+      binding_kind: "todo",
+      binding_id: todoId,
+      effect_id: `${input.goal_id}:${input.agent_id}:${todoId}:${input.turn_instance_id}`,
+    };
+  }
+  if (replanObligationId) {
+    return {
+      ...common,
+      todo_id: null,
+      replan_obligation_id: replanObligationId,
+      binding_kind: "autonomous_replan",
+      binding_id: replanObligationId,
+      effect_id: `${input.goal_id}:${input.agent_id}:autonomous_replan:${replanObligationId}:${input.turn_instance_id}`,
+    };
+  }
+  if (requestSubject) {
+    const bindingId = canonicalAuthoritySha256(requestSubject);
+    return {...common, todo_id: null, replan_obligation_id: null,
+      binding_kind: "request", binding_id: bindingId,
+      effect_id: `${input.goal_id}:${input.agent_id}:request:${bindingId}:${input.turn_instance_id}`};
+  }
+  return {
+    ...common,
+    todo_id: null,
+    replan_obligation_id: null,
+    binding_kind: "unbound",
+    binding_id: "",
+    effect_id: `${input.goal_id}:${input.agent_id}::${input.turn_instance_id}`,
   };
 }
 
@@ -463,7 +516,7 @@ export function settlementIdentityPayload(
   identityValue: SettlementIdentityInput,
 ): JsonObject {
   const identity = settlementIdentity(identityValue);
-  if (identity.todo_id || !identity.replan_obligation_id) {
+  if (identity.todo_id || identity.binding_kind === "unbound") {
     return {
       schema_version: SETTLEMENT_IDENTITY_SCHEMA_VERSION,
       effect_id: identity.effect_id,
@@ -481,7 +534,8 @@ export function settlementIdentityPayload(
     turn_instance_id: identity.turn_instance_id,
     binding_kind: identity.binding_kind,
     binding_id: identity.binding_id,
-    replan_obligation_id: identity.replan_obligation_id,
+    ...(identity.request_subject ? {request_subject: identity.request_subject}
+      : {replan_obligation_id: identity.replan_obligation_id}),
   };
 }
 
@@ -600,7 +654,10 @@ export function settlementStepPayload(step: SettlementStep): JsonObject {
     expected_receipt: step.expected_receipt,
   };
   if (step.command_template) payload.command_template = step.command_template;
+  if (step.semantic_closeout_command_template) payload.semantic_closeout_command_template = step.semantic_closeout_command_template;
+  if (step.command_condition) payload.command_condition = step.command_condition;
   if (step.conditional) payload.conditional = true;
+  if (step.vision_authoring) payload.vision_authoring = step.vision_authoring;
   return payload;
 }
 
@@ -640,7 +697,7 @@ export function settlementReceipt(
 
 export function settlementIdentityFromPlan(
   transactionPlanValue: unknown,
-): SettlementResult<SettlementIdentity> {
+): SettlementResult<BoundSettlementIdentity> {
   const transactionPlan = asObject(transactionPlanValue);
   const settlementPlanValue = transactionPlan.settlement_plan;
   if (
@@ -667,22 +724,29 @@ export function settlementIdentityFromPlan(
     });
   }
   const identityObject = identityValue as JsonObject;
+  const { goal_id: goalId, agent_id: agentId, turn_instance_id: turnInstanceId } = identityObject;
   if (
-    ["goal_id", "agent_id", "turn_instance_id"].some(
-      (field) => truthyString(identityObject[field]).trim().length === 0,
+    typeof goalId !== "string" || !goalId.trim() ||
+    typeof agentId !== "string" || !agentId.trim() ||
+    typeof turnInstanceId !== "string" || !turnInstanceId.trim() ||
+    ["todo_id", "replan_obligation_id"].some(
+      (field) => identityObject[field] != null && typeof identityObject[field] !== "string",
     )
   ) {
     return settlementFailed({
       kind: "invalid_identity",
       step_kind: "validation",
-      reason: "Turn settlement plan has an incomplete identity",
+      reason: "Turn settlement plan identity requires string identifiers",
     });
   }
   const todoId = truthyString(identityObject.todo_id).trim();
   const replanObligationId = truthyString(
     identityObject.replan_obligation_id,
   ).trim();
-  if (Boolean(todoId) === Boolean(replanObligationId)) {
+  let requestSubject: ExecutionRequestSubject | null;
+  try { requestSubject = executionRequestSubject(identityObject.request_subject); }
+  catch (error) { return settlementFailed({kind: "invalid_identity", step_kind: "validation", reason: (error as Error).message}); }
+  if ([todoId, replanObligationId, requestSubject].filter(Boolean).length > 1) {
     return settlementFailed({
       kind: "invalid_identity",
       step_kind: "validation",
@@ -690,31 +754,57 @@ export function settlementIdentityFromPlan(
         "Turn settlement plan requires exactly one Todo or autonomous replan obligation binding",
     });
   }
-  let built: SettlementIdentity;
-  try {
-    built = settlementIdentity({
-      goal_id: pythonString(identityObject.goal_id),
-      agent_id: pythonString(identityObject.agent_id),
-      todo_id: todoId || null,
-      turn_instance_id: pythonString(identityObject.turn_instance_id),
-      replan_obligation_id: replanObligationId || null,
-    });
-  } catch (error) {
+  const built = settlementIdentity({
+    goal_id: goalId,
+    agent_id: agentId,
+    todo_id: todoId || null,
+    turn_instance_id: turnInstanceId,
+    replan_obligation_id: replanObligationId || null,
+    request_subject: requestSubject,
+  });
+  // Unbound identities remain useful for non-executable plans, never settlement.
+  if (built.binding_kind === "unbound") {
     return settlementFailed({
       kind: "invalid_identity",
       step_kind: "validation",
-      reason: error instanceof Error ? error.message : pythonString(error),
+      reason: "Turn settlement plan has no binding",
     });
   }
-  const effectId = truthyString(identityObject.effect_id).trim();
-  if (!effectId) {
+  const version = identityObject.schema_version;
+  if (
+    (version !== undefined && version !== SETTLEMENT_IDENTITY_SCHEMA_VERSION &&
+      version !== SCOPED_SETTLEMENT_IDENTITY_SCHEMA_VERSION) ||
+    (version === SETTLEMENT_IDENTITY_SCHEMA_VERSION && built.binding_kind !== "todo")
+  ) {
+    return settlementFailed({
+      kind: "invalid_identity",
+      step_kind: "validation",
+      reason: "Turn settlement plan identity schema is unsupported for its binding",
+    });
+  }
+  // Legacy Todo wire records omit these fields. If supplied, they must agree;
+  // scoped v1 records always declare both. Never normalize contradictory facts.
+  if (
+    ((version === SCOPED_SETTLEMENT_IDENTITY_SCHEMA_VERSION || identityObject.binding_kind !== undefined) &&
+      identityObject.binding_kind !== built.binding_kind) ||
+    ((version === SCOPED_SETTLEMENT_IDENTITY_SCHEMA_VERSION || identityObject.binding_id !== undefined) &&
+      identityObject.binding_id !== built.binding_id)
+  ) {
+    return settlementFailed({
+      kind: "invalid_identity",
+      step_kind: "validation",
+      reason: "Turn settlement plan binding does not match its identity",
+    });
+  }
+  const effectId = identityObject.effect_id;
+  if (typeof effectId !== "string" || !effectId.trim()) {
     return settlementFailed({
       kind: "invalid_identity",
       step_kind: "validation",
       reason: "Turn settlement plan has no effect id",
     });
   }
-  if (effectId !== built.effect_id) {
+  if (effectId.trim() !== built.effect_id) {
     return settlementFailed({
       kind: "invalid_identity",
       step_kind: "validation",
@@ -871,13 +961,16 @@ export function settlementNextAction(options: {
   return { decision: "complete", step_kind: null, result: seeded };
 }
 
+/** Only the actual quota admission refusal carries a rejecting action.
+ * Missing/unknown facts retain a stage failure; diagnostic text is never authority. */
 export function callbackFailureKind(
   stepKind: SettlementStepKind,
-  reason: string,
+  payload: JsonObject,
 ): SettlementFailureKind {
   if (stepKind === "durable_writeback") return "writeback_rejected";
   if (stepKind === "terminal_closeout") return "terminal_closeout_rejected";
-  if (reason.toLowerCase().includes("budget")) return "budget_rejected";
+  if (stepKind === "quota_spend" &&
+      payload.quota_rejection_action === EffectiveAction.THROTTLED_SKIP) return "budget_rejected";
   return "quota_spend_rejected";
 }
 
@@ -896,7 +989,7 @@ export function commitStepPayload(options: {
       `${stepKind} callback rejected the settlement`;
     return {
       result: settlementFailed({
-        kind: callbackFailureKind(stepKind, reason),
+        kind: callbackFailureKind(stepKind, payload),
         step_kind: stepKind,
         reason,
       }),
@@ -905,7 +998,7 @@ export function commitStepPayload(options: {
   }
   const phaseIndex = options.transaction_phases.indexOf(stepKind);
   if (phaseIndex < 0) {
-    throw new Error(`transaction phases do not contain ${stepKind}`);
+    throw new EffectRuntimeRequestError(`transaction phases do not contain ${stepKind}`);
   }
   const completedPhases = options.transaction_phases.slice(0, phaseIndex + 1);
   const sourcePrefix = options.source_ref_prefix ?? "turn_journal";

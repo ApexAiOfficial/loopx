@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
+
 
 from ...control_plane import control_plane_policy_summary
-from ...execution_profile import execution_profile_summary
-from ...long_task_cadence import long_task_cadence_hint_summary
-from ...orchestration import orchestration_policy_summary
 from ...control_plane.quota.states import QUOTA_STATE_ORDER
+from ...control_plane.projection_envelope_facts import render_projection_envelope_markdown
 from ...control_plane.runtime.decision_freshness import (
     DECISION_FRESHNESS_WARNING_ITEM_LIMIT,
 )
+from ...execution_profile import execution_profile_summary
+from ...long_task_cadence import long_task_cadence_hint_summary
+from ...orchestration import orchestration_policy_summary
 from ..markdown import (
     append_operator_action_markdown,
     as_dict,
@@ -192,6 +194,14 @@ def render_quota_markdown(payload: dict[str, Any]) -> str:
         f"- goals: `{payload.get('goal_count')}`",
         f"- runs: `{payload.get('run_count')}`",
     ]
+    if payload.get("goal_filter"):
+        lines.append(f"- goal_filter: `{markdown_scalar(payload['goal_filter'])}` (counts and ranking cover this Goal only)")
+    if payload.get("reason"):
+        lines.append(f"- reason: {markdown_scalar(payload['reason'])}")
+    if payload.get("recommended_action"):
+        lines.append(f"- action: {markdown_scalar(payload['recommended_action'])}")
+    if payload.get("status_projection_envelope"):
+        lines.extend(render_projection_envelope_markdown(payload["status_projection_envelope"]))
     summary = as_dict(payload.get("summary"))
     states = as_dict(summary.get("states"))
     state_text = ", ".join(f"{state}={states.get(state, 0)}" for state in QUOTA_STATE_ORDER)
@@ -204,7 +214,8 @@ def render_quota_markdown(payload: dict[str, Any]) -> str:
     lines.append(f"- states: {state_text}")
 
     next_turn = as_dict(payload.get("next_automatic_turn"))
-    lines.extend(["", "## Next Automatic Turn"])
+    next_title = "Next Automatic Turn Within Selected Goal" if payload.get("goal_filter") else "Next Automatic Turn"
+    lines.extend(["", f"## {next_title}"])
     if next_turn:
         quota = as_dict(next_turn.get("quota"))
         lines.append(
@@ -338,10 +349,14 @@ def render_quota_scheduler_failure_markdown(payload: dict[str, Any]) -> str:
 
 
 def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
+    from ...control_plane.effect_program import reject_retired_quota_format
+
+    reject_retired_quota_format(payload)
     quota = as_dict(payload.get("quota"))
     lines = [
         "# LoopX Quota Should Run",
         "",
+        *render_projection_envelope_markdown(payload.get("projection_envelope")),
         f"- ok: `{payload.get('ok')}`",
         f"- goal_id: `{payload.get('goal_id')}`",
         f"- decision: `{payload.get('decision')}`",
@@ -381,6 +396,8 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
             lines.append(
                 f"- agent_lane_next_action_text: {markdown_scalar(agent_lane_next_action.get('text'))}"
             )
+        if agent_lane_next_action.get("next_step"):
+            lines.append(f"- agent_lane_next_step: {markdown_scalar(agent_lane_next_action['next_step'])}")
     agent_lane_frontier_hint = as_dict(payload.get("agent_lane_frontier_hint"))
     if agent_lane_frontier_hint:
         lines.append(
@@ -485,8 +502,14 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
                     f"resume_when={vision_wait_state.get('resume_when')} "
                     f"automatic_resume={vision_wait_state.get('automatic_resume')}"
                 )
-    task_orchestration = as_dict(payload.get("task_orchestration_contract"))
-    if task_orchestration:
+    orchestration = as_dict(payload.get("task_orchestration_contract"))
+    boundary_orchestration: dict[str, Any] | None
+    for label, task_orchestration in (
+        ("task_orchestration", orchestration),
+        ("peer_activation_diagnostic", as_dict(orchestration.get("peer_activation_diagnostic"))),
+    ):
+        if not task_orchestration:
+            continue
         lanes = as_list(task_orchestration.get("eligible_child_lanes"))
         if not lanes:
             lanes = as_list(task_orchestration.get("eligible_peer_lanes"))
@@ -494,13 +517,26 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
         if not blocked_lanes:
             blocked_lanes = as_list(task_orchestration.get("blocked_peer_lanes"))
         lines.append(
-            "- task_orchestration: "
+            f"- {label}: "
             f"mode={task_orchestration.get('mode')} "
             f"activation_required={task_orchestration.get('activation_required')} "
-            f"lanes={len(lanes)} "
-            f"blocked_lanes={len(blocked_lanes)} "
+            f"lanes={task_orchestration.get('eligible_peer_count', len(lanes))} "
+            f"blocked_lanes={task_orchestration.get('blocked_peer_count', len(blocked_lanes))} "
             f"writeback_owner={task_orchestration.get('writeback_owner')}"
         )
+        fields = " ".join(
+            f"{key}={markdown_scalar(task_orchestration[key])}"
+            for key in ("execution_scope", "execution_state", "task_selection", "activation_allowed")
+            if key in task_orchestration
+        )
+        if fields:
+            lines.append(f"- {label}_admission: {fields}")
+        reasons = sorted({str(reason) for row in blocked_lanes if isinstance(row, dict)
+                          for reason in as_list(row.get("reason_codes"))})
+        if reasons:
+            lines.append(f"- {label}_blockers: {', '.join(reasons)}")
+        if task_orchestration.get("read_required") is True:
+            lines.append(f"- {label}_required_detail: {task_orchestration.get('detail_ref')}")
     replan_decision = as_dict(payload.get("autonomous_replan_decision"))
     if replan_decision:
         lines.append(
@@ -664,14 +700,32 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
             f"trigger_count={replan_obligation.get('trigger_count')} "
             f"triggers={','.join(trigger_kinds)}"
         )
-    required_reads = as_list(payload.get("required_reads"))
-    for read in required_reads[:3]:
+        for trigger in as_list(replan_obligation.get("triggers")):
+            if not isinstance(trigger, dict) or not trigger.get("reason_code"):
+                continue
+            lines.append(f"  - reason_code: {trigger['reason_code']}")
+            checks = as_dict(trigger.get("component_checks"))
+            lines.append("  - component_checks: " + ", ".join(
+                f"{key}={'pass' if passed else 'fail'}" for key, passed in checks.items()
+            ))
+            lines.append(f"  - resolution: {trigger.get('resolution_hint')}")
+    interaction = as_dict(payload.get("interaction_contract"))
+    channel = as_dict(interaction.get("agent_channel"))
+    context = as_dict(channel.get("work_context"))
+    if context:
+        from .turn_envelope_markdown import work_context_lines
+
+        lines.extend(work_context_lines(context))
+    required_reads = as_list(channel.get("required_reads",
+        interaction.get("required_reads", payload.get("required_reads"))))
+    for read in required_reads:
         if not isinstance(read, dict):
             continue
         command = str(read.get("command") or "").strip()
         if command:
             lines.append(
                 "- required_read: "
+                f"source={read.get('source')} "
                 f"kind={read.get('kind')} "
                 f"agent_id={read.get('agent_id')} "
                 f"todo_id={read.get('todo_id') or ''} "
@@ -873,7 +927,9 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
             lines.append(f"- automation_pause_policy: {automation_liveness.get('pause_policy')}")
     scheduler_hint = as_dict(payload.get("scheduler_hint"))
     if scheduler_hint:
-        codex_app = as_dict(scheduler_hint.get("codex_app"))
+        app_automation = as_dict(
+            scheduler_hint.get("app_automation") or scheduler_hint.get("codex_app")
+        )
         unchanged_poll = as_dict(scheduler_hint.get("unchanged_poll"))
         limits = as_dict(unchanged_poll.get("limits"))
         codex_cli_tui = as_dict(scheduler_hint.get("codex_cli_tui"))
@@ -892,10 +948,10 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
             "- scheduler_hint: "
             f"action={scheduler_hint.get('action')} "
             f"cadence={scheduler_hint.get('cadence_class')} "
-            f"codex_app_minutes={codex_app.get('recommended_interval_minutes')} "
-            f"codex_app_rrule={codex_app.get('recommended_rrule')} "
-            f"codex_app_apply_needed={(codex_app.get('stateful_backoff') or {}).get('apply_needed') if isinstance(codex_app.get('stateful_backoff'), dict) else None} "
-            f"codex_app_progression={codex_app.get('example_progression_minutes')} "
+            f"app_automation_minutes={app_automation.get('recommended_interval_minutes')} "
+            f"app_automation_rrule={app_automation.get('recommended_rrule')} "
+            f"app_automation_apply_needed={(app_automation.get('stateful_backoff') or {}).get('apply_needed') if isinstance(app_automation.get('stateful_backoff'), dict) else None} "
+            f"app_automation_progression={app_automation.get('example_progression_minutes')} "
             f"cli_unchanged_limit={cli_unchanged_limit} "
             f"claude_unchanged_limit={claude_unchanged_limit}"
         )
@@ -904,18 +960,11 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
         if reset_policy := as_dict(scheduler_hint.get("reset_policy")):
             lines.append(
                 "- scheduler_reset: "
-                f"initial_interval={reset_policy.get('codex_app_initial_interval_minutes')} "
-                f"initial_rrule={reset_policy.get('codex_app_initial_rrule')} "
+                f"initial_interval={reset_policy.get('app_automation_initial_interval_minutes')} "
+                f"initial_rrule={reset_policy.get('app_automation_initial_rrule')} "
                 f"reset_generation={reset_policy.get('reset_token')} "
                 f"identity_signature={reset_policy.get('identity_signature')}"
             )
-    protocol_action_packet = as_dict(payload.get("protocol_action_packet"))
-    if protocol_action_packet:
-        lines.append(
-            "- protocol_action_packet: "
-            f"schema={protocol_action_packet.get('schema_version')} "
-            f"{protocol_action_packet.get('summary') or ''}"
-        )
     stall_self_repair = as_dict(payload.get("stall_self_repair"))
     if stall_self_repair:
         lines.append(
@@ -1028,13 +1077,13 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
         guards = as_list(goal_boundary.get("guards"))
         for guard in guards[:5]:
             lines.append(f"- goal_boundary_guard: {guard}")
-        orchestration = (
-            goal_boundary.get("orchestration")
+        boundary_orchestration = (
+            cast(dict[str, Any], goal_boundary.get("orchestration"))
             if isinstance(goal_boundary.get("orchestration"), dict)
             else None
         )
-        if orchestration:
-            lines.append(f"- goal_boundary_orchestration: {orchestration_policy_summary(orchestration)}")
+        if boundary_orchestration:
+            lines.append(f"- goal_boundary_orchestration: {orchestration_policy_summary(boundary_orchestration)}")
         capabilities = as_dict(goal_boundary.get("capabilities"))
         lark_inbox = as_dict(capabilities.get("lark_event_inbox"))
         urgency = as_dict(lark_inbox.get("urgency"))
@@ -1046,10 +1095,12 @@ def render_quota_should_run_markdown(payload: dict[str, Any]) -> str:
                 f"mentions={urgency.get('direct_mention_count')} "
                 f"bot_replies={urgency.get('reply_to_bot_count')} "
                 f"reply_due={urgency.get('reply_due')} "
+                f"material_review={urgency.get('material_review_count')} "
+                f"material_review_due={urgency.get('material_review_due')} "
                 f"oldest_age_seconds={urgency.get('oldest_pending_age_seconds')}"
             )
         run_permission_policy = (
-            goal_boundary.get("run_permission_policy")
+            cast(dict[str, Any], goal_boundary.get("run_permission_policy"))
             if isinstance(goal_boundary.get("run_permission_policy"), dict)
             else None
         )

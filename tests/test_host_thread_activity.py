@@ -1,0 +1,1335 @@
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import subprocess
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+import loopx.chat.status_api as chat_status_api
+import loopx.codex_app_thread_activity as codex_activity
+from loopx.codex_app_thread_activity import (
+    _automation_rrule_interval_minutes,
+    codex_delivery_expectations,
+    codex_homes,
+    codex_thread_observers,
+    observe_codex_threads,
+)
+from loopx.control_plane.agents.host_thread_activity import (
+    HostDeliveryExpectation,
+    HostDeliveryScope,
+    HostDeliveryWindowState,
+    HostThreadActivity,
+    HostThreadState,
+    HostThreadUnknownReason,
+    attach_host_delivery_windows,
+    attach_host_thread_activity,
+    build_host_delivery_window,
+)
+
+T0 = "2026-09-25T10:00:00.000Z"
+T1 = "2026-09-25T10:05:00.000Z"
+T2 = "2026-09-25T10:06:00.000Z"
+T3 = "2026-09-25T10:07:00.000Z"
+
+
+def _event(timestamp: str, kind: Any, **payload: Any) -> dict[str, Any]:
+    return {"timestamp": timestamp, "type": "event_msg", "payload": {"type": kind, **payload}}
+
+
+def _item(timestamp: str) -> dict[str, Any]:
+    return {"timestamp": timestamp, "type": "response_item", "payload": {"type": "message", "content": "x"}}
+
+
+class CodexHome:
+    """A disposable Codex home with the store shape the adapter depends on."""
+
+    def __init__(self, root: Path, *, columns: str = "id TEXT PRIMARY KEY, rollout_path TEXT, archived INTEGER") -> None:
+        self.root = root
+        (root / "sessions").mkdir(parents=True)
+        self.db = root / "state_5.sqlite"
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(f"CREATE TABLE threads ({columns})")
+
+    def thread(self, thread_id: str, records: list[dict[str, Any]], *, archived: int = 0, tail: str = "", rollout: Path | None = None) -> Path:
+        path = rollout or self.root / "sessions" / f"rollout-{thread_id}.jsonl"
+        if records and records[0].get("type") != "session_meta":
+            records = [{"timestamp": T0, "type": "session_meta", "payload": {"id": thread_id}}, *records]
+        path.write_text("".join(json.dumps(record) + "\n" for record in records) + tail, encoding="utf-8")
+        with sqlite3.connect(self.db) as connection:
+            connection.execute("INSERT INTO threads VALUES (?, ?, ?)", (thread_id, str(path), archived))
+        return path
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cache() -> None:
+    codex_activity._rollout_cache.clear()
+
+
+@pytest.fixture
+def home(tmp_path: Path) -> CodexHome:
+    return CodexHome(tmp_path / ".codex")
+
+
+def _observe(home: CodexHome, *thread_ids: str) -> dict[str, HostThreadActivity]:
+    return observe_codex_threads(thread_ids, homes=[home.root])
+
+
+@pytest.mark.parametrize("configuration", ["explicit", "CODEX_HOME", "LOOPX_CODEX_HOMES"])
+def test_relative_codex_home_recovers_activity_without_writing_the_store(
+    tmp_path, monkeypatch, configuration,
+):
+    selected = CodexHome(tmp_path / "project # 中文" / ".codex")
+    rollout = selected.thread("relative-thread", [_event(T2, "task_complete")])
+    before = {path: path.read_bytes() for path in (selected.db, rollout)}
+    monkeypatch.chdir(tmp_path)
+    relative = selected.root.relative_to(tmp_path)
+    homes = [relative] if configuration == "explicit" else codex_homes(
+        env={configuration: str(relative)}, user_home=tmp_path / "synthetic-user",
+    )
+    assert homes[0] == relative
+    result = observe_codex_threads(["relative-thread"], homes=homes)["relative-thread"]
+    assert result.state is HostThreadState.IDLE
+    assert result.last_turn_ended_at == T2
+    assert all(path.read_bytes() == content for path, content in before.items())
+
+
+def test_current_execution_reads_the_bound_home_only_and_recovers_without_preferences(home, tmp_path):
+    other = CodexHome(tmp_path / ".codex-other")
+    meta = {"timestamp": T0, "type": "session_meta", "payload": {"id": "t", "model_provider": "openai"}}
+    context = {"timestamp": T3, "type": "turn_context", "payload": {"turn_id": "new", "model": "example-model-2", "effort": "xhigh"}}
+    other.thread("t", [meta, _event(T2, "task_started", turn_id="new"), context])
+    env = {"CODEX_HOME": str(home.root), "CODEX_THREAD_ID": "t", "LOOPX_CODEX_HOMES": str(other.root)}
+    assert codex_activity.current_codex_execution_identity(env) == {"status": "unavailable", "reason": "session_not_found"}
+    path = home.thread("t", [meta, _event(T2, "task_started", turn_id="new")])
+    # Preference fields can disagree; they are not execution evidence.
+    with sqlite3.connect(home.db) as connection:
+        connection.execute("ALTER TABLE threads ADD COLUMN model TEXT DEFAULT 'old-model'")
+        connection.execute("ALTER TABLE threads ADD COLUMN reasoning_effort TEXT DEFAULT 'low'")
+    assert codex_activity.current_codex_execution_identity(env)["status"] == "unavailable"
+    with path.open("a") as stream:
+        stream.write(json.dumps(context) + "\n")
+    before = {p: p.read_bytes() for p in (home.db, path, other.db)}
+    result = codex_activity.current_codex_execution_identity(env)
+    assert result["status"] == "runtime_reported"
+    assert (result["model"], result["reasoning_effort"], result["provider"]) == ("example-model-2", "xhigh", "OpenAI")
+    assert result["active_turn_verified"] is True
+    assert all(p.read_bytes() == data for p, data in before.items())
+    assert str(home.root) not in json.dumps(result)
+
+
+def test_unbound_execution_does_not_discover_any_home(monkeypatch):
+    monkeypatch.setattr(codex_activity, "_state_db", lambda _: pytest.fail("unbound invocation must not open a store"))
+    assert codex_activity.current_codex_execution_identity({}) == {"status": "unavailable", "reason": "session_not_bound"}
+
+
+def test_review_packet_projects_real_bound_turn_metadata_into_its_template(home, monkeypatch, capsys):
+    from loopx.cli import main
+
+    home.thread("t", [
+        {"type": "session_meta", "payload": {"id": "t", "model_provider": "openai"}},
+        _event(T2, "task_started", turn_id="new"),
+        {"type": "turn_context", "payload": {"turn_id": "new", "model": "example-model-2", "effort": "xhigh"}},
+    ])
+    monkeypatch.setenv("CODEX_HOME", str(home.root))
+    monkeypatch.setenv("CODEX_THREAD_ID", "t")
+    monkeypatch.setattr("loopx.cli_commands.pr_review.resolve_current_github_login", lambda: "reviewer")
+    monkeypatch.setattr("loopx.cli_commands.pr_review.scan_github_pull_request_targets", lambda **_: {
+        "pull_requests": [{"number": 42, "title": "Repair request retry", "headRefOid": "a" * 40,
+                           "state": "OPEN", "author": {"login": "contributor"}, "files": [], "reviews": []}],
+        "complete": True,
+    })
+    assert main(["--format", "json", "pr-review", "--repo", "owner/repo", "--target-exact-head", "42@" + "a" * 40]) == 0
+    packet = json.loads(capsys.readouterr().out)
+    execution = packet["reviewer_execution"]
+    reviewer = packet["pull_requests"][0]["review_plan"]["result_template"]["reviewer"]
+    assert reviewer["declared_model"] == "example-model-2"
+    assert reviewer["declared_reasoning_effort"] == "xhigh"
+    assert reviewer["execution_observation_id"] == execution["observation_id"]
+    assert str(home.root) not in json.dumps(packet)
+
+
+def test_turn_without_end_marker_is_open(home: CodexHome) -> None:
+    home.thread("t", [
+        _event(T0, "task_started", turn_id="a"), _event(T1, "task_complete", turn_id="a"),
+        _event(T2, "task_started", turn_id="b"), _item(T3),
+    ])
+    assert _observe(home, "t")["t"] == HostThreadActivity(
+        state=HostThreadState.TURN_OPEN, turn_started_at=T2, last_event_at=T3,
+    )
+
+
+@pytest.mark.parametrize("end", ["task_complete", "turn_aborted"])
+def test_completed_or_aborted_turn_is_idle(home: CodexHome, end: str) -> None:
+    home.thread("t", [_event(T0, "task_started"), _item(T1), _event(T2, end), _event(T3, "token_count")])
+    assert _observe(home, "t")["t"] == HostThreadActivity(
+        state=HostThreadState.IDLE, last_turn_ended_at=T2, last_event_at=T3,
+    )
+
+
+def test_archived_thread_is_not_read_as_open(home: CodexHome) -> None:
+    home.thread("t", [_event(T0, "task_started")], archived=1)
+    assert _observe(home, "t")["t"].state is HostThreadState.ARCHIVED
+
+
+def test_line_being_appended_is_ignored(home: CodexHome, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(codex_activity, "_OBSERVATION_CHUNK_BYTES", 16)
+    home.thread("t", [_event(T0, "task_started"), _item(T1)], tail='{"timestamp": "' + "x" * 80)
+    assert _observe(home, "t")["t"] == HostThreadActivity(
+        state=HostThreadState.TURN_OPEN, turn_started_at=T0, last_event_at=T1,
+    )
+
+
+def test_lines_spanning_chunks_are_reassembled(home: CodexHome, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(codex_activity, "_OBSERVATION_CHUNK_BYTES", 7)
+    home.thread("t", [_event(T0, "task_complete"), _event(T1, "task_started"), _item(T2)])
+    assert _observe(home, "t")["t"].turn_started_at == T1
+
+
+def test_new_records_invalidate_the_cached_scan(home: CodexHome) -> None:
+    path = home.thread("t", [_event(T0, "task_started")])
+    assert _observe(home, "t")["t"].state is HostThreadState.TURN_OPEN
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_event(T1, "task_complete")) + "\n")
+    assert _observe(home, "t")["t"].state is HostThreadState.IDLE
+
+
+@pytest.mark.parametrize("kind", [[], {}, None, 42])
+@pytest.mark.parametrize("following_item", [False, True], ids=["latest-event", "before-response"])
+def test_malformed_event_is_unknown_and_recovers_without_poisoning_other_threads(
+    home: CodexHome, kind: Any, following_item: bool,
+) -> None:
+    records = [_event(T0, "task_started"), _event(T1, kind)]
+    if following_item:
+        records.append(_item(T2))
+    path = home.thread("malformed", records)
+    home.thread("healthy", [_event(T0, "task_started"), _item(T1)])
+    observed = _observe(home, "malformed", "healthy")
+    assert observed["malformed"] == HostThreadActivity.unknown(HostThreadUnknownReason.RECORD_UNRECOGNIZED)
+    assert observed["healthy"].state is HostThreadState.TURN_OPEN
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_event(T3, "task_complete")) + "\n")
+    assert _observe(home, "malformed")["malformed"].state is HostThreadState.IDLE
+
+
+@pytest.mark.parametrize("payload", [None, [], "task_complete", {}])
+def test_malformed_event_payload_cannot_imply_an_open_turn(home: CodexHome, payload: Any) -> None:
+    home.thread("t", [
+        _event(T0, "task_started"),
+        {"timestamp": T1, "type": "event_msg", "payload": payload},
+        _item(T2),
+    ])
+    assert _observe(home, "t")["t"] == HostThreadActivity.unknown(HostThreadUnknownReason.RECORD_UNRECOGNIZED)
+
+
+@pytest.mark.parametrize("kind", ["task_complete", []])
+def test_escaped_event_type_keeps_typed_marker_semantics(home: CodexHome, kind: Any) -> None:
+    path = home.thread("t", [_event(T0, "task_started"), _event(T1, kind), _item(T2)])
+    lines = path.read_text().splitlines()
+    lines[2] = lines[2].replace('"event_msg"', '"event\\u005fmsg"')
+    path.write_text("\n".join(lines) + "\n")
+    expected = HostThreadState.IDLE if isinstance(kind, str) else HostThreadState.UNKNOWN
+    assert _observe(home, "t")["t"].state is expected
+
+
+@pytest.mark.parametrize(
+    ("records", "tail_limit", "reason"),
+    [
+        ([_event(T0, "task_started"), {"unexpected": True}], None, HostThreadUnknownReason.RECORD_UNRECOGNIZED),
+        ([], None, HostThreadUnknownReason.RECORD_UNRECOGNIZED),
+        ([_event(T0, "task_started"), *[_item(T1)] * 20], 400, HostThreadUnknownReason.NO_TURN_MARKER),
+    ],
+    ids=["unrecognized-last-record", "empty-rollout", "no-marker-in-tail"],
+)
+def test_unrecognized_rollouts_are_unknown(
+    home: CodexHome, monkeypatch: pytest.MonkeyPatch, records: list[dict[str, Any]], tail_limit: int | None, reason: HostThreadUnknownReason,
+) -> None:
+    if tail_limit:
+        monkeypatch.setattr(codex_activity, "_OBSERVATION_READ_BYTES", tail_limit)
+    home.thread("t", records)
+    assert _observe(home, "t")["t"] == HostThreadActivity.unknown(reason)
+
+
+def test_rollout_outside_the_home_is_not_read(home: CodexHome, tmp_path: Path) -> None:
+    home.thread("t", [_event(T0, "task_started")], rollout=tmp_path / "elsewhere.jsonl")
+    assert _observe(home, "t")["t"] == HostThreadActivity.unknown(HostThreadUnknownReason.RECORD_UNRECOGNIZED)
+
+
+def test_store_without_required_columns_is_unrecognized(tmp_path: Path) -> None:
+    home = CodexHome(tmp_path / ".codex", columns="id TEXT PRIMARY KEY, rollout_path TEXT, hidden INTEGER")
+    assert _observe(home, "t")["t"] == HostThreadActivity.unknown(HostThreadUnknownReason.RECORD_UNRECOGNIZED)
+
+
+def test_unreadable_store_and_missing_thread_are_distinguished(tmp_path: Path) -> None:
+    broken = tmp_path / ".codex-broken"
+    broken.mkdir()
+    (broken / "state_5.sqlite").write_bytes(b"not a database")
+    healthy = CodexHome(tmp_path / ".codex")
+    assert observe_codex_threads(["t"], homes=[healthy.root])["t"].reason is HostThreadUnknownReason.THREAD_NOT_FOUND
+    assert observe_codex_threads(["t"], homes=[broken, healthy.root])["t"].reason is HostThreadUnknownReason.STORE_UNAVAILABLE
+
+
+def test_wal_store_without_shared_memory_file_is_readable(tmp_path: Path) -> None:
+    home = CodexHome(tmp_path / ".codex")
+    home.thread("t", [_event(T0, "task_complete")])
+    connection = sqlite3.connect(home.db)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.close()
+    assert not Path(f"{home.db}-wal").exists() and not Path(f"{home.db}-shm").exists()
+    assert _observe(home, "t")["t"].state is HostThreadState.IDLE
+
+
+def test_threads_resolve_across_homes_and_explicit_homes_disable_discovery(tmp_path: Path) -> None:
+    default = CodexHome(tmp_path / ".codex")
+    secondary = CodexHome(tmp_path / ".codex-secondary")
+    default.thread("a", [_event(T0, "task_complete")])
+    secondary.thread("b", [_event(T0, "task_started")])
+    homes = codex_homes(env={}, user_home=tmp_path)
+    assert homes == [default.root, secondary.root]
+    observed = observe_codex_threads(["a", "b"], homes=homes)
+    assert (observed["a"].state, observed["b"].state) == (HostThreadState.IDLE, HostThreadState.TURN_OPEN)
+    assert codex_homes(env={"LOOPX_CODEX_HOMES": str(secondary.root)}, user_home=tmp_path) == [secondary.root]
+
+
+def test_unknown_state_requires_exactly_one_reason() -> None:
+    with pytest.raises(ValueError):
+        HostThreadActivity(state=HostThreadState.UNKNOWN)
+    with pytest.raises(ValueError):
+        HostThreadActivity(state=HostThreadState.IDLE, reason=HostThreadUnknownReason.THREAD_NOT_FOUND)
+
+
+def _status(*bindings: dict[str, str]) -> dict[str, Any]:
+    return {"run_history": {"goals": [
+        {"id": "bound", "coordination": {"thread_agent_bindings": list(bindings)}},
+        {"id": "unbound", "coordination": {"registered_agents": ["lead"]}},
+    ]}}
+
+
+def test_attach_reports_each_binding_without_thread_ids() -> None:
+    calls: list[list[str]] = []
+
+    def observe(thread_ids: Any) -> dict[str, HostThreadActivity]:
+        calls.append(list(thread_ids))
+        return {"t-open": HostThreadActivity(state=HostThreadState.TURN_OPEN, turn_started_at=T0, last_event_at=T1)}
+
+    payload = _status(
+        {"agent_id": "a", "host_surface": "codex-app", "thread_id": "t-open"},
+        {"agent_id": "b", "host_surface": "codex-app", "thread_id": "t-gone"},
+        {"agent_id": "c", "host_surface": "codex-app-ssh", "thread_id": "t-remote"},
+    )
+    attach_host_thread_activity(payload, observers={"codex-app": observe})
+    bound, unbound = payload["run_history"]["goals"]
+    assert calls == [["t-gone", "t-open"]]
+    assert bound["host_thread_activity"]["completeness"] == "complete"
+    assert bound["host_thread_activity"]["threads"] == [
+        {"agent_id": "a", "host_surface": "codex-app", "state": "turn_open", "turn_started_at": T0, "last_event_at": T1},
+        {"agent_id": "b", "host_surface": "codex-app", "state": "unknown", "reason": "thread_not_found"},
+        {"agent_id": "c", "host_surface": "codex-app-ssh", "state": "unknown", "reason": "unsupported_host"},
+    ]
+    assert "t-open" not in json.dumps(bound["host_thread_activity"])
+    assert "host_thread_activity" not in unbound
+
+
+def test_capped_observation_discloses_incomplete_coverage_in_either_binding_order(home: CodexHome) -> None:
+    bindings = []
+    for i in range(33):
+        thread_id = f"t-{i}"
+        home.thread(thread_id, [_event(T0, "task_started" if i == 32 else "task_complete")])
+        bindings.append({"agent_id": f"a-{i}", "host_surface": "codex-app", "thread_id": thread_id})
+    for ordered in (bindings, [bindings[-1], *bindings[:-1]]):
+        payload = _status(*ordered)
+        attach_host_thread_activity(payload, observers=codex_thread_observers([home.root]))
+        observation = payload["run_history"]["goals"][0]["host_thread_activity"]
+        assert observation["completeness"] == "incomplete"
+        assert len(observation["threads"]) == 32
+    # Removing the unread binding makes a negative inference valid again.
+    payload = _status(*bindings[:-1])
+    attach_host_thread_activity(payload, observers=codex_thread_observers([home.root]))
+    observation = payload["run_history"]["goals"][0]["host_thread_activity"]
+    assert observation["completeness"] == "complete"
+    assert all(thread["state"] == "idle" for thread in observation["threads"])
+
+
+def test_unbound_status_is_unchanged_and_does_not_read_any_host() -> None:
+    payload = _status()
+    expected = json.loads(json.dumps(payload))
+
+    def unexpected_read(_thread_ids: Any) -> dict[str, HostThreadActivity]:
+        raise AssertionError("unbound Goals must not access a host store")
+
+    attach_host_thread_activity(payload, observers={"codex-app": unexpected_read})
+    assert payload == expected
+
+
+def test_app_status_route_attaches_codex_thread_activity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = CodexHome(tmp_path / ".codex")
+    home.thread("t-open", [_event(T0, "task_started"), _item(T1)])
+    monkeypatch.setenv("LOOPX_CODEX_HOMES", str(home.root))
+    monkeypatch.setattr(chat_status_api, "collect_status", lambda **_kwargs: _status(
+        {"agent_id": "a", "host_surface": "codex-app", "thread_id": "t-open"},
+    ))
+    sent: list[dict[str, Any]] = []
+
+    class Handler(chat_status_api.ChatStatusRequestMixin):
+        path = "/status.json"
+        server = SimpleNamespace(
+            selected_goal_id=None, registry_path=tmp_path / "registry.json", runtime_root_override=None,
+            scan_roots=[], runtime_root=tmp_path / "runtime", limit=10,
+            goal_subagent_configuration_enabled=False,
+        )
+
+        def _send_json(self, payload: dict[str, Any], *, status: int = 200) -> None:
+            sent.append(payload)
+
+        def _send_error(self, message: str, **kwargs: Any) -> None:
+            raise AssertionError(message)
+
+    Handler()._status()
+    threads = sent[0]["run_history"]["goals"][0]["host_thread_activity"]["threads"]
+    assert threads == [
+        {
+            "agent_id": "a",
+            "host_surface": "codex-app",
+            "state": "turn_open",
+            "turn_started_at": T0,
+            "last_event_at": T1,
+            # This home installs no automation, so the expected cadence is
+            # unknown rather than assumed healthy.
+            "delivery_window": {
+                "schema_version": "loopx_host_delivery_window_v0",
+                "state": "unknown",
+                "reason": "no_expectation",
+            },
+        }
+    ]
+
+
+def test_ssh_origin_uses_source_host_observer_and_missing_store_stays_unknown(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LOOPX_CODEX_HOMES", str(tmp_path / "missing-home"))
+    observers = codex_thread_observers()
+    assert {"codex-app", "codex-app-ssh", "codex-cli-tui", "codex-ide-plugin"} <= set(observers)
+    result = observers["codex-app-ssh"](["remote-task"])["remote-task"]
+    assert result.state is HostThreadState.UNKNOWN
+    assert result.reason is HostThreadUnknownReason.THREAD_NOT_FOUND
+
+
+def test_automation_rrule_interval_reads_only_minutely_intervals() -> None:
+    assert _automation_rrule_interval_minutes("FREQ=MINUTELY;INTERVAL=30") == 30
+    assert _automation_rrule_interval_minutes("freq=minutely;interval=5") == 5
+    assert _automation_rrule_interval_minutes("RRULE:FREQ=MINUTELY;INTERVAL=2") == 2
+    # Field order, spacing and duplicates follow the canonical parser.
+    assert _automation_rrule_interval_minutes("INTERVAL=3;FREQ=MINUTELY") == 3
+    assert _automation_rrule_interval_minutes("FREQ=MINUTELY; INTERVAL = 7") == 7
+    assert _automation_rrule_interval_minutes("FREQ=MINUTELY;INTERVAL=5;INTERVAL=9") == 9
+    assert _automation_rrule_interval_minutes(
+        f"FREQ=MINUTELY;INTERVAL={2**53 - 1}"
+    ) == 2**53 - 1
+    # Leading zeros are not part of the value, and must not be converted.
+    assert _automation_rrule_interval_minutes(
+        "FREQ=MINUTELY;INTERVAL=" + "0" * 5000 + "5"
+    ) == 5
+    # Anything this adapter cannot read reports no interval rather than one.
+    assert _automation_rrule_interval_minutes("FREQ=HOURLY;INTERVAL=2") is None
+    assert _automation_rrule_interval_minutes("FREQ=MINUTELY;INTERVAL=0") is None
+    assert _automation_rrule_interval_minutes(None) is None
+
+
+@pytest.mark.parametrize(
+    "rrule",
+    [
+        # An omitted INTERVAL is unreadable, not a one-minute cadence.
+        "FREQ=MINUTELY",
+        "FREQ=MINUTELY;INTERVAL=-3",
+        "FREQ=MINUTELY;INTERVAL=bad",
+        "FREQ=MINUTELY;INTERVAL=",
+        "FREQ=MINUTELY;INTERVAL=1.5",
+        # The frequency must match exactly, not as a substring.
+        "FREQ=MINUTELYISH;INTERVAL=7",
+        "MINUTELY;INTERVAL=7",
+        "",
+    ],
+)
+def test_an_unreadable_automation_rrule_never_reports_a_cadence(rrule: str) -> None:
+    assert _automation_rrule_interval_minutes(rrule) is None
+
+
+@pytest.mark.parametrize(
+    "interval",
+    [
+        "9" * 16,  # one digit past the safe integer range
+        str(2**53),
+        "1" * 4301,  # past the interpreter's own decimal digit limit
+        "0" * 5000,  # leading zeros the interpreter still counts as digits
+        "-" + "1" * 4301,
+    ],
+    ids=["16-nines", "safe-plus-one", "4301-digits", "5000-zeros", "negative-4301"],
+)
+def test_an_out_of_range_interval_is_reported_without_converting_it(
+    interval: str,
+) -> None:
+    """The provider must not ask the interpreter for a value it refuses to build.
+
+    ``int()`` raises above ``sys.get_int_max_str_digits()``, and the status route
+    turns any local projection failure into one 500 for the whole workspace.
+    """
+
+    assert _automation_rrule_interval_minutes(
+        f"FREQ=MINUTELY;INTERVAL={interval}"
+    ) is None
+
+
+def _install_automation(
+    home: CodexHome,
+    *,
+    automation_id: str,
+    goal_id: str,
+    agent_id: str,
+    rrule: str,
+    status: str = "ACTIVE",
+    kind: str = "heartbeat",
+    target_thread_id: str = "t-open",
+) -> None:
+    path = home.root / "automations" / automation_id / "automation.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f'version = 1\nid = "{automation_id}"\nkind = "{kind}"\n'
+        f'status = "{status}"\nrrule = "{rrule}"\ntarget_thread_id = "{target_thread_id}"\n'
+        f'prompt = "Advance `{goal_id}` from active state. Agent: `{agent_id}`."\n',
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("selection", ["configured", "sibling", "explicit"])
+def test_aliased_homes_preserve_one_installed_heartbeat_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
+    selection: str,
+) -> None:
+    home = CodexHome(tmp_path / ".codex")
+    alias = tmp_path / ".codex-alias"
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(home.root)],
+            capture_output=True,
+        )
+        assert created.returncode == 0, created.stderr or created.stdout
+        request.addfinalizer(alias.rmdir)
+    else:
+        alias.symlink_to(home.root, target_is_directory=True)
+    other = CodexHome(tmp_path / ".codex-other")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("LOOPX_CODEX_HOMES", raising=False)
+    first = home.root
+    if selection == "configured":
+        monkeypatch.setenv("CODEX_HOME", str(alias))
+        first = alias
+    elif selection == "explicit":
+        monkeypatch.setenv(
+            "LOOPX_CODEX_HOMES", os.pathsep.join(map(str, [alias, home.root, other.root]))
+        )
+        first = alias
+    _install_automation(
+        home, automation_id="one", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=5",
+    )
+    lane = HostDeliveryScope(
+        goal_id="bound", agent_id="a", host_surface="codex-app", thread_id="t-open"
+    )
+    reads: list[Path] = []
+    read_text = Path.read_text
+
+    def record_read(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path.name == "automation.toml":
+            reads.append(path)
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", record_read)
+
+    assert codex_delivery_expectations([lane]) == {
+        lane: HostDeliveryExpectation(
+            expected_interval_minutes=5, source="codex_app_automation_rrule"
+        )
+    }
+    assert reads == [first / "automations" / "one" / "automation.toml"]
+    logical_homes = [home.root, alias, other.root] if selection == "sibling" else [alias, home.root, other.root]
+    assert codex_homes() == logical_homes
+    # Explicit reader inputs receive the same physical-store protection.
+    assert codex_delivery_expectations([lane], homes=logical_homes)[lane].expected_interval_minutes == 5
+    # Two distinct automations remain ambiguous even when their home has aliases.
+    _install_automation(
+        home, automation_id="two", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=9",
+    )
+    assert codex_delivery_expectations([lane]) == {}
+    _install_automation(
+        home, automation_id="two", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=9", status="PAUSED",
+    )
+    assert codex_delivery_expectations([lane])[lane].expected_interval_minutes == 5
+
+
+def test_case_alias_cadence_uses_physical_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pathlib import PurePosixPath
+
+    home = CodexHome(tmp_path / ".codex")
+    alias = tmp_path / ".CODEX"
+    if not alias.exists() or not alias.samefile(home.root):
+        pytest.skip("Requires a case-insensitive filesystem")
+    _install_automation(
+        home, automation_id="one", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=5",
+    )
+    lane = HostDeliveryScope(
+        goal_id="bound", agent_id="a", host_surface="codex-app", thread_id="t-open"
+    )
+    assert codex_delivery_expectations([lane], homes=[alias, home.root])[lane].expected_interval_minutes == 5
+    # Case-insensitive POSIX volumes retain differently cased resolved names.
+    # Windows may canonicalize their spelling; preserve the POSIX comparison
+    # here while keeping directory identity and manifest reads on the real FS.
+    resolve = Path.resolve
+
+    def resolved_spelling(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if str(path) in (str(home.root), str(alias)):
+            return PurePosixPath(str(path))
+        return resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolved_spelling)
+    reads: list[Path] = []
+    read_text = Path.read_text
+
+    def record_read(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path.name == "automation.toml":
+            reads.append(path)
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", record_read)
+    assert codex_delivery_expectations([lane], homes=[alias, home.root])[lane].expected_interval_minutes == 5
+    assert reads == [alias / "automations" / "one" / "automation.toml"]
+    _install_automation(
+        home, automation_id="two", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=9",
+    )
+    assert codex_delivery_expectations([lane], homes=[alias, home.root]) == {}
+
+
+def test_discovered_home_becoming_a_loop_preserves_healthy_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    healthy = CodexHome(tmp_path / ".codex")
+    unstable = tmp_path / ".codex-unstable"
+    unstable.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("LOOPX_CODEX_HOMES", raising=False)
+    discovered = codex_homes()
+    assert unstable in discovered
+    _install_automation(
+        healthy, automation_id="one", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=5",
+    )
+    lane = HostDeliveryScope(
+        goal_id="bound", agent_id="a", host_surface="codex-app", thread_id="t-open"
+    )
+    unstable.rmdir()
+    alias_active = True
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(unstable), str(unstable)],
+            capture_output=True,
+        )
+        assert created.returncode == 0, created.stderr or created.stdout
+        request.addfinalizer(lambda: unstable.rmdir() if alias_active else None)
+    else:
+        unstable.symlink_to(unstable, target_is_directory=True)
+        request.addfinalizer(lambda: unstable.unlink() if alias_active else None)
+    monkeypatch.setattr(codex_activity, "codex_homes", lambda: discovered)
+    assert codex_delivery_expectations([lane])[lane].expected_interval_minutes == 5
+    healthy.thread("t-open", [_event(T0, "task_started"), _item(T1)])
+    payload = _status(*(
+        {"agent_id": agent, "host_surface": "codex-app", "thread_id": "t-open"}
+        for agent in ("a", "other")
+    ))
+    attach_host_thread_activity(payload, observers=codex_thread_observers([healthy.root]))
+    attach_host_delivery_windows(
+        payload, expectations=codex_delivery_expectations,
+        now=datetime(2026, 9, 25, 10, 6, tzinfo=timezone.utc),
+    )
+    rows = payload["run_history"]["goals"][0]["host_thread_activity"]["threads"]
+    assert [row["delivery_window"]["state"] for row in rows] == ["fresh", "unknown"]
+    # Recovery does not require restarting the reader or retaining failure state.
+    if os.name == "nt":
+        unstable.rmdir()
+    else:
+        unstable.unlink()
+    alias_active = False
+    recovered = CodexHome(unstable)
+    _install_automation(
+        recovered, automation_id="recovered", goal_id="bound", agent_id="other",
+        rrule="FREQ=MINUTELY;INTERVAL=7",
+    )
+    assert codex_delivery_expectations([lane])[lane].expected_interval_minutes == 5
+    other = HostDeliveryScope(
+        goal_id="bound", agent_id="other", host_surface="codex-app", thread_id="t-open"
+    )
+    assert codex_delivery_expectations([other])[other].expected_interval_minutes == 7
+
+
+def test_delivery_expectations_resolve_only_installed_active_app_automations(
+    tmp_path: Path,
+) -> None:
+    home = CodexHome(tmp_path / ".codex")
+    _install_automation(
+        home, automation_id="a", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=30",
+    )
+    _install_automation(
+        home, automation_id="b", goal_id="bound", agent_id="b",
+        rrule="FREQ=MINUTELY;INTERVAL=30", status="PAUSED",
+    )
+    _install_automation(
+        home, automation_id="c", goal_id="bound", agent_id="c",
+        rrule="FREQ=HOURLY;INTERVAL=2",
+    )
+
+    lane = HostDeliveryScope(
+        goal_id="bound", agent_id="a", host_surface="codex-app", thread_id="t-open"
+    )
+    resolved = codex_delivery_expectations(
+        [
+            lane,
+            HostDeliveryScope(goal_id="bound", agent_id="b", host_surface="codex-app", thread_id="t-open"),
+            HostDeliveryScope(goal_id="bound", agent_id="c", host_surface="codex-app", thread_id="t-open"),
+            # The app automation is not the loop that drives another surface.
+            HostDeliveryScope(goal_id="bound", agent_id="a", host_surface="codex-cli-tui", thread_id="t-open"),
+            # Without the canonical binding a lane has no identity to place.
+            HostDeliveryScope(goal_id="bound", agent_id="a", host_surface="codex-app"),
+        ],
+        homes=[home.root],
+    )
+
+    assert resolved == {
+        lane: HostDeliveryExpectation(
+            expected_interval_minutes=30, source="codex_app_automation_rrule"
+        )
+    }
+
+
+def test_delivery_expectations_ignore_another_thread_or_kind_of_the_same_goal(
+    tmp_path: Path,
+) -> None:
+    home = CodexHome(tmp_path / ".codex")
+    _install_automation(
+        home, automation_id="lane", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=5", target_thread_id="t-lane",
+    )
+    # Same Goal and agent, but another bound thread.
+    _install_automation(
+        home, automation_id="other-thread", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=60", target_thread_id="t-other",
+    )
+    # Same Goal, agent and thread, but a different kind of automation.
+    _install_automation(
+        home, automation_id="cron", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=7", kind="cron", target_thread_id="t-lane",
+    )
+
+    lane = HostDeliveryScope(
+        goal_id="bound", agent_id="a", host_surface="codex-app", thread_id="t-lane"
+    )
+    assert codex_delivery_expectations([lane], homes=[home.root]) == {
+        lane: HostDeliveryExpectation(
+            expected_interval_minutes=5, source="codex_app_automation_rrule"
+        )
+    }
+    # A thread with no automation of its own inherits neither neighbour's cadence.
+    assert (
+        codex_delivery_expectations(
+            [
+                HostDeliveryScope(
+                    goal_id="bound", agent_id="a", host_surface="codex-app", thread_id="t-unbound"
+                )
+            ],
+            homes=[home.root],
+        )
+        == {}
+    )
+
+
+def test_two_automations_claiming_one_lane_report_no_cadence(tmp_path: Path) -> None:
+    home = CodexHome(tmp_path / ".codex")
+    for automation_id, interval in (("first", 5), ("second", 9)):
+        _install_automation(
+            home, automation_id=automation_id, goal_id="bound", agent_id="a",
+            rrule=f"FREQ=MINUTELY;INTERVAL={interval}", target_thread_id="t-lane",
+        )
+    lane = HostDeliveryScope(
+        goal_id="bound", agent_id="a", host_surface="codex-app", thread_id="t-lane"
+    )
+    assert codex_delivery_expectations([lane], homes=[home.root]) == {}
+
+
+def _attached_delivery_window(
+    payload: dict[str, Any], *, expectations: Any, now: datetime
+) -> dict[str, Any]:
+    attach_host_thread_activity(payload, observers=codex_thread_observers())
+    attach_host_delivery_windows(payload, expectations=expectations, now=now)
+    threads = payload["run_history"]["goals"][0]["host_thread_activity"]["threads"]
+    return threads[0]["delivery_window"]
+
+
+def test_status_route_measures_a_lane_against_its_own_automation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = CodexHome(tmp_path / ".codex")
+    home.thread("t-open", [_event(T2, "task_complete")])
+    _install_automation(
+        home, automation_id="lane", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=5", target_thread_id="t-open",
+    )
+    monkeypatch.setenv("LOOPX_CODEX_HOMES", str(home.root))
+    payload = _status({"agent_id": "a", "host_surface": "codex-app", "thread_id": "t-open"})
+
+    window = _attached_delivery_window(
+        payload,
+        expectations=codex_delivery_expectations,
+        now=datetime(2026, 9, 25, 10, 7, tzinfo=timezone.utc),
+    )
+
+    assert window["state"] == "fresh"
+    assert window["expected_interval_minutes"] == 5
+    assert window["window_minutes"] == 10
+    assert window["age_seconds"] == 60
+    assert window["source"] == "codex_app_automation_rrule"
+
+
+def test_status_route_does_not_measure_a_lane_against_another_threads_automation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = CodexHome(tmp_path / ".codex")
+    # Recent manual activity on the lane's own thread, and one automation
+    # installed for another thread of the same Goal with a wide cadence.
+    home.thread("t-open", [_event(T2, "task_complete")])
+    _install_automation(
+        home, automation_id="other-thread", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=60", target_thread_id="t-other",
+    )
+    monkeypatch.setenv("LOOPX_CODEX_HOMES", str(home.root))
+    payload = _status({"agent_id": "a", "host_surface": "codex-app", "thread_id": "t-open"})
+
+    window = _attached_delivery_window(
+        payload,
+        expectations=codex_delivery_expectations,
+        now=datetime(2026, 9, 25, 10, 7, tzinfo=timezone.utc),
+    )
+
+    assert window == {
+        "schema_version": "loopx_host_delivery_window_v0",
+        "state": "unknown",
+        "reason": "no_expectation",
+    }
+
+
+@pytest.mark.parametrize("rrule", ["FREQ=MINUTELY;INTERVAL=-3", "FREQ=MINUTELY", "FREQ=MINUTELYISH;INTERVAL=1"])
+def test_status_route_never_reports_fresh_from_an_unreadable_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rrule: str
+) -> None:
+    home = CodexHome(tmp_path / ".codex")
+    home.thread("t-open", [_event(T2, "task_complete")])
+    _install_automation(
+        home, automation_id="lane", goal_id="bound", agent_id="a",
+        rrule=rrule, target_thread_id="t-open",
+    )
+    monkeypatch.setenv("LOOPX_CODEX_HOMES", str(home.root))
+    payload = _status({"agent_id": "a", "host_surface": "codex-app", "thread_id": "t-open"})
+
+    window = _attached_delivery_window(
+        payload,
+        expectations=codex_delivery_expectations,
+        now=datetime(2026, 9, 25, 10, 7, tzinfo=timezone.utc),
+    )
+
+    assert window["state"] == "unknown"
+    assert window["reason"] == "no_expectation"
+
+
+def _just_now() -> str:
+    """A host timestamp seconds old, in the rollout's own format.
+
+    The status route reads the wall clock, so a healthy lane can only be
+    measured as fresh against activity this recent.
+    """
+
+    stamp = datetime.now(timezone.utc) - timedelta(seconds=30)
+    return f"{stamp:%Y-%m-%dT%H:%M:%S}.{stamp.microsecond // 1000:03d}Z"
+
+
+def _route_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Run the real status route once; any error response fails the test."""
+
+    monkeypatch.setattr(chat_status_api, "collect_status", lambda **_kwargs: payload)
+    sent: list[dict[str, Any]] = []
+
+    class Handler(chat_status_api.ChatStatusRequestMixin):
+        path = "/status.json"
+        server = SimpleNamespace(
+            selected_goal_id=None,
+            registry_path=tmp_path / "registry.json",
+            runtime_root_override=None,
+            scan_roots=[],
+            runtime_root=tmp_path / "runtime",
+            limit=10,
+            goal_subagent_configuration_enabled=False,
+        )
+
+        def _send_json(self, payload: dict[str, Any], *, status: int = 200) -> None:
+            sent.append(payload)
+
+        def _send_error(self, message: str, **kwargs: Any) -> None:
+            raise AssertionError(f"the status route errored: {message} {kwargs}")
+
+    Handler()._status()
+    assert len(sent) == 1, "the route must answer once with the workspace projection"
+    return sent[0]
+
+
+def _lane_window(payload: dict[str, Any]) -> dict[str, Any]:
+    threads = payload["run_history"]["goals"][0]["host_thread_activity"]["threads"]
+    return threads[0]["delivery_window"]
+
+
+@pytest.mark.parametrize("oversized_lane", ["own", "unrelated"])
+def test_an_oversized_interval_cannot_take_down_the_workspace_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, oversized_lane: str
+) -> None:
+    """One unreadable manifest must not cost the whole workspace its readback."""
+
+    home = CodexHome(tmp_path / ".codex")
+    home.thread("t-open", [_event(_just_now(), "task_complete")])
+    oversized = "FREQ=MINUTELY;INTERVAL=" + "1" * 4301
+    if oversized_lane == "own":
+        _install_automation(
+            home, automation_id="lane", goal_id="bound", agent_id="a",
+            rrule=oversized, target_thread_id="t-open",
+        )
+    else:
+        _install_automation(
+            home, automation_id="lane", goal_id="bound", agent_id="a",
+            rrule="FREQ=MINUTELY;INTERVAL=5", target_thread_id="t-open",
+        )
+        _install_automation(
+            home, automation_id="other", goal_id="unrelated", agent_id="z",
+            rrule=oversized, target_thread_id="t-other",
+        )
+    monkeypatch.setenv("LOOPX_CODEX_HOMES", str(home.root))
+
+    window = _lane_window(
+        _route_response(
+            tmp_path,
+            monkeypatch,
+            _status({"agent_id": "a", "host_surface": "codex-app", "thread_id": "t-open"}),
+        )
+    )
+
+    if oversized_lane == "own":
+        # Unreadable is unknown; it is never a guessed cadence.
+        assert window == {
+            "schema_version": "loopx_host_delivery_window_v0",
+            "state": "unknown",
+            "reason": "no_expectation",
+        }
+    else:
+        # The unrelated manifest is skipped, so the healthy lane keeps its window.
+        assert window["state"] == "fresh"
+        assert window["expected_interval_minutes"] == 5
+
+
+def test_correcting_an_oversized_interval_restores_the_lane_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = CodexHome(tmp_path / ".codex")
+    home.thread("t-open", [_event(_just_now(), "task_complete")])
+    _install_automation(
+        home, automation_id="lane", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=" + "1" * 4301, target_thread_id="t-open",
+    )
+    monkeypatch.setenv("LOOPX_CODEX_HOMES", str(home.root))
+    payload = _status({"agent_id": "a", "host_surface": "codex-app", "thread_id": "t-open"})
+
+    assert _lane_window(_route_response(tmp_path, monkeypatch, payload))["state"] == "unknown"
+
+    _install_automation(
+        home, automation_id="lane", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=5", target_thread_id="t-open",
+    )
+
+    assert _lane_window(_route_response(tmp_path, monkeypatch, payload))["state"] == "fresh"
+
+
+def _offered_scopes(payload: dict[str, Any]) -> list[HostDeliveryScope]:
+    seen: list[HostDeliveryScope] = []
+
+    def expectations(scopes: Any) -> dict[HostDeliveryScope, HostDeliveryExpectation]:
+        seen.extend(scopes)
+        return {}
+
+    attach_host_delivery_windows(payload, expectations=expectations)
+    return seen
+
+
+def test_delivery_scope_carries_the_canonical_binding_without_serializing_it() -> None:
+    payload = _status({"agent_id": "a", "host_surface": "codex-app", "thread_id": "t-open"})
+    attach_host_thread_activity(
+        payload,
+        observers={"codex-app": lambda _ids: {
+            "t-open": HostThreadActivity(state=HostThreadState.IDLE, last_event_at=T1),
+        }},
+    )
+
+    assert [
+        (scope.goal_id, scope.agent_id, scope.host_surface, scope.thread_id)
+        for scope in _offered_scopes(payload)
+    ] == [("bound", "a", "codex-app", "t-open")]
+    # The binding stays in coordination; the projection never names the thread.
+    assert "t-open" not in json.dumps(
+        payload["run_history"]["goals"][0]["host_thread_activity"]
+    )
+
+
+def test_a_lane_bound_to_two_threads_is_offered_without_an_identity() -> None:
+    payload = _status(
+        {"agent_id": "a", "host_surface": "codex-app", "thread_id": "t-one"},
+        {"agent_id": "a", "host_surface": "codex-app", "thread_id": "t-two"},
+    )
+    attach_host_thread_activity(
+        payload,
+        observers={"codex-app": lambda _ids: {
+            "t-one": HostThreadActivity(state=HostThreadState.IDLE, last_event_at=T1),
+            "t-two": HostThreadActivity(state=HostThreadState.IDLE, last_event_at=T1),
+        }},
+    )
+
+    assert [scope.thread_id for scope in _offered_scopes(payload)] == [None, None]
+    assert all(
+        row["delivery_window"] == {
+            "schema_version": "loopx_host_delivery_window_v0",
+            "state": "unknown",
+            "reason": "no_expectation",
+        }
+        for row in payload["run_history"]["goals"][0]["host_thread_activity"]["threads"]
+    )
+
+
+def test_delivery_expectations_read_no_home_without_an_app_lane(tmp_path: Path) -> None:
+    absent = tmp_path / "absent-home"
+
+    assert (
+        codex_delivery_expectations(
+            [HostDeliveryScope(goal_id="bound", agent_id="a", host_surface="codex-cli-tui")],
+            homes=[absent],
+        )
+        == {}
+    )
+    assert not absent.exists()
+
+
+def test_delivery_window_never_reports_absence_as_fresh() -> None:
+    expected = HostDeliveryExpectation(expected_interval_minutes=5, source="test")
+    observed = HostThreadActivity(state=HostThreadState.IDLE, last_event_at=T1)
+    now = datetime(2026, 9, 25, 10, 20, tzinfo=timezone.utc)
+
+    assert build_host_delivery_window(None, expected, now=now).to_payload() == {
+        "schema_version": "loopx_host_delivery_window_v0",
+        "state": "missing",
+        "reason": "no_observation",
+        "source": "test",
+    }
+    assert build_host_delivery_window(observed, None, now=now).to_payload() == {
+        "schema_version": "loopx_host_delivery_window_v0",
+        "state": "unknown",
+        "reason": "no_expectation",
+    }
+    unreadable = HostThreadActivity(state=HostThreadState.IDLE, last_event_at="not-a-time")
+    assert (
+        build_host_delivery_window(unreadable, expected, now=now).state
+        is HostDeliveryWindowState.UNKNOWN
+    )
+    unobserved = HostThreadActivity.unknown(HostThreadUnknownReason.STORE_UNAVAILABLE)
+    assert (
+        build_host_delivery_window(unobserved, expected, now=now).state
+        is HostDeliveryWindowState.MISSING
+    )
+
+
+def test_delivery_window_separates_fresh_from_stale_by_the_expected_cadence() -> None:
+    expected = HostDeliveryExpectation(
+        expected_interval_minutes=5, source="codex_app_automation_rrule"
+    )
+    observed = HostThreadActivity(state=HostThreadState.IDLE, last_event_at=T1)
+
+    fresh = build_host_delivery_window(
+        observed, expected, now=datetime(2026, 9, 25, 10, 11, tzinfo=timezone.utc)
+    )
+    assert fresh.to_payload() == {
+        "schema_version": "loopx_host_delivery_window_v0",
+        "state": "fresh",
+        "last_observed_at": T1,
+        "age_seconds": 360,
+        "age_hours": 0.1,
+        "expected_interval_minutes": 5,
+        "window_minutes": 10,
+        "tolerance": 2,
+        "source": "codex_app_automation_rrule",
+    }
+
+    stale = build_host_delivery_window(
+        observed, expected, now=datetime(2026, 9, 25, 10, 31, tzinfo=timezone.utc)
+    )
+    assert stale.state is HostDeliveryWindowState.STALE
+    assert stale.age_seconds == 1560
+    assert stale.last_observed_at == T1
+
+    # A later observation moves the window forward instead of the clock.
+    later = HostThreadActivity(state=HostThreadState.IDLE, last_event_at=T2)
+    assert (
+        build_host_delivery_window(
+            later, expected, now=datetime(2026, 9, 25, 10, 11, tzinfo=timezone.utc)
+        ).state
+        is HostDeliveryWindowState.FRESH
+    )
+
+
+def test_attach_reports_the_window_from_an_installed_automation(tmp_path: Path) -> None:
+    home = CodexHome(tmp_path / ".codex")
+    home.thread("t-open", [_event(T0, "task_started"), _item(T1)])
+    _install_automation(
+        home, automation_id="a", goal_id="bound", agent_id="a",
+        rrule="FREQ=MINUTELY;INTERVAL=5",
+    )
+
+    payload = _status({"agent_id": "a", "host_surface": "codex-app", "thread_id": "t-open"})
+    reads: list[list[str]] = []
+
+    def observe(thread_ids: Any) -> dict[str, HostThreadActivity]:
+        reads.append(list(thread_ids))
+        return observe_codex_threads(thread_ids, homes=[home.root])
+
+    attach_host_thread_activity(payload, observers={"codex-app": observe})
+    attach_host_delivery_windows(
+        payload,
+        expectations=lambda scopes: codex_delivery_expectations(scopes, homes=[home.root]),
+        now=datetime(2026, 9, 25, 10, 31, tzinfo=timezone.utc),
+    )
+
+    observation = payload["run_history"]["goals"][0]["host_thread_activity"]
+    assert observation["threads"][0]["delivery_window"] == {
+        "schema_version": "loopx_host_delivery_window_v0",
+        "state": "stale",
+        "last_observed_at": T1,
+        "age_seconds": 1560,
+        "age_hours": 0.43,
+        "expected_interval_minutes": 5,
+        "window_minutes": 10,
+        "tolerance": 2,
+        "source": "codex_app_automation_rrule",
+    }
+    # The window reads the projection that already observed the host.
+    assert reads == [["t-open"]]
+    assert "t-open" not in json.dumps(observation)
+
+    unattached = _status()
+    expected = json.loads(json.dumps(unattached))
+    attach_host_delivery_windows(
+        unattached,
+        expectations=lambda scopes: pytest.fail("no observed lane may ask for a cadence"),
+    )
+    assert unattached == expected
+
+
+@pytest.mark.parametrize("unavailable_identity", [None, "st_dev", "st_ino"])
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+@pytest.mark.parametrize("field", ["st_mtime_ns", "st_ctime_ns"])
+def test_same_size_read_fence_metadata_policy(home, monkeypatch, platform, field, unavailable_identity):
+    rollout = home.thread("t", [_event(T2, "task_complete")])
+    rollout_stat = rollout.stat()
+    assert rollout_stat.st_dev and rollout_stat.st_ino
+    original_fstat = os.fstat
+    original_stat = Path.stat
+    descriptor_observations = 0
+
+    def partial_identity(observed):
+        if unavailable_identity is None or (observed.st_dev, observed.st_ino) != (
+            rollout_stat.st_dev, rollout_stat.st_ino
+        ):
+            return observed
+        # Unavailable volume/file indexes are injected at every rollout stat.
+        fields = {name: getattr(observed, name) for name in dir(observed) if name.startswith("st_")}
+        fields[unavailable_identity] = 0
+        return SimpleNamespace(**fields)
+
+    def path_stat(self, *args, **kwargs):
+        return partial_identity(original_stat(self, *args, **kwargs))
+
+    def descriptor_stat(fd):
+        nonlocal descriptor_observations
+        observed = original_fstat(fd)
+        if (observed.st_dev, observed.st_ino) != (rollout_stat.st_dev, rollout_stat.st_ino):
+            return observed
+        descriptor_observations += 1
+        observed = partial_identity(observed)
+        if descriptor_observations != 2:
+            return observed
+        fields = {name: getattr(observed, name) for name in dir(observed) if name.startswith("st_")}
+        fields[field] += 1
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(Path, "stat", path_stat)
+    monkeypatch.setattr(codex_activity, "os", SimpleNamespace(**{
+        **vars(os), "name": platform, "fstat": descriptor_stat,
+    }))
+    result = observe_codex_threads(["t"], homes=[home.root])["t"]
+    if platform == "nt" and field == "st_ctime_ns" and unavailable_identity is None:
+        assert result.state is HostThreadState.IDLE
+        assert result.last_turn_ended_at == T2
+        assert descriptor_observations == 4
+    else:
+        assert result == HostThreadActivity.unknown(HostThreadUnknownReason.RECORD_UNRECOGNIZED)
+        assert descriptor_observations == 2
+
+
+@pytest.mark.parametrize("warm_cursor", [False, True], ids=["cold", "forward"])
+@pytest.mark.parametrize("change", ["none", "marker", "latest", "append"])
+def test_windows_ctime_skew_checks_current_rollout_records(home, monkeypatch, warm_cursor, change):
+    records = [_event(T1, "task_complete"), _item(T2)]
+    if warm_cursor:
+        path = home.thread("t", [_event(T0, "task_started")])
+        assert _observe(home, "t")["t"].state is HostThreadState.TURN_OPEN
+        with path.open("ab") as handle:
+            handle.write("".join(json.dumps(row) + "\n" for row in records).encode())
+    else:
+        path = home.thread("t", records)
+    initial = path.stat()
+    old_bytes = path.read_bytes()
+    old_identity = (initial.st_dev, initial.st_ino)
+    observed_stats = 0
+
+    def fstat(fd):
+        nonlocal observed_stats
+        observed = os.fstat(fd)
+        if (observed.st_dev, observed.st_ino) != old_identity:
+            return observed
+        observed_stats += 1
+        if observed_stats != 2:
+            return observed
+        if change == "append":
+            with path.open("ab") as handle:
+                handle.write((json.dumps(_event(T3, "task_started")) + "\n").encode())
+            return os.fstat(fd)
+        if change in {"marker", "latest"}:
+            new_bytes = (
+                old_bytes.replace(b'"task_complete"', b'"task_started" ')
+                if change == "marker"
+                else old_bytes.replace(T2.encode(), T3.encode())
+            )
+            assert old_bytes != new_bytes and len(old_bytes) == len(new_bytes)
+            path.write_bytes(new_bytes)
+            os.utime(path, ns=(initial.st_atime_ns, initial.st_mtime_ns))
+        fields = {name: getattr(observed, name) for name in dir(observed) if name.startswith("st_")}
+        fields["st_ctime_ns"] = initial.st_ctime_ns + 1
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(codex_activity, "os", SimpleNamespace(**{**vars(os), "name": "nt", "fstat": fstat}))
+    result = _observe(home, "t")["t"]
+    if change == "none":
+        assert result == HostThreadActivity(
+            state=HostThreadState.IDLE, last_turn_ended_at=T1, last_event_at=T2,
+        )
+    elif change == "append":
+        assert result == HostThreadActivity.unknown(HostThreadUnknownReason.NO_TURN_MARKER)
+        assert _observe(home, "t")["t"].turn_started_at == T3
+    else:
+        assert result == HostThreadActivity.unknown(HostThreadUnknownReason.RECORD_UNRECOGNIZED)
+        refreshed = _observe(home, "t")["t"]
+        if change == "marker":
+            assert refreshed == HostThreadActivity(
+                state=HostThreadState.TURN_OPEN, turn_started_at=T1, last_event_at=T2,
+            )
+        else:
+            assert refreshed == HostThreadActivity(
+                state=HostThreadState.IDLE, last_turn_ended_at=T1, last_event_at=T3,
+            )
+
+
+def test_windows_ctime_skew_does_not_exceed_remaining_read_budget(home, monkeypatch):
+    path = home.thread("t", [_event(T2, "task_complete")])
+    total_bytes = 0
+    read = codex_activity.Reader.read
+
+    def count(reader, offset, count):
+        nonlocal total_bytes
+        data = read(reader, offset, count)
+        total_bytes += len(data)
+        return data
+
+    monkeypatch.setattr(codex_activity.Reader, "read", count)
+    assert _observe(home, "t")["t"].state is HostThreadState.IDLE
+    budget = total_bytes
+    monkeypatch.setattr(codex_activity, "_OBSERVATION_READ_BYTES", budget)
+    codex_activity._rollout_cache.clear()
+    total_bytes = observations = 0
+    original = path.stat()
+
+    def fstat(fd):
+        nonlocal observations
+        observed = os.fstat(fd)
+        if (observed.st_dev, observed.st_ino) != (original.st_dev, original.st_ino):
+            return observed
+        observations += 1
+        if observations != 2:
+            return observed
+        fields = {name: getattr(observed, name) for name in dir(observed) if name.startswith("st_")}
+        fields["st_ctime_ns"] += 1
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(codex_activity, "os", SimpleNamespace(**{**vars(os), "name": "nt", "fstat": fstat}))
+    result = _observe(home, "t")["t"]
+    assert result == HostThreadActivity.unknown(HostThreadUnknownReason.RECORD_UNRECOGNIZED)
+    assert total_bytes == budget
+
+
+@pytest.mark.parametrize(("sample", "field"), [
+    (3, "st_ino"),
+    (4, "st_mtime_ns"),
+    (4, "st_ctime_ns"),
+])
+def test_windows_ctime_skew_requires_a_stable_second_read(home, monkeypatch, sample, field):
+    path = home.thread("t", [_event(T2, "task_complete")])
+    original = path.stat()
+    sampled_descriptors = []
+
+    def fstat(fd):
+        observed = os.fstat(fd)
+        if (observed.st_dev, observed.st_ino) != (original.st_dev, original.st_ino):
+            return observed
+        sampled_descriptors.append(fd)
+        sample_number = len(sampled_descriptors)
+        if sample_number not in {2, sample}:
+            return observed
+        fields = {name: getattr(observed, name) for name in dir(observed) if name.startswith("st_")}
+        fields["st_ctime_ns" if sample_number == 2 else field] += 1
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(codex_activity, "os", SimpleNamespace(**{**vars(os), "name": "nt", "fstat": fstat}))
+    actual = _observe(home, "t")["t"]
+    assert actual == HostThreadActivity.unknown(HostThreadUnknownReason.RECORD_UNRECOGNIZED)
+    assert len(sampled_descriptors) == sample
+    assert sampled_descriptors[0] != sampled_descriptors[2]

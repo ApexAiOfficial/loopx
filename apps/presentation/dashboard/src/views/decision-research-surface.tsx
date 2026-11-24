@@ -1,7 +1,12 @@
+import {ContextHelp} from "../features/personal-workspace/context-help";
 import { CircleAlert, Clock3, FileSearch, ShieldCheck } from "lucide-react";
 
 import type { PresentationSurface, RunGoal } from "../data/status";
-import type { DecisionResearchView } from "../data/decision-research";
+import {
+  publishedResearchLineage,
+  type DecisionResearchView,
+  type PresentationProjectionEnvelope,
+} from "../data/decision-research";
 import { Badge } from "../components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 
@@ -9,18 +14,28 @@ type BadgeVariant = "neutral" | "success" | "warning" | "info" | "danger";
 
 const stateVariant: Record<string, BadgeVariant> = {
   blocked: "danger",
+  clear: "success",
+  complete: "success",
+  confirmed: "danger",
+  conflicting: "danger",
+  declared_only: "warning",
+  duplicate_upstream: "neutral",
   empty: "neutral",
   failed: "danger",
   insufficient_evidence: "warning",
   invalid: "danger",
+  missing: "warning",
   partial: "warning",
   pending: "neutral",
   ready: "success",
   rejected: "danger",
   review_due: "warning",
   selected: "success",
+  source_error: "danger",
   supported: "success",
   superseded: "neutral",
+  unverified: "warning",
+  verified: "success",
 };
 
 const toneVariant: Record<string, BadgeVariant> = {
@@ -37,7 +52,7 @@ function StateBadge({ value }: { value: string }) {
 
 function TextList({ empty, items }: { empty: string; items: string[] }) {
   if (!items.length) {
-    return <p className="text-sm text-slate-500 dark:text-zinc-400">{empty}</p>;
+    return <ContextHelp label={empty}><p>{empty}</p></ContextHelp>;
   }
   return (
     <ul className="space-y-2 text-sm leading-6 text-slate-700 dark:text-zinc-300">
@@ -53,10 +68,26 @@ function TextList({ empty, items }: { empty: string; items: string[] }) {
   );
 }
 
-function ProvenanceCard({ surface }: { surface: PresentationSurface }) {
+function ProvenanceCard({ surface, projection, zh }: {
+  surface: PresentationSurface;
+  projection?: PresentationProjectionEnvelope | null;
+  zh: boolean;
+}) {
   if (surface.state !== "ready" && surface.state !== "review_due") {
     return null;
   }
+  const lineage = publishedResearchLineage(projection);
+  const unknown = zh ? "未知" : "unknown";
+  const references = [
+    [zh ? "原 Goal" : "Original Goal", surface.goal_id],
+    [zh ? "来源编号" : "Source ID", lineage.sourceId],
+    [zh ? "来源版本" : "Source version", lineage.version],
+    [zh ? "替代来源" : "Supersedes", lineage.supersedes === null ? null
+      : lineage.supersedes.length ? lineage.supersedes.join(", ") : zh ? "无" : "none"],
+    [zh ? "扩展 / 展示面" : "Extension / surface", `${surface.extension_id} / ${surface.surface_id}`],
+    [zh ? "展示 schema" : "View schema", surface.view_schema],
+    [zh ? "扩展 revision" : "Extension revision", surface.detail_ref.extension_revision],
+  ];
   return (
     <Card data-testid="decision-research-surface-summary">
       <CardHeader>
@@ -66,51 +97,229 @@ function ProvenanceCard({ surface }: { surface: PresentationSurface }) {
             <StateBadge value={surface.state} />
             <Badge variant="neutral">{surface.visibility}</Badge>
           </div>
-          <p className="mt-3 text-sm leading-6 text-slate-600 dark:text-zinc-300">
-            Rendered from the published projection resolved by content-addressed
-            reference. Core status remains a compact provider-neutral index.
-          </p>
+          <ContextHelp icon={FileSearch} label={zh ? "研究来源与复核期限" : "Research source and review deadline"}><p>{zh ? "已发布研究的原始时间与来源引用；刷新页面不延长复核期限。" : "Original publication times and source reference. Refreshing does not extend the review deadline."}</p></ContextHelp>
         </div>
-        <FileSearch className="h-5 w-5 text-slate-400 dark:text-zinc-500" />
       </CardHeader>
       <CardContent>
         <dl className="grid gap-3 text-sm sm:grid-cols-2">
           <div>
-            <dt className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500 dark:text-zinc-400">
-              View schema
-            </dt>
-            <dd className="mt-1 font-mono text-slate-800 dark:text-zinc-200">
-              {surface.view_schema}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500 dark:text-zinc-400">
-              Generated at
+            <dt className="text-xs font-semibold text-slate-500 dark:text-zinc-400">
+              {zh ? "发布时间" : "Published at"}
             </dt>
             <dd className="mt-1 text-slate-800 dark:text-zinc-200">
               {surface.generated_at}
             </dd>
           </div>
           <div>
-            <dt className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500 dark:text-zinc-400">
-              Extension revision
+            <dt className="text-xs font-semibold text-slate-500 dark:text-zinc-400">
+              {zh ? "原复核期限" : "Original review deadline"}
             </dt>
-            <dd className="mt-1 font-mono text-slate-800 dark:text-zinc-200">
-              {surface.detail_ref.extension_revision}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500 dark:text-zinc-400">
-              Payload SHA-256
-            </dt>
-            <dd
-              className="mt-1 break-all font-mono text-xs text-slate-800 dark:text-zinc-200"
-              data-testid="research-detail-ref-hash"
-            >
-              {surface.detail_ref.payload_sha256}
+            <dd className="mt-1 text-slate-800 dark:text-zinc-200" data-testid="research-review-deadline">
+              {surface.review_due_at ?? unknown}
             </dd>
           </div>
         </dl>
+        <details className="mt-4 text-sm" data-testid="research-reference-details">
+          <summary className="cursor-pointer font-medium">
+            {zh ? "来源与引用详情" : "Source and reference details"}
+          </summary>
+          <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+            {references.map(([label, value]) => <div key={String(label)}>
+              <dt className="text-xs font-semibold text-slate-500 dark:text-zinc-400">{label}</dt>
+              <dd className="mt-1 break-all font-mono text-xs text-slate-800 dark:text-zinc-200">{value ?? unknown}</dd>
+            </div>)}
+            <div>
+              <dt className="text-xs font-semibold text-slate-500 dark:text-zinc-400">
+                Payload SHA-256
+              </dt>
+              <dd
+                className="mt-1 break-all font-mono text-xs text-slate-800 dark:text-zinc-200"
+                data-testid="research-detail-ref-hash"
+              >
+                {surface.detail_ref.payload_sha256}
+              </dd>
+            </div>
+          </dl>
+        </details>
+      </CardContent>
+    </Card>
+  );
+}
+
+export function SourcePeriodMetricsCard({
+  metrics,
+}: {
+  metrics: DecisionResearchView["source_period_metrics"];
+}) {
+  if (!metrics.length) {
+    return null;
+  }
+
+  return (
+    <Card data-testid="research-source-period-metrics">
+      <CardHeader>
+        <div>
+          <CardTitle>Source-period evidence</CardTitle>
+          <ContextHelp label="Source-period evidence basis"><p>Period completeness, calculation basis, and upstream lineage stay explicit. Missing values are not zero, and these rows never grant ready status.</p></ContextHelp>
+        </div>
+        <Badge variant="neutral">{metrics.length}</Badge>
+      </CardHeader>
+      <CardContent>
+        <div className="grid gap-3 lg:grid-cols-2">
+          {metrics.map((metric) => (
+            <article
+              className="rounded-lg border border-slate-200 p-4 dark:border-zinc-800"
+              key={metric.metric_id}
+            >
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <h3 className="font-semibold">{metric.label}</h3>
+                  <p className="mt-1 font-mono text-xs text-slate-500 dark:text-zinc-400">
+                    {metric.period_start === metric.period_end
+                      ? metric.period_start
+                      : `${metric.period_start} → ${metric.period_end}`}
+                  </p>
+                </div>
+                <StateBadge value={metric.coverage_state} />
+              </div>
+              <div className="mt-3 text-2xl font-semibold">
+                {metric.value === null
+                  ? "missing (not zero)"
+                  : `${metric.value} ${metric.unit}`}
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Badge variant="info">{metric.metric_basis}</Badge>
+                <Badge variant="info">{metric.metric_semantics}</Badge>
+                <Badge variant="neutral">{metric.value_origin}</Badge>
+                <Badge variant="neutral">{metric.value_precision}</Badge>
+                <Badge variant="neutral">{metric.observation_authority}</Badge>
+                <StateBadge value={metric.methodology_state} />
+                <StateBadge value={metric.anomaly_state} />
+                <StateBadge value={metric.lineage_state} />
+              </div>
+              <dl className="mt-4 grid gap-2 text-xs text-slate-600 dark:text-zinc-300 sm:grid-cols-2">
+                <div>
+                  <dt className="font-semibold">Component coverage</dt>
+                  <dd className="mt-1">
+                    {metric.observed_components.length}/{metric.expected_components.length}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Independent evidence</dt>
+                  <dd className="mt-1">{String(metric.independent_evidence)}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Composite event</dt>
+                  <dd className="mt-1 break-words">
+                    {metric.event_identity.namespace} / {metric.event_identity.source_event_id}
+                    {" · "}{metric.event_identity.instrument_id}{" · "}{metric.event_identity.event_at}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Signed / account basis</dt>
+                  <dd className="mt-1 break-words">
+                    {metric.sign_basis} · {metric.account_nav_treatment}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Numerator scope</dt>
+                  <dd className="mt-1 break-words">{metric.numerator_scope.join(", ")}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Denominator scope</dt>
+                  <dd className="mt-1 break-words">
+                    {metric.denominator_scope.length
+                      ? metric.denominator_scope.join(", ")
+                      : "none"}
+                  </dd>
+                </div>
+              </dl>
+              {metric.missing_components.length ? (
+                <p className="mt-3 text-sm leading-6 text-amber-700 dark:text-amber-300">
+                  Missing components: {metric.missing_components.join(", ")}
+                </p>
+              ) : null}
+              {metric.double_counted_components.length ? (
+                <p className="mt-2 text-sm leading-6 text-slate-600 dark:text-zinc-300">
+                  Excluded double-counted components: {metric.double_counted_components.join(", ")}
+                </p>
+              ) : null}
+              {metric.gap_reasons.length ? (
+                <p className="mt-2 text-sm leading-6 text-rose-700 dark:text-rose-300">
+                  Holds: {metric.gap_reasons.join(", ")}
+                </p>
+              ) : null}
+              <p className="mt-3 break-all font-mono text-xs text-slate-500 dark:text-zinc-400">
+                source: {metric.source_ref}
+              </p>
+            </article>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+export function SpotMarketIdentityCard({
+  identity,
+}: {
+  identity: DecisionResearchView["spot_market_identity"];
+}) {
+  if (!identity?.markets.length) {
+    return null;
+  }
+
+  return (
+    <Card data-testid="research-spot-market-identity">
+      <CardHeader>
+        <div>
+          <CardTitle>Spot identity joins</CardTitle>
+          <ContextHelp label="Spot identity basis"><p>Contexts match pair names and assets resolve by explicit index. Array position and naming canonicality never establish backing.</p></ContextHelp>
+        </div>
+        <Badge variant="neutral">{identity.markets.length}</Badge>
+      </CardHeader>
+      <CardContent>
+        <div className="grid gap-3 lg:grid-cols-2">
+          {identity.markets.map((market) => (
+            <article
+              className="rounded-lg border border-slate-200 p-4 dark:border-zinc-800"
+              key={market.pair_name}
+            >
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <h3 className="font-semibold">{market.pair_name}</h3>
+                  <p className="mt-1 text-sm text-slate-500 dark:text-zinc-400">
+                    {market.base_asset.symbol} / {market.quote_asset.symbol}
+                  </p>
+                </div>
+                <Badge variant="neutral">{market.canonicality}</Badge>
+              </div>
+              <p className="mt-3 text-2xl font-semibold">
+                {market.mark_price === null ? "missing (not zero)" : market.mark_price}
+              </p>
+              <dl className="mt-4 grid gap-2 text-xs text-slate-600 dark:text-zinc-300 sm:grid-cols-2">
+                <div>
+                  <dt className="font-semibold">Context identity</dt>
+                  <dd className="mt-1 break-words">{market.context_coin}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Observed</dt>
+                  <dd className="mt-1 break-words">{market.observed_at}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Asset indexes</dt>
+                  <dd className="mt-1">
+                    {market.base_asset.index} / {market.quote_asset.index}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-semibold">Backing inference</dt>
+                  <dd className="mt-1">{market.backing_inference}</dd>
+                </div>
+              </dl>
+            </article>
+          ))}
+        </div>
       </CardContent>
     </Card>
   );
@@ -122,12 +331,16 @@ export function DecisionResearchSurface({
   view = null,
   viewError = null,
   viewLoading = false,
+  projection = null,
+  zh = false,
 }: {
   goals: RunGoal[];
   surface: PresentationSurface;
   view?: DecisionResearchView | null;
   viewError?: string | null;
   viewLoading?: boolean;
+  projection?: PresentationProjectionEnvelope | null;
+  zh?: boolean;
 }) {
   if (surface.state === "invalid") {
     return (
@@ -220,7 +433,7 @@ export function DecisionResearchSurface({
               Loading the full research view…
             </p>
           ) : null}
-          <ProvenanceCard surface={surface} />
+          <ProvenanceCard surface={surface} projection={projection} zh={zh} />
         </>
       ) : (
         <>
@@ -305,6 +518,10 @@ export function DecisionResearchSurface({
               </div>
             </CardContent>
           </Card>
+
+          <SourcePeriodMetricsCard metrics={view.source_period_metrics} />
+
+          <SpotMarketIdentityCard identity={view.spot_market_identity} />
 
           <Card>
             <CardHeader>
@@ -637,7 +854,7 @@ export function DecisionResearchSurface({
             </Card>
           </div>
 
-          <ProvenanceCard surface={surface} />
+          <ProvenanceCard surface={surface} projection={projection} zh={zh} />
         </>
       )}
     </div>

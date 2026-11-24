@@ -6,9 +6,15 @@ from pathlib import Path
 import pytest
 
 from loopx.control_plane.quota.heartbeat_receipt import (
+    bind_replan_successor_heartbeat_receipt,
     find_heartbeat_receipt,
+    heartbeat_receipt_view,
+    requalify_bound_heartbeat_receipt,
+    retain_pending_heartbeat_action_selection,
     upgrade_identityless_heartbeat_receipt,
 )
+from loopx.control_plane.quota.error_codes import HeartbeatReceiptIdentityConflictError
+from loopx.control_plane.quota.settlement import read_heartbeat_settlement
 from loopx.rollout_event_log import (
     append_rollout_event,
     build_rollout_event,
@@ -21,6 +27,66 @@ AGENT_ID = "codex-heartbeat-receipt"
 TURN_ID = "turn-heartbeat-receipt-1"
 TODO_ID = "todo_heartbeat_receipt"
 EFFECT_ID = f"{GOAL_ID}:{AGENT_ID}:{TODO_ID}:{TURN_ID}"
+
+
+@pytest.mark.parametrize("todo_id", ["todo_BAD_ID", "not_a_todo", "todo_a", "todo_" + "x" * 65])
+def test_receipt_reader_rejects_the_same_illegal_binding_as_settlement(
+    tmp_path: Path, todo_id: str,
+) -> None:
+    _append_receipt(tmp_path, todo_id=todo_id, effect_id=f"{GOAL_ID}:{AGENT_ID}:{todo_id}:{TURN_ID}")
+    path = rollout_event_log_path(tmp_path, GOAL_ID)
+    original = path.read_bytes()
+    typed = read_heartbeat_settlement(
+        tmp_path, goal_id=GOAL_ID, agent_id=AGENT_ID, todo_id=None,
+        turn_instance_id=TURN_ID, resolve_original_binding=True,
+    )
+    assert typed is not None and typed.identity.failure is not None
+    reason = "heartbeat receipt declares a Todo binding that is not a legal Todo id"
+    assert typed.identity.failure.reason == reason
+    with pytest.raises(HeartbeatReceiptIdentityConflictError, match="not a legal Todo id") as rejected:
+        find_heartbeat_receipt(tmp_path, goal_id=GOAL_ID, agent_id=AGENT_ID, turn_instance_id=TURN_ID)
+    assert str(rejected.value) == reason
+    assert path.read_bytes() == original
+
+
+def test_binding_projection_does_not_cache_or_roundtrip_receipt_details(tmp_path: Path) -> None:
+    # Two fresh logs have identical binding facts and different unconsumed
+    # details. A pure selection may be reused; the event must be read afresh.
+    for ordinal in (1, 2):
+        runtime = tmp_path / str(ordinal)
+        event = build_rollout_event(
+            goal_id=GOAL_ID, event_kind="quota_should_run", agent_id=AGENT_ID,
+            run_id=TURN_ID, status="normal_run", details={
+                "todo_id": TODO_ID, "settlement_effect_id": EFFECT_ID,
+                "opaque_observation": ordinal, "exact_integer": 2**60 + ordinal,
+            },
+        )
+        recorded = append_rollout_event(rollout_event_log_path(runtime, GOAL_ID), event)
+        read = find_heartbeat_receipt(runtime, goal_id=GOAL_ID, agent_id=AGENT_ID, turn_instance_id=TURN_ID)
+        assert read == recorded
+        assert read["details"]["opaque_observation"] == ordinal
+        assert read["details"]["exact_integer"] == 2**60 + ordinal
+
+
+@pytest.mark.parametrize("binding_details", [
+    {"replan_obligation_id": "replan-2222222222222222"},
+    {"request_id": "a" * 64, "request_revision": 1,
+     "request_digest": "b" * 64, "execution_scope_sha256": "c" * 64},
+])
+def test_shared_binding_outranks_a_later_unbound_receipt(
+    tmp_path: Path, binding_details: dict[str, object],
+) -> None:
+    path = rollout_event_log_path(tmp_path, GOAL_ID)
+    bound = append_rollout_event(path, build_rollout_event(
+        goal_id=GOAL_ID, event_kind="quota_should_run", agent_id=AGENT_ID,
+        run_id=TURN_ID, status="normal_run", details=binding_details,
+    ))
+    _append_receipt(tmp_path)
+    before = path.read_bytes()
+    assert find_heartbeat_receipt(
+        tmp_path, goal_id=GOAL_ID, agent_id=AGENT_ID, turn_instance_id=TURN_ID,
+    ) == bound
+    assert path.read_bytes() == before
 
 
 def _append_receipt(
@@ -97,6 +163,116 @@ def test_identityless_receipt_upgrade_rejects_conflicting_selected_todo(
     assert len(load_rollout_events(rollout_event_log_path(tmp_path, GOAL_ID))) == 2
 
 
+def test_replan_binding_rechecks_identity_inside_the_lock(
+    tmp_path: Path,
+) -> None:
+    _append_receipt(tmp_path, todo_id=TODO_ID, effect_id=EFFECT_ID)
+
+    with pytest.raises(ValueError):
+        bind_replan_successor_heartbeat_receipt(
+            tmp_path,
+            goal_id=GOAL_ID,
+            agent_id=AGENT_ID,
+            turn_instance_id=TURN_ID,
+            replan_obligation_id="replan-2222222222222222",
+        )
+
+    assert len(load_rollout_events(rollout_event_log_path(tmp_path, GOAL_ID))) == 1
+
+
+def test_replan_binding_preserves_concurrent_effective_details(
+    tmp_path: Path,
+) -> None:
+    obligation_id = "replan-2222222222222222"
+    original = build_rollout_event(
+        goal_id=GOAL_ID,
+        event_kind="quota_should_run",
+        agent_id=AGENT_ID,
+        run_id=TURN_ID,
+        status="autonomous_replan_required",
+        summary="identity-less autonomous replan receipt",
+        details={
+            "interaction_mode": "autonomous_replan",
+            "ok": True,
+            "should_run": True,
+            "must_attempt_work": True,
+            "delivery_allowed": False,
+            "quiet_noop_allowed": False,
+            "semantic_replan_obligation_id": obligation_id,
+        },
+    )
+    log_path = rollout_event_log_path(tmp_path, GOAL_ID)
+    append_rollout_event(log_path, original)
+    retained, retained_appended = retain_pending_heartbeat_action_selection(
+        tmp_path,
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+        turn_instance_id=TURN_ID,
+        todo_id="todo_concurrent_choice",
+        reason="owner_selected_candidate",
+    )
+    assert retained_appended is True
+
+    bound, appended = bind_replan_successor_heartbeat_receipt(
+        tmp_path,
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+        turn_instance_id=TURN_ID,
+        replan_obligation_id=obligation_id,
+    )
+
+    assert appended is True
+    assert retained["details"]["pending_action_selection_todo_id"] == (
+        "todo_concurrent_choice"
+    )
+    assert bound["details"]["pending_action_selection_todo_id"] == (
+        "todo_concurrent_choice"
+    )
+    assert bound["details"]["replan_obligation_id"] == obligation_id
+
+
+def test_the_receipt_view_says_when_the_turn_still_owes_its_binding(
+    tmp_path: Path,
+) -> None:
+    """A guard that ran before selection may not read as a settled guard.
+
+    The documented wake order commits the receipt first, so the view has to name
+    the debt: without it the caller only finds out when the closeout refuses, and
+    the turn's work stays unaccounted.
+    """
+
+    identityless = _append_receipt(tmp_path)
+    owed = heartbeat_receipt_view(
+        identityless,
+        turn_instance_id=TURN_ID,
+        status="committed",
+    )
+
+    assert owed["settlement_binding_owed"] is True
+    assert "settlement_identity" not in owed
+
+    # A receipt that names its work item and effect no longer owes anything, and
+    # the flag is absent rather than false so a bound receipt keeps its shape.
+    bound = _append_receipt(tmp_path, todo_id=TODO_ID, effect_id=EFFECT_ID)
+    served = heartbeat_receipt_view(
+        bound,
+        turn_instance_id=TURN_ID,
+        status="upgraded",
+    )
+
+    assert "settlement_binding_owed" not in served
+    assert served["settlement_identity"]["todo_id"] == TODO_ID
+
+    # A half-written binding (a work item with no effect id) cannot settle
+    # either, so it still counts as owed instead of reading as bound.
+    half = _append_receipt(tmp_path, todo_id=TODO_ID)
+    assert heartbeat_receipt_view(
+        half,
+        turn_instance_id=TURN_ID,
+        status="committed",
+    )["settlement_binding_owed"] is True
+
+
 def test_concurrent_identityless_receipt_upgrades_append_one_correction(
     tmp_path: Path,
 ) -> None:
@@ -110,6 +286,42 @@ def test_concurrent_identityless_receipt_upgrades_append_one_correction(
         results[0][0]["event_id"]
     }
     assert len(load_rollout_events(rollout_event_log_path(tmp_path, GOAL_ID))) == 2
+
+
+def test_concurrent_work_requalification_appends_one_same_binding_receipt(tmp_path: Path) -> None:
+    proof = {"ok": True, "should_run": True, "must_attempt_work": True,
+             "delivery_allowed": True, "quiet_noop_allowed": False,
+             "todo_id": TODO_ID, "selected_todo_id": TODO_ID, "settlement_effect_id": EFFECT_ID,
+             "admission_resume_when": "resume_at:2000-01-01T00:00:00Z", "admission_resume_ready": True}
+    original = build_rollout_event(goal_id=GOAL_ID, event_kind="quota_should_run",
+        agent_id=AGENT_ID, todo_id=TODO_ID, run_id=TURN_ID,
+        status="successor_replan_required", summary="delivery denied",
+        details={**proof, "delivery_allowed": False,
+                 "admission_resume_when": None, "admission_resume_ready": None})
+    log_path = rollout_event_log_path(tmp_path, GOAL_ID)
+    append_rollout_event(log_path, original)
+
+    def qualify(_: int) -> tuple[dict[str, object], bool]:
+        return requalify_bound_heartbeat_receipt(tmp_path, goal_id=GOAL_ID, agent_id=AGENT_ID,
+            turn_instance_id=TURN_ID, todo_id=TODO_ID, replan_obligation_id=None,
+            status="normal_run", details=proof, registry_path=None, goal_ref=None)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(qualify, range(8)))
+    assert sum(appended for _, appended in results) == 1
+    assert len({event["event_id"] for event, _ in results}) == 1
+    events = load_rollout_events(log_path)
+    assert len(events) == 2 and events[0] == original
+    assert events[1]["details"]["settlement_effect_id"] == EFFECT_ID
+    assert events[1]["details"]["admission_resume_when"] == proof["admission_resume_when"]
+    assert events[1]["details"]["admission_resume_ready"] is True
+    assert events[1]["causality"]["caused_by"] == original["event_id"]
+    replay, appended = requalify_bound_heartbeat_receipt(tmp_path, goal_id=GOAL_ID, agent_id=AGENT_ID,
+        turn_instance_id=TURN_ID, todo_id=TODO_ID, replan_obligation_id=None,
+        status="normal_run", details={**proof, "admission_resume_when": "resume_at:2099-01-01T00:00:00Z"},
+        registry_path=None, goal_ref=None)
+    assert appended is False
+    assert replay == events[1]
 
 
 def test_legacy_todo_only_receipt_upgrades_derived_effect_identity(
@@ -157,3 +369,92 @@ def test_effective_receipt_does_not_downgrade_after_identity_correction(
 
     assert effective is not None
     assert effective["event_id"] == corrected["event_id"]
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("preexisting", [True, False], ids=["already-due", "introduced-later"])
+def test_cli_reentry_distinguishes_admission_timer_from_later_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str, preexisting: bool,
+) -> None:
+    from tests.control_plane.canonical_authority_fixture import isolate_sqlite_runtime
+    from loopx.control_plane.coordination.local_authority import read_canonical_todos_if_promoted
+    from tests.control_plane.test_quota_settlement_cli import (
+        AGENT_ID as actor, GOAL_ID as goal, TODO_ID as work, ALTERNATIVE_TODO_ID as successor,
+        _configure_selectable_alternative, _initialize_fixture_authority, _run_cli,
+        _run_generated_cli, _spend_run_count, _write_fixture,
+    )
+
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_fixture(tmp_path)
+    _configure_selectable_alternative(project)
+    state = project / f".codex/goals/{goal}/ACTIVE_GOAL_STATE.md"
+    resume = "resume_at:2000-01-01T00:00:00Z"
+    if preexisting:
+        state.write_text(state.read_text().replace(
+            f"todo_id={work} status=open",
+            f"todo_id={work} status=open resume_when={resume} successor_todo_ids={successor}",
+        ))
+    _initialize_fixture_authority(project, runtime, provider=provider)
+    turn = "admission-timer-reentry"
+    binding = ("--goal-id", goal, "--agent-id", actor, "--todo-id", work,
+               "--turn-instance-id", turn)
+    guard = ("quota", "should-run", "--codex-app", *binding)
+    rc, admitted = _run_cli(registry, runtime, *guard)
+    assert rc == 0, admitted
+    assert admitted["interaction_contract"]["agent_channel"]["delivery_allowed"] is True
+    identity = admitted["heartbeat_receipt"]["settlement_identity"]
+    if not preexisting:
+        # The new wait is already due too. Its authoring after admission, not
+        # the deadline alone, requires closing the original admitted result.
+        rc, updated = _run_cli(registry, runtime, "todo", "update", "--goal-id", goal,
+            "--agent-id", actor, "--todo-id", work, "--resume-when", resume,
+            "--successor-todo-id", successor, "--reason", "Return the verified original result.")
+        assert rc == 0, updated
+
+    def rows():
+        return read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=goal)["todos"]
+
+    before = rows()
+    rc, reentry = _run_cli(registry, runtime, *guard)
+    assert rc == 0, reentry
+    assert reentry["heartbeat_receipt"]["settlement_identity"] == identity
+    if preexisting:
+        assert reentry["interaction_contract"]["agent_channel"]["delivery_allowed"] is True
+        assert reentry["selected_todo"]["todo_id"] == work
+    else:
+        assert reentry["unsettled_host_turn_recovery"]["repair"] == "durable_writeback"
+        assert reentry["interaction_contract"]["agent_channel"]["delivery_allowed"] is False
+    receipt = find_heartbeat_receipt(runtime, goal_id=goal, agent_id=actor, turn_instance_id=turn)
+    assert receipt is not None
+    assert receipt["details"]["admission_resume_when"] == (resume if preexisting else None)
+    if preexisting:
+        assert receipt["details"]["admission_resume_ready"] is True
+    assert rows() == before
+    assert _spend_run_count(runtime) == 0
+
+    # Both routes still owe the same result, writeback and exactly one debit.
+    (project / "validated-result.txt").write_text("Synthetic result validated before closeout.\n")
+    plan = reentry["interaction_contract"]["cli_channel"]["settlement_plan"]
+    assert plan["schema_version"] == "quota_settlement_plan_v2"
+    command = next(s["command_template"] for s in plan["ordered_steps"] if s["kind"] == "durable_writeback")
+    command = command.replace("<validated_progress>", "admission_timer_validated").replace(
+        "<scale>", "single_surface").replace("<outcome>", "outcome_progress")
+    command += (" --delivery-boundary in_flight_continuation --progress-result-class advanced"
+                f" --progress-work-item-id {work} --progress-evidence-id evidence:synthetic-result"
+                " --no-global-sync --suppress-external-sinks")
+    for attempt in range(2):
+        rc, written = _run_generated_cli(command, registry_path=registry, cwd=project)
+        assert rc == 0, written
+        assert written["settlement_result"]["ok"] is True
+        assert written["settlement_progress"]["state"] == "settled"
+        assert [row["step_kind"] for row in written["settlement_result"]["receipts"]] == [
+            "validation", "durable_writeback", "quota_spend",
+        ]
+        assert written.get("idempotent_replay", False) is bool(attempt)
+    assert _spend_run_count(runtime) == 1
+    rc, replay = _run_cli(registry, runtime, *guard)
+    assert rc == 0, replay
+    assert replay["effective_action"] == "heartbeat_settled_skip"
+    assert replay["heartbeat_receipt"]["settlement_identity"] == identity
+    assert rows() == before

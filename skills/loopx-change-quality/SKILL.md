@@ -61,6 +61,15 @@ Spend the review budget on simplification before broad quality analysis:
 4. Prefer the smallest coherent edit that leaves ownership and intent clearer.
    Do not create churn when the current shape is already direct and cohesive.
 
+Simplification must preserve decision meaning, including agent-consumed prose.
+Compare ordering, evidence provenance, modality, qualifiers, continuation and
+stop conditions before shortening instructions. Unchanged fields and green size
+tests are insufficient. Follow the repository's budget decision guide; prefer
+an evidence-backed regression-limit increase when compaction loses useful
+meaning. Never treat a test ceiling as frozen authority or infer a semantic
+change is authorized by a size target. Keep this judgment in the existing
+reuse/simplification and validation evidence rather than a separate receipt.
+
 Write one evidence-backed `reuse` conclusion and one evidence-backed
 `simplification` conclusion. Do not emit a row for every remaining lens.
 Those dimensions are guardrail categories for sparse `risks[]`: add an item
@@ -119,8 +128,7 @@ This first version is single-level. Review one final diff; do not recursively
 review the review, spawn a hierarchy of quality agents, or require agreement
 between several models.
 
-The guardrail catalog is review guidance, not an Agent output checklist or
-evidence that a particular model applies it well. Maintainers qualify model
+The guardrail catalog is review guidance. Maintainers qualify model
 behavior separately against the public clean-PR and seeded Python, Rust, and
 TypeScript shadow matrix.
 Normal delivery does not launch that low-frequency evaluation, and a model
@@ -199,5 +207,12 @@ Report:
 - receipt id and exact verification status;
 - premerge status, failures or skips, and manual holds.
 
-Stop before delivery when strict policy requires a receipt and the receipt is
-missing, invalid, stale, or contains an unresolved blocker.
+Hold merge, promotion and claims of qualified delivery when strict policy
+requires a receipt and it is missing, invalid, stale, or contains an unresolved
+blocker. Continue feasible authorized repair and rerun qualification; a quality
+hold does not itself make an Agent task an external wait. Preserve the actual
+required checks and failed observations. When a real dependency prevents
+repair, record its typed wait and consider other authorized Goal work through
+the current selection contract. A completed author proposal may enter normal
+PR review with its qualification hold disclosed; this grants no merge or
+installation authority.

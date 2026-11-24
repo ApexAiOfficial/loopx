@@ -177,13 +177,14 @@ def _write_private_json_atomic(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
-        directory_fd = os.open(
-            destination.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        if os.name == "posix":
+            directory_fd = os.open(
+                destination.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)

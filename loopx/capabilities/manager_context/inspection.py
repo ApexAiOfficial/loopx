@@ -1,0 +1,930 @@
+"""On-demand manager reads from the existing scoped Core projections."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from copy import deepcopy
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from ...chat.manager_details import read_manager_goal_details
+from ...chat.manager_history import delivery_history_window, read_manager_delivery_history
+from ...control_plane.effect_runtime import effect_runtime_result
+
+
+TOOL_NAME = "loopx_manager_read"
+_TODO_DETAIL_GUIDANCE = (
+    "For an oversized exact local Todo, follow its read_reference. Concatenate "
+    "detail_page.text from offset zero through EOF with the same source_revision, "
+    "then parse the complete JSON record before deciding; a fragment is not the full task. "
+)
+READ_TOOL = {
+    "type": "function",
+    "name": TOOL_NAME,
+    "description": (
+        "Read authorized LoopX Core evidence on demand: the global Goal portfolio, "
+        "registered Agent responsibilities, one Goal's current Todos, recorded deliveries, or handoff receipt status. Use view=agents without source_id to discover across authorized local and SSH sources equally; delivery targets are not the discovery inventory. Follow next_reads for source-specific remaining pages. Agent search does not search task requirements: browse registrations when shorthand has no match, then read relevant source-qualified Todos. Use view=agent_route with exact goal_id and agent_id to observe a binding on the selected source host before asking the user for a task link. A readable route is not execution readiness or delivery authority. "
+        "For a current-work overview, start with the index's bounded Agent Todo summaries; "
+        "use view=portfolio for source and coverage, and view=todos for needed detail. "
+        "Delivery history answers past results, not live activity. "
+        "For handoffs, read inbox_state, remaining_work and the existing agenda together with return_replies: "
+        "a delivered conclusion can be a partial result, and an older delivered result does not settle a newer pending reply. "
+        "These receipt observations do not verify that the original question was substantively answered. "
+        "Every portfolio row carries its Goal lifecycle readback: reached milestones with "
+        "their evidence refs and the phase (starting/qualifying/waiting_owner/closing/closed), "
+        "or a typed unavailable gap naming why it could not be derived. Use that to state where "
+        "the Goal stands before listing detail. Use concrete evidence "
+        "to answer progress and priority questions. Paginate with next_offset. "
+        "An oversized portfolio row is incomplete; resolve attention read_reference "
+        "to recover complete decision terms before deciding or acting. "
+        + _TODO_DETAIL_GUIDANCE +
+        "Use view=report_source with a closed window_start/window_end for a frozen periodic-report "
+        "source over all authorized local Goals including stopped ones, current tasks, window deliveries "
+        "and their associated tasks, and handoff receipts. Copy source.source_revision when paging. "
+        "It reads evidence; it neither enables a schedule nor generates or sends a report. "
+        "No shell, writes, raw files, or additional Goal authorization."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "view": {
+                "type": "string",
+                "enum": ["sources", "portfolio", "todos", "deliveries", "handoffs", "agents", "agent_route", "report_source"],
+            },
+            "source_id": {"type": "string", "description": "Agents defaults to all authorized sources; other views default local. Copy a discovered row's source_id for its Goal details. Set local only to deliberately restrict discovery. Follow next_reads for federated continuation; scoped pages use next_offset."},
+            "days": {"type": "integer", "minimum": 1, "maximum": 90, "description": "Deliveries lookback; expand for latest known progress older than yesterday."},
+            "include_outcome_gaps": {"type": "boolean", "description": "Local deliveries: include recorded outcome_gap counterevidence alongside progress. Default false for ordinary delivery queries; report_source always includes it. Observations and untyped host failures are not delivery outcomes."},
+            "window_start": {"type": "string", "description": "Local deliveries/report_source: exact inclusive ISO-8601 timestamp with offset. Pair with window_end instead of days, e.g. a frozen report window."},
+            "window_end": {"type": "string", "description": "Local deliveries/report_source: exact exclusive ISO-8601 timestamp with offset. Boundaries do not move while paging; report_source requires a closed window."},
+            "expected_source_revision": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$", "description": "Local deliveries/report_source: copy source.source_revision when paging. Exact local Todo: copy its read_reference; this revision selects bounded JSON detail pages, where offset counts Unicode characters. Follow detail_page.next_read. On conflict restart the exact read; never merge revisions."},
+            "delivery_ref": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$", "description": "Local deliveries only: use an observed row's source_ref to recover its full permitted recorded_details and evidence references within the same read window/revision. Does not read referenced artifacts or prove the recorded claims."},
+            "goal_id": {"type": "string"},
+            "agent_id": {"type": "string", "minLength": 1,
+                         "description": "Agent_route only, with goal_id: exact registered Agent to locate. Search view=agents first; does not delegate or create an execution driver."},
+            "thread_link": {"type": "string", "minLength": 1,
+                            "description": "Agent_route only: optional exact host task link already supplied by the user. Do not guess a link to resolve ambiguous bindings."},
+            "host_surface": {"type": "string", "minLength": 1,
+                             "description": "Agent_route only: optionally narrow to an observed binding's exact host surface. This does not select another machine or grant delivery."},
+            "todo_id": {"type": "string", "minLength": 1,
+                        "description": "Todos only, with goal_id: read one exact record including its complete permitted text. Recover content_truncated excerpts; a completed record does not authorize new work."},
+            "query": {"type": "string", "maxLength": 200, "description": "Agents: match identity/responsibility, not Goal requirements. Todos: search permitted full task text before paging; requires goal_id and the discovered source_id. Omit to browse."},
+            "request_id": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$",
+                "description": "Handoffs only: exact request receipt ID.",
+            },
+            "include_stopped": {
+                "type": "boolean",
+                "description": "Portfolio/agents: include stopped Goals for an explicit historical question.",
+            },
+            "offset": {"type": "integer", "minimum": 0},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 12},
+        },
+        "required": ["view"],
+    },
+}
+
+# Existing manager threads retain their registered tool name. New project
+# conversations use a neutral name with the same reader, schema and limits.
+CONTEXT_TOOL_NAME = "loopx_context_read"
+CONTEXT_READ_TOOL = {**deepcopy(READ_TOOL), "name": CONTEXT_TOOL_NAME,
+    "description": "Read this conversation's authorized Goal, Todos, deliveries and handoff receipts. "
+    "The Goal row carries its lifecycle readback: reached milestones with evidence refs and the phase "
+    "(starting/qualifying/waiting_owner/closing/closed), or a typed unavailable gap naming why. "
+    "Use view=agents to find registered peers, then view=agent_route with exact goal_id and agent_id to observe an existing local host binding. A route is not execution readiness. "
+    "Paginate with next_offset. " + _TODO_DETAIL_GUIDANCE +
+    "No cross-Goal access, shell, writes or execution authority."}
+
+
+# The published tool schema is the contract the caller sees, so the reader takes
+# its allowlist and ranges from there instead of restating them in prose that can
+# drift from what a caller was offered.
+_READ_PROPERTIES = READ_TOOL["inputSchema"]["properties"]
+READ_ARGUMENT_NAMES = tuple(_READ_PROPERTIES)
+READ_VIEWS = tuple(_READ_PROPERTIES["view"]["enum"])
+READ_LIMIT_RANGE = (
+    _READ_PROPERTIES["limit"]["minimum"],
+    _READ_PROPERTIES["limit"]["maximum"],
+)
+READ_DAYS_RANGE = (
+    _READ_PROPERTIES["days"]["minimum"],
+    _READ_PROPERTIES["days"]["maximum"],
+)
+
+
+def rejected_read_arguments(arguments: dict[str, Any]) -> list[str]:
+    """Name every argument that keeps a manager read from running.
+
+    The caller is a model that can repair its own tool call, but only when the
+    refusal says which argument is wrong and what the tool accepts. Each entry
+    is ``<argument>:<what it must be>`` so the correction is mechanical instead
+    of a guess against a bare ``invalid_arguments``.
+    """
+
+    rejected = [
+        f"unknown_argument:{name}"
+        for name in sorted(set(arguments) - set(READ_ARGUMENT_NAMES))
+    ]
+    view = arguments.get("view")
+    if view not in READ_VIEWS:
+        rejected.append("view:must_be_one_of_" + ",".join(READ_VIEWS))
+    if "request_id" in arguments and view != "handoffs":
+        rejected.append("request_id:only_for_view_handoffs")
+    for name in ("agent_id", "thread_link", "host_surface"):
+        if name in arguments:
+            if view != "agent_route":
+                rejected.append(f"{name}:only_for_view_agent_route")
+            elif not isinstance(arguments[name], str) or not arguments[name].strip():
+                rejected.append(f"{name}:must_be_a_nonempty_string")
+    if view == "agent_route":
+        for name in ("goal_id", "agent_id"):
+            if not arguments.get(name):
+                rejected.append(f"agent_route:requires_{name}")
+        for name in ("offset", "limit"):
+            if name in arguments:
+                rejected.append(f"{name}:not_for_view_agent_route")
+    if "todo_id" in arguments:
+        if view != "todos":
+            rejected.append("todo_id:only_for_view_todos")
+        elif not isinstance(arguments["todo_id"], str) or not arguments["todo_id"]:
+            rejected.append("todo_id:must_be_a_nonempty_string")
+        elif not arguments.get("goal_id"):
+            rejected.append("todo_id:requires_goal_id")
+    if "include_stopped" in arguments:
+        if view not in {"portfolio", "agents"}:
+            rejected.append("include_stopped:only_for_view_portfolio_or_agents")
+        elif type(arguments["include_stopped"]) is not bool:
+            rejected.append("include_stopped:must_be_a_boolean")
+    if "query" in arguments:
+        if view not in {"agents", "todos"}:
+            rejected.append("query:only_for_view_agents_or_todos")
+        elif not isinstance(arguments["query"], str) or len(arguments["query"]) > 200:
+            rejected.append("query:must_be_a_string_at_most_200_characters")
+        if view == "todos" and "todo_id" in arguments:
+            rejected.append("query:cannot_combine_with_todo_id")
+    offset = arguments.get("offset", 0)
+    if type(offset) is not int or offset < 0:
+        rejected.append("offset:must_be_an_integer_at_least_0")
+    limit = arguments.get("limit", 8)
+    if type(limit) is not int or not READ_LIMIT_RANGE[0] <= limit <= READ_LIMIT_RANGE[1]:
+        rejected.append(
+            "limit:must_be_an_integer_between_"
+            f"{READ_LIMIT_RANGE[0]}_and_{READ_LIMIT_RANGE[1]}"
+        )
+    goal_id = arguments.get("goal_id")
+    if goal_id is not None and not isinstance(goal_id, str):
+        rejected.append("goal_id:must_be_a_string")
+    if "days" in arguments:
+        days = arguments["days"]
+        if view != "deliveries":
+            rejected.append("days:only_for_view_deliveries")
+        elif type(days) is not int or not READ_DAYS_RANGE[0] <= days <= READ_DAYS_RANGE[1]:
+            rejected.append(
+                "days:must_be_an_integer_between_"
+                f"{READ_DAYS_RANGE[0]}_and_{READ_DAYS_RANGE[1]}"
+            )
+    if "include_outcome_gaps" in arguments:
+        if view != "deliveries" or arguments.get("source_id", "local") != "local":
+            rejected.append("include_outcome_gaps:only_for_local_deliveries")
+        elif type(arguments["include_outcome_gaps"]) is not bool:
+            rejected.append("include_outcome_gaps:must_be_a_boolean")
+    if not isinstance(arguments.get("source_id", "local"), str):
+        rejected.append("source_id:must_be_a_string")
+    detail_read = view == "todos" and "expected_source_revision" in arguments
+    if detail_read:
+        if not arguments.get("goal_id") or not arguments.get("todo_id"):
+            rejected.append("expected_source_revision:requires_exact_todo")
+        if arguments.get("source_id", "local") != "local":
+            rejected.append("expected_source_revision:only_for_source_local")
+    exact_arguments = {"window_start", "window_end", "delivery_ref"} & arguments.keys()
+    if "expected_source_revision" in arguments and not detail_read:
+        exact_arguments.add("expected_source_revision")
+    for name in sorted(exact_arguments):
+        if view not in {"deliveries", "report_source"} or name == "delivery_ref" and view != "deliveries":
+            rejected.append(f"{name}:only_for_view_deliveries" if name == "delivery_ref" else f"{name}:only_for_view_deliveries_or_report_source")
+        elif arguments.get("source_id", "local") != "local":
+            rejected.append(f"{name}:only_for_source_local")
+    if {"window_start", "window_end"} & arguments.keys():
+        if "days" in arguments:
+            rejected.append("days:cannot_combine_with_exact_window")
+        try:
+            if not all(isinstance(arguments.get(name), str) for name in ("window_start", "window_end")):
+                raise ValueError("two timestamps required")
+            delivery_history_window(arguments.get("window_start"), arguments.get("window_end"))
+        except ValueError:
+            rejected.append("window_start,window_end:require_two_offset_timestamps_increasing_at_most_90_days")
+        if ((type(offset) is int and offset > 0) or "delivery_ref" in arguments) and "expected_source_revision" not in arguments:
+            rejected.append("expected_source_revision:required_for_exact_window_pagination")
+    for name in ("expected_source_revision", "delivery_ref"):
+        if name in arguments and (not isinstance(arguments[name], str)
+                or not re.fullmatch(r"sha256:[a-f0-9]{64}", arguments[name])):
+            rejected.append(f"{name}:must_be_a_sha256_revision")
+    if "delivery_ref" in arguments and offset != 0:
+        rejected.append("delivery_ref:requires_offset_0")
+    if view == "report_source":
+        for name in ("goal_id", "include_stopped"):
+            if name in arguments:
+                rejected.append(f"{name}:report_source_uses_complete_authorized_local_portfolio")
+        if not {"window_start", "window_end"} <= arguments.keys():
+            rejected.append("report_source:requires_window_start_and_window_end")
+    return rejected
+
+
+def _todo_detail_revision(row: dict[str, Any], source: dict[str, Any]) -> str:
+    # Bind both native source and permitted projection, so an old owner-only
+    # cursor cannot continue into a different redaction/presentation scope.
+    encoded = json.dumps([source["source_revision"], row], ensure_ascii=False, sort_keys=True)
+    return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _todo_detail_page(row: dict[str, Any], arguments: dict[str, Any], revision: str) -> dict[str, Any]:
+    """Page transport encoding only; canonical selection and redaction stay in Core."""
+    text = json.dumps(row, ensure_ascii=False, sort_keys=True)
+    offset = arguments.get("offset", 0)
+    if offset >= len(text):
+        return {"ok": False, "error": "todo_detail_offset_out_of_range"}
+    reference = {**arguments, "source_id": "local"}
+
+    def page(end: int) -> dict[str, Any]:
+        return {"offset": offset, "next_offset": end if end < len(text) else None,
+                "total_characters": len(text), "source_revision": revision,
+                "text": text[offset:end], "eof": end == len(text),
+                "next_read": {**reference, "offset": end} if end < len(text) else None}
+
+    # The JSON string escapes quotes/control characters again. Budget the
+    # encoded page, not just the original text, without splitting Unicode.
+    low, high = offset, min(len(text), offset + 24000)
+    while low < high:
+        end = (low + high + 1) // 2
+        if len(json.dumps(page(end), ensure_ascii=False)) <= 24000:
+            low = end
+        else:
+            high = end - 1
+    if low == offset:
+        return {"ok": False, "error": "todo_detail_page_unavailable"}
+    return {"ok": True, "detail_page": page(low)}
+
+
+def agent_work_summary(agent: dict[str, Any]) -> dict[str, Any]:
+    """Keep the existing quota projection small; never infer live presence."""
+    verified = agent.get("source_verified") is True
+    todos = agent.get("todos", []) if verified else []
+    todos = [todo for todo in todos if isinstance(todo, dict)]
+    count = agent.get("todo_count_in_projection", len(todos))
+    count = max(count, len(todos)) if type(count) is int else len(todos)
+    selected: list[dict[str, Any]] = []
+    for todo in todos[:3]:
+        # The portfolio already normalizes/redacts these fields. Keep that
+        # vocabulary and order, without copying raw records or receipt bodies.
+        selected.append({
+            key: value[:240] if isinstance(value, str) else None
+            for key in ("todo_id", "title", "status", "priority", "claimed_by",
+                        "readiness", "next_safe_action")
+            if (value := todo.get(key)) is not None
+        })
+        if todo.get("content_truncated") is True or any(
+            isinstance(todo.get(key), str) and len(todo[key]) > 240 for key in selected[-1]
+        ):
+            selected[-1]["content_truncated"] = True
+    return {
+        "agent_id": agent.get("agent_id"),
+        "source_verified": verified,
+        "waiting_on": agent.get("waiting_on") if verified else None,
+        "owner_gate_ids": agent.get("owner_gate_ids", [])[:8] if verified else [],
+        "todo_count_in_projection": count if verified else None,
+        "todos_omitted": count - len(selected) if verified else None,
+        "todos": selected,
+    }
+
+
+def manager_index(context: dict[str, Any], *, status_on_demand: bool = False) -> dict[str, Any]:
+    """A small directory, never a second mutable progress store."""
+    read_tool = CONTEXT_TOOL_NAME if context.get("scope") == "owner_goal" else TOOL_NAME
+    execution = context.get("context_execution")
+    # Only the prompt directory uses excerpts. The context and scoped reader
+    # retain complete records, source quality and the original authority.
+    goals = context.get("goals", [])
+    previews = effect_runtime_result(
+        "presentation.goal_attention.bound",
+        {"goals": [{"goal_id": row.get("goal_id"), "attention": row.get("attention")}
+                   for row in goals], "preview": True},
+    )["goals"]
+    return {
+        "schema_version": "manager_evidence_index_v1",
+        "snapshot_id": context.get("snapshot_id"),
+        "collected_at": context.get("collection_completed_at"),
+        "coverage": context.get("coverage"),
+        "scope": context.get("scope"),
+        "warnings": context.get("warnings", []),
+        "stopped_goals_excluded": sum(
+            r.get("activation_state") == "stopped" for r in context.get("goals", [])
+        ),
+        "goals": [
+            {
+                "goal_id": row["goal_id"],
+                "source_id": "local",
+                **(
+                    {"goal_instance_id": row["goal_instance_id"]}
+                    if row.get("goal_instance_id")
+                    else {}
+                ),
+                "description": row.get("description"),
+                "activation_state": row.get("activation_state", "unknown"),
+                "quality": row.get("quality"),
+                "source": {key: (row.get("source") or {}).get(key)
+                           for key in ("revision", "latest_recorded_at")},
+                "agent_coverage": row.get("agent_coverage"),
+                "agents": [agent_work_summary(agent) for agent in row.get("agents", [])],
+                "progress": row.get("progress"),
+                "lifecycle_phase": _lifecycle_phase(row.get("goal_lifecycle")),
+                "attention": preview.get("attention") or {
+                    "status": "unavailable", "items": [], "reason": "goal_not_read",
+                },
+                "details": "use_" + read_tool,
+            }
+            for row, preview in zip(goals, previews, strict=True)
+            if row.get("activation_state") != "stopped"
+        ],
+        "context_delegation": context.get("context_delegation"),
+        **({"context_execution": execution} if isinstance(execution, dict)
+           and (execution.get("bindings") or execution.get("available") is False) else {}),
+        "evidence_sources": context.get("evidence_sources", [])[:12],
+        "evidence_source_count": len(context.get("evidence_sources", [])),
+        "agent_discovery": {"tool": read_tool, "view": "agents", "scope": "permitted_registry",
+                            "independent_of_delivery_targets": True, "route_view": "agent_route",
+                            "source_scope": "local" if context.get("scope") == "owner_goal" else "all_authorized",
+                            "note": "The initial Goal preview is local only, not a preference or complete inventory. Discover across sources before resolving project shorthand; preserve source_id for detail reads."},
+        "read_tool": read_tool,
+        "agent_work_note": (
+            "Agent Todos are bounded declared work from this portfolio snapshot, not live activity "
+            "or completed results. Respect each Goal's quality, recorded timestamp and Agent coverage. "
+            "An empty or unverified projection does not prove idle or stopped. "
+            + (
+                "Use the scoped read tool with view=portfolio before drawing conclusions "
+                "that depend on current Goal status or attention."
+                if status_on_demand else
+                "For a current-work question, answer the known overview first; read only missing or requested detail."
+            )
+        ),
+        "attention_note": (
+            "Attention is a directory preview, not complete decision terms or an action grant. "
+            "Resolve read_reference with the scoped read tool before deciding or acting; "
+            "details_omitted and content_truncated never prove complete evidence."
+        ),
+    }
+
+
+def _lifecycle_phase(readback: Any) -> str | None:
+    """The derived phase, or None when the readback names a gap instead.
+
+    A derived projection always carries a phase string, so None means "not
+    derived here", never "this Goal has no phase". The portfolio view carries
+    the typed reason next to the row's existing `quality`.
+    """
+
+    if not isinstance(readback, dict) or readback.get("status") == "unavailable":
+        return None
+    phase = readback.get("lifecycle_phase")
+    return phase if isinstance(phase, str) and phase else None
+
+
+def handoff_receipt_readbacks(root, registry, rows):
+    """Join an audience-checked page to the existing Inbox's read-only agenda.
+
+    Transport delivery alone cannot tell whether the latest result retained
+    work, or whether a newer result still awaits its original return.
+    """
+    from ...chat import redact_local_paths
+    from ...control_plane.collaboration.inbox import _entry, read_inbox_transaction
+    from ...control_plane.collaboration.goal_instance_scope import collaboration_goal_scope
+
+    if not rows:
+        return []
+    requests = []
+    for row in rows:
+        with collaboration_goal_scope(registry, goal_id=row["goal_id"], agents=(),
+                caller_goal_ref=row.get("goal_ref")) as scope:
+            request = _entry(root, row["goal_id"], row["agent_id"], row["request_id"], scope=scope)
+        if any(request.get(key) != row.get(key) for key in ("request_id", "goal_id", "agent_id", "source_id", "goal_ref")):
+            raise ValueError("handoff receipt identity changed")
+        requests.append(request)
+    snapshot = read_inbox_transaction(root, {
+        "operation": "receipt_states", "rows": requests, "include_agenda": True,
+    })
+
+    def safe(value):
+        if isinstance(value, str):
+            return redact_local_paths(value)
+        return {key: safe(item) for key, item in value.items()} if isinstance(value, dict) else value
+
+    page = []
+    for row, state, agenda in zip(rows, snapshot["items"], snapshot["agenda_items"], strict=True):
+        if "request_revision" in row and row["request_revision"] != (state.get("readback") or {}).get("request_revision"):
+            raise ValueError("handoff request revision changed")
+        item = {**row, "inbox_state": state["kind"], "agenda": safe(agenda),
+                "warnings": list(dict.fromkeys([*row["warnings"], *state["warnings"]]))}
+        item.pop("remaining_work", None)
+        if state.get("remaining_work"):
+            item["remaining_work"] = safe(state["remaining_work"])
+        page.append(item)
+    return page
+
+
+def _oversized_portfolio_index(row: dict[str, Any], gap: dict[str, Any]) -> dict[str, Any]:
+    """Keep recoverable decision references without lifting the row budget.
+
+    These are already scoped, public-safe portfolio fields. The existing typed
+    attention owner makes directory excerpts; exact Todo reads retain the full
+    terms, current authority check and original source. Other views keep their
+    existing oversized-record response.
+    """
+    reference = {"view": "todos", "goal_id": row["goal_id"]}
+    preview = effect_runtime_result("presentation.goal_attention.bound", {
+        "goals": [{"goal_id": row["goal_id"], "attention": row.get("attention")}],
+        "preview": True,
+    })["goals"][0]
+    index = {
+        **gap,
+        **{key: row[key] for key in (
+            "goal_instance_id", "description", "activation_state", "quality",
+            "progress", "source", "warnings", "goal_lifecycle",
+        ) if key in row},
+        "attention": preview.get("attention"),
+        "details_omitted": True,
+        "read_reference": reference,
+    }
+    if len(json.dumps(index, ensure_ascii=False)) <= 24000:
+        return index
+    # Even metadata can exceed the budget. Keep an explicit unknown gap and
+    # the existing scoped read route, never malformed JSON or a partial term.
+    from ...goal_portfolio import lifecycle_readback_unavailable
+
+    return {**gap, "details_omitted": True, "read_reference": reference,
+            "goal_lifecycle": lifecycle_readback_unavailable(row["goal_id"], "omitted_due_to_size"),
+            "attention": {"status": "unavailable", "items": [], "reason": "omitted_due_to_size"}}
+
+
+class ManagerInspection:
+    def __init__(
+        self,
+        *,
+        context: dict[str, Any],
+        registry_path: Path,
+        runtime_root: Path,
+        owner_scope: bool,
+        scope_valid: Callable[[], bool],
+        record: Callable[[dict[str, Any]], None],
+        channel_id: str | None = None,
+        remote_runner=None,
+        ssh_config_path=None,
+        discovery_scope: Callable[[], list[str] | None] | None = None,
+        delegation_authority: Callable[[], dict] | None = None,
+    ) -> None:
+        self.context = context
+        self.registry_path = registry_path
+        self.runtime_root = runtime_root
+        self.owner_scope = owner_scope
+        self.scope_valid = scope_valid
+        self.record = record
+        self.channel_id = channel_id
+        self.remote_runner = remote_runner
+        self.ssh_config_path = ssh_config_path
+        self.discovery_scope = discovery_scope
+        self.delegation_authority = delegation_authority
+        # An explicit report read freezes one bounded source in this original
+        # Turn's reader. No durable shadow history or cross-session cache.
+        self._report_snapshot = None
+
+    def sources(self) -> list[dict[str, Any]]:
+        if self.context.get("scope") == "owner_goal":
+            return [{"source_id": "local", "source_host": "local", "status": "available"}]
+        from .ssh_evidence import sources
+        return sources(self.runtime_root, self.channel_id, self.owner_scope, self.ssh_config_path)
+
+    def _registered_goals(self) -> list[dict[str, Any]]:
+        from ...history import decode_registry_snapshot
+        inventory = decode_registry_snapshot(self.registry_path, self.registry_path.read_bytes())["goals"]
+        if not isinstance(inventory, list) or any(not isinstance(g, dict) or not isinstance(g.get("id"), str) for g in inventory):
+            raise ValueError("Goal inventory is unreadable")
+        return inventory
+
+    def _discover_sources(self, tool, arguments, sources):
+        """Bounded transport fanout; the typed projection owns fair presentation.
+
+        This runs only for an explicit discovery read, never at Turn preparation.
+        Keep per-source continuations instead of conflating host-local offsets.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        from .ssh_evidence import grants, read_remote, MANAGER_REMOTE_EVIDENCE_HOST_TIMEOUT_SECONDS
+
+        if arguments.get("offset", 0):
+            return {"ok": False, "error": "invalid_arguments",
+                    "rejected_arguments": ["offset:select_source_id_from_next_reads"]}
+        try:
+            scope = self._goal_scope()
+        except ValueError:
+            return {"ok": False, "error": "authorization_changed"}
+        grant = grants(self.runtime_root, self.channel_id)
+
+        def collect(source):
+            args = {**arguments, "source_id": source["source_id"]}
+            if source["source_id"] == "local":
+                return self.read(tool, args)
+            return read_remote(self.runtime_root, self.channel_id, self.owner_scope, args,
+                self.scope_valid, config_path=self.ssh_config_path,
+                timeout_seconds=MANAGER_REMOTE_EVIDENCE_HOST_TIMEOUT_SECONDS,
+                **({"runner": self.remote_runner} if self.remote_runner else {}))
+
+        # Cap connections and returned evidence, not authorization. Sources past
+        # this bounded batch remain visible with an exact read continuation.
+        with ThreadPoolExecutor(max_workers=min(12, len(sources))) as pool:
+            pages = list(pool.map(collect, sources[:12]))
+        try:
+            current_scope = self._goal_scope()
+        except ValueError:
+            return {"ok": False, "error": "authorization_changed"}
+        if (not self.scope_valid() or current_scope != scope
+                or grants(self.runtime_root, self.channel_id) != grant or self.sources() != sources):
+            return {"ok": False, "error": "authorization_changed"}
+        result = effect_runtime_result("manager.discovery.project", {
+            "arguments": arguments, "sources": sources, "pages": pages,
+        })
+        self.record(result)
+        return result
+
+    def _goal_scope(self) -> list[str] | None:
+        try:
+            ids = (self.discovery_scope() if self.discovery_scope else
+                   None if self.owner_scope and self.context.get("scope") == "owner_global" else
+                   [r["goal_id"] for r in self.context.get("goals", [])])
+        except (OSError, KeyError, TypeError) as error:
+            raise ValueError("current audience scope unavailable") from error
+        if ids is None:
+            if not (self.owner_scope and self.context.get("scope") == "owner_global"):
+                raise ValueError("current audience scope unavailable")
+        elif not isinstance(ids, list) or any(not isinstance(g, str) for g in ids):
+            raise ValueError("invalid audience scope")
+        return ids
+
+    def _portfolio(self, ids, goal_id, include_stopped, offset, limit):
+        from ...control_plane.goals.activation import goal_activation_state
+        from ...chat_manager_context import manager_turn_context
+        try:
+            inventory_bytes = self.registry_path.read_bytes()
+            inventory = self._registered_goals()
+            permitted = sorted({g["id"] for g in inventory if ids is None or g["id"] in ids})
+            if goal_id is not None:
+                permitted = [goal_id] if goal_id in permitted else []
+            elif not include_stopped:
+                stopped = set()
+                for g in inventory:
+                    if g["id"] not in permitted:
+                        continue
+                    try:
+                        if goal_activation_state(g).value == "stopped":
+                            stopped.add(g["id"])
+                    except ValueError:
+                        pass  # Unknown activation stays visible as a source gap.
+                permitted = [gid for gid in permitted if gid not in stopped]
+            selected = permitted[offset:offset + limit]
+            page, contexts, collected = [], [], []
+            for selected_id in selected:
+                context = manager_turn_context(
+                    self.registry_path,
+                    {"channel_id": self.channel_id or ("manager" if self.owner_scope else "manager.external.inspection")},
+                    self.runtime_root, authorized_goal_ids=ids, requested_goal_ids=[selected_id],
+                    include_stopped=include_stopped or goal_id is not None, include_details=False,
+                )
+                if not self.scope_valid():
+                    return {"ok": False, "error": "authorization_changed"}
+                rows = context.get("goals", [])
+                if len(rows) != 1 or rows[0].get("goal_id") != selected_id:
+                    raise ValueError("requested portfolio row is unavailable")
+                contexts.append(context)
+                collected.extend(rows)
+                bounded = effect_runtime_result("presentation.goal_attention.bound", {"goals": collected})["goals"]
+                # Apply the existing encoded-row budget while collecting. At
+                # most one lookahead row is read again on the next page; do not
+                # collect every later Goal only to discard it in read(). A lone
+                # oversized row keeps the existing explicit gap/continuation.
+                if len(json.dumps(bounded, ensure_ascii=False)) > 24000 and page:
+                    break
+                page = bounded
+                if len(json.dumps(page, ensure_ascii=False)) > 24000:
+                    break
+            if self.registry_path.read_bytes() != inventory_bytes:
+                raise ValueError("Goal inventory changed during collection")
+            coverages = [context.get("coverage", {}) for context in contexts]
+            coverage = {"complete": all(c.get("complete") is True for c in coverages)}
+            for key in set().union(*(c.keys() for c in coverages)) - {"complete"}:
+                values = [c.get(key, 0) for c in coverages]
+                coverage[key] = ((max(values) if key == "invalid_registry_entries" else sum(values))
+                                 if all(type(v) is int for v in values) else None)
+            snapshot_id = ("sha256:" + hashlib.sha256(json.dumps(
+                contexts, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+                if contexts else None)
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return {"ok": False, "view": "portfolio", "error": "goal_inventory_unavailable"}
+        end = offset + len(page)
+        return {"ok": True, "view": "portfolio", "goal_id": goal_id, "rows": page,
+                "offset": offset, "included": len(page), "matched": len(permitted),
+                "next_offset": end if end < len(permitted) else None,
+                "source": {"source": "goal_portfolio", "snapshot_id": snapshot_id,
+                           "coverage": coverage},
+                "unknown": any(context.get("warnings") for context in contexts),
+                "initial_snapshot_id": self.context.get("snapshot_id"),
+                "source_id": "local", "source_host": "local"}
+
+    def read(self, tool: str, arguments: Any) -> dict[str, Any]:
+        if tool not in {TOOL_NAME, CONTEXT_TOOL_NAME} or not isinstance(arguments, dict):
+            return {"ok": False, "error": "unsupported_read_tool"}
+        rejected = rejected_read_arguments(arguments)
+        if rejected:
+            return {
+                "ok": False,
+                "error": "invalid_arguments",
+                "rejected_arguments": rejected,
+                "allowed_arguments": list(READ_ARGUMENT_NAMES),
+                "allowed_views": list(READ_VIEWS),
+                "detail": (
+                    f"resend {tool} with only the allowed arguments; each rejected "
+                    "entry names the argument and what it must be"
+                ),
+            }
+        view, goal_id = arguments.get("view"), arguments.get("goal_id")
+        offset, limit = arguments.get("offset", 0), arguments.get("limit", 8)
+        include_stopped = arguments.get("include_stopped", False)
+        if not self.scope_valid():
+            self._report_snapshot = None
+            return {"ok": False, "error": "authorization_changed"}
+        source_id = arguments.get("source_id", "local")
+        if view == "report_source":
+            return self._report_source(tool, arguments)
+        if self.context.get("scope") == "owner_goal" and source_id != "local":
+            return {"ok": False, "error": "source_outside_available_scope"}
+        if view == "agents" and "source_id" not in arguments:
+            sources = self.sources()
+            if len(sources) > 1:
+                return self._discover_sources(tool, arguments, sources)
+        if view == "sources":
+            rows = self.sources()
+            if not self.scope_valid():
+                return {"ok": False, "error": "authorization_changed"}
+            result = {"ok": True, "view": view, "rows": rows[offset:offset + limit],
+                      "matched": len(rows), "next_offset": offset + limit if offset + limit < len(rows) else None,
+                      "note": "Configured sources are not yet read. Select source_id for remote evidence; an empty local host_id does not imply missing remote Goals."}
+            self.record(result)
+            return result
+        if source_id != "local":
+            if not source_id.startswith("ssh:") or view == "handoffs" or (view not in {"portfolio", "agents"} and not goal_id):
+                return {"ok": False, "error": "invalid_remote_read"}
+            from .ssh_evidence import read_remote
+            result = read_remote(self.runtime_root, self.channel_id, self.owner_scope, arguments,
+                                 self.scope_valid, config_path=self.ssh_config_path,
+                                 **({"runner": self.remote_runner} if self.remote_runner else {}))
+            self.record(result)
+            return result
+        try:
+            ids = self._goal_scope()
+        except ValueError:
+            return {"ok": False, "error": "authorization_changed"}
+        if goal_id is not None and ids is not None and goal_id not in ids:
+            return {"ok": False, "error": "goal_outside_available_scope"}
+        if view in {"agents", "agent_route"}:
+            if goal_id is not None:
+                ids = [goal_id]
+            if view == "agent_route":
+                from ...control_plane.collaboration.peer_host_route import resolve_peer_host_route
+
+                result = resolve_peer_host_route(self.registry_path, goal_id=goal_id,
+                                                agent_id=arguments["agent_id"],
+                                                thread_link=arguments.get("thread_link"),
+                                                host_surface=arguments.get("host_surface"))
+                if not self.scope_valid():
+                    return {"ok": False, "error": "authorization_changed"}
+                self.record(result)
+                return result
+            from .discovery import agent_page
+
+            grant = self.delegation_authority() if self.delegation_authority else self.context.get("context_delegation")
+            result = agent_page(self.registry_path, goal_ids=ids, query=arguments.get("query", ""),
+                                include_stopped=include_stopped, offset=offset, limit=limit, delegation=grant)
+            if not self.scope_valid():
+                return {"ok": False, "error": "authorization_changed"}
+            self.record(result)
+            return result
+        if view not in {"portfolio", "handoffs"} and not goal_id:
+            return {"ok": False, "error": "goal_outside_available_scope"}
+        if view != "portfolio":
+            if ids is None:
+                try:
+                    ids = [g["id"] for g in self._registered_goals()]
+                except (OSError, ValueError, KeyError, TypeError):
+                    return {"ok": False, "error": "goal_inventory_unavailable"}
+            if goal_id is not None and goal_id not in ids:
+                return {"ok": False, "error": "goal_outside_available_scope"}
+        portfolio_unknown = False
+        if view == "portfolio":
+            result = self._portfolio(ids, goal_id, include_stopped, offset, limit)
+            if not result.get("ok"):
+                return result
+            page, source, matched = result["rows"], result["source"], result["matched"]
+            portfolio_unknown = result["unknown"]
+        elif view == "handoffs":
+            from .tracking import query
+
+            try:
+                source = query(
+                    self.runtime_root,
+                    self.registry_path,
+                    goal_ids=[goal_id] if goal_id else ids,
+                    owner_scope=self.owner_scope,
+                    channel_id=self.channel_id,
+                    request_id=arguments.get("request_id"),
+                    offset=offset,
+                    limit=limit,
+                )
+                page = handoff_receipt_readbacks(self.runtime_root, self.registry_path, source.pop("rows"))
+            except (OSError, ValueError, TypeError, KeyError):
+                return {"ok": False, "error": "handoff_query_unavailable_or_invalid"}
+            matched = source.pop("matched")
+        elif view == "todos":
+            source = read_manager_goal_details(
+                self.registry_path,
+                self.runtime_root,
+                goal_id,
+                owner_scope=self.owner_scope,
+                limit=limit,
+                offset=0 if "expected_source_revision" in arguments else offset,
+                todo_id=arguments.get("todo_id"),
+                query=arguments.get("query", ""),
+            )
+            page = source.pop("todos", [])
+            # Completed title joins remain available through the delivery view.
+            source.pop("completed_todos", None)
+            matched = source.get("coverage", {}).get("matched", source.get("coverage", {}).get("active"))
+        else:
+            source = read_manager_delivery_history(
+                self.runtime_root, goal_id, limit=limit, offset=offset, lookback_days=arguments.get("days", 1),
+                **{name: arguments[name] for name in ("window_start", "window_end", "expected_source_revision", "delivery_ref", "include_outcome_gaps")
+                   if name in arguments},
+            )
+            page = source.pop("deliveries", [])
+            matched = source.get("coverage", {}).get("matched")
+            details = read_manager_goal_details(
+                self.registry_path,
+                self.runtime_root,
+                goal_id,
+                owner_scope=self.owner_scope,
+                completed_todo_ids={r.get("todo_id") for r in page},
+            )
+            titles = {
+                r["todo_id"]: r.get("title")
+                for r in details.get("todos", []) + details.get("completed_todos", [])
+            }
+            # A delivery's task can be beyond the overview page. Recover only
+            # its exact canonical record; never mistake the first page's cap
+            # for an absent task, or treat a completed record as new authority.
+            for todo_id in {row.get("todo_id") for row in page} - titles.keys():
+                if not todo_id:
+                    continue
+                exact = read_manager_goal_details(self.registry_path, self.runtime_root, goal_id,
+                    owner_scope=self.owner_scope, todo_id=todo_id)
+                for row in exact.get("todos", []):
+                    titles[row["todo_id"]] = row.get("title")
+            page = [{**r, "todo_title": titles.get(r.get("todo_id"))} for r in page]
+        if not self.scope_valid():
+            return {"ok": False, "error": "authorization_changed"}
+        if view == "todos" and "expected_source_revision" in arguments:
+            if source.get("status") != "read":
+                return {"ok": False, "error": "todo_detail_unavailable"}
+            if len(page) != 1:
+                return {"ok": False, "error": "todo_detail_unavailable"}
+            revision = _todo_detail_revision(page[0], source)
+            if revision != arguments["expected_source_revision"]:
+                return {"ok": False, "error": "todo_detail_revision_mismatch"}
+            result = _todo_detail_page(page[0], arguments, revision)
+            if not result["ok"]:
+                return result
+            if not self.scope_valid():
+                return {"ok": False, "error": "authorization_changed"}
+            result.update({"view": view, "goal_id": goal_id, "source": source,
+                           "rows": [], "matched": matched, "unknown": True, "source_id": "local",
+                           "source_host": "local", "note": _TODO_DETAIL_GUIDANCE})
+            self.record(result)
+            return result
+        # Trim whole rows, never malformed JSON or undisclosed byte truncation.
+        while len(page) > 1 and len(json.dumps(page, ensure_ascii=False)) > 24000:
+            page.pop()
+        oversized = []
+        for i, row in enumerate(page):
+            if len(json.dumps(row, ensure_ascii=False)) > 24000:
+                oversized.append(offset + i)
+                gap = {
+                    "status": "oversized_record",
+                    "row_index": offset + i,
+                    "goal_id": row.get("goal_id"),
+                    "todo_id": row.get("todo_id"),
+                    "details": "omitted_due_to_size",
+                }
+                page[i] = _oversized_portfolio_index(row, gap) if view == "portfolio" else gap
+                if view == "todos" and arguments.get("todo_id") and source.get("source_revision"):
+                    page[i]["read_reference"] = {
+                        "view": "todos", "source_id": "local", "goal_id": goal_id,
+                        "todo_id": arguments["todo_id"], "offset": 0,
+                        "expected_source_revision": _todo_detail_revision(row, source),
+                    }
+                    page[i]["read_instruction"] = _TODO_DETAIL_GUIDANCE
+        # Building an oversized index crosses the typed presentation owner;
+        # a grant revoked during that read must suppress the entire response.
+        if view == "portfolio" and oversized and not self.scope_valid():
+            return {"ok": False, "error": "authorization_changed"}
+        end = offset + len(page)
+        result = {
+            "ok": True,
+            "view": view,
+            "goal_id": goal_id,
+            "source": source,
+            "rows": page,
+            "offset": offset,
+            "included": len(page),
+            "matched": matched,
+            "next_offset": end
+            if isinstance(matched, int) and page and end < matched
+            else None,
+            # An omitted record is incomplete evidence in every view, even
+            # when an exact Todo has no further row page to read.
+            "unknown": matched is None or portfolio_unknown or bool(oversized)
+            or ("window_start" in arguments and (
+                source.get("window_complete") is False
+                or bool(source.get("coverage", {}).get("invalid_delivery_records"))
+                or bool(source.get("coverage", {}).get("invalid_index_records"))))
+            or (
+                view == "handoffs"
+                and (
+                    not source["coverage"]["scan_complete"]
+                    or not source["coverage"]["legacy_audience_scan_complete"]
+                    or bool(source["coverage"]["unreadable"])
+                    or any(row.get("inbox_state") == "receipt_unavailable" for row in page)
+                )
+            ),
+            "oversized_rows": oversized,
+            "initial_snapshot_id": self.context.get("snapshot_id"),
+            "source_id": "local",
+            "source_host": "local",
+        }
+        self.record(result)
+        return result
+
+    def _report_source(self, tool, arguments):
+        from .report_source import collect_manager_report_source
+
+        start, end = delivery_history_window(arguments["window_start"], arguments["window_end"])
+        window = {"window_start": start.isoformat(), "window_end": end.isoformat()}
+        snapshot = self._report_snapshot
+        expected = arguments.get("expected_source_revision")
+        if snapshot is None or snapshot["window"] != window:
+            # A lost/another Turn's snapshot never silently resumes at offset N.
+            if arguments.get("offset", 0) or expected:
+                return {"ok": False, "error": "report_snapshot_unavailable", "rows": []}
+            try:
+                snapshot = collect_manager_report_source(lambda query: self.read(tool, query), window)
+            except PermissionError:
+                self._report_snapshot = None
+                return {"ok": False, "error": "authorization_changed", "rows": []}
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                return {"ok": False, "error": "report_source_unavailable_or_window_not_closed", "rows": []}
+            self._report_snapshot = snapshot
+        if not self.scope_valid():
+            self._report_snapshot = None
+            return {"ok": False, "error": "authorization_changed", "rows": []}
+        if expected is not None and expected != snapshot["source_revision"]:
+            return {"ok": False, "error": "report_snapshot_revision_mismatch", "rows": []}
+        offset, limit = arguments.get("offset", 0), arguments.get("limit", 8)
+        page = deepcopy(snapshot["rows"][offset:offset + limit])
+        while len(page) > 1 and len(json.dumps(page, ensure_ascii=False)) > 24000:
+            page.pop()
+        oversized = []
+        for i, row in enumerate(page):
+            if len(json.dumps(row, ensure_ascii=False)) > 24000:
+                oversized.append(offset + i)
+                page[i] = {"kind": row["kind"], "goal_id": row["goal_id"],
+                    "source_ref": row["source_ref"], "status": "oversized_record"}
+        end = offset + len(page)
+        result = {"ok": True, "view": "report_source", "rows": page, "offset": offset,
+            "included": len(page), "matched": len(snapshot["rows"]),
+            "next_offset": end if page and end < len(snapshot["rows"]) else None,
+            "source": {**{key: snapshot[key] for key in (
+                "source_revision", "window", "window_bounds", "observed_at", "coverage")},
+                "gap_count": len(snapshot["gaps"]), "source_observation_count": len(snapshot["sources"])},
+            "report_source": {key: snapshot["source_result"][key] for key in (
+                "schema_version", "source_id", "source_kind", "status", "snapshot_digest", "snapshot_ref", "item_count")},
+            "unknown": not snapshot["coverage"]["complete"] or bool(oversized),
+            "oversized_rows": oversized, "source_id": "local", "source_host": "local",
+            "note": "Frozen read evidence, not an authored report, independent artifact verification, schedule activation or permission to publish."}
+        self.record(result)
+        return result

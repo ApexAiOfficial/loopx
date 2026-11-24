@@ -12,13 +12,25 @@ CODEX_BIN="codex"
 CLAUDE_BIN="claude"
 LARK_CLI_BIN=""
 LARK_CLI_ARGS=()
+GOAL_SUBAGENT_ARGS=()
+if [[ "${LOOPX_ENABLE_GOAL_SUBAGENT_CONFIGURATION:-0}" = "1" ]]; then
+  GOAL_SUBAGENT_ARGS=(--enable-goal-subagent-configuration)
+fi
 
 node_is_supported() {
-  "$1" -e '
-const [major, minor] = process.versions.node.split(".").map(Number);
-const supported = (major === 20 && minor >= 19) || (major === 22 && minor >= 12) || major > 22;
-process.exit(supported ? 0 : 1);
-' 2>/dev/null
+  local node_ts_flags=()
+  if [[ "$(uname -s 2>/dev/null || true)" == Linux* ]]; then
+    case "$(uname -m 2>/dev/null || true)" in
+      x86_64|amd64)
+        node_ts_flags=(--liftoff-only --no-wasm-tier-up --no-wasm-dynamic-tiering)
+        ;;
+    esac
+  fi
+  "$1" --no-warnings --experimental-strip-types ${node_ts_flags[@]+"${node_ts_flags[@]}"} --input-type=module -e '
+import { pathToFileURL } from "node:url";
+const { isSupportedNodeVersion } = await import(pathToFileURL(process.argv[1]).href);
+process.exit(isSupportedNodeVersion(process.versions.node) ? 0 : 1);
+' "${REPO_ROOT}/loopx/control_plane/runtime/node_version.ts" 2>/dev/null
 }
 
 select_node_runtime() {
@@ -41,8 +53,8 @@ select_node_runtime() {
     fi
   done
 
-  echo "LoopX dashboard requires Node.js 20.19+ or 22.12+. Node.js 22 is recommended." >&2
-  echo "Install Node.js 22, then retry: loopx dashboard" >&2
+  echo "LoopX dashboard requires Node.js 22.22.3 or newer for its control plane." >&2
+  echo "Activate a compatible Node.js runtime, then retry: loopx dashboard" >&2
   return 1
 }
 
@@ -62,16 +74,25 @@ fi
 wait_for_service() {
   local service_name="$1"
   local service_url="$2"
-  "${PYTHON_BIN}" - "${service_name}" "${service_url}" <<'PY'
+  local service_pid="$3"
+  local probe_status=0
+  local service_status=0
+  "${PYTHON_BIN}" - "${service_name}" "${service_url}" "${service_pid}" <<'PY'
+import os
 import sys
 import time
 import urllib.error
 import urllib.request
 
-name, url = sys.argv[1:]
+name, url, pid_text = sys.argv[1:]
+pid = int(pid_text)
 deadline = time.monotonic() + 15
 last_error = "service did not respond"
 while time.monotonic() < deadline:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        raise SystemExit(2)
     try:
         with urllib.request.urlopen(url, timeout=1) as response:
             if response.status == 200:
@@ -83,6 +104,15 @@ while time.monotonic() < deadline:
 print(f"LoopX {name} service failed to start: {last_error}", file=sys.stderr)
 raise SystemExit(1)
 PY
+  probe_status=$?
+  if [ "${probe_status}" -eq 2 ]; then
+    wait "${service_pid}"
+    service_status=$?
+    echo "LoopX ${service_name} service exited before it became ready (exit status ${service_status})." >&2
+    echo "The original service error output is shown above." >&2
+    return 1
+  fi
+  return "${probe_status}"
 }
 
 cleanup() {
@@ -98,9 +128,10 @@ trap cleanup EXIT INT TERM
 
 if ! PYTHON_BIN="$(bash "${SCRIPT_DIR}/loopx-python.sh")"; then
   echo "LoopX requires Python 3.11 or newer to start status and Chat services." >&2
-  echo "Install Python 3.11+ (for example: brew install python@3.12), or set" >&2
-  echo "LOOPX_PYTHON to an existing Python 3.11+ executable and retry, e.g.:" >&2
-  echo "  LOOPX_PYTHON=/path/to/python3.12 npm run dev" >&2
+  echo "From the repository root, prepare a project environment and retry:" >&2
+  echo "  uv sync --extra test" >&2
+  echo "  uv run --extra test bash scripts/dashboard-dev.sh" >&2
+  echo "Or set LOOPX_PYTHON to an existing Python 3.11+ executable." >&2
   echo "Starting the Vite UI only; use 'npm run dev:web' for the same UI-only preview." >&2
   cd "${DASHBOARD_DIR}"
   exec npm run dev:web
@@ -199,10 +230,13 @@ else
 fi
 
 cd "${REPO_ROOT}"
+"${PYTHON_BIN}" "${REPO_ROOT}/scripts/chat_bundle.py" ensure || exit 1
+
 "${PYTHON_BIN}" -m loopx.cli serve-status \
   --global-registry \
   --host 127.0.0.1 \
   --port 8766 \
+  ${GOAL_SUBAGENT_ARGS[@]+"${GOAL_SUBAGENT_ARGS[@]}"} \
   --limit 80 &
 STATUS_PID=$!
 
@@ -212,14 +246,15 @@ STATUS_PID=$!
   --port 8767 \
   --codex-bin "${CODEX_BIN}" \
   --claude-bin "${CLAUDE_BIN}" \
-  "${LARK_CLI_ARGS[@]}" \
+  ${GOAL_SUBAGENT_ARGS[@]+"${GOAL_SUBAGENT_ARGS[@]}"} \
+  ${LARK_CLI_ARGS[@]+"${LARK_CLI_ARGS[@]}"} \
   --no-open &
 CHAT_PID=$!
 
-if ! wait_for_service "status" "http://127.0.0.1:8766/healthz"; then
+if ! wait_for_service "status" "http://127.0.0.1:8766/healthz" "${STATUS_PID}"; then
   exit 1
 fi
-if ! wait_for_service "Chat" "http://127.0.0.1:8767/api/chat/capabilities"; then
+if ! wait_for_service "Chat" "http://127.0.0.1:8767/api/chat/capabilities" "${CHAT_PID}"; then
   exit 1
 fi
 

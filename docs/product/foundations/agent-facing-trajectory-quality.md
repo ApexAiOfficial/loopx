@@ -34,7 +34,7 @@ LoopX 需要同时保留两种不同形态的信息：
 
 ### 控制事件多于任务事件
 
-quota spend、scheduler acknowledgement、unchanged monitor poll 和 state refresh 对审计有价值，但它们不等于新的任务进展。控制事件密度持续上升时，Agent-facing 上下文和 run history 都会变得难以阅读，action 与 outcome 的对应关系也更难追踪。
+quota spend、scheduler acknowledgement、unchanged monitor poll 和 state refresh 对审计有价值。控制事件密度持续上升时，Agent-facing 上下文和 run history 都会变得难以阅读，action 与 outcome 的对应关系也更难追踪。
 
 ## 3. 三层质量架构
 
@@ -66,7 +66,7 @@ Registry、active state、todo、gate、quota decision、run history 和可选 t
 - validation、writeback 与 quota spend policy；
 - scheduler action 和必要的 cadence acknowledgement。
 
-TurnEnvelope 是 additive read model，目前仍为 opt-in，不改变 quota selection、todo routing 或默认完整输出。协议见 [TurnEnvelope v0](../../reference/protocols/turn-envelope-v0.md)。
+当前 quota guard 使用 Complete Turn v1。历史 v0 是已决策 quota 的精简读模型。历史读取与现用契约见 [TurnEnvelope](../../reference/protocols/turn-envelope-v0.md)。
 
 ### 质量审计层
 
@@ -176,7 +176,7 @@ budget:              8,192 B
 action signature:    match
 ```
 
-这个结果说明当前 envelope 已显著减少重复信息，同时保留了已覆盖的 action dimensions。它不证明所有状态都已具备完整 parity，因此默认 quota output 仍保持不变。
+这个结果说明当前 envelope 已显著减少重复信息，同时保留了已覆盖的 action dimensions。
 
 ### Compact history hygiene
 
@@ -190,7 +190,7 @@ action signature:    match
 - duplicate action ratio 为 10%；
 - 当前样本的 action、outcome 和 decision-anchor coverage 均为 100%。
 
-当前最明确的信号是：控制事件占比仍高，action/outcome 归因暂时完整。后续优化应优先减少控制语义在 Agent-facing 热路径中的重复，而不是删除审计事件。
+当前最明确的信号是：控制事件占比仍高，action/outcome 归因暂时完整。后续优化应优先减少控制语义在 Agent-facing 热路径中的重复。
 
 ## 7. 监控与优化闭环
 
@@ -204,10 +204,10 @@ loopx history trajectory-hygiene \
 loopx quota should-run \
   --goal-id <goal-id> \
   --agent-id <agent-id> \
-  --turn-envelope
+  --context-delivery off --delta-delivery off
 ```
 
-第一条命令观察 compact history 的事件结构；第二条命令检查当前 Agent-facing envelope、byte budget 和 action signature。
+第一条命令观察 compact history 的事件结构；第二条命令检查当前 Agent-facing Complete Turn 决策。
 
 ### 分类
 

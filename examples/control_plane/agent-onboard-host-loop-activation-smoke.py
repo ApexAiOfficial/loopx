@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -23,6 +24,10 @@ from loopx.bootstrap_command_pack import (  # noqa: E402
 )
 from loopx.cli import build_parser  # noqa: E402
 from loopx.control_plane.quota.usage_summary import is_automation_run  # noqa: E402
+from loopx.control_plane.testing.canary_harness import import_fixture_authority  # noqa: E402
+from loopx.control_plane.scheduler.automation_liveness import (  # noqa: E402
+    build_automation_liveness,
+)
 from loopx.control_plane.scheduler.execution_context import (  # noqa: E402
     scheduler_execution_context_for_runtime_profile,
 )
@@ -49,11 +54,51 @@ def run_cli(
     )
 
 
+def load_bootstrap(packet: dict, cli_bin: str, home: Path, *, env: dict[str, str] | None = None) -> dict:
+    assert packet["ok"] and packet["bootstrap"]
+    assert packet["interface_budget"]["within_budget"]
+    loader = shlex.split(packet["task_body"].split("```sh\n", 1)[1].split("\n```", 1)[0])
+    assert "--bootstrap" not in loader
+    loader[0] = cli_bin
+    result = subprocess.run(
+        loader,
+        env=env if env is not None else {**os.environ, "HOME": str(home), "LOOPX_PYTHON": sys.executable},
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def read_native_quota(packet: dict, cli_bin: str, *, cwd: Path, env: dict[str, str]) -> dict:
+    """Read back the returned current capture; this is not model-retention proof."""
+    command = packet["recovery"]["command"]
+    raw = bytearray()
+    while True:
+        argv = shlex.split(command)
+        if Path(argv[0]).name == "loopx":
+            argv[0] = cli_bin
+        result = subprocess.run(argv, cwd=cwd, env=env, check=True,
+            text=True, capture_output=True, timeout=120)
+        page = json.loads(result.stdout)
+        assert page["ok"] and page["offset"] == len(raw), page
+        previous = len(raw)
+        raw.extend(page["content"].encode())
+        if page["eof"]:
+            break
+        assert len(raw) > previous and page["next_offset"] == len(raw), page
+        command = page["next_command"]
+    return json.loads(raw)
+
+
 def main() -> int:
     catalog = build_agent_type_catalog()
     agent_types = {item["agent_type"] for item in catalog["canonical_agent_types"]}
     assert {
         "codex-app",
+        "trae_app",
         "codex-app-ssh",
         "codex-ide-plugin",
         "codex-cli",
@@ -73,6 +118,7 @@ def main() -> int:
     ], ambiguous
 
     assert agent_type_for_host_surface("chat-box") == "codex-app"
+    assert agent_type_for_host_surface("trae_app") == "trae_app"
     assert agent_type_for_host_surface("codex-app-ssh") == "codex-app-ssh"
     assert agent_type_for_host_surface("codex-ide-plugin") == "codex-ide-plugin"
     assert agent_type_for_host_surface("codex-ide") == "codex-ide-plugin"
@@ -87,6 +133,7 @@ def main() -> int:
     assert agent_type_for_host_surface("dsh") == "deepseek-harness"
 
     codex_app = build_host_loop_activation_packet(agent_type="codex-app", goal_id="demo")
+    trae_app = build_host_loop_activation_packet(agent_type="trae_app", goal_id="demo")
     codex_app_ssh = build_host_loop_activation_packet(
         agent_type="codex-app-ssh",
         goal_id="demo",
@@ -103,6 +150,24 @@ def main() -> int:
     traex_cli = build_host_loop_activation_packet(agent_type="traex-cli", goal_id="demo")
     dsh = build_host_loop_activation_packet(agent_type="deepseek-harness", goal_id="demo")
     assert codex_app["activation_method"] == "create_or_update_codex_app_automation", codex_app
+    assert trae_app["activation_method"] == "create_or_update_trae_app_automation", trae_app
+    assert trae_app["host_mutation"]["preferred_tool"] == "automation_update", trae_app
+    assert "--trae_app" in trae_app["commands"]["heartbeat_prompt"], trae_app
+    trae_scheduler = scheduler_execution_context_for_runtime_profile(
+        "trae_app"
+    )
+    assert trae_scheduler.ok, trae_scheduler
+    assert trae_scheduler.projection()["host_surface"] == "trae_app"
+    assert trae_scheduler.projection()["scheduler_owner"] == "host_automation"
+    settled = build_automation_liveness(
+        {
+            "effective_action": "heartbeat_settled_skip",
+            "heartbeat_recommendation": {},
+            "execution_obligation": {"must_attempt_work": False},
+        }
+    )
+    assert settled["keep_active"] is True, settled
+    assert settled["next_trigger"] == "next heartbeat turn with a fresh turn identity"
     assert codex_app_ssh["activation_method"] == "set_visible_goal", codex_app_ssh
     assert codex_app_ssh["host_surface"] == "codex_app_ssh_visible_goal_mode", codex_app_ssh
     assert any(
@@ -131,7 +196,7 @@ def main() -> int:
     assert pi["host_surface"] == "pi_visible_goal_mode", pi
     assert pi["host_mutation"]["host_tool"] == "loopx_goal_activate", pi
     assert pi["host_mutation"]["tool_argument_mapping"]["goalId"] == (
-        "heartbeat_prompt.goal_id"
+        "optional compatibility echo; host authority derives the value"
     ), pi
     assert "--runtime-profile generic_cli" in pi["commands"]["heartbeat_prompt"], pi
     assert ark_managed_agent["activation_method"] == "submit_goal_once", ark_managed_agent
@@ -228,6 +293,8 @@ def main() -> int:
             cli_bin="loopx",
             host_surface="codex-cli-tui",
             goal_text="build a deterministic onboarding path",
+            resolve_linked_worktree_alias=False,
+            runtime_root_arg=str(Path(tmp) / "runtime"),
         )
     assert payload["agent_type"] == "codex-cli", payload
     activation = payload["host_loop_activation"]
@@ -249,7 +316,16 @@ def main() -> int:
     assert "register-agent" in message, message
     assert "explicit takeover" in message, message
 
-    with tempfile.TemporaryDirectory(prefix="loopx-agent-onboard-identity-") as tmp:
+    # Route the connected fixture's builders and CLI children through its legacy registry.
+    with (
+        tempfile.TemporaryDirectory(prefix="loopx-agent-onboard-identity-") as tmp,
+        patch.dict(os.environ, {"LOOPX_RUNTIME_ROOT": str(Path(tmp) / "home" / ".codex" / "loopx")}),
+        patch.multiple(
+            "loopx.paths",
+            DEFAULT_RUNTIME_ROOT=Path(tmp) / "home" / ".loopx",
+            LEGACY_RUNTIME_ROOT=Path(tmp) / "home" / ".codex" / "loopx",
+        ),
+    ):
         root = Path(tmp)
         project = root / "project"
         home = root / "home"
@@ -259,8 +335,9 @@ def main() -> int:
         state_file.parent.mkdir(parents=True)
         project_registry.parent.mkdir(parents=True)
         global_registry.parent.mkdir(parents=True)
-        state_file.write_text("# Active State\n", encoding="utf-8")
+        state_file.write_text("# Active State\n\n## Agent Todo\n", encoding="utf-8")
         registry = {
+            "common_runtime_root": str(root / "runtime"),
             "goals": [
                 {
                     "id": "multi-agent-goal",
@@ -281,6 +358,9 @@ def main() -> int:
         }
         serialized_registry = json.dumps(registry)
         project_registry.write_text(serialized_registry, encoding="utf-8")
+        import_fixture_authority(project_registry, "multi-agent-goal", provider="sqlite")
+        registry = json.loads(project_registry.read_text(encoding="utf-8"))
+        serialized_registry = json.dumps(registry)
         global_registry.write_text(serialized_registry, encoding="utf-8")
         cli_bin = str(REPO_ROOT / "scripts" / "loopx")
 
@@ -312,7 +392,7 @@ def main() -> int:
         choice_run = subprocess.run(
             shlex.split(selected_choice["activation_input_command"]),
             cwd=REPO_ROOT,
-            env={**os.environ, "HOME": str(home)},
+            env={**os.environ, "HOME": str(home), "LOOPX_PYTHON": sys.executable},
             check=True,
             text=True,
             capture_output=True,
@@ -412,10 +492,14 @@ def main() -> int:
         )
         assert "/goal <task_body>" in app_ssh_activation["host_mutation"]["host_command"]
 
+        app_ssh_env = {**os.environ, "HOME": str(home), "LOOPX_PYTHON": sys.executable}
+        # This fresh synthetic host tests the absent-preference default, rather
+        # than an enclosing benchmark worker's explicitly disabled treatment.
+        app_ssh_env.pop("LOOPX_CONTEXT_DELIVERY", None)
         app_ssh_prompt_run = subprocess.run(
             shlex.split(app_ssh_activation["activation_input_command"]),
             cwd=REPO_ROOT,
-            env={**os.environ, "HOME": str(home)},
+            env=app_ssh_env,
             check=True,
             text=True,
             capture_output=True,
@@ -423,12 +507,15 @@ def main() -> int:
         )
         app_ssh_prompt = json.loads(app_ssh_prompt_run.stdout)
         assert app_ssh_prompt["ok"] is True, app_ssh_prompt
+        app_ssh_prompt = load_bootstrap(app_ssh_prompt, cli_bin, home, env=app_ssh_env)
+        assert app_ssh_prompt["context_delivery"]["enabled"] is True, app_ssh_prompt
         assert app_ssh_prompt["interface_budget"]["mode"] == "visible_goal", app_ssh_prompt
         assert app_ssh_prompt["interface_budget"]["max_chars"] == 4_000, app_ssh_prompt
         assert app_ssh_prompt["interface_budget"]["within_budget"] is True, app_ssh_prompt
         assert "--runtime-profile codex_app_ssh_goal" in (
             app_ssh_prompt["quota_guard_command"]
         ), app_ssh_prompt
+        assert "--begin-turn" in app_ssh_prompt["quota_guard_command"], app_ssh_prompt
         assert "--turn-instance-id" not in app_ssh_prompt["quota_guard_command"], app_ssh_prompt
         assert "--source visible-goal" in app_ssh_prompt["quota_spend_command"], app_ssh_prompt
         spend_args = build_parser().parse_args(
@@ -443,16 +530,15 @@ def main() -> int:
                 "quota_event": {"source": spend_args.source},
             }
         ) is False
-        assert "not a heartbeat automation" in app_ssh_prompt["task_body"], app_ssh_prompt
         assert "host_action=" not in app_ssh_prompt["task_body"], app_ssh_prompt
         assert "automation_update stop" not in app_ssh_prompt["task_body"], app_ssh_prompt
-        assert "call `update_goal` with `status=blocked`" in (
+        assert "Third identical blocked turn without progress: update_goal(status=blocked)" in (
             app_ssh_prompt["task_body"]
         ), app_ssh_prompt
-        assert "Only user `/goal resume`" in (
+        assert "no spend/LoopX completion" in (
             app_ssh_prompt["task_body"]
         ), app_ssh_prompt
-        assert "reactivates it; rerun quota after resume" in (
+        assert "Only user `/goal resume` reactivates; then rerun quota" in (
             app_ssh_prompt["task_body"]
         ), app_ssh_prompt
         app_ssh_quota_argv = shlex.split(app_ssh_prompt["quota_guard_command"])
@@ -461,17 +547,18 @@ def main() -> int:
             str(home) + arg[len("$HOME") :] if arg.startswith("$HOME/") else arg
             for arg in app_ssh_quota_argv
         ]
-        app_ssh_quota_argv.extend(["--scan-root", str(project)])
         app_ssh_quota_run = subprocess.run(
             app_ssh_quota_argv,
             cwd=project,
-            env={**os.environ, "HOME": str(home)},
+            env=app_ssh_env,
             check=True,
             text=True,
             capture_output=True,
             timeout=120,
         )
-        app_ssh_quota = json.loads(app_ssh_quota_run.stdout)
+        app_ssh_navigation = json.loads(app_ssh_quota_run.stdout)
+        assert app_ssh_navigation["mode"] == "full", app_ssh_navigation
+        app_ssh_quota = read_native_quota(app_ssh_navigation, cli_bin, cwd=project, env=app_ssh_env)
         execution_context = app_ssh_quota["scheduler_hint"]["execution_context"]
         assert execution_context["source"] == (
             "runtime_profile:codex_app_ssh_goal"
@@ -492,13 +579,14 @@ def main() -> int:
                 cli_onboarding["host_loop_activation"]["activation_input_command"]
             ),
             cwd=REPO_ROOT,
-            env={**os.environ, "HOME": str(home)},
+            env={**os.environ, "HOME": str(home), "LOOPX_PYTHON": sys.executable},
             check=True,
             text=True,
             capture_output=True,
             timeout=120,
         )
         cli_prompt = json.loads(cli_prompt_run.stdout)
+        cli_prompt = load_bootstrap(cli_prompt, cli_bin, home)
         assert cli_prompt["interface_budget"]["mode"] == "visible_goal", cli_prompt
         assert "--turn-instance-id" not in cli_prompt["quota_guard_command"], cli_prompt
         assert "--source visible-goal" in cli_prompt["quota_spend_command"], cli_prompt
@@ -577,6 +665,7 @@ def main() -> int:
             "loopx-doc-registry",
             "loopx-benchmark",
             "loopx-self-repair",
+            "loopx-performance-diagnosis",
         }, delivery
         assert delivery["delivery_options"] == [
             "host_skill_manifest",

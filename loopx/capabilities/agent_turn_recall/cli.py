@@ -2,31 +2,35 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import re
 import sys
-import tempfile
+from datetime import datetime, timezone
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 from ...history import load_registry
 from ...materials import find_registry_goal, goal_repo
-from ..reward_memory.experiment import (
-    resolve_reward_memory_experiment,
-    resolve_reward_memory_surface_config,
+from ...control_plane.quota.effect_program import SettlementIdentity
+from ...control_plane.work_items.autonomous_replan_obligation import (
+    replan_obligation_id_from_packet,
 )
+from ..reward_memory.experiment import resolve_reward_memory_experiment
 from .core import (
     AGENT_TURN_RECALL_SCHEMA_VERSION,
-    AGENT_TURN_RECALL_SURFACE_ID,
     build_agent_turn_recall_preview,
     build_agent_turn_situation,
     run_agent_turn_recall,
 )
-
-
-AGENT_TURN_RECALL_RECEIPT_SCHEMA_VERSION = "agent_turn_recall_receipt_v0"
-_SAFE_PATH_TOKEN = re.compile(r"[^A-Za-z0-9._-]+")
+from .runtime import (
+    AGENT_TURN_RECALL_RECEIPT_SCHEMA_VERSION,
+    agent_turn_recall_receipt_path,
+    deduplicated_agent_turn_recall_payload,
+    load_agent_turn_recall_receipt,
+    resolve_reward_memory_turn_session_ref,
+    reward_memory_turn_identity_scope,
+    reward_memory_turn_read_authority_checkpoints,
+    write_agent_turn_recall_receipt,
+)
 
 
 def _mapping(value: object) -> dict[str, Any]:
@@ -49,6 +53,22 @@ def _render(payload: dict[str, object]) -> str:
     if isinstance(guidance, list):
         lines.append(f"- guidance_count: `{len(guidance)}`")
     return "\n".join(lines) + "\n"
+
+
+def _runtime_unavailable_payload(goal_id: str, agent_id: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "schema_version": AGENT_TURN_RECALL_SCHEMA_VERSION,
+        "status": "runtime_unavailable",
+        "reason_code": "automatic_recall_runtime_failed",
+        "goal_id": goal_id,
+        "agent_id": agent_id,
+        "provider_call_count": 0,
+        "grants_new_action_authority": False,
+        "quota_spend_performed": False,
+        "external_writes_performed": False,
+        "suppress_external_sinks": True,
+    }
 
 
 def register_agent_turn_recall_commands(
@@ -92,9 +112,12 @@ def _goal_repo(registry_path: Path, goal_id: str) -> Path:
     return repo
 
 
-def _receipt_path(repo: Path, agent_id: str) -> Path:
-    token = _SAFE_PATH_TOKEN.sub("-", agent_id).strip("-") or "agent"
-    return repo / ".local" / "loopx" / "agent-turn-recall" / f"{token}.json"
+def _receipt_path(repo: Path, goal_id: str, agent_id: str) -> Path:
+    return agent_turn_recall_receipt_path(
+        repo,
+        goal_id=goal_id,
+        agent_id=agent_id,
+    )
 
 
 def _quota_decision(path_value: str) -> dict[str, Any]:
@@ -129,101 +152,61 @@ def _validate_quota_identity(
         raise ValueError(
             "quota decision turn_instance_id does not match --turn-instance-id"
         )
-    if receipt.get("status") not in {"committed", "replayed"}:
+    if receipt.get("status") not in {"committed", "replayed", "upgraded"}:
         raise ValueError("quota decision heartbeat receipt is not committed")
+    binding = receipt.get("settlement_identity")
+    if binding is None and receipt.get("status") != "upgraded":
+        return
+    try:
+        identity = SettlementIdentity.from_runtime_payload(binding)
+    except RuntimeError:
+        raise ValueError("quota decision settlement identity is invalid") from None
+    if (
+        identity.goal_id != goal_id
+        or identity.agent_id != agent_id
+        or identity.turn_instance_id != turn_instance_id
+    ):
+        raise ValueError("quota decision settlement identity does not match this turn")
+    if identity.todo_id:
+        if identity.todo_id != _mapping(quota_decision.get("selected_todo")).get("todo_id"):
+            raise ValueError("quota decision settlement identity does not match selected Todo")
+    elif identity.replan_obligation_id != replan_obligation_id_from_packet(
+        quota_decision.get("autonomous_replan_obligation")
+    ):
+        raise ValueError("quota decision settlement identity does not match replan obligation")
+    expected = SettlementIdentity(
+        goal_id=goal_id,
+        agent_id=agent_id,
+        todo_id=identity.todo_id,
+        turn_instance_id=turn_instance_id,
+        replan_obligation_id=identity.replan_obligation_id,
+    )
+    if identity.effect_id != expected.effect_id:
+        raise ValueError("quota decision settlement effect identity is invalid")
 
 
 def _load_receipt(path: Path) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("schema_version") != AGENT_TURN_RECALL_RECEIPT_SCHEMA_VERSION:
-        return None
-    return payload
+    return load_agent_turn_recall_receipt(path)
 
 
 def _write_receipt(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    write_agent_turn_recall_receipt(path, payload)
 
 
 def _identity_scope(config: Mapping[str, Any]) -> dict[str, str | None]:
-    route = resolve_reward_memory_surface_config(
-        config,
-        AGENT_TURN_RECALL_SURFACE_ID,
-    )
-    routes = route.get("recall_corpora")
-    if not isinstance(routes, list) or not routes:
-        raise ValueError("agent turn recall surface has no corpus")
-    identity: dict[str, str | None] | None = None
-    for item in routes:
-        corpus = item.get("corpus") if isinstance(item, Mapping) else None
-        scope = corpus.get("scope") if isinstance(corpus, Mapping) else None
-        if not isinstance(scope, Mapping):
-            raise ValueError("agent turn recall corpus scope is invalid")
-        current = {
-            key: str(scope.get(key) or "").strip() or None
-            for key in (
-                "workspace_ref",
-                "project_ref",
-                "user_ref",
-                "peer_ref",
-                "session_ref",
-            )
-        }
-        if identity is not None and current != identity:
-            raise ValueError("agent turn recall corpora must share one identity scope")
-        identity = current
-    assert identity is not None
-    return identity
+    return reward_memory_turn_identity_scope(config)
 
 
 def _resolve_session_ref(
     identity: Mapping[str, str | None], requested: str | None
 ) -> str | None:
-    configured = str(identity.get("session_ref") or "").strip() or None
-    requested = str(requested or "").strip() or None
-    if configured and requested and configured != requested:
-        raise ValueError("--session-ref does not match the configured corpus scope")
-    return configured or requested
+    return resolve_reward_memory_turn_session_ref(identity, requested)
 
 
 def _read_authority_checkpoints(
     config: Mapping[str, Any], goal_id: str
 ) -> dict[str, dict[str, Any]]:
-    route = resolve_reward_memory_surface_config(
-        config,
-        AGENT_TURN_RECALL_SURFACE_ID,
-    )
-    checkpoints: dict[str, dict[str, Any]] = {}
-    for item in route["recall_corpora"]:
-        corpus = item["corpus"]
-        scope = corpus["scope"]
-        checkpoint = {
-            "verified": True,
-            "corpus_id": corpus["corpus_id"],
-            "workspace_ref": scope["workspace_ref"],
-            "project_ref": scope["project_ref"],
-            "surface_id": AGENT_TURN_RECALL_SURFACE_ID,
-            "read_authority": corpus["read_authority"],
-            "source_ref": f"registry:{goal_id}:reward-memory",
-        }
-        for field in ("user_ref", "peer_ref", "session_ref"):
-            if scope.get(field):
-                checkpoint[field] = scope[field]
-        checkpoints[corpus["corpus_id"]] = checkpoint
-    return checkpoints
+    return reward_memory_turn_read_authority_checkpoints(config, goal_id)
 
 
 def _deduplicated_payload(
@@ -232,27 +215,11 @@ def _deduplicated_payload(
     goal_id: str,
     agent_id: str,
 ) -> dict[str, Any] | None:
-    context = receipt.get("context")
-    if not isinstance(context, Mapping):
-        return None
-    return {
-        "ok": True,
-        "schema_version": AGENT_TURN_RECALL_SCHEMA_VERSION,
-        "status": "deduplicated",
-        "goal_id": goal_id,
-        "agent_id": agent_id,
-        "surface_id": AGENT_TURN_RECALL_SURFACE_ID,
-        "turn_recall_id": receipt.get("turn_recall_id"),
-        "situation_fingerprint": receipt.get("situation_fingerprint"),
-        "context": dict(context),
-        "provider_call_count": 0,
-        "same_turn_receipt_reused": True,
-        "source_status": receipt.get("source_status"),
-        "grants_new_action_authority": False,
-        "quota_spend_performed": False,
-        "external_writes_performed": False,
-        "suppress_external_sinks": True,
-    }
+    return deduplicated_agent_turn_recall_payload(
+        receipt,
+        goal_id=goal_id,
+        agent_id=agent_id,
+    )
 
 
 def handle_agent_turn_recall_command(
@@ -275,7 +242,8 @@ def handle_agent_turn_recall_command(
             payload: dict[str, Any] = {
                 "ok": True,
                 "schema_version": AGENT_TURN_RECALL_SCHEMA_VERSION,
-                "status": "disabled",
+                "status": str(experiment_status.get("status") or "not_available"),
+                "reason_code": experiment_status.get("reason_code"),
                 "goal_id": args.goal_id,
                 "agent_id": args.agent_id,
                 "experiment": experiment_status,
@@ -288,12 +256,17 @@ def handle_agent_turn_recall_command(
         else:
             identity = _identity_scope(config)
             quota_decision = _quota_decision(args.quota_decision_json)
-            _validate_quota_identity(
-                quota_decision,
-                goal_id=args.goal_id,
-                agent_id=args.agent_id,
-                turn_instance_id=args.turn_instance_id,
-            )
+            try:
+                _validate_quota_identity(
+                    quota_decision,
+                    goal_id=args.goal_id,
+                    agent_id=args.agent_id,
+                    turn_instance_id=args.turn_instance_id,
+                )
+            except RuntimeError:
+                payload = _runtime_unavailable_payload(args.goal_id, args.agent_id)
+                print_payload(payload, output_format(args), _render)
+                return 2
             situation = build_agent_turn_situation(
                 quota_decision,
                 goal_id=args.goal_id,
@@ -304,7 +277,7 @@ def handle_agent_turn_recall_command(
                 user_ref=identity["user_ref"],
                 session_ref=_resolve_session_ref(identity, args.session_ref),
             )
-            receipt_path = _receipt_path(goal_repo, args.agent_id)
+            receipt_path = _receipt_path(goal_repo, args.goal_id, args.agent_id)
             previous = None if args.force_refresh else _load_receipt(receipt_path)
             deduplicated = (
                 _deduplicated_payload(
@@ -314,6 +287,7 @@ def handle_agent_turn_recall_command(
                 )
                 if previous
                 and previous.get("turn_recall_id") == situation["turn_recall_id"]
+                and previous.get("binding_revision") == experiment_status.get("binding_revision")
                 else None
             )
             if deduplicated is not None:
@@ -325,13 +299,19 @@ def handle_agent_turn_recall_command(
                     "experiment": experiment_status,
                 }
             else:
+                try:
+                    read_checkpoints = _read_authority_checkpoints(config, args.goal_id)
+                except RuntimeError:
+                    # This failure precedes the provider; do not fabricate a
+                    # zero-call receipt for errors after recall has begun.
+                    payload = _runtime_unavailable_payload(args.goal_id, args.agent_id)
+                    print_payload(payload, output_format(args), _render)
+                    return 2
                 payload = run_agent_turn_recall(
                     config,
                     situation,
-                    observed_at=args.turn_instance_id,
-                    read_authority_checkpoints=_read_authority_checkpoints(
-                        config, args.goal_id
-                    ),
+                    observed_at=datetime.now(timezone.utc).isoformat(),
+                    read_authority_checkpoints=read_checkpoints,
                 ) | {
                     "goal_id": args.goal_id,
                     "agent_id": args.agent_id,
@@ -342,12 +322,15 @@ def handle_agent_turn_recall_command(
                         receipt_path,
                         {
                             "schema_version": AGENT_TURN_RECALL_RECEIPT_SCHEMA_VERSION,
+                            "goal_id": args.goal_id,
+                            "agent_id": args.agent_id,
                             "turn_recall_id": payload.get("turn_recall_id"),
                             "situation_fingerprint": payload.get(
                                 "situation_fingerprint"
                             ),
                             "source_status": payload.get("status"),
                             "context": payload.get("context"),
+                            **({"binding_revision": experiment_status["binding_revision"]} if experiment_status.get("binding_revision") else {}),
                         },
                     )
                     payload["same_turn_receipt_written"] = True

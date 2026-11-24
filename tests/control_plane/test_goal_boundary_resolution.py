@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import datetime, timezone
 
-from loopx.boundary_authority import build_checkpointed_boundary_authority_entry
+import pytest
+
+from loopx.boundary_authority import (
+    build_checkpointed_boundary_authority_entry,
+    normalize_checkpointed_boundary_authority_entries,
+)
+from loopx.capabilities.explore.harness_gate import resolve_explore_harness_gate
 from loopx.control_plane.quota.goal_boundary import (
     declared_available_capabilities,
     goal_boundary,
@@ -176,6 +183,35 @@ def test_goal_boundary_projects_credential_free_repository_identity(
     ]
 
 
+def test_goal_boundary_requires_boolean_spawn_authority() -> None:
+    for authority_key in ("allowed", "spawn_allowed"):
+        boundary = goal_boundary(
+            {
+                "spawn_policy": {
+                    authority_key: "false",
+                    "max_children": 2,
+                    "explore_harness": {"enabled": True},
+                }
+            }
+        )
+
+        assert boundary is not None
+        assert boundary["orchestration"] == {
+            "mode": "default",
+            "spawn_allowed": False,
+            "max_children": 2,
+            "explore_harness": {"enabled": True},
+        }
+        gate = resolve_explore_harness_gate(
+            boundary["orchestration"],
+            requested_width=2,
+            max_lanes=8,
+            max_lanes_label="max_worker_lanes",
+        )
+        assert gate["state"] == "analysis_only"
+        assert gate["reason"] == "spawn_not_allowed_by_goal_boundary"
+
+
 def test_goal_boundary_appends_only_active_checkpointed_write_scopes() -> None:
     active = build_checkpointed_boundary_authority_entry(
         write_scopes=["tests/**", "loopx/**"],
@@ -204,6 +240,81 @@ def test_goal_boundary_appends_only_active_checkpointed_write_scopes() -> None:
     assert authority["active_count"] == 1
     assert authority["inactive_count"] == 1
     assert authority["active_write_scope"] == ["tests/**", "loopx/**"]
+
+
+def test_cba_folds_internally_without_cross_folding_against_goal_write_scope() -> None:
+    active_broad = build_checkpointed_boundary_authority_entry(
+        write_scopes=["docs/**"],
+        source="operator_gate_resume_contract_v0:active",
+        recorded_at="2026-07-01T00:00:00+00:00",
+    )
+    active_nested = build_checkpointed_boundary_authority_entry(
+        write_scopes=["docs/guide/intro.md", "tests/unit/**"],
+        source="operator_gate_resume_contract_v0:active-nested",
+        recorded_at="2026-07-01T00:00:00+00:00",
+    )
+    boundary = goal_boundary(
+        {
+            "coordination": {
+                "write_scope": ["**"],
+                "checkpointed_boundary_authority": [active_broad, active_nested],
+            }
+        }
+    )
+
+    assert boundary is not None
+    assert boundary["write_scope"] == ["**"]
+    authority = boundary["checkpointed_boundary_authority"]
+    assert authority["active_write_scope"] == ["docs/**", "tests/unit/**"]
+
+
+@pytest.mark.parametrize("field", ["expires_at", "fresh_until"])
+@pytest.mark.parametrize("value", [
+    "not-an-iso-timestamp", "2026-02-30T00:00:00Z", 0, 20990101, False, [], {},
+    "0001-01-01T00:00:00+01:00",
+])
+def test_checkpointed_authority_rejects_malformed_expiration(field, value) -> None:
+    entry = {
+        "write_scope": ["worker/**"], "source": "operator-test",
+        "recorded_at": "2026-01-01T00:00:00Z", field: value,
+    }
+    normalized, = normalize_checkpointed_boundary_authority_entries(
+        [entry], now=datetime(2026, 10, 5, tzinfo=timezone.utc),
+    )
+    assert normalized["active"] is False
+    assert normalized["inactive_reasons"] == ["invalid_expires_at"]
+    assert normalized["freshness"] == "invalid"
+    boundary = goal_boundary({"coordination": {"checkpointed_boundary_authority": [entry]}})
+    assert boundary.get("write_scope", []) == []
+    assert boundary["checkpointed_boundary_authority"]["active_count"] == 0
+
+
+@pytest.mark.parametrize("expiration", [
+    {}, {"expires_at": None}, {"expires_at": ""}, {"expires_at": "  "},
+    {"fresh_until": None}, {"fresh_until": ""},
+    {"fresh_until": "2099-01-01T00:00:00Z"},
+    {"expires_at": "2099-01-01T00:00:00Z", "fresh_until": "invalid-alias"},
+])
+def test_checkpointed_authority_preserves_optional_expiration_and_precedence(expiration) -> None:
+    entry = {
+        "write_scope": ["worker/**"], "source": "operator-test",
+        "recorded_at": "2026-01-01T00:00:00Z", **expiration,
+    }
+    normalized, = normalize_checkpointed_boundary_authority_entries(
+        [entry], now=datetime(2026, 10, 5, tzinfo=timezone.utc),
+    )
+    assert normalized["active"] is True
+    assert normalized["freshness"] == "fresh"
+
+
+def test_checkpointed_authority_does_not_replace_invalid_primary_expiry_with_alias() -> None:
+    normalized, = normalize_checkpointed_boundary_authority_entries([{
+        "write_scope": ["worker/**"], "source": "operator-test",
+        "recorded_at": "2026-01-01T00:00:00Z", "expires_at": "invalid",
+        "fresh_until": "2099-01-01T00:00:00Z",
+    }])
+    assert normalized["active"] is False
+    assert normalized["inactive_reasons"] == ["invalid_expires_at"]
 
 
 def test_declared_available_capabilities_preserves_layer_order_and_deduplicates() -> None:

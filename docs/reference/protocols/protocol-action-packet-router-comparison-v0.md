@@ -1,8 +1,14 @@
 # Protocol Action Packet Router Comparison v0
 
-`protocol_action_packet_v0` is the rule-only hot-path baseline for executor
-action clarity. It intentionally stays small: `schema_version` plus one compact
-`summary` string inside `quota should-run`.
+> Historical synthetic experiment only. The production packet reader is retired;
+> see the [current format contract](protocol-action-packet-decision-v0.md).
+> These examples do not qualify current execution or quota-size reduction.
+
+`protocol_action_packet_v0` was the rule-only hot-path baseline for executor
+action clarity. Under the [PR-05 migration](protocol-action-packet-decision-v0.md),
+new `quota should-run` output uses structured contracts and omits this packet.
+This comparison retains explicitly synthetic legacy-format input; it neither
+requires current quota to emit the packet nor measures current quota shrinkage.
 
 The next experiment must run off the hot path. A comparison record uses schema
 `protocol_router_comparison_v0` and checks whether a Codex CLI or optional

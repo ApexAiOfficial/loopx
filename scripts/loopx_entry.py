@@ -5,6 +5,10 @@ from pathlib import Path
 import runpy
 import sys
 
+# Stable process identity shared with the POSIX release launcher and LoopX
+# Desktop stale-service recovery. Keep it independent from the entry module.
+LOOPX_MANAGED_RELEASE_LAUNCHER_V1 = True
+
 
 def main() -> int:
     if sys.version_info < (3, 11):
@@ -37,7 +41,12 @@ def main() -> int:
         filtered_path.append(entry)
     sys.path[:] = [str(release_root), *filtered_path]
     sys.argv[0] = str(release_root / "scripts" / "loopx")
-    runpy.run_module("loopx.cli", run_name="__main__")
+    module = (
+        "loopx.entrypoint"
+        if (release_root / "loopx" / "entrypoint.py").is_file()
+        else "loopx.cli"
+    )
+    runpy.run_module(module, run_name="__main__")
     return 0
 
 

@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve LoopX. Do not report an unpatched security vulnerability here; use [Private Vulnerability Reporting](https://github.com/huangruiteng/loopx/security/advisories/new). Remove credentials, private data, raw agent sessions, internal links, and local runtime state before submitting.
+        Thanks for helping improve LoopX. Do not report an unpatched security vulnerability here; use [Private Vulnerability Reporting](https://github.com/loopx-project/loopx/security/advisories/new). Remove credentials, private data, raw agent sessions, internal links, and local runtime state before submitting.
 
   - type: checkboxes
     id: preflight

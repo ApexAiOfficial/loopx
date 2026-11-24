@@ -32,6 +32,16 @@ DELIVERY_REPOSITORY = "git:example.invalid/loopx/delivery"
 os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
 
 
+def without_revision_digest(workspace: dict[str, object]) -> dict[str, object]:
+    workspace_contract = dict(workspace)
+    revision_digest = workspace_contract.pop("workspace_revision_digest")
+    assert isinstance(revision_digest, str)
+    assert len(revision_digest) == 64 and all(
+        character in "0123456789abcdef" for character in revision_digest
+    ), revision_digest
+    return workspace_contract
+
+
 def run_git(cwd: Path, *args: str) -> None:
     subprocess.run(
         ["git", "-C", str(cwd), *args],
@@ -133,6 +143,9 @@ def write_goal_fixture(
         + "\n",
         encoding="utf-8",
     )
+    from loopx.control_plane.testing.canary_harness import import_fixture_authority
+
+    import_fixture_authority(registry_path, GOAL_ID, provider="sqlite")
     return registry_path
 
 
@@ -207,8 +220,11 @@ def main() -> None:
                 sync_global=False,
             )
         workspace = refresh["delivery_workspace"]
-        assert workspace == {
-            "schema_version": "delivery_workspace_v0",
+        workspace_contract = without_revision_digest(workspace)
+        assert workspace_contract == {
+            "schema_version": "delivery_workspace_v1",
+            "workspace_identity": DELIVERY_REPOSITORY,
+            "identity_kind": "git_repository",
             "task_repository": DELIVERY_REPOSITORY,
             "repository_source": "current_git_origin",
             "workspace_kind": "independent_git_worktree",
@@ -220,6 +236,14 @@ def main() -> None:
         # worktree. An explicit causal path preserves the delivery identity
         # without persisting that local path.
         split_runtime = root / "split-runtime"
+        # This second owned runtime is a separate canonical authority, not a
+        # Markdown fallback selected by the override. Import its source once.
+        split_registry = root / "split-registry.json"
+        split_source = json.loads(registry_path.read_text())
+        split_source["common_runtime_root"] = str(split_runtime)
+        split_registry.write_text(json.dumps(split_source))
+        from loopx.control_plane.testing.canary_harness import import_fixture_authority
+        import_fixture_authority(split_registry, GOAL_ID, provider="sqlite")
         with working_directory(delivery):
             split_refresh = refresh_state_run(
                 registry_path=registry_path,
@@ -265,6 +289,12 @@ def main() -> None:
         assert explicit_preview["delivery_workspace_validated"] is True, (
             explicit_preview
         )
+
+        invalid_runtime = root / "invalid-runtime"
+        invalid_source = {**split_source, "common_runtime_root": str(invalid_runtime)}
+        invalid_registry = root / "invalid-registry.json"
+        invalid_registry.write_text(json.dumps(invalid_source))
+        import_fixture_authority(invalid_registry, GOAL_ID, provider="sqlite")
 
         # An explicit canonical path cannot bless a peer delivery. Omitting the
         # override retains the existing fail-closed recorded-history behavior.
@@ -392,8 +422,10 @@ def main() -> None:
                 canonical_runtime,
                 quota_decision(workspace_repair=True),
             )
-        assert canonical_refresh["delivery_workspace"] == {
-            "schema_version": "delivery_workspace_v0",
+        assert without_revision_digest(canonical_refresh["delivery_workspace"]) == {
+            "schema_version": "delivery_workspace_v1",
+            "workspace_identity": "git:example.invalid/loopx/canonical-delivery",
+            "identity_kind": "git_repository",
             "task_repository": "git:example.invalid/loopx/canonical-delivery",
             "repository_source": "current_git_origin",
             "workspace_kind": "canonical_checkout",

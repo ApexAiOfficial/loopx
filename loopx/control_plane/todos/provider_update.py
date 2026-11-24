@@ -1,0 +1,438 @@
+"""Input transport for the native update transaction, never a Markdown editor.
+
+The provider owns target lookup, planning, authority and CAS at one revision.
+This adapter preserves CLI text encoding and drains the committed projection.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from dataclasses import asdict
+from typing import Any
+from uuid import uuid4
+
+from ...state_refresh import now_local
+from ..coordination.local_authority import (
+    LOCAL_AUTHORITY_SOURCES,
+    LocalCoordinationAuthorityRejection,
+    LocalCoordinationAuthorityUnavailable,
+    ambiguous_todo_write,
+    claim_worktree_candidate,
+    raise_canonical_write_failure,
+    read_canonical_todos_if_promoted,
+)
+from ..effect_runtime import (
+    CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+    EffectRuntimeResponseAmbiguous,
+    effect_runtime_result,
+)
+from .contract import compact_todo_text
+from .provider_projection import settle_canonical_todo_projection
+from .text import normalize_new_todo
+from .mutation_authority import todo_lifecycle_facts
+from ..coordination.authority_source_capture import authority_registry_source
+from .completion_validation import (
+    completion_validation_execution,
+    completion_validation_failure,
+    execute_completion_validation_effects,
+    resolve_private_completion_validation_declaration,
+)
+from .completion_validation_store import (
+    persist_completion_validation_declaration,
+    prepare_completion_validation_declaration,
+    read_completion_validation_declaration,
+)
+from .completion_validation_projection import (
+    completion_validation_declaration_sha256,
+)
+from .external_wait_contract import TodoExternalWaitAuthoringError
+from .path_resolution import resolve_todo_state_path
+from .monitor_metadata import MonitorPollObservation
+from .resume_condition import normalize_supported_todo_resume_when
+
+
+def _dispatch_canonical_todo_update(
+    request: dict[str, Any], *, registry_path: Path,
+) -> Any:
+    try:
+        return effect_runtime_result(
+            "coordination.local_authority.todo_update", request,
+            timeout=CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+        )
+    except EffectRuntimeResponseAmbiguous as error:
+        raise ambiguous_todo_write(
+            error, registry_path=registry_path, runtime_root=request["runtime_root"],
+            goal_id=request["goal_id"], todo_id=request["todo_id"],
+            operation_id=request["operation_id"],
+        ) from error
+
+
+def _completion_validation_revision_request(
+    *,
+    runtime_root: Path,
+    goal_id: str,
+    todo_id: str,
+    operation_id: str | None,
+    declaration: dict[str, Any],
+) -> dict[str, Any]:
+    if not operation_id:
+        raise ValueError("completion validation revision requires an operation id")
+    canonical = read_canonical_todos_if_promoted(
+        runtime_root=runtime_root, goal_id=goal_id
+    )
+    if canonical is None:
+        raise ValueError("Canonical authority changed during validation revision; retry")
+    target = next(
+        (todo for todo in canonical["todos"] if todo.get("todo_id") == todo_id),
+        {},
+    )
+    expected_digest = target.get("completion_validation_sha256")
+    # An idempotent retry observes the post-commit Todo. Reconstruct the
+    # original CAS witness from its durable revision receipt so the same
+    # operation id hashes to the same request instead of looking like a
+    # conflicting mutation.
+    for receipt in target.get("completion_validation_revision_history") or []:
+        if (
+            isinstance(receipt, dict)
+            and receipt.get("operation_id") == operation_id
+            and "previous_declaration_sha256" in receipt
+        ):
+            expected_digest = receipt["previous_declaration_sha256"]
+            break
+    # Serialize canonical absence; the typed transaction alone decides whether
+    # this is a legal first binding or an inconsistent/missing declaration.
+    return {
+        "schema_version": (
+            "loopx_todo_completion_validation_revision_v1"
+            if expected_digest is None
+            else "loopx_todo_completion_validation_revision_v0"
+        ),
+        "expected_declaration_sha256": expected_digest,
+        "declaration": declaration,
+    }
+
+
+def _publish_completion_validation_revision(
+    *,
+    runtime_root: Path,
+    goal_id: str,
+    todo_id: str,
+    operation_id: str,
+    declaration: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    expected_digest = completion_validation_declaration_sha256(declaration)
+    canonical = read_canonical_todos_if_promoted(
+        runtime_root=runtime_root, goal_id=goal_id
+    )
+    target = next(
+        (
+            todo
+            for todo in (canonical or {}).get("todos", [])
+            if todo.get("todo_id") == todo_id
+        ),
+        {},
+    )
+    revision_history = target.get("completion_validation_revision_history")
+    if (
+        target.get("completion_validation_sha256") != expected_digest
+        or not isinstance(revision_history, list)
+        or not any(
+            isinstance(receipt, dict)
+            and receipt.get("operation_id") == operation_id
+            and receipt.get("declaration_sha256") == expected_digest
+            for receipt in revision_history
+        )
+    ):
+        raise LocalCoordinationAuthorityUnavailable(
+            "completion validation revision receipt does not match canonical readback",
+            code="completion_validation_revision_publication_mismatch",
+            payload=dict(result),
+        )
+    persist_completion_validation_declaration(
+        runtime_root=runtime_root,
+        goal_id=goal_id,
+        todo_id=todo_id,
+        declaration=declaration,
+    )
+    if read_completion_validation_declaration(
+        runtime_root=runtime_root,
+        goal_id=goal_id,
+        todo_id=todo_id,
+        expected_digest=expected_digest,
+    ) != declaration:
+        raise LocalCoordinationAuthorityUnavailable(
+            "completion validation revision committed but private declaration readback failed",
+            code="completion_validation_revision_readback_failed",
+            payload=dict(result),
+        )
+
+
+def _raise_public_update_rejection(
+    result: dict[str, Any],
+    *,
+    planning_intent: dict[str, Any] | None,
+    runtime_root: Path | None = None,
+    goal_id: str | None = None,
+    todo_id: str | None = None,
+) -> None:
+    if result.get("status") != "failed":
+        return
+    reason_code = str(result.get("reason_code") or "")
+    if reason_code.startswith("external_wait_"):
+        raw_resume_when = (planning_intent or {}).get("resume_when")
+        raw_successors = (planning_intent or {}).get("successor_todo_ids")
+        if (
+            (not raw_resume_when or raw_successors is None)
+            and runtime_root is not None
+            and goal_id
+            and todo_id
+        ):
+            canonical = read_canonical_todos_if_promoted(
+                runtime_root=runtime_root, goal_id=goal_id
+            )
+            target = next(
+                (
+                    todo
+                    for todo in (canonical or {}).get("todos", ())
+                    if todo.get("todo_id") == todo_id
+                ),
+                {},
+            )
+            if not raw_resume_when:
+                raw_resume_when = target.get("resume_when")
+            if raw_successors is None:
+                raw_successors = target.get("successor_todo_ids")
+        resume_when = (
+            normalize_supported_todo_resume_when(raw_resume_when)
+            or str(raw_resume_when or "").strip()
+        )
+        resume_kind, separator, dependency_spec = resume_when.partition(":")
+        monitor_id, scope_separator, scope = dependency_spec.partition("@")
+        raise TodoExternalWaitAuthoringError(
+            str(result.get("reason") or "external-wait Todo update was rejected"),
+            code=reason_code,
+            monitor_todo_id=(
+                monitor_id
+                if separator and resume_kind == "monitor_changed" and monitor_id
+                else None
+            ),
+            material_change_scope=(
+                scope.lower()
+                if separator and resume_kind == "monitor_changed" and scope_separator and scope
+                else None
+            ),
+            successor_todo_ids=(
+                [str(item) for item in raw_successors]
+                if isinstance(raw_successors, list)
+                else None
+            ),
+        )
+    if reason_code == "todo_not_found":
+        raise ValueError("Todo is missing from canonical authority")
+    if reason_code == "todo_role_mismatch":
+        raise ValueError("Todo does not have the requested role")
+    rejection_messages = {
+        "coordination_operation_identity_mismatch": (
+            "monitor effect identity is already bound to a different observation"
+        ),
+        "update_owner_mismatch": (
+            "Todo claimed_by does not grant this actor update authority"
+        ),
+    }
+    if reason_code in rejection_messages:
+        raise LocalCoordinationAuthorityRejection(
+            rejection_messages[reason_code],
+            code=reason_code,
+            payload=result,
+        )
+    if result.get("failure_kind") == "decision_rejection":
+        raise LocalCoordinationAuthorityRejection(
+            str(result.get("reason") or "canonical Todo update was rejected"),
+            code=reason_code or "todo_update_rejected",
+            payload=result,
+        )
+
+
+def update_canonical_todo_if_promoted(
+    *, registry_path: Path, runtime_root: Path, goal_id: str, todo_id: str,
+    actor_agent_id: str | None, role: str | None, text: str | None,
+    note: str | None, dry_run: bool,
+    project: Path | None = None, state_file: Path | None = None,
+    claim_operation_id: str | None = None,
+    operation_id: str | None = None, task_lease_idempotency_key: str | None = None,
+    task_lease_expected_version: int | None = None,
+    planning_intent: dict[str, Any] | None = None,
+    authority_reason: str | None = None,
+    expected_provider_revision: str | None = None,
+    expected_registry_sha256: str | None = None,
+    routing_registry_witness: dict[str, str] | None = None,
+    monitor_observation: MonitorPollObservation | None = None,
+    completion_validation_revision: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # The witness brackets fact projection and is rechecked by the native
+    # transaction. Reviewed edits additionally bind the preview's registry hash.
+    with authority_registry_source(registry_path, routing_registry_witness=routing_registry_witness) as registry_source:
+        registered, grants = todo_lifecycle_facts(registry_path, goal_id)
+    patch: dict[str, Any] = {}
+    if text is not None:
+        patch["text"] = normalize_new_todo(text)
+    if note is not None:
+        # Empty notes have always meant omission at the public update boundary.
+        # Clearing a persisted note requires a future explicit contract; never
+        # reinterpret an empty CLI/Python value as an implicit clear here.
+        normalized_note = compact_todo_text(note)
+        if normalized_note:
+            patch["note"] = normalized_note
+    if claim_operation_id is not None and (monitor_observation is not None
+            or str((planning_intent or {}).get("status", "")).lower() == "done"):
+        raise ValueError("Claim execution progress does not observe Monitors; use todo complete for completion")
+    completion = None
+    validation_revision = None
+    if completion_validation_revision is not None:
+        validation_revision = _completion_validation_revision_request(
+            runtime_root=runtime_root,
+            goal_id=goal_id,
+            todo_id=todo_id,
+            operation_id=operation_id,
+            declaration=completion_validation_revision,
+        )
+    if str((planning_intent or {}).get("status", "")).strip().lower() == "done":
+        project, state_file = resolve_todo_state_path(registry_path=registry_path, goal_id=goal_id,
+            project=project, state_file=state_file, require_existing=False)
+        canonical = read_canonical_todos_if_promoted(runtime_root=runtime_root, goal_id=goal_id)
+        if canonical is None:
+            raise ValueError("Canonical authority changed during Todo completion update; retry")
+        target = next((todo for todo in canonical["todos"] if todo.get("todo_id") == todo_id), {})
+        declaration = None
+        if target.get("status") != "done" and target.get("completion_validation_required") is True:
+            declaration = resolve_private_completion_validation_declaration(
+                canonical_todo=target, state_file=state_file, runtime_root=runtime_root,
+                registry_path=registry_path, goal_id=goal_id, todo_id=todo_id, role=role,
+                persist_if_resolved=not dry_run)
+        completion = {"validation_declaration": declaration}
+    worktree = claim_worktree_candidate() if claim_operation_id is not None else None
+    request = {
+        "schema_version": ("loopx_local_coordination_todo_update_request_v6" if claim_operation_id is not None
+                           else "loopx_local_coordination_todo_update_request_v5" if validation_revision is not None
+                           else "loopx_local_coordination_todo_update_request_v4" if monitor_observation is not None
+                           else "loopx_local_coordination_todo_update_request_v3" if completion is not None
+                           else "loopx_local_coordination_todo_update_request_v2"),
+        "runtime_root": str(runtime_root.resolve()), "goal_id": goal_id,
+        "todo_id": todo_id, "role": role, "actor_agent_id": actor_agent_id,
+        "registered_agents": registered, "lifecycle_grants": grants,
+        "authority_reason": authority_reason,
+        "registry_source": registry_source,
+        "expected_provider_revision": expected_provider_revision,
+        "expected_registry_sha256": expected_registry_sha256,
+        "operation_id": (operation_id if operation_id is not None else
+                         (monitor_observation.monitor_effect_id if monitor_observation else None)
+                         or f"todo-update:{uuid4().hex}"),
+        **({"claim_operation_id": claim_operation_id} if claim_operation_id is not None else {}),
+        **({"write_worktree": str(worktree)} if worktree is not None else {}),
+        "lease_idempotency_key": task_lease_idempotency_key,
+        "lease_expected_version": task_lease_expected_version,
+        "patch": patch, "clear_fields": [], "dry_run": dry_run,
+        "planning_intent": planning_intent or {},
+        "observed_at": now_local(),
+        **({"completion": completion} if completion is not None else {}),
+        **({"completion_validation_revision": validation_revision}
+           if validation_revision is not None else {}),
+        **({"monitor_observation": asdict(monitor_observation)} if monitor_observation is not None else {}),
+    }
+    if completion_validation_revision is not None and not dry_run:
+        prepare_completion_validation_declaration(
+            runtime_root=runtime_root, goal_id=goal_id, declaration=completion_validation_revision
+        )
+    result = _dispatch_canonical_todo_update(request, registry_path=registry_path)
+    completion_validation_executed = False
+    if isinstance(result, dict) and result.get("status") == "execute_validation":
+        if completion is None:
+            raise RuntimeError("Ordinary Todo update cannot issue completion validation")
+        completion["source_provider_revision"] = result["provider_revision"]
+        with completion_validation_execution(runtime_root=runtime_root, goal_id=goal_id, todo_id=todo_id):
+            request["observed_at"] = now_local()
+            result = _dispatch_canonical_todo_update(request, registry_path=registry_path)
+            if isinstance(result, dict) and result.get("status") == "execute_validation":
+                completion.update(execute_completion_validation_effects(
+                    result, registry_path=registry_path, goal_id=goal_id))
+                completion_validation_executed = True
+                request["observed_at"] = now_local()
+                result = _dispatch_canonical_todo_update(request, registry_path=registry_path)
+    if isinstance(result, dict):
+        # Preserve native recovery decisions and arguments, adding only the
+        # caller's exact transport route. A default-registry command could read
+        # an unrelated Goal when this call used an explicit registry/runtime.
+        recovery = result.get("recovery")
+        if isinstance(recovery, dict):
+            for step in ("claim", "inspect", "retry", "acquire", "release"):
+                descriptor = recovery.get(step)
+                if isinstance(descriptor, dict) and isinstance(descriptor.get("cli_args"), list):
+                    descriptor["cli_args"] = [f"--registry={registry_path}",
+                        f"--runtime-root={runtime_root}", "--format", "json", *descriptor["cli_args"]]
+        raise_canonical_write_failure(
+            result,
+            goal_id=goal_id,
+            operation="todo_update",
+        )
+        failure = completion_validation_failure(result, goal_id=goal_id, todo_id=todo_id, dry_run=dry_run)
+        if failure is not None:
+            return failure
+    # Keep the public lookup-error contract, without a second pre-transaction read.
+    if isinstance(result, dict):
+        _raise_public_update_rejection(
+            result,
+            planning_intent=planning_intent,
+            runtime_root=runtime_root,
+            goal_id=goal_id,
+            todo_id=todo_id,
+        )
+    if isinstance(result, dict) and (
+        result.get("status") == "missing"
+        and result.get("source_authority") in LOCAL_AUTHORITY_SOURCES
+        and result.get("decision_read_from_provider") is True
+        and result.get("legacy_fallback_used") is False
+    ):
+        payload = dict(result)
+        payload["recovery"] = {
+            "action": "restore_canonical_authority",
+            "runtime_root": str(runtime_root.expanduser().resolve(strict=False)),
+            "goal_id": goal_id,
+            "legacy_markdown_fallback_allowed": False,
+            "retry_after": "canonical_provider_readback_loaded",
+        }
+        raise LocalCoordinationAuthorityUnavailable(
+            "canonical Todo authority is unavailable",
+            code="local_authority_todo_list_unavailable",
+            payload=payload,
+        )
+    if not isinstance(result, dict) or result.get("status") not in {
+        "applied", "recovered", "replayed", "no_change", "planned",
+    } or result.get("source_authority") not in LOCAL_AUTHORITY_SOURCES or (
+        result.get("decision_read_from_provider") is not True
+        or result.get("legacy_fallback_used") is not False
+    ):
+        payload = dict(result) if isinstance(result, dict) else {}
+        if completion_validation_executed:
+            payload["completion_validation_executed"] = True
+        raise LocalCoordinationAuthorityUnavailable(
+            str(payload.get("reason") or "canonical Todo update failed; reread before retry"),
+            code=str(payload.get("reason_code") or payload.get("conflict_kind")
+                     or "local_authority_todo_update_failed"), payload=payload,
+        )
+    if validation_revision is not None and not dry_run:
+        declaration = dict(validation_revision["declaration"])
+        _publish_completion_validation_revision(
+            runtime_root=runtime_root,
+            goal_id=goal_id,
+            todo_id=todo_id,
+            operation_id=str(request["operation_id"]),
+            declaration=declaration,
+            result=result,
+        )
+    return settle_canonical_todo_projection(
+        {"ok": True, "goal_id": goal_id, "todo_id": todo_id,
+         "role": role, "dry_run": dry_run, **result},
+        registry_path=registry_path, runtime_root=runtime_root, goal_id=goal_id,
+        project=project, state_file=state_file,
+    )

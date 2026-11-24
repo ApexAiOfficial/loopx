@@ -1,0 +1,622 @@
+"""Real managed Host boundaries: no paid model, no external side effects."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+
+import pytest
+
+from loopx import collaboration_mcp as delegation_module
+from loopx.control_plane.turn_driver.executor import _run_host
+from loopx.control_plane.turn_driver.host_process_transport import (
+    HOST_PROCESS_RECORD_ENV,
+    HostOutputLines,
+    HostProcessInterruptionUnconfirmed,
+    execution_host_drain,
+    run_host_process,
+)
+from tests.control_plane.host_process_fixture import COUNTER_PROCESS_SOURCE
+
+
+def test_launch_guard_releases_before_running_host_output(tmp_path: Path) -> None:
+    held = []
+    observed = []
+
+    @contextmanager
+    def admission():
+        held.append(True)
+        try:
+            yield
+        finally:
+            held.pop()
+
+    def output(text: str) -> None:
+        # A running Host must not hold the owner lock and delay a user stop.
+        assert not held
+        observed.append(text)
+
+    result = run_host_process(
+        [sys.executable, "-c", "print('current work')"], project=tmp_path,
+        input_text="", timeout_seconds=5, launch_guard=admission, on_stdout=output,
+    )
+    assert result["returncode"] == 0 and observed and not held
+    failed = run_host_process(
+        [str(tmp_path / "absent-host")], project=tmp_path,
+        input_text="", timeout_seconds=5, launch_guard=admission,
+    )
+    assert failed["outcome"] == "spawn_failed" and not held
+
+
+def test_rejected_launch_guard_keeps_nonexecution_evidence(tmp_path: Path, monkeypatch) -> None:
+    from loopx.control_plane.turn_driver.host_process_transport import prepare_host_process_record
+
+    marker, record = tmp_path / "work", tmp_path / "host.json"
+    prepare_host_process_record(record)
+    before = record.read_bytes()
+    monkeypatch.setenv(HOST_PROCESS_RECORD_ENV, str(record))
+
+    @contextmanager
+    def stopped():
+        raise ValueError("Goal was stopped after planning")
+        yield
+
+    with pytest.raises(ValueError, match="stopped after planning"):
+        run_host_process(
+            [sys.executable, "-c", "from pathlib import Path;Path('work').touch()"],
+            project=tmp_path, input_text="", timeout_seconds=5, launch_guard=stopped,
+        )
+    assert not marker.exists() and record.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native SIGINT handling on POSIX")
+@pytest.mark.parametrize("handles_interrupt", [True, False])
+def test_running_guard_interrupts_silent_host(tmp_path: Path, monkeypatch, handles_interrupt: bool) -> None:
+    ready, interrupted = tmp_path / "ready", tmp_path / "interrupted"
+    record = tmp_path / "host.json"
+    monkeypatch.setenv(HOST_PROCESS_RECORD_ENV, str(record))
+    handler = "on_interrupt" if handles_interrupt else "signal.SIG_IGN"
+    host = f'''
+import signal, sys, time
+from pathlib import Path
+
+def on_interrupt(_signum, _frame):
+    Path("interrupted").touch()
+    sys.exit(1)
+
+signal.signal(signal.SIGINT, {handler})
+Path("ready").touch()
+time.sleep(30)
+'''
+
+    def check_running() -> None:
+        if ready.exists():
+            raise ValueError("Goal stopped while Host was running")
+
+    error = ValueError if handles_interrupt else HostProcessInterruptionUnconfirmed
+    message = "Goal stopped while Host was running" if handles_interrupt else "interrupt unconfirmed"
+    with pytest.raises(error, match=message):
+        run_host_process(
+            [sys.executable, "-c", host], project=tmp_path, input_text="", timeout_seconds=8,
+            launch_guard=nullcontext, check_running=check_running, interrupt_before_terminate=True,
+        )
+    assert ready.exists()
+    assert interrupted.exists() is handles_interrupt
+    assert execution_host_drain(record) == ("drained" if handles_interrupt else "unattributable")
+
+
+def test_host_output_lines_bound_storage_and_use_lf() -> None:
+    rows: list[str] = []
+    lines = HostOutputLines(rows.append, max_chars=20)
+    lines.feed("one\u2028two\n" + "x" * 100)
+    assert lines.pending == ""
+    lines.feed("tail\nlast")
+    lines.finish()
+    assert rows == ["one\u2028two", "last"]
+    assert not lines.complete
+
+
+def test_real_generic_host_roundtrip_and_stream_budget(tmp_path: Path) -> None:
+    request = {"message": "one private local request"}
+    result = _run_host(
+        request,
+        argv=[
+            sys.executable,
+            "-c",
+            "import sys,json;print(json.dumps(json.load(sys.stdin)))",
+        ],
+        project=tmp_path,
+        timeout_seconds=5,
+    )
+    assert result == {"ok": True, "value": request, "returncode": 0}
+    overflow = _run_host(
+        request,
+        argv=[
+            sys.executable,
+            "-c",
+            "import sys,time;sys.stdout.write('x'*1000000);sys.stdout.flush();time.sleep(30)",
+        ],
+        project=tmp_path,
+        timeout_seconds=5,
+    )
+    assert overflow["ok"] is False
+    assert overflow["reason"] == "host stdout exceeded the result budget"
+
+
+@pytest.mark.parametrize("deadline", [None, 20])
+def test_callback_failure_waits_for_owned_host_cleanup(tmp_path: Path, deadline) -> None:
+    def reject(_text: str) -> None:
+        raise ValueError("consumer stopped")
+
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="consumer stopped"):
+        run_host_process(
+            [
+                sys.executable,
+                "-c",
+                "import time;print('ready',flush=True);time.sleep(30)",
+            ],
+            project=tmp_path,
+            input_text="",
+            timeout_seconds=deadline,
+            on_stdout=reject,
+        )
+    assert time.monotonic() - started < 8
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process interruption contract")
+def test_counter_process_fixture_publishes_atomically(tmp_path: Path) -> None:
+    marker = tmp_path / "counter"
+    pid_path = tmp_path / "pid"
+    pause_path = tmp_path / "before-publish"
+    marker.write_text("published", encoding="utf-8")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            COUNTER_PROCESS_SOURCE,
+            str(marker),
+            str(pid_path),
+            "0.02",
+            str(pause_path),
+        ]
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not pause_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert pause_path.exists(), "Counter process never reached the publication fence"
+        process.kill()
+        process.wait(timeout=5)
+        assert marker.read_text(encoding="utf-8") == "published"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group cancellation contract")
+def test_disappearing_python_owner_cancels_real_host(tmp_path: Path) -> None:
+    marker = tmp_path / "counter"
+    pid_path = tmp_path / "pid"
+    host_argv = [
+        sys.executable,
+        "-c",
+        COUNTER_PROCESS_SOURCE,
+        str(marker),
+        str(pid_path),
+        "0.02",
+    ]
+    launcher = f"""
+from pathlib import Path
+from loopx.control_plane.turn_driver.host_process_transport import run_host_process
+run_host_process({host_argv!r}, project=Path({str(tmp_path)!r}), input_text='', timeout_seconds=30)
+"""
+    owner = subprocess.Popen(
+        [sys.executable, "-c", launcher],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert marker.exists(), "Host never started"
+        owner.kill()
+        owner.wait(timeout=5)
+        time.sleep(1)
+        before = marker.read_text()
+        time.sleep(0.15)
+        assert marker.read_text() == before, "Host survived loss of its owner"
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=5)
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group cancellation contract")
+def test_generic_host_timeout_stops_real_descendant(tmp_path: Path) -> None:
+    marker = tmp_path / "child-work"
+    pid_path = tmp_path / "child-pid"
+    child_argv = [
+        sys.executable,
+        "-c",
+        COUNTER_PROCESS_SOURCE,
+        str(marker),
+        str(pid_path),
+        "0.02",
+    ]
+    host = f"import subprocess,time;subprocess.Popen({child_argv!r});time.sleep(30)"
+    try:
+        result = _run_host(
+            {}, argv=[sys.executable, "-c", host], project=tmp_path, timeout_seconds=1
+        )
+        assert result["ok"] is False
+        assert result["reason"] == "host process timeout"
+        before = marker.read_text()
+        time.sleep(0.15)
+        assert marker.read_text() == before
+    finally:
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_windows_transport_relay_preserves_argv_and_stdin(tmp_path: Path) -> None:
+    from loopx.control_plane.turn_driver.host_process_transport import _WINDOWS_COMMAND_RELAY
+
+    # The relay is tested here on any OS; real .cmd resolution remains a Windows
+    # integration obligation. All args stay argv entries, not interpolated code.
+    values = ["two words", "a&b", "%NAME%", 'one"quote', "界"]
+    result = _run_host(
+        {},
+        argv=[
+            sys.executable,
+            "-c",
+            _WINDOWS_COMMAND_RELAY,
+            sys.executable,
+            "-c",
+            "import json,sys;print(json.dumps({'args':sys.argv[1:],'input':json.load(sys.stdin)}))",
+            *values,
+        ],
+        project=tmp_path,
+        timeout_seconds=5,
+    )
+    assert result["ok"] is True
+    assert result["value"] == {"args": values, "input": {}}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group drain readback")
+def test_host_process_record_names_the_owned_group_and_is_not_inherited(tmp_path: Path, monkeypatch) -> None:
+    from loopx.control_plane.turn_driver.host_process_transport import (
+        HOST_PROCESS_RECORD_ENV, execution_host_drain, prepare_host_process_record,
+    )
+
+    record_path = tmp_path / "op.host.json"
+    assert execution_host_drain(record_path) == "unattributable"
+    prepare_host_process_record(record_path)
+    assert execution_host_drain(record_path) == "not_launched"
+    monkeypatch.setenv(HOST_PROCESS_RECORD_ENV, str(record_path))
+    host = ("import json,os,sys;print(json.dumps({'env': os.environ.get(%r), 'pid': os.getpid(),"
+            " 'pgid': os.getpgid(0)}))" % HOST_PROCESS_RECORD_ENV)
+    result = _run_host({}, argv=[sys.executable, "-c", host], project=tmp_path, timeout_seconds=5)
+    assert result["ok"] is True
+    # A nested LoopX run inside the Host cannot overwrite its parent's record.
+    assert result["value"]["env"] is None
+    record = json.loads(record_path.read_text())
+    assert record["phase"] == "finished"
+    assert record["host_pid"] == result["value"]["pid"] == record["process_group"] == result["value"]["pgid"]
+    assert execution_host_drain(record_path) == "drained"
+    observed = record_path.read_bytes()
+    prepare_host_process_record(record_path)
+    assert record_path.read_bytes() == observed, "initialization must not overwrite execution evidence"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group drain readback")
+def test_host_process_drain_reads_live_groups_and_refuses_unattributable_records(tmp_path: Path) -> None:
+    from loopx.control_plane.turn_driver.host_process_transport import (
+        HOST_PROCESS_RECORD_SCHEMA_VERSION, execution_host_drain,
+    )
+    from loopx.file_lock import lock_holder_host_label
+
+    path = tmp_path / "op.host.json"
+    live = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"], start_new_session=True)
+    gone = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    gone.wait(timeout=10)
+
+    def drain(**fields):
+        path.write_text(json.dumps({"schema_version": HOST_PROCESS_RECORD_SCHEMA_VERSION,
+                                    "host": lock_holder_host_label(), "owner_pid": 1,
+                                    "supervises": "host", "supervision": "direct", **fields}))
+        return execution_host_drain(path)
+
+    try:
+        # A live supervisor or a live Host group is still draining.
+        assert drain(phase="launching", bridge_pid=live.pid, process_group=None) == "draining"
+        assert drain(phase="spawned", bridge_pid=gone.pid, process_group=live.pid) == "draining"
+        assert drain(phase="finished", bridge_pid=gone.pid, process_group=live.pid) == "draining"
+        assert drain(phase="spawned", bridge_pid=gone.pid, process_group=gone.pid) == "drained"
+        # A supervisor gone before it reported a group may have spawned one anyway.
+        assert drain(phase="launching", bridge_pid=gone.pid, process_group=None) == "unattributable"
+        assert drain(phase="finished", bridge_pid=gone.pid, process_group=None) == "drained"
+        for fields in ({"phase": "invalid", "bridge_pid": gone.pid, "process_group": None},
+                       {"phase": "finished", "bridge_pid": gone.pid, "process_group": gone.pid,
+                        "supervision": None},
+                       {"phase": "spawned", "bridge_pid": None, "process_group": gone.pid},
+                       {"phase": "spawned", "bridge_pid": gone.pid, "process_group": "1"},
+                       {"phase": "spawned", "bridge_pid": gone.pid, "process_group": 1},
+                       {"phase": "spawned", "bridge_pid": gone.pid, "process_group": gone.pid,
+                        "host": "another-machine"},
+                       {"phase": "spawned", "bridge_pid": gone.pid, "process_group": gone.pid,
+                        "schema_version": "other"},
+                       # A record must say which group it supervises.
+                       {"phase": "spawned", "bridge_pid": gone.pid, "process_group": gone.pid,
+                        "supervises": None},
+                       {"phase": "spawned", "bridge_pid": gone.pid, "process_group": gone.pid,
+                        "supervises": "nested_host"}):
+            assert drain(**fields) == "unattributable", fields
+        path.write_text("{not json")
+        assert execution_host_drain(path) == "unattributable"
+    finally:
+        live.kill()
+        live.wait(timeout=10)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group transport parity")
+def test_explicit_environment_reaches_the_host_and_stays_out_of_the_record(tmp_path: Path) -> None:
+    """A caller-supplied environment is used, and the record marker is not inherited.
+
+    The bridge runs on the caller's mapping: it may pin the release the Host must
+    run, and it names the record the supervisor owns. Replacing that mapping with
+    the ambient one would silently change which code the Host runs and lose the
+    record; passing it through unchanged would leak the record marker into a
+    nested run that must not overwrite its parent's record.
+    """
+    from loopx.control_plane.turn_driver.host_process_transport import (
+        HOST_PROCESS_RECORD_ENV, execution_host_drain, run_host_process,
+    )
+
+    record_path = tmp_path / "op.host.json"
+    excluded = "LOOPX_TRANSPORT_PARITY_EXCLUDED"
+    selected = "LOOPX_TRANSPORT_PARITY_SELECTED"
+    host = ("import json,os,sys;print(json.dumps({'selected': os.environ.get(%r),"
+            " 'excluded': os.environ.get(%r), 'record': os.environ.get(%r),"
+            " 'pgid': os.getpgid(0), 'pid': os.getpid()}))" % (selected, excluded, HOST_PROCESS_RECORD_ENV))
+    environment = {**os.environ, selected: "caller-selected", HOST_PROCESS_RECORD_ENV: str(record_path)}
+    environment.pop(excluded, None)
+    chunks: list[str] = []
+    observation = run_host_process([sys.executable, "-c", host], project=tmp_path, input_text="",
+                                   timeout_seconds=15, environment=environment,
+                                   on_stdout=chunks.append)
+    assert observation["outcome"] == "exited", observation
+    value = json.loads("".join(chunks))
+    assert value["selected"] == "caller-selected"
+    assert value["excluded"] is None
+    # The record is the supervisor's, and it is not a Host input.
+    assert value["record"] is None
+    record = json.loads(record_path.read_text())
+    assert record["phase"] == "finished"
+    assert record["host_pid"] == value["pid"] == record["process_group"] == value["pgid"]
+    assert execution_host_drain(record_path) == "drained"
+    # The caller's mapping is the caller's.
+    assert environment[HOST_PROCESS_RECORD_ENV] == str(record_path)
+    assert environment[selected] == "caller-selected"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group transport parity")
+def test_hard_leased_cli_pins_the_release_and_the_record_through_the_transport(tmp_path, monkeypatch) -> None:
+    """`_cli`'s pinned release and Host record only reach the CLI through the transport.
+
+    The managed CLI runs under the bridge, so the environment `_cli` builds is
+    only effective if the transport consumes it. Capture what `_cli` hands the
+    transport instead of restating the native propagation the parity test covers.
+    """
+    from loopx.collaboration_mcp import Delegations
+
+    runner = Delegations(tmp_path, tmp_path / "registry.json", "goal", "lead", tmp_path / "config.json")
+    monkeypatch.setenv("PYTHONPATH", "/ambient")
+    handed = {}
+
+    def transport(*args, **kwargs):
+        handed.update(kwargs)
+        handed["argv"] = args[0]
+        kwargs["on_stdout"]("{}")
+        return {"outcome": "exited", "output_complete": True, "returncode": 0}
+
+    monkeypatch.setattr("loopx.control_plane.turn_driver.host_process_transport.run_host_process", transport)
+    record = tmp_path / "op.host.json"
+    runner._cli({"agent_id": "analyst", "todo_id": "todo", "workspace": str(tmp_path)}, "todo", "claim",
+                host_record=record, delegated_lease={"lease": {}, "ttl_seconds": None,
+                                                     "renew_argv": [], "read_argv": []})
+    assert handed["environment"]["PYTHONPATH"].split(os.pathsep)[0] == str(delegation_module._release_root())
+    # One record names the execution; the transport places its leased supervisor's record.
+    assert handed["environment"][HOST_PROCESS_RECORD_ENV] == str(record)
+    index = handed["argv"].index("--host-process-record")
+    assert handed["argv"][index + 1] == str(record)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group drain readback")
+def test_execution_drain_needs_every_group_a_leased_run_launched(tmp_path: Path) -> None:
+    """The Host transport alone reads one execution's records, whatever its topology.
+
+    A leased run's supervisor records the private CLI beside the owner's record
+    and the actual Host writes that record, so an outer exit proves nothing
+    about the nested Host. A record that does not say what it supervises, or
+    sits where the other kind belongs, attributes nothing.
+    """
+    from loopx.control_plane.turn_driver.host_process_transport import (
+        HOST_PROCESS_RECORD_SCHEMA_VERSION, execution_host_drain, host_process_supervisor_record,
+    )
+    from loopx.file_lock import lock_holder_host_label
+
+    record = tmp_path / "op.host.json"
+    supervisor = host_process_supervisor_record(record)
+    live = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"], start_new_session=True)
+    gone = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    gone.wait(timeout=10)
+
+    def written(path, supervises, group, supervision):
+        path.write_text(json.dumps({"schema_version": HOST_PROCESS_RECORD_SCHEMA_VERSION,
+                                    "host": lock_holder_host_label(), "owner_pid": 1, "supervises": supervises,
+                                    "supervision": supervision,
+                                    "phase": "finished", "bridge_pid": gone.pid, "process_group": group}))
+
+    cases = [
+        # (supervisor record, owner's record, observation)
+        (None, None, "unattributable"),
+        (None, ("host", gone.pid, "direct"), "drained"),
+        (None, ("host", live.pid, "direct"), "draining"),
+        (("nested_host", gone.pid, "leased"), None, "unattributable"),
+        (("nested_host", gone.pid, "leased"), ("host", gone.pid, "leased"), "drained"),
+        # A later direct recovery Host still reads the earlier outer group.
+        (("nested_host", gone.pid, "leased"), ("host", gone.pid, "direct"), "drained"),
+        # Losing either leased record leaves the surviving peer insufficient.
+        (None, ("host", gone.pid, "leased"), "unattributable"),
+        (None, ("host", live.pid, "leased"), "draining"),
+        # The leased CLI exited while its nested Host still runs.
+        (("nested_host", gone.pid, "leased"), ("host", live.pid, "leased"), "draining"),
+        (("nested_host", live.pid, "leased"), ("host", gone.pid, "leased"), "draining"),
+        # A group still seen running outranks a missing proof.
+        (("nested_host", live.pid, "leased"), "corrupt", "draining"),
+        (("nested_host", gone.pid, "leased"), "corrupt", "unattributable"),
+        # Records that do not say what they supervise, or say the wrong thing.
+        (None, (None, gone.pid, "leased"), "unattributable"),
+        (None, ("nested_host", gone.pid, "leased"), "unattributable"),
+        (("host", gone.pid, "leased"), ("host", gone.pid, "leased"), "unattributable"),
+        ((None, gone.pid, "leased"), None, "unattributable"),
+    ]
+    try:
+        for outer, owned, expected in cases:
+            for path, fact in ((supervisor, outer), (record, owned)):
+                path.unlink(missing_ok=True)
+                if fact == "corrupt":
+                    path.write_text("{corrupt")
+                elif fact is not None:
+                    written(path, *fact)
+            assert execution_host_drain(record) == expected, (outer, owned)
+    finally:
+        live.kill()
+        live.wait(timeout=10)
+
+
+def test_default_turn_deadline_is_optional_and_real_transport_accepts_none(tmp_path):
+    from loopx.cli import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["turn", "run-once", "--goal-id", "fixture",
+                              "--agent-id", "agent", "--project", str(tmp_path)])
+    assert args.timeout_seconds is None
+    result = run_host_process(
+        [sys.executable, "-c", "import time;time.sleep(.15);print('finished')"],
+        project=tmp_path, input_text="", timeout_seconds=None,
+    )
+    assert result["outcome"] == "exited"
+    assert result["returncode"] == 0
+
+
+@pytest.mark.parametrize("operation", ["send", "cancel"])
+def test_host_bridge_preserves_process_helper_patch_points(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str,
+) -> None:
+    from loopx.control_plane.turn_driver import host_bridge_transport as bridge_module
+
+    calls: list[str] = []
+    original_write = bridge_module.write_process_stdin_before_deadline
+    original_terminate = bridge_module.force_terminate_process
+
+    def write(*args, **kwargs):
+        calls.append("send")
+        return original_write(*args, **kwargs)
+
+    def terminate(*args, **kwargs):
+        assert kwargs["process_tree_owned"] is True
+        calls.append("cancel")
+        return original_terminate(*args, **kwargs)
+
+    monkeypatch.setattr(bridge_module, "write_process_stdin_before_deadline", write)
+    monkeypatch.setattr(bridge_module, "force_terminate_process", terminate)
+    source = """
+import json, sys
+print(json.dumps({"kind": "ready"}), flush=True)
+assert json.loads(sys.stdin.readline()) == {"message": "bridge λ😀"}
+print(json.dumps({"kind": "result", "outcome": "exited"}), flush=True)
+"""
+    with subprocess.Popen(
+        [sys.executable, "-u", "-c", source], cwd=tmp_path,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        encoding="utf-8", start_new_session=True,
+    ) as process:
+        bridge = bridge_module.GuardedHostBridge(
+            process, deadline=time.monotonic() + 5, cleanup_timeout=2,
+        )
+        try:
+            if operation == "send":
+                bridge.send(json.dumps({"message": "bridge λ😀"}, ensure_ascii=False) + "\n")
+                process.wait(timeout=5)
+            bridge.cancel()
+            bridge.cancel()
+            assert calls == [operation]
+            assert process.poll() is not None
+            assert bridge.not_launched is (operation == "cancel")
+            if operation == "send":
+                assert bridge.result == {"kind": "result", "outcome": "exited"}
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            bridge.close_output()
+        assert not bridge.reader.is_alive() and bridge.output.closed
+
+
+@pytest.mark.parametrize("broken_observation", ["not-json", "[]"])
+def test_host_bridge_parser_failure_closes_reader_without_claiming_cleanup(broken_observation):
+    from loopx.control_plane.turn_driver.host_bridge_transport import GuardedHostBridge
+
+    source = """
+import json, sys
+print(json.dumps({"kind": "ready"}), flush=True)
+sys.stdin.readline()
+for line in (sys.argv[1], sys.argv[1], '{"kind":"stdout","text":"diagnostic"}',
+             '{"kind":"result","outcome":"exited"}'):
+    print(line, flush=True)
+"""
+    with subprocess.Popen([sys.executable, "-u", "-c", source, broken_observation],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          text=True, encoding="utf-8") as process:
+        bridge = GuardedHostBridge(process, deadline=time.monotonic() + 5, cleanup_timeout=.2)
+        try:
+            bridge.send("{}\n")
+            process.wait(timeout=5)
+            with pytest.raises((json.JSONDecodeError, RuntimeError)):
+                bridge.next(deadline=time.monotonic() + 5)
+            with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+                bridge.cancel()
+            bridge.close_output()
+            assert not bridge.reader.is_alive()
+            assert bridge.output.closed
+            bridge.close_output()
+            # A dead bridge or reclaimed pipe cannot establish the Host's exit.
+            assert bridge.not_launched is False and bridge.result is None
+        finally:
+            # Keep a failing baseline from stranding its producer in the test runner.
+            import queue
+            for _ in range(4):
+                if not bridge.reader.is_alive():
+                    break
+                try:
+                    bridge.pending.get(timeout=.2)
+                except queue.Empty:
+                    pass
+                bridge.reader.join(timeout=.2)

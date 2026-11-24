@@ -4,11 +4,38 @@ import pytest
 
 from loopx.control_plane.todos.contract import (
     format_todo_metadata_line,
+    metadata_line_for_todo_block,
     parse_todo_metadata_line,
 )
 from loopx.control_plane.todos.active_state_todo_parser import (
     parse_active_state_todos,
 )
+
+
+def test_todo_metadata_edits_preserve_the_exact_validation_declaration() -> None:
+    metadata = "  <!-- loopx:todo todo_id=todo_schema001 status=open validation_command=python3%20-m%20pytest validation_label=check -->"
+    parsed = parse_todo_metadata_line(metadata)
+    assert parsed is not None
+    assert format_todo_metadata_line(**parsed) == metadata
+
+    updated = metadata_line_for_todo_block(parsed, {
+        "validation_command": "python3 -c 'if True:\n    pass'",
+        "validation_label": " \t ",
+        "note": " two  spaces ",
+    })
+    assert updated is not None and updated.splitlines() == [updated]
+    restored = parse_todo_metadata_line(updated)
+    assert restored is not None
+    assert restored["validation_command"] == "python3 -c 'if True:\n    pass'"
+    assert restored["validation_label"] == " \t "
+    assert restored["note"] == "two spaces"
+
+    updated_note = metadata_line_for_todo_block(restored, {"note": "Still exact"})
+    assert updated_note is not None
+    assert parse_todo_metadata_line(updated_note) == {**restored, "note": "Still exact"}
+    assert parse_todo_metadata_line(
+        "  <!-- loopx:todo validation_command=%20 validation_command_argv=%09 -->"
+    ) is None
 
 
 def test_todo_metadata_round_trip_preserves_canonical_values() -> None:
@@ -36,6 +63,7 @@ def test_todo_metadata_round_trip_preserves_canonical_values() -> None:
             }
         ],
         claimed_by="codex-quality",
+        last_actor_agent_id="codex-quality",
         bound_agent="codex-main",
         goal_bound=False,
         blocks_agent="codex-side",
@@ -46,6 +74,7 @@ def test_todo_metadata_round_trip_preserves_canonical_values() -> None:
         resume_when="todo_done:todo_blocked001",
         no_followup=False,
         target_key="github-pr-1",
+        monitor_effect_id="quota-monitor-poll:effect-001",
         cadence="30m",
         next_due_at="2026-07-28T01:00:00+08:00",
         expires_at="2026-07-29T01:00:00+08:00",
@@ -53,6 +82,7 @@ def test_todo_metadata_round_trip_preserves_canonical_values() -> None:
         result_hash="abc123",
         consecutive_no_change="2",
         material_change="false",
+        material_change_generation=0,
         max_no_change_before_replan="3",
         note="focused validation passed",
         evidence="receipt cqr_123",
@@ -105,6 +135,7 @@ def test_todo_metadata_round_trip_preserves_canonical_values() -> None:
             }
         ],
         "claimed_by": "codex-quality",
+        "last_actor_agent_id": "codex-quality",
         "bound_agent": "codex-main",
         "goal_bound": False,
         "blocks_agent": "codex-side",
@@ -115,6 +146,7 @@ def test_todo_metadata_round_trip_preserves_canonical_values() -> None:
         "resume_when": "todo_done:todo_blocked001",
         "no_followup": False,
         "target_key": "github-pr-1",
+        "monitor_effect_id": "quota-monitor-poll:effect-001",
         "cadence": "30m",
         "next_due_at": "2026-07-28T01:00:00+08:00",
         "expires_at": "2026-07-29T01:00:00+08:00",
@@ -122,6 +154,7 @@ def test_todo_metadata_round_trip_preserves_canonical_values() -> None:
         "result_hash": "abc123",
         "consecutive_no_change": "2",
         "material_change": "false",
+        "material_change_generation": "0",
         "max_no_change_before_replan": "3",
         "note": "focused validation passed",
         "evidence": "receipt cqr_123",
@@ -247,13 +280,18 @@ def test_multi_subagent_todo_parser_projects_untruncated_admission_authority() -
     lines = ["## Agent Todo", ""]
     for index in range(1, 19):
         todo_id = "todo_blocked_child" if index == 18 else f"todo_agent_{index}"
+        validation = (
+            " validation_command=python3%20-m%20pytest"
+            if index == 2
+            else ""
+        )
         lines.extend(
             [
                 f"- [ ] [P0] Inspect agent fixture {index}.",
                 (
                     f"  <!-- loopx:todo todo_id={todo_id} status=open "
                     "task_class=advancement_task action_kind=inspect "
-                    "task_domain=code -->"
+                    f"task_domain=code{validation} -->"
                 ),
             ]
         )
@@ -290,6 +328,10 @@ def test_multi_subagent_todo_parser_projects_untruncated_admission_authority() -
     user_authority = adaptive["user_todos"]["task_orchestration_authority"]
     assert len(agent_authority["candidate_items"]) == 18
     assert agent_authority["candidate_items"][-1]["todo_id"] == "todo_blocked_child"
+    declared_validation = agent_authority["candidate_items"][1]
+    assert declared_validation["completion_validation_required"] is True
+    assert "validation_command" not in declared_validation
+    assert "validation_command_argv" not in declared_validation
     assert user_authority["user_blocker_items"] == [
         {
             "todo_id": "todo_user_18",

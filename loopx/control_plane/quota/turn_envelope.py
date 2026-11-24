@@ -1,847 +1,388 @@
+"""Compatibility transport for the TypeScript-owned Turn envelope transaction."""
+
 from __future__ import annotations
 
-import json
+import base64
 from collections.abc import Mapping
-from hashlib import sha256
-from typing import Any
+from copy import deepcopy
+import json
+from typing import Any, cast
+import zlib
 
-from ..effect_program import EffectTurn, interpret_quota_should_run_packet
+from ..effect_runtime import _encode_rpc_json, effect_runtime_projection_result, source_number_tokens
 from ..scheduler.execution_context import (
     SchedulerExecutionContextResolution,
     render_scheduler_execution_args,
     resolve_scheduler_execution_context,
 )
-from ..work_items.interaction_contract import (
-    PROTOCOL_ACTION_PACKET_LLM_POLICY,
-    protocol_action_packet_fields,
-    render_protocol_action_packet_summary,
-)
-from ..work_items.primary_action import protocol_action_text
-
 
 TURN_ENVELOPE_SCHEMA_VERSION = "loopx_turn_envelope_v0"
+COMPLETE_TURN_DECISION_VERSION = "loopx_turn_envelope_v1"
 TURN_ENVELOPE_BUDGET_BYTES = 8_192
-EXECUTABLE_CLI_ARGS_MAX_ITEMS = 64
-EXECUTABLE_CLI_ARGS_MAX_ITEM_CHARS = 512
-EXECUTABLE_CLI_ARGS_MAX_TOTAL_CHARS = 2_048
-SCHEDULER_DETAIL_REQUEST = "loopx quota should-run --include-detail scheduler"
 CONTRACT_CAPSULE_SCHEMA_VERSION = "loopx_contract_capsule_v0"
 ACTION_SIGNATURE_SCHEMA_VERSION = "loopx_action_signature_v0"
 ACTION_SIGNATURE_COVERAGE_V0 = "turn_envelope_action_dimensions_v0"
 ACTION_SIGNATURE_COVERAGE_V1 = "turn_envelope_action_dimensions_v1"
 ACTION_SIGNATURE_COVERAGE_V2 = "turn_envelope_action_dimensions_v2"
+ACTION_SIGNATURE_COVERAGE_V3 = "turn_envelope_action_dimensions_v3"
+ACTION_SIGNATURE_COVERAGE_V4 = "turn_envelope_action_dimensions_v4"
+ACTION_SIGNATURE_COVERAGE_V5 = "turn_envelope_action_dimensions_v5"
 ACTION_SIGNATURE_COVERAGE = ACTION_SIGNATURE_COVERAGE_V0
-ACTIONABLE_WARNING_FIELDS = (
-    "state_projection_gap",
-    "boundary_projection_gap",
-    "state_action_projection_warning",
-    "next_action_projection_warning",
-    "stale_latest_run_warning",
-    "decision_freshness_warning",
-)
-CONTRACT_CAPSULE_FIELDS = {
-    "interaction_contract": (
-        "schema_version",
-        "mode",
-    ),
-    "work_lane_contract": (
-        "schema_version",
-        "lane",
-        "monitor_kind",
-        "next_lane",
-        "obligation",
-        "must_attempt_work",
-        "reason_codes",
-        "monitor_policy",
-        "selected_todo_id",
-        "selected_next_due_at",
-        "material_transition",
-        "action",
-    ),
-    "execution_profile": (
-        "cadence",
-        "minimum_scale",
-        "spend_rule",
-        "must_include",
-    ),
-    "execution_obligation": (
-        "kind",
-        "contract",
-        "contract_obligation",
-        "must_attempt_work",
-        "notify_is_execution_gate",
-        "delivery_allowed",
-        "reason",
-    ),
-    "goal_route_hint": (
-        "schema_version",
-        "kind",
-        "route_decision",
-        "preserves_goal_next_action",
-        "goal_next_action_mutation",
-    ),
-    "autonomous_replan_scope": (
-        "schema_version",
-        "required",
-        "applies",
-        "scope",
-        "owner_agent_ids",
-        "selected_peer_agent",
-    ),
-    "agent_scope_frontier": (
-        "schema_version",
-        "action",
-        "effective_action",
-        "blocks_delivery",
-        "quiet_noop_allowed",
-        "requires_replan",
-        "recommended_action",
-        "spend_policy",
-    ),
-    "automation_liveness": (
-        "schema_version",
-        "keep_active",
-        "pause_allowed",
-        "pause_policy",
-        "automation_action",
-    ),
-    "vision_continuation_audit": (
-        "schema_version",
-        "required",
-        "decision",
-        "selected_todo_is_goal_completion",
-        "closeout_allowed_without_evidence",
-        "trigger_kinds",
-        "required_before_closeout",
-        "recommended_action",
-    ),
-    "handoff_readiness": (
-        "ready",
-        "codex_ready",
-        "handoff_status",
-        "post_handoff_run_seen",
-    ),
-    "capability_monitor_fallback": (
-        "schema_version",
-        "capability_gate_action",
-        "blocked_advancement_count",
-        "blocked_due_monitor_count",
-        "mode",
-    ),
-}
-CONTRACT_CAPSULE_TEXT_LIMITS = {
-    "work_lane_contract": {"action": 300, "material_transition": 240},
-    "execution_obligation": {"reason": 240},
-    "agent_scope_frontier": {"recommended_action": 320, "spend_policy": 220},
-    "automation_liveness": {"pause_policy": 260},
-    "vision_continuation_audit": {"recommended_action": 320},
-}
+PLANNING_HORIZON_DETAIL_REFS_REF = "$.detail_ref"
 
 
-def _mapping(value: Any) -> dict[str, Any]:
+def _apply_context_projection_changes(
+    source: dict[str, Any], result: dict[str, Any], *, base: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply typed display edits to the original Python facts, without policy."""
+    if set(result) != {"changes"} or not isinstance(result["changes"], list):
+        raise RuntimeError("TypeScript context projection must return changes")
+    # JSON transport has no aliasing. Keep Python's exact numeric values while
+    # separating repeated caller-owned objects before applying path edits.
+    projected = json.loads(json.dumps(source if base is None else base, allow_nan=False))
+    try:
+        for change in result["changes"]:
+            path = change["path"]
+            if not isinstance(path, list):
+                raise ValueError("projection path must be a list")
+            if not path and "remove" in change:
+                raise ValueError("projection root cannot be removed")
+            parent: Any = projected
+            for key in path[:-1]:
+                parent = parent[key]
+            if "remove" in change:
+                del parent[path[-1]]
+                continue
+            if "from" in change:
+                value: Any = source
+                for part in change["from"]:
+                    value = value[part]
+            else:
+                value = change["value"]
+            if not path:
+                if not isinstance(value, dict):
+                    raise ValueError("projection root must be an object")
+                projected = deepcopy(value)
+                continue
+            key = path[-1]
+            if isinstance(parent, list) and key == len(parent):
+                parent.append(deepcopy(value))
+            else:
+                parent[key] = deepcopy(value)
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise RuntimeError("Invalid TypeScript context projection changes") from error
+    return cast(dict[str, Any], projected)
+
+
+def pack_turn_source(
+    source: Mapping[str, Any], *, max_encoded_fraction: float = 1.0,
+) -> dict[str, str] | None:
+    """Use the lossless wire for bounded sources that compress well."""
+    raw = _encode_rpc_json(source)
+    if 16 * 1024 <= len(raw) <= 1024 * 1024:
+        data = base64.b64encode(zlib.compress(raw, level=1)).decode("ascii")
+        if len(data) + 128 < len(raw) * max_encoded_fraction:
+            return {"encoding": "deflate-base64-json-v0", "data": data}
+    return None
+
+
+def _turn_envelope_result(
+    operation: str,
+    **params: object,
+) -> dict[str, Any]:
+    """Call the coarse TS owner and fail closed on transport shape drift."""
+
+    request = {"operation": operation, **params}
+    payload = params.get("payload")
+    complete = isinstance(payload, Mapping) and payload.get("schema_version") == COMPLETE_TURN_DECISION_VERSION
+    staged_replan = (
+        operation in {"build", "quota_signature", "replan_cli_view", "bind_capture",
+                      "capability_automation_source"}
+        and isinstance(payload, Mapping)
+        and (
+            (operation == "replan_cli_view" and params.get("source_edits") is True)
+            or (payload.get("replan_action_packet") and (payload.get("replan_read_path") or params.get("reader_argv")))
+        )
+    )
+    if complete or operation == "compose_complete" or operation == "replan_view" or staged_replan or operation == "reference_context":
+        tokens = source_number_tokens(payload)
+        if tokens:
+            request["source_number_tokens"] = tokens
+    elif operation in {"context_delivery", "context_recovery", "progressive_context_delivery", "context_read_sections"}:
+        tokens = source_number_tokens(params)
+        if tokens:
+            request["source_number_tokens"] = tokens
+    if operation == "attach_complete_turn_context" and isinstance(params.get("context_additions"), Mapping):
+        addition_tokens = source_number_tokens(params["context_additions"])
+        if addition_tokens:
+            request["context_addition_tokens"] = addition_tokens
+    source_field = "context" if operation == "context_delivery" else "payload"
+    compact_source = (
+        operation in {"compose_complete", "attach_complete_turn_context", "context_delivery"}
+        or (operation == "capability_automation_source" and set(params) == {"payload"})
+    )
+    source = params.get(source_field)
+    if compact_source and isinstance(source, Mapping):
+        # Base64 of ordinary prose can cost more tokens than inline JSON.
+        # Large repeated Goal bodies qualify only with a threefold byte reduction.
+        fraction = 1.0 if operation == "capability_automation_source" else 1 / 3
+        transport = pack_turn_source(source, max_encoded_fraction=fraction)
+        if transport is not None:
+            del request[source_field]
+            request["source_transport"] = transport
+    result = effect_runtime_projection_result("quota.turn_envelope.evaluate", request)
+    if not isinstance(result, Mapping):
+        raise RuntimeError("TypeScript Turn envelope result must be an object")
+    if operation == "replan_view" and "source_number_tokens" in request:
+        return _apply_context_projection_changes(cast(dict[str, Any], payload), dict(result), base={})
+    return dict(result)
+
+
+LOOPX_TURN_PLAN_SCHEMA_VERSION = "loopx_turn_plan_v0"
+COMPLETE_TURN_PLAN_SCHEMA_VERSION = "loopx_turn_plan_v1"
+LOOPX_TURN_HOST_REQUEST_SCHEMA = "loopx_turn_host_request_v0"
+COMPLETE_TURN_HOST_REQUEST_SCHEMA = "loopx_turn_host_request_v1"
+
+
+def _wire_mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
-def _text(value: Any, *, limit: int) -> str | None:
-    return protocol_action_text(value, limit=limit) or None
+def turn_plan_host_source(request: Mapping[str, Any]) -> Mapping[str, Any]:
+    # Result validation and completion also read the private plan. Its schema
+    # is not a model wire version; adapt only its existing source carriers.
+    if request.get("schema_version") == COMPLETE_TURN_PLAN_SCHEMA_VERSION:
+        if "work_contract" not in request or "turn_envelope" in request or "source_decision_hash" not in request:
+            raise ValueError("complete Turn plan requires one source without an executor adapter")
+        return {"schema_version": "loopx_turn_host_request_v1",
+                "turn_key": _wire_mapping(request.get("transaction")).get("turn_key"),
+                **{key: request[key] for key in ("work_contract", "source_decision_hash", "detail_ref")
+                   if key in request}}
+    return ({key: request[key] for key in ("work_contract", "turn_envelope") if key in request}
+            if request.get("schema_version") == LOOPX_TURN_PLAN_SCHEMA_VERSION else request)
 
 
-def _text_list(value: Any, *, limit: int, item_limit: int = 240) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    result: list[str] = []
-    for item in value:
-        text = _text(item, limit=item_limit)
-        if not text or text in result:
-            continue
-        result.append(text)
-        if len(result) >= limit:
-            break
-    return result
-
-
-def _executable_cli_args(value: Any) -> list[str]:
-    """Return one exact CLI argv vector or omit it entirely.
-
-    General compact text lists intentionally deduplicate and truncate. Both
-    behaviors corrupt argv because flags such as ``--available-capability``
-    are repeated and a partial vector is not executable.
-    """
-
-    if not isinstance(value, list) or not value:
-        return []
-    if len(value) > EXECUTABLE_CLI_ARGS_MAX_ITEMS:
-        return []
-    result: list[str] = []
-    total_chars = 0
-    for item in value:
-        if not isinstance(item, str) or not item:
-            return []
-        if len(item) > EXECUTABLE_CLI_ARGS_MAX_ITEM_CHARS:
-            return []
-        total_chars += len(item) + 1
-        if total_chars > EXECUTABLE_CLI_ARGS_MAX_TOTAL_CHARS:
-            return []
-        result.append(item)
-    return result
-
-
-def _canonical_hash(value: Any) -> str:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return "sha256:" + sha256(encoded).hexdigest()
-
-
-def _compact_fields(
-    value: Any,
-    fields: tuple[str, ...],
-    *,
-    text_limits: Mapping[str, int] | None = None,
-) -> dict[str, Any]:
-    source = _mapping(value)
-    compact: dict[str, Any] = {}
-    limits = dict(text_limits or {})
-    for field in fields:
-        raw = source.get(field)
-        if raw is None:
-            continue
-        if field in limits:
-            text = _text(raw, limit=limits[field])
-            if text:
-                compact[field] = text
-        elif isinstance(raw, list):
-            values = _text_list(raw, limit=6, item_limit=140)
-            if values:
-                compact[field] = values
-        else:
-            compact[field] = raw
-    return compact
-
-
-def _same_action_text(left: Any, right: Any) -> bool:
-    left_text = _text(left, limit=2_000)
-    right_text = _text(right, limit=2_000)
-    if not left_text or not right_text:
-        return False
-    left_folded = left_text.casefold()
-    right_folded = right_text.casefold()
-    if left_folded == right_folded:
-        return True
-    # Upstream todo projections may already be ellipsized; require a substantial
-    # shared prefix before treating that compact text as the same action.
-    if left_folded.endswith("..."):
-        prefix = left_folded[:-3].rstrip()
-        return len(prefix) >= 80 and right_folded.startswith(prefix)
-    if right_folded.endswith("..."):
-        prefix = right_folded[:-3].rstrip()
-        return len(prefix) >= 80 and left_folded.startswith(prefix)
-    return False
-
-
-def _selected_todo(
-    payload: Mapping[str, Any],
-    *,
-    recommended_action: str | None,
-) -> dict[str, Any] | None:
-    source = _mapping(payload.get("selected_todo"))
-    if not source:
-        return None
-    fields = (
-        "todo_id",
-        "priority",
-        "status",
-        "task_class",
-        "action_kind",
-        "task_repository",
-        "continuation_policy",
-        "claimed_by",
-        "bound_agent",
-        "goal_bound",
-        "blocks_agent",
-        "unblocks_todo_id",
-        "next_due_at",
-        "expires_at",
-        "selected_by",
-        "confidence",
-    )
-    compact = {field: source[field] for field in fields if source.get(field) is not None}
-    text = _text(source.get("text"), limit=360)
-    if text and _same_action_text(source.get("text"), recommended_action):
-        compact["text_ref"] = "action.recommended_action"
-    elif text:
-        compact["text"] = text
-    return compact or None
-
-
-def _replan_action_packet(payload: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Project the semantic replan contract without duplicating cold-path help.
-
-    The full quota packet keeps copy-ready writeback templates.  The turn
-    envelope carries those operations once in ``writeback.next_cli_actions``;
-    retaining a second copy inside the decision packet spends scarce hot-path
-    budget without adding an executable choice.
-    """
-
-    source = _mapping(payload.get("replan_action_packet"))
-    if not source:
-        return None
-    compact = _compact_fields(
-        source,
-        (
-            "schema_version",
-            "decision",
-            "obligation_id",
-            "uncovered_frontier",
-            "required_outcome",
-            "allowed_terminal",
-            "bounded_frontier",
-        ),
-    )
-    return compact or None
-
-
-def _user_channel(interaction: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
-    source = _mapping(interaction.get("user_channel"))
-    channel: dict[str, Any] = {
-        "action_required": bool(source.get("action_required", payload.get("action_required"))),
-        "open_count": int(payload.get("open_count") or 0),
-        "notify": str(source.get("notify") or "DONT_NOTIFY"),
-    }
-    actions = _text_list(source.get("actions"), limit=3, item_limit=360)
-    if actions:
-        channel["actions"] = actions
-    reason = _text(source.get("reason"), limit=360)
-    if reason:
-        channel["reason"] = reason
-    return channel
-
-
-def _response_plan(interaction: Mapping[str, Any]) -> dict[str, Any] | None:
-    source = _mapping(interaction.get("response_plan"))
-    if not source:
-        return None
-    plan: dict[str, Any] = {}
-    for field in ("schema_version", "kind", "decision"):
-        text = _text(source.get(field), limit=80)
-        if text:
-            plan[field] = text
-    action_sequence = _text_list(
-        source.get("action_sequence"),
-        limit=8,
-        item_limit=80,
-    )
-    if action_sequence:
-        plan["action_sequence"] = action_sequence
-    if isinstance(source.get("silent_wait_allowed"), bool):
-        plan["silent_wait_allowed"] = source["silent_wait_allowed"]
-    return plan or None
-
-
-def _required_reads(interaction: Mapping[str, Any], payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-    raw_reads = interaction.get("required_reads") or payload.get("required_reads")
-    if not isinstance(raw_reads, list):
-        return []
-    reads: list[dict[str, Any]] = []
-    for item in raw_reads[:5]:
-        if not isinstance(item, Mapping):
-            continue
-        command = _text(item.get("command"), limit=360)
-        if not command:
-            continue
-        compact = {"command": command}
-        for field in ("kind", "reason", "source"):
-            text = _text(item.get(field), limit=240)
-            if text:
-                compact[field] = text
-        reads.append(compact)
-    return reads
-
-
-def _boundary(payload: Mapping[str, Any]) -> dict[str, Any]:
-    source = _mapping(payload.get("goal_boundary"))
-    boundary: dict[str, Any] = {
-        "rule": str(source.get("rule") or "stay_in_scope_or_stop"),
-    }
-    adapter = _mapping(source.get("adapter"))
-    if adapter:
-        boundary["adapter"] = {
-            field: adapter[field]
-            for field in ("kind", "status")
-            if adapter.get(field) is not None
+def captured_turn_host_input(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Use the checked wire or transfer original-reader metadata from v0."""
+    if "turn_envelope" not in request:
+        return {**request, "schema_version": COMPLETE_TURN_HOST_REQUEST_SCHEMA}
+    envelope = _wire_mapping(request.get("turn_envelope"))
+    model_input = {**{key: value for key, value in request.items() if key != "turn_envelope"},
+                   "schema_version": COMPLETE_TURN_HOST_REQUEST_SCHEMA}
+    detail = _wire_mapping(envelope.get("detail_ref"))
+    captured = _wire_mapping(detail.get("captured_decision"))
+    if captured:
+        model_input["source_decision_hash"] = _wire_mapping(envelope.get("action_signature"))["source_decision_hash"]
+        model_input["detail_ref"] = {
+            "full_decision": detail["full_decision"],
+            "captured_decision": {**captured, "source_hash_ref": "$.source_decision_hash"},
         }
-    for field in ("write_scope", "available_capabilities", "requires_parent_approval"):
-        values = _text_list(source.get(field), limit=16, item_limit=180)
-        if values:
-            boundary[field] = values
-    guards = _text_list(source.get("guards"), limit=8, item_limit=280)
-    if guards:
-        boundary["guards"] = guards
-    stop_condition = _text(source.get("stop_condition"), limit=320)
-    if stop_condition:
-        boundary["stop_condition"] = stop_condition
-    for field in ("execution_profile", "orchestration"):
-        value = _mapping(source.get(field))
-        if value:
-            boundary[field] = value
-
-    workspace_guard = _mapping(payload.get("workspace_guard"))
-    if workspace_guard:
-        boundary["workspace_guard"] = workspace_guard
-    capability_gate = _mapping(payload.get("capability_gate"))
-    if capability_gate:
-        boundary["capability_gate"] = {
-            field: capability_gate[field]
-            for field in (
-                "action",
-                "reason",
-                "required_capabilities",
-                "missing_capabilities",
-                "owner_action",
-            )
-            if capability_gate.get(field) is not None
-        }
-    return boundary
-
-
-def _quota_effect_turn(payload: Mapping[str, Any]) -> EffectTurn:
-    agent_identity = _mapping(payload.get("agent_identity"))
-    agent_id = str(
-        payload.get("agent_id") or agent_identity.get("agent_id") or ""
-    ).strip() or None
-    return interpret_quota_should_run_packet(
-        payload,
-        goal_id=str(payload.get("goal_id") or "") or None,
-        agent_id=agent_id,
-    )
-
-
-def _scheduler(
-    payload: Mapping[str, Any],
-    turn: EffectTurn | None = None,
-) -> dict[str, Any]:
-    source = _mapping(payload.get("scheduler_hint"))
-    effect_turn = turn or _quota_effect_turn(payload)
-    scheduler: dict[str, Any] = {}
-    action = effect_turn.next_effect.scheduler_action or source.get("action")
-    cadence_class = (
-        effect_turn.next_effect.cadence_class or source.get("cadence_class")
-    )
-    if action is not None:
-        scheduler["action"] = action
-    if cadence_class is not None:
-        scheduler["cadence_class"] = cadence_class
-    for field in ("reason_code", "spend_policy"):
-        if source.get(field) is not None:
-            scheduler[field] = source[field]
-    codex_app = _mapping(source.get("codex_app"))
-    if not codex_app:
-        return scheduler
-    app: dict[str, Any] = {
-        field: codex_app[field]
-        for field in ("apply", "host_action", "recommended_rrule", "no_spend_for_cadence_change")
-        if codex_app.get(field) is not None
-    }
-    state = _mapping(codex_app.get("stateful_backoff"))
-    if state:
-        app["stateful_backoff"] = {
-            field: state[field]
-            for field in (
-                "state_key",
-                "current_rrule",
-                "apply_needed",
-                "ack_needed",
-                "state_status",
-            )
-            if state.get(field) is not None
-        }
-        failure = _mapping(state.get("host_update_failure"))
-        if failure:
-            app["stateful_backoff"]["host_update_failure"] = {
-                field: failure[field]
-                for field in (
-                    "target_rrule",
-                    "observed_host_rrule",
-                    "failure_kind",
-                    "failure_count",
-                )
-                if failure.get(field) is not None
+        readers = _wire_mapping(detail.get("replan_action_packet"))
+        if readers.get("review"):
+            model_input["detail_ref"]["replan_action_packet"] = {
+                key: value for key, value in readers.items() if key in {"review", "writeback"}
             }
-    ack = _mapping(codex_app.get("ack_hint"))
-    cli_args = _executable_cli_args(ack.get("cli_args"))
-    if cli_args:
-        app["ack_cli_args"] = cli_args
-    elif ack.get("cli_args"):
-        app["ack_cli_args_detail_ref"] = {
-            "reason": "omitted_to_preserve_executable_argv",
-            "request": SCHEDULER_DETAIL_REQUEST,
-        }
-    failure_hint = _mapping(codex_app.get("failure_hint"))
-    if failure_hint.get("cli_args"):
-        app["failure_cli_args_detail_ref"] = {
-            "reason": "cold_path_until_host_update_failure",
-            "request": SCHEDULER_DETAIL_REQUEST,
-        }
-    if app:
-        scheduler["codex_app"] = app
-    return scheduler
+    return model_input
 
 
-def _execution_policy(payload: Mapping[str, Any]) -> dict[str, Any]:
-    fields = (
-        "normal_delivery_allowed",
-        "recovery_delivery_allowed",
-        "self_repair_allowed",
-        "capability_repair_allowed",
-        "workspace_repair_allowed",
-        "safe_bypass_allowed",
-        "safe_bypass_kind",
-        "blocked_action_scope",
-    )
-    return {field: payload[field] for field in fields if payload.get(field) is not None}
+def assert_turn_host_request_version(request: Mapping[str, Any]) -> None:
+    """Decode the two published Host transports;"""
+    version = request.get("schema_version")
+    if version not in (LOOPX_TURN_HOST_REQUEST_SCHEMA, COMPLETE_TURN_HOST_REQUEST_SCHEMA):
+        raise ValueError("unsupported LoopX Turn host request schema")
+    if version == COMPLETE_TURN_HOST_REQUEST_SCHEMA and (
+        "work_contract" not in request or "turn_envelope" in request
+    ):
+        raise ValueError("complete Host request requires work_contract without an executor adapter")
 
 
-def _derived_protocol_action_packet_fields(
-    *,
-    action: Mapping[str, Any],
-    user: Mapping[str, Any],
-    capsule: Mapping[str, Any],
-    scheduler: Mapping[str, Any],
+def complete_turn_host_source(
+    request: Mapping[str, Any], *, operation: str = "host_context",
+    include_session_lineage: bool = False,
+    include_model_context: bool = False,
+    recorded_capability_result: bool = False,
+) -> dict[str, Any] | None:
+    if "schema_version" in request:
+        assert_turn_host_request_version(request)
+    if "work_contract" not in request:
+        return None
+    wire = {}
+    if request.get("schema_version") == COMPLETE_TURN_HOST_REQUEST_SCHEMA:
+        wire["complete_host_request"] = {key: request[key] for key in (
+            "schema_version", "turn_key", "source_decision_hash", "detail_ref",
+        ) if key in request}
+    elif "turn_envelope" in request or operation != "complete_host_lineage":
+        # An explicit historical adapter still requires full validation.
+        wire["envelope"] = _wire_mapping(request.get("turn_envelope"))
+    checked = _turn_envelope_result(operation, payload=request["work_contract"], **wire,
+                                 **({"recorded_capability_result": True} if recorded_capability_result else {}),
+                                 **({"include_model_context": True} if include_model_context else {}),
+                                 **({"include_session_lineage": True} if include_session_lineage else {}))
+    if include_model_context:
+        changes = checked.pop("model_context_changes", None)
+        if not isinstance(changes, dict):
+            raise RuntimeError("TypeScript Host model-context projection is missing")
+        checked["model_context"] = _apply_context_projection_changes(
+            dict(request["work_contract"]), changes,
+        )
+    return checked
+
+
+def projected_host_model_input(request: Mapping[str, Any], checked: Mapping[str, Any]) -> dict[str, Any]:
+    """Render task data with original-reader provenance, never a new source.
+
+    The full v1 wire/journal remains unchanged. Applying the TS owner's path
+    edits above preserves original Python numbers and complete task text.
+    """
+    context = checked.get("model_context")
+    if not isinstance(context, dict):
+        raise RuntimeError("checked Host model-context projection is missing")
+    original = captured_turn_host_input(request)
+    return {**{key: value for key, value in original.items()
+               if key not in {"work_contract", "schema_version"}},
+            "schema_version": checked["model_context_schema_version"],
+            "source_schema_version": original["schema_version"], "task_context": context}
+
+
+def selected_turn_todo(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """Transport historical selection to the shared work/settlement owner.
+
+    Only Python's original scalar codec remains here. Pure source edits retain
+    unknown fields and exact numbers without another JSON value decoder.
+    """
+    orchestration = _wire_mapping(envelope.get("task_orchestration_contract"))
+    source = {"selected_todo": _wire_mapping(_wire_mapping(envelope.get("action")).get("selected_todo")),
+              "task_orchestration_contract": orchestration}
+    edits = _turn_envelope_result("selected_work_todo", payload=source,
+        historical_primary_text=str(orchestration.get("primary_todo_id") or "").strip())
+    selected: dict[str, Any] = _apply_context_projection_changes(source, edits)["selected_todo"]
+    return selected
+
+
+def read_turn_plan_work(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Read checked execution facts; current plans never regenerate a v0 view."""
+    if plan.get("schema_version") == COMPLETE_TURN_PLAN_SCHEMA_VERSION or "work_contract" in plan:
+        result = complete_turn_host_source(turn_plan_host_source(plan), operation="plan_work")
+        assert result is not None
+        return result
+    if plan.get("schema_version") not in (None, LOOPX_TURN_PLAN_SCHEMA_VERSION):
+        raise ValueError("unsupported Turn plan version")
+    return _wire_mapping(plan.get("turn_envelope"))
+
+
+def read_recorded_turn_plan_lineage(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Check a recorded plan with the same source reader as journal inspection."""
+    tokens = source_number_tokens(plan.get("work_contract"))
+    return _turn_envelope_result("recorded_plan_lineage", plan=plan,
+        **({"source_number_tokens": tokens} if tokens else {}))
+
+
+def turn_host_lineage(request: Mapping[str, Any]) -> dict[str, str]:
+    """Read identity from the complete owner, with historical request decoding."""
+    checked = complete_turn_host_source(turn_plan_host_source(request), operation="complete_host_lineage")
+    if checked is not None:
+        return checked
+    envelope = _wire_mapping(request.get("turn_envelope"))
+    todo = selected_turn_todo(envelope)
+    return {
+        "goal_id": str(envelope.get("goal_id") or "").strip(),
+        "agent_id": str(envelope.get("agent_id") or "").strip(),
+        "todo_id": str(todo.get("todo_id") or "").strip(),
+    }
+
+
+def assert_turn_envelope_consumer_version(envelope: Mapping[str, Any]) -> None:
+    """Use the typed wire-version gate before any Host consumes this packet."""
+    _turn_envelope_result("consumer_version", envelope=dict(envelope))
+
+
+def turn_envelope_action_signature_document(
+    envelope: Mapping[str, Any],
 ) -> dict[str, Any]:
-    interaction = _mapping(capsule.get("interaction_contract"))
-    work_lane = _mapping(capsule.get("work_lane_contract"))
-    automation = _mapping(capsule.get("automation_liveness"))
-    mode = str(interaction.get("mode") or "")
-    user_required = bool(user.get("action_required"))
-    agent_required = bool(action.get("must_attempt"))
-    actor = (
-        "agent_with_user_gate"
-        if user_required
-        and mode in {"scoped_user_gate_fallback", "bounded_delivery_with_user_notice"}
-        else "user"
-        if user_required
-        else "agent"
+    return _turn_envelope_result(
+        "envelope_signature",
+        envelope=dict(envelope),
     )
-    fields: dict[str, Any] = {
-        "actor": actor,
-        "user_action_required": user_required,
-        "agent_action_required": agent_required,
-        "quiet_noop_allowed": bool(action.get("quiet_noop_allowed")),
-    }
-    if work_lane.get("lane"):
-        fields["lane"] = work_lane.get("lane")
-    if automation.get("automation_action"):
-        fields["automation"] = automation.get("automation_action")
-    if scheduler.get("action"):
-        fields["scheduler"] = scheduler.get("action")
-    if automation.get("pause_allowed") is False:
-        fields["pause_allowed"] = False
-    fields["llm"] = PROTOCOL_ACTION_PACKET_LLM_POLICY
-
-    user_actions = user.get("actions") if isinstance(user.get("actions"), list) else []
-    action_key = "agent_action" if agent_required or not user_required else "user_action"
-    if user_actions and (not user_required or action_key != "user_action"):
-        fields["user_action_pending"] = True
-        user_action = _text(user_actions[0], limit=80)
-        if user_action:
-            fields["user_action"] = user_action
-
-    if agent_required:
-        action_value = action.get("primary_action")
-    elif user_required and user_actions:
-        action_value = user_actions[0]
-    elif work_lane.get("obligation") == "quiet_until_material_monitor_transition":
-        action_value = (
-            "quiet until a material monitor transition, regression, or concrete blocker appears"
-        )
-    else:
-        action_value = action.get("primary_action") or "quiet no-op; no material transition"
-    text = _text(action_value, limit=80)
-    if text:
-        fields[action_key] = text
-    return fields
-
-
-def _contract_capsule(
-    payload: Mapping[str, Any],
-    *,
-    action: Mapping[str, Any],
-    user: Mapping[str, Any],
-    scheduler: Mapping[str, Any],
-) -> dict[str, Any]:
-    capsule: dict[str, Any] = {
-        "schema_version": CONTRACT_CAPSULE_SCHEMA_VERSION,
-        "source": "full_quota_decision",
-    }
-    for source_key, fields in CONTRACT_CAPSULE_FIELDS.items():
-        compact = _compact_fields(
-            payload.get(source_key),
-            fields,
-            text_limits=CONTRACT_CAPSULE_TEXT_LIMITS.get(source_key),
-        )
-        if compact:
-            capsule[source_key] = compact
-    task_scope = _text(payload.get("task_scope"), limit=80)
-    if task_scope:
-        capsule["task_scope"] = task_scope
-
-    work_lane = _mapping(payload.get("work_lane_contract"))
-    work_lane_compact = _mapping(capsule.get("work_lane_contract"))
-    outcome_followthrough = _mapping(work_lane.get("outcome_followthrough"))
-    if outcome_followthrough:
-        work_lane_compact["outcome_followthrough"] = _compact_fields(
-            outcome_followthrough,
-            (
-                "required",
-                "obligation",
-                "accepted_resolution_kinds",
-                "spend_policy",
-            ),
-            text_limits={"spend_policy": 220},
-        )
-        capsule["work_lane_contract"] = work_lane_compact
-
-    packet = _mapping(payload.get("protocol_action_packet"))
-    if packet and not _mapping(payload.get("replan_action_packet")):
-        summary = _text(packet.get("summary"), limit=2_000)
-        source_fields = protocol_action_packet_fields(dict(payload))
-        derived_fields = _derived_protocol_action_packet_fields(
-            action=action,
-            user=user,
-            capsule=capsule,
-            scheduler=scheduler,
-        )
-        residue = {
-            key: value
-            for key, value in source_fields.items()
-            if derived_fields.get(key) != value
-        }
-        reconstructed_fields = {
-            key: residue.get(key, derived_fields.get(key)) for key in source_fields
-        }
-        reconstructed_summary = render_protocol_action_packet_summary(reconstructed_fields)
-        reconstruction_verified = bool(summary) and reconstructed_summary == summary
-        packet_projection: dict[str, Any] = {
-            "schema_version": packet.get("schema_version"),
-            "present": True,
-            "summary_hash": _canonical_hash(summary or ""),
-            "derivation_status": (
-                "verified_with_residue" if residue else "verified"
-            )
-            if reconstruction_verified
-            else "unverified_retain_summary",
-            "reconstruction_verified": reconstruction_verified,
-            "llm_policy": PROTOCOL_ACTION_PACKET_LLM_POLICY,
-            "candidate_derivation_inputs": [
-                "action",
-                "user",
-                "work_lane_contract",
-                "automation_liveness",
-                "scheduler",
-            ],
-        }
-        if residue:
-            packet_projection["residue"] = residue
-        if not reconstruction_verified:
-            packet_projection["summary"] = summary
-        capsule["protocol_action_packet"] = packet_projection
-
-    warnings = [field for field in ACTIONABLE_WARNING_FIELDS if payload.get(field)]
-    if warnings:
-        capsule["actionable_warning_refs"] = warnings
-    return capsule
-
-
-def _action_projection(
-    payload: Mapping[str, Any],
-    turn: EffectTurn | None = None,
-) -> dict[str, Any]:
-    effect_turn = turn or _quota_effect_turn(payload)
-    agent_id = effect_turn.request.agent_id
-    interaction = _mapping(payload.get("interaction_contract"))
-    agent_channel = _mapping(interaction.get("agent_channel"))
-    cli_channel = _mapping(interaction.get("cli_channel"))
-    replan_action_packet = _replan_action_packet(payload)
-    recommended_action = (
-        "apply replan_action_packet and emit one required semantic outcome"
-        if replan_action_packet
-        else _text(
-            effect_turn.observation.recommended_action
-            or payload.get("recommended_action"),
-            limit=480,
-        )
-    )
-    action = {
-        "recommended_action": recommended_action,
-        "primary_action": (
-            "produce one required semantic outcome"
-            if replan_action_packet
-            else _text(agent_channel.get("primary_action"), limit=480)
-        ),
-        "must_attempt": bool(agent_channel.get("must_attempt")),
-        "delivery_allowed": bool(agent_channel.get("delivery_allowed")),
-        "quiet_noop_allowed": bool(agent_channel.get("quiet_noop_allowed")),
-        "selected_todo": _selected_todo(
-            payload,
-            recommended_action=recommended_action,
-        ),
-    }
-    if effect_turn.observation.action_portfolio is not None:
-        action["action_portfolio"] = dict(
-            effect_turn.observation.action_portfolio
-        )
-    user = _user_channel(interaction, payload)
-    scheduler = _scheduler(payload, turn=effect_turn)
-    next_cli_actions = list(effect_turn.next_effect.cli_actions) or list(
-        cli_channel.get("next_cli_actions") or []
-    )
-    if replan_action_packet:
-        # Resolve the full packet's atomic successor reference before the
-        # cold-path writeback contract is removed from the turn envelope.
-        full_packet = _mapping(payload.get("replan_action_packet"))
-        replan_writeback = _mapping(full_packet.get("writeback_contract"))
-        successor_command = replan_writeback.get("successor_command")
-        refresh_command = next(
-            (
-                action
-                for action in next_cli_actions
-                if isinstance(action, str) and "refresh-state" in action
-            ),
-            None,
-        )
-        next_cli_actions = []
-        if successor_command:
-            next_cli_actions.append(successor_command)
-        if refresh_command:
-            next_cli_actions.append(refresh_command)
-    writeback = {
-        "next_cli_actions": _text_list(
-            next_cli_actions,
-            limit=5,
-            item_limit=420,
-        ),
-        "spend_allowed_now": bool(cli_channel.get("spend_allowed_now")),
-        "spend_after_validation": bool(cli_channel.get("spend_after_validation")),
-        "spend_policy": _text(cli_channel.get("spend_policy"), limit=280),
-    }
-    replan_settlement_contract = _mapping(
-        cli_channel.get("replan_settlement_contract")
-    )
-    if replan_settlement_contract:
-        writeback["replan_settlement_contract"] = replan_settlement_contract
-    delivery_workspace_causality = _mapping(
-        cli_channel.get("delivery_workspace_causality")
-    )
-    if delivery_workspace_causality:
-        writeback["delivery_workspace_causality"] = delivery_workspace_causality
-    projection = {
-        "agent_id": agent_id,
-        "decision": payload.get("decision"),
-        "should_run": bool(payload.get("should_run")),
-        "effective_action": payload.get("effective_action"),
-        "state": payload.get("state"),
-        "action": action,
-        "user": user,
-        "required_reads": _required_reads(interaction, payload),
-        "replan_action_packet": replan_action_packet,
-        "boundary": _boundary(payload),
-        "execution_policy": _execution_policy(payload),
-        "writeback": writeback,
-        "scheduler": scheduler,
-        "contract_capsule": _contract_capsule(
-            payload,
-            action=action,
-            user=user,
-            scheduler=scheduler,
-        ),
-    }
-    task_orchestration = payload.get("task_orchestration_contract")
-    if isinstance(task_orchestration, Mapping):
-        projection["task_orchestration_contract"] = dict(task_orchestration)
-    response_plan = _response_plan(interaction)
-    if response_plan is not None:
-        projection["response_plan"] = response_plan
-    return projection
-
-
-def turn_envelope_action_signature_document(envelope: Mapping[str, Any]) -> dict[str, Any]:
-    fields = (
-        "agent_id",
-        "decision",
-        "should_run",
-        "effective_action",
-        "state",
-        "action",
-        "user",
-        "required_reads",
-        "replan_action_packet",
-        "boundary",
-        "execution_policy",
-        "writeback",
-        "scheduler",
-        "contract_capsule",
-        "task_orchestration_contract",
-    )
-    response_plan = envelope.get("response_plan")
-    coverage = (
-        ACTION_SIGNATURE_COVERAGE_V2
-        if isinstance(
-            _mapping(envelope.get("action")).get("action_portfolio"), Mapping
-        )
-        else ACTION_SIGNATURE_COVERAGE_V1
-        if isinstance(response_plan, Mapping)
-        else ACTION_SIGNATURE_COVERAGE_V0
-    )
-    signature = {
-        "schema_version": ACTION_SIGNATURE_SCHEMA_VERSION,
-        "coverage": coverage,
-        **{field: envelope.get(field) for field in fields},
-    }
-    if isinstance(response_plan, Mapping):
-        signature["response_plan"] = dict(response_plan)
-    return signature
 
 
 def quota_action_signature_document(payload: Mapping[str, Any]) -> dict[str, Any]:
-    return turn_envelope_action_signature_document(_action_projection(payload))
+    return _turn_envelope_result(
+        "quota_signature",
+        payload=dict(payload),
+    )
 
 
-def _cold_path(
-    payload: Mapping[str, Any],
-    agent_id: str | None,
-    scheduler_execution_context: (
+def quota_capability_automation_source(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Read checked capability gates before the native quota source is sealed."""
+    return _turn_envelope_result("capability_automation_source", payload=dict(payload))
+
+
+def _turn_settlement_identity(
+    operation: str, envelope: Mapping[str, Any], *, turn_instance_id: str | None,
+) -> dict[str, Any] | None:
+    identity = _turn_envelope_result(operation, envelope=dict(envelope), turn_instance_id=turn_instance_id).get("identity")
+    if identity is None:
+        return None
+    if not isinstance(identity, Mapping):
+        raise RuntimeError("TypeScript Turn settlement identity must be an object")
+    return dict(identity)
+
+
+def turn_envelope_replan_settlement_identity(
+    envelope: Mapping[str, Any], *, turn_instance_id: str | None,
+) -> dict[str, Any] | None:
+    return _turn_settlement_identity("replan_settlement_identity", envelope, turn_instance_id=turn_instance_id)
+
+
+def compose_turn_decision(
+    payload: Mapping[str, Any], *, scheduler_execution_context: (
         Mapping[str, Any] | SchedulerExecutionContextResolution | None
-    ),
+    ) = None,
+    composed_settlement: bool = False,
 ) -> dict[str, Any]:
-    goal_id = str(payload.get("goal_id") or "<goal-id>")
-    agent_arg = f" --agent-id {agent_id}" if agent_id else ""
+    """Transport complete source facts to the existing typed composition owner."""
     resolution = resolve_scheduler_execution_context(scheduler_execution_context)
-    scheduler_args = ""
-    if resolution.ok and resolution.context is not None:
-        scheduler_args = render_scheduler_execution_args(
-            scheduler_execution_context=resolution,
-        )
-    return {
-        "full_decision": (
-            f"loopx --format json quota should-run --goal-id {goal_id}"
-            f"{agent_arg}{scheduler_args}"
-            if scheduler_args
-            else "rerun the typed quota_guard from the current host packet"
-        ),
-        "todo_detail": f"loopx --format json todo list --goal-id {goal_id}",
-        "status_detail": f"loopx --format json status --goal-id {goal_id}",
-        "contains": [
-            "quota accounting detail",
-            "goal frontier and route diagnostics",
-            "full todo summaries",
-            "handoff and readiness diagnostics",
-            "promotion, archive, and projection warnings",
-            "scheduler runtime detail",
-        ],
-    }
+    args = render_scheduler_execution_args(scheduler_execution_context=resolution) if resolution.ok and resolution.context is not None else ""
+    source = dict(payload)
+    result = _turn_envelope_result("compose_complete", payload=source,
+        scheduler_execution_args=args, source_edits=True,
+        **({"composed_settlement": composed_settlement} if composed_settlement is not False else {}))
+    return _apply_context_projection_changes(source, result)
+
+
+def attach_complete_turn_context(
+    payload: Mapping[str, Any],
+    context_additions: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Seal validated turn-context fields onto an already-composed decision."""
+    source = dict(payload)
+    additions = dict(context_additions)
+    result = _turn_envelope_result(
+        "attach_complete_turn_context",
+        payload=source,
+        context_additions=additions,
+        source_edits=True,
+    )
+    return _apply_context_projection_changes({**source, **additions}, result)
+
+
+def is_legacy_saved_quota_decision(payload: Mapping[str, Any]) -> bool:
+    """Recognize saved raw/v0 carriers that predate complete-source checking."""
+    return (
+        "contract_binding" not in payload
+        and payload.get("schema_version", TURN_ENVELOPE_SCHEMA_VERSION) == TURN_ENVELOPE_SCHEMA_VERSION
+    )
+
+
+def assert_complete_turn_decision(payload: Mapping[str, Any]) -> None:
+    """Validate the original contract; keep its host binding and caller-owned bytes."""
+    _turn_envelope_result("complete_consumer", payload=dict(payload))
+
+
+def turn_envelope_scoped_settlement_identity(
+    envelope: Mapping[str, Any], *, turn_instance_id: str | None,
+) -> dict[str, Any] | None:
+    return _turn_settlement_identity("scoped_settlement_identity", envelope, turn_instance_id=turn_instance_id)
 
 
 def build_turn_envelope(
@@ -850,54 +391,127 @@ def build_turn_envelope(
     scheduler_execution_context: (
         Mapping[str, Any] | SchedulerExecutionContextResolution | None
     ) = None,
+    captured_decision_path: str | None = None,
 ) -> dict[str, Any]:
-    """Project a full quota decision into an additive, model-facing hot-path view."""
-
-    agent_identity = _mapping(payload.get("agent_identity"))
-    agent_id = str(agent_identity.get("agent_id") or "").strip() or None
-
-    envelope: dict[str, Any] = {
-        "ok": bool(payload.get("ok")),
-        "schema_version": TURN_ENVELOPE_SCHEMA_VERSION,
-        "mode": "should-run",
-        "view": "turn_envelope",
-        "goal_id": payload.get("goal_id"),
-        "agent_id": agent_id,
-        "reason": _text(payload.get("reason"), limit=360),
-        "action_required": bool(payload.get("action_required")),
-        "open_count": int(payload.get("open_count") or 0),
-        **_action_projection(payload),
-        "detail_ref": _cold_path(payload, agent_id, scheduler_execution_context),
-    }
-
-    source_signature = quota_action_signature_document(payload)
-    envelope_signature = turn_envelope_action_signature_document(envelope)
-    envelope["action_signature"] = {
-        "schema_version": ACTION_SIGNATURE_SCHEMA_VERSION,
-        "coverage": envelope_signature["coverage"],
-        "source_hash": _canonical_hash(source_signature),
-        "envelope_hash": _canonical_hash(envelope_signature),
-        "matches": source_signature == envelope_signature,
-        "source_decision_hash": _canonical_hash(dict(payload)),
-    }
-
-    source_bytes = len(json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":")))
-    envelope["compaction"] = {
-        "source_json_bytes": source_bytes,
-        "envelope_json_bytes": 0,
-        "byte_reduction_ratio": 0.0,
-        "budget_bytes": TURN_ENVELOPE_BUDGET_BYTES,
-        "within_budget": True,
-    }
-    for _ in range(3):
-        envelope_bytes = len(json.dumps(envelope, ensure_ascii=False, separators=(",", ":")))
-        envelope["compaction"].update(
-            {
-                "envelope_json_bytes": envelope_bytes,
-                "byte_reduction_ratio": (
-                    round(1 - envelope_bytes / source_bytes, 4) if source_bytes else 0.0
-                ),
-                "within_budget": envelope_bytes <= TURN_ENVELOPE_BUDGET_BYTES,
-            }
+    """Project one full quota decision through the canonical TS transaction."""
+    resolution = resolve_scheduler_execution_context(scheduler_execution_context)
+    scheduler_execution_args: object = ""
+    if resolution.ok and resolution.context is not None:
+        scheduler_execution_args = render_scheduler_execution_args(
+            scheduler_execution_context=resolution,
         )
-    return envelope
+    # A captured complete contract already records the original host binding.
+    # Only transport that value when no caller override was supplied; TS checks
+    # its integrity and rejects an explicit conflicting binding.
+    if scheduler_execution_context is None and payload.get("schema_version") == COMPLETE_TURN_DECISION_VERSION:
+        binding = payload.get("contract_binding")
+        scheduler_execution_args = binding.get("scheduler_execution_args") if isinstance(binding, Mapping) else None
+    return _turn_envelope_result(
+        "build",
+        payload=dict(payload),
+        scheduler_execution_args=scheduler_execution_args,
+        **({"captured_decision_path": captured_decision_path}
+           if captured_decision_path is not None else {}),
+    )
+
+
+def bind_turn_decision_capture(
+    payload: Mapping[str, Any], envelope: Mapping[str, Any] | None = None, *,
+    captured_decision_path: str, turn_instance_id: str, turn_key: str,
+    reader_argv: list[str] | None = None,
+    complete_host_request: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate and bind original native Turn evidence through the existing TS owner."""
+    return _turn_envelope_result(
+        "bind_capture", payload=dict(payload),
+        **({"complete_host_request": dict(complete_host_request)} if complete_host_request is not None
+           else {"envelope": dict(envelope or {})}),
+        captured_decision_path=captured_decision_path,
+        turn_instance_id=turn_instance_id, turn_key=turn_key,
+        **({"reader_argv": reader_argv} if reader_argv is not None else {}),
+    )
+
+
+def project_captured_replan_cli_view(
+    payload: dict[str, Any], *, captured_decision_path: str | None = None,
+) -> dict[str, Any]:
+    """Stage replan reads against the verified capture without rewriting its source."""
+    if not isinstance(payload.get("replan_read_path"), str):
+        return payload
+    result = _turn_envelope_result("replan_cli_view", payload=payload, source_edits=True,
+        **({"captured_decision_path": captured_decision_path} if captured_decision_path is not None else {}))
+    return _apply_context_projection_changes(payload, result)
+
+
+def prepare_context_delivery(
+    context: Mapping[str, Any], *, scope: Mapping[str, str], capture_id: str,
+    baseline: Mapping[str, Any] | None = None,
+    retained: Mapping[str, Any] | None = None,
+    continuity: Mapping[str, Any] | None = None,
+    surface: str = "work_context", native_projection: Mapping[str, Any] | None = None,
+    consumed_pointers: Mapping[str, str] | None = None, observe_first_read: bool = False,
+    include_initial_read_plan: bool = False,
+) -> dict[str, Any]:
+    """Prepare under the Host's explicit continuity basis, not a model assertion.
+
+    Quota and Turn hosts pass their complete immutable projection (or the shared
+    work_context) and its capture id. Surface binding prevents cross-projection reuse.
+    Unsupported hosts omit retention and keep complete delivery. A candidate is
+    not an ACK. Confirmed input and native delivery assumptions stay distinct.
+    """
+    source: dict[str, Any] = dict(context=dict(context), scope=dict(scope), capture_id=capture_id, surface=surface,
+        baseline=dict(baseline) if baseline is not None else None,
+        retained=dict(retained) if retained is not None else None,
+        continuity=dict(continuity) if continuity is not None else None)
+    if native_projection is not None:
+        source["native_projection"] = dict(native_projection)
+        if include_initial_read_plan:
+            source["include_initial_read_plan"] = True
+    if consumed_pointers is not None:
+        source["consumed_pointers"] = dict(consumed_pointers)
+        if consumed_pointers and observe_first_read:
+            source["observe_first_read"] = True
+    result = _turn_envelope_result("context_delivery", **source, source_edits=True)
+    transaction = _apply_context_projection_changes(source, result)
+    if native_projection is not None:
+        delivery = transaction["delivery"]
+        if delivery["mode"] == "full" and "context" not in delivery:
+            # Preserve the separately owned delivery body for callers.
+            delivery["context"] = deepcopy(transaction["context"])
+    return transaction
+
+
+def prepare_progressive_context(context: Mapping[str, Any], *, source_reference: Mapping[str, Any],
+                                surface: str = "quota_packet") -> dict[str, Any]:
+    """Stateless IO adapter to the same typed presentation owner; no Delta identity."""
+    source = dict(context=dict(context), native_projection=dict(source_reference), surface=surface)
+    return _apply_context_projection_changes(source,
+        _turn_envelope_result("progressive_context_delivery", **source, source_edits=True))
+
+
+def update_native_context_lifecycle(state: Mapping[str, Any], event: Mapping[str, Any], *,
+                                    new_epoch: str, pages: list[dict[str, Any]],
+                                    pages_verified: bool = False,
+                                    resume_verified: bool = False,
+                                    resume_sections: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Native IO adapter; the shared typed owner reduces continuity assumptions."""
+    source = dict(state)
+    result = _turn_envelope_result("native_context_lifecycle", state=source, source_edits=True,
+        event=dict(event), new_epoch=new_epoch, pages=pages, pages_verified=pages_verified,
+        resume_verified=resume_verified, **({"resume_sections": dict(resume_sections)} if resume_sections else {}))
+    try:
+        return _apply_context_projection_changes(source, result)
+    except RuntimeError as error:
+        # The native hook retires an invalid reduction under the journal lock.
+        raise ValueError("Invalid native context journal edits") from error
+
+
+def restore_context_delivery(
+    delivery: Mapping[str, Any], *, baseline: Mapping[str, Any] | None,
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate/reconstruct or return the same-capture full body without effects."""
+    source = dict(delivery=dict(delivery), baseline=dict(baseline) if baseline is not None else None,
+        current=dict(current))
+    result = _turn_envelope_result("context_recovery", **source, source_edits=True)
+    return _apply_context_projection_changes(source, result)

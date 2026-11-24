@@ -38,6 +38,16 @@ Keep examples public-safe. Do not copy raw benchmark tasks, raw trajectories,
 private logs, verifier output tails, credentials, internal URLs, or local
 machine paths.
 
+### Admission Of New Patterns
+
+A new `IP-` entry is not a contributor task on its own. Since 2026-09-26 the
+catalog accepts a new pattern only when the same change, or a linked merged
+change, names the consumer that reads it: a controller decision, dashboard or
+notification copy, a smoke that asserts the pattern's state contract, or an
+RFC section that cites the entry. Patterns that only restate an existing
+`IP-` under a new trigger are folded into the existing entry. See the
+[Contributor Task Board](../development/contributor-tasks.md#task-admission-rule).
+
 ## Catalog Maintenance And Validation Design
 
 The catalog is for reusable user / agent / state interaction shapes. Do not add
@@ -87,10 +97,10 @@ Map P0/P1 catalog rows to canary archetypes before picking commands:
 | Family | P0/P1 Pattern Coverage | Default Canary Archetypes | Trigger Surfaces | Minimum Useful Fixture | Failure Meaning |
 | --- | --- | --- | --- | --- | --- |
 | Work Routing | IP-001, IP-002, IP-003, IP-007, IP-008, IP-021, IP-029 | Hot-path route canary; Planning governance canary when cadence or repair is involved | `quota should-run`, `interaction_contract`, `work_lane_contract`, scheduler hint, handoff todo state | one eligible delivery fixture, one blocked/fallback fixture, one quiet or monitor fixture | agent turn routing is unsafe: it may spend, wait, notify, or choose fallback incorrectly |
-| Human Decision | IP-004, IP-014, IP-017, IP-027 | Scoped decision canary; Product/readiness canary when first-screen human copy changes | user todos, decision scope, operator-gate/reward preview, deferred resume candidates | one concrete user ask, one scoped non-blocking gate, one preview-or-append dry run | humans may be asked the wrong question, or an agent may continue without the needed decision |
-| State And Boundary | IP-005, IP-006, IP-011, IP-016, IP-019, IP-020, IP-022, IP-023, IP-025, IP-026, IP-028 | Projection and boundary canary; Hot-path route canary when the projection feeds quota/status | active state, todo metadata, task graph, authority source, claim lease, connector runtime policy, public/private scan | fixture state plus structured projection check; boundary scan for touched public files | compact state and executable truth diverge, so dashboards and agents may trust stale or unsafe authority |
+| Human Decision | IP-004, IP-014, IP-017, IP-027, IP-030, IP-033 | Scoped decision canary; Product/readiness canary when first-screen human copy changes | user todos, decision scope, operator-gate/reward preview, deferred resume candidates | one concrete user ask, one scoped non-blocking gate, one preview-or-append dry run | humans may be asked the wrong question, or an agent may continue without the needed decision |
+| State And Boundary | IP-005, IP-006, IP-011, IP-016, IP-019, IP-020, IP-022, IP-023, IP-025, IP-026, IP-028, IP-031, IP-032, IP-035, IP-036, IP-037, IP-038 | Projection and boundary canary; Hot-path route canary when the projection feeds quota/status | active state, todo metadata, task graph, authority source, claim lease, completed-work archive, install ownership, connector runtime policy, operation receipt, retired setting projection, public/private scan | fixture state plus structured projection check; boundary scan for touched public files | compact state and executable truth diverge, so dashboards and agents may trust stale or unsafe authority |
 | Evidence Lifecycle | IP-012, IP-015 | Evidence lifecycle canary; Product/readiness canary when evidence is rendered | external handle observation, benchmark lifecycle reducer, compact result projection | compact public-safe evidence fixture with raw-material exclusion assertions | progress evidence may be missing, double-counted, or represented with unsafe raw material |
-| Planning Governance | IP-010, IP-013, IP-018, IP-024 | Planning governance canary; Hot-path route canary when cadence changes affect execution | stalled run history, autonomous replan obligation, repair delta, cadence hint, plan-to-todo writeback | two-turn stalled fixture plus repair/writeback delta assertion | the agent may keep planning in prose while the machine-visible frontier stays unchanged |
+| Planning Governance | IP-010, IP-013, IP-018, IP-024, IP-034 | Planning governance canary; Hot-path route canary when cadence changes affect execution | stalled run history, autonomous replan obligation, repair delta, cadence hint, plan-to-todo writeback | two-turn stalled fixture plus repair/writeback delta assertion | the agent may keep planning in prose while the machine-visible frontier stays unchanged |
 
 P2 patterns may still have canaries, but they should be selected by an explicit
 domain profile instead of being pulled into every default profile. If a P2
@@ -320,6 +330,8 @@ Human asks, approvals, interventions, and reward-derived lessons.
 | P0 | IP-027 | Deferred Gate Resume | Status/quota plus controller | notify only when the resume gate is still user-held | keep deferred work visible after open lanes; when ready, require lifecycle replan instead of no-candidate wait |
 | P0 | IP-014 | Decision Write Preview And Append | User/operator | explicit preview/apply decision | append only exact run-bound reward or gate decision event |
 | P1 | IP-017 | User Reward Lesson Promotion | User plus LoopX | acknowledge only when lesson changes route/priority/boundary | promote correction into durable lesson, todo, or projection before continuing |
+| P1 | IP-030 | Machine Configuration Preview And Revision-Guarded Apply | User plus agent | require explicit approval of the exact plan revision | preview the exact change, then apply, remove, or roll back only the matching revision |
+| P1 | IP-033 | Recorded Rejection Is Not Absent Authority | User plus LoopX | no interruption; the refusal is already recorded | read the recorded outcome; do not re-ask a settled scope or infer approval from a missing rejection |
 | P2 | IP-009 | Active User Assistance | User simulator / operator | bounded intervention | inject audited user help without leaking reward/oracle signals |
 
 ### State And Boundary
@@ -339,6 +351,12 @@ Projection, authority, write scope, and lease integrity.
 | P1 | IP-023 | Status Neutral Run Window | Status/quota/history | no interruption | ignore neutral run noise for state authority while retaining it as stall evidence |
 | P1 | IP-025 | Experimental Diagnostic Sidecar Boundary | Runtime/protocol owners | no interruption unless an opt-in proof asks for user action | keep proof/debug verdicts as sidecar diagnostics until a product-general schema is validated |
 | P1 | IP-028 | Connector Runtime Boundary | Connector/runtime owners | notify only if the required owner decision is missing | enforce runtime allow/deny policy before browser or API connector reads can autoload raw material |
+| P1 | IP-031 | Manager Context Is Not Turn Authority | Manager connection owner | no interruption; retention is silent | retain group context only and act only on a provider-native mention, verified reply, or existing typed authority |
+| P1 | IP-032 | Completed Work Archive With Durable Decision Retention | Archive selector plus controller | no interruption; preview-then-execute readback | treat archived done work as history, keep durable decisions authoritative, and never move another role's lane |
+| P1 | IP-035 | Install Ownership Is Not An Update Permission | Install lifecycle owner plus user | no silent mutation; report the owning installer and its command | classify the install before mutating it; when LoopX does not own it, hand back the owner-owned command instead of switching install channels |
+| P1 | IP-036 | A Lost Response Is Not An Absent Commit | Effect dispatcher plus caller | no interruption unless recovery needs a user decision; report the receipt read back | name the write with a stable operation id, recover by readback instead of blind retry, and never leave a committed record pointing at material nobody published |
+| P1 | IP-037 | A Retired Setting Is Not An Absent Setting | Configuration reader plus migration owner | no interruption; keep the retired entry visible and read-only where it was once configurable | reject the retired activation before any write, carry its retired status and replacement in the projection, and treat clearing it as neither enable nor bootstrap of the replacement |
+| P1 | IP-038 | A Generic Fallback Is Not A Typed Diagnosis | Diagnostic publisher plus its reader | no interruption; the failure names the value or check that was refused | ask the typed channel before any fallback, frame the reason channel by the separator the publisher writes, and report an unrecovered reason as missing evidence rather than as the cause |
 
 ### Evidence Lifecycle
 
@@ -359,6 +377,7 @@ Replanning, dreaming, cadence, and future-work writeback.
 | P1 | IP-024 | Repair Delta Contract | Agent/controller | no interruption unless repair creates a user todo | self-repair/replan must change the machine-visible frontier or record a no-op/blocker |
 | P1 | IP-010 | Cadence Hint | Agent/controller | no interruption by default | surface a low-confidence hint when turns look too thin |
 | P1 | IP-018 | Plan To Todo Writeback | Agent plus LoopX | no interruption unless a user todo is created | write user-facing plans into todos, Next Action, or refresh-state |
+| P1 | IP-034 | Unstaffable Team Lane Is A Typed Gap | Steward/manager plus the work-items transaction | name the gap in the preview; no interruption for the admitted lanes | create only the lanes that can run; never invent a lane, an Agent, a capability, or an action kind |
 
 ## Visual Model
 
@@ -452,9 +471,12 @@ number is stable identity, not display priority.
 
 **Expected behavior**
 
-The agent chooses one bounded segment, performs the work, runs focused
-validation, writes durable state or history, and spends exactly once after the
-validated delivery.
+The control plane projects hard eligibility boundaries separately from bounded,
+non-exhaustive steering suggestions. The agent chooses one eligible bounded
+segment, even when it was not among the displayed suggestions, binds that choice
+through the current turn guard, performs the work, runs focused validation,
+writes durable state or history, and spends exactly once after the validated
+delivery.
 
 **Visual Model**
 
@@ -603,12 +625,92 @@ IP-003 scope metadata being ignored by the user-todo blocking summary.
 **Validation**
 
 - `regression/scoped-user-gate-fallback-contract.py`
-- `examples/protocol/protocol-action-packet-smoke.py`
+- `examples/protocol/quota-without-legacy-packet-smoke.py`
 - `examples/control_plane/work-lane-contract-smoke.py`
 - `examples/control_plane/quota-agent-scoped-user-gate-smoke.py` for `blocks_agent` scoped
   user gates that block only the target agent while preserving other-agent
   delivery.
 - `docs/archive/incidents/agent-scoped-user-gate-overreach-incident-20260624.md`
+
+#### IP-029 Handoff Todo Gate State
+
+**Trigger**
+
+- a todo carries `blocks_agent=<agent-id>` and represents review, handoff,
+  unblock, or owner work for that agent;
+- the todo status changes among open/blocked, done, deferred, or superseded;
+- the todo may name a follow-up via `unblocks_todo_id`,
+  `resume_when=todo_done:<todo_id>`, or `superseded_by`; and
+- `quota should-run --agent-id <agent-id>` needs to decide whether the agent
+  should wait, replan, or run a concrete successor.
+
+**Expected behavior**
+
+`blocks_agent` todos are not only backlog rows. They are inter-agent gate
+states. Status should project `agent_todos.handoff_gates[]` from the complete
+todo list, not only from open lanes, using `todo_handoff_gate_v0`.
+
+| gate_state | Todo condition | Quota effect |
+| --- | --- | --- |
+| `blocking` | non-terminal handoff todo for the scoped agent | return `agent_scope_wait`; name the owning reviewer/agent rather than waking the blocked agent for delivery |
+| `cleared_without_successor` | done handoff with no stable successor or supersede link | return `successor_replan_required`; reopen, supersede, or record no-follow-up rationale |
+| `cleared_with_successor` | done handoff linked to a successor via `unblocks_todo_id`, `resume_when`, or `superseded_by` | route to the concrete successor through normal todo selection |
+| `cleared_no_followup` | done handoff carries `no_followup=true` with a compact rationale | keep as terminal history; do not wake the blocked agent for successor replan |
+| `superseded` | handoff todo carries `superseded_by` | keep as history; do not wake the blocked agent from the stale gate |
+| `deferred` | handoff todo is parked behind an unsatisfied resume condition | keep diagnostic visibility; IP-027 owns the ready-deferred resume path |
+
+Quota ordering matters. Current-agent ordinary advancement still wins normal
+delivery. If no ordinary current-agent successor is ready, a current-agent
+`blocking` handoff wins over stale done handoffs. A
+`cleared_without_successor` handoff wins over generic IP-026 no-candidate wait
+because it means the handoff state changed but no replayable successor exists.
+Only after those checks may IP-026 classify `scope_exhausted` or
+`agent_scope_wait`.
+
+**Visual Model**
+
+```mermaid
+flowchart TD
+  T["blocks_agent todo"] --> S{"todo lifecycle"}
+  S -->|"open / blocked"| B["handoff gate: blocking"]
+  B --> W["agent_scope_wait for blocked agent"]
+  S -->|"done + successor"| C["handoff gate: cleared_with_successor"]
+  C --> N["run concrete successor normally"]
+  S -->|"done + no successor"| R["handoff gate: cleared_without_successor"]
+  R --> L["successor_replan_required"]
+  L --> F["reopen / supersede / no-follow-up rationale"]
+  S -->|"open + stale closeout"| X["route continuation replan required"]
+  X --> L
+  S -->|"superseded_by"| H["handoff gate: superseded"]
+  H --> I["historical only"]
+  S -->|"deferred"| D["handoff gate: deferred"]
+  D --> P["IP-027 resume rules"]
+```
+
+**Bad smell**
+
+A done review/handoff todo disappears because only open lanes feed quota, so
+the blocked agent falls into a vague `agent_scope_wait`. The opposite bad smell
+is also harmful: a stale done handoff outranks a live open review blocker, so
+the agent replans while a real reviewer-owned gate is still open. Both are
+state-machine bugs, not prompt wording bugs.
+
+A third bad smell is an open handoff gate whose action is already a stale
+handoff closeout. That gate is no longer a live reviewer decision. It should
+project `route_continuation_replan_required` so quota wakes successor replan to
+reopen, supersede, or close the stale route with a no-follow-up rationale.
+
+**Validation**
+
+- `loopx/control_plane/todos/handoff_gate.py` owns the
+  `todo_handoff_gate_v0` projection.
+- `examples/control_plane/quota-cleared-blocker-successor-gate-smoke.py` covers
+  `blocking`, `cleared_without_successor`, `cleared_with_successor`, and
+  `superseded` gate states.
+- `docs/quota-allocation.md`
+- `docs/status-data-contract.md`
+- `skills/loopx-self-repair/references/repair-patterns.md` records
+  `handoff_gate_state_projection_gap` for incident triage.
 
 #### IP-021 Per-Todo Capability Gate
 
@@ -714,8 +816,9 @@ flowchart TD
   M -->|"bridge"| P["repair_bridge"]
   M -->|"owner-held"| U["ask_owner with concrete capability ask"]
   M -->|"unsupported"| S["skip without spend"]
-  R --> A["agent steering audit chooses one runnable todo"]
-  A --> V["validate chosen work"]
+  R --> A["quota recommends one and exposes bounded alternatives"]
+  A --> B["agent steering audit binds one todo with same-turn quota"]
+  B --> V["validate chosen work"]
   V --> W["write back and spend-slot with same available capabilities"]
 ```
 
@@ -942,6 +1045,14 @@ still user-held or ambiguous, IP-004 / IP-003 owns the user-facing ask. If no
 ready deferred item exists, IP-026 may classify the scoped frontier as
 `scope_exhausted`, `agent_scope_wait`, or `reassignment_required`.
 
+An unrelated `user_action` is only a dual-channel notice in this state. It may
+set `user_channel.notify=NOTIFY` and `user_channel.non_blocking=true`, but the
+agent channel must remain `must_attempt=true`, `delivery_allowed=false`, and
+`quiet_noop_allowed=false`; the lifecycle CLI action and active scheduler
+cadence remain authoritative. Empty-open-backlog detection must count this
+selected control-plane obligation as agent work instead of promoting the
+notice into `notify,wait`.
+
 **Visual Model**
 
 ```mermaid
@@ -968,6 +1079,9 @@ step, so stale or future work outranks live open tasks.
 
 - `examples/control_plane/work-lane-contract-smoke.py` covers a ready deferred successor
   returning `successor_replan_required` instead of a quiet no-op.
+- `examples/control_plane/quota-resume-gated-open-todo-smoke.py` covers the
+  same required successor replan while an unrelated non-blocking user action
+  remains visible.
 - `examples/control_plane/todo-durability-fixture-smoke.py` covers parsing
   `resume_when=todo_done:<todo_id>` and projecting ready deferred candidates
   after open items.
@@ -976,86 +1090,6 @@ step, so stale or future work outranks live open tasks.
 - `docs/status-data-contract.md`
 - `skills/loopx-self-repair/references/repair-patterns.md` records
   `deferred_gate_resume_misclassified` for incident triage.
-
-#### IP-029 Handoff Todo Gate State
-
-**Trigger**
-
-- a todo carries `blocks_agent=<agent-id>` and represents review, handoff,
-  unblock, or owner work for that agent;
-- the todo status changes among open/blocked, done, deferred, or superseded;
-- the todo may name a follow-up via `unblocks_todo_id`,
-  `resume_when=todo_done:<todo_id>`, or `superseded_by`; and
-- `quota should-run --agent-id <agent-id>` needs to decide whether the agent
-  should wait, replan, or run a concrete successor.
-
-**Expected behavior**
-
-`blocks_agent` todos are not only backlog rows. They are inter-agent gate
-states. Status should project `agent_todos.handoff_gates[]` from the complete
-todo list, not only from open lanes, using `todo_handoff_gate_v0`.
-
-| gate_state | Todo condition | Quota effect |
-| --- | --- | --- |
-| `blocking` | non-terminal handoff todo for the scoped agent | return `agent_scope_wait`; name the owning reviewer/agent rather than waking the blocked agent for delivery |
-| `cleared_without_successor` | done handoff with no stable successor or supersede link | return `successor_replan_required`; reopen, supersede, or record no-follow-up rationale |
-| `cleared_with_successor` | done handoff linked to a successor via `unblocks_todo_id`, `resume_when`, or `superseded_by` | route to the concrete successor through normal todo selection |
-| `cleared_no_followup` | done handoff carries `no_followup=true` with a compact rationale | keep as terminal history; do not wake the blocked agent for successor replan |
-| `superseded` | handoff todo carries `superseded_by` | keep as history; do not wake the blocked agent from the stale gate |
-| `deferred` | handoff todo is parked behind an unsatisfied resume condition | keep diagnostic visibility; IP-027 owns the ready-deferred resume path |
-
-Quota ordering matters. Current-agent ordinary advancement still wins normal
-delivery. If no ordinary current-agent successor is ready, a current-agent
-`blocking` handoff wins over stale done handoffs. A
-`cleared_without_successor` handoff wins over generic IP-026 no-candidate wait
-because it means the handoff state changed but no replayable successor exists.
-Only after those checks may IP-026 classify `scope_exhausted` or
-`agent_scope_wait`.
-
-**Visual Model**
-
-```mermaid
-flowchart TD
-  T["blocks_agent todo"] --> S{"todo lifecycle"}
-  S -->|"open / blocked"| B["handoff gate: blocking"]
-  B --> W["agent_scope_wait for blocked agent"]
-  S -->|"done + successor"| C["handoff gate: cleared_with_successor"]
-  C --> N["run concrete successor normally"]
-  S -->|"done + no successor"| R["handoff gate: cleared_without_successor"]
-  R --> L["successor_replan_required"]
-  L --> F["reopen / supersede / no-follow-up rationale"]
-  S -->|"open + stale closeout"| X["route continuation replan required"]
-  X --> L
-  S -->|"superseded_by"| H["handoff gate: superseded"]
-  H --> I["historical only"]
-  S -->|"deferred"| D["handoff gate: deferred"]
-  D --> P["IP-027 resume rules"]
-```
-
-**Bad smell**
-
-A done review/handoff todo disappears because only open lanes feed quota, so
-the blocked agent falls into a vague `agent_scope_wait`. The opposite bad smell
-is also harmful: a stale done handoff outranks a live open review blocker, so
-the agent replans while a real reviewer-owned gate is still open. Both are
-state-machine bugs, not prompt wording bugs.
-
-A third bad smell is an open handoff gate whose action is already a stale
-handoff closeout. That gate is no longer a live reviewer decision. It should
-project `route_continuation_replan_required` so quota wakes successor replan to
-reopen, supersede, or close the stale route with a no-follow-up rationale.
-
-**Validation**
-
-- `loopx/control_plane/todos/handoff_gate.py` owns the
-  `todo_handoff_gate_v0` projection.
-- `examples/control_plane/quota-cleared-blocker-successor-gate-smoke.py` covers
-  `blocking`, `cleared_without_successor`, `cleared_with_successor`, and
-  `superseded` gate states.
-- `docs/quota-allocation.md`
-- `docs/status-data-contract.md`
-- `skills/loopx-self-repair/references/repair-patterns.md` records
-  `handoff_gate_state_projection_gap` for incident triage.
 
 #### IP-014 Decision Write Preview And Append
 
@@ -1172,6 +1206,103 @@ main blocker or keeps following a stale local-only benchmark staging todo.
   explicit operating lessons are projected into `recommended_action`,
   active `Agent Todo`, or a state-projection repair warning.
 
+#### IP-030 Machine Configuration Preview And Revision-Guarded Apply
+
+**Trigger**
+
+- a typed machine-configuration namespace is about to change; the built-in
+  namespaces are `change_quality_qualification`, `codex_chat`, `context_delivery`,
+  `explore_harness`, `goal_closeout`, `goal_storage`, `manager_runtime`,
+  `periodic_report`, `pull_request_review`, `steward_executor`, `steward_memory`,
+  and `todo_replan_cadence`. The public catalog returned by
+  `loopx machine-config describe` is authoritative, so this inventory has to stay
+  complete rather than approximate;
+- `goal_closeout` configures an optional command for terminal Goal transitions.
+  The local operator sets the command through the machine-config CLI. The
+  Dashboard shows whether a command is configured and can adjust its timeout.
+- `goal_storage` carries the storage target a newly created Goal is fixed to
+  (`new_goal_provider`, canonical `sqlite` with hard leases by default; explicit
+  `file` and soft-claim creation choices remain available).
+  It does not promote existing Goals or migrate their data, and existing Goals
+  keep the selection they were created with; see
+  `docs/reference/local-authority-provider-selection.md`;
+- `codex_chat` carries the native Codex profile alias, model, reasoning effort,
+  and service tier for new ordinary Goal conversations. Existing conversations
+  keep their identity and history. It does not configure the steward, an
+  attached Agent, or a LoopX Agent Loop, and it grants no permissions and
+  stores no credentials; see
+  `docs/integrations/session-runtime-control-plane-adapter.md#projection-boundary`;
+- `context_delivery` controls differential native Codex context (`off` by default).
+  A saved preference neither proves host readiness nor actual delta use; known
+  context loss keeps full context and unsupported declarations refuse. It grants
+  no execution authority; see `docs/reference/required-work-context.md#machine-default`;
+- `explore_harness` sets the default exploration mode (`off` by default) for new
+  and existing Goals; explicit Goal modes take precedence. Planning supplies
+  evidence and read-only guidance, while execution authority stays separate;
+  see `loopx/capabilities/explore/README.md#machine-default`;
+- `pull_request_review` carries `review_order` (`forward` by default, or
+  `reverse`) and Goal-owned `agent_orders` for registered Agent overrides.
+  Commands resolve explicit direction, Agent, Goal, then machine; reverse inverts
+  the full actionable queue, including time order. Legacy priorities map to
+  forward/reverse; configuration grants no review, Todo or merge authority;
+- `steward_executor` carries the executor, model, and reasoning effort the steward
+  channel answers on for one machine. It stores no credential and grants no
+  authority, and it precedes the Chat service environment rather than replacing
+  it, so a machine-local decision is editable in the Dashboard and readable from
+  `loopx machine-config inspect`;
+- `steward_memory` carries the default-off isolated OpenViking memory setting
+  (`enabled`, `user_space`, `auto_recall`, and `recall_timeout_seconds` from `1`
+  to `15`) for verified owner private Steward conversations. It stores no
+  credentials (`OPENVIKING_*` stays in the Chat host environment and is scrubbed
+  from worker environments) and never leaks into group chats, project
+  conversations, or worker Agents;
+- `loopx machine-config preview` returns a `plan_revision` for the exact
+  envelope, namespace patch, removal, or rollback that would be applied;
+- a Goal-level override and a live machine default may both be in scope.
+
+**Expected behavior**
+
+The control plane separates the preview from the effect. `preview` computes the
+exact resulting configuration and returns a `plan_revision` derived from that
+plan identity. `apply`, `remove`, and `rollback` re-derive the plan and refuse to
+write unless `--expected-plan-revision` still matches, so an owner decision is
+bound to the exact revision that was shown. A namespace-scoped patch preserves
+every sibling namespace; a whole-envelope write must name them explicitly. A
+Goal override wins over the machine default, and clearing the override restores
+the live machine default rather than a stale snapshot. Unknown namespaces,
+unknown envelope fields, and private fields inside a public update fail closed
+before any effect.
+
+**Visual Model**
+
+```mermaid
+sequenceDiagram
+  participant U as User or operator
+  participant A as Agent
+  participant M as machine-config store
+  A->>M: preview exact change
+  M-->>A: plan_revision for the resulting plan
+  A->>U: show exact change and revision
+  U-->>A: approve that revision
+  A->>M: apply --expected-plan-revision --execute
+  M-->>A: applied, or rejected when the plan no longer matches
+```
+
+**Bad smell**
+
+The agent applies a revision the owner never saw, or reuses a `plan_revision`
+after another writer changed the plan, so the applied configuration no longer
+matches what was previewed. A namespace patch is written as a whole envelope and
+silently drops sibling namespaces, or a machine default replaces an explicit
+Goal override instead of the override winning.
+
+**Validation**
+
+- `tests/capabilities/test_machine_configuration_contract.py`
+- `tests/capabilities/test_machine_configuration_goal_defaults.py`
+- `loopx machine-config preview` and `loopx machine-config apply --help` for the
+  exact `--expected-plan-revision` and `--execute` contract
+
 #### IP-009 Active User Assistance
 
 **Trigger**
@@ -1207,9 +1338,92 @@ reward signals, oracle information, or unbounded human hints.
 
 **Validation**
 
-- `examples/worker-bridge-active-user-after-start-observation-smoke.py`
-- `examples/worker-bridge-install-contract-smoke.py`
+- [`examples/worker-bridge-active-user-after-start-observation-smoke.py`](https://github.com/loopx-project/loopx/blob/0cd999ca0dd6290c9b48b84bc23c5f6b40630516/examples/worker-bridge-active-user-after-start-observation-smoke.py)
+- [`examples/worker-bridge-install-contract-smoke.py`](https://github.com/loopx-project/loopx/blob/0cd999ca0dd6290c9b48b84bc23c5f6b40630516/examples/worker-bridge-install-contract-smoke.py)
 - benchmark active-user protocol docs.
+
+The linked scripts are historical versions. They were removed from the current
+checkout in [#3267](https://github.com/loopx-project/loopx/pull/3267). Current
+checks include `examples/worker-bridge-active-user-feed-smoke.py` and
+`examples/cli-worker-bridge-command-modularization-smoke.py`.
+
+#### IP-033 Recorded Rejection Is Not Absent Authority
+
+**Trigger**
+
+- a user gate carries a typed `decision_scope` together with an explicit
+  `decision_outcome` of `reject` or `cancel`;
+- the gate is broad (`granularity` of `goal`, `project`, or `global`) and is
+  either `global_gate=true` or `blocks_agent`-scoped, so the same record would
+  qualify as standing authority if its outcome were `approve`; and
+- a later turn, projection, archive pass, or operator surface has to answer
+  "has this scope already been decided?".
+
+**Expected behavior**
+
+A recorded rejection is a decision, not the absence of one. Three rules keep
+the two apart.
+
+1. **Record it.** The todo stays a standing decision receipt
+   (`standing_decision_receipt_v0`) whose scope, owner, and chronology are
+   preserved exactly like an approval's. Archive retains it for the same reason
+   it retains an approval, and `retained_standing_decision_count` counts it.
+2. **Do not activate it.** Activation is `decision_outcome === "approve"` and
+   nothing else. `reject` and `cancel` raise `inactive_count` and never
+   `active_count`. "No active approval" must not be rendered as "no decision was
+   made", and a mixed or undated chronology must resolve to a recorded conflict
+   rather than silently choosing approval.
+3. **Read the outcome; do not infer it.** A consumer that needs to know whether
+   a scope was settled reads the recorded receipt. It may not treat a missing
+   rejection as an approval, and it may not treat a retained, done, global todo
+   as authority when the recorded outcome says otherwise.
+
+IP-014 owns how a decision is written and previewed, and IP-032 owns what
+happens to a durable decision when its todo leaves the active window. Neither
+owns the meaning of an explicitly refused decision, which is the gap this
+pattern fills.
+
+**Visual Model**
+
+```mermaid
+flowchart TD
+  A["user gate with typed decision_scope<br/>and explicit decision_outcome"] --> B{"outcome"}
+  B -->|"approve"| C["standing receipt, active=true<br/>active_count += 1"]
+  B -->|"reject / cancel"| D["standing receipt, active=false<br/>inactive_count += 1"]
+  B -->|"missing or mixed chronology"| E["conflict, no silent approval"]
+  C --> F["later turns read settled approval"]
+  D --> G["later turns read settled refusal<br/>do not re-ask as undecided"]
+  E --> H["standing_decision_order_unresolved"]
+```
+
+**Bad smell**
+
+An operator refuses a broad write scope. The surface only renders active
+authority, so the refusal disappears from view and two turns later the agent
+re-proposes the same write scope as though it had never been considered. The
+operator experience is "I already said no" followed by "why is this being asked
+again".
+
+The mirror-image smell is over-reading a retained record: because the todo is
+done, global, and retained by archive, a consumer treats the refusal as the
+approval it structurally resembles. A third smell is a fixture or projection
+that only ever generates approvals, so no test can tell a refused scope from an
+unasked one.
+
+**Validation**
+
+- `tests/control_plane_ts/production_scale_rejected_decision.test.ts` owns the
+  mutation and negative cases: a rejection is a receipt, only an explicit
+  approval activates a scope, and dropping the typed scope leaves no entry.
+  It arrives with the GH-C102 fixture slice (#4540).
+- `tests/control_plane_ts/authority_store_conformance.ts` asserts
+  `inactive_count` and per-entry `active` on every provider conformance arm.
+- `tests/fixtures/control_plane/coordination_production_scale_v0.json` and
+  `tests/control_plane_ts/production_scale_coordination_fixture.ts` carry the
+  shared rejection band.
+- `loopx/control_plane/todos/standing_decision.ts` owns the predicate and the
+  projection.
+- `examples/interaction-pattern-catalog-smoke.py` protects this entry.
 
 ### State And Boundary
 
@@ -1257,7 +1471,7 @@ todo and the automation drifts into monitor-only no-ops.
 **Validation**
 
 - `examples/state-projection-gap-smoke.py`
-- `examples/project/onboarding-no-scan-projection-smoke.py`
+- `examples/project/first-connect-contract-smoke.py`
 - `docs/project-agent-todo-contract.md`
 
 #### IP-006 Checkpointed Scope Mismatch
@@ -1317,6 +1531,116 @@ the checkpointed decision.
 - `examples/control_plane/quota-action-scope-guard-smoke.py`;
 - `examples/project/configure-goal-smoke.py`;
 - `docs/state-interaction-model.md` checkpointed decision sections.
+
+#### IP-026 Agent-Scoped No-Candidate Gap
+
+**Trigger**
+
+- `quota should-run --agent-id <agent>` returns `should_run=true` or
+  `interaction_contract.agent_channel.must_attempt=true`;
+- the same payload has no `agent_lane_next_action`;
+- `current_agent_claimed_advancement_items` is empty;
+- no runnable candidate is projected for that agent;
+- no current-agent or unclaimed deferred resume candidate is ready; and
+- the recommended action points at another agent's lane, an out-of-scope lane,
+  or a goal-level route the current agent cannot safely advance.
+
+**Expected behavior**
+
+Agent-scoped quota must distinguish "the goal has runnable work" from "this
+agent has runnable work." When the current agent has no in-scope candidate,
+quota should not force a delivery turn. This pattern applies only after the
+guard has also checked IP-027 and found no ready current-agent or unclaimed
+deferred resume candidate, and after IP-029 has found no current-agent handoff
+gate state that should wait or replan. If a deferred resume candidate is ready,
+IP-027 owns the `successor_replan_required` path; if a handoff review todo has
+changed state, IP-029 owns the handoff wait or successor-replan path. IP-026
+must not swallow either case as "nothing runnable."
+
+When the scoped frontier is truly empty, quota should project one of these
+machine states:
+
+- `scope_exhausted`: no current-agent or unclaimed candidate matches the
+  registered agent profile and boundary;
+- `agent_scope_wait`: an explicit blocking review/handoff dependency is owned
+  by another peer and must clear before the current peer can continue;
+- `reassignment_required`: useful work exists, but ownership must be changed
+  before this agent may treat it as its lane.
+
+The interaction contract should then set:
+
+```text
+agent_channel.must_attempt=false
+agent_channel.delivery_allowed=false
+agent_channel.quiet_noop_allowed=true
+```
+
+The user channel remains quiet unless a concrete user todo exists. The
+recommended action should name the scoped condition, not borrow the global
+goal-level route. A peer should be allowed to no-op without spend, or
+claim a newly exposed in-scope todo before delivery becomes allowed again.
+
+This pattern is the runtime counterpart of IP-022. IP-022 makes claimed,
+deferred, handoff, and agent-lane work visible; IP-026 says what to do when the
+scoped open frontier is empty, IP-027 has not found a ready deferred gate
+resume, and IP-029 has not found a handoff todo gate state for the scoped
+agent.
+If the only apparent blocker is a user todo with `blocks_agent` pointing at a
+different agent, IP-003 owns the case before IP-026: filter that other-agent
+gate out of the current agent's blocking user summary, then decide whether the
+current agent still has runnable work. If it does, delivery may continue; if it
+does not, IP-026 can classify the remaining empty frontier.
+
+**Visual Model**
+
+```mermaid
+flowchart TD
+  Q["quota should-run --agent-id side"] --> F{"current-agent frontier?"}
+  F -->|"current-agent candidate"| D["bounded delivery allowed"]
+  F -->|"unclaimed in-scope candidate"| C["agent may claim before delivery"]
+  F -->|"no open candidate"| R{"IP-027 ready deferred resume?"}
+  R -->|"yes"| P["defer to IP-027"]
+  R -->|"no"| G{"IP-029 handoff gate state?"}
+  G -->|"blocking or cleared_without_successor"| K["defer to IP-029"]
+  G -->|"none"| X["scope_exhausted / agent_scope_wait"]
+  F -->|"only other-agent or out-of-scope work"| X
+  X --> N["quiet no-op, no spend"]
+  X --> H["owning agent may advance, merge, or reassign"]
+  H --> Q
+```
+
+**Bad smell**
+
+A peer heartbeat receives `should_run=true`,
+`delivery_allowed=true`, and `quiet_noop_allowed=false` even though
+`agent_lane_next_action=None`, `current_agent_claimed_advancement_items=[]`,
+and the only recommendation is another agent's benchmark or runtime lane. The
+agent either churns through repeated empty heartbeats or risks working outside
+its registered scope. A related failure is treating a ready deferred successor
+as part of this no-candidate pattern instead of routing it through IP-027's
+gate-resume lifecycle, or treating a handoff todo lifecycle change as generic
+agent wait instead of routing it through IP-029. The opposite bad smell is also
+harmful: deferred or handoff items are mixed into the open todo list, so stale
+or future work outranks live open tasks.
+
+**Validation**
+
+- future quota/status regression with two registered peers where all runnable
+  work is claimed by the other peer and the current `--agent-id` call returns
+  `reassignment_required` unless an explicit blocking review dependency exists;
+- `examples/control_plane/work-lane-contract-smoke.py` should cover that an empty
+  current-agent frontier cannot produce `delivery_allowed=true`;
+- `docs/project-agent-todo-contract.md`
+- `docs/quota-allocation.md`
+- `docs/status-data-contract.md`
+- `examples/control_plane/quota-agent-scoped-user-gate-smoke.py` for the nearby case where
+  a user gate is real but scoped to a different agent and therefore must not
+  create current-agent scope exhaustion.
+- `examples/control_plane/quota-cleared-blocker-successor-gate-smoke.py` for the nearby
+  case where a `blocks_agent` handoff todo directly controls the scoped gate.
+- `skills/loopx-self-repair/references/repair-patterns.md` records
+  `agent_scoped_no_candidate_gap` and `handoff_gate_state_projection_gap` for
+  incident triage.
 
 #### IP-011 Authority Material Intake
 
@@ -1487,6 +1811,14 @@ running from a non-git, unrelated, or non-isolated checkout. In that state
 `interaction_contract.mode=agent_workspace_repair`: the only allowed action is
 to move to a compliant worktree/branch and rerun the guard before editing.
 Workspace repair is preflight and does not spend quota.
+
+Accountable settlement uses the same typed boundary without assuming that all
+delivery is a repository write. Git-backed delivery records a canonical
+`git_repository` workspace identity. A registered single-agent, non-Git goal
+may instead record a path-free `local_goal` identity (`loopx:<goal-id>`) while
+running inside its registered project root. That identity is sufficient for
+causal quota settlement, but is never accepted as a substitute for the
+independent Git worktree required by a repository-writing peer.
 
 The same scoped identity must be carried through the whole successful turn.
 If `quota should-run` was evaluated with `--agent-id <peer-agent-id>`, follow-up
@@ -1718,7 +2050,8 @@ flowchart TD
   T --> B["claimed lane claimant-balanced truncation"]
   B --> V["visibility lanes: claimed, unclaimed, monitor"]
   S --> Q["quota/capability guard chooses runnable candidate set"]
-  Q --> A["agent steering audit chooses actual todo"]
+  Q --> A["recommendation plus non-exhaustive suggestions"]
+  A --> B["agent may bind any currently eligible todo"]
   Q --> N["agent_lane_next_action for --agent-id scoped turns"]
   V --> F["dashboard/frontstage/review packet shows ownership"]
   V --> C{"agent identity present?"}
@@ -1756,116 +2089,6 @@ monitor through status/quota/todo projection.
   agent-lane pointer without replacing the project route.
 - PR #262 / commit `292a2c8`: additive status/quota visibility lanes with a
   16-item agent-facing cap.
-
-#### IP-026 Agent-Scoped No-Candidate Gap
-
-**Trigger**
-
-- `quota should-run --agent-id <agent>` returns `should_run=true` or
-  `interaction_contract.agent_channel.must_attempt=true`;
-- the same payload has no `agent_lane_next_action`;
-- `current_agent_claimed_advancement_items` is empty;
-- no runnable candidate is projected for that agent;
-- no current-agent or unclaimed deferred resume candidate is ready; and
-- the recommended action points at another agent's lane, an out-of-scope lane,
-  or a goal-level route the current agent cannot safely advance.
-
-**Expected behavior**
-
-Agent-scoped quota must distinguish "the goal has runnable work" from "this
-agent has runnable work." When the current agent has no in-scope candidate,
-quota should not force a delivery turn. This pattern applies only after the
-guard has also checked IP-027 and found no ready current-agent or unclaimed
-deferred resume candidate, and after IP-029 has found no current-agent handoff
-gate state that should wait or replan. If a deferred resume candidate is ready,
-IP-027 owns the `successor_replan_required` path; if a handoff review todo has
-changed state, IP-029 owns the handoff wait or successor-replan path. IP-026
-must not swallow either case as "nothing runnable."
-
-When the scoped frontier is truly empty, quota should project one of these
-machine states:
-
-- `scope_exhausted`: no current-agent or unclaimed candidate matches the
-  registered agent profile and boundary;
-- `agent_scope_wait`: an explicit blocking review/handoff dependency is owned
-  by another peer and must clear before the current peer can continue;
-- `reassignment_required`: useful work exists, but ownership must be changed
-  before this agent may treat it as its lane.
-
-The interaction contract should then set:
-
-```text
-agent_channel.must_attempt=false
-agent_channel.delivery_allowed=false
-agent_channel.quiet_noop_allowed=true
-```
-
-The user channel remains quiet unless a concrete user todo exists. The
-recommended action should name the scoped condition, not borrow the global
-goal-level route. A peer should be allowed to no-op without spend, or
-claim a newly exposed in-scope todo before delivery becomes allowed again.
-
-This pattern is the runtime counterpart of IP-022. IP-022 makes claimed,
-deferred, handoff, and agent-lane work visible; IP-026 says what to do when the
-scoped open frontier is empty, IP-027 has not found a ready deferred gate
-resume, and IP-029 has not found a handoff todo gate state for the scoped
-agent.
-If the only apparent blocker is a user todo with `blocks_agent` pointing at a
-different agent, IP-003 owns the case before IP-026: filter that other-agent
-gate out of the current agent's blocking user summary, then decide whether the
-current agent still has runnable work. If it does, delivery may continue; if it
-does not, IP-026 can classify the remaining empty frontier.
-
-**Visual Model**
-
-```mermaid
-flowchart TD
-  Q["quota should-run --agent-id side"] --> F{"current-agent frontier?"}
-  F -->|"current-agent candidate"| D["bounded delivery allowed"]
-  F -->|"unclaimed in-scope candidate"| C["agent may claim before delivery"]
-  F -->|"no open candidate"| R{"IP-027 ready deferred resume?"}
-  R -->|"yes"| P["defer to IP-027"]
-  R -->|"no"| G{"IP-029 handoff gate state?"}
-  G -->|"blocking or cleared_without_successor"| K["defer to IP-029"]
-  G -->|"none"| X["scope_exhausted / agent_scope_wait"]
-  F -->|"only other-agent or out-of-scope work"| X
-  X --> N["quiet no-op, no spend"]
-  X --> H["owning agent may advance, merge, or reassign"]
-  H --> Q
-```
-
-**Bad smell**
-
-A peer heartbeat receives `should_run=true`,
-`delivery_allowed=true`, and `quiet_noop_allowed=false` even though
-`agent_lane_next_action=None`, `current_agent_claimed_advancement_items=[]`,
-and the only recommendation is another agent's benchmark or runtime lane. The
-agent either churns through repeated empty heartbeats or risks working outside
-its registered scope. A related failure is treating a ready deferred successor
-as part of this no-candidate pattern instead of routing it through IP-027's
-gate-resume lifecycle, or treating a handoff todo lifecycle change as generic
-agent wait instead of routing it through IP-029. The opposite bad smell is also
-harmful: deferred or handoff items are mixed into the open todo list, so stale
-or future work outranks live open tasks.
-
-**Validation**
-
-- future quota/status regression with two registered peers where all runnable
-  work is claimed by the other peer and the current `--agent-id` call returns
-  `reassignment_required` unless an explicit blocking review dependency exists;
-- `examples/control_plane/work-lane-contract-smoke.py` should cover that an empty
-  current-agent frontier cannot produce `delivery_allowed=true`;
-- `docs/project-agent-todo-contract.md`
-- `docs/quota-allocation.md`
-- `docs/status-data-contract.md`
-- `examples/control_plane/quota-agent-scoped-user-gate-smoke.py` for the nearby case where
-  a user gate is real but scoped to a different agent and therefore must not
-  create current-agent scope exhaustion.
-- `examples/control_plane/quota-cleared-blocker-successor-gate-smoke.py` for the nearby
-  case where a `blocks_agent` handoff todo directly controls the scoped gate.
-- `skills/loopx-self-repair/references/repair-patterns.md` records
-  `agent_scoped_no_candidate_gap` and `handoff_gate_state_projection_gap` for
-  incident triage.
 
 #### IP-023 Status Neutral Run Window
 
@@ -1994,9 +2217,7 @@ the stable schema.
 **Validation**
 
 - `docs/reference/protocols/protocol-action-packet-decision-v0.md`
-- `docs/product/runtimes/codex-cli/codex-cli-same-open-tui-continuation-observation.md`
 - `examples/interaction-pattern-catalog-smoke.py`
-- `examples/codex-cli-visible-attach-acceptance-smoke.py`
 
 #### IP-028 Connector Runtime Boundary
 
@@ -2037,6 +2258,21 @@ connector_runtime_policy = {
 }
 ```
 
+**Visual Model**
+
+```mermaid
+flowchart TD
+  A["Connector todo or packet proposes a live run"] --> B{"Runtime policy present?"}
+  B -->|"no"| C["fail closed: require the policy before the first run"]
+  B -->|"yes"| D{"access_mode"}
+  D -->|"private_metadata_only"| E["gate projection only, browser open stays closed"]
+  D -->|"public_metadata_only"| F["bounded metadata probe: head-only, forbidden prefixes blocked"]
+  D -->|"synthetic_fixture_only"| G["fixture only, no live route"]
+  E --> H["Owner decision unblocks the next stage"]
+  F --> H
+  G --> H
+```
+
 **Bad smell**
 
 An agent opens a private connector's default web route because the page looks
@@ -2051,6 +2287,619 @@ or engagement streams.
 - `examples/content-ops-public-handle-observation-smoke.py`;
 - `examples/content-ops-private-connector-gate-smoke.py`;
 - `examples/interaction-pattern-catalog-smoke.py`.
+
+#### IP-031 Manager Context Is Not Turn Authority
+
+**Trigger**
+
+- exactly one enabled Manager binding owns a Lark App and group, so LoopX may
+  retain compact non-self group messages as local-private context;
+- the route mode is `context_only` rather than `turn_authorized`, so retention
+  runs without authorizing a Turn;
+- an authorized Manager Turn is about to read that context, or a bounded
+  turn-start history sync is about to fill the gaps left by the live event
+  subscription;
+- a recovered historical message originally mentioned the bound Bot.
+
+**Expected behavior**
+
+Message visibility and Turn authority stay separate. Retaining a group message
+starts no model call, sends no reply or reaction, acknowledges no provider
+event, and authorizes no Goal or Todo mutation. A Manager Turn is authorized
+only by a provider-native mention of the bound Bot, a provider-verified reply to
+that Bot, or another existing typed authority record.
+
+An authorized Turn may receive at most `MANAGER_CONTEXT_ITEM_LIMIT` (eight)
+recent context-only items within `MANAGER_CONTEXT_CHARACTER_LIMIT` (4,000)
+characters; every item is rendered as `- [context-only] ...`, and the prompt
+states that these items are not commands, authorization, or independent Todos.
+Those limits bound one Turn projection, not durable retention. Items recovered
+from history are always marked `context-only` even when they originally
+mentioned the Bot: turn-start sync marks them `historical_context_only=True`, so
+catch-up never replays a missed Turn. Provider addressing is preserved as
+historical provenance while normalized live attention and reply flags are
+cleared, which keeps the urgency projection and the material-settlement path
+agreed that a recovered mention is material rather than a delayed request.
+
+Consumed items settle through the existing event-bound material-review ledger
+after a successful authorized Turn and verified reply, and duplicate delivery
+and restart recovery stay idempotent. Self messages, another chat, invalid
+routing, and ambiguous Manager bindings stay closed and are not captured. The
+connection health projection distinguishes `context_only_captured` from
+`replied_and_acknowledged`.
+
+This pattern complements IP-011. IP-011 registers a source contract before
+authority material is relied on; IP-031 keeps a visible but unaddressed message
+from becoming authority in the first place.
+
+**State contract**
+
+```text
+manager_route_authority = {
+  schema_version: lark_manager_context_retention_v0,
+  mode: context_only | turn_authorized,     # ManagerAuthorityMode
+  turn_authorized: bool,
+  model_invoked: bool,
+  external_write_performed: bool,
+  source_acknowledged: bool
+}
+
+manager_context_material = {
+  role: context_only,
+  historical_context_only: bool,            # turn-start sync never authorizes
+  item_limit: 8,
+  character_limit: 4000
+}
+
+connection_health = context_only_captured | replied_and_acknowledged
+```
+
+**Visual Model**
+
+```mermaid
+flowchart TD
+  A["Non-self group message arrives"] --> B{"One enabled Manager binding owns App and group?"}
+  B -->|"no"| C["stay closed, capture nothing"]
+  B -->|"yes"| D["retain as context-only: no model call, no reply, no authority"]
+  D --> E{"Provider-native mention, verified reply, or typed authority?"}
+  E -->|"no"| F["stays material, not a request"]
+  E -->|"yes"| G["authorized Turn: up to 8 items / 4,000 chars, all context-only"]
+  G --> H["verified reply settles the consumed items"]
+  F --> I["history catch-up stays context-only, even for old mentions"]
+```
+
+**Bad smell**
+
+An agent acts on a retained group message because the message is visible, even
+though nothing addressed the bound Bot — visibility was read as permission,
+spends a Turn, and may mutate Goal or Todo state that nobody authorized. Another
+bad smell is a history catch-up replaying an old mention as a delayed Turn
+because the recovered item looked like a request, or an adapter inventing a
+second authority source by treating the inbox or the material ledger as its own
+request database.
+
+**Validation**
+
+- `docs/reference/protocols/lark-manager-context-authority-v0.md`;
+- `tests/extensions/test_lark_turn_start_sync.py`;
+- `tests/extensions/test_lark_goal_topic_runtime.py`;
+- `tests/extensions/test_lark_goal_topic_connections.py`.
+
+#### IP-032 Completed Work Archive With Durable Decision Retention
+
+**Trigger**
+
+- a role-scoped todo lane holds more done todos than the active window allows,
+  so `loopx todo archive-completed --max-active-done <n>` has something to move;
+- a done todo carries a durable decision receipt, so later turns still depend on
+  it even though the todo itself is finished; and
+- the caller picks a lane with `--role user` or `--role agent`, and omits
+  `--execute` for a preview.
+
+**Expected behavior**
+
+Archive is a storage move, not a decision loss. The command moves finished work
+out of the active lane into the `Completed Work Archive` section, and three
+rules bound what that move may do.
+
+1. **Retention.** A done todo carrying a durable standing decision is not a move
+   candidate. The payload reports `retained_standing_decision_count`, and after
+   the move the decision still resolves as active standing authority under
+   `standing_decision_authority_v0`. Archiving completed work must never be the
+   reason a settled policy has to be re-decided.
+2. **Role scope.** The archive only touches the section for the requested role.
+   `--role user` moves out of `User Todo / Owner Review Reading Queue` and must
+   leave `Agent Todo` untouched. The role defaults to `agent`, so a caller that
+   means the user lane has to say so. A todo whose role contradicts its active
+   section is rejected rather than silently relocated.
+3. **Preview.** Without `--execute` the command is a dry run. The preview must
+   not change the state file, and the preview payload must describe exactly what
+   the execute run would move.
+
+Moved blocks keep their role identity with a `<!-- loopx:todo role=... -->`
+marker inside the mixed archive section, so the archive stays readable by lane
+instead of collapsing ownership into one undifferentiated list.
+
+IP-020 owns claim, supersede, and successor lifecycle, and IP-014 owns how a
+decision is written. Neither owns what happens to a durable decision when the
+todo carrying it leaves the active window, which is the gap this pattern fills.
+
+**Visual Model**
+
+```mermaid
+flowchart TD
+  A["done todos exceed --max-active-done"] --> P{"--execute?"}
+  P -->|"no"| V["preview payload, state file unchanged"]
+  P -->|"yes"| R{"requested --role"}
+  R -->|"user"| U["scan User Todo section only"]
+  R -->|"agent"| G["scan Agent Todo section only"]
+  U --> S{"todo carries durable standing decision?"}
+  G --> S
+  S -->|"yes"| K["retain in active lane<br/>retained_standing_decision_count += 1"]
+  S -->|"no"| M["move to Completed Work Archive<br/>preserve role marker"]
+  K --> Z["authority still resolves as active"]
+  M --> Z
+```
+
+**Bad smell**
+
+An agent tidies the active lane, the durable policy decision is compressed away
+with the todo that carried it, and two turns later the agent re-asks a question
+the user already answered or re-litigates an approved policy. The archive
+"cleaned up" the only durable record of the decision.
+
+The opposite bad smell is ownership bleed: an operator runs `--role user`
+expecting to tidy the user lane and the agent lane moves too, so the archive
+section mixes decisions nobody can attribute later. A third bad smell is
+treating a dry-run preview as applied, after which status and projection
+quietly disagree with what the operator believes happened.
+
+**Validation**
+
+- `examples/control_plane/todo-archive-completed-smoke.py` owns the CLI-level
+  archive move, preview, and payload metadata.
+- `examples/control_plane/todo-standing-decision-authority-smoke.py` owns
+  standing-decision retention and authority, including
+  `assert_archive_retains_standing_receipt`.
+- `loopx/control_plane/todos/completed_archive.py` and
+  `loopx/control_plane/coordination/todo_archive_selection.ts` own the typed
+  selector behind the command.
+- `examples/interaction-pattern-catalog-smoke.py` protects this entry.
+- Future smoke: role isolation is currently proven at helper level; a CLI-level
+  assertion that `--role user` leaves `Agent Todo` byte-identical is proposed
+  and not yet landed.
+
+#### IP-035 Install Ownership Is Not An Update Permission
+
+**Trigger**
+
+- `loopx update` or `loopx doctor` reports upgrade drift: `requires_upgrade=true`
+  or an install-freshness status that no longer matches the release manifest;
+- the active install is one of three owned kinds, `release_snapshot`,
+  `python_distribution`, or `live_checkout`, and only some of them are writable
+  by LoopX itself;
+- an agent, automation, or operator script wants the upgrade to actually happen
+  in this turn rather than be reported.
+
+**Expected behavior**
+
+An update is a write to an installation LoopX does not always own. Three rules
+keep "newer version available" from becoming "rewrite whatever is installed".
+
+1. **Classify before you mutate.** `install_lifecycle` names the
+   `install_kind`, the `owner` (`loopx_release_snapshot`,
+   `python_package_manager`, or `source_checkout`), `loopx_apply_supported`,
+   the `execution_driver`, and the `owner_upgrade_command`. No mutating step
+   runs before that classification exists.
+2. **An unowned install fails closed instead of guessing.** When
+   `loopx_apply_supported=false`, `update apply` returns `ok=false`,
+   `commands.apply=None`, `changes_applied=false`, and
+   `next_action.kind=use_installation_owner`. It must not substitute a
+   different installer, so a `custom-manager` Python environment never gets a
+   guessed `pip install`; it must not run `git pull` on a `live_checkout`; and
+   it must not replace a source checkout with an archive snapshot.
+3. **Report the owner's command, then stop.** The payload carries
+   `owner_upgrade_command` (or `plan.install_command`) and
+   `post_update_validation=loopx doctor`. When no owner command exists, the
+   correct output is "this install is owned by X" with
+   `next_action.command=None`, not a silent success and not a fabricated
+   command.
+
+IP-006 owns the case where a required *write scope* is not projected at all.
+IP-035 is the sibling case: the scope is known, but the write target itself has
+a different owner. IP-030 owns revision-guarded preview/apply for machine
+configuration; the same "exact target plus explicit approval" discipline applies
+here, except the approval belongs to the install owner rather than to LoopX.
+
+**Visual Model**
+
+```mermaid
+flowchart TD
+  A["requires_upgrade / freshness drift"] --> B{"install_lifecycle.install_kind"}
+  B -->|"release_snapshot"| C{"POSIX?"}
+  C -->|"yes"| D["loopx_apply_supported=true<br/>atomic snapshot replace"]
+  C -->|"no"| E["owner: install-windows.ps1<br/>apply=None"]
+  B -->|"python_distribution"| F{"installer is pip or pipx?"}
+  F -->|"yes"| G["driver python_pip / python_pipx<br/>upgrade the owning environment"]
+  F -->|"no"| H["owner: package manager<br/>no pip guess, apply=None"]
+  B -->|"live_checkout"| I["owner: source_checkout<br/>no git pull, no channel switch"]
+  D --> J["loopx doctor revalidation"]
+  E --> K["use_installation_owner<br/>ok=false, changes_applied=false"]
+  H --> K
+  I --> K
+```
+
+**Bad smell**
+
+An agent sees `requires_upgrade=true` and reaches for the installer it knows
+best: `pip install --upgrade loopx` inside a checkout install, `pipx upgrade`
+against an environment LoopX does not own, or `git pull` on a contributor
+workspace. The result is a second LoopX in a different environment while `loopx`
+on `PATH` still resolves to the old one, or a source checkout silently converted
+into an archive snapshot. The operator experience is "doctor says I am behind"
+forever, plus an environment nobody can attribute ownership for.
+
+The mirror-image smell is reporting success without writing:
+`unsupported_install_owner`, an `apply=None` command, or a `None`
+`next_action.command` is rendered as "update complete", so the same drift is
+rediscovered next turn. A third smell is a fixture that only ever exercises the
+pip path, so no test can tell an owned install from an unowned one.
+
+**Validation**
+
+- `tests/test_self_update_runtime_activation.py` owns the mutation and negative
+  cases: `test_live_checkout_apply_never_mutates_git_or_switches_install_channels`,
+  `test_unknown_package_manager_apply_fails_without_guessing_pip`,
+  `test_python_distribution_apply_uses_the_owning_interpreter_pip`,
+  `test_pipx_distribution_apply_preserves_the_pipx_environment`, and
+  `test_windows_execute_update_fails_closed_without_launching_bash`.
+- `tests/test_doctor_install_freshness.py` pins install-kind classification
+  (`live_checkout`, `python_distribution`) behind the freshness contract.
+- `loopx/self_update.py::_install_lifecycle` owns the kind, owner, driver, and
+  `owner_upgrade_command` predicate; `loopx/doctor.py` supplies the install
+  snapshot it classifies.
+- `examples/loopx-update-smoke.py` and `docs/guides/installing-loopx.md` own the
+  operator-facing update, activation, and recovery path.
+- `examples/interaction-pattern-catalog-smoke.py` protects this entry.
+
+#### IP-036 A Lost Response Is Not An Absent Commit
+
+**Trigger**
+
+- a command that commits durable state returns an error, exceeds its response
+  budget, or loses its reply on the wire, so the caller cannot tell from the
+  response alone whether the write landed;
+- the caller is about to retry, or a downstream projection now rejects a record
+  whose backing material never arrived;
+- the signals that say this already happened are typed, not inferred from prose:
+  an `already_applied` replay carrying its `original_receipt`, a
+  `receipt_index` entry per operation id, `outcome=ambiguous_reconciled` in a
+  settlement receipt, or an `operation_id was reused` rejection on the retry.
+
+**Expected behavior**
+
+A response is a notification about a commit, not the commit itself. Four rules
+keep "we never heard back" from becoming "nothing happened".
+
+1. **Name the write before dispatching it.** A command whose durable effect is
+   not derivable from context takes a stable identity and says so in its own
+   help: `loopx/cli_commands/delegation.py:25` registers `--operation-id` as
+   "Stable request identity; reuse after a lost response", and
+   `loopx/cli_commands/handoff_mode.py:99` the same shape for a canonical set
+   intent. Reusing an id means "that same request again", never "that intent a
+   second time".
+2. **Recover by readback, not by blind retry.** A re-sent operation returns the
+   original receipt rather than a second effect:
+   `tests/control_plane_ts/authority_store_conformance.ts:833` replays the same
+   `archive-completed` request and asserts the second call reports `replayed`
+   with an identical `original_receipt` and an unchanged authority (`:836`-`:839`),
+   while the same operation id carrying a changed intent is rejected with
+   `coordination_operation_identity_mismatch` (`:843`).
+3. **Publish the material an authoritative record points at before, or under the
+   same identity as, that record.** A committed pointer with no backing content
+   is worse than no commit, because every later reader must guess. `#5007` is
+   the public counterexample: canonical Todo creation dispatched first, the
+   TypeScript effect lost its response, and the private completion-validation
+   declaration was only persisted after `effect_runtime_result(...)` returned
+   successfully (`loopx/control_plane/todos/provider_create.py:86` dispatch,
+   `:136` persist). The authoritative Todo then carried
+   `completion_validation_sha256` with no declaration behind it, so
+   `todo project-markdown` rejected the Goal while a plain `todo add` retry risked
+   a second Todo. `#5012` proposes the ordering this pattern requires: prepare
+   the private content durably before dispatch, and recover the create through
+   `--operation-id`.
+4. **One identity, one intent.** The same id carrying a different request is a
+   rejection, not a retry to be forced through:
+   `tests/cli_commands/test_source_session_lifetime.py:1175` pins
+   `operation_id was reused` across a session bind and a lifetime receipt.
+   Ambiguity settles to a reconciled receipt — `_SETTLED_OUTCOMES` is
+   `{delivered, replayed, ambiguous_reconciled}`
+   (`loopx/control_plane/coordination/local_authority_shadow_adapter.py:92`) —
+   and never to two settlements.
+
+IP-016 owns the idempotency key carried by a task lease and IP-020 owns a Todo's
+claim / supersede / successor lifecycle; both assume the caller learned the
+outcome. This is the transport-level case those two do not cover: the commit
+landed and nobody was told. IP-033 is its mirror — a recorded rejection is a
+decision that is present, while a lost response is a signal that is absent and
+must not be read as an absent commit. IP-006 owns a projected write scope that
+disagrees with its checkpoint; here nothing disagrees yet, which is exactly the
+danger.
+
+**Visual Model**
+
+```mermaid
+flowchart TD
+  A["durable effect dispatched"] --> B{"response arrived?"}
+  B -->|"yes"| C["continue from the receipt"]
+  B -->|"error / budget exceeded / lost"| D{"same operation id available?"}
+  D -->|"yes"| E["re-send: read back committed state, reuse the original receipt"]
+  D -->|"no, only a fresh id"| F["retry as a new request: duplicate commit, or a typed reuse rejection"]
+  E --> G{"does the record name material that must exist?"}
+  G -->|"yes, present"| C
+  G -->|"yes, missing"| H["fail closed and name the unpublished material"]
+  G -->|"no"| C
+  F --> H2["duplicate work, duplicate spend, or a rolled-back settled effect"]
+```
+
+**Bad smell**
+
+- "the command errored, so nothing happened", followed by a retry that creates a
+  second authoritative record or spends quota twice;
+- a Goal rejected in projection because a digest points at a sidecar nobody
+  published, while the record naming that digest is already committed;
+- recovery that depends on an operator remembering "did that one already go
+  through?", with no receipt to read back;
+- treating an unanswerable ambiguity as a reason to roll a settled effect back.
+
+**Validation**
+
+- `tests/control_plane_ts/authority_store_conformance.ts` keeps operation
+  identity honest across every provider arm — the shared suite is registered
+  once per store — and pins the replay-and-receipt path together with the
+  lease-fenced write paths.
+- `tests/cli_commands/test_source_session_lifetime.py` pins the negative twin:
+  one identity may not carry two different intents.
+- `loopx/control_plane/coordination/local_authority_shadow_adapter.py` and
+  `shadow_entry_delivery.ts` keep the settled-vocabulary contract
+  (`delivered` / `replayed` / `ambiguous_reconciled`) single-owner, so a new
+  recovery path reuses it instead of inventing a fourth answer.
+- `examples/interaction-pattern-catalog-smoke.py` protects this entry.
+
+#### IP-037 A Retired Setting Is Not An Absent Setting
+
+**Trigger**
+
+- a Goal, registry entry, or settings document still names a configuration
+  whose implementation has been retired, so a reader must decide whether that
+  setting is off, missing, or still writable;
+- the caller is about to re-enable it, clear it, or migrate state that mentions
+  it, and the cheapest wrong move is to treat "no longer supported" as "never
+  existed";
+- the signals that say this already happened are typed, not inferred from
+  prose: a summary carrying `configured: true` with
+  `status: "retired"` and `enabled: false`, a migration row with
+  `attempted: false` and `outcome: "retired"`, a
+  `request_rejected / local_authority_shadow_retired` reply, or a
+  `retired corpus requires lifecycle.retirement_reason` rejection.
+
+**Expected behavior**
+
+Retiring a capability removes what it may write, not what it says. Four rules
+keep "we stopped supporting this" from becoming "this was never configured".
+
+1. **Keep the retired setting in the projection.** The summary of a Goal that
+   still carries the old key stays present and self-describing rather than
+   dropping the field: `local_authority_shadow_summary` returns
+   `{"enabled": False, ..., "status": "retired" if valid else "invalid",
+   "configured": True, ...}`
+   (`loopx/control_plane/coordination/runtime_shadow.py:53-63`), so a malformed
+   setting reads as `invalid` and a retained one reads as `retired` — neither
+   collapses into "unconfigured". Historical records under the old path remain
+   readable and are labelled instead of being relabelled as promotion evidence:
+   `local_authority_shadow_adapter.py:784` computes `legacy_observation` and
+   `:805` stamps each candidate store as `legacy_observation` or
+   `runtime_shadow`.
+2. **Reject re-enabling before any write, and reject it by code.** The gate sits
+   ahead of the mutation, not inside it:
+   `validate_coordination_shadow_changes` is documented as "Reject retired
+   activation before any registry mutation"
+   (`loopx/control_plane/coordination/runtime_shadow.py:103-115`) and carries the
+   reason in its message (`:67-78`, text at `:72`). The old runtime RPC keeps
+   its address and answers `local_authority_shadow_retired`
+   (`loopx/control_plane/coordination/local_authority_shadow.ts:57`) rather than
+   disappearing into a transport error, because a rejection that looks like a
+   transient failure invites a retry loop.
+3. **Clearing is neither enable nor bootstrap.** One setting is retired; the
+   replacement capture path is configured on its own terms.
+   `apply_coordination_shadow_changes` is documented as "Clear retired settings
+   and configure the transaction-bound shadow independently"
+   (`loopx/control_plane/coordination/runtime_shadow.py:117-131`), and
+   `tests/control_plane/test_local_authority_shadow_config.py:58` pins that
+   clearing preserves the runtime configuration and peer registration instead of
+   silently starting the new capture.
+4. **Migration reports the retirement rather than seeding it.** `migrate-state`
+   keeps the response field callers already parse and answers it with a
+   non-action: `retired_authority_shadow_notices` emits
+   `{"attempted": False, "outcome": "retired", "reason_code":
+   "local_authority_shadow_retired"}`
+   (`loopx/state_migration.py:236-241`), is still the call site's source of that
+   column (`:395`), and renders `attempted=` in the operator table (`:460`). The
+   same rule holds where retirement is a lifecycle state instead of a deletion:
+   a corpus may not claim `state: "retired"` without a reason
+   (`loopx/capabilities/reward_memory/registry.py:156-157`).
+
+IP-030 owns applying a machine configuration under a revision guard, which
+presumes the setting still has an apply path; this is the case where the apply
+path is gone and the setting remains. IP-032 keeps durable decisions
+authoritative across an archive of completed work, and IP-033 reads a recorded
+rejection as a decision that is present — both are about what stays *writable
+or countable* after a state change, while this pattern is about what stays
+*legible* after a capability change. IP-036 is its transport-side twin: a lost
+response must not be read as an absent commit, and a retired path must not be
+read as an absent setting. IP-006 owns a projected write scope that disagrees
+with its checkpoint; here the projection is honest about being inert, and the
+danger is a reader inferring a write from silence.
+
+**Visual Model**
+
+```mermaid
+flowchart TD
+  A["reader finds a setting whose path is retired"] --> B{"is the setting well-formed?"}
+  B -->|"malformed"| C["status=invalid, configured=true; offer clear, never enable"]
+  B -->|"retained"| D["status=retired, enabled=false, configured=true"]
+  D --> E{"what does the caller want?"}
+  E -->|"enable the old path"| F["reject by code before any registry write"]
+  E -->|"clear it"| G["clear only this key; replacement stays as configured"]
+  E -->|"migrate state"| H["report attempted=false, outcome=retired; do not seed"]
+  E -->|"read history"| I["label legacy records as legacy; never as promotion proof"]
+  F --> J["operator doc names the replacement path"]
+  G --> J
+  H --> J
+```
+
+| Situation | What must be visible | What must not happen |
+| --- | --- | --- |
+| Retained old key | `configured=true`, `enabled=false`, `status=retired` | field dropped, or read as unconfigured |
+| Re-enable attempt | typed rejection naming the reason code | registry or store write, or a retryable transport error |
+| Clear request | this key removed, replacement untouched | implicit bootstrap of the new capture |
+| Migration row | `attempted=false`, `outcome=retired` | seeding a second observation store |
+| Historical read | records labelled `legacy_observation` | counted as promotion evidence |
+
+**Bad smell**
+
+- the setting vanishes from status or the settings surface, so an operator
+  reading an old Goal cannot tell whether they ever opted in, and the history
+  under it loses its explanation;
+- a retired enable flag that "does nothing" instead of rejecting, so a script or
+  a stale client believes it turned capture on;
+- clearing a retired key as a side door that boots the replacement capture, or
+  a migration that re-seeds the retired observer because the response field is
+  still expected;
+- retrying `local_authority_shadow_retired` as a transient storage failure;
+- promoting a historical `legacy_observation` record into evidence for the
+  transaction-bound lineage because both rows live in one directory;
+- a retirement that ships as a deletion with no reason recorded, so the next
+  reader reinstates it as a bug fix.
+
+**Validation**
+
+- `tests/control_plane/test_local_authority_shadow_config.py` exercises the real
+  `configure-goal` CLI. Retired activation returns
+  `local_authority_shadow_retired`, leaves the registry unchanged and exposes
+  no enable action. Clearing the retired key preserves peer registration and
+  only enables runtime configuration when the caller requests it explicitly.
+- `tests/control_plane/test_state_migration_authority_shadow.py` keeps
+  `migrate-state` reporting retirement instead of seeding it, and
+  `tests/control_plane_ts/local_authority_shadow.test.ts` keeps the old RPC
+  answer typed.
+- `tests/control_plane/test_coordination_runtime_shadow_adapter.py:637` proves a
+  retired CLI observer cannot overwrite transaction evidence, which is what
+  makes the historical read safe rather than merely available.
+- `docs/reference/authority-observation-retirement.md` owns the operator
+  transition and rollback wording; `#5011` records this as the answer to the
+  shared-authority RFC's open question on keeping one capture boundary.
+- `examples/interaction-pattern-catalog-smoke.py` protects this entry.
+
+#### IP-038 A Generic Fallback Is Not A Typed Diagnosis
+
+**Trigger**
+
+- a component refuses a configuration, an identity, or a write and publishes a
+  typed reason, while the caller also holds a catch-all that explains the same
+  failure by its own observation — an exit status, an empty read, a deadline;
+- the caller can only reach the typed reason by parsing something the publisher
+  framed, so a defect in that parse is silent: nothing reports "the envelope was
+  there and I could not read it";
+- the operator is about to act on the reported cause: restart a host, respend a
+  Turn, clear a setting, or retry an operation whose real blocker is a single
+  malformed value.
+
+**Expected behavior**
+
+A fallback earns its place only after the typed channel has been exhausted, and
+it must never overwrite a reason that exists. Four rules keep "I could not
+recover the cause" from being published as "the cause".
+
+1. **Ask the typed channel first, and fall back only on an empty answer.**
+   `_start_runtime` reads the captured startup stderr before it reads the exit
+   status: a recovered envelope raises
+   `EffectRuntimeStartupError(message, diagnostic_code=code)`, and only a `None`
+   answer reaches `runtime_exited_before_ready (exit_code=...)`
+   (`loopx/control_plane/effect_runtime.py:776-791`). The fallback is a name for
+   missing evidence, not a diagnosis of the failure.
+2. **Frame the reason channel by the separator the publisher writes.** One
+   envelope is one record. `str.splitlines()` honours U+0085, U+2028 and
+   U+2029 as line breaks while `JSON.stringify` escapes only code points below
+   U+0020, so a rejected value quoted back inside its own message can tear the
+   record apart and every fragment that still starts with `{` fails to parse.
+   The response reader in the same module already frames on the byte newline
+   (`loopx/control_plane/effect_runtime.py:588`); a diagnostic channel is the
+   same obligation.
+3. **Reject by code before any mutation, and name the guard in the message.**
+   The projection writer refuses on identity before it appends, with three
+   distinct rejections rather than one generic one: `must include object marker`
+   and `is missing identity fields` before the write
+   (`loopx/control_plane/runtime/runtime_projection_writer.py:27-31`), and
+   `append did not pass index readback` for a write that went out and could not
+   be read back (`:88`). Each says which check fired, so no caller can mistake a
+   rejected identity for an unavailable backend.
+4. **Report a fallback as coverage, never as health.** `not_observed`,
+   `not_supplied` and `unknown` are the honest shapes for a channel nobody read:
+   `subagent_context.ts` defaults `live_availability` to `not_observed`
+   (`loopx/control_plane/subagent_context.ts:31`) and only upgrades
+   `receipt_observation` when a receipt was actually supplied (`:52`), rather
+   than inferring either from configured intent, and `agent-context` answers
+   `host_receipts_observed: false` instead of promoting a configured ceiling
+   into an execution promise (#5051). A fallback that reads as a clean result is
+   the same defect wearing a different face.
+
+This is the read-side twin of IP-036: there a lost response must not be read as
+an absent commit, and here a lost *reason* must not be reported as an absent
+cause. IP-037 keeps a retired setting legible after a capability change, while
+this pattern is about a reason that is fully present and still gets replaced.
+IP-005 is the inverse gap — humans see work the machine projection does not —
+and IP-033 reads a recorded rejection as authority that exists. None of them
+cover the moment a consumer chooses its own explanation over one that was
+published for it.
+
+**Visual Model**
+
+```mermaid
+flowchart TD
+  A["a component rejects something and publishes a typed reason"] --> B{"can the caller parse the reason channel?"}
+  B -->|"yes"| C["raise with the publisher's own code"]
+  B -->|"no, framing broke"| D["generic fallback masks the real cause"]
+  B -->|"none was published"| E["report not_observed or unknown, never health"]
+  D --> F["operator restarts a host or respends a Turn for the wrong reason"]
+  C --> G["operator fixes the named value or scope"]
+  E --> G
+```
+
+**Bad smell**
+
+One error string carries two different meanings: "the runtime refused my
+configuration" and "I could not tell what the runtime said". Retries, restarts
+and escalations then target the exit code, the guard keeps firing, and the
+actionable guidance that was already produced is nowhere in what the operator
+sees.
+
+**Validation**
+
+- `tests/control_plane/test_effect_runtime_integration.py::test_invalid_idle_timeout_configuration_fails_closed`
+  drives the real managed Python-to-TypeScript startup boundary and asserts the
+  publisher's own `invalid_idle_timeout` code plus the absence of a runtime-info
+  file, so a fallback cannot pass as correct behaviour there.
+- `tests/control_plane/test_runtime_projection_writer_guards.py` pins rule 3:
+  `:75`, `:86` and `:93` each reject before any write on a different identity
+  defect, `:134` injects the post-write readback failure, and `:124` is the same
+  fixture left unpatched — which is what proves that negative is not a
+  self-fulfilling injection.
+- `tests/control_plane_ts/agent_context.test.ts` keeps the defaults honest:
+  `:35` asserts `receipt_observation` stays `not_supplied` on the after-result
+  phase, and `:210` asserts `live_availability` stays `not_observed` rather than
+  being inferred from configured intent.
+- `examples/interaction-pattern-catalog-smoke.py` protects this entry.
 
 ### Evidence Lifecycle
 
@@ -2096,7 +2945,7 @@ from a meta/controller poll that was only authorized to observe.
 **Validation**
 
 - `regression/external-evidence-observation-real-codex.py`
-- `examples/benchmark-lifecycle-state-smoke.py`
+- [Retired benchmark lifecycle smoke](https://github.com/loopx-project/loopx/blob/54d42da44283bb414b24f71d16642c25cbcaf5dd/deprecate/benchmark-legacy/examples/benchmark-lifecycle-state-smoke.py) (Git history only)
 - `docs/state-interaction-model.md`
 
 #### IP-015 Benchmark Lifecycle Countability
@@ -2170,7 +3019,7 @@ resolved. The two lanes must not collapse into each other.
 
 Replan closeout is semantic and causally bound. A normal validated progress
 refresh may record useful work, but it must not silently close the
-`autonomous_replan_obligation_v0`. Quota first projects the evidence-log into a
+`autonomous_replan_obligation_v0`. Quota first projects compact run history into a
 compact coverage ledger and emits an opaque `obligation_id`; after the bounded
 slice, the agent writes one typed observation. When the result is a runnable
 successor, the Todo transition itself is the receipt:
@@ -2399,6 +3248,87 @@ successor work. The next automation then behaves as if the plan never existed.
 - `examples/control_plane/heartbeat-prompt-smoke.py`
 - future status/quota smoke that flags user-facing plans without todo or
   refresh-state writeback.
+
+#### IP-034 Unstaffable Team Lane Is A Typed Gap
+
+**Trigger**
+
+- one owner sentence asks for a team rather than a single task, so a plan
+  preview has to name the Agent that runs each lane;
+- a requested lane needs an Agent registration, capability grant, or action
+  kind the current host or profile does not have, so no honest assignment
+  exists for it; or
+- a confirmed plan is being applied and one admitted lane cannot be started on
+  this host.
+
+**Expected behavior**
+
+An unstaffable lane is a typed gap, not an invented lane. Admission and
+staffing are two different questions, and only the first one is
+all-or-nothing.
+
+1. **Name the gap instead of inventing the lane.** A lane that cannot be
+   staffed is reported as a gap with the missing registration or grant, or with
+   the shipped action kind that covers the requested work. The preview may not
+   invent a lane, an Agent, a capability, or an action kind to fill the slot.
+2. **Keep the admitted plan.** The rest of the plan is the owner's request, so
+   it stays admitted. Applying it creates the first bounded Todo for exactly
+   the lanes that can run; one unstaffable lane does not fail the whole
+   confirmation.
+3. **Show the lane; do not drop it silently.** "Dropped instead of shown"
+   applies to a plan that names no Goal or a Goal outside the authorized
+   scope, not to one lane inside an admitted plan. An omitted lane is work
+   nobody knows is unowned.
+4. **A gap is not self-healing.** Retrying the same proposal recovers an
+   uncertain commit; it does not fill a previously unstaffed gap. Filling one
+   needs explicit new intent, and never by impersonating a receiving Agent as
+   the author.
+
+IP-018 owns plan-to-todo writeback and IP-024 owns the repair delta. Neither
+owns the case where part of an admitted plan has no honest owner, which is the
+gap this pattern fills.
+
+**Visual Model**
+
+```mermaid
+flowchart TD
+  A["owner asks for a team"] --> B["one plan preview, every lane named"]
+  B --> C{"each lane staffable?"}
+  C -->|"yes"| D["admitted lane: first bounded Todo on apply"]
+  C -->|"no"| E["typed gap: missing registration or grant"]
+  D --> F["apply receipt read before reporting assignments"]
+  E --> G["plan stays admitted, gap shown in the preview"]
+  E --> H["no invented lane, Agent, capability, or action kind"]
+  H --> I["filling the gap later needs explicit new intent"]
+```
+
+**Bad smell**
+
+A host does not ship the action kind a requested lane needs, so the surface
+invents one: the preview shows every lane staffed and a first Todo lands in a
+lane no Agent can actually run. The operator experience is "the whole team is
+up" followed by "why is that lane not moving".
+
+The mirror-image smell is all-or-nothing admission: because one lane cannot be
+staffed, the confirmation fails and discards the lanes the owner already
+authorized. A third smell is the quiet omission, where the unstaffable lane is
+left out of the preview so the plan looks complete and the work simply never
+appears.
+
+**Validation**
+
+- `tests/test_steward_team_plan_apply.py` owns the apply-side case:
+  `test_a_lane_whose_kind_the_host_does_not_ship_creates_nothing` proves the
+  plan is still admitted and creates exactly one Todo, for the lane that can
+  run, while the unstaffable lane's Todo is absent.
+- `tests/test_manager_team_plan_guidance.py` pins the preview contract,
+  including "as a gap, with the missing registration or grant" and the "do not
+  regenerate every lane" rule that stops an automatic gap fill.
+- `loopx/capabilities/manager_context/skills/loopx-manager/SKILL.md` owns the
+  preview wording and the gap-versus-invention boundary.
+- `loopx/control_plane/work_items/governed_transition_proposal.py` owns the
+  admission-to-receipt transaction that creates only the admitted lanes.
+- `examples/interaction-pattern-catalog-smoke.py` protects this entry.
 
 ## Maintenance Rules
 

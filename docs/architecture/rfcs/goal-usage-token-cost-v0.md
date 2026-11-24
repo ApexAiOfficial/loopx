@@ -1,6 +1,7 @@
 # RFC: Per-Goal Usage, Token, and Cost Surfacing v0
 
-- Status: Draft
+- Status: Accepted
+- Supersedes / closes: none
 - Scope: core `usage_summary` token / cost / duration capture and existing-dashboard surfacing
 - Decision type: bounded public-contract change plus a provider-neutral capture layer
 
@@ -17,6 +18,18 @@ actually consumed — not only whether it was allowed to run (the current quota
 slot accounting) but what it spent. This closes the gap left open in
 `docs/quota-allocation.md`, which notes that later versions may "replace slots
 with real runtime, token spend, or cost."
+
+## Current implementation checkpoint
+
+The Codex capture adapter and typed run usage are shipped; the problem and
+smallest-slice sections below retain the original proposal basis. The existing
+booking module now streams its complete retained run index when reconstructing
+the session baseline. This removes whole-index text buffers without adding an
+public interface, cache, ledger or decision owner. The [usage contract](../../status-data-contract.md#usage-summary)
+retains replay, duplicate suppression, corruption refusal and unknown metrics.
+Buffering scales with the largest record; selected-session row identities still
+grow with that session's retained history. Lifetime and runtime coverage remain
+open questions, not inferred totals.
 
 ## Problem
 
@@ -190,6 +203,11 @@ The slice must prove:
 4. Whether to add a dedicated `/usage.json` endpoint or continue surfacing
    through the existing status payload (this RFC assumes the latter).
 5. The duration capture anchor — which run boundary events delimit wall-time.
+6. Lifetime and coverage. The [Goal workspace](goal-workspace-surface-v0.md)
+   vitals show window-labeled cost and Agent time (its D2/D4). Should this owner
+   add an aggregate since Goal creation, with retention disclosure, and an
+   explicit field for measured versus observed runtimes? Until then consumers
+   must not sum windows into a lifetime figure or render absent cost as zero.
 
 ## Public References
 

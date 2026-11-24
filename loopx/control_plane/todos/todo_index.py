@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from typing import Any, Protocol, cast
+
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
 
 from ...rollout_event_log import load_rollout_events, rollout_event_log_path
 from .contract import normalize_todo_id, normalize_todo_status, todo_done_for_status
-from .handoff_note import attach_todo_handoff_note
-from .todo_summary import compact_todo_item
+from .handoff_note import todo_read_source, project_handoff_context
+from .todo_summary import _compact_todo_item_record
 
 TODO_INDEX_SCHEMA_VERSION = "todo_index_v0"
 TODO_INDEX_ITEM_SCHEMA_VERSION = "todo_index_item_v0"
@@ -15,6 +16,15 @@ MAX_TODO_INDEX_ITEMS = 240
 MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL = 500
 
 CompactText = Callable[..., Any]
+
+
+class EventsForGoal(Protocol):
+    def __call__(
+        self,
+        goal_id: str,
+        *,
+        limit: int,
+    ) -> Sequence[Mapping[str, Any]]: ...
 
 
 def compact_agent_lane_todo_index_for_status_display(
@@ -46,7 +56,7 @@ def _todo_index_key(goal_id: str, todo: dict[str, Any]) -> tuple[str, str]:
     return goal_id, f"synthetic:{todo.get('role') or ''}:{todo.get('index') or ''}:{todo.get('text') or ''}"
 
 
-def _indexed_status_todo(
+def _status_index_labels(
     *,
     goal_id: str,
     role: str,
@@ -57,22 +67,17 @@ def _indexed_status_todo(
     text = public_safe_compact_text(todo.get("title") or todo.get("text"), limit=320)
     if not text:
         return None
-    item = compact_todo_item(todo)
-    item.update(
-        {
-            "schema_version": TODO_INDEX_ITEM_SCHEMA_VERSION,
-            "goal_id": goal_id,
-            "role": role,
-            "source": source,
-            "text": text,
-            "title": public_safe_compact_text(todo.get("title"), limit=320) or text,
-        }
-    )
-    attach_todo_handoff_note(item, goal_id=goal_id, source=source)
-    return item
+    return {
+        "schema_version": TODO_INDEX_ITEM_SCHEMA_VERSION,
+        "goal_id": goal_id,
+        "role": role,
+        "source": source,
+        "text": text,
+        "title": public_safe_compact_text(todo.get("title"), limit=320) or text,
+    }
 
 
-def _rollout_event_todo_status(event: dict[str, Any]) -> str:
+def _rollout_event_todo_status(event: Mapping[str, Any]) -> str:
     status = normalize_todo_status(event.get("status"))
     if status:
         return status
@@ -85,7 +90,7 @@ def _rollout_event_todo_status(event: dict[str, Any]) -> str:
 
 
 def _indexed_rollout_todo_event(
-    event: dict[str, Any],
+    event: Mapping[str, Any],
     *,
     public_safe_compact_text: CompactText,
 ) -> dict[str, Any] | None:
@@ -93,7 +98,7 @@ def _indexed_rollout_todo_event(
     goal_id = str(event.get("goal_id") or "").strip()
     if not goal_id or not todo_id:
         return None
-    details = event.get("details") if isinstance(event.get("details"), dict) else {}
+    details = cast(dict[str, Any], event.get("details")) if isinstance(event.get("details"), dict) else {}
     role = str(details.get("role") or "agent").strip().lower()
     if role not in {"user", "agent"}:
         role = "agent"
@@ -104,6 +109,11 @@ def _indexed_rollout_todo_event(
     )
     if not summary:
         summary = f"todo event recorded for {todo_id}"
+    # The rollout summary is an audit sentence ("todo add recorded for <id>"),
+    # not the Todo's own text. A row that exists only in the rollout event log
+    # is therefore labelled by id, and the audit sentence stays available as
+    # event metadata instead of being rendered as the task title.
+    row_text = f"todo {todo_id}"
     item = {
         "schema_version": TODO_INDEX_ITEM_SCHEMA_VERSION,
         "goal_id": goal_id,
@@ -112,20 +122,21 @@ def _indexed_rollout_todo_event(
         "status": status,
         "done": todo_done_for_status(status),
         "index": 0,
-        "text": summary,
-        "title": summary,
+        "text": row_text,
+        "title": row_text,
+        "title_source": "event_audit",
         "source": "rollout_event_log",
         "event_count": 1,
         "event_kinds": [str(event.get("event_kind") or "todo_event")],
         "latest_event_kind": str(event.get("event_kind") or "todo_event"),
         "latest_event_at": public_safe_compact_text(event.get("recorded_at"), limit=80),
         "latest_event_status": status,
+        "latest_event_summary": summary,
         "agent_id": public_safe_compact_text(event.get("agent_id"), limit=120),
     }
     handoff = event.get("handoff") or details.get("handoff")
     if isinstance(handoff, dict):
         item["handoff"] = handoff
-    attach_todo_handoff_note(item, goal_id=goal_id, source="rollout_event_log")
     return item
 
 
@@ -137,47 +148,61 @@ def build_todo_index(
     public_safe_compact_text: CompactText,
     limit: int = MAX_TODO_INDEX_ITEMS,
     max_rollout_events_per_goal: int = MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL,
+    events_for_goal: EventsForGoal | None = None,
 ) -> dict[str, Any]:
     indexed: dict[tuple[str, str], dict[str, Any]] = {}
-    current_count = 0
-    for item in queue.get("items") or []:
-        if not isinstance(item, dict):
+    unavailable_goal_ids = {
+        str(item["goal_id"])
+        for item in queue.get("items") or []
+        if isinstance(item, dict) and item.get("goal_id")
+        and item.get("todo_source") == "unavailable"
+    }
+    status_sources: list[tuple[str, str, dict[str, Any]]] = []
+    for entry in queue.get("items") or []:
+        if not isinstance(entry, dict):
             continue
-        goal_id = str(item.get("goal_id") or "")
-        if not goal_id:
+        goal_id = str(entry.get("goal_id") or "")
+        if not goal_id or goal_id in unavailable_goal_ids:
             continue
         for role in ("user", "agent"):
-            todos = item.get(f"{role}_todos")
-            if not isinstance(todos, dict):
-                continue
-            for todo in todos.get("items") or []:
-                if not isinstance(todo, dict):
-                    continue
-                indexed_item = _indexed_status_todo(
-                    goal_id=goal_id,
-                    role=role,
-                    todo=todo,
-                    source="attention_queue",
-                    public_safe_compact_text=public_safe_compact_text,
-                )
-                if indexed_item is None:
-                    continue
-                indexed[_todo_index_key(goal_id, indexed_item)] = indexed_item
-                current_count += 1
+            todos = entry.get(f"{role}_todos")
+            if isinstance(todos, dict):
+                status_sources.extend((goal_id, role, todo) for todo in todos.get("items") or []
+                                      if isinstance(todo, dict))
+    compacts = [_compact_todo_item_record(todo) for _, _, todo in status_sources]
+    status_rows, context_sources, index_labels = [], [], []
+    for (goal_id, role, _), compact in zip(status_sources, compacts, strict=True):
+        labels = _status_index_labels(goal_id=goal_id, role=role, todo=compact,
+            source="attention_queue", public_safe_compact_text=public_safe_compact_text)
+        if labels is not None:
+            status_rows.append({**compact, **labels})
+            context_sources.append(todo_read_source(compact))
+            index_labels.append(labels)
+    current_count = len(status_rows)
 
     rollout_event_count = 0
+    event_rows = []
     goal_ids = [
         str(goal.get("id") or "")
         for goal in history.get("goals") or []
         if isinstance(goal, dict) and str(goal.get("id") or "")
     ]
     for goal_id in sorted(set(goal_ids)):
-        events = load_rollout_events(
-            rollout_event_log_path(runtime_root, goal_id),
-            limit=max_rollout_events_per_goal,
+        if goal_id in unavailable_goal_ids:
+            continue
+        events = (
+            events_for_goal(
+                goal_id,
+                limit=max_rollout_events_per_goal,
+            )
+            if events_for_goal is not None
+            else load_rollout_events(
+                rollout_event_log_path(runtime_root, goal_id),
+                limit=max_rollout_events_per_goal,
+            )
         )
         for event in events:
-            if not isinstance(event, dict) or not str(event.get("event_kind") or "").startswith("todo_"):
+            if not isinstance(event, Mapping) or not str(event.get("event_kind") or "").startswith("todo_"):
                 continue
             rollout_event_count += 1
             event_item = _indexed_rollout_todo_event(
@@ -186,25 +211,46 @@ def build_todo_index(
             )
             if event_item is None:
                 continue
-            key = _todo_index_key(goal_id, event_item)
-            existing = indexed.get(key)
-            if existing:
-                existing["event_count"] = int(existing.get("event_count") or 0) + 1
-                kinds = list(existing.get("event_kinds") or [])
-                latest_kind = event_item.get("latest_event_kind")
-                if latest_kind and latest_kind not in kinds:
-                    kinds.append(latest_kind)
-                existing["event_kinds"] = kinds
-                existing["latest_event_kind"] = latest_kind
-                existing["latest_event_at"] = event_item.get("latest_event_at")
-                existing["latest_event_status"] = event_item.get("latest_event_status")
+            event_rows.append(event_item)
+    contexts = project_handoff_context([
+        *context_sources, *(todo_read_source(row) for row in event_rows)],
+        index_labels=[*index_labels, *([None] * len(event_rows))])
+    for row, context in zip([*status_rows, *event_rows], contexts, strict=True):
+        if context["note"]:
+            row["handoff_note"] = context["note"]
+    for row in status_rows:
+        indexed[_todo_index_key(row["goal_id"], row)] = row
+    for event_item in event_rows:
+        key = _todo_index_key(event_item["goal_id"], event_item)
+        existing = indexed.get(key)
+        if existing:
+            existing["event_count"] = int(existing.get("event_count") or 0) + 1
+            kinds = list(existing.get("event_kinds") or [])
+            latest_kind = event_item.get("latest_event_kind")
+            if latest_kind and latest_kind not in kinds:
+                kinds.append(latest_kind)
+            existing["event_kinds"] = kinds
+            existing["latest_event_kind"] = latest_kind
+            existing["latest_event_at"] = event_item.get("latest_event_at")
+            existing["latest_event_status"] = event_item.get("latest_event_status")
+            # Audit receipts describe historical operations. They cannot
+            # replace the current authority's status or mint a claimant.
+            if existing.get("source") == "rollout_event_log":
                 if event_item.get("status"):
                     existing["status"] = event_item.get("status")
                     existing["done"] = bool(event_item.get("done"))
                 if event_item.get("agent_id"):
                     existing["agent_id"] = event_item.get("agent_id")
-                continue
-            indexed[key] = event_item
+            # The audit sentence describes the newest event for every row
+            # kind; only event-only rows also carry `title_source`, and the
+            # text of an attention-queue row stays authoritative because
+            # it is never overwritten here.
+            existing["latest_event_summary"] = (
+                event_item.get("latest_event_summary")
+                or existing.get("latest_event_summary")
+            )
+            continue
+        indexed[key] = event_item
 
     items = sorted(
         indexed.values(),
@@ -215,7 +261,7 @@ def build_todo_index(
             str(item.get("latest_event_at") or ""),
         ),
     )
-    return {
+    result: dict[str, Any] = {
         "schema_version": TODO_INDEX_SCHEMA_VERSION,
         "source": "attention_queue_and_rollout_event_log",
         "total_count": len(items),
@@ -224,3 +270,7 @@ def build_todo_index(
         "item_limit": limit,
         "items": items[: max(0, limit)],
     }
+    if unavailable_goal_ids:
+        result["complete"] = False
+        result["unavailable_goal_ids"] = sorted(unavailable_goal_ids)
+    return result

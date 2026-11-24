@@ -8,7 +8,6 @@ import contextlib
 import io
 import json
 import shutil
-import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -22,6 +21,10 @@ from loopx.cli import main as cli_main  # noqa: E402
 from loopx.control_plane.turn_driver import (  # noqa: E402
     load_loopx_turn_plan_from_journal,
 )
+from tests.control_plane.canonical_authority_fixture import (  # noqa: E402
+    initialize_canonical_source_fixture,
+)
+from tests.control_plane.host_process_fixture import write_python_host_fixture  # noqa: E402
 
 
 GOAL_ID = "loopx-turn-real-cli-e2e"
@@ -45,10 +48,9 @@ def _marker_value(turn_number: int) -> str:
 def _write_fixture(root: Path, *, turn_count: int) -> tuple[Path, Path, Path, Path]:
     project = root / "project"
     runtime = root / "runtime"
-    workspace = root / "workspace"
+    workspace = project
     runtime.mkdir(parents=True)
-    workspace.mkdir(parents=True)
-    (workspace / "docs").mkdir()
+    (workspace / "docs").mkdir(parents=True)
     state = project / ".codex" / "goals" / GOAL_ID / "ACTIVE_GOAL_STATE.md"
     state.parent.mkdir(parents=True)
     state.write_text(
@@ -125,7 +127,8 @@ def _write_fixture(root: Path, *, turn_count: int) -> tuple[Path, Path, Path, Pa
 
 def _write_fake_codex(root: Path) -> Path:
     executable = root / "fake-codex"
-    executable.write_text(
+    executable = write_python_host_fixture(
+        executable,
         f"""#!/usr/bin/env python3
 import json
 import pathlib
@@ -144,6 +147,7 @@ if marker.is_file():
         raise SystemExit("unexpected marker value")
     turn_number = int(match.group(1)) + 1
 marker.write_text({MARKER_PREFIX!r} + str(turn_number), encoding="utf-8")
+assert marker.read_text(encoding="utf-8") == {MARKER_PREFIX!r} + str(turn_number)
 print(json.dumps({{
     "type": "thread.started",
     "thread_id": "session-fixture-0001",
@@ -161,11 +165,11 @@ output_path.write_text(json.dumps({{
     "delivery_outcome": "outcome_progress",
     "vision_unchanged_reason": "The fixture objective remains unchanged.",
     "summary": f"The isolated public marker reached step {{turn_number}}.",
+    "work_evidence": ["artifact:turn-e2e-marker"],
+    "validation_evidence": ["check:marker-file-readback"],
 }}), encoding="utf-8")
 """,
-        encoding="utf-8",
     )
-    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
     return executable
 
 
@@ -227,8 +231,6 @@ def _base_argv(
         "workspace-write",
         "--validation-command-json",
         json.dumps(_validator_command(expected_marker)),
-        "--scan-root",
-        str(registry.parent.parent),
         "--no-global-sync",
         "--timeout-seconds",
         str(timeout_seconds),
@@ -363,6 +365,12 @@ def main() -> int:
         project, runtime, workspace, registry = _write_fixture(
             root,
             turn_count=args.turn_count,
+        )
+        initialize_canonical_source_fixture(
+            runtime,
+            GOAL_ID,
+            state_path=project / ".codex" / "goals" / GOAL_ID / "ACTIVE_GOAL_STATE.md",
+            provider="sqlite",
         )
         if args.real_codex_cli:
             candidate = args.codex_bin or (

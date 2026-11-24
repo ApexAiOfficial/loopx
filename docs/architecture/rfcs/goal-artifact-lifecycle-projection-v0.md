@@ -1,6 +1,7 @@
 # RFC: Goal Artifact Lifecycle Projection (milestone / guard / next-transition) v0
 
-- Status: Draft, under maintainer review
+- Status: Accepted
+- Supersedes / closes: none
 - Proposed by: LoopX maintainers
 - Date: 2026-08-12
 - Scope: a read-only, goal-level lifecycle projection derived from existing
@@ -109,6 +110,19 @@ state machine.
    so an operator can answer the three questions from the example.
 4. Public-safe boundary stays identical to existing projections: no raw logs,
    evidence bodies, credentials, or local paths.
+
+### Acceptance observation source
+
+The existing `goal_acceptance_observation_projection_v0` discovers Agent lanes
+from recent runs and retained semantic history. It uses the existing
+`goal_frontier.semantic_history` module's vision-read interface. For a known
+Agent, present semantic history selects the current vision or its absence;
+retirement or a missing lane cannot revive an older recent row. Without
+semantic history, the legacy recent-list fallback remains. Unattributed legacy
+rows stay unattributed. Retained observations provide partial coverage, never
+acceptance certification. Public text validation and bounded output remain.
+The same observation module supplies the artifact lifecycle's evidence guards.
+This read-only correction adds no stored state, authority or execution gate.
 
 ## 4. Mid-Term Applications (2-4 releases)
 

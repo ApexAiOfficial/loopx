@@ -26,6 +26,63 @@ decision or turn-settlement logic; they give refactor and test code one
 stable abstraction for reading the effect program shape across packet
 families.
 
+The action slot depends on the packet family:
+
+| Observation | Verdict | `effective_action` |
+| --- | --- | --- |
+| Quota should-run | Quota decision | Existing decision/frontier action string |
+| Turn result | `decision` carries `result_kind` | Always JSON `null` / Python `None` |
+| Journal replay | `replay_legal` or `replay_blocked` | Omitted from the internal replay observation |
+
+Turn-result readers must use `decision` for the result verdict. The result lens
+ignores a host-supplied action; it cannot create a quota decision. The TS result
+type fixes its action to null, while the generic quota type retains its default
+string action. This changes the transient result projection, not persisted
+host results, receipts, or journal plans. See the
+[semantic vocabulary RFC](../architecture/rfcs/semantic-vocabulary-convergence-v0.md#m1-action-domains-and-compatibility)
+for the versioned frontier migration and its compatibility boundary.
+
+动作槽位按 packet family 区分：quota 保留决策/前沿动作字符串；Turn result 的
+判决从 `decision` 读取，`effective_action` 固定为 `null`（Python 为 `None`）；
+journal replay 使用自己的判决，不再输出动作字段。host 提供的 action 不会被
+解释为 quota 决策。这只改变瞬时结果投射，不重写落盘的 host result、receipt
+或 journal plan。
+
+## Interaction consistency validation
+
+The TypeScript interaction-contract owner supplies the execution-consistency
+rules used by the Effect interpreter, scoped-override projection and Python
+scheduler arbitration. Delivery requires an attempt; a quiet no-op cannot
+coexist with required work or user action. Terminal, peer-blocked and
+monitor-only modes require `quiet_noop_allowed=true`, no required action or
+delivery, and no quota spend. An already-settled mode permits neither required
+work/user action, delivery nor another spend. Non-blocking notifications remain valid.
+Independent capability intent retains its own mode and existing authority.
+
+This strengthens transient contract validation: typed consumers now reject the
+closed-mode contradictions that scheduler arbitration already rejected, and
+all consumers reject a closed mode with `spend_allowed_now=true` or
+`spend_after_validation=true`. TurnEnvelope construction uses the same interpreter
+before signing its action. Missing spend metadata remains false for older packets;
+a present value must be boolean. Python retains structural diagnostics and cadence selection, while
+semantic rules come from the existing Effect runtime. Runtime unavailability
+cannot fall back to a second Python rule. No persisted receipt is rewritten and
+these checks do not grant execution, lease or charging authority.
+
+TypeScript interaction-contract owner 统一提供 Effect 解释器、scoped-override
+投影与 Python 调度仲裁使用的执行一致性规则。delivery 必须有 attempt；quiet
+no-op 不能与必须执行的工作或用户动作并存。terminal、peer-blocked、monitor-only
+模式必须允许 quiet no-op，不得要求动作、允许交付或扣费；已结算模式也不得重新
+要求工作或用户动作、允许交付或扣费。非阻塞通知仍然有效。
+独立 capability intent 保留自己的模式与现有权限。
+
+本次加强瞬时合同校验：类型化消费者开始拒绝此前调度仲裁已拒绝的关闭模式矛盾，
+消费者都拒绝关闭模式的 `spend_allowed_now=true` 或 `spend_after_validation=true`；
+TurnEnvelope 构造在签署动作前也使用同一解释器。旧 packet 缺失扣费字段时仍按
+false 处理，显式提供的值必须是布尔值。Python 保留结构诊断与 cadence
+选择，语义规则来自已有 Effect runtime；运行时不可用时不回退到另一套 Python
+判断。不重写历史回执，也不授予执行、租约或扣费权限。
+
 ## Turn Journal Lens
 
 `interpret_turn_journal` reads an existing fenced Turn journal and returns an
@@ -34,15 +91,19 @@ journal, stored plan, typed settlement identity, host result, and receipt. It
 also validates that completed phases are an ordered transaction prefix and
 exposes retained `committed`, `stopped`, and `failed` journal tombstones.
 
-`request.context.replay_legal` is the replay-legality signal. Identity,
+`request.context.replay_legal` is only the effect-free terminal replay signal. Identity,
 phase-order, and terminal-status failures appear together as stable typed
 violation values in `request.context.violations`; semantic mismatches return a
 blocked observation instead of raising an exception.
 
-`EffectObservation.should_run` remains false and `EffectNext` remains empty.
-Interpretation therefore grants no authority to execute or retry a Turn,
-schedule work, write state, or spend quota. In particular, failed-journal
-recovery with `retry_failed=True` remains owned by the Turn executor.
+`EffectObservation.should_run` remains false and `EffectNext` remains empty, so
+inspection itself never grants effect authority. The same interpreter also
+projects `recovery_decision`, which is the executor's recovery plan: its action,
+whether continuation is allowed, the phase to resume, whether Host must be
+invoked again, a typed reason, and only the checks that participated. The real
+Turn executor consumes that decision before continuing. `replay_legal=false`
+therefore does not mean that an `in_progress` or `scheduler_action_required`
+journal is unrecoverable.
 
 The public read-only consumer is:
 
@@ -54,19 +115,41 @@ loopx turn inspect-journal \
   --format json
 ```
 
+Add `--retry-failed-turn` to evaluate the same explicit failed-Turn retry used
+by `turn run-once`. When the failed Host recorded `resume_session`, inspection
+performs the current read-only Session Binding check; without an explicit retry
+request, the decision reports `failed_retry_not_requested`.
+
+When continuation would invoke Host again, inspection also uses the executor's
+read-only original decision capture check. A missing, altered, or invalid capture
+exits non-zero without effects; restore the original capture before retrying the
+same Turn. Recovery of an already saved Host result and effect-free terminal
+replay do not require that capture, including historical v0 journals.
+
 It resolves only the canonical journal location. There is no arbitrary
 `--journal-path` input. The command validates selectors, takes the existing
 journal lock, schema-checks the stored JSON, and returns the versioned
-`loopx_turn_journal_inspection_v0` projection. That projection allowlists only
-the replay decision, journal status, replay legality, identity-match booleans,
-ordered phase-prefix result, completed phase ids, tombstone retention, typed
-violation ids, and the explicit effect-free marker `effects: []`.
+`loopx_turn_journal_inspection_v1` projection. Version 1 retains every v0 replay
+and integrity field and adds `journal_consistent`, `recovery_decision`, and the
+optional `last_recovery` audit. The audit contains only the adopted public-safe
+plan and its bounded actual status, completed phase ids, and Host-invocation
+boolean. It never contains Host logs, Session content, provider payloads, or
+paths.
+
+Journal consistency is fail-closed over the canonical typed settlement
+identity as well as Journal/envelope lineage and phase ordering. Settlement
+goal, agent, Turn instance, binding, and effect id must all validate and bind to
+the inspected Turn before the shared recovery decision can authorize any
+provider call. In the current Turn driver, the binding is the envelope's
+selected Todo (or adaptive primary Todo override); a different canonical Todo
+identity is still inconsistent and fails closed.
 
 JSON and Markdown render the same projection. They do not expose raw journal,
 plan, host-result, or receipt bodies; request context; capabilities;
 recommended actions; credentials; evidence; or resolved local paths. A
 successfully interpreted `replay_blocked` journal exits zero because replay
-legality is diagnostic data. Invalid selectors, missing journals, malformed
+legality and recoverability are separate diagnostic data. Invalid selectors,
+missing journals, malformed
 JSON, and unsupported schemas exit non-zero.
 
 ## Canonical Example
@@ -104,7 +187,14 @@ The decision is returned as:
 | `effective_action` | Machine-visible effective action |
 | `recommended_action` | Next concrete action text |
 | `action_portfolio` | Primary plus bounded typed fallbacks, when present |
-| `protocol_action_packet.summary` | Compact actor-facing summary |
+
+The quota lens exposes `protocol_summary=null`; typed interaction, lane and
+scheduler contracts supply obligations and next effects. Any supplied
+`protocol_action_packet`, even null or empty, is explicitly unsupported before
+interpretation. The [retirement contract](protocols/protocol-action-packet-decision-v0.md)
+replaces the former historical-read compatibility promise. Existing packet-free
+signatures remain valid; old records are not stripped, migrated or re-signed.
+The shared observation field remains for the separate turn-result family.
 
 `EffectTurn.observation.action_portfolio` is the canonical TypeScript-owned
 observation of this field. Python supplies only scope/capability-admitted todo
@@ -122,8 +212,8 @@ The observation points back into the loop:
 | `execution_mode` | Execution strategy (`serial` / `parallel` / `interleaved`) for an ordered effect program |
 | `scheduler_hint.action` | Scheduler around decision |
 | `scheduler_hint.cadence_class` | Cadence for the next host wake |
-| `scheduler_hint.codex_app.ack_hint.cli_args` | Host ACK effect |
-| `scheduler_hint.codex_app.failure_hint.cli_args` | Host failure effect |
+| `scheduler_hint.app_automation.ack_hint.cli_args` | Host ACK effect |
+| `scheduler_hint.app_automation.failure_hint.cli_args` | Host failure effect |
 
 `EffectTurn.next_effect` is the code lens for this slot. It keeps the
 data-encoded handler visible: the host invokes the CLI actions and settles

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import html
 import json
 import re
 import subprocess
@@ -8,13 +7,24 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ...capabilities.issue_fix.reviewer_notification import (
-    CommandRunner,
     SAFE_LOCAL_KEY_PATTERN,
+    CommandRunner,
     build_reviewer_notification_sink_result,
     reviewer_notification_idempotency_key,
 )
 from ...control_plane.runtime.public_safety import public_safe_compact_text
-
+from .identity_shapes import (
+    LARK_CHAT_ID_PATTERN,
+    LARK_MESSAGE_ID_PATTERN,
+    LARK_OPEN_ID_PATTERN,
+)
+from .outbound import (
+    LarkMention,
+    build_lark_mention_prefix,
+    lark_provider_preview_matches_outbound,
+    lark_readback_matches_outbound,
+    normalize_lark_outbound_text,
+)
 
 LARK_PERMISSION_PATTERN = re.compile(
     r"(?:missing\s+scope|permission|not\s+in\s+(?:the\s+)?chat|"
@@ -25,9 +35,6 @@ LARK_SEARCH_PERMISSION_PATTERN = re.compile(
     r"search:message|missing\s+scope[^\n]*(?:message|search)",
     re.IGNORECASE,
 )
-LARK_DESTINATION_PATTERN = re.compile(r"oc_[A-Za-z0-9_-]+")
-LARK_MEMBER_PATTERN = re.compile(r"ou_[A-Za-z0-9_-]+")
-LARK_MESSAGE_PATTERN = re.compile(r"om_[A-Za-z0-9_-]+")
 
 
 def _normalise_handle(value: Any) -> str | None:
@@ -38,7 +45,7 @@ def _normalise_handle(value: Any) -> str | None:
 def _find_message_id(value: Any) -> str | None:
     if isinstance(value, Mapping):
         candidate = value.get("message_id")
-        if isinstance(candidate, str) and LARK_MESSAGE_PATTERN.fullmatch(candidate):
+        if isinstance(candidate, str) and LARK_MESSAGE_ID_PATTERN.fullmatch(candidate):
             return candidate
         for nested in value.values():
             found = _find_message_id(nested)
@@ -48,6 +55,22 @@ def _find_message_id(value: Any) -> str | None:
         for nested in value:
             found = _find_message_id(nested)
             if found:
+                return found
+    return None
+
+
+def _find_message(value: Any, message_id: str) -> Mapping[str, Any] | None:
+    if isinstance(value, Mapping):
+        if str(value.get("message_id") or "") == message_id:
+            return value
+        for nested in value.values():
+            found = _find_message(nested, message_id)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _find_message(nested, message_id)
+            if found is not None:
                 return found
     return None
 
@@ -78,7 +101,7 @@ def _lark_member_ids(value: Any) -> set[str]:
             for key, child in node.items():
                 if key in {"member_id", "open_id"} and isinstance(child, str):
                     member_id = child.strip()
-                    if LARK_MEMBER_PATTERN.fullmatch(member_id):
+                    if LARK_OPEN_ID_PATTERN.fullmatch(member_id):
                         member_ids.add(member_id)
                 else:
                     visit(child)
@@ -88,6 +111,7 @@ def _lark_member_ids(value: Any) -> set[str]:
 
     visit(value)
     return member_ids
+
 
 def lark_reviewer_notification_sink(
     *,
@@ -157,7 +181,7 @@ def lark_reviewer_notification_sink(
             external_write_authority_asserted=execute,
             blocker="dedicated_bot_identity_required",
         )
-    if not LARK_DESTINATION_PATTERN.fullmatch(destination_id):
+    if not LARK_CHAT_ID_PATTERN.fullmatch(destination_id):
         return build_reviewer_notification_sink_result(
             sink_kind=sink_kind,
             reviewer_handles=[],
@@ -185,7 +209,7 @@ def lark_reviewer_notification_sink(
             identity.get("display_name") or handle,
             limit=80,
         )
-        if not LARK_MEMBER_PATTERN.fullmatch(member_id):
+        if not LARK_OPEN_ID_PATTERN.fullmatch(member_id):
             return build_reviewer_notification_sink_result(
                 sink_kind=sink_kind,
                 reviewer_handles=[],
@@ -474,18 +498,25 @@ def lark_reviewer_notification_sink(
             )
 
     provider_idempotency_key = f"loopx-{key.partition(':')[2][:32]}"
-    mentions = " ".join(
-        f'<at user_id="{member_id}">{html.escape(display_name)}</at>'
-        for _, member_id, display_name in resolved
+    mentions = build_lark_mention_prefix(
+        [
+            LarkMention(
+                identity_kind="open_id",
+                identity=member_id,
+                display_name=display_name,
+            )
+            for _, member_id, display_name in resolved
+        ]
     )
     issue_clause = (
         f"（修复 {', '.join(linked_issue_refs)}）" if linked_issue_refs else ""
     )
     summary = f"：{pr_title}" if pr_title else ""
+    notification_text = normalize_lark_outbound_text(
+        f"{mentions} 请帮忙 review PR #{pr_number}{issue_clause}{summary}。{pr_url}"
+    )
     content = json.dumps(
-        {
-            "text": f"{mentions} 请帮忙 review PR #{pr_number}{issue_clause}{summary}。{pr_url}"
-        },
+        {"text": notification_text},
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -508,6 +539,30 @@ def lark_reviewer_notification_sink(
         "--format",
         "json",
     ]
+    try:
+        preview = runner(send_args + ["--dry-run"])
+    except (OSError, subprocess.SubprocessError):
+        preview = {"returncode": 1}
+    preview_payload = _parse_json_object(preview.get("stdout"))
+    if not (
+        preview.get("returncode") == 0
+        and preview_payload is not None
+        and lark_provider_preview_matches_outbound(
+            outbound_text=notification_text,
+            payload=preview_payload,
+        )
+    ):
+        return build_reviewer_notification_sink_result(
+            sink_kind=sink_kind,
+            reviewer_handles=reviewer_handles,
+            idempotency_key=key,
+            status="gate_required",
+            ok=False,
+            external_write_authority_asserted=True,
+            blocker="lark_notification_provider_preview_mismatch",
+            bot_identity_verified=True,
+            reader_identity_verified=reader_verified,
+        )
     try:
         send = runner(send_args)
     except (OSError, subprocess.SubprocessError):
@@ -577,15 +632,18 @@ def lark_reviewer_notification_sink(
     except (OSError, subprocess.SubprocessError):
         readback = {"returncode": 1}
     readback_payload = _parse_json_object(readback.get("stdout"))
-    readback_text = (
-        json.dumps(readback_payload, ensure_ascii=False, sort_keys=True)
+    readback_message = (
+        _find_message(readback_payload, message_id)
         if readback_payload is not None
-        else ""
+        else None
     )
     verified = bool(
         readback.get("returncode") == 0
-        and message_id in readback_text
-        and pr_url in readback_text
+        and readback_message is not None
+        and lark_readback_matches_outbound(
+            outbound_text=notification_text,
+            message=readback_message,
+        )
     )
     return build_reviewer_notification_sink_result(
         sink_kind=sink_kind,

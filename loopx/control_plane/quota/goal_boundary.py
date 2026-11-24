@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-import json
+from typing import Any, cast
+
 import shlex
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
-
-from ..reward_memory import reward_memory_goal_policy
 
 from ...boundary_authority import checkpointed_boundary_authority_summary
 from ...execution_profile import execution_profile_outcome_floor
 from ...explore_graph import compact_explore_graph_policy
+from ..projects.registry_codec import load_registry
 from ...orchestration import (
     compact_orchestration_policy,
     compact_peer_task_coordination_policy,
 )
 from ...repository_identity import resolve_project_identity
+from ..operator_inbox_binding import operator_inbox_binding
+from ..reward_memory import reward_memory_goal_policy
 from ..todos.contract import (
     normalize_required_capabilities,
     normalize_required_write_scopes,
@@ -33,21 +34,23 @@ def quota_execution_profile_summary(value: Any) -> dict[str, Any] | None:
     if isinstance(must_include, list) and must_include:
         compact["must_include"] = [str(item) for item in must_include[:3]]
     policy = (
-        value.get("degradation_policy")
+        cast(dict[str, Any], value.get("degradation_policy"))
         if isinstance(value.get("degradation_policy"), dict)
         else {}
     )
     if policy.get("small_scale_streak_threshold") is not None:
-        compact["small_scale_streak_threshold"] = policy.get("small_scale_streak_threshold")
+        compact["small_scale_streak_threshold"] = policy.get(
+            "small_scale_streak_threshold"
+        )
     floor = execution_profile_outcome_floor(value)
     if floor:
         outcome_markers = (
-            floor.get("outcome_markers")
+            cast(list[Any], floor.get("outcome_markers"))
             if isinstance(floor.get("outcome_markers"), list)
             else []
         )
         surface_hints = (
-            floor.get("surface_only_hints")
+            cast(list[Any], floor.get("surface_only_hints"))
             if isinstance(floor.get("surface_only_hints"), list)
             else []
         )
@@ -57,7 +60,7 @@ def quota_execution_profile_summary(value: Any) -> dict[str, Any] | None:
             "must_advance": [
                 str(item)
                 for item in (
-                    floor.get("must_advance")
+                    cast(list[Any], floor.get("must_advance"))
                     if isinstance(floor.get("must_advance"), list)
                     else []
                 )[:2]
@@ -76,10 +79,10 @@ def registry_goal_by_id(
         return {}
     registry_path = Path(str(registry_value)).expanduser()
     try:
-        payload = json.loads(registry_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = load_registry(registry_path)
+    except (OSError, ValueError):
         return {}
-    goals = payload.get("goals") if isinstance(payload, dict) else None
+    goals = payload.get("goals")
     if not isinstance(goals, list):
         return {}
     return {
@@ -106,7 +109,7 @@ def _lark_kanban_post_writeback_projection(
     registry_path: Path | None,
 ) -> dict[str, Any]:
     lark_kanban = (
-        control_plane.get("lark_kanban")
+        cast(dict[str, Any], control_plane.get("lark_kanban"))
         if isinstance(control_plane.get("lark_kanban"), dict)
         else {}
     )
@@ -155,6 +158,7 @@ def _registry_boundary_projection(goal: Mapping[str, Any]) -> dict[str, Any]:
     coordination: dict[str, Any] = (
         coordination_value if isinstance(coordination_value, dict) else {}
     )
+    goal_repo = goal.get("repo")
     write_scope_value = coordination.get("write_scope")
     write_scope = write_scope_value if isinstance(write_scope_value, list) else []
     normalized_write_scope: list[str] = []
@@ -162,7 +166,10 @@ def _registry_boundary_projection(goal: Mapping[str, Any]) -> dict[str, Any]:
         scope = str(value).strip()
         if scope and scope not in normalized_write_scope:
             normalized_write_scope.append(scope)
-    boundary_authority = checkpointed_boundary_authority_summary(coordination)
+    boundary_authority = checkpointed_boundary_authority_summary(
+        coordination,
+        goal_repo=goal_repo,
+    )
     if boundary_authority:
         for scope in normalize_required_write_scopes(
             boundary_authority.get("active_write_scope")
@@ -171,15 +178,18 @@ def _registry_boundary_projection(goal: Mapping[str, Any]) -> dict[str, Any]:
                 normalized_write_scope.append(scope)
         boundary["checkpointed_boundary_authority"] = boundary_authority
     if normalized_write_scope:
-        boundary["write_scope"] = normalized_write_scope
+        from ..coordination.configuration import fold_write_scope_subpaths
+
+        boundary["write_scope"] = fold_write_scope_subpaths(
+            normalized_write_scope,
+            goal_repo=goal_repo,
+        )
     available_capabilities = declared_available_capabilities(goal)
     if available_capabilities:
         boundary["available_capabilities"] = available_capabilities
     requires_approval_value = coordination.get("requires_parent_approval")
     requires_approval = (
-        requires_approval_value
-        if isinstance(requires_approval_value, list)
-        else []
+        requires_approval_value if isinstance(requires_approval_value, list) else []
     )
     if requires_approval:
         boundary["requires_parent_approval"] = [
@@ -188,10 +198,44 @@ def _registry_boundary_projection(goal: Mapping[str, Any]) -> dict[str, Any]:
     peer_task_coordination = compact_peer_task_coordination_policy(coordination)
     if peer_task_coordination:
         boundary["peer_task_coordination"] = peer_task_coordination
-    guards = goal.get("guards") if isinstance(goal.get("guards"), list) else []
+    guards = cast(list[Any], goal.get("guards")) if isinstance(goal.get("guards"), list) else []
     if guards:
         boundary["guards"] = [str(value) for value in guards if str(value).strip()]
     return boundary
+
+
+def _reward_memory_enablement_projection(
+    status: Mapping[str, Any],
+) -> dict[str, Any]:
+    fields = (
+        "reason_code",
+        "repair",
+        "isolation_mode",
+        "enablement_receipt_status",
+        "actor_binding_verified",
+        "writability_verified",
+        "exact_readback_verified",
+    )
+    projection = {field: status[field] for field in fields if field in status}
+    if status.get("config_schema_version"):
+        projection["config_schema_version"] = str(status["config_schema_version"])
+    config_runtime_route = status.get("config_runtime_route")
+    if isinstance(config_runtime_route, Mapping):
+        projection["config_runtime_route"] = dict(config_runtime_route)
+    return projection
+
+
+def _reward_memory_automation_projection(
+    status: Mapping[str, Any],
+) -> dict[str, Any]:
+    automation_intent = status.get("automation_intent")
+    host_coverage = status.get("host_coverage")
+    return {
+        "automation_intent": (
+            dict(automation_intent) if isinstance(automation_intent, Mapping) else {}
+        ),
+        "host_coverage": list(host_coverage) if isinstance(host_coverage, list) else [],
+    }
 
 
 def goal_boundary(
@@ -205,31 +249,25 @@ def goal_boundary(
 ) -> dict[str, Any] | None:
     boundary = _registry_boundary_projection(goal)
     control_plane = (
-        goal.get("control_plane")
-        if isinstance(goal.get("control_plane"), dict)
-        else {}
+        cast(dict[str, Any], goal.get("control_plane")) if isinstance(goal.get("control_plane"), dict) else {}
     )
     issue_fix = (
-        control_plane.get("issue_fix")
+        cast(dict[str, Any], control_plane.get("issue_fix"))
         if isinstance(control_plane.get("issue_fix"), dict)
         else {}
     )
     reviewer_notification = (
-        issue_fix.get("reviewer_notification")
+        cast(dict[str, Any], issue_fix.get("reviewer_notification"))
         if isinstance(issue_fix.get("reviewer_notification"), dict)
         else {}
     )
     if reviewer_notification.get("enabled") is True:
-        boundary.setdefault("capabilities", {})[
-            "issue_fix_reviewer_notification"
-        ] = {
+        boundary.setdefault("capabilities", {})["issue_fix_reviewer_notification"] = {
             "enabled": True,
-            "config_pointer_registered": bool(
-                reviewer_notification.get("config_path")
-            ),
+            "config_pointer_registered": bool(reviewer_notification.get("config_path")),
         }
     agent_inboxes = (
-        control_plane.get("lark_event_inboxes")
+        cast(dict[str, Any], control_plane.get("lark_event_inboxes"))
         if isinstance(control_plane.get("lark_event_inboxes"), dict)
         else {}
     )
@@ -237,7 +275,7 @@ def goal_boundary(
     lark_event_inbox = (
         agent_inbox
         if isinstance(agent_inbox, dict)
-        else control_plane.get("lark_event_inbox")
+        else cast(dict[str, Any], control_plane.get("lark_event_inbox"))
         if isinstance(control_plane.get("lark_event_inbox"), dict)
         else {}
     )
@@ -263,7 +301,25 @@ def goal_boundary(
         }
         project = Path(str(goal.get("repo") or "")).expanduser()
         config_path = str(lark_event_inbox.get("config_path") or "").strip()
-        if project.is_dir() and config_path and operator_inbox_urgency_projector:
+        binding = operator_inbox_binding(
+            project=project,
+            config_path=config_path,
+            expected_digest=lark_event_inbox.get("config_digest"),
+        )
+        inbox_capability["binding"] = binding
+        owner_binding_blocked = bool(
+            isinstance(agent_inbox, dict) and binding["attention_required"]
+        )
+        if owner_binding_blocked:
+            inbox_capability.pop("drain_command", None)
+            inbox_capability["urgency"] = {
+                "schema_version": "lark_event_inbox_urgency_v0",
+                "enabled": True,
+                "projection_status": "unavailable",
+                "blocker": "agent_lark_inbox_config_binding_drift",
+                "local_private_content_returned": False,
+            }
+        elif project.is_dir() and config_path and operator_inbox_urgency_projector:
             try:
                 urgency = operator_inbox_urgency_projector(
                     project=project,
@@ -292,7 +348,7 @@ def goal_boundary(
             registry_path=registry_path,
         )
     )
-    reward_memory = reward_memory_goal_policy(goal)
+    reward_memory = reward_memory_goal_policy(goal, agent_id=agent_id)
     if reward_memory["enabled"] and (
         agent_id is None or agent_id in reward_memory["enabled_agents"]
     ):
@@ -330,19 +386,14 @@ def goal_boundary(
                     "automation_projection_source": (
                         "reward_memory_experiment_status_v1"
                     ),
+                    **_reward_memory_automation_projection(
+                        reward_memory_experiment_status
+                    ),
                 }
             )
-            if reward_memory_experiment_status.get("config_schema_version"):
-                reward_capability["config_schema_version"] = str(
-                    reward_memory_experiment_status["config_schema_version"]
-                )
-            config_runtime_route = reward_memory_experiment_status.get(
-                "config_runtime_route"
+            reward_capability.update(
+                _reward_memory_enablement_projection(reward_memory_experiment_status)
             )
-            if isinstance(config_runtime_route, Mapping):
-                reward_capability["config_runtime_route"] = dict(
-                    config_runtime_route
-                )
         if agent_id is not None:
             reward_capability.update(
                 {
@@ -376,19 +427,21 @@ def goal_boundary(
         boundary.setdefault("capabilities", {})["reward_memory"] = reward_capability
     if goal.get("next_probe"):
         boundary["next_probe"] = str(goal.get("next_probe"))
-    if isinstance(goal.get("explore_graph"), dict):
+    if isinstance(goal.get("explore_graph"), dict) or (goal.get("spawn_policy") or {}).get("explore_harness"):
         boundary["explore_graph"] = compact_explore_graph_policy(
-            goal.get("explore_graph")
+            goal.get("explore_graph"), (goal.get("spawn_policy") or {}).get("explore_harness")
         )
-    spawn_policy = goal.get("spawn_policy") if isinstance(goal.get("spawn_policy"), dict) else None
+    spawn_policy = (
+        cast(dict[str, Any], goal.get("spawn_policy")) if isinstance(goal.get("spawn_policy"), dict) else None
+    )
     if spawn_policy is not None:
         orchestration = compact_orchestration_policy(spawn_policy)
         boundary["orchestration"] = orchestration
-        project = str(goal.get("repo") or "").strip()
-        if orchestration.get("spawn_allowed") is True and project:
+        project_ref = str(goal.get("repo") or "").strip()
+        if orchestration.get("spawn_allowed") is True and project_ref:
             try:
                 repository_identity = resolve_project_identity(
-                    project,
+                    project_ref,
                     loopx_project_id=str(goal.get("id") or "").strip() or None,
                 )
             except ValueError:
@@ -396,21 +449,30 @@ def goal_boundary(
             if repository_identity and repository_identity.startswith("git:"):
                 boundary["task_repository"] = repository_identity
     project_asset_source = item if item is not None else goal
-    for policy_source in (goal, project_asset_source):
-        if not isinstance(policy_source, dict):
-            continue
-            break
-    if isinstance(project_asset_source, dict) and project_asset_source.get("project_asset"):
+    if isinstance(project_asset_source, dict) and project_asset_source.get(
+        "project_asset"
+    ):
         project_asset = project_asset_source.get("project_asset")
         if isinstance(project_asset, dict):
             if project_asset.get("stop_condition"):
                 boundary["stop_condition"] = project_asset.get("stop_condition")
             if isinstance(project_asset.get("execution_profile"), dict):
-                boundary["execution_profile"] = quota_execution_profile_boundary_summary(
-                    project_asset["execution_profile"]
+                boundary["execution_profile"] = (
+                    quota_execution_profile_boundary_summary(
+                        project_asset["execution_profile"]
+                    )
                 )
             if isinstance(project_asset.get("orchestration"), dict):
-                boundary["orchestration"] = compact_orchestration_policy(project_asset["orchestration"])
+                boundary["orchestration"] = compact_orchestration_policy(
+                    project_asset["orchestration"]
+                )
+    # Model preferences belong to the current registry, not a stale asset snapshot.
+    if spawn_policy is not None and "orchestration" in boundary:
+        model_config = compact_orchestration_policy(spawn_policy).get("model_config")
+        if model_config is not None:
+            boundary["orchestration"]["model_config"] = model_config
+        else:
+            boundary["orchestration"].pop("model_config", None)
     if boundary:
         boundary["rule"] = "stay_in_scope_or_stop"
         return boundary
@@ -429,33 +491,15 @@ def declared_available_capabilities(source: Any) -> list[str]:
 
     append(source.get("available_capabilities"))
     coordination = (
-        source.get("coordination")
+        cast(dict[str, Any], source.get("coordination"))
         if isinstance(source.get("coordination"), dict)
         else {}
     )
     append(coordination.get("available_capabilities"))
     project_asset = (
-        source.get("project_asset")
+        cast(dict[str, Any], source.get("project_asset"))
         if isinstance(source.get("project_asset"), dict)
         else {}
     )
     append(project_asset.get("available_capabilities"))
-    return capabilities
-
-
-def effective_available_capabilities(
-    runtime_available_capabilities: Any,
-    *,
-    item: dict[str, Any],
-    project_asset: dict[str, Any],
-) -> list[str]:
-    capabilities: list[str] = []
-    for raw in (
-        declared_available_capabilities(item),
-        declared_available_capabilities(project_asset),
-        runtime_available_capabilities,
-    ):
-        for capability in normalize_required_capabilities(raw):
-            if capability not in capabilities:
-                capabilities.append(capability)
     return capabilities

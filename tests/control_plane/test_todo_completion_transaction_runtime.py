@@ -4,6 +4,9 @@ import pytest
 
 from loopx.control_plane import effect_runtime
 from loopx.control_plane.todos import completion_transaction
+from loopx.control_plane.todos.completion_policy import (
+    completion_policy_from_transaction,
+)
 
 
 def _commit_result(**overrides: object) -> dict[str, object]:
@@ -28,6 +31,37 @@ def _commit_result(**overrides: object) -> dict[str, object]:
         "validation_receipt": None,
         **overrides,
     }
+
+
+def _completion_policy_result(**overrides: object) -> dict[str, object]:
+    return {
+        "schema_version": "loopx_todo_completion_policy_result_v0",
+        "effective_claimed_by": "agent-a",
+        "registered_agents": ["agent-a"],
+        "effective_next_claimed_by": "agent-a",
+        "effective_next_excluded_agents": [],
+        "self_merged": False,
+        "linked_successor_id": None,
+        **overrides,
+    }
+
+
+def _completion_policy_failure(**overrides: object) -> dict[str, object]:
+    return {
+        "schema_version": "loopx_todo_completion_policy_failure_v0",
+        "kind": "completion_policy_rejected",
+        "diagnostic_code": "invalid_request",
+        "summary": "completion policy was rejected",
+        **overrides,
+    }
+
+
+def _policy_reject_result(**overrides: object) -> dict[str, object]:
+    return _commit_result(
+        decision="policy_reject",
+        completion_policy_failure=_completion_policy_failure(),
+        **overrides,
+    )
 
 
 def test_python_adapter_sends_one_coarse_transaction(monkeypatch) -> None:
@@ -95,6 +129,180 @@ def test_source_snapshot_detects_completion_authority_drift() -> None:
         snapshot,
         {**todo, "validation_command": "python -m pytest -q"},
     )
+
+
+def test_python_adapter_requires_requested_completion_policy_projection(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+    policy_request = {
+        "schema_version": "loopx_todo_completion_policy_request_v0",
+        "goal_id": "goal-example",
+    }
+
+    def call(method: str, params: dict[str, object]) -> dict[str, object]:
+        captured["method"] = method
+        captured["params"] = params
+        return _commit_result(completion_policy=_completion_policy_result())
+
+    monkeypatch.setattr(completion_transaction, "effect_runtime_result", call)
+    result = completion_transaction.reduce_todo_completion_transaction(
+        todo={"status": "open"},
+        projection_source="materialized",
+        goal_id="goal-example",
+        todo_id="todo_example001",
+        completion_turn_key=None,
+        completion_identity_source=None,
+        no_followup=False,
+        requested_has_successor=True,
+        dry_run=False,
+        completion_policy_request=policy_request,
+    )
+
+    assert result["completion_policy"] == _completion_policy_result()
+    assert captured["params"]["completion_policy_request"] == policy_request
+
+    monkeypatch.setattr(
+        completion_transaction,
+        "effect_runtime_result",
+        lambda _method, _params: _commit_result(),
+    )
+    with pytest.raises(RuntimeError, match="result shape mismatch"):
+        completion_transaction.reduce_todo_completion_transaction(
+            todo={"status": "open"},
+            projection_source="materialized",
+            goal_id="goal-example",
+            todo_id="todo_example001",
+            completion_turn_key=None,
+            completion_identity_source=None,
+            no_followup=False,
+            requested_has_successor=True,
+            dry_run=False,
+            completion_policy_request=policy_request,
+        )
+
+    monkeypatch.setattr(
+        completion_transaction,
+        "effect_runtime_result",
+        lambda _method, _params: _policy_reject_result(),
+    )
+    failure_result = completion_transaction.reduce_todo_completion_transaction(
+        todo={"status": "open"},
+        projection_source="materialized",
+        goal_id="goal-example",
+        todo_id="todo_example001",
+        completion_turn_key=None,
+        completion_identity_source=None,
+        no_followup=False,
+        requested_has_successor=True,
+        dry_run=False,
+        completion_policy_request=policy_request,
+    )
+    assert failure_result["completion_policy_failure"] == (
+        _completion_policy_failure()
+    )
+    assert failure_result["decision"] == "policy_reject"
+
+
+def test_python_adapter_and_typescript_runtime_share_agent_identity_semantics() -> None:
+    policy_request = {
+        "schema_version": "loopx_todo_completion_policy_request_v0",
+        "goal_id": "goal-example",
+        "agent_model": "peer_v1",
+        "claimed_by": "agent\u0085a",
+        "registered_agents": ["agent\u0085a", "agent-b"],
+        "next_claimed_by": "agent\u0085b",
+        "next_agent_todo": "Continue the bounded migration.",
+        "next_continuation_policy": None,
+        "next_excluded_agents": ["agent\u0085a"],
+        "self_merged": False,
+        "evidence": None,
+        "linked_successors": [],
+    }
+
+    result = completion_transaction.reduce_todo_completion_transaction(
+        todo={"status": "open"},
+        projection_source="materialized",
+        goal_id="goal-example",
+        todo_id="todo_example001",
+        completion_turn_key=None,
+        completion_identity_source=None,
+        no_followup=False,
+        requested_has_successor=True,
+        dry_run=False,
+        completion_policy_request=policy_request,
+    )
+
+    assert result["completion_policy"] == _completion_policy_result(
+        registered_agents=["agent-a", "agent-b"],
+        effective_next_claimed_by="agent-b",
+        effective_next_excluded_agents=["agent-a"],
+    )
+
+    continuation_result = completion_transaction.reduce_todo_completion_transaction(
+        todo={"status": "open"},
+        projection_source="materialized",
+        goal_id="goal-example",
+        todo_id="todo_example001",
+        completion_turn_key=None,
+        completion_identity_source=None,
+        no_followup=False,
+        requested_has_successor=True,
+        dry_run=False,
+        completion_policy_request={
+            **policy_request,
+            "next_claimed_by": None,
+            "next_continuation_policy": "\u0085same_agent_non_delivery\u0085",
+            "next_excluded_agents": [],
+            "self_merged": True,
+            "evidence": "\ufeff",
+        },
+    )
+    assert continuation_result["completion_policy"] == _completion_policy_result(
+        registered_agents=["agent-a", "agent-b"],
+        effective_next_claimed_by="agent-a",
+        self_merged=True,
+    )
+
+    rejected_evidence = completion_transaction.reduce_todo_completion_transaction(
+        todo={"status": "open"},
+        projection_source="materialized",
+        goal_id="goal-example",
+        todo_id="todo_example001",
+        completion_turn_key=None,
+        completion_identity_source=None,
+        no_followup=False,
+        requested_has_successor=False,
+        dry_run=False,
+        completion_policy_request={
+            **policy_request,
+            "next_claimed_by": None,
+            "next_agent_todo": None,
+            "next_excluded_agents": [],
+            "self_merged": True,
+            "evidence": "\u0085",
+        },
+    )
+    with pytest.raises(ValueError, match="--self-merged requires --evidence"):
+        completion_policy_from_transaction(rejected_evidence)
+
+    rejected_agent = completion_transaction.reduce_todo_completion_transaction(
+        todo={"status": "open"},
+        projection_source="materialized",
+        goal_id="goal-example",
+        todo_id="todo_example001",
+        completion_turn_key=None,
+        completion_identity_source=None,
+        no_followup=False,
+        requested_has_successor=True,
+        dry_run=False,
+        completion_policy_request={
+            **policy_request,
+            "claimed_by": "\ufeffagent-a",
+        },
+    )
+    with pytest.raises(ValueError, match="public-safe registered agent id"):
+        completion_policy_from_transaction(rejected_agent)
 
 
 @pytest.mark.parametrize(

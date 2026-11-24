@@ -67,11 +67,12 @@ def agent_profile_for_goal(goal: dict[str, Any] | None, agent_id: str | None) ->
 
 
 def load_goal_from_registry(registry_path: Path, goal_id: str) -> dict[str, Any] | None:
-    from .registry import read_json, registry_goals
+    from .history import load_registry
+    from .registry import registry_goals
 
     if not registry_path.exists():
         return None
-    registry = read_json(registry_path)
+    registry = load_registry(registry_path)
     return next(
         (goal for goal in registry_goals(registry) if str(goal.get("id")) == str(goal_id)),
         None,

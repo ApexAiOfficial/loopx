@@ -1,16 +1,23 @@
 # LoopX 采用者登记机制
 
+> [English](../../ADOPTERS.md)
+
 这是一个由项目和用户自愿维护、自己声明的公开目录。登记表示公开关系，不代表
 testimonial、认证、安全审查、支持承诺或 maintainer 背书。
 
-维护者基于公开证据观察的[生态采用清单](../community/ecosystem-adoption.zh-CN.md)
-仍然是独立的证据表面。根目录的 [`ADOPTERS.md`](../../ADOPTERS.md) 用于项目和用户
-主动描述自己的使用，也允许登记计划中或实验中的试用。
+想了解哪些项目正在使用 LoopX 或基于它构建？请查看维护者观察的
+[生态采用清单](../community/ecosystem-adoption.zh-CN.md)，其中分别列出
+[开发工作流与集成](../community/ecosystem-adoption.zh-CN.md#1-工作流与集成)、
+[机制借鉴](../community/ecosystem-adoption.zh-CN.md#2-机制借鉴)及
+[提案与当前限制](../community/ecosystem-adoption.zh-CN.md#3-提案与暂缓采用)。
+这些公开来源的观察集中维护在生态清单；根目录的 [`ADOPTERS.md`](../../ADOPTERS.md)
+记录项目和用户主动描述的使用，也允许登记计划中或实验中的试用。
 
 ## 当前目录
 
-目前还没有公开自报条目。这是有意保持的空状态：只有项目或用户愿意被公开点名时，
-才添加自己。
+目前尚无项目或用户提交自报条目。这只是本目录的登记状态，不是 LoopX 用户数量。
+[生态采用清单](../community/ecosystem-adoption.zh-CN.md) 已记录公开使用证据。
+项目和用户可自愿在根目录表格中添加或确认自己的条目；不会代替项目把观察案例填入自报表。
 
 ## 登记方式
 

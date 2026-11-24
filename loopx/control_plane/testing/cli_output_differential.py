@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
+from ..heartbeat.agent_input import HEARTBEAT_AGENT_INPUT_SCHEMA_VERSION
 from ..quota.turn_envelope import (
     ACTION_SIGNATURE_COVERAGE_V0,
     ACTION_SIGNATURE_COVERAGE_V1,
     ACTION_SIGNATURE_COVERAGE_V2,
+    ACTION_SIGNATURE_COVERAGE_V3,
+    ACTION_SIGNATURE_COVERAGE_V4,
+    ACTION_SIGNATURE_COVERAGE_V5,
 )
 
 
@@ -15,6 +20,12 @@ CLI_OUTPUT_PROBE_SCHEMA_VERSION = "loopx_cli_output_probe_v0"
 CLI_OUTPUT_FIXTURE_CONTRACT_VERSION = "loopx_cli_output_public_fixture_v0"
 CLI_OUTPUT_DIFFERENTIAL_SCHEMA_VERSION = "loopx_cli_output_differential_v0"
 ACTION_PORTFOLIO_SCHEMA_VERSION_V0 = "quota_action_portfolio_v0"
+ACTION_PORTFOLIO_SCHEMA_VERSION_V1 = "quota_action_portfolio_v1"
+ACTION_PORTFOLIO_SCHEMA_VERSION_V2 = "quota_action_portfolio_v2"
+PLANNING_HORIZON_SCHEMA_VERSION_V0 = "quota_planning_horizon_v0"
+GUIDED_TODO_DELTA_SCHEMA_VERSION_V0 = "loopx_guided_todo_delta_v0"
+PLANNING_INVENTORY_DETAIL_SCHEMA_VERSION_V0 = "todo_planning_inventory_detail_v0"
+TODO_WORK_COUNTS_SCHEMA_VERSION_V0 = "todo_work_counts_v0"
 
 Metric = Literal["chars", "utf8_bytes", "lines", "compact_payload_chars"]
 
@@ -100,15 +111,239 @@ _GROWTH_ALLOWANCE_BY_POLICY: dict[str, GrowthAllowance] = {
     ),
 }
 
-# action_dimensions_v2 adds the bounded, executable fallback portfolio to the
-# signed hot path.  This allowance applies only while a base row migrates from
-# v0/v1 to v2; once v2 is the baseline, ordinary policy budgets apply again.
+# quota_action_portfolio_v1/v2 migrations add a bounded executable portfolio
+# and then inline the small action context needed to interpret each choice.
+# This allowance applies only to a declared schema transition; once v2 is the
+# baseline, ordinary policy budgets apply again.
 _ACTION_PORTFOLIO_V0_MIGRATION_GROWTH_ALLOWANCE: dict[Metric, int] = {
+    "chars": 1_600,
+    "utf8_bytes": 1_600,
+    "lines": 42,
+    "compact_payload_chars": 1_280,
+}
+
+# quota_planning_horizon_v0 adds one bounded read-only strategic context to the
+# default agent path and TurnEnvelope. This allowance applies only while the
+# schema and action-signature coverage move to v0/v3; after merge the candidate
+# becomes the new baseline and ordinary growth limits apply again.
+# Default Goal + flat work context costs 2,940 compact characters on the
+# matched multi-Agent fixture; preserve its work visibility and completeness.
+_PLANNING_HORIZON_V0_MIGRATION_GROWTH_ALLOWANCE: dict[Metric, int] = {
+    "chars": 3_200,
+    "utf8_bytes": 3_200,
+    "lines": 84,
+    "compact_payload_chars": 3_000,
+}
+
+# Capability-owned context adds one bounded signed planning contribution. Only
+# an explicit older-coverage -> v4 transition receives this allowance; v4 -> v4
+# keeps the ordinary output budget. Absolute probe ceilings remain unchanged.
+_AGENT_CONTEXT_V4_MIGRATION_GROWTH_ALLOWANCE: dict[Metric, int] = {
+    "chars": 2_048,
+    "utf8_bytes": 2_048,
+    "lines": 48,
+    "compact_payload_chars": 1_664,
+}
+
+# todo_planning_inventory_detail_v0 adds planning/claim semantics only to the
+# explicit agent-Todo detail variants. The allowance is bound to the declared
+# none-to-v0 schema migration; after merge the ordinary cold-path budget
+# applies again.
+_PLANNING_INVENTORY_DETAIL_V0_MIGRATION_GROWTH_ALLOWANCE: dict[Metric, int] = {
     "chars": 1_280,
     "utf8_bytes": 1_280,
     "lines": 36,
-    "compact_payload_chars": 896,
+    "compact_payload_chars": 1_024,
 }
+
+# Source-complete Todo counts add one compact scope/completeness envelope to
+# the existing Todo, status, and quota projections. The allowance is bound to
+# the none-to-v0 schema transition; v0-to-v0 changes use the ordinary budgets.
+_TODO_WORK_COUNTS_V0_MIGRATION_GROWTH_ALLOWANCE: dict[Metric, int] = {
+    "chars": 320,
+    "utf8_bytes": 320,
+    "lines": 10,
+    "compact_payload_chars": 192,
+}
+
+# Explicit registry/runtime-root routing repeats one bounded command argument per
+# executable action. The allowance covers the prefix and its JSON projection;
+# it is per newly observed route, not per row, so unrelated output growth still
+# fails under the normal hot-path policy.
+_COMMAND_ROUTE_GROWTH_PER_ROUTE: dict[Metric, int] = {
+    "chars": 160,
+    "utf8_bytes": 160,
+    "lines": 0,
+    "compact_payload_chars": 160,
+}
+
+# Automatic Reward Memory adds one fail-closed reflection/validation contract
+# to the installed heartbeat body.  The allowance is bound to an exact
+# none-to-v1 prompt revision, applies only to heartbeat rows, and keeps the
+# absolute surface ceilings intact.  Once v1 is the baseline, normal budgets
+# apply again.
+_REWARD_MEMORY_OUTCOME_PROMPT_V1_MIGRATION_ALLOWANCE: dict[Metric, int] = {
+    "chars": 640,
+    "utf8_bytes": 640,
+    "lines": 5,
+    "compact_payload_chars": 640,
+}
+
+# Replacing fixed Chinese heartbeat instructions with user-language policy
+# grows the installed prompt once. These per-mode limits cover the measured
+# same-fixture base/head delta plus 24-28 characters of variation; the brief
+# renderer also adds five lines. Absolute output ceilings still apply, and
+# once v1 is in the baseline ordinary growth limits apply again.
+_HEARTBEAT_USER_LANGUAGE_V1_MIGRATION_ALLOWANCE: dict[str, dict[Metric, int]] = {
+    "heartbeat_prompt_thin": {"chars": 400, "compact_payload_chars": 400},
+    "heartbeat_prompt_brief": {
+        "chars": 720,
+        "lines": 6,
+        "compact_payload_chars": 720,
+    },
+    "heartbeat_prompt_compact": {"chars": 288, "compact_payload_chars": 288},
+    "heartbeat_prompt_full": {"chars": 288, "compact_payload_chars": 288},
+}
+
+# Two reviewed causes grow the Turn plan readback once, and both are consequences
+# of the same declared behavior change:
+#
+# 1. the plan adds one bounded managed-executor binding so a caller sees which
+#    executor a planned Turn would use and whether it can launch here, instead
+#    of inferring it from the host id;
+# 2. the default host becomes the managed `dsh` host, so the plan's host
+#    projection, scheduler execution context, and controller-owned
+#    `next_cli_actions` rendering change with it (a bounded-headless plan hands
+#    the next steps back to the outer controller instead of to the agent CLI
+#    loop).
+#
+# The allowance is bound to the rejected-then-accepted
+# none-to-v0 transition and to the Turn surfaces that quote it; quota, status,
+# and every other agent-facing surface keep the ordinary budget. It is one
+# time: once v0 is the baseline a v0-to-v0 change receives no allowance.
+_TURN_HOST_AND_MANAGED_EXECUTOR_BINDING_V0_GROWTH_ALLOWANCE: dict[Metric, int] = {
+    "chars": 832,
+    "utf8_bytes": 832,
+    "lines": 14,
+    "compact_payload_chars": 768,
+}
+
+_MANAGED_EXECUTOR_BINDING_SURFACES = frozenset(
+    {
+        "loopx_turn_plan",
+        "loopx_turn_plan_transaction_detail",
+        "loopx_turn_run_once_preview",
+    }
+)
+
+
+def _turn_host_and_managed_executor_binding_allowance(
+    row_id: str,
+    base: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    metric: Metric,
+) -> int:
+    surface = row_id.partition("/")[2].partition("/")[0]
+    if (
+        row_id.startswith(("surface/", "variant/"))
+        and surface in _MANAGED_EXECUTOR_BINDING_SURFACES
+        and base.get("managed_executor_binding_revision") is None
+        and candidate.get("managed_executor_binding_revision")
+        == "managed_executor_binding_v0"
+    ):
+        return _TURN_HOST_AND_MANAGED_EXECUTOR_BINDING_V0_GROWTH_ALLOWANCE[metric]
+    return 0
+
+
+def _reward_memory_outcome_prompt_allowance(
+    row_id: str,
+    base: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    metric: Metric,
+) -> int:
+    surface = row_id.partition("/")[2].partition("/")[0]
+    if (
+        row_id.startswith(("surface/", "variant/"))
+        and surface
+        in {
+            "heartbeat_prompt_thin",
+            "heartbeat_prompt_brief",
+            "heartbeat_prompt_compact",
+            "heartbeat_prompt_full",
+        }
+        and base.get("reward_memory_outcome_prompt_revision") is None
+        and candidate.get("reward_memory_outcome_prompt_revision")
+        == "reward_memory_outcome_prompt_v1"
+    ):
+        return _REWARD_MEMORY_OUTCOME_PROMPT_V1_MIGRATION_ALLOWANCE[metric]
+    return 0
+
+
+def _heartbeat_peer_admission_migration_allowance(
+    row_id: str, base: dict[str, Any], candidate: dict[str, Any], metric: Metric,
+) -> int:
+    # Readable peer admission adds 117 chars on the same CLI fixture. Admit
+    # this reviewed transition once; ordinary growth limits resume at v1.
+    if (
+        row_id.startswith("surface/heartbeat_prompt_thin/")
+        and base.get("heartbeat_peer_admission_prompt_revision") is None
+        and candidate.get("heartbeat_peer_admission_prompt_revision")
+        == "heartbeat_peer_admission_v1"
+        and metric in {"chars", "utf8_bytes", "compact_payload_chars"}
+    ):
+        return 160
+    return 0
+
+
+def _heartbeat_user_language_migration_allowance(
+    row_id: str,
+    base: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    metric: Metric,
+) -> int:
+    surface = row_id.partition("/")[2].partition("/")[0]
+    if (
+        row_id.startswith(("surface/", "variant/"))
+        and base.get("heartbeat_user_language_prompt_revision") is None
+        and candidate.get("heartbeat_user_language_prompt_revision")
+        == "heartbeat_user_language_v1"
+    ):
+        return _HEARTBEAT_USER_LANGUAGE_V1_MIGRATION_ALLOWANCE.get(surface, {}).get(
+            metric, 0
+        )
+    return 0
+
+
+# loopx_guided_todo_delta_v0 adds the continuation-aware Todo authoring
+# decision contract (reuse/update/link_successor/add_new plus a bounded
+# runnable-frontier summary) to the guided start-goal packet when an
+# existing-Agent takeover is projected. The allowance is bound to the
+# declared none-to-v0 schema migration; after merge the ordinary
+# start_goal_guided growth budgets apply again.
+_GUIDED_TODO_DELTA_V0_MIGRATION_GROWTH_ALLOWANCE: dict[Metric, int] = {
+    "chars": 512,
+    "utf8_bytes": 512,
+    "lines": 16,
+    "compact_payload_chars": 448,
+}
+
+
+def _command_route_growth_allowances(
+    base: dict[str, Any], candidate: dict[str, Any]
+) -> tuple[dict[str, int], dict[Metric, int]]:
+    additions: dict[str, int] = {}
+    for option in ("runtime_root", "registry"):
+        field = f"{option}_command_route_count"
+        before, after = base.get(field), candidate.get(field)
+        # Missing, malformed or negative observations never grant an allowance.
+        if type(before) is int and type(after) is int and 0 <= before < after:
+            additions[option] = after - before
+    if not additions:
+        return {}, {}
+    return additions, {
+        metric: sum(additions.values()) * allowance
+        for metric, allowance in _COMMAND_ROUTE_GROWTH_PER_ROUTE.items()
+    }
 
 
 def _rows_by_id(receipt: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -146,6 +381,30 @@ def _removed(base: dict[str, Any], candidate: dict[str, Any], field: str) -> lis
     return sorted(base_values - candidate_values)
 
 
+def _has_decision_evidence(row: dict[str, Any]) -> bool:
+    paths = set(row.get("json_shape_paths") or [])
+    return any(path.endswith(".replan_context.core_goal") and
+               path.removesuffix("core_goal") + "evidence" in paths and
+               path.removesuffix("core_goal") + "coverage_ledger" in paths for path in paths)
+
+
+def _decision_evidence_migration_allowance(base: dict[str, Any], candidate: dict[str, Any], metric: Metric) -> int:
+    # One-time, measured transition from coverage-only to dense decision context.
+    # Future dense->dense edits and ordinary guard rows keep their original budget.
+    if candidate.get("format") != "json" or _has_decision_evidence(base) or not _has_decision_evidence(candidate):
+        return 0
+    row_id = str(candidate["row_id"])
+    if row_id == "surface/quota_should_run/crowded/json":
+        limits = (7_000, 7_000, 96, 6_000)
+    elif row_id == "surface/diagnose/crowded/json":
+        limits = (15_000, 15_000, 190, 12_000)
+    elif row_id == "variant/review_packet_full/small/json":
+        limits = (800, 800, 24, 650)
+    else:
+        return 0
+    return dict(zip(("chars", "utf8_bytes", "lines", "compact_payload_chars"), limits))[metric]
+
+
 def _action_signature_migration(
     base: dict[str, Any], candidate: dict[str, Any]
 ) -> str | None:
@@ -155,6 +414,18 @@ def _action_signature_migration(
         (ACTION_SIGNATURE_COVERAGE_V0, ACTION_SIGNATURE_COVERAGE_V1),
         (ACTION_SIGNATURE_COVERAGE_V0, ACTION_SIGNATURE_COVERAGE_V2),
         (ACTION_SIGNATURE_COVERAGE_V1, ACTION_SIGNATURE_COVERAGE_V2),
+        (ACTION_SIGNATURE_COVERAGE_V0, ACTION_SIGNATURE_COVERAGE_V3),
+        (ACTION_SIGNATURE_COVERAGE_V1, ACTION_SIGNATURE_COVERAGE_V3),
+        (ACTION_SIGNATURE_COVERAGE_V2, ACTION_SIGNATURE_COVERAGE_V3),
+        (ACTION_SIGNATURE_COVERAGE_V0, ACTION_SIGNATURE_COVERAGE_V4),
+        (ACTION_SIGNATURE_COVERAGE_V1, ACTION_SIGNATURE_COVERAGE_V4),
+        (ACTION_SIGNATURE_COVERAGE_V2, ACTION_SIGNATURE_COVERAGE_V4),
+        (ACTION_SIGNATURE_COVERAGE_V3, ACTION_SIGNATURE_COVERAGE_V4),
+        (ACTION_SIGNATURE_COVERAGE_V0, ACTION_SIGNATURE_COVERAGE_V5),
+        (ACTION_SIGNATURE_COVERAGE_V1, ACTION_SIGNATURE_COVERAGE_V5),
+        (ACTION_SIGNATURE_COVERAGE_V2, ACTION_SIGNATURE_COVERAGE_V5),
+        (ACTION_SIGNATURE_COVERAGE_V3, ACTION_SIGNATURE_COVERAGE_V5),
+        (ACTION_SIGNATURE_COVERAGE_V4, ACTION_SIGNATURE_COVERAGE_V5),
     }
     if not (
         isinstance(base_coverages, list)
@@ -174,11 +445,765 @@ def _action_portfolio_schema_migration(
 ) -> str | None:
     base_versions = base.get("action_portfolio_schema_versions")
     candidate_versions = candidate.get("action_portfolio_schema_versions")
-    if base_versions == [] and candidate_versions == [
-        ACTION_PORTFOLIO_SCHEMA_VERSION_V0
-    ]:
-        return f"none -> {ACTION_PORTFOLIO_SCHEMA_VERSION_V0}"
+    allowed_migrations = {
+        ((), (ACTION_PORTFOLIO_SCHEMA_VERSION_V0,)),
+        ((), (ACTION_PORTFOLIO_SCHEMA_VERSION_V1,)),
+        ((), (ACTION_PORTFOLIO_SCHEMA_VERSION_V2,)),
+        (
+            (ACTION_PORTFOLIO_SCHEMA_VERSION_V0,),
+            (ACTION_PORTFOLIO_SCHEMA_VERSION_V1,),
+        ),
+        (
+            (ACTION_PORTFOLIO_SCHEMA_VERSION_V0,),
+            (ACTION_PORTFOLIO_SCHEMA_VERSION_V2,),
+        ),
+        (
+            (ACTION_PORTFOLIO_SCHEMA_VERSION_V1,),
+            (ACTION_PORTFOLIO_SCHEMA_VERSION_V2,),
+        ),
+    }
+    migration = (tuple(base_versions or []), tuple(candidate_versions or []))
+    if migration in allowed_migrations:
+        before = base_versions[0] if base_versions else "none"
+        after = candidate_versions[0] if candidate_versions else "none"
+        return f"{before} -> {after}"
     return None
+
+
+def _planning_horizon_schema_migration(
+    base: dict[str, Any], candidate: dict[str, Any]
+) -> str | None:
+    base_versions = tuple(base.get("planning_horizon_schema_versions") or [])
+    candidate_versions = tuple(candidate.get("planning_horizon_schema_versions") or [])
+    if base_versions == () and candidate_versions == (
+        PLANNING_HORIZON_SCHEMA_VERSION_V0,
+    ):
+        return f"none -> {PLANNING_HORIZON_SCHEMA_VERSION_V0}"
+    return None
+
+
+def _guided_todo_delta_schema_migration(
+    base: dict[str, Any], candidate: dict[str, Any]
+) -> str | None:
+    base_versions = tuple(base.get("guided_todo_delta_schema_versions") or [])
+    candidate_versions = tuple(candidate.get("guided_todo_delta_schema_versions") or [])
+    if base_versions == () and candidate_versions == (
+        GUIDED_TODO_DELTA_SCHEMA_VERSION_V0,
+    ):
+        return f"none -> {GUIDED_TODO_DELTA_SCHEMA_VERSION_V0}"
+    return None
+
+
+def _planning_inventory_detail_schema_migration(
+    base: dict[str, Any], candidate: dict[str, Any]
+) -> str | None:
+    base_versions = tuple(base.get("planning_inventory_detail_schema_versions") or [])
+    candidate_versions = tuple(
+        candidate.get("planning_inventory_detail_schema_versions") or []
+    )
+    if base_versions == () and candidate_versions == (
+        PLANNING_INVENTORY_DETAIL_SCHEMA_VERSION_V0,
+    ):
+        return f"none -> {PLANNING_INVENTORY_DETAIL_SCHEMA_VERSION_V0}"
+    return None
+
+
+def _todo_work_counts_schema_migration(
+    base: dict[str, Any], candidate: dict[str, Any]
+) -> str | None:
+    base_versions = tuple(base.get("todo_work_counts_schema_versions") or [])
+    candidate_versions = tuple(candidate.get("todo_work_counts_schema_versions") or [])
+    if base_versions == () and candidate_versions == (TODO_WORK_COUNTS_SCHEMA_VERSION_V0,):
+        return f"none -> {TODO_WORK_COUNTS_SCHEMA_VERSION_V0}"
+    return None
+
+
+@dataclass(frozen=True)
+class _SchemaMigrationState:
+    signature_changed: bool
+    signature_migration: str | None
+    portfolio_schema_changed: bool
+    portfolio_schema_migration: str | None
+    horizon_schema_changed: bool
+    horizon_schema_migration: str | None
+    inventory_detail_schema_changed: bool
+    inventory_detail_schema_migration: str | None
+    guided_todo_delta_schema_changed: bool
+    guided_todo_delta_schema_migration: str | None
+    todo_work_counts_schema_changed: bool
+    todo_work_counts_schema_migration: str | None
+    portfolio_growth_migration: bool
+    horizon_growth_migration: bool
+    agent_context_growth_migration: bool
+    inventory_detail_growth_migration: bool
+    guided_todo_delta_growth_migration: bool
+    todo_work_counts_growth_migration: bool
+
+
+def _schema_migration_state(
+    base: dict[str, Any], candidate: dict[str, Any], *, output_format: str
+) -> _SchemaMigrationState:
+    base_signature = base.get("action_signature_sha256")
+    signature_changed = bool(
+        base_signature and candidate.get("action_signature_sha256") != base_signature
+    )
+    signature_migration = (
+        _action_signature_migration(base, candidate) if signature_changed else None
+    )
+    base_portfolio_versions = base.get("action_portfolio_schema_versions")
+    candidate_portfolio_versions = candidate.get("action_portfolio_schema_versions")
+    portfolio_schema_changed = base_portfolio_versions != candidate_portfolio_versions
+    portfolio_schema_migration = (
+        _action_portfolio_schema_migration(base, candidate)
+        if portfolio_schema_changed
+        else None
+    )
+    base_horizon_versions = base.get("planning_horizon_schema_versions")
+    candidate_horizon_versions = candidate.get("planning_horizon_schema_versions")
+    horizon_schema_changed = base_horizon_versions != candidate_horizon_versions
+    horizon_schema_migration = (
+        _planning_horizon_schema_migration(base, candidate)
+        if horizon_schema_changed
+        else None
+    )
+    base_inventory_detail_versions = base.get(
+        "planning_inventory_detail_schema_versions"
+    )
+    candidate_inventory_detail_versions = candidate.get(
+        "planning_inventory_detail_schema_versions"
+    )
+    inventory_detail_schema_changed = (
+        base_inventory_detail_versions != candidate_inventory_detail_versions
+    )
+    inventory_detail_schema_migration = (
+        _planning_inventory_detail_schema_migration(base, candidate)
+        if inventory_detail_schema_changed
+        else None
+    )
+    guided_todo_delta_schema_changed = tuple(
+        base.get("guided_todo_delta_schema_versions") or []
+    ) != tuple(candidate.get("guided_todo_delta_schema_versions") or [])
+    guided_todo_delta_schema_migration = (
+        _guided_todo_delta_schema_migration(base, candidate)
+        if guided_todo_delta_schema_changed
+        else None
+    )
+    todo_work_counts_schema_changed = tuple(
+        base.get("todo_work_counts_schema_versions") or []
+    ) != tuple(candidate.get("todo_work_counts_schema_versions") or [])
+    todo_work_counts_schema_migration = (
+        _todo_work_counts_schema_migration(base, candidate)
+        if todo_work_counts_schema_changed
+        else None
+    )
+    return _SchemaMigrationState(
+        signature_changed=signature_changed,
+        signature_migration=signature_migration,
+        portfolio_schema_changed=portfolio_schema_changed,
+        portfolio_schema_migration=portfolio_schema_migration,
+        horizon_schema_changed=horizon_schema_changed,
+        horizon_schema_migration=horizon_schema_migration,
+        inventory_detail_schema_changed=inventory_detail_schema_changed,
+        inventory_detail_schema_migration=inventory_detail_schema_migration,
+        guided_todo_delta_schema_changed=guided_todo_delta_schema_changed,
+        guided_todo_delta_schema_migration=guided_todo_delta_schema_migration,
+        todo_work_counts_schema_changed=todo_work_counts_schema_changed,
+        todo_work_counts_schema_migration=todo_work_counts_schema_migration,
+        portfolio_growth_migration=bool(
+            output_format == "json"
+            and (
+                portfolio_schema_migration
+                or (
+                    signature_migration
+                    and signature_migration.endswith(
+                        f" -> {ACTION_SIGNATURE_COVERAGE_V2}"
+                    )
+                )
+            )
+        ),
+        horizon_growth_migration=bool(
+            output_format == "json"
+            and (
+                horizon_schema_migration
+                or (
+                    signature_migration
+                    and signature_migration.endswith(
+                        f" -> {ACTION_SIGNATURE_COVERAGE_V3}"
+                    )
+                )
+            )
+        ),
+        agent_context_growth_migration=bool(
+            output_format == "json"
+            and signature_migration
+            and signature_migration.endswith(f" -> {ACTION_SIGNATURE_COVERAGE_V4}")
+        ),
+        inventory_detail_growth_migration=bool(
+            output_format == "json" and inventory_detail_schema_migration
+        ),
+        guided_todo_delta_growth_migration=bool(
+            output_format == "json" and guided_todo_delta_schema_migration
+        ),
+        todo_work_counts_growth_migration=bool(
+            output_format == "json" and todo_work_counts_schema_migration
+        ),
+    )
+
+
+def _schema_migration_growth_allowance(
+    migration: _SchemaMigrationState,
+    metric: Metric,
+) -> int:
+    allowances: list[int] = []
+    if migration.portfolio_growth_migration:
+        allowances.append(_ACTION_PORTFOLIO_V0_MIGRATION_GROWTH_ALLOWANCE[metric])
+    if migration.horizon_growth_migration:
+        allowances.append(_PLANNING_HORIZON_V0_MIGRATION_GROWTH_ALLOWANCE[metric])
+    if migration.agent_context_growth_migration:
+        allowances.append(_AGENT_CONTEXT_V4_MIGRATION_GROWTH_ALLOWANCE[metric])
+    if migration.inventory_detail_growth_migration:
+        allowances.append(
+            _PLANNING_INVENTORY_DETAIL_V0_MIGRATION_GROWTH_ALLOWANCE[metric]
+        )
+    if migration.guided_todo_delta_growth_migration:
+        allowances.append(_GUIDED_TODO_DELTA_V0_MIGRATION_GROWTH_ALLOWANCE[metric])
+    if migration.todo_work_counts_growth_migration:
+        allowances.append(_TODO_WORK_COUNTS_V0_MIGRATION_GROWTH_ALLOWANCE[metric])
+    return max(allowances, default=0)
+
+
+# The unchanged status matrix adds 2,801 pretty JSON chars / 102 lines /
+# 1,910 compact chars for five source rows. Quota should-run adds 2,617 JSON
+# chars or 167 Markdown chars for its inherited and direct source rows. This
+# reviewed one-time transition leaves headroom without changing absolute
+# ceilings or ordinary v0-to-v0 growth.
+_PROJECTION_ENVELOPE_V0_MIGRATION_ALLOWANCE = GrowthAllowance(
+    ratio=0,
+    json={"chars": 3_000, "utf8_bytes": 3_000, "lines": 110, "compact_payload_chars": 2_048},
+    markdown={"chars": 192, "utf8_bytes": 224, "lines": 3, "compact_payload_chars": 0},
+)
+_QUOTA_PROJECTION_ENVELOPE_V0_MIGRATION_ALLOWANCE = GrowthAllowance(
+    ratio=0,
+    json={"chars": 3_000, "utf8_bytes": 3_000, "lines": 110, "compact_payload_chars": 2_800},
+    markdown={"chars": 192, "utf8_bytes": 224, "lines": 3, "compact_payload_chars": 0},
+)
+# The unchanged 18-row Todo matrix adds 783–854 JSON chars and no lines.
+# Source freshness and omitted-work coverage are useful; Markdown is unchanged.
+_TODO_PROJECTION_ENVELOPE_V0_MIGRATION_ALLOWANCE: dict[Metric, int] = {
+    "chars": 896, "utf8_bytes": 896, "lines": 0, "compact_payload_chars": 896,
+}
+
+
+def _complete_turn_plan_migration(base: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    """One declared v0 -> v1 plan transition with unchanged measured controls."""
+    row = base.get("row_id")
+    before, after = base.get("turn_plan_controls"), candidate.get("turn_plan_controls")
+    return bool(row == candidate.get("row_id") and base.get("format") == candidate.get("format") == "json"
+        and row in {"surface/loopx_turn_plan/small/json", "surface/loopx_turn_plan/crowded/json",
+                    "surface/loopx_turn_plan/multi_agent/json", "variant/loopx_turn_plan_transaction_detail/small/json"}
+        and isinstance(before, dict) and isinstance(after, dict)
+        and before.get("plan_version") == "loopx_turn_plan_v0" and after.get("plan_version") == "loopx_turn_plan_v1"
+        and isinstance(before.get("controls_sha256"), str) and len(before["controls_sha256"]) == 64
+        and before["controls_sha256"] == after.get("controls_sha256")
+        and base.get("output_contract_version") is None
+        and candidate.get("output_contract_version") == ("loopx_turn_plan_v1" if row.startswith("variant/") else None))
+
+
+def _matching_quota_controls(base: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    before, after = base.get("quota_controls"), candidate.get("quota_controls")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    fields = before.get("field_sha256")
+    # The frozen probe owns the source-field inventory; its independent tests
+    # pin every field and mutation. Compare its bounded witness here without
+    # creating another inventory/consumer of retired source fields.
+    return bool(isinstance(fields, dict) and len(fields) == 19
+        and all(isinstance(key, str) and key for key in fields)
+        and all(isinstance(value, str) and len(value) == 64 for value in fields.values())
+        and fields == after.get("field_sha256")
+        and isinstance(before.get("controls_sha256"), str) and len(before["controls_sha256"]) == 64
+        and before["controls_sha256"] == after.get("controls_sha256"))
+
+
+def _complete_quota_source_migration(base: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    """Qualify this declared carrier transition, not arbitrary or later growth.
+
+    The fixture compares 19 original control values, not a schema name alone.
+    This does not certify full instruction equivalence, recovery or model use.
+    """
+    formats = {"json", "markdown"}
+    variants = {
+        "quota_should_run_scheduler_detail", "quota_should_run_todo_summary_detail",
+        "quota_should_run_user_todo_summary_detail", "quota_should_run_goal_boundary_detail",
+        "quota_should_run_vision_detail", "quota_should_run_all_detail",
+    }
+    aliases = {
+        "quota_should_run_turn_envelope": {"json", "markdown"},
+        "quota_should_run_turn_envelope_blocking_user_gate": {"json"},
+        "quota_should_run_turn_envelope_multi_subagent": {"json"},
+    }
+    scenario, output_format = base.get("scenario"), base.get("format")
+    variant = base.get("variant_id")
+    alias_variant = isinstance(variant, str) and variant in aliases and output_format in aliases[variant]
+    source_schema = (base.get("quota_controls") or {}).get("source_schema")
+    legacy = alias_variant and source_schema == "loopx_turn_envelope_v0"
+    allowed_variant = variant in variants or alias_variant
+    policy = "explicit_opt_in_cold_path" if variant else "absolute_hot_path"
+    row = (f"variant/{variant}/{scenario}/{output_format}" if variant
+           else f"surface/quota_should_run/{scenario}/{output_format}")
+    if not (base.get("row_id") == candidate.get("row_id") == row
+        and base.get("surface_id") == candidate.get("surface_id") == "quota_should_run"
+        and base.get("variant_id") == candidate.get("variant_id")
+        and scenario == candidate.get("scenario") and scenario in {"small", "crowded", "multi_agent"}
+        and (scenario == "small" if variant else True)
+        and output_format == candidate.get("format") and output_format in formats
+        and (not variant or allowed_variant)
+        and base.get("qualification_policy") == candidate.get("qualification_policy") == policy
+        and base.get("output_contract_version") is None
+        and candidate.get("output_contract_version") == "loopx_turn_envelope_v1"
+        and tuple(base.get("projection_envelope_schema_versions") or [])
+            == (() if legacy else ("loopx_projection_envelope_v0",))
+        and tuple(candidate.get("projection_envelope_schema_versions") or [])
+            == ("loopx_projection_envelope_v0",)
+        and base.get("markdown_anchor") == ("# LoopX Turn Envelope" if legacy else "# LoopX Quota Should Run")
+        and candidate.get("markdown_anchor") == "# LoopX Turn Envelope"
+        and _matching_quota_controls(base, candidate)):
+        return False
+    return (source_schema == ("loopx_turn_envelope_v0" if legacy else None)
+            and candidate["quota_controls"].get("source_schema") == "loopx_turn_envelope_v1")
+
+
+def _complete_quota_source_allowance(base: dict[str, Any], candidate: dict[str, Any]) -> dict[Metric, int]:
+    if not _complete_quota_source_migration(base, candidate):
+        return {}
+    # Same frozen ef099ae3 caller: full Goal material moves into this source;
+    # Markdown carries every field. Absolute ceilings still apply. A v1 -> v1
+    # change, altered control/material witness or unrelated row gets no waiver.
+    legacy = base["quota_controls"]["source_schema"] == "loopx_turn_envelope_v0"
+    if legacy:
+        chars = 16_640 if base["format"] == "json" else 23_296
+    elif base["format"] == "json":
+        chars = {"small": 2_048, "crowded": 11_264, "multi_agent": 4_608}[base["scenario"]]
+    else:
+        chars = 19_456 if base.get("variant_id") else {"small": 18_432, "crowded": 46_336, "multi_agent": 24_064}[base["scenario"]]
+    return {"chars": chars, "utf8_bytes": chars,
+            **({"compact_payload_chars": chars} if base["format"] == "json" else {"lines": 6})}
+
+
+def _projection_envelope_migration(
+    base: dict[str, Any], candidate: dict[str, Any], *, output_format: str,
+) -> tuple[dict[Metric, int], list[str], list[str]]:
+    """Qualify the one-time projection schema transition, never unrelated growth."""
+    before = tuple(base.get("projection_envelope_schema_versions") or [])
+    after = tuple(candidate.get("projection_envelope_schema_versions") or [])
+    if before == after:
+        return {}, [], []
+    if _complete_turn_plan_migration(base, candidate):
+        return {}, [], ["complete Turn plan exposes the full source projection metadata"]
+    if _complete_quota_source_migration(base, candidate):
+        return {}, [], ["complete quota source retains its original projection metadata"]
+    surface_id = str(base.get("surface_id") or "")
+    row_surface = str(base.get("row_id") or "").partition("/")[2].partition("/")[0]
+    if (surface_id == "todo_list" and row_surface in {
+            "todo_list", "todo_list_limited", "todo_list_thin"}
+            and output_format == "json" and before == ()
+            and after == ("loopx_projection_envelope_v0",)):
+        return _TODO_PROJECTION_ENVELOPE_V0_MIGRATION_ALLOWANCE, [], [
+            "Todo projection envelope schema migrated: none -> loopx_projection_envelope_v0"]
+    if (surface_id in {"status", "quota_should_run"}
+            and before == () and after == ("loopx_projection_envelope_v0",)):
+        migration_allowance = (
+            _QUOTA_PROJECTION_ENVELOPE_V0_MIGRATION_ALLOWANCE
+            if surface_id == "quota_should_run"
+            else _PROJECTION_ENVELOPE_V0_MIGRATION_ALLOWANCE
+        )
+        allowance = (
+            migration_allowance.json
+            if output_format == "json"
+            else migration_allowance.markdown
+        )
+        return allowance, [], ["projection envelope schema migrated: none -> loopx_projection_envelope_v0"]
+    return {}, ["projection envelope schema coverage changed"], []
+
+
+def _task_step_read_fence_migration(
+    base: dict[str, Any], candidate: dict[str, Any],
+) -> tuple[dict[Metric, int], list[str]]:
+    """Bound the first read-fence projection, not later growth or other views."""
+    before = base.get("next_action_basis_count", 0)
+    after = candidate.get("next_action_basis_count", 0)
+    row_id = str(base["row_id"])
+    if not (base["format"] == "json"
+        and row_id.startswith(("surface/status/", "surface/quota_should_run/", "variant/status_task_graph_detail/"))
+        and type(before) is int and before == 0
+        and type(after) is int and 0 < after <= 4):
+        return {}, []
+    # Each ordinary fence is 100 pretty / 94 compact chars. The unchanged
+    # two-peer detail fixture adds 457 / 346 chars including task/actor rows.
+    per_fence: dict[Metric, int] = (
+        {"chars": 256, "utf8_bytes": 256, "lines": 8, "compact_payload_chars": 192}
+        if row_id.startswith("variant/status_task_graph_detail/") else
+        {"chars": 192, "utf8_bytes": 192, "lines": 6, "compact_payload_chars": 144}
+    )
+    return {metric: value * after for metric, value in per_fence.items()}, [
+        "task-bound recommendation read fences added; bounded one-time JSON growth",
+    ]
+
+
+def _authoring_input_migration(
+    base: dict[str, Any], candidate: dict[str, Any],
+) -> tuple[dict[Metric, int], list[str]]:
+    """Bound only the observed addition; an already upgraded base gets none."""
+    surface = str(base["row_id"]).partition("/")[2].partition("/")[0]
+    before = base.get("authoring_inputs") or {}
+    after = candidate.get("authoring_inputs") or {}
+    limits: dict[Metric, int] = {}
+    reason = ""
+    if (surface in {"start_goal_guided", "start_goal_guided_command_pack_detail"}
+            and before.get("complete_todo_readback") is False
+            and after.get("complete_todo_readback") is True):
+        # Same fixture: JSON +948 chars/+894 compact/+6 lines; Markdown
+        # +436 chars/+2 lines. Preserve full-body and authority guidance.
+        limits = (
+            {"chars": 1_000, "utf8_bytes": 1_000, "lines": 8, "compact_payload_chars": 960}
+            if base.get("format") == "json" else
+            {"chars": 480, "utf8_bytes": 480, "lines": 3, "compact_payload_chars": 0}
+        )
+        reason = "complete Todo readback step added"
+    elif (surface in {"quota_should_run", "loopx_turn_plan"}
+            and base.get("format") == "json"
+            and before.get("vision_cli_authoring") is False
+            and after.get("vision_cli_authoring") is True):
+        # Default required-replan quota gains the full authoring input:
+        # +3,049 chars/+1,807 compact/+94 lines. Turn already had the schema
+        # and gains only +237 chars of first-write/recovery guidance.
+        limits = (
+            {"chars": 3_200, "utf8_bytes": 3_200, "lines": 96, "compact_payload_chars": 1_920}
+            if surface == "quota_should_run" else
+            {"chars": 256, "utf8_bytes": 256, "lines": 0, "compact_payload_chars": 256}
+        )
+        reason = "Vision CLI authoring input added"
+    elif (surface in {"start_goal_guided", "start_goal_guided_command_pack_detail",
+                      "bootstrap_command_pack", "bootstrap_command_pack_message_only"}
+            and before.get("first_delivery_guidance") is False
+            and after.get("first_delivery_guidance") is True):
+        # Frozen 96-row fixture: +2,340 JSON chars, +3,496 for explicit
+        # command-pack detail, +578 Markdown. Keep all existing consumers and
+        # the full guidance; no additional lines or absolute budget increase.
+        chars = (
+            (3_600 if surface == "start_goal_guided_command_pack_detail" else 2_400)
+            if base.get("format") == "json" else 600
+        )
+        limits = {"chars": chars, "utf8_bytes": chars, "lines": 0,
+                  "compact_payload_chars": chars if base.get("format") == "json" else 0}
+        reason = "complete initial-delivery quality guidance added"
+    return limits, [reason + "; bounded one-time growth"] if limits else []
+
+
+def _continuation_instruction_migration(
+    base: dict[str, Any], candidate: dict[str, Any],
+) -> tuple[dict[Metric, int], list[str]]:
+    """Qualify only reviewed instruction transitions on their actual carriers."""
+    row_id = str(base["row_id"])
+    surface = row_id.split("/")[1]
+    before = base.get("continuation_instructions") or {}
+    after = candidate.get("continuation_instructions") or {}
+
+    def migrated(clause: str) -> bool:
+        return (before.get(f"{clause}_before") is True
+                and before.get(f"{clause}_after") is False
+                and after.get(f"{clause}_before") is False
+                and after.get(f"{clause}_after") is True)
+
+    chars, lines = 0, 0
+    if (surface in {"quota_should_run", "loopx_turn_plan"}
+            and base.get("format") == candidate.get("format") == "json"
+            and migrated("objective_replan")):
+        # Matched crowded fixture: +729 after moving the ordinary read hint
+        # into the complete replan review. Once delivered, ordinary growth
+        # budgets resume. No line, shape, action or envelope-budget exception.
+        chars += 768
+    if surface in {
+        "quota_should_run", "loopx_turn_plan", "quota_should_run_all_detail",
+        "quota_should_run_goal_boundary_detail", "quota_should_run_scheduler_detail",
+        "quota_should_run_todo_summary_detail", "quota_should_run_turn_envelope",
+        "quota_should_run_user_todo_summary_detail", "quota_should_run_vision_detail",
+    }:
+        # Same-fixture context +208, with one character of receipt metadata
+        # variation; optional replan guidance +363. Do not loosen line budgets.
+        if migrated("context"):
+            chars += 224
+        if migrated("replan"):
+            chars += 384
+        if migrated("objective_maintenance"):
+            # Matched fixture: maintenance +208 chars (including separator).
+            # The complete reviewed transition also carries platform-normalized
+            # projection metadata; preserve that prose with a bounded allowance.
+            chars += 224
+            lines = 4
+        if migrated("open_work_review"):
+            # Same fixture: +212 text bytes, +213 quota / +216 turn-plan
+            # JSON chars after accounting metadata. Preserve all prior prose;
+            # only this complete transition receives the one-time allowance.
+            chars += 224
+            if migrated("objective_maintenance"):
+                # Combined objective + work-review migration measured 497
+                # characters on Windows. Do not drop either reviewed clause to
+                # satisfy the legacy 224-character growth floor.
+                chars = max(chars, 512)
+    elif surface in {"heartbeat_prompt_thin", "heartbeat_prompt_brief", "heartbeat_prompt_compact"}:
+        # Complete stop/correction rollout: thin +154, brief +163, compact +215.
+        if migrated("stop"):
+            chars = 224
+        if migrated("authorized_delivery"):
+            # Same public fixture: thin +427 body chars plus generator policy
+            # text in brief; retain authority/recovery clauses. Once present,
+            # ordinary growth limits resume; no new line or shape allowance.
+            chars += 512
+    if row_id.startswith((
+        "surface/heartbeat_prompt_thin/",
+        "variant/heartbeat_prompt_brief/",
+        "variant/heartbeat_prompt_compact/",
+        "variant/heartbeat_prompt_full/",
+    )) and migrated("outcome_refinement"):
+        # The complete outcome paragraph adds 523 chars/bytes in all four
+        # matched heartbeat modes. Bound that one-time addition, including
+        # a boolean budget diagnostic's single-character variation; later
+        # growth, other surfaces, lines and shapes receive no new allowance.
+        chars += 544
+    if (surface in {"loopx_turn_plan", "quota_should_run_turn_envelope"}
+            and base.get("format") == candidate.get("format") == "markdown"
+            and base.get("turn_budget_warning") is False and candidate.get("turn_budget_warning") is True
+            and (base.get("turn_envelope_cost_basis") or {}).get("objective_maintenance_before") is True
+            and (candidate.get("turn_envelope_cost_basis") or {}).get("objective_maintenance_after") is True):
+        # Measured warning appearance: +417/+419 chars and four lines. Preserve
+        # the warning and its target; paired JSON proves the reviewed cause.
+        chars, lines = max(chars, 448), 4
+    if not chars:
+        return {}, []
+    return {
+        "chars": chars, "utf8_bytes": chars, "lines": lines,
+        "compact_payload_chars": chars if base.get("format") == "json" else 0,
+    }, ["reviewed continuation instructions migrated; bounded one-time growth"]
+
+
+def _turn_projection_migration(
+    base: dict[str, Any], candidate: dict[str, Any],
+) -> tuple[dict[str, int], list[str]]:
+    old_paths = set(base.get("json_shape_paths") or [])
+    new_paths = set(candidate.get("json_shape_paths") or [])
+    # Inherited Stride now supplies the existing bounded decision contract on
+    # the required-review route. Only absence -> complete projection receives
+    # this one-time allowance; later growth, removed facts and other paths do not.
+    stride_routes = {
+        "surface/quota_should_run/crowded/json": ("$", 6_800),
+        "surface/loopx_turn_plan/crowded/json": (
+            "$.work_contract" if "$.work_contract" in new_paths else "$.turn_envelope", 6_500),
+    }
+    stride_route = stride_routes.get(str(base.get("row_id")))
+    if stride_route and candidate.get("row_id") == base.get("row_id"):
+        root, bound = stride_route
+        control = f"{root}.replan_action_packet.stride_control"
+        strategy = f"{root}.autonomous_replan_obligation.replan_context.stride_strategy"
+        required = {f"{control}.{key}" for key in (
+            "schema_version", "strategy_version", "reference_context_id",
+            "reference_obligation_id", "required_fields", "rule",
+            "minimal_example.schema_version", "minimal_example.strategy_version",
+            "minimal_example.reference_context_id", "minimal_example.reference_obligation_id",
+            "minimal_example.basis", "minimal_example.action",
+            *[f"minimal_example.axes.{axis}.{field}"
+              for axis in ("work_slice", "route_distance", "validation_scope")
+              for field in ("plan", "reason")],
+            *[f"minimal_example.next_probe.{field}" for field in (
+                "scope", "prediction", "adoption_criterion", "cost_bound", "minimum_evidence",
+            )],
+        )}
+        # Optional review blocks are required in full once projected. Presence
+        # of representative leaves cannot qualify a truncated decision example.
+        for review, fields in (
+            ("previous_review", ("reference_decision_ref", "adoption", "information_gain",
+                                 "goal_gain", "evidence_refs", "lesson")),
+            ("explore_review", ("revision", "disposition", "considered_refs", "reason")),
+        ):
+            prefix = f"{control}.minimal_example.{review}"
+            if any(path == prefix or path.startswith(prefix + ".") for path in new_paths):
+                required.update(f"{prefix}.{field}" for field in fields)
+        added = new_paths - old_paths
+        if (base.get("format") == candidate.get("format") == "json"
+            and control not in old_paths and required <= new_paths and old_paths <= new_paths
+            and all(path == control or path.startswith(control + ".") or path == strategy
+                    for path in added)):
+            return {metric: bound for metric in ("chars", "utf8_bytes", "compact_payload_chars")}, [
+                "inherited Stride decision context enabled; bounded one-time JSON growth"
+            ]
+    profile = "$.turn_envelope.contract_capsule.execution_profile"
+    restored = {f"{profile}.{field}" for field in (
+        "small_scale_streak_threshold", "outcome_floor", "outcome_floor.configured",
+        "outcome_floor.surface_streak_threshold", "outcome_floor.must_advance",
+        "outcome_floor.must_advance[]",
+    )}
+    if (
+        str(base.get("row_id", "")).startswith("surface/loopx_turn_plan/")
+        and candidate.get("row_id") == base["row_id"]
+        and base.get("format") == candidate.get("format") == "json"
+        and {f"{profile}.{field}" for field in (
+            "cadence", "minimum_scale", "spend_rule", "must_include", "must_include[]",
+        )} <= old_paths
+        and old_paths.isdisjoint(restored)
+        and old_paths <= new_paths and new_paths - old_paths == restored
+        and base.get("action_signature_coverages") == candidate.get("action_signature_coverages")
+        and base.get("action_signature_coverages") in (
+            [ACTION_SIGNATURE_COVERAGE_V0], [ACTION_SIGNATURE_COVERAGE_V2],
+        )
+    ):
+        # Same 96-row fixture: restoring the native outcome/degradation rules
+        # adds 138–142 JSON chars/bytes, zero lines. Keep 18 chars of headroom
+        # only for this first complete projection; later/partial/unrelated
+        # growth and absolute ceilings retain their existing guards.
+        return {metric: 160 for metric in ("chars", "utf8_bytes", "compact_payload_chars")}, [
+            "complete execution profile restored; bounded one-time JSON growth"
+        ]
+    # The unchanged public multi-subagent fixture grows 1,147 JSON characters
+    # when its bounded contribution replaces a historical reference. Qualify
+    # only that transition (133 chars headroom), never later inline growth.
+    if (
+        base.get("row_id") == "variant/quota_should_run_turn_envelope_multi_subagent/small/json"
+        and candidate.get("row_id") == base["row_id"]
+        and base.get("format") == candidate.get("format") == "json"
+        and base.get("action_signature_coverages") == candidate.get("action_signature_coverages")
+        == [ACTION_SIGNATURE_COVERAGE_V4]
+        and {"$.agent_context.detail_ref", "$.agent_context.content_hash"} <= old_paths
+        and "$.agent_context.contributions[]" not in old_paths
+        and {"$.agent_context.contributions[]", "$.agent_context.failures"} <= new_paths
+        and "$.agent_context.detail_ref" not in new_paths
+    ):
+        return {metric: 1_280 for metric in ("chars", "utf8_bytes", "compact_payload_chars")}, [
+            "bounded planning context migrated from reference to inline; one-time growth"
+        ]
+    return {}, []
+
+
+def _compare_row_growth(
+    base: dict[str, Any], candidate: dict[str, Any], *,
+    migration: _SchemaMigrationState,
+    command_route_allowances: dict[Metric, int],
+) -> tuple[dict[str, int | None], dict[str, int | None], list[str], list[str]]:
+    """Compare output cost independently of contract and semantic coverage."""
+    row_id = str(base["row_id"])
+    policy = str(base.get("qualification_policy") or "")
+    output_format = str(base.get("format") or "")
+    failures: list[str] = []
+    review_signals: list[str] = []
+    projection_allowance, projection_failures, projection_signals = _projection_envelope_migration(
+        base, candidate, output_format=output_format,
+    )
+    failures.extend(projection_failures)
+    review_signals.extend(projection_signals)
+    fence_allowance, fence_signals = _task_step_read_fence_migration(base, candidate)
+    review_signals.extend(fence_signals)
+    authoring_allowance, authoring_signals = _authoring_input_migration(base, candidate)
+    review_signals.extend(authoring_signals)
+    continuation_allowance, continuation_signals = _continuation_instruction_migration(base, candidate)
+    review_signals.extend(continuation_signals)
+    context_allowance, context_signals = _turn_projection_migration(base, candidate)
+    review_signals.extend(context_signals)
+    # The source-complete detail replaces the old summary; default inspection
+    # retains a small pinned-source route. Absolute ceilings stay unchanged.
+    if _complete_turn_plan_migration(base, candidate):
+        bound = 16_000 if base["row_id"].startswith("variant/") else 2_000
+        context_allowance = {metric: max(context_allowance.get(metric, 0), bound)
+                             for metric in ("chars", "utf8_bytes", "compact_payload_chars")}
+        review_signals.append("Turn plan v0 -> v1: unchanged current controls; full-source costs require review")
+    quota_allowance = _complete_quota_source_allowance(base, candidate)
+    deltas: dict[str, int | None] = {}
+    allowances: dict[str, int | None] = {}
+    for metric in ("chars", "utf8_bytes", "lines", "compact_payload_chars"):
+        base_value = base.get(metric)
+        candidate_value = candidate.get(metric)
+        if not isinstance(base_value, int) or not isinstance(candidate_value, int):
+            deltas[metric] = None
+            allowances[metric] = None
+            continue
+        delta = candidate_value - base_value
+        allowance = max(
+            _growth_limit(
+                policy=policy,
+                output_format=output_format,
+                metric=metric,
+                base=base_value,
+            ),
+            _reward_memory_outcome_prompt_allowance(
+                row_id,
+                base,
+                candidate,
+                metric,
+            ),
+            _heartbeat_peer_admission_migration_allowance(row_id, base, candidate, metric),
+            _heartbeat_user_language_migration_allowance(
+                row_id,
+                base,
+                candidate,
+                metric,
+            ),
+            _turn_host_and_managed_executor_binding_allowance(
+                row_id,
+                base,
+                candidate,
+                metric,
+            ),
+            _schema_migration_growth_allowance(migration, metric),
+            _decision_evidence_migration_allowance(base, candidate, metric),
+            projection_allowance.get(metric, 0),
+            fence_allowance.get(metric, 0),
+            authoring_allowance.get(metric, 0),
+            continuation_allowance.get(metric, 0),
+            context_allowance.get(metric, 0),
+            quota_allowance.get(metric, 0),
+        )
+        # Thin installed prompts contain bilingual lifecycle instructions. A
+        # small character-level clarification can cost three bytes per CJK
+        # character. Keep character, line and absolute output ceilings intact;
+        # do not relax quota or other agent-facing surfaces with this allowance.
+        if (
+            row_id.startswith("surface/heartbeat_prompt_thin/")
+            and metric == "utf8_bytes"
+        ):
+            allowance = max(allowance, 192)
+        if (
+            row_id.startswith(("surface/", "variant/"))
+            and row_id.partition("/")[2].partition("/")[0]
+            in {
+                "heartbeat_prompt_thin",
+                "heartbeat_prompt_brief",
+                "heartbeat_prompt_compact",
+            }
+            and base.get("host_prompt_static_safety_revision") is None
+            and candidate.get("host_prompt_static_safety_revision")
+            == "host_prompt_static_safety_v1"
+        ):
+            # Authorized static safety + executable shell bootstrap restoration.
+            # Absolute ceilings stay enforced by the probe; once merged, v1->v1
+            # receives no allowance. Quota/status and other surfaces are excluded.
+            allowance = max(
+                allowance,
+                {
+                    "chars": 512,
+                    "utf8_bytes": 640,
+                    "lines": 5,
+                    "compact_payload_chars": 512,
+                }[metric],
+            )
+        if command_route_allowances:
+            allowance = max(
+                allowance,
+                command_route_allowances[metric],
+            )
+        deltas[metric] = delta
+        allowances[metric] = allowance
+        if delta > allowance:
+            failures.append(f"{metric} grew by {delta}; allowance is {allowance}")
+
+    return deltas, allowances, failures, review_signals
 
 
 def _compare_row(base: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -192,67 +1217,63 @@ def _compare_row(base: dict[str, Any], candidate: dict[str, Any]) -> dict[str, A
     if candidate.get("format") != output_format:
         failures.append("format changed")
 
-    base_signature = base.get("action_signature_sha256")
-    signature_changed = bool(
-        base_signature
-        and candidate.get("action_signature_sha256") != base_signature
+    before_controls, after_controls = base.get("turn_plan_controls"), candidate.get("turn_plan_controls")
+    if (isinstance(before_controls, dict) and isinstance(after_controls, dict)
+            and before_controls.get("plan_version") == "loopx_turn_plan_v0"
+            and after_controls.get("plan_version") == "loopx_turn_plan_v1"
+            and before_controls.get("controls_sha256") != after_controls.get("controls_sha256")):
+        old, new = before_controls["field_sha256"], after_controls["field_sha256"]
+        changed = sorted(key for key in old.keys() | new.keys() if old.get(key) != new.get(key))
+        failures.append("Turn plan current controls changed: " + ", ".join(changed))
+
+    quota_migration = _complete_quota_source_migration(base, candidate)
+    base_output_contract = base.get("output_contract_version")
+    candidate_output_contract = candidate.get("output_contract_version")
+    heartbeat_agent_input_migration = bool(
+        row_id.startswith("surface/heartbeat_prompt_thin/")
+        and output_format == "json"
+        and base_output_contract is None
+        and candidate_output_contract == HEARTBEAT_AGENT_INPUT_SCHEMA_VERSION
     )
-    signature_migration = (
-        _action_signature_migration(base, candidate) if signature_changed else None
+    if (
+        candidate_output_contract != base_output_contract
+        and not heartbeat_agent_input_migration
+        and not _complete_turn_plan_migration(base, candidate)
+        and not quota_migration
+    ):
+        failures.append("output_contract_version changed")
+
+    migration = _schema_migration_state(
+        base,
+        candidate,
+        output_format=output_format,
     )
-    base_portfolio_versions = base.get("action_portfolio_schema_versions")
-    candidate_portfolio_versions = candidate.get("action_portfolio_schema_versions")
-    portfolio_schema_changed = base_portfolio_versions != candidate_portfolio_versions
-    portfolio_schema_migration = (
-        _action_portfolio_schema_migration(base, candidate)
-        if portfolio_schema_changed
-        else None
-    )
-    portfolio_growth_migration = bool(
-        output_format == "json"
-        and (
-            portfolio_schema_migration
-            or (
-                signature_migration
-                and signature_migration.endswith(
-                    f" -> {ACTION_SIGNATURE_COVERAGE_V2}"
-                )
-            )
-        )
+    added_command_routes, command_route_allowances = (
+        _command_route_growth_allowances(base, candidate)
     )
 
-    deltas: dict[str, int | None] = {}
-    allowances: dict[str, int | None] = {}
-    for metric in ("chars", "utf8_bytes", "lines", "compact_payload_chars"):
-        base_value = base.get(metric)
-        candidate_value = candidate.get(metric)
-        if not isinstance(base_value, int) or not isinstance(candidate_value, int):
-            deltas[metric] = None
-            allowances[metric] = None
-            continue
-        delta = candidate_value - base_value
-        allowance = _growth_limit(
-            policy=policy,
-            output_format=output_format,
-            metric=metric,
-            base=base_value,
-        )
-        if portfolio_growth_migration:
-            allowance = max(
-                allowance,
-                _ACTION_PORTFOLIO_V0_MIGRATION_GROWTH_ALLOWANCE[metric],
-            )
-        deltas[metric] = delta
-        allowances[metric] = allowance
-        if delta > allowance:
-            failures.append(f"{metric} grew by {delta}; allowance is {allowance}")
+    deltas, allowances, growth_failures, growth_signals = _compare_row_growth(
+        base, candidate, migration=migration,
+        command_route_allowances=command_route_allowances,
+    )
+    failures.extend(growth_failures)
+    review_signals.extend(growth_signals)
 
-    for field in ("semantic_json_keys",):
-        missing = _removed(base, candidate, field)
+    if output_format == "json":
+        missing = _removed(base, candidate, "semantic_json_keys")
         if missing:
             preview = ", ".join(missing[:5])
             suffix = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
-            failures.append(f"{field} removed: {preview}{suffix}")
+            message = f"semantic_json_keys removed: {preview}{suffix}"
+            if heartbeat_agent_input_migration or _complete_turn_plan_migration(base, candidate) or quota_migration:
+                review_signals.append(message)
+            else:
+                failures.append(message)
+
+    if heartbeat_agent_input_migration:
+        review_signals.append(
+            "output contract migrated: generator payload -> heartbeat_agent_input_v1"
+        )
 
     for field in ("json_shape_paths", "markdown_headings"):
         missing = _removed(base, candidate, field)
@@ -262,21 +1283,62 @@ def _compare_row(base: dict[str, Any], candidate: dict[str, Any]) -> dict[str, A
             review_signals.append(f"{field} removed: {preview}{suffix}")
 
     base_anchor = base.get("markdown_anchor")
-    if base_anchor and candidate.get("markdown_anchor") != base_anchor:
+    if base_anchor and candidate.get("markdown_anchor") != base_anchor and not quota_migration:
         failures.append("markdown_anchor changed")
-    if signature_changed:
-        if signature_migration is None:
-            failures.append("action_signature semantic digest changed")
+    if migration.signature_changed:
+        if migration.signature_migration is None:
+            if _complete_turn_plan_migration(base, candidate) or quota_migration:
+                review_signals.append("historical action signature replaced by the checked complete source")
+            else:
+                failures.append("action_signature semantic digest changed")
         else:
             review_signals.append(
-                f"action_signature coverage migrated: {signature_migration}"
+                f"action_signature coverage migrated: {migration.signature_migration}"
             )
-    if portfolio_schema_changed:
-        if portfolio_schema_migration is None:
+    if migration.portfolio_schema_changed:
+        if migration.portfolio_schema_migration is None:
             failures.append("action_portfolio schema coverage changed")
         else:
             review_signals.append(
-                f"action_portfolio schema migrated: {portfolio_schema_migration}"
+                "action_portfolio schema migrated: "
+                f"{migration.portfolio_schema_migration}"
+            )
+    if migration.horizon_schema_changed:
+        if migration.horizon_schema_migration is None:
+            failures.append("planning_horizon schema coverage changed")
+        else:
+            review_signals.append(
+                "planning_horizon schema migrated: "
+                f"{migration.horizon_schema_migration}"
+            )
+    if migration.inventory_detail_schema_changed:
+        if migration.inventory_detail_schema_migration is None:
+            failures.append("planning inventory detail schema coverage changed")
+        else:
+            review_signals.append(
+                "planning inventory detail schema migrated: "
+                f"{migration.inventory_detail_schema_migration}"
+            )
+    for option, count in added_command_routes.items():
+        review_signals.append(
+            f"{option.replace('_', '-')} command route coverage added: "
+            f"{count} executable route(s)"
+        )
+    if migration.guided_todo_delta_schema_changed:
+        if migration.guided_todo_delta_schema_migration is None:
+            failures.append("guided todo delta schema coverage changed")
+        else:
+            review_signals.append(
+                "guided todo delta schema migrated: "
+                f"{migration.guided_todo_delta_schema_migration}"
+            )
+    if migration.todo_work_counts_schema_changed:
+        if migration.todo_work_counts_schema_migration is None:
+            failures.append("Todo work-count schema coverage changed")
+        else:
+            review_signals.append(
+                "Todo work-count schema migrated: "
+                f"{migration.todo_work_counts_schema_migration}"
             )
 
     return {
@@ -311,14 +1373,22 @@ def compare_cli_output_receipts(
                 }
             )
         elif candidate is None:
+            parts = row_id.split("/")
+            replacement = next((row for key, row in candidate_rows.items()
+                                if key.startswith(("variant/review_packet_full/", "surface/quota_should_run/"))
+                                and _has_decision_evidence(row)), None)
+            retired_evidence_command = bool(
+                len(parts) == 4 and parts[:2] == ["surface", "evidence_log_thin"]
+                and replacement and _has_decision_evidence(replacement)
+            )
             results.append(
                 {
                     "row_id": row_id,
-                    "status": "failed",
+                    "status": "passed" if retired_evidence_command else "failed",
                     "deltas": {},
                     "allowances": {},
-                    "failures": ["qualified base row is missing from candidate"],
-                    "review_signals": [],
+                    "failures": [] if retired_evidence_command else ["qualified base row is missing from candidate"],
+                    "review_signals": ["evidence-log retired; scoped decision evidence is delivered by replan_context"] if retired_evidence_command else [],
                 }
             )
         else:

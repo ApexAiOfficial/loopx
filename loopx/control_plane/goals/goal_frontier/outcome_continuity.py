@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 from datetime import UTC, datetime
-from typing import Any
+from enum import StrEnum
 
 from ...agents.agent_scope import agent_scope_item_claimed_by
+from ...work_items.autonomous_replan_ack import accepted_blocked_replan_history_indexes
 from ..goal_vision_policy import (
     COMPLETED_TODO_CHAIN_REPLAN_THRESHOLD,
 )
@@ -21,6 +24,13 @@ VISION_OUTCOME_CHECKPOINT_CONTINUATION_OUTCOMES = {
     "no_change",
     "replan",
 }
+
+
+class OutcomeCheckpointReason(StrEnum):
+    CLAIM_MISSING = "final_outcome_claim_missing"
+    INCOMPLETE = "final_outcome_checkpoint_incomplete"
+
+
 def _compact_text(value: Any, *, limit: int) -> str | None:
     text = " ".join(str(value or "").strip().split())
     return text[:limit] if text else None
@@ -94,7 +104,9 @@ def _outcome_checkpoint_runs_for_goal(
             else None
         )
         return [checkpoint_run] if isinstance(checkpoint_run, dict) else []
-    return _latest_runs_for_goal(status_payload, goal_id=goal_id)
+    runs = _latest_runs_for_goal(status_payload, goal_id=goal_id)
+    administrative = accepted_blocked_replan_history_indexes(runs)
+    return [run for index, run in enumerate(runs) if index not in administrative]
 
 
 def latest_outcome_vision_checkpoint_from_status_payload(
@@ -110,50 +122,60 @@ def latest_outcome_vision_checkpoint_from_status_payload(
         goal_id=goal_id,
         agent_id=agent_id,
     ):
-        checkpoint = run.get("vision_checkpoint")
-        if not isinstance(checkpoint, dict):
-            continue
-        checkpoint_agent_id = str(
-            checkpoint.get("agent_id") or run.get("agent_id") or ""
-        ).strip()
-        if agent_id and checkpoint_agent_id != agent_id:
-            continue
-        if not agent_id and checkpoint_agent_id:
-            continue
-        trigger_kinds = {
-            str(trigger.get("kind") or "").strip()
-            for trigger in (checkpoint.get("triggers") or [])
-            if isinstance(trigger, dict)
-            and str(trigger.get("kind") or "").strip()
-        }
-        if "material_delivery_outcome" not in trigger_kinds:
-            continue
-        result: dict[str, Any] = {
-            "schema_version": checkpoint.get("schema_version"),
-            "goal_id": goal_id,
-            "agent_id": checkpoint_agent_id or agent_id,
-            "required": checkpoint.get("required") is True,
-            "satisfied": checkpoint.get("satisfied") is True,
-            "decision": checkpoint.get("decision"),
-            "triggers": checkpoint.get("triggers")
-            if isinstance(checkpoint.get("triggers"), list)
-            else [],
+        checkpoint = outcome_vision_checkpoint_from_run(run, goal_id=goal_id, agent_id=agent_id)
+        if checkpoint is not None:
+            return checkpoint
+    return None
+
+
+def outcome_vision_checkpoint_from_run(
+    run: dict[str, Any], *, goal_id: str, agent_id: str | None,
+) -> dict[str, Any] | None:
+    """Project the same checkpoint facts for immediate and historical readback."""
+
+    checkpoint = run.get("vision_checkpoint")
+    if not isinstance(checkpoint, dict):
+        return None
+    checkpoint_agent_id = str(
+        checkpoint.get("agent_id") or run.get("agent_id") or ""
+    ).strip()
+    if agent_id and checkpoint_agent_id != agent_id:
+        return None
+    if not agent_id and checkpoint_agent_id:
+        return None
+    trigger_kinds = {
+        str(trigger.get("kind") or "").strip()
+        for trigger in (checkpoint.get("triggers") or [])
+        if isinstance(trigger, dict)
+        and str(trigger.get("kind") or "").strip()
+    }
+    if "material_delivery_outcome" not in trigger_kinds:
+        return None
+    result: dict[str, Any] = {
+        "schema_version": checkpoint.get("schema_version"),
+        "goal_id": goal_id,
+        "agent_id": checkpoint_agent_id or agent_id,
+        "required": checkpoint.get("required") is True,
+        "satisfied": checkpoint.get("satisfied") is True,
+        "decision": checkpoint.get("decision"),
+        "triggers": cast(list[Any], checkpoint.get("triggers"))
+        if isinstance(checkpoint.get("triggers"), list)
+        else [],
+        "generated_at": run.get("generated_at"),
+    }
+    continuity_basis = checkpoint.get("continuity_basis")
+    if isinstance(continuity_basis, dict):
+        result["continuity_basis"] = dict(continuity_basis)
+    run_vision = run.get("agent_vision")
+    if isinstance(run_vision, dict):
+        result["qualification_agent_vision"] = {
+            "agent_id": run_vision.get("agent_id") or checkpoint_agent_id,
+            "state": run_vision.get("state"),
+            "vision_patch": _dict_field(run_vision, "vision_patch"),
+            "path_delta": _dict_field(run_vision, "path_delta"),
             "generated_at": run.get("generated_at"),
         }
-        continuity_basis = checkpoint.get("continuity_basis")
-        if isinstance(continuity_basis, dict):
-            result["continuity_basis"] = dict(continuity_basis)
-        run_vision = run.get("agent_vision")
-        if isinstance(run_vision, dict):
-            result["qualification_agent_vision"] = {
-                "agent_id": run_vision.get("agent_id") or checkpoint_agent_id,
-                "state": run_vision.get("state"),
-                "vision_patch": _dict_field(run_vision, "vision_patch"),
-                "path_delta": _dict_field(run_vision, "path_delta"),
-                "generated_at": run.get("generated_at"),
-            }
-        return result
-    return None
+    return result
 
 
 def acceptance_gaps_from_vision_checkpoint(
@@ -267,22 +289,43 @@ def acceptance_gaps_from_outcome_checkpoint(
         == qualification_vision.get("generated_at")
     )
     outcome_gap_reported = "outcome_gap" in delivery_outcomes
-    checkpoint_complete = bool(
-        checkpoint.get("satisfied") is True
-        and (fresh_vision_patch or unchanged_vision_revision)
-        and claim
-        and evidence_refs
-        and path_outcome in VISION_OUTCOME_CHECKPOINT_CONTINUATION_OUTCOMES
-        and not outcome_gap_reported
-    )
-    if checkpoint_complete:
+    # The same component facts own both qualification and its explanation.
+    component_checks = {
+        "checkpoint_satisfied": checkpoint.get("satisfied") is True,
+        "checkpoint_fresh": fresh_vision_patch or unchanged_vision_revision,
+        "path_outcome_valid": path_outcome in VISION_OUTCOME_CHECKPOINT_CONTINUATION_OUTCOMES,
+        "evidence_refs_present": bool(evidence_refs),
+        "final_outcome_claim_present": bool(claim),
+        "no_reported_outcome_gap": not outcome_gap_reported,
+    }
+    failed_components = [key for key, passed in component_checks.items() if not passed]
+    if not failed_components:
         return []
+    claim_only_missing = failed_components == ["final_outcome_claim_present"]
+    reason = (
+        OutcomeCheckpointReason.CLAIM_MISSING
+        if claim_only_missing else OutcomeCheckpointReason.INCOMPLETE
+    )
 
     gap: dict[str, Any] = {
         "kind": VISION_OUTCOME_CHECKPOINT_REQUIRED_TRIGGER,
         "source": "latest_vision_checkpoint",
         "agent_id": checkpoint.get("agent_id") or agent_vision.get("agent_id"),
+        "reason_code": reason.value,
+        "component_checks": component_checks,
+        "resolution_hint": (
+            "Add or restore a bounded vision_patch.acceptance_summary stating the "
+            "final outcome supported by the existing evidence. Retain that route "
+            "and its refs in the required path_delta.outcome=replan correction. "
+            "A learning milestone alone is not completion."
+            if claim_only_missing else
+            "Repair the failed checkpoint components with a fresh evidence-linked "
+            "final-outcome claim and a valid continuation path decision."
+        ),
         "replan_trigger_summary": (
+            "the checkpoint, path decision, and evidence are valid, but the "
+            "final-outcome claim (vision_patch.acceptance_summary) is missing"
+            if claim_only_missing else
             "a material milestone closed without a fresh evidence-linked final-outcome "
             "path decision"
         ),
@@ -350,7 +393,7 @@ def acceptance_gaps_from_todo_completion_checkpoint(
 
     vision_present = isinstance(agent_vision, dict)
     if vision_present and goal_vision_state_is_closed(
-        str(agent_vision.get("state") or "")
+        str(cast(dict[str, Any], agent_vision).get("state") or "")
     ):
         return []
     if not agent_id:
@@ -406,12 +449,12 @@ def acceptance_gaps_from_todo_completion_checkpoint(
     if len(uncheckpointed_items) < threshold:
         return []
 
-    patch = _dict_field(agent_vision, "vision_patch") if vision_present else {}
+    patch = _dict_field(cast(dict[str, Any], agent_vision), "vision_patch") if vision_present else {}
     return [
         {
             "kind": VISION_OUTCOME_CHECKPOINT_REQUIRED_TRIGGER,
             "source": "recent_completed_advancement_todo",
-            "agent_id": agent_id or agent_vision.get("agent_id"),
+            "agent_id": agent_id or cast(dict[str, Any], agent_vision).get("agent_id"),
             "replan_trigger_summary": (
                 "a completed advancement Todo chain has no later final-outcome "
                 "checkpoint"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shlex
+from pathlib import Path
 from typing import Any
 
 from ...turn_identity import normalize_turn_instance_id
@@ -17,6 +18,45 @@ from ..scheduler.execution_context import (
 )
 
 HEARTBEAT_PROMPT_SCHEMA_VERSION = "loopx_heartbeat_prompt_v0"
+
+
+def resolve_heartbeat_capture_root(
+    root: str | Path | None,
+    *,
+    thin: bool,
+    full: bool,
+    compact: bool,
+    brief: bool,
+    native_goal_host: bool,
+    turn_instance_id: str | None,
+    decision_handoff_socket: str | None = None,
+    codex_context_dir: str | None = None,
+    codex_context_root: str | None = None,
+    context_delivery: str = "off",
+) -> Path | None:
+    """Validate capture transport for an already resolved host-owned Turn."""
+    enabled = context_delivery == "on"
+    if enabled and not (codex_context_dir or codex_context_root):
+        raise ValueError("context-delivery requires a native context location")
+    if codex_context_dir is not None and codex_context_root is not None:
+        raise ValueError("choose codex-context-dir or codex-context-root")
+    if (codex_context_dir is not None or codex_context_root is not None) and root is None:
+        raise ValueError("native context delivery requires a capture root")
+    if root is None:
+        if decision_handoff_socket is not None:
+            raise ValueError("decision handoff requires an explicit decision capture root")
+        return None
+    if (not thin or full or compact or brief or (native_goal_host and not enabled)
+            or (not turn_instance_id and codex_context_root is None)):
+        raise ValueError("--decision-output-root requires thin mode and an explicit host-owned Turn ID")
+    directory = Path(root).expanduser().absolute()
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("--decision-output-root must be an existing directory, not a symlink")
+    if decision_handoff_socket is not None:
+        from ..turn_driver.decision_capture import validate_handoff_socket
+
+        validate_handoff_socket(decision_handoff_socket, capture_root=directory)
+    return directory
 
 
 def uses_native_goal_host_loop(
@@ -93,10 +133,13 @@ def resolve_exact_heartbeat_turn_identity(
     if profile not in {
         SchedulerRuntimeProfile.GENERIC_CLI_AGENT_LOOP,
         SchedulerRuntimeProfile.CODEX_APP_HEARTBEAT,
+        SchedulerRuntimeProfile.TRAE_APP,
+        SchedulerRuntimeProfile.ANTIGRAVITY_APP,
     }:
         raise ValueError(
             "--turn-instance-id requires runtime-profile generic_cli or "
-            "codex_app_heartbeat so quota guard creates a heartbeat receipt"
+            "codex_app_heartbeat, or trae_app so quota guard creates "
+            "a heartbeat receipt"
         )
     return normalized, f" --turn-instance-id {shlex.quote(normalized)}", {
         "schema_version": HEARTBEAT_PROMPT_SCHEMA_VERSION,

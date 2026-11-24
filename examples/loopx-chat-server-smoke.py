@@ -13,11 +13,16 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from loopx.control_plane.testing.canary_harness import import_fixture_authority  # noqa: E402
+
 GOAL_ID = "loopx-chat-server-smoke"
 SECOND_GOAL_ID = "loopx-chat-server-second-goal"
 TODO_TEXT = "[P0] Implement the approved Goal Studio review card."
@@ -168,6 +173,8 @@ def write_fixture(root: Path) -> tuple[Path, Path]:
         + "\n",
         encoding="utf-8",
     )
+    for goal_id in (GOAL_ID, SECOND_GOAL_ID):
+        import_fixture_authority(registry, goal_id)
     return registry, state_file
 
 
@@ -176,14 +183,15 @@ def request_json(
     *,
     method: str = "GET",
     body: dict | None = None,
-    origin: str = "http://127.0.0.1",
+    origin: str | None = None,
 ) -> tuple[int, dict]:
     data = json.dumps(body).encode("utf-8") if body is not None else None
+    parsed_url = urllib.parse.urlsplit(url)
     request = urllib.request.Request(
         url,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json", "Origin": origin},
+        headers={"Content-Type": "application/json", "Origin": origin if origin is not None else f"{parsed_url.scheme}://{parsed_url.netloc}"},
     )
     try:
         with urllib.request.urlopen(request, timeout=4) as response:
@@ -208,12 +216,13 @@ def wait_for_json(url: str) -> dict:
 
 def main() -> None:
     sys.path.insert(0, str(REPO_ROOT))
+    from loopx.chat.status_api import build_bounded_chat_status_projection
     from loopx.chat_server import (
         ChatHTTPServer,
         ChatRequestHandler,
-        build_bounded_chat_status_projection,
     )
-    from loopx.chat_endpoints import AgentEndpointRegistry
+    from loopx.chat.endpoints import AgentEndpointRegistry
+    from loopx.chat_manager import manager_executor_endpoint_default
 
     try:
         ChatHTTPServer(("127.0.0.1", 70_000), ChatRequestHandler)
@@ -259,6 +268,8 @@ def main() -> None:
             "loopx.cli",
             "--registry",
             str(registry),
+            "--runtime-root",
+            str(root / "runtime"),
             "chat",
             "--goal-id",
             GOAL_ID,
@@ -274,6 +285,46 @@ def main() -> None:
             str(assets / "index.html"),
             "--no-open",
         ]
+        disabled_server = subprocess.Popen(
+            command,
+            cwd=root / "project",
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            disabled_capabilities = wait_for_json(
+                f"{base_url}/api/chat/capabilities"
+            )
+            assert "goal_subagent_configuration" not in disabled_capabilities
+            disabled_status = wait_for_json(f"{base_url}/status.json")
+            assert all(
+                "spawn_policy" not in goal
+                for goal in disabled_status["run_history"]["goals"]
+            ), disabled_status
+            for route in (
+                "/api/chat/goal-subagents/dry-run",
+                "/api/chat/goal-subagents/apply",
+            ):
+                code, disabled_route = request_json(
+                    f"{base_url}{route}",
+                    method="POST",
+                    body={"goal_id": GOAL_ID, "enabled": False},
+                )
+                assert code == 404, disabled_route
+        finally:
+            disabled_server.terminate()
+            try:
+                disabled_server.wait(timeout=5)
+            except subprocess.TimeoutExpired:  # pragma: no cover - defensive cleanup.
+                disabled_server.kill()
+                disabled_server.wait(timeout=5)
+
+        port = free_port()
+        base_url = f"http://127.0.0.1:{port}"
+        command[command.index("--port") + 1] = str(port)
+        command.append("--enable-goal-subagent-configuration")
         server = subprocess.Popen(
             command,
             cwd=root / "project",
@@ -288,6 +339,7 @@ def main() -> None:
             assert capabilities["streaming"] is True, capabilities
             assert capabilities["resume"] is True, capabilities
             assert capabilities["interrupt"] is True, capabilities
+            assert capabilities["goal_subagent_configuration"] == "preview_locked", capabilities
             assert capabilities["adapters"][0]["agent_id"] == "codex", capabilities
             endpoints = wait_for_json(f"{base_url}/api/chat/endpoints")
             fixture_endpoint = next(
@@ -300,10 +352,12 @@ def main() -> None:
             with urllib.request.urlopen(f"{base_url}/chat/", timeout=4) as response:
                 html = response.read().decode("utf-8")
             assert "LoopX 个人 Agent 工作区" in html, html
-            stylesheet_match = re.search(r'href="(/chat/assets/[^"]+\.css)"', html)
-            assert stylesheet_match, html
-            with urllib.request.urlopen(f"{base_url}{stylesheet_match.group(1)}", timeout=4) as response:
-                stylesheet = response.read().decode("utf-8")
+            stylesheets = re.findall(r'href="(/chat/assets/[^"]+\.css)"', html)
+            assert stylesheets, html
+            stylesheet = ""
+            for asset in stylesheets:
+                with urllib.request.urlopen(f"{base_url}{asset}", timeout=4) as response:
+                    stylesheet += response.read().decode("utf-8")
             assert ".personal-workspace" in stylesheet, "packaged workspace stylesheet is incomplete"
 
             code, targets_payload = request_json(f"{base_url}/api/chat/goal-channel/targets")
@@ -346,12 +400,225 @@ def main() -> None:
             assert code == 400, configure_invalid
             assert configure_invalid["error_code"] == "invalid_goal_channel_configure", configure_invalid
 
+            code, blocked_notice_missing = request_json(
+                f"{base_url}/api/chat/goal-channel/configure",
+                method="POST",
+                body={"goal_id": GOAL_ID, "auto_notify_blocked_notices": False},
+            )
+            assert code == 400, blocked_notice_missing
+            assert blocked_notice_missing["blocker"] == "channel_binding_missing", blocked_notice_missing
+
+            code, configure_conflict = request_json(
+                f"{base_url}/api/chat/goal-channel/configure",
+                method="POST",
+                body={"goal_id": GOAL_ID, "auto_notify_human_gates": True,
+                      "auto_notify_blocked_notices": True},
+            )
+            assert code == 400, configure_conflict
+            assert configure_conflict["error_code"] == "invalid_goal_channel_configure", configure_conflict
+
+            registry_before_subagent_preview = registry.read_text(encoding="utf-8")
+            code, invalid_domain = request_json(
+                f"{base_url}/api/chat/goal-subagents/dry-run",
+                method="POST",
+                body={
+                    "goal_id": GOAL_ID,
+                    "enabled": True,
+                    "max_children": 2,
+                    "allowed_domains": ["../private"],
+                },
+            )
+            assert code == 400, invalid_domain
+            assert (
+                invalid_domain["error_code"] == "invalid_goal_subagent_configuration"
+            ), invalid_domain
+
+            unrestricted_subagent_request = {
+                "goal_id": GOAL_ID,
+                "enabled": True,
+                "max_children": 2,
+            }
+            code, unrestricted_preview = request_json(
+                f"{base_url}/api/chat/goal-subagents/dry-run",
+                method="POST",
+                body=unrestricted_subagent_request,
+            )
+            assert code == 200 and unrestricted_preview["preview_id"], (
+                unrestricted_preview
+            )
+            assert unrestricted_preview["dry_run"] is True, unrestricted_preview
+            assert unrestricted_preview["written"] is False, unrestricted_preview
+            assert unrestricted_preview["after"]["orchestration"].get(
+                "allowed_domains", []
+            ) == [], unrestricted_preview
+            assert unrestricted_preview["feature_summary"]["multi_subagent"] == (
+                "enabled"
+            ), unrestricted_preview
+            assert (
+                registry.read_text(encoding="utf-8") == registry_before_subagent_preview
+            )
+
+            code, stale_subagent_apply = request_json(
+                f"{base_url}/api/chat/goal-subagents/apply",
+                method="POST",
+                body={**unrestricted_subagent_request, "preview_id": "stale-preview"},
+            )
+            assert code == 409, stale_subagent_apply
+            assert (
+                stale_subagent_apply["error_code"] == "stale_goal_subagent_preview"
+            ), stale_subagent_apply
+
+            code, unrestricted_applied = request_json(
+                f"{base_url}/api/chat/goal-subagents/apply",
+                method="POST",
+                body={
+                    **unrestricted_subagent_request,
+                    "preview_id": unrestricted_preview["preview_id"],
+                },
+            )
+            assert code == 200 and unrestricted_applied["written"] is True, (
+                unrestricted_applied
+            )
+            assert (
+                unrestricted_applied["global_sync"]["readback"]["verified"] is True
+            ), unrestricted_applied
+            unrestricted_goal = next(
+                item
+                for item in json.loads(registry.read_text(encoding="utf-8"))["goals"]
+                if item["id"] == GOAL_ID
+            )
+            assert unrestricted_goal["spawn_policy"] == {
+                "mode": "multi_subagent",
+                "allowed": True,
+                "max_children": 2,
+                "allowed_domains": [],
+            }, unrestricted_goal
+
+            unrestricted_status = wait_for_json(f"{base_url}/status.json")
+            unrestricted_projected_goal = next(
+                item
+                for item in unrestricted_status["run_history"]["goals"]
+                if item["id"] == GOAL_ID
+            )
+            assert unrestricted_projected_goal["spawn_policy"]["spawn_allowed"] is True
+            assert unrestricted_projected_goal["spawn_policy"]["max_children"] == 2
+            assert (
+                unrestricted_projected_goal["spawn_policy"].get("allowed_domains", []) == []
+            ), unrestricted_projected_goal
+
+            restricted_subagent_request = {
+                "goal_id": GOAL_ID,
+                "enabled": True,
+                "max_children": 2,
+                "allowed_domains": ["code", "validation"],
+            }
+            code, restricted_preview = request_json(
+                f"{base_url}/api/chat/goal-subagents/dry-run",
+                method="POST",
+                body=restricted_subagent_request,
+            )
+            assert code == 200 and restricted_preview["preview_id"], restricted_preview
+            assert restricted_preview["written"] is False, restricted_preview
+
+            code, subagent_applied = request_json(
+                f"{base_url}/api/chat/goal-subagents/apply",
+                method="POST",
+                body={
+                    **restricted_subagent_request,
+                    "preview_id": restricted_preview["preview_id"],
+                },
+            )
+            assert code == 200, subagent_applied
+            assert subagent_applied["written"] is True, subagent_applied
+            assert subagent_applied["global_sync"]["readback"]["verified"] is True, (
+                subagent_applied
+            )
+            configured_goal = next(
+                item
+                for item in json.loads(registry.read_text(encoding="utf-8"))["goals"]
+                if item["id"] == GOAL_ID
+            )
+            assert configured_goal["spawn_policy"] == {
+                "mode": "multi_subagent",
+                "allowed": True,
+                "max_children": 2,
+                "allowed_domains": ["code", "validation"],
+            }, configured_goal
+
             status_payload = wait_for_json(f"{base_url}/status.json")
             assert status_payload["ok"] is True, status_payload
             assert status_payload["goal_count"] == 1, status_payload
             assert status_payload["goal_filter"] == GOAL_ID, status_payload
             assert status_payload["global_registry"]["ok"] is True, status_payload
             assert str(root) not in json.dumps(status_payload), status_payload
+            projected_goal = next(
+                item
+                for item in status_payload["run_history"]["goals"]
+                if item["id"] == GOAL_ID
+            )
+            assert projected_goal["spawn_policy"]["spawn_allowed"] is True, projected_goal
+            assert projected_goal["spawn_policy"]["max_children"] == 2, projected_goal
+            assert projected_goal["spawn_policy"]["allowed_domains"] == [
+                "code",
+                "validation",
+            ], projected_goal
+
+            disable_subagents = {"goal_id": GOAL_ID, "enabled": False}
+            code, disable_preview = request_json(
+                f"{base_url}/api/chat/goal-subagents/dry-run",
+                method="POST",
+                body=disable_subagents,
+            )
+            assert code == 200 and disable_preview["preview_id"], disable_preview
+            code, disable_applied = request_json(
+                f"{base_url}/api/chat/goal-subagents/apply",
+                method="POST",
+                body={**disable_subagents, "preview_id": disable_preview["preview_id"]},
+            )
+            assert code == 200 and disable_applied["written"] is True, disable_applied
+            assert disable_applied["global_sync"]["readback"]["verified"] is True, (
+                disable_applied
+            )
+            disabled_status = wait_for_json(f"{base_url}/status.json")
+            disabled_goal = next(
+                item
+                for item in disabled_status["run_history"]["goals"]
+                if item["id"] == GOAL_ID
+            )
+            assert disabled_goal["spawn_policy"] == {
+                "mode": "default",
+                "spawn_allowed": False,
+                "max_children": 0,
+            }, disabled_goal
+
+            for model_config in (
+                {"model": "gpt-5.6-luna", "reasoning_effort": "max"},
+                {"model": "gpt-5.6-luna"},
+                None,
+            ):
+                model_request = {"goal_id": GOAL_ID, "enabled": False, "model_config": model_config}
+                before_model_preview = registry.read_bytes()
+                code, model_preview = request_json(
+                    f"{base_url}/api/chat/goal-subagents/dry-run", method="POST", body=model_request,
+                )
+                assert code == 200, model_preview
+                assert registry.read_bytes() == before_model_preview
+                code, tampered_model = request_json(
+                    f"{base_url}/api/chat/goal-subagents/apply", method="POST",
+                    body={**model_request, "model_config": {"model": "another-model"}, "preview_id": model_preview["preview_id"]},
+                )
+                assert code == 409, tampered_model
+                assert registry.read_bytes() == before_model_preview
+                code, model_applied = request_json(
+                    f"{base_url}/api/chat/goal-subagents/apply", method="POST",
+                    body={**model_request, "preview_id": model_preview["preview_id"]},
+                )
+                assert code == 200, model_applied
+                assert model_applied["after"]["orchestration"].get("model_config") == model_config
+                model_status = wait_for_json(f"{base_url}/status.json")
+                model_goal = next(item for item in model_status["run_history"]["goals"] if item["id"] == GOAL_ID)
+                assert model_goal["spawn_policy"].get("model_config") == model_config
+                assert model_goal["spawn_policy"]["spawn_allowed"] is False
 
             code, created = request_json(
                 f"{base_url}/api/chat/sessions",
@@ -364,9 +631,19 @@ def main() -> None:
             code, manager_created = request_json(
                 f"{base_url}/api/chat/sessions",
                 method="POST",
-                body={"goal_id": GOAL_ID, "context_kind": "manager"},
+                body={"context_kind": "manager"},
             )
+            # The steward channel owns its executor default. This client sends
+            # no pick, so the session must land on whatever the channel resolves
+            # on this machine -- never on an executor the caller's client
+            # happens to ship with.
+            expected_manager_endpoint = manager_executor_endpoint_default()
             assert code == 201, manager_created
+            assert manager_created["agent_id"] == expected_manager_endpoint, manager_created
+            assert (
+                manager_created["session"]["executor_endpoint_id"]
+                == expected_manager_endpoint
+            ), manager_created
             assert manager_created["session"]["channel_id"] == "manager", manager_created
             assert manager_created["session_id"] != session_id, manager_created
             code, manager_resumed = request_json(
@@ -376,9 +653,18 @@ def main() -> None:
             )
             assert code == 200 and manager_resumed["resumed"] is True, manager_resumed
             assert manager_resumed["session_id"] == manager_created["session_id"], manager_resumed
-            assert manager_resumed["goal_id"] == GOAL_ID, manager_resumed
+            assert manager_resumed["goal_id"] == "loopx-manager", manager_resumed
+            # An explicit pick still travels, and it resumes the same channel
+            # conversation instead of silently opening a second one.
+            code, manager_explicit = request_json(
+                f"{base_url}/api/chat/sessions",
+                method="POST",
+                body={"context_kind": "manager", "agent_id": expected_manager_endpoint},
+            )
+            assert code == 200 and manager_explicit["resumed"] is True, manager_explicit
+            assert manager_explicit["session_id"] == manager_created["session_id"], manager_explicit
             listed_manager = wait_for_json(
-                f"{base_url}/api/chat/sessions?agent_id=codex&channel_id=manager"
+                f"{base_url}/api/chat/sessions?channel_id=manager"
             )
             assert [item["session_id"] for item in listed_manager["sessions"]] == [
                 manager_created["session_id"]
@@ -405,6 +691,10 @@ def main() -> None:
                 "现在该做什么？",
                 "当前没有阻塞。",
             ], projection_snapshot
+            assert [message["message_id"] for message in projection_snapshot["messages"]] == [
+                projection_exchange["user_message_id"],
+                projection_exchange["answer_message_id"],
+            ], projection_snapshot
 
             code, turn = request_json(
                 f"{base_url}/api/chat/sessions/{session_id}/turns",
@@ -424,7 +714,7 @@ def main() -> None:
             with urllib.request.urlopen(
                 urllib.request.Request(
                     f"{base_url}{accepted['events_url']}",
-                    headers={"Accept": "text/event-stream", "Origin": "http://127.0.0.1:5173"},
+                    headers={"Accept": "text/event-stream", "Origin": base_url},
                 ),
                 timeout=4,
             ) as response:
@@ -449,7 +739,7 @@ def main() -> None:
                     headers={
                         "Accept": "text/event-stream",
                         "Last-Event-ID": first_event_id,
-                        "Origin": "http://127.0.0.1:5173",
+                        "Origin": base_url,
                     },
                 ),
                 timeout=4,

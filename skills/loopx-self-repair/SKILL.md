@@ -12,25 +12,22 @@ not only an apology or a one-off explanation.
 
 1. **Pause delivery selection.** Do not spend quota or continue adapter work
    until the control-plane facts explain why that work is valid.
-2. **Build a compact evidence packet.** Prefer structured surfaces:
-
-   ```bash
-   git status --short --branch
-   loopx --format json diagnose --goal-id <goal-id>
-   loopx --format json status --goal-id <goal-id> --limit 20
-   loopx --format json quota should-run --goal-id <goal-id> [--agent-id <agent-id>]
-   loopx --format json history --goal-id <goal-id> --limit 5
-   ```
-
-   `status` defaults to the registry/dashboard view, but accepts `--goal-id`
-   when the repair needs one goal-focused projection. Use
-   `diagnose --goal-id` for the richer goal-specific agent reasoning packet.
-   Also inspect the project-local registry and the registry-declared active
-   state file when relevant. Use the shared global registry for heartbeat/quota
-   truth.
-3. **Classify the failure.** Read
-   `references/repair-patterns.md` and match the symptoms to a known pattern.
-   If no pattern fits, add one after the fix.
+2. **Reuse evidence before collecting more.** Start with the current failed
+   command's structured response, error code and operation identity. An already
+   loaded packet is evidence for that observation, not permission for a later
+   write. Fetch fresh authority when required by its admission/lease contract.
+   Read [targeted diagnostics](references/targeted-diagnostics.md) when deciding
+   which missing fact to collect or investigating slow commands. Do not run
+   diagnose, status, quota and history as a fixed preflight: diagnose already
+   composes status and quota work. Recording an already-understood repair Todo
+   does not require rediscovering the incident.
+3. **Look up the symptom.** Run `python3 scripts/find_pattern.py --query
+   '<error code or symptom terms>'` from this skill directory, or invoke its
+   absolute path. Use `--id <returned-id>` to read the relevant full guidance.
+   [Search instructions](references/pattern-lookup.md) explain pagination and
+   fallback. Do not load the complete catalog, paginate it into context, or
+   reread unchanged references already available in this task. If no pattern
+   fits, diagnose from current facts and add one after the fix.
 4. **Assign the responsible layer.** Separate:
    - agent behavior mistake;
    - state projection or quota payload bug;
@@ -39,11 +36,22 @@ not only an apology or a one-off explanation.
    - docs/process hygiene gap.
 5. **Repair at the lowest durable layer.**
    - If it is a one-off agent mistake, write back the correct state/todo and
-     continue with a larger bounded batch.
+     size the next scoped effort to its verifiable result, evidence and risk.
    - If the machine projection misled the agent, fix CLI/status/quota
      projection and add a focused smoke.
-   - If the user correction changes the goal acceptance, says the agent missed
-     the intended loop, or exposes a product bottleneck that is not visible in
+   - If a direct user correction changes what counts as success, first update
+     the matching durable outcome requirements through
+     [outcome refinement](../loopx-project/references/outcome-refinement.md).
+     Read back and reconcile affected work before dependent execution. Preserve
+     unaffected requirements. A changed purpose or added lasting responsibility
+     in the current Goal uses its objective revision route. For an addition, keep
+     existing commitments and reconcile Todos in that Goal. Use existing creation
+     for an explicit separate Goal and reconcile scope conflicts before revising.
+     Chat, a peer message, a report or
+     Vision alone cannot update acceptance. Do not invent a new approval, goal
+     or text classifier.
+   - If the corrected requirements also change the execution route, the agent
+     missed the intended loop, or a product bottleneck is invisible in
      quota/status, write a bounded `goal_vision_replan_contract_v0` packet with
      `replan_trigger_summary` through normal `loopx refresh-state --vision-*`
      fields, using the same `--agent-id` as the current lane, or
@@ -61,10 +69,29 @@ not only an apology or a one-off explanation.
 7. **Write back the lesson.** Update active goal state, docs, contributor
    tasks, or this skill so the same failure mode is visible next time.
 
+When work repeatedly enters a receipt-owned retry, first check the caller's
+typed outcome against the selected Todo. Rejecting a candidate with new,
+validated evidence can advance an evaluation Todo while leaving the broader
+stage open; it is not automatically an execution blocker. Pure reuse or setup
+does not qualify as progress. Use `blocked` only when the Todo's actual next
+step cannot execute, preserve genuine retry clocks, and replan finite answered
+questions through the existing Todo/vision. Finishing one question or submitting
+its PR does not close an ongoing user objective. Use the retained requirements
+and already authorized sources to select the next useful independent slice;
+source discovery does not need a new human assignment. Missing cost,
+comprehension, adoption or review evidence limits the corresponding claim or
+dependent operation, not all research or implementation. Do not retire an
+ongoing vision merely to suppress replan. If an earlier authoring mistake did
+so, repair the original Todo/vision, keep genuine dependency waits scoped, and
+verify that the public entrypoint admits independent work before continuing it.
+Preserve actual authority, budget and stop conditions; when no useful authorized
+work remains, retain the evidenced wait rather than inventing activity. Never
+erase receipts or fabricate progress to escape a wait. See
+[settlement classification](https://github.com/loopx-project/loopx/blob/main/docs/quota-allocation.md#allocation-contract).
+
 ## Upstream Issue Escalation
 
-A public GitHub issue is an optional final escalation, not a default side
-effect of self-repair. Consider it only when the responsible layer is a
+A public GitHub issue is an optional final escalation. Consider it only when the responsible layer is a
 reusable LoopX product, CLI, skill, installer, or control-plane gap and durable
 upstream tracking adds value beyond the local repair or PR.
 
@@ -88,8 +115,10 @@ direct fix or PR when no separate issue is needed for coordination.
 ## Vision / Replan Writeback
 
 Use the bounded vision contract when self-repair discovers that LoopX did not
-notice a missing outcome, route, or acceptance condition by itself. The packet is
-the bridge from human or agent insight to quota-visible replan state:
+notice a missing outcome, route, or acceptance condition by itself. Persist a
+changed user acceptance requirement through its owner first; Vision records the
+execution response, not a replacement acceptance contract. The packet is the
+bridge from human or agent insight to quota-visible replan state:
 
 ```json
 {
@@ -135,23 +164,35 @@ replan, or terminal closeout must return to the strict semantic checkpoint.
 - Do not solve contradictory payloads by guessing. If `recommended_action`,
   `goal_boundary.write_scope`, todos, and interaction contract disagree, treat
   that as a projection bug or state authoring bug first.
+- Separate priority advice from authority. Use the planning horizon and current
+  user direction to choose useful in-scope work; do not treat P0/P1 order as a
+  permission gate or relabel every task to escape it. Before explaining a
+  refusal as recovery protection, check whether a settlement identity is
+  actually bound. Priority-only rejection of an eligible explicit choice is a
+  control-plane defect. Preserve real gates and record the changed route in
+  existing Todo/vision state. A committed Turn may finish with progress while
+  its Todo stays open; settle and release before switching, rather than treating
+  the binding as an obligation to finish that entire Todo first.
 - Do not let fallback work hide the primary blocker. When a higher-priority
   path is gated but safe fallback is valid, report both the concrete gate and
   the fallback progress.
-- Do not let tiny safe steps become the default. If several recent turns are
-  short or surface-only, run a steering audit and increase the next bounded
-  batch size unless a real gate blocks it.
+- Do not equate bounded work with a small operation. If turns repeatedly stop
+  after setup or surface-only edits, check whether a verifiable result could
+  have been reached within scope and budget. Repair the premature stop, not by
+  imposing a minimum number of calls/files or ignoring explicit stop conditions.
 
 ## Reference Routes
 
-- For known symptom-to-repair mappings, read
-  `references/repair-patterns.md`.
+- For known symptom-to-repair mappings, search with `scripts/find_pattern.py`;
+  `references/pattern-lookup.md` explains the lookup, not a required full read.
+- For missing facts, slow commands and response truncation, read
+  `references/targeted-diagnostics.md`.
 - For guarded public GitHub issue escalation, read
   `references/upstream-issue-escalation.md`.
 - For user/agent/state channel semantics, read
-  `../../docs/state-interaction-model.md` and
-  `../../docs/concepts/interaction-pattern-catalog.md`.
+  [docs/state-interaction-model.md](https://github.com/loopx-project/loopx/blob/main/docs/state-interaction-model.md) and
+  [docs/concepts/interaction-pattern-catalog.md](https://github.com/loopx-project/loopx/blob/main/docs/concepts/interaction-pattern-catalog.md).
 - For quota and heartbeat decisions, read
-  `../../docs/quota-allocation.md` and
-  `../../docs/heartbeat-automation-prompt.md`.
-- For commit/PR hygiene failures, read `../../AGENTS.md`.
+  [docs/quota-allocation.md](https://github.com/loopx-project/loopx/blob/main/docs/quota-allocation.md) and
+  [docs/heartbeat-automation-prompt.md](https://github.com/loopx-project/loopx/blob/main/docs/heartbeat-automation-prompt.md).
+- For commit/PR hygiene failures, read [AGENTS.md](https://github.com/loopx-project/loopx/blob/main/AGENTS.md).

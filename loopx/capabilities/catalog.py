@@ -23,9 +23,15 @@ from .periodic_report.catalog_entry import PERIODIC_REPORT_CATALOG_ENTRY
 from .content_ops.catalog_entry import CONTENT_OPS_CATALOG_ENTRY
 from .value_connectors.catalog_entry import VALUE_CONNECTORS_CATALOG_ENTRY
 from .explore.catalog_entry import EXPLORE_CATALOG_ENTRY
-from .auto_research.catalog_entry import AUTO_RESEARCH_CATALOG_ENTRY
+from .deep_research.catalog_entry import DEEP_RESEARCH_CATALOG_ENTRY
 from .public_safe_outbound.catalog_entry import PUBLIC_SAFE_OUTBOUND_CATALOG_ENTRY
 from .connector_registry.catalog_entry import CONNECTOR_REGISTRY_CATALOG_ENTRY
+from .external_research.catalog_entry import EXTERNAL_RESEARCH_CATALOG_ENTRY
+from .performance_diagnosis.catalog_entry import PERFORMANCE_DIAGNOSIS_CATALOG_ENTRY
+from .reliability_diagnostics.catalog_entry import RELIABILITY_DIAGNOSTICS_CATALOG_ENTRY
+from .progress_review.catalog_entry import PROGRESS_REVIEW_CATALOG_ENTRY
+from .goal_capability_organization.catalog_entry import GOAL_CAPABILITY_ORGANIZATION_CATALOG_ENTRY
+from .anti_entropy.catalog_entry import ANTI_ENTROPY_CATALOG_ENTRY
 from .registry import CapabilityRegistry
 
 CAPABILITY_CATALOG_SCHEMA_VERSION = "loopx_capability_catalog_v0"
@@ -49,9 +55,15 @@ BUILTIN_CAPABILITIES: tuple[dict[str, Any], ...] = (
     CONTENT_OPS_CATALOG_ENTRY,
     VALUE_CONNECTORS_CATALOG_ENTRY,
     EXPLORE_CATALOG_ENTRY,
-    AUTO_RESEARCH_CATALOG_ENTRY,
+    DEEP_RESEARCH_CATALOG_ENTRY,
     PUBLIC_SAFE_OUTBOUND_CATALOG_ENTRY,
     CONNECTOR_REGISTRY_CATALOG_ENTRY,
+    EXTERNAL_RESEARCH_CATALOG_ENTRY,
+    PERFORMANCE_DIAGNOSIS_CATALOG_ENTRY,
+    RELIABILITY_DIAGNOSTICS_CATALOG_ENTRY,
+    PROGRESS_REVIEW_CATALOG_ENTRY,
+    GOAL_CAPABILITY_ORGANIZATION_CATALOG_ENTRY,
+    ANTI_ENTROPY_CATALOG_ENTRY,
 )
 # Preserve the original import surface while routing all reads through the registry.
 CAPABILITIES = BUILTIN_CAPABILITIES
@@ -78,6 +90,55 @@ def _summary(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _register_declared_implementation_providers(
+    registry: CapabilityRegistry,
+    record: Mapping[str, object],
+) -> None:
+    """Register implementation providers a builtin entry declares by id.
+
+    A declared provider has no manifest or state file of its own: an npm
+    plugin lives outside the Python extension lifecycle, and a bundled
+    default-off provider such as the Git hook is installed per repository
+    rather than per runtime. The owning capability declares the id so the
+    catalog projects `declared=true` and `installed=enabled=ready=false`
+    until a real lifecycle proves otherwise. Both origins take the same
+    path; otherwise a builtin declaration leaks into the record as a raw
+    dict with no `provider_state` and never reaches the provider list.
+    """
+
+    for implementation in record.get("implementation_providers") or []:
+        if not isinstance(implementation, Mapping):
+            continue
+        origin = str(implementation.get("origin") or "")
+        if origin not in {"builtin", "extension"}:
+            raise ValueError(
+                f"capability `{record['id']}` declares implementation provider "
+                f"`{implementation.get('provider_id')}` with unsupported origin "
+                f"`{origin}`"
+            )
+        provider_id = str(implementation["provider_id"])
+        if not any(provider["id"] == provider_id for provider in registry.providers()):
+            registry.register_provider(
+                {
+                    "id": provider_id,
+                    "origin": origin,
+                    "declared": True,
+                    "installed": False,
+                    "enabled": False,
+                    "ready": False,
+                }
+            )
+        registry.register_implementation(
+            {
+                "capability_id": record["id"],
+                "provider_id": provider_id,
+                "protocol": implementation["protocol"],
+                "package": implementation.get("package"),
+                "status": implementation.get("status"),
+            }
+        )
+
+
 def build_capability_registry(
     extension_manifest_paths: Iterable[str | Path] = (),
     *,
@@ -96,6 +157,8 @@ def build_capability_registry(
     )
     for record in BUILTIN_CAPABILITIES:
         registry.register_capability(record)
+    for record in BUILTIN_CAPABILITIES:
+        _register_declared_implementation_providers(registry, record)
     for manifest in extension_catalog_entries(
         extension_manifest_paths,
         state_file=extension_state_file,

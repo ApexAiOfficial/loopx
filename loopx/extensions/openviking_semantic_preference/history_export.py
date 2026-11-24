@@ -29,8 +29,12 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from ...control_plane.content_digest import BARE_SHA256_PATTERN
 from ...control_plane.runtime.public_safety import public_safe_compact_text
+from ...entrypoint import pin_utf8_stdio
 from ...history import collect_history, validate_goal_id_path_segment
+from ...paths import PATH_SEGMENT_UNSAFE_RE
+from ...public_safe_text import IDENTITY_TOKEN_PATTERN as _PUBLIC_GOAL_ID_RE
 
 HISTORY_EXPORT_SCHEMA_VERSION = "loopx_history_conclusion_export_v0"
 
@@ -39,11 +43,8 @@ _MAX_PROGRESS_BULLETS = 3
 _CORPUS_DIR = "history-conclusions"
 _MANIFEST_FILE = ".loopx-history-conclusion-export.json"
 _MANIFEST_SCHEMA_VERSION = "loopx_history_conclusion_export_manifest_v0"
-_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 # Bounded ISO-8601-ish timestamp: digits, T/space, colon, dot, +/- and Z only.
 _TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9:.+\-]{1,20}Z?$")
-_PUBLIC_GOAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,120}$")
 _SECRET_SHAPED_GOAL_ID_RE = re.compile(
     r"(?i)^(?:"
     r"gh[pousr]_[A-Za-z0-9]{20,}|"
@@ -87,7 +88,7 @@ def _safe_generated_at(value: Any) -> str:
 
 
 def _slug(value: str) -> str:
-    slug = _SLUG_RE.sub("-", value).strip("-")
+    slug = PATH_SEGMENT_UNSAFE_RE.sub("-", value).strip("-")
     return slug[:80] or "run"
 
 
@@ -162,7 +163,7 @@ def _read_owned_manifest(path: Path, *, goal_id: str) -> dict[str, str]:
             not name
             or Path(name).name != name
             or not name.endswith(".md")
-            or not _SHA256_RE.fullmatch(digest)
+            or not BARE_SHA256_PATTERN.fullmatch(digest)
             or name in owned
         ):
             raise RuntimeError("history export manifest contains an invalid file entry")
@@ -294,7 +295,7 @@ def _publish_generation(
         staged = Path(temp_dir) / "publish"
         staged.mkdir()
         for name, data in sorted(documents.items()):
-            (staged / name).write_text(data.decode("utf-8"), encoding="utf-8")
+            (staged / name).write_bytes(data)
         _write_manifest(staged / _MANIFEST_FILE, manifest)
         _validate_staged_generation(
             staged,
@@ -392,6 +393,8 @@ def export_goal_conclusions(
     - ``goal_id`` is validated as a single path segment before it is used as a
       directory component, so an unsafe id (``../escaped``) cannot escape
       ``out_dir``.
+    - The per-goal output directory cannot be a symlink, so an existing link
+      cannot redirect this goal's corpus outside its selected output directory.
     - A private manifest identifies only this exporter's documents. The owned
       corpus directory is fully staged and read back before one atomic directory
       replacement, while unrelated files under ``out_dir/<goal_id>/`` are never
@@ -400,6 +403,10 @@ def export_goal_conclusions(
       never part of the ``public_projection``.
     """
     safe_goal_id = _public_goal_id(goal_id)
+    goal_root = out_dir / safe_goal_id
+    if goal_root.is_symlink():
+        raise RuntimeError("goal output directory must not be a symlink")
+
     history = collect_history(
         registry_path=registry_path,
         runtime_root=runtime_root,
@@ -407,7 +414,6 @@ def export_goal_conclusions(
         limit=limit,
     )
     runs = history.get("runs") or []
-    goal_root = out_dir / safe_goal_id
     corpus_out = goal_root / _CORPUS_DIR
     manifest_path = corpus_out / _MANIFEST_FILE
 
@@ -468,6 +474,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    pin_utf8_stdio()
     args = _parser().parse_args(argv)
     payload = export_goal_conclusions(
         goal_id=args.goal_id,

@@ -154,10 +154,39 @@ def test_shared_target_cli_parses_add_setup_and_bounded_attach() -> None:
             "goal-second-public-fixture",
         ]
     )
+    deliver = parser.parse_args(
+        [
+            "goal-channel",
+            "deliver-operation",
+            "--goal-id",
+            GOAL_ID,
+            "--proposal-id",
+            "proposal-public-fixture",
+        ]
+    )
+    prepare = parser.parse_args(
+        [
+            "goal-channel",
+            "prepare-operation",
+            "--goal-id",
+            GOAL_ID,
+            "--agent-id",
+            "finance-agent",
+            "--summary",
+            "Review the simulated order",
+            "--idempotency-key",
+            "finance-order-fixture",
+            "--request-json",
+            "operation.json",
+        ]
+    )
 
     assert target.goal_channel_target_command == "add"
     assert setup.target == "loopx-dev"
     assert attach.goal_id == [GOAL_ID, "goal-second-public-fixture"]
+    assert deliver.proposal_id == "proposal-public-fixture"
+    assert prepare.agent_id == "finance-agent"
+    assert prepare.idempotency_key == "finance-order-fixture"
 
     bounded = goal_channel_cli._attach_goals(
         registry={},
@@ -183,6 +212,7 @@ def test_effectful_attach_stops_after_first_failed_goal(
             {"goals": []},
             tmp_path / ".loopx" / "registry.json",
             tmp_path / ".loopx" / "goal-channel.json",
+            tmp_path / "runtime",
         ),
     )
 

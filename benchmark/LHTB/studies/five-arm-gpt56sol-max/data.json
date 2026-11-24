@@ -1,0 +1,435 @@
+{
+  "schema_version": "loopx_lhtb_five_arm_public_v1",
+  "generated_at": "2026-09-18",
+  "benchmark": {
+    "name": "Long-Horizon Terminal-Bench",
+    "version": "July 2026 snapshot",
+    "tasks": 46,
+    "solved_threshold": 0.95
+  },
+  "model": {
+    "name": "openai/gpt-5.6-sol",
+    "reasoning_effort": "max",
+    "web_search": "disabled"
+  },
+  "arms": {
+    "plain": {
+      "label": "Plain",
+      "mean_reward": 0.42176041537557174,
+      "pass_095": 7,
+      "tokens": 251717094,
+      "estimated_cost_usd": 212.97,
+      "runtime": "Codex app-server; native Goal disabled"
+    },
+    "native_goal": {
+      "label": "Native Goal",
+      "mean_reward": 0.4475494760979694,
+      "pass_095": 4,
+      "tokens": 293812465,
+      "estimated_cost_usd": 344.25,
+      "runtime": "Codex app-server; native persistent Goal"
+    },
+    "ssh_goal": {
+      "label": "LoopX SSH-Goal",
+      "mean_reward": 0.46782079861524567,
+      "pass_095": 6,
+      "tokens": 402858861,
+      "estimated_cost_usd": 425.5,
+      "runtime": "Codex app-server; LoopX registry, quota, Todo, dispatcher, and writeback"
+    },
+    "legacy_heartbeat": {
+      "label": "Legacy Heartbeat",
+      "mean_reward": 0.47944902808463125,
+      "pass_095": 7,
+      "tokens": 387179773,
+      "estimated_cost_usd": 332.7,
+      "runtime": "LoopX 0.5.3; Codex app-server; native Goal heartbeat"
+    },
+    "new_heartbeat": {
+      "label": "New Heartbeat",
+      "mean_reward": 0.49483286022245104,
+      "pass_095": 7,
+      "input_tokens": 505102471,
+      "cache_tokens": 462858960,
+      "output_tokens": 3636057,
+      "recorded_cost_usd": 551.728745,
+      "runtime": "LoopX 1.0.3 at 1c7b40e; generic_cli; fresh codex exec per wake; replan after 3 completed advancement Todos"
+    }
+  },
+  "heartbeat_comparison": {
+    "wins": 17,
+    "ties": 19,
+    "losses": 10,
+    "mean_delta": 0.015383832137819754
+  },
+  "tasks": [
+    {
+      "task": "2048",
+      "plain": 0.410864,
+      "native_goal": 0.5744,
+      "ssh_goal": 0.659182,
+      "legacy_heartbeat": 0.528945,
+      "new_heartbeat": 0.708182
+    },
+    {
+      "task": "alp-paper-reproduction",
+      "plain": 0.4,
+      "native_goal": 0.5,
+      "ssh_goal": 0.5,
+      "legacy_heartbeat": 0.5,
+      "new_heartbeat": 0.5
+    },
+    {
+      "task": "apex-ib244-matter",
+      "plain": 0.993151,
+      "native_goal": 0.883562,
+      "ssh_goal": 0.993151,
+      "legacy_heartbeat": 0.993151,
+      "new_heartbeat": 0.993151
+    },
+    {
+      "task": "apex-investment-banking-matter",
+      "plain": 0.43662,
+      "native_goal": 0.43662,
+      "ssh_goal": 0.704225,
+      "legacy_heartbeat": 0.647887,
+      "new_heartbeat": 0.56338
+    },
+    {
+      "task": "apex-law433-matter",
+      "plain": 0.400685,
+      "native_goal": 0.815068,
+      "ssh_goal": 0.434932,
+      "legacy_heartbeat": 0.520548,
+      "new_heartbeat": 0.613014
+    },
+    {
+      "task": "apex-management-consulting-matter",
+      "plain": 0.44385,
+      "native_goal": 0.385027,
+      "ssh_goal": 0.417112,
+      "legacy_heartbeat": 0.433155,
+      "new_heartbeat": 0.513369
+    },
+    {
+      "task": "apex-openroad-ibex-signoff",
+      "plain": 0,
+      "native_goal": 0,
+      "ssh_goal": 0,
+      "legacy_heartbeat": 0,
+      "new_heartbeat": 0
+    },
+    {
+      "task": "audio-visual-event-alignment",
+      "plain": 0.027818181818,
+      "native_goal": 0.028,
+      "ssh_goal": 0.028,
+      "legacy_heartbeat": 0.027818181818,
+      "new_heartbeat": 0.028
+    },
+    {
+      "task": "chess-mate",
+      "plain": 0.2167,
+      "native_goal": 0.1167,
+      "ssh_goal": 0.2042,
+      "legacy_heartbeat": 0.1208,
+      "new_heartbeat": 0.2
+    },
+    {
+      "task": "climate-netcdf-extreme-event-audit",
+      "plain": 0.085505193353,
+      "native_goal": 0.085505193353,
+      "ssh_goal": 0.087171860019,
+      "legacy_heartbeat": 0.085005193353,
+      "new_heartbeat": 0.085505193353
+    },
+    {
+      "task": "commit0-multilib-tdd",
+      "plain": 0.9069,
+      "native_goal": 0.4311,
+      "ssh_goal": 0.9298,
+      "legacy_heartbeat": 0.9337,
+      "new_heartbeat": 0.8852
+    },
+    {
+      "task": "dicom-radiology-audit",
+      "plain": 0.8857634902411022,
+      "native_goal": 0.8851894374282434,
+      "ssh_goal": 0.8851894374282434,
+      "legacy_heartbeat": 0.8851894374282434,
+      "new_heartbeat": 0.8851894374282434
+    },
+    {
+      "task": "document-table-layout-reconstruction",
+      "plain": 0.0925,
+      "native_goal": 0.0725,
+      "ssh_goal": 0.0925,
+      "legacy_heartbeat": 0.0925,
+      "new_heartbeat": 0.0925
+    },
+    {
+      "task": "duckdb-optimizer-closure",
+      "plain": 0,
+      "native_goal": 0.769742,
+      "ssh_goal": 0.785907,
+      "legacy_heartbeat": 0.771367,
+      "new_heartbeat": 0
+    },
+    {
+      "task": "epa-swmm-stormwater-regression-audit",
+      "plain": 0.05165289256198347,
+      "native_goal": 0.05165289256198347,
+      "ssh_goal": 0.05165289256198347,
+      "legacy_heartbeat": 0.13705234159779614,
+      "new_heartbeat": 0.13911845730027547
+    },
+    {
+      "task": "epidemic-inverse-control-audit",
+      "plain": 0.1685126582278481,
+      "native_goal": 0.029272151898734177,
+      "ssh_goal": 0.12262658227848101,
+      "legacy_heartbeat": 0.15427215189873417,
+      "new_heartbeat": 0.16376582278481014
+    },
+    {
+      "task": "foldseek-paper-reproduction",
+      "plain": 0.7777777777777778,
+      "native_goal": 0.8888888888888888,
+      "ssh_goal": 0.7777777777777778,
+      "legacy_heartbeat": 0.8888888888888888,
+      "new_heartbeat": 0.8888888888888888
+    },
+    {
+      "task": "gdal-proj-raster-regression",
+      "plain": 0.03455775737071049,
+      "native_goal": 0.021024649589173515,
+      "ssh_goal": 0.025616239729337846,
+      "legacy_heartbeat": 0.026582890285161913,
+      "new_heartbeat": 0.038424359594006766
+    },
+    {
+      "task": "generals-bot-arena",
+      "plain": 0.975,
+      "native_goal": 0.945,
+      "ssh_goal": 0.985,
+      "legacy_heartbeat": 0.955,
+      "new_heartbeat": 0.955
+    },
+    {
+      "task": "grammar-fuzz-coverage-hunt",
+      "plain": 0.947,
+      "native_goal": 0.947,
+      "ssh_goal": 0.9459,
+      "legacy_heartbeat": 0.947,
+      "new_heartbeat": 0.9451
+    },
+    {
+      "task": "great-expectations-audit",
+      "plain": 0.36363636363636365,
+      "native_goal": 0.36363636363636365,
+      "ssh_goal": 0.36363636363636365,
+      "legacy_heartbeat": 0.2727272727272727,
+      "new_heartbeat": 0.2727272727272727
+    },
+    {
+      "task": "langchain-version-migration",
+      "plain": 1,
+      "native_goal": 1,
+      "ssh_goal": 1,
+      "legacy_heartbeat": 1,
+      "new_heartbeat": 1
+    },
+    {
+      "task": "materials-phase-diagram-audit",
+      "plain": 0.090173445825,
+      "native_goal": 0.028142857143,
+      "ssh_goal": 0.090418343784,
+      "legacy_heartbeat": 0.090173445825,
+      "new_heartbeat": 0.06740625
+    },
+    {
+      "task": "matpower-opf-regression",
+      "plain": 0.9166666666666666,
+      "native_goal": 0.9166666666666666,
+      "ssh_goal": 0.9166666666666666,
+      "legacy_heartbeat": 0.9166666666666666,
+      "new_heartbeat": 0.9166666666666666
+    },
+    {
+      "task": "microscopy-cell-count-qc-audit",
+      "plain": 0.02,
+      "native_goal": 0.02,
+      "ssh_goal": 0.02,
+      "legacy_heartbeat": 0.015,
+      "new_heartbeat": 0.02
+    },
+    {
+      "task": "modflow6-groundwater-regression-audit",
+      "plain": 0.4265975820379965,
+      "native_goal": 0.4265975820379965,
+      "ssh_goal": 0.4260218767990789,
+      "legacy_heartbeat": 0.4265975820379965,
+      "new_heartbeat": 0.39666090961427747
+    },
+    {
+      "task": "nbody-accel-iterative",
+      "plain": 1,
+      "native_goal": 1,
+      "ssh_goal": 1,
+      "legacy_heartbeat": 1,
+      "new_heartbeat": 1
+    },
+    {
+      "task": "nrel-pysam-hybrid-renewables-audit",
+      "plain": 0.34854151084517576,
+      "native_goal": 0.06806282722513089,
+      "ssh_goal": 0.1256544502617801,
+      "legacy_heartbeat": 0.006731488406881077,
+      "new_heartbeat": 0.22213911742707554
+    },
+    {
+      "task": "opensees-seismic-structural-regression-audit",
+      "plain": 0.04386484884410195,
+      "native_goal": 0.02845287492590397,
+      "ssh_goal": 0.024896265560165973,
+      "legacy_heartbeat": 0.025489033787788974,
+      "new_heartbeat": 0.023710729104919975
+    },
+    {
+      "task": "poc-exploit-craft",
+      "plain": 0,
+      "native_goal": 0.8921,
+      "ssh_goal": 0.8921,
+      "legacy_heartbeat": 0.8921,
+      "new_heartbeat": 0.8921
+    },
+    {
+      "task": "riscv-core-debug",
+      "plain": 1,
+      "native_goal": 1,
+      "ssh_goal": 1,
+      "legacy_heartbeat": 1,
+      "new_heartbeat": 1
+    },
+    {
+      "task": "robotics-slam-benchmark-repair",
+      "plain": 0.031277777778,
+      "native_goal": 0.03075,
+      "ssh_goal": 0.031105555556,
+      "legacy_heartbeat": 0.029194444444,
+      "new_heartbeat": 0.031277777778
+    },
+    {
+      "task": "rush-hour-campaign",
+      "plain": 0.541647,
+      "native_goal": 0.530993,
+      "ssh_goal": 0.52,
+      "legacy_heartbeat": 0.481159,
+      "new_heartbeat": 0.7716
+    },
+    {
+      "task": "satellite-flood-change-detection-audit",
+      "plain": 0.04,
+      "native_goal": 0.03,
+      "ssh_goal": 0.03,
+      "legacy_heartbeat": 0.285166666667,
+      "new_heartbeat": 0.04
+    },
+    {
+      "task": "scientific-figure-data-reconstruction",
+      "plain": 0.04,
+      "native_goal": 0.015,
+      "ssh_goal": 0.02,
+      "legacy_heartbeat": 0.015,
+      "new_heartbeat": 0.02
+    },
+    {
+      "task": "snake-obstacle-campaign",
+      "plain": 0.8415,
+      "native_goal": 0.3639,
+      "ssh_goal": 0.4262,
+      "legacy_heartbeat": 0.5907,
+      "new_heartbeat": 0.6164
+    },
+    {
+      "task": "sokoban",
+      "plain": 0.270968,
+      "native_goal": 0.593548,
+      "ssh_goal": 0.593548,
+      "legacy_heartbeat": 0.980645,
+      "new_heartbeat": 0.890323
+    },
+    {
+      "task": "spice-ephemeris-regression",
+      "plain": 0.7878787878787878,
+      "native_goal": 0.8484848484848485,
+      "ssh_goal": 0.7575757575757576,
+      "legacy_heartbeat": 0.9393939393939394,
+      "new_heartbeat": 0.8484848484848485
+    },
+    {
+      "task": "spot-scheduler-traces",
+      "plain": 0.9802,
+      "native_goal": 0.9766,
+      "ssh_goal": 0.9708,
+      "legacy_heartbeat": 0.9754,
+      "new_heartbeat": 0.9633
+    },
+    {
+      "task": "su2-airfoil-regression",
+      "plain": 0.2,
+      "native_goal": 0.4,
+      "ssh_goal": 0.5,
+      "legacy_heartbeat": 0.4,
+      "new_heartbeat": 0.3
+    },
+    {
+      "task": "sudoku-recovery",
+      "plain": 0.285714,
+      "native_goal": 0.619855,
+      "ssh_goal": 0.43609,
+      "legacy_heartbeat": 0.446115,
+      "new_heartbeat": 0.548872
+    },
+    {
+      "task": "super-mario",
+      "plain": 0.3528,
+      "native_goal": 0.263867,
+      "ssh_goal": 0.403733,
+      "legacy_heartbeat": 0.231367,
+      "new_heartbeat": 0.255833
+    },
+    {
+      "task": "tabular-data-feature-covshift",
+      "plain": 0,
+      "native_goal": 0.2047,
+      "ssh_goal": 0.2549,
+      "legacy_heartbeat": 0.2918,
+      "new_heartbeat": 0.743
+    },
+    {
+      "task": "unison-paper-reproduction",
+      "plain": 0.3333333333333333,
+      "native_goal": 0.16666666666666666,
+      "ssh_goal": 0.16666666666666666,
+      "legacy_heartbeat": 0.16666666666666666,
+      "new_heartbeat": 0.5
+    },
+    {
+      "task": "unknown-config-semantics",
+      "plain": 0.23132183908045978,
+      "native_goal": 0,
+      "ssh_goal": 0,
+      "legacy_heartbeat": 0,
+      "new_heartbeat": 0.23132183908045978
+    },
+    {
+      "task": "vector-db-iterative-build",
+      "plain": 1,
+      "native_goal": 0.933,
+      "ssh_goal": 0.9198,
+      "legacy_heartbeat": 0.9277,
+      "new_heartbeat": 0.9927
+    }
+  ]
+}

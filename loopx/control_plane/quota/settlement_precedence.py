@@ -1,13 +1,20 @@
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, cast
+from .effective_action import EffectiveAction
+from .selected_todo_projection import selected_todo_projection
+from ..work_items.work_lane import work_lane_contract_is_receipt_bound_monitor_settled
 
-from ..effect_program import ReceiptBoundTerminalPhase
 
 
-TERMINAL_HEARTBEAT_SETTLED_REASON = (
-    "the receipt-bound terminal closeout and required settlement receipts "
+
+HEARTBEAT_SETTLED_REPLAY_REASON = (
+    "the receipt-bound work binding and required settlement receipts "
     "are complete for this heartbeat turn; defer successor selection to a new turn"
+)
+RECEIPT_BOUND_DEFERRED_REASON = (
+    "the Todo bound to this heartbeat receipt is deferred; do not "
+    "select or spend an independent successor in the same Turn"
 )
 
 _ACTION_PROJECTION_KEYS = (
@@ -39,66 +46,6 @@ _ACTION_PROJECTION_KEYS = (
 )
 
 
-class TerminalSettlementRoute(Protocol):
-    normal_delivery_allowed: bool
-    recovery_allowed: bool
-    self_repair_allowed: bool
-    capability_repair_allowed: bool
-    workspace_repair_allowed: bool
-    should_run: bool
-    effective_action: str
-    reason: str
-    replan_decision_allowed: bool
-    receipt_bound_replan_decision: bool
-    heartbeat_recommendation: dict[str, Any]
-    external_evidence_observation: dict[str, Any] | None
-    external_evidence_observation_recent: dict[str, Any] | None
-    selected_recommended_action: Any
-    agent_lane_next_action: dict[str, Any] | None
-    agent_scope_frontier: dict[str, Any] | None
-    agent_lane_frontier_hint: dict[str, Any] | None
-    state_action_projection_warning: dict[str, Any] | None
-    next_action_warning: dict[str, Any] | None
-    goal_route_hint: dict[str, Any] | None
-
-
-def apply_terminal_settlement_route_precedence(
-    route: TerminalSettlementRoute,
-    *,
-    terminal_phase: ReceiptBoundTerminalPhase | None,
-) -> None:
-    """Prevent a settled heartbeat identity from selecting work in the same turn."""
-
-    if terminal_phase is not ReceiptBoundTerminalPhase.SETTLED:
-        return
-    route.normal_delivery_allowed = False
-    route.recovery_allowed = False
-    route.self_repair_allowed = False
-    route.capability_repair_allowed = False
-    route.workspace_repair_allowed = False
-    route.should_run = False
-    route.effective_action = "heartbeat_settled_skip"
-    route.reason = TERMINAL_HEARTBEAT_SETTLED_REASON
-    route.replan_decision_allowed = False
-    route.receipt_bound_replan_decision = False
-    route.heartbeat_recommendation = {
-        **route.heartbeat_recommendation,
-        "recommended_mode": route.effective_action,
-        "notify": "DONT_NOTIFY",
-        "reason": route.reason,
-        "spend_policy": "no quota spend for an already-settled heartbeat turn",
-    }
-    route.external_evidence_observation = None
-    route.external_evidence_observation_recent = None
-    route.selected_recommended_action = route.reason
-    route.agent_lane_next_action = None
-    route.agent_scope_frontier = None
-    route.agent_lane_frontier_hint = None
-    route.state_action_projection_warning = None
-    route.next_action_warning = None
-    route.goal_route_hint = None
-
-
 def clear_quota_action_projections(
     payload: dict[str, Any],
     *,
@@ -108,72 +55,101 @@ def clear_quota_action_projections(
         payload.pop(key, None)
 
 
-def apply_terminal_heartbeat_settlement_precedence(
-    payload: dict[str, Any],
-    *,
-    terminal_phase: ReceiptBoundTerminalPhase | None,
-) -> None:
-    """Keep late supporting projections from reopening a settled heartbeat turn."""
-
-    if terminal_phase is not ReceiptBoundTerminalPhase.SETTLED:
-        return
-    reason = TERMINAL_HEARTBEAT_SETTLED_REASON
-    payload.update(
-        {
-            "decision": "skip",
-            "should_run": False,
-            "normal_delivery_allowed": False,
-            "recovery_delivery_allowed": False,
-            "self_repair_allowed": False,
-            "capability_repair_allowed": False,
-            "workspace_repair_allowed": False,
-            "effective_action": "heartbeat_settled_skip",
-            "actionable_by_codex": False,
-            "reason": reason,
-            "requires_user_action": False,
-            "recommended_action": (
-                "Finish this heartbeat without another action; use a fresh turn "
-                "identity for successor selection."
-            ),
-            "heartbeat_recommendation": {
-                "recommended_mode": "heartbeat_settled_skip",
-                "notify": "DONT_NOTIFY",
-                "reason": reason,
-                "spend_policy": "no quota spend for an already-settled heartbeat turn",
-                "agent_must_attempt": False,
-            },
-            "execution_obligation": {
-                "must_attempt_work": False,
-                "kind": "heartbeat_settled_skip",
-                "delivery_allowed": False,
-                "notify_is_execution_gate": False,
-                "reason": reason,
-                "spend_policy": "no quota spend for an already-settled heartbeat turn",
-            },
-        }
-    )
-    frontier = payload.get("goal_frontier_projection")
-    if isinstance(frontier, dict):
-        payload["goal_frontier_projection"] = {
-            key: value
-            for key, value in frontier.items()
-            if key
-            not in {
-                "autonomous_replan_decision",
-                "replan_ack_feedback",
-                "replan_obligation",
-                "vision_continuation_audit",
-                "vision_wait_state",
-            }
-        }
-    clear_quota_action_projections(
-        payload,
-        additional_keys=(
-            "boundary_projection_gap",
-            "operator_question",
-            "selected_todo",
-            "state_projection_gap",
-            "task_orchestration_contract",
-            "todo_write_hint",
+def settled_replay_fields() -> dict[str, Any]:
+    """Construct the authority fields of a verified, already-settled Turn."""
+    reason = HEARTBEAT_SETTLED_REPLAY_REASON
+    return {
+        "decision": "skip",
+        "should_run": False,
+        "normal_delivery_allowed": False,
+        "recovery_delivery_allowed": False,
+        "self_repair_allowed": False,
+        "capability_repair_allowed": False,
+        "workspace_repair_allowed": False,
+        # A settled Turn grants no safe bypass: the heartbeat task body reads
+        # safe_bypass_allowed as permission to run a bounded step and spend, so
+        # a fresh Turn must recompute any fallback instead of inheriting one.
+        "safe_bypass_allowed": False,
+        "safe_bypass_kind": None,
+        "safe_bypass_policy": None,
+        "effective_action": EffectiveAction.HEARTBEAT_SETTLED_SKIP.value,
+        "actionable_by_codex": False,
+        "reason": reason,
+        "requires_user_action": False,
+        "recommended_action": (
+            "Finish this heartbeat without another action; use a fresh turn "
+            "identity for successor selection."
         ),
+        "heartbeat_recommendation": {
+            "recommended_mode": "heartbeat_settled_skip",
+            "notify": "DONT_NOTIFY",
+            "reason": reason,
+            "spend_policy": "no quota spend for an already-settled heartbeat turn",
+            "agent_must_attempt": False,
+        },
+        "execution_obligation": {
+            "must_attempt_work": False,
+            "kind": "heartbeat_settled_skip",
+            "delivery_allowed": False,
+            "notify_is_execution_gate": False,
+            "reason": reason,
+            "spend_policy": "no quota spend for an already-settled heartbeat turn",
+        },
+    }
+
+
+def deferred_receipt_bound_skip_fields(
+    quota: dict[str, Any],
+    heartbeat_recommendation: dict[str, Any],
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Project a deferred receipt without borrowing a successor's authority."""
+
+    reason = RECEIPT_BOUND_DEFERRED_REASON
+    return (
+        reason,
+        {**quota, "safe_bypass_allowed": False},
+        {
+            **heartbeat_recommendation,
+            "recommended_mode": EffectiveAction.QUOTA_SKIP.value,
+            "notify": "DONT_NOTIFY",
+            "reason": reason,
+            "spend_policy": "no quota spend for a deferred receipt-bound Todo",
+            "stop_if_unchanged": True,
+        },
     )
+
+
+def apply_settled_monitor_precedence(payload: dict[str, Any]) -> None:
+    """Adapt the typed settled phase after every notification/fallback overlay.
+
+    Receipt-bound monitor identity remains observable; it cannot supply current
+    execution or a second settlement. The next Turn recomputes pending work.
+    """
+    lane = payload.get("work_lane_contract")
+    if not work_lane_contract_is_receipt_bound_monitor_settled(lane):
+        return
+    lane = cast(dict[str, Any], lane)
+    recorded_action = payload.get("agent_lane_next_action")
+    clear_quota_action_projections(payload)
+    payload.update(settled_replay_fields())
+    bound_action = next(
+        (
+            candidate
+            for candidate in (
+                recorded_action,
+                lane.get("receipt_bound_monitor_item"),
+            )
+            if isinstance(candidate, dict)
+            and candidate.get("selection_binding") == "heartbeat_receipt"
+            and candidate.get("todo_id") == lane.get("selected_todo_id")
+        ),
+        None,
+    )
+    if bound_action is not None:
+        payload["agent_lane_next_action"] = bound_action
+    selected_todo = selected_todo_projection(
+        agent_lane_next_action=bound_action,
+        work_lane_contract=lane,
+    )
+    if selected_todo is not None:
+        payload["selected_todo"] = selected_todo

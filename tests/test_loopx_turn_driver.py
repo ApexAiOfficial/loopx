@@ -4,14 +4,27 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-import loopx.cli_commands.turn as turn_command
+import loopx.cli_commands.turn_run_once as turn_run_once_command
+from loopx.cli_commands.turn_rendering import render_loopx_turn_execution_markdown
+from tests.control_plane.codex_checkpoint_fixture import read_cli_policy_payload
+from tests.control_plane.canonical_authority_fixture import (
+    initialize_canonical_authority,
+    isolate_sqlite_runtime,
+)
 from loopx.cli import main as cli_main
+from loopx.control_plane.coordination.runtime_shadow import (
+    build_todo_runtime_shadow_projection,
+)
+from loopx.control_plane.todos.active_state_todo_parser import parse_active_state_todos
 from loopx.control_plane.quota.turn_envelope import build_turn_envelope
 from loopx.control_plane.turn_driver import (
     LOOPX_TURN_SESSION_BINDING_SCHEMA_VERSION,
@@ -20,12 +33,19 @@ from loopx.control_plane.turn_driver import (
     build_loopx_turn_plan,
     codex_cli_session_binding,
     loopx_turn_execution_committed,
+    reward_memory_reflection_digest,
     run_loopx_turn_once,
 )
-from loopx.control_plane.turn_driver.codex_cli import _store_codex_cli_session
+from loopx.control_plane.turn_driver.codex_sessions import (
+    _session_path,
+    _store_codex_cli_session,
+    load_codex_cli_session,
+)
+from loopx.control_plane.turn_driver.subagent_execution_topology import (
+    CHILD_FALLBACK_ACTIONS,
+)
 from loopx.control_plane.turn_driver.executor import BuiltInHostError
 from loopx.control_plane.quota.live_decision import bind_scheduler_followup_cli_routes
-from loopx.todos import complete_goal_todo
 
 
 def _envelope(
@@ -67,6 +87,51 @@ def _envelope(
     }
 
 
+@pytest.mark.parametrize("primary, expected", [
+    (None, None), (False, None), (0, None), (" \t", None),
+    (" todo_other ", "todo_other"), (True, "True"), (1e-7, "1e-07"),
+    (["owner"], "['owner']"), ({"id": "owner"}, "{'id': 'owner'}"),
+    ("\x1c todo_other \x1f", "todo_other"), ("\u0085todo_other\u0085", "todo_other"),
+    ("\ufefftodo_other\ufeff", "\ufefftodo_other\ufeff"),
+])
+def test_planning_and_recovery_retain_historical_selected_work_codec(primary, expected):
+    """Old journal identity/hash encoding survives migration to the typed selector."""
+    from hashlib import sha256
+    from loopx.control_plane.quota.turn_envelope import turn_envelope_action_signature_document
+    from loopx.control_plane.turn_driver.driver import reconcile_failed_turn_session_request
+
+    for schema, mode in (("task_orchestration_contract_v2", "adaptive"),
+                         ("task_orchestration_contract_v1", "adaptive"),
+                         ("task_orchestration_contract_v2", "parallel")):
+        envelope = _envelope()
+        envelope["task_orchestration_contract"] = {
+            "schema_version": schema, "mode": mode, "primary_todo_id": primary,
+        }
+        selected = ({"todo_id": expected, "source": "task_orchestration_contract.primary_todo_id"}
+                    if expected is not None and schema == "task_orchestration_contract_v2" and mode == "adaptive"
+                    else envelope["action"]["selected_todo"])
+        signature = turn_envelope_action_signature_document(envelope)
+        signature["action"]["selected_todo"] = selected
+        action_hash = "sha256:" + sha256(json.dumps(signature, ensure_ascii=False,
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        plan = build_loopx_turn_plan(envelope, host="codex-cli", execution_mode="isolated-headless",
+                                     session_scope="todo", turn_instance_id="legacy-selected-work")
+        assert plan["route"]["selected_todo"] == selected
+        identity = {"lineage": {"goal_id": "fixture-goal", "agent_id": "codex-fixture",
+                               "todo_id": selected["todo_id"], "action_hash": action_hash},
+                    "host": "codex-cli", "execution_mode": "isolated-headless",
+                    "scheduler_owner": plan["host"]["scheduler_owner"], "session_action": "start_new",
+                    "turn_instance_id": "legacy-selected-work"}
+        assert plan["transaction"]["turn_key"] == "sha256:" + sha256(json.dumps(identity, ensure_ascii=False,
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        binding = {"schema_version": LOOPX_TURN_SESSION_BINDING_SCHEMA_VERSION,
+                   "goal_id": "fixture-goal", "agent_id": "codex-fixture", "todo_id": selected["todo_id"]}
+        recovered = reconcile_failed_turn_session_request({"turn_envelope": envelope, "session": plan["session"]},
+                                                          session_binding=binding)
+        assert recovered["session"]["action"] == "resume"
+        assert recovered["session"]["binding_status"] == "failed_turn_recovery"
+
+
 def test_turn_plan_projects_ready_route_without_side_effects() -> None:
     envelope = _envelope()
 
@@ -85,6 +150,12 @@ def test_turn_plan_projects_ready_route_without_side_effects() -> None:
     assert payload["session"] == {
         "schema_version": LOOPX_TURN_SESSION_BINDING_SCHEMA_VERSION,
         "action": "start_new",
+        "context_policy": {
+            "schema_version": "loopx_iteration_context_policy_v0",
+            "mode": "resume",
+            "scope": "iteration",
+            "binding_scope": "agent",
+        },
     }
     assert payload["transaction"]["status"] == "planned"
     assert payload["transaction"]["phases"] == [
@@ -124,6 +195,40 @@ def test_turn_plan_projects_ready_route_without_side_effects() -> None:
     assert payload["boundary"]["read_only"] is True
 
 
+def test_dsh_turn_plan_uses_the_headless_outer_controller_context() -> None:
+    payload = build_loopx_turn_plan(
+        _envelope(),
+        host="dsh",
+        execution_mode="isolated-headless",
+    )
+
+    assert payload["ok"] is True
+    assert payload["route"]["kind"] == LoopXTurnRoute.READY_FOR_HOST.value
+    assert payload["host"]["kind"] == "dsh"
+    assert payload["host"]["explicit_isolation"] is True
+    assert payload["scheduler_execution_context"] == {
+        "schema_version": "scheduler_execution_context_v0",
+        "host_surface": "generic_cli",
+        "scheduler_owner": "outer_controller",
+        "execution_mode": "isolated_headless",
+        "source": "loopx_turn",
+        "valid": True,
+        "codex_app_applicability": "not_applicable",
+    }
+
+
+def test_app_server_turn_retains_agent_session_and_names_its_actual_host() -> None:
+    payload = build_loopx_turn_plan(_envelope(), host="codex-app-server",
+        execution_mode="isolated-headless", session_scope="agent",
+        session_binding={"schema_version": LOOPX_TURN_SESSION_BINDING_SCHEMA_VERSION,
+            "goal_id": "fixture-goal", "agent_id": "codex-fixture"})
+    assert payload["ok"] and payload["session"]["action"] == "resume"
+    assert payload["host"]["kind"] == "codex-app-server"
+    assert payload["scheduler_execution_context"]["host_surface"] == "codex_app_server"
+    assert payload["scheduler_execution_context"]["scheduler_owner"] == "outer_controller"
+    assert payload["scheduler_execution_context"]["codex_app_applicability"] == "not_applicable"
+
+
 def _adaptive_envelope() -> dict[str, object]:
     envelope = _envelope()
     envelope["task_orchestration_contract"] = {
@@ -133,11 +238,24 @@ def _adaptive_envelope() -> dict[str, object]:
         "child_brief_defaults": {
             "schema_version": "subagent_control_plane_handoff_v0",
             "parent_goal_id": "fixture-goal",
+            "authority_artifact": "quota_should_run.goal_boundary",
+            "latest_state_ref": "quota_should_run.action_signature.source_hash",
             "context_policy": {
                 "selection_owner": "task_coordinator",
                 "default": "fresh",
                 "allowed": ["fresh", "resume"],
             },
+            "expected_output": "public_safe_evidence",
+            "execution_policy": {
+                "timeout": "bounded_by_host_turn",
+                "cancel": "task_coordinator_or_host_timeout",
+            },
+            "child_guard_policy": "prevention_first_v0",
+            "validation_policy": "report validation commands and results",
+            "acceptance": [
+                "report completed scope and evidence",
+                "do not write LoopX state or spend quota",
+            ],
         },
         "eligible_child_lanes": [
             {
@@ -147,7 +265,12 @@ def _adaptive_envelope() -> dict[str, object]:
                 "child_brief": {
                     "todo_id": "todo_child001",
                     "objective": "Validate one independent fixture.",
+                    "action_kind": "validate",
                     "task_domain": "validation",
+                    "required_capabilities": [],
+                    "task_repository": None,
+                    "required_write_scopes": [],
+                    "workspace_isolation": "not_required",
                 },
             }
         ],
@@ -216,6 +339,10 @@ def test_turn_plan_maps_admitted_child_to_codex_native_operation() -> None:
             "required_write_scopes": [],
         },
     }
+    topology = payload["subagent_execution_topology"]
+    lane = topology["lanes"][0]
+    task_packet = lane["task_packet"]
+    source_state_ref = "sha256:fixture"
     assert payload["child_operations"] == [
         {
             "schema_version": "loopx_child_host_operation_v0",
@@ -223,23 +350,356 @@ def test_turn_plan_maps_admitted_child_to_codex_native_operation() -> None:
             "host": "codex-cli",
             "selection_owner": "task_coordinator",
             "recommended_context": "fresh",
-            "available_contexts": [
-                {
-                    "context": "fresh",
-                    "native_operation": "spawn_agent",
-                    "requires_session": False,
-                },
-                {
-                    "context": "resume",
-                    "native_operation": "resume_agent",
-                    "requires_session": True,
-                },
-            ],
+            "available_contexts": ["fresh"],
             "brief": brief,
             "result_channel": "public_safe_typed_evidence",
             "writeback_owner": "task_coordinator",
+            "bundle_id": topology["bundle_id"],
+            "lane_id": lane["lane_id"],
+            "execution_kind": "ephemeral_child",
+            "source_state_ref": source_state_ref,
+            "task_packet_digest": lane["task_packet_digest"],
+            "task_packet": task_packet,
+            "effect_boundary": "held_evidence_only",
+            "workspace_ref": None,
+            "host_adapter": {
+                "host": "codex-cli",
+                "native_operation": "spawn_agent",
+                "arguments": {"fork_turns": "none"},
+                "requires_session": False,
+            },
         }
     ]
+    assert topology == {
+        "schema_version": "subagent_execution_topology_v0",
+        "goal_id": "fixture-goal",
+        "bundle_id": topology["bundle_id"],
+        "coordinator_agent_id": "codex-fixture",
+        "source_state_ref": source_state_ref,
+        "topology": "ephemeral_children",
+        "execution_envelope": {
+            "source": "task_orchestration_contract_v2",
+            "expires_with_turn": True,
+            "max_children": 1,
+            "allowed_effect_classes": ["local_read"],
+        },
+        "rationale_codes": ["admitted_ephemeral_child_lanes"],
+        "lanes": [
+            {
+                "lane_id": lane["lane_id"],
+                "todo_id": "todo_child001",
+                "execution_kind": "ephemeral_child",
+                "admission_ref": "task_orchestration_contract_v2:todo_child001",
+                "effect_boundary": "held_evidence_only",
+                "allowed_effect_classes": ["local_read"],
+                "workspace_requirement": "not_required",
+                "workspace_ref": None,
+                "task_packet": task_packet,
+                "task_packet_digest": lane["task_packet_digest"],
+            }
+        ],
+    }
+    assert task_packet["schema_version"] == "child_execution_task_packet_v0"
+    assert task_packet["objective"] == "Validate one independent fixture."
+    assert task_packet["action_kind"] == "validate"
+    assert task_packet["deliverable"] == "public_safe_evidence"
+    assert task_packet["acceptance_mode"] == "parent_review_only"
+    assert task_packet["acceptance"] == [
+        "report completed scope and evidence",
+        "do not write LoopX state or spend quota",
+    ]
+    assert task_packet["context"] == {
+        "mode": "fresh",
+        "inheritance": "none",
+    }
+    assert task_packet["guard"] == {
+        "schema_version": "child_execution_guard_v0",
+        "pre_spawn": "require_complete_task_packet",
+        "on_deviation": "project_stop_and_quarantine_child",
+        "evidence_disposition": "candidate_until_parent_accepts",
+        "parent_blocked": False,
+        "parent_continuation": "continue",
+        "fallback_actions": [
+            "retry_fresh",
+            "replace_child",
+            "serial_takeover",
+            "ignore_optional_result",
+        ],
+    }
+    assert lane["task_packet_digest"].startswith("sha256:")
+
+
+def test_turn_plan_rejects_incomplete_child_lane_without_blocking_parent() -> None:
+    envelope = _adaptive_envelope()
+    orchestration = envelope["task_orchestration_contract"]
+    assert isinstance(orchestration, dict)
+    defaults = orchestration["child_brief_defaults"]
+    assert isinstance(defaults, dict)
+    defaults.pop("acceptance")
+    lanes = orchestration["eligible_child_lanes"]
+    assert isinstance(lanes, list)
+    lanes.append(
+        {
+            "todo_id": "todo_child002",
+            "task_domain": "validation",
+            "execution_kind": "ephemeral_child",
+            "child_brief": {
+                "todo_id": "todo_child002",
+                "objective": "Validate another independent fixture.",
+                "action_kind": "validate",
+                "task_domain": "validation",
+                "required_capabilities": [],
+                "task_repository": None,
+                "required_write_scopes": [],
+                "workspace_isolation": "not_required",
+                "acceptance": ["return one bounded validation result"],
+            },
+        }
+    )
+
+    payload = build_loopx_turn_plan(
+        envelope,
+        host="codex-cli",
+        execution_mode="interactive-visible",
+    )
+
+    assert payload["ok"] is True
+    assert payload["route"]["kind"] == LoopXTurnRoute.READY_FOR_HOST.value
+    assert [item["todo_id"] for item in payload["child_operations"]] == [
+        "todo_child002"
+    ]
+    topology = payload["subagent_execution_topology"]
+    assert topology["topology"] == "ephemeral_children"
+    assert [lane["todo_id"] for lane in topology["lanes"]] == ["todo_child002"]
+    assert topology["pre_spawn_rejections"] == [
+        {
+            "schema_version": "child_execution_rejection_v0",
+            "todo_id": "todo_child001",
+            "stage": "pre_spawn",
+            "reason_codes": ["child_task_packet_incomplete"],
+            "launch_allowed": False,
+            "recommended_child_action": "do_not_launch",
+            "parent_blocked": False,
+            "parent_continuation": "continue",
+            "fallback_actions": list(CHILD_FALLBACK_ACTIONS),
+        }
+    ]
+
+
+def test_turn_plan_falls_back_to_serial_when_every_child_packet_is_incomplete() -> (
+    None
+):
+    envelope = _adaptive_envelope()
+    orchestration = envelope["task_orchestration_contract"]
+    assert isinstance(orchestration, dict)
+    defaults = orchestration["child_brief_defaults"]
+    assert isinstance(defaults, dict)
+    defaults.pop("acceptance")
+
+    payload = build_loopx_turn_plan(
+        envelope,
+        host="codex-cli",
+        execution_mode="interactive-visible",
+    )
+
+    assert payload["ok"] is True
+    assert payload["route"]["kind"] == LoopXTurnRoute.READY_FOR_HOST.value
+    assert "child_operations" not in payload
+    topology = payload["subagent_execution_topology"]
+    assert topology["topology"] == "serial"
+    assert topology["rationale_codes"] == [
+        "parent_serial_fallback",
+        "child_launch_rejected",
+    ]
+    assert topology["lanes"] == []
+    assert topology["pre_spawn_rejections"][0]["parent_blocked"] is False
+
+
+def test_turn_plan_rejects_excess_child_lane_without_blocking_admitted_sibling() -> (
+    None
+):
+    envelope = _adaptive_envelope()
+    orchestration = envelope["task_orchestration_contract"]
+    assert isinstance(orchestration, dict)
+    orchestration["max_children"] = 1
+    lanes = orchestration["eligible_child_lanes"]
+    assert isinstance(lanes, list)
+    lanes.append(
+        {
+            "todo_id": "todo_child002",
+            "task_domain": "validation",
+            "execution_kind": "ephemeral_child",
+            "child_brief": {
+                "todo_id": "todo_child002",
+                "objective": "Validate another independent fixture.",
+                "task_domain": "validation",
+            },
+        }
+    )
+
+    payload = build_loopx_turn_plan(
+        envelope,
+        host="codex-cli",
+        execution_mode="interactive-visible",
+    )
+
+    assert payload["ok"] is True
+    assert [item["todo_id"] for item in payload["child_operations"]] == [
+        "todo_child001"
+    ]
+    topology = payload["subagent_execution_topology"]
+    assert [lane["todo_id"] for lane in topology["lanes"]] == ["todo_child001"]
+    rejection = topology["pre_spawn_rejections"][0]
+    assert rejection["todo_id"] == "todo_child002"
+    assert rejection["reason_codes"] == ["child_capacity_exceeded"]
+    assert rejection["parent_blocked"] is False
+    assert rejection["fallback_actions"] == list(CHILD_FALLBACK_ACTIONS)
+
+
+def test_turn_plan_exposes_forked_snapshot_only_when_explicitly_selected() -> None:
+    envelope = _adaptive_envelope()
+    orchestration = envelope["task_orchestration_contract"]
+    assert isinstance(orchestration, dict)
+    defaults = orchestration["child_brief_defaults"]
+    assert isinstance(defaults, dict)
+    defaults["context_policy"] = {
+        "selection_owner": "task_coordinator",
+        "default": "forked_snapshot",
+        "allowed": ["fresh", "forked_snapshot"],
+    }
+
+    payload = build_loopx_turn_plan(
+        envelope,
+        host="codex-cli",
+        execution_mode="interactive-visible",
+    )
+
+    operation = payload["child_operations"][0]
+    assert operation["recommended_context"] == "forked_snapshot"
+    assert operation["available_contexts"] == ["fresh", "forked_snapshot"]
+    assert operation["task_packet"]["context"] == {
+        "mode": "forked_snapshot",
+        "inheritance": "parent_conversation_snapshot",
+    }
+    assert operation["host_adapter"] == {
+        "host": "codex-cli",
+        "native_operation": "spawn_agent",
+        "arguments": {"fork_turns": "all"},
+        "requires_session": False,
+    }
+
+
+def test_turn_plan_keeps_declared_validation_with_registered_parent() -> None:
+    envelope = _adaptive_envelope()
+    orchestration = envelope["task_orchestration_contract"]
+    assert isinstance(orchestration, dict)
+    lanes = orchestration["eligible_child_lanes"]
+    assert isinstance(lanes, list)
+    child_brief = lanes[0]["child_brief"]
+    assert isinstance(child_brief, dict)
+    child_brief.update(
+        validation_declared=True,
+        validation_label="child regression",
+    )
+
+    payload = build_loopx_turn_plan(
+        envelope,
+        host="codex-cli",
+        execution_mode="interactive-visible",
+    )
+
+    validation = payload["child_operations"][0]["task_packet"]["validation"]
+    assert validation == {
+        "declared": True,
+        "authority_ref": "todo:todo_child001:completion_validation",
+        "execution_owner": "registered_parent",
+        "command_disclosed": False,
+        "label": "child regression",
+        "policy": (
+            "registered parent runs declared todo completion validation; "
+            "child reports relevant validation evidence"
+        ),
+    }
+    assert payload["child_operations"][0]["task_packet"]["acceptance_mode"] == (
+        "parent_validation_then_review"
+    )
+
+
+def test_turn_plan_rejects_context_not_supported_by_selected_host() -> None:
+    envelope = _adaptive_envelope()
+    orchestration = envelope["task_orchestration_contract"]
+    assert isinstance(orchestration, dict)
+    defaults = orchestration["child_brief_defaults"]
+    assert isinstance(defaults, dict)
+    defaults["context_policy"] = {
+        "selection_owner": "task_coordinator",
+        "default": "forked_snapshot",
+        "allowed": ["fresh", "forked_snapshot"],
+    }
+
+    payload = build_loopx_turn_plan(
+        envelope,
+        host="claude-code",
+        execution_mode="interactive-visible",
+    )
+
+    assert payload["ok"] is True
+    assert "child_operations" not in payload
+    rejection = payload["subagent_execution_topology"][
+        "pre_spawn_rejections"
+    ][0]
+    assert rejection["reason_codes"] == ["child_task_packet_incomplete"]
+    assert rejection["parent_blocked"] is False
+
+
+def test_turn_plan_rejects_resume_without_child_session_binding() -> None:
+    envelope = _adaptive_envelope()
+    orchestration = envelope["task_orchestration_contract"]
+    assert isinstance(orchestration, dict)
+    defaults = orchestration["child_brief_defaults"]
+    assert isinstance(defaults, dict)
+    defaults["context_policy"] = {
+        "selection_owner": "task_coordinator",
+        "default": "resume",
+        "allowed": ["fresh", "resume"],
+    }
+
+    payload = build_loopx_turn_plan(
+        envelope,
+        host="codex-cli",
+        execution_mode="interactive-visible",
+    )
+
+    assert payload["ok"] is True
+    assert "child_operations" not in payload
+    rejection = payload["subagent_execution_topology"][
+        "pre_spawn_rejections"
+    ][0]
+    assert rejection["reason_codes"] == ["child_task_packet_incomplete"]
+    assert rejection["parent_blocked"] is False
+
+
+def test_task_packet_digest_is_independent_of_host_adapter() -> None:
+    envelope = _adaptive_envelope()
+
+    codex = build_loopx_turn_plan(
+        envelope,
+        host="codex-cli",
+        execution_mode="interactive-visible",
+    )
+    claude = build_loopx_turn_plan(
+        envelope,
+        host="claude-code",
+        execution_mode="interactive-visible",
+    )
+
+    codex_operation = codex["child_operations"][0]
+    claude_operation = claude["child_operations"][0]
+    assert codex_operation["task_packet"] == claude_operation["task_packet"]
+    assert codex_operation["task_packet_digest"] == claude_operation[
+        "task_packet_digest"
+    ]
+    assert codex_operation["host_adapter"] != claude_operation["host_adapter"]
 
 
 def test_turn_plan_uses_adaptive_primary_todo_for_bundle_lineage() -> None:
@@ -294,6 +754,14 @@ def test_turn_plan_uses_adaptive_primary_todo_for_bundle_lineage() -> None:
         == same_primary_plan["transaction"]["turn_key"]
     )
     assert (
+        payload["subagent_execution_topology"]["source_state_ref"]
+        != same_primary_plan["subagent_execution_topology"]["source_state_ref"]
+    )
+    assert (
+        payload["subagent_execution_topology"]["bundle_id"]
+        == same_primary_plan["subagent_execution_topology"]["bundle_id"]
+    )
+    assert (
         payload["transaction"]["turn_key"]
         != changed_action_plan["transaction"]["turn_key"]
     )
@@ -317,6 +785,9 @@ def test_turn_plan_exposes_only_qualified_claude_child_contexts() -> None:
             "required_write_scopes": [],
         },
     }
+    topology = payload["subagent_execution_topology"]
+    lane = topology["lanes"][0]
+    source_state_ref = topology["source_state_ref"]
 
     assert payload["child_operations"][0] == {
         "schema_version": "loopx_child_host_operation_v0",
@@ -324,16 +795,24 @@ def test_turn_plan_exposes_only_qualified_claude_child_contexts() -> None:
         "host": "claude-code",
         "selection_owner": "task_coordinator",
         "recommended_context": "fresh",
-        "available_contexts": [
-            {
-                "context": "fresh",
-                "native_operation": "Task",
-                "requires_session": False,
-            }
-        ],
+        "available_contexts": ["fresh"],
         "brief": brief,
         "result_channel": "public_safe_typed_evidence",
         "writeback_owner": "task_coordinator",
+        "bundle_id": topology["bundle_id"],
+        "lane_id": lane["lane_id"],
+        "execution_kind": "ephemeral_child",
+        "source_state_ref": source_state_ref,
+        "task_packet_digest": lane["task_packet_digest"],
+        "task_packet": lane["task_packet"],
+        "effect_boundary": "held_evidence_only",
+        "workspace_ref": None,
+        "host_adapter": {
+            "host": "claude-code",
+            "native_operation": "Task",
+            "arguments": {},
+            "requires_session": False,
+        },
     }
 
 
@@ -387,6 +866,67 @@ def test_codex_session_store_falls_back_when_fchmod_is_unavailable(
     }
 
 
+@pytest.mark.parametrize(
+    "digest", ["A" * 64, "a" * 63, "a" * 65, "sha256:" + "a" * 64,
+               " " + "a" * 64, "a" * 64 + "\n", "é" * 64],
+)
+@pytest.mark.parametrize("retained", [False, True])
+def test_checkpoint_session_digest_rejection_preserves_the_original_record(
+    tmp_path: Path, digest: str, retained: bool,
+) -> None:
+    lineage = {"goal_id": "fixture-goal", "agent_id": "codex-fixture", "todo_id": "todo_fixture0001"}
+    _store_codex_cli_session(tmp_path, lineage=lineage, session_id="original",
+                            checkpoint_artifact_sha256="a" * 64)
+    path = _session_path(tmp_path, lineage)
+    if retained:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["checkpoint_artifact_sha256"] = digest
+        path.write_text(json.dumps(document), encoding="utf-8")
+    before = path.read_bytes()
+    message = "stored checkpoint session source digest is invalid" if retained else "checkpoint session source digest is invalid"
+    with pytest.raises(ValueError) as failure:
+        _store_codex_cli_session(tmp_path, lineage=lineage, session_id="original",
+                                checkpoint_artifact_sha256=None if retained else digest)
+    assert str(failure.value) == message
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("digest", [42, False, [], {}])
+@pytest.mark.parametrize("retained", [False, True])
+def test_checkpoint_session_digest_type_rejection_has_no_partial_write(
+    tmp_path: Path, digest: Any, retained: bool,
+) -> None:
+    lineage = {"goal_id": "fixture-goal", "agent_id": "codex-fixture", "todo_id": "todo_fixture0001"}
+    path = _session_path(tmp_path, lineage)
+    if retained:
+        _store_codex_cli_session(tmp_path, lineage=lineage, session_id="original",
+                                checkpoint_artifact_sha256="a" * 64)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["checkpoint_artifact_sha256"] = digest
+        path.write_text(json.dumps(document), encoding="utf-8")
+    before = path.read_bytes() if retained else None
+    with pytest.raises(ValueError if retained else TypeError):
+        _store_codex_cli_session(tmp_path, lineage=lineage, session_id="original",
+                                checkpoint_artifact_sha256=None if retained else digest)
+    assert (path.read_bytes() if path.exists() else None) == before
+
+
+def test_checkpoint_session_observation_retains_provenance_and_refuses_replacement(tmp_path: Path) -> None:
+    lineage = {"goal_id": "fixture-goal", "agent_id": "codex-fixture", "todo_id": "todo_fixture0001"}
+    root = str(tmp_path.resolve())
+    _store_codex_cli_session(tmp_path, lineage=lineage, session_id="original",
+                            checkpoint_artifact_sha256="a" * 64, checkpoint_artifact_root=root)
+    path = _session_path(tmp_path, lineage)
+    before = path.read_bytes()
+    _store_codex_cli_session(tmp_path, lineage=lineage, session_id="original")
+    assert path.read_bytes() == before
+    assert load_codex_cli_session(tmp_path, lineage=lineage)["checkpoint_artifact_root"] == root
+    with pytest.raises(ValueError, match="checkpoint session source digest cannot change"):
+        _store_codex_cli_session(tmp_path, lineage=lineage, session_id="original",
+                                checkpoint_artifact_sha256="b" * 64)
+    assert path.read_bytes() == before
+
+
 def test_generic_host_does_not_project_unqualified_child_operations() -> None:
     payload = build_loopx_turn_plan(
         _adaptive_envelope(),
@@ -396,6 +936,7 @@ def test_generic_host_does_not_project_unqualified_child_operations() -> None:
 
     assert payload["ok"] is True
     assert "child_operations" not in payload
+    assert "subagent_execution_topology" not in payload
 
 
 def test_turn_host_request_carries_typed_child_operations() -> None:
@@ -408,12 +949,58 @@ def test_turn_host_request_carries_typed_child_operations() -> None:
     request = build_loopx_turn_host_request(plan)
 
     assert request["child_operations"] == plan["child_operations"]
-    assert request["child_operations"][0]["available_contexts"][0] == {
-        "context": "fresh",
+    assert (
+        request["subagent_execution_topology"]
+        == plan["subagent_execution_topology"]
+    )
+    assert request["child_operations"][0]["available_contexts"][0] == "fresh"
+    assert request["child_operations"][0]["host_adapter"] == {
+        "host": "codex-cli",
         "native_operation": "spawn_agent",
+        "arguments": {"fork_turns": "none"},
         "requires_session": False,
     }
     assert request["result_contract"]["stdout"] == "one public-safe JSON object"
+
+
+def test_turn_host_request_carries_reward_memory_decision_context() -> None:
+    from tests.control_plane.reward_memory_host_fixture import enable_plan_memory
+    plan = build_loopx_turn_plan(
+        _adaptive_envelope(),
+        host="codex-cli",
+        execution_mode="interactive-visible",
+    )
+    enable_plan_memory(plan)
+    plan["reward_memory_recall"].update({
+        "schema_version": "agent_turn_recall_v0",
+        "status": "applied",
+        "context": {
+            "schema_version": "agent_turn_recall_context_v0",
+            "guidance": [
+                {
+                    "candidate_ref": "candidate:reviewed",
+                    "target_class": "soft_preference",
+                    "content_summary": "Reuse the verified validation sequence.",
+                }
+            ],
+        },
+        "grants_new_action_authority": False,
+    })
+
+    from tests.control_plane.reward_memory_host_fixture import register_plan_memory
+    register_plan_memory(plan)
+    request = build_loopx_turn_host_request(plan)
+
+    expected_recall = {
+        **plan["reward_memory_recall"],
+        "context": plan["turn_context_contributions"][0]["context_fields"][
+            "reward_memory_recall"
+        ]["context"],
+    }
+    assert request["reward_memory_recall"] == expected_recall
+    assert request["reward_memory_recall"]["context"]["guidance"][0][
+        "content_summary"
+    ]
 
 
 def test_turn_help_omits_legacy_agent_loop_entrypoint() -> None:
@@ -445,6 +1032,25 @@ def test_turn_plan_resumes_only_a_matching_session_binding() -> None:
     assert payload["boundary"]["opaque_session_handle_omitted"] is True
 
 
+@pytest.mark.parametrize("field", ["goal_id", "agent_id", "todo_id"])
+def test_agent_session_scope_preserves_current_turn_identity(field) -> None:
+    binding = {
+        "schema_version": LOOPX_TURN_SESSION_BINDING_SCHEMA_VERSION,
+        "goal_id": "fixture-goal", "agent_id": "codex-fixture",
+        "todo_id": "todo_fixture0001",
+    }
+    binding[field] = "different-identity"
+    payload = build_loopx_turn_plan(
+        _envelope(), host="codex-cli", execution_mode="interactive-visible",
+        session_binding=binding, session_scope="agent",
+    )
+    assert payload["ok"] is (field == "todo_id")
+    assert payload["session"]["action"] == ("resume" if field == "todo_id" else "reject")
+    if field == "todo_id":
+        assert payload["session"]["context_policy"]["binding_scope"] == "agent"
+        assert payload["transaction"]["settlement_plan"]["identity"]["todo_id"] == "todo_fixture0001"
+
+
 def test_turn_plan_rejects_session_binding_identity_drift() -> None:
     payload = build_loopx_turn_plan(
         _envelope(),
@@ -465,6 +1071,359 @@ def test_turn_plan_rejects_session_binding_identity_drift() -> None:
     assert payload["session"]["binding_status"] == "identity_mismatch"
     assert payload["transaction"]["status"] == "not_applicable"
     assert payload["effects"]["host_invoked"] is False
+
+
+def test_default_agent_session_reuses_planning_across_completed_todos(tmp_path, monkeypatch):
+    from benchmark.runtime.codex import Execution
+    from benchmark.runtime.sessions import BenchmarkSessionWake
+    from tests.test_loopx_turn_codex_cli import _fake_codex
+
+    project, runtime, registry = _write_live_fixture(tmp_path, extra_agent_todo_lines=(
+        "- [ ] [P1] Complete the successor fixture.",
+        "  <!-- loopx:todo todo_id=todo_fixture0002 status=open task_class=advancement_task "
+        "action_kind=fixture claimed_by=codex-fixture priority=P1 -->",
+    ))
+    binary, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    # A planning exec observes the native ID before either Todo is executed.
+    env = {"LOOPX_RUNTIME_ROOT": str(runtime), "LOOPX_REGISTRY": str(registry),
+           "LOOPX_GOAL_ID": "loopx-turn-fixture", "LOOPX_AGENT_ID": "codex-fixture",
+           "LOOPX_PROJECT": str(project), "CODEX_HOME": str(home), "CODEX_BIN": str(binary),
+           "MODEL_NAME": "fixture-model", "REASONING_EFFORT": "high"}
+    wake = BenchmarkSessionWake(env, Execution(context="resume", sandbox="read-only"), {})
+    observed = tmp_path / "planning-stream.jsonl"
+    observed.write_text('{"type":"thread.started","thread_id":"session-fixture-0001"}\n')
+    wake.observe(observed)
+    binary.write_text(binary.read_text().replace('"validated_progress"', '"validated_completion"').replace(
+        'output_path = ', 'pathlib.Path("completed-todo.txt").write_text("complete")\noutput_path = ',
+    ))
+    argv = ["--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+            "turn", "run-once", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+            "--host", "codex-cli", "--project", str(project),
+            "--codex-bin", str(binary), "--codex-model", "fixture-model",
+            "--codex-reasoning-effort", "high", "--codex-sandbox", "read-only",
+            "--no-global-sync", "--validation-command-json",
+            json.dumps([sys.executable, "-c", "from pathlib import Path; assert Path('completed-todo.txt').read_text() == 'complete'"]),
+            "--execute"]
+    results = []
+    for number in range(2):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cli_main([*argv, "--turn-instance-id", f"completion-{number}"])
+        result = json.loads(output.getvalue())
+        assert code == 0, result
+        assert result["status"] == "committed", result
+        results.append(result)
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(calls) == 2 and all("resume" in call and "session-fixture-0001" in call for call in calls)
+    assert results[0]["resume_turn_key"] != results[1]["resume_turn_key"]
+    journals = [json.loads(path.read_text()) for path in (runtime / "goals/loopx-turn-fixture/turns").glob("*.json")]
+    assert {journal["writeback"]["completion"]["todo_id"] for journal in journals} == {
+        "todo_fixture0001", "todo_fixture0002",
+    }
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_run_once_claims_zero_lease_before_codex_host(
+    tmp_path, monkeypatch, provider,
+):
+    from tests.test_loopx_turn_codex_cli import _fake_codex
+
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(
+        tmp_path, provider=provider, handoff_mode="hard_lease",
+    )
+    binary, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("LOOPX_RELEASE_ROOT", str(Path(__file__).resolve().parents[1]))
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        guard_code = cli_main([
+            "--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+            "quota", "should-run", "--goal-id", "loopx-turn-fixture",
+            "--agent-id", "codex-fixture", "--context-delivery", "off",
+        ])
+    before = read_cli_policy_payload(output.getvalue(), returncode=guard_code)
+    assert guard_code == 0, before
+    preparation = before["execution_preparation"]
+    assert preparation["state"] == "claim_required", before
+    assert preparation["reason_code"] == "task_lease_missing", before
+    assert preparation["claim"]["host_execution_allowed"] is True, before
+    assert before["normal_delivery_allowed"] is False, before
+    assert not log.exists()
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main([
+            "--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+            "turn", "run-once", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+            "--host", "codex-cli", "--project", str(project), "--codex-bin", str(binary),
+            "--codex-model", "fixture-model", "--codex-reasoning-effort", "high",
+            "--codex-sandbox", "read-only", "--no-global-sync",
+            "--validation-command-json",
+            json.dumps([sys.executable, "-c", "import sys; sys.stdin.read()"]),
+            "--execute",
+        ])
+    result = json.loads(output.getvalue())
+    assert exit_code == 0, result
+    assert result["status"] == "committed", result
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(calls) == 1, calls
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_run_once_conflicting_turn_identity_does_not_claim_another_todo(
+    tmp_path, monkeypatch, provider,
+):
+    from tests.test_loopx_turn_codex_cli import _fake_codex
+
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(
+        tmp_path,
+        provider=provider,
+        handoff_mode="hard_lease",
+        extra_agent_todo_lines=(
+            "- [ ] [P1] Complete the conflicting successor fixture.",
+            "  <!-- loopx:todo todo_id=todo_fixture0002 status=open "
+            "task_class=advancement_task action_kind=fixture claimed_by=codex-fixture "
+            "priority=P1 -->",
+        ),
+    )
+    binary, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("LOOPX_RELEASE_ROOT", str(Path(__file__).resolve().parents[1]))
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        guard_code = cli_main([
+            "--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+            "quota", "should-run", "--goal-id", "loopx-turn-fixture",
+            "--agent-id", "codex-fixture", "--todo-id", "todo_fixture0001",
+            "--turn-instance-id", "bound-preparation-turn", "--context-delivery", "off",
+        ])
+    bound = read_cli_policy_payload(output.getvalue(), returncode=guard_code)
+    assert guard_code == 0, bound
+    assert bound["heartbeat_receipt"]["turn_instance_id"] == "bound-preparation-turn"
+    assert bound["heartbeat_receipt"]["settlement_identity"]["todo_id"] == "todo_fixture0001"
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main([
+            "--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+            "turn", "run-once", "--goal-id", "loopx-turn-fixture",
+            "--agent-id", "codex-fixture", "--todo-id", "todo_fixture0002",
+            "--turn-instance-id", "bound-preparation-turn",
+            "--host", "codex-cli", "--project", str(project), "--codex-bin", str(binary),
+            "--codex-model", "fixture-model", "--codex-reasoning-effort", "high",
+            "--codex-sandbox", "read-only", "--no-global-sync",
+            "--validation-command-json",
+            json.dumps([sys.executable, "-c", "import sys; sys.stdin.read()"]),
+            "--execute",
+        ])
+    refused = json.loads(output.getvalue())
+    assert exit_code == 1, refused
+    assert "belongs to another settlement identity" in refused["error"]
+    assert not log.exists()
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        lease_code = cli_main([
+            "--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+            "task-lease", "inspect", "--goal-id", "loopx-turn-fixture",
+            "--todo-id", "todo_fixture0002",
+        ])
+    lease = read_cli_policy_payload(output.getvalue(), returncode=lease_code)
+    assert lease_code == 0, lease
+    assert lease["active"] is False, lease
+    assert lease["lease"] is None, lease
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize(
+    ("requested_turn", "expected_error"),
+    [
+        (" bound-preparation-turn ", "belongs to another settlement identity"),
+        ("bound preparation turn", "turn_instance_id must be"),
+    ],
+    ids=["padded-valid", "explicit-invalid"],
+)
+def test_run_once_validates_the_turn_identity_before_claiming(
+    tmp_path, monkeypatch, provider, requested_turn, expected_error,
+):
+    from tests.test_loopx_turn_codex_cli import _fake_codex
+
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(
+        tmp_path,
+        provider=provider,
+        handoff_mode="hard_lease",
+        extra_agent_todo_lines=(
+            "- [ ] [P1] Complete the conflicting successor fixture.",
+            "  <!-- loopx:todo todo_id=todo_fixture0002 status=open "
+            "task_class=advancement_task action_kind=fixture claimed_by=codex-fixture "
+            "priority=P1 -->",
+        ),
+    )
+    binary, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("LOOPX_RELEASE_ROOT", str(Path(__file__).resolve().parents[1]))
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        guard_code = cli_main([
+            "--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+            "quota", "should-run", "--goal-id", "loopx-turn-fixture",
+            "--agent-id", "codex-fixture", "--todo-id", "todo_fixture0001",
+            "--turn-instance-id", "bound-preparation-turn", "--context-delivery", "off",
+        ])
+    bound = read_cli_policy_payload(output.getvalue(), returncode=guard_code)
+    assert guard_code == 0, bound
+    assert bound["heartbeat_receipt"]["settlement_identity"]["todo_id"] == "todo_fixture0001"
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main([
+            "--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+            "turn", "run-once", "--goal-id", "loopx-turn-fixture",
+            "--agent-id", "codex-fixture", "--todo-id", "todo_fixture0002",
+            "--turn-instance-id", requested_turn,
+            "--host", "codex-cli", "--project", str(project), "--codex-bin", str(binary),
+            "--codex-model", "fixture-model", "--codex-reasoning-effort", "high",
+            "--codex-sandbox", "read-only", "--no-global-sync",
+            "--validation-command-json",
+            json.dumps([sys.executable, "-c", "import sys; sys.stdin.read()"]),
+            "--execute",
+        ])
+    refused = json.loads(output.getvalue())
+    assert exit_code == 1, refused
+    assert expected_error in refused["error"]
+    assert not log.exists()
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        lease_code = cli_main([
+            "--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+            "task-lease", "inspect", "--goal-id", "loopx-turn-fixture",
+            "--todo-id", "todo_fixture0002",
+        ])
+    lease = read_cli_policy_payload(output.getvalue(), returncode=lease_code)
+    assert lease_code == 0, lease
+    assert lease["active"] is False, lease
+    assert lease["lease"] is None, lease
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_run_once_reserves_turn_before_claim_under_competing_guard(
+    tmp_path, monkeypatch, provider,
+):
+    from loopx.control_plane.turn_driver import codex_execution_preparation
+    from tests.test_loopx_turn_codex_cli import _fake_codex
+
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(
+        tmp_path,
+        provider=provider,
+        handoff_mode="hard_lease",
+        extra_agent_todo_lines=(
+            "- [ ] [P1] Compete for the same Turn fixture.",
+            "  <!-- loopx:todo todo_id=todo_fixture0002 status=open "
+            "task_class=advancement_task action_kind=fixture claimed_by=codex-fixture "
+            "priority=P1 -->",
+        ),
+    )
+    binary, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("LOOPX_RELEASE_ROOT", str(Path(__file__).resolve().parents[1]))
+
+    original_runner = codex_execution_preparation._default_runner
+    competing_guard: dict[str, object] = {}
+
+    def interleaving_runner(command, *, cwd, timeout):
+        # This runs after the Turn reservation and immediately before the
+        # ordinary claim subprocess, the exact window that previously let a
+        # competing guard bind the same Turn to a different Todo first.
+        if "claim" in command and "todo" in command:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                guard_code = cli_main([
+                    "--registry", str(registry), "--runtime-root", str(runtime),
+                    "--format", "json", "quota", "should-run",
+                    "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+                    "--todo-id", "todo_fixture0001",
+                    "--turn-instance-id", "reserved-preparation-turn",
+                    "--context-delivery", "off",
+                ])
+            competing_guard["code"] = guard_code
+            competing_guard["payload"] = json.loads(output.getvalue())
+        return original_runner(command, cwd=cwd, timeout=timeout)
+
+    monkeypatch.setattr(codex_execution_preparation, "_default_runner", interleaving_runner)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main([
+            "--registry", str(registry), "--runtime-root", str(runtime),
+            "--format", "json", "turn", "run-once",
+            "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+            "--todo-id", "todo_fixture0002",
+            "--turn-instance-id", "reserved-preparation-turn",
+            "--host", "codex-cli", "--project", str(project), "--codex-bin", str(binary),
+            "--codex-model", "fixture-model", "--codex-reasoning-effort", "high",
+            "--codex-sandbox", "read-only", "--no-global-sync",
+            "--validation-command-json",
+            json.dumps([sys.executable, "-c", "import sys; sys.stdin.read()"]),
+            "--execute",
+        ])
+    result = json.loads(output.getvalue())
+    assert exit_code == 0, result
+    assert result["status"] == "committed", result
+    assert competing_guard["code"] == 1, competing_guard
+    assert (
+        competing_guard["payload"]["error_code"]
+        == "heartbeat_receipt_identity_conflict"
+    ), competing_guard
+    assert (
+        "settlement identity conflicts with the current selected Todo"
+        in competing_guard["payload"]["reason"]
+    ), competing_guard
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(calls) == 1, calls
+
+    for todo_id, expected_active in (
+        ("todo_fixture0001", False),
+        ("todo_fixture0002", True),
+    ):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            lease_code = cli_main([
+                "--registry", str(registry), "--runtime-root", str(runtime),
+                "--format", "json", "task-lease", "inspect",
+                "--goal-id", "loopx-turn-fixture", "--todo-id", todo_id,
+            ])
+        lease = read_cli_policy_payload(output.getvalue(), returncode=lease_code)
+        assert lease_code == 0, lease
+        assert lease["active"] is expected_active, lease
+        if not expected_active:
+            assert lease["lease"] is None, lease
 
 
 def test_turn_plan_transaction_key_is_stable_and_todo_scoped() -> None:
@@ -498,6 +1457,44 @@ def test_turn_plan_transaction_key_is_stable_and_todo_scoped() -> None:
     )
 
 
+def test_source_goal_ref_scopes_turn_identity_without_changing_legacy_plan() -> None:
+    legacy = build_loopx_turn_plan(
+        _envelope(),
+        host="generic-cli",
+        execution_mode="isolated-headless",
+    )
+    instance_a = build_loopx_turn_plan(
+        _envelope(),
+        host="generic-cli",
+        execution_mode="isolated-headless",
+        goal_ref={
+            "goal_id": "fixture-goal",
+            "goal_instance_id": "ginst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+    )
+    instance_b = build_loopx_turn_plan(
+        _envelope(),
+        host="generic-cli",
+        execution_mode="isolated-headless",
+        goal_ref={
+            "goal_id": "fixture-goal",
+            "goal_instance_id": "ginst_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        },
+    )
+
+    assert "goal_ref" not in legacy
+    assert "goal_ref" not in legacy["transaction"]
+    assert instance_a["goal_ref"] == instance_a["transaction"]["goal_ref"]
+    assert (
+        instance_a["transaction"]["turn_key"]
+        != instance_b["transaction"]["turn_key"]
+    )
+    assert (
+        instance_a["transaction"]["turn_key"]
+        != legacy["transaction"]["turn_key"]
+    )
+
+
 def test_turn_plan_instance_id_distinguishes_new_turns_from_retries() -> None:
     first = build_loopx_turn_plan(
         _envelope(),
@@ -523,6 +1520,46 @@ def test_turn_plan_instance_id_distinguishes_new_turns_from_retries() -> None:
     assert first["transaction"]["turn_key"] != second["transaction"]["turn_key"]
 
 
+def test_turn_plan_fresh_iteration_ignores_compatible_session_binding() -> None:
+    payload = build_loopx_turn_plan(
+        _envelope(),
+        host="codex-cli",
+        execution_mode="interactive-visible",
+        session_binding={
+            "schema_version": LOOPX_TURN_SESSION_BINDING_SCHEMA_VERSION,
+            "goal_id": "fixture-goal",
+            "agent_id": "codex-fixture",
+            "todo_id": "todo_fixture0001",
+        },
+        iteration_context_policy="fresh",
+        turn_instance_id="cycle-2:iteration-1",
+    )
+
+    assert payload["ok"] is True
+    assert payload["session"] == {
+        "schema_version": LOOPX_TURN_SESSION_BINDING_SCHEMA_VERSION,
+        "action": "start_new",
+        "binding_status": "existing_binding_ignored",
+        "context_policy": {
+            "schema_version": "loopx_iteration_context_policy_v0",
+            "mode": "fresh",
+            "scope": "iteration",
+            "binding_scope": "agent",
+        },
+    }
+    assert payload["transaction"]["turn_instance_id"] == "cycle-2:iteration-1"
+
+
+def test_turn_plan_rejects_unknown_iteration_context_policy() -> None:
+    with pytest.raises(ValueError, match="iteration context policy"):
+        build_loopx_turn_plan(
+            _envelope(),
+            host="codex-cli",
+            execution_mode="interactive-visible",
+            iteration_context_policy="automatic",
+        )
+
+
 @pytest.mark.parametrize(
     "instance_id",
     ["", "contains space", "private/path", "x" * 129],
@@ -540,7 +1577,7 @@ def test_turn_plan_rejects_unsafe_instance_id(instance_id: str) -> None:
 @pytest.mark.parametrize(
     ("effective_action", "expected"),
     [
-        ("capability_repair", LoopXTurnRoute.REPAIR_REQUIRED),
+        ("capability_bridge_repair", LoopXTurnRoute.REPAIR_REQUIRED),
         ("autonomous_replan", LoopXTurnRoute.REPLAN_REQUIRED),
         ("successor_replan_required", LoopXTurnRoute.REPLAN_REQUIRED),
     ],
@@ -581,6 +1618,83 @@ def test_turn_plan_rejects_contradictory_scheduler_owner() -> None:
     assert payload["route"]["kind"] == LoopXTurnRoute.CONTRACT_ERROR.value
     assert payload["route"]["would_invoke_host"] is False
     assert "cannot be owned by host_automation" in payload["error"]
+
+
+@pytest.mark.parametrize(
+    "effective_action",
+    ["autonomous_replan", "autonomous_replan_required", "successor_replan_required"],
+)
+def test_turn_plan_keeps_todoless_replan_for_controller(effective_action: str) -> None:
+    envelope = _envelope(effective_action=effective_action)
+    envelope["action"]["selected_todo"] = None
+    payload = build_loopx_turn_plan(
+        envelope, host="generic-cli", execution_mode="isolated-headless",
+    )
+
+    assert payload["ok"] is True
+    assert payload["route"]["kind"] == "blocked"
+    assert payload["route"]["would_invoke_host"] is False
+    assert payload["session"]["action"] == "none"
+    assert payload["transaction"]["status"] == "not_applicable"
+    assert not any(payload["effects"].values())
+    assert payload["turn_envelope"] == envelope
+
+
+@pytest.mark.parametrize("hold", [None, "should_run", "must_attempt", "signature", "obligation", "business",
+                                  "missing_binding", "identity", "turn"])
+def test_signed_governance_can_run_while_normal_delivery_remains_withheld(hold):
+    from loopx.control_plane.quota.settlement import build_turn_scoped_cli_settlement_plan
+    obligation = "replan-" + "a" * 16
+    settlement = build_turn_scoped_cli_settlement_plan(goal_id="fixture-goal", agent_id="codex-fixture",
+        replan_obligation_id=obligation, turn_instance_id="fixture.replan", command_prefix="loopx",
+        scoped_cli_args="", lifecycle_actor_args="").as_dict()
+    decision = {"ok": True, "goal_id": "fixture-goal", "agent_id": "codex-fixture", "decision": "run",
+        "should_run": hold != "should_run", "effective_action": "normal_run" if hold == "business" else "autonomous_replan_required",
+        "replan_action_packet": {"schema_version": "replan_action_packet_v0", "decision": "replan_required", "obligation_id": obligation},
+        "interaction_contract": {"schema_version": "loopx_interaction_contract_v0", "mode": "autonomous_replan",
+            "user_channel": {"action_required": False, "notify": "DONT_NOTIFY"},
+            "agent_channel": {"must_attempt": hold != "must_attempt", "delivery_allowed": False, "quiet_noop_allowed": False},
+            "cli_channel": {"spend_after_validation": True, "settlement_plan": settlement}}}
+    if hold == "missing_binding":
+        del decision["interaction_contract"]["cli_channel"]["settlement_plan"]
+    if hold == "identity":
+        settlement["identity"]["agent_id"] = "different-agent"
+    envelope = build_turn_envelope(decision)
+    if hold == "signature":
+        envelope["action_signature"]["matches"] = False
+    if hold == "obligation":
+        envelope["replan_action_packet"]["obligation_id"] = "replan-" + "b" * 16
+    plan = build_loopx_turn_plan(envelope, host="codex-app-server", execution_mode="isolated-headless",
+        session_scope="agent", turn_instance_id="different-turn" if hold == "turn" else "fixture.replan")
+    assert plan["route"]["would_invoke_host"] is (hold is None)
+    assert plan["route"]["selected_todo"] is None
+    assert not any(plan["effects"].values())
+    if hold is None:
+        assert plan["route"]["kind"] == "replan_required"
+        assert plan["transaction"]["settlement_plan"]["identity"]["replan_obligation_id"] == obligation
+
+
+@pytest.mark.parametrize("invalid_signature", [False, True])
+def test_turn_plan_without_todo_requires_signature_and_scoped_binding(
+    invalid_signature: bool,
+) -> None:
+    envelope = _envelope(
+        effective_action="autonomous_replan_required" if invalid_signature else "normal_run",
+    )
+    envelope["action"]["selected_todo"] = None
+    if invalid_signature:
+        envelope["action_signature"]["matches"] = False
+    payload = build_loopx_turn_plan(
+        envelope, host="generic-cli", execution_mode="isolated-headless",
+    )
+
+    assert payload["ok"] is (not invalid_signature)
+    assert payload["route"]["kind"] == ("contract_error" if invalid_signature else "blocked")
+    assert payload["route"]["would_invoke_host"] is False
+    assert payload["route"]["host_invocation_allowed"] is False
+    assert payload["session"]["action"] == "none"
+    assert payload["transaction"]["status"] == "not_applicable"
+    assert not any(payload["effects"].values())
 
 
 def test_turn_plan_preserves_safe_bypass_when_user_action_is_visible() -> None:
@@ -638,7 +1752,7 @@ def test_turn_plan_fails_closed_on_action_signature_drift() -> None:
     assert payload["route"]["would_invoke_host"] is False
 
 
-def test_turn_plan_fails_closed_on_oversized_turn_envelope() -> None:
+def test_turn_plan_preserves_route_on_budget_warning() -> None:
     envelope = _envelope()
     envelope["compaction"] = {"within_budget": False}
 
@@ -648,8 +1762,9 @@ def test_turn_plan_fails_closed_on_oversized_turn_envelope() -> None:
         execution_mode="interactive-visible",
     )
 
-    assert payload["ok"] is False
-    assert payload["route"]["kind"] == LoopXTurnRoute.CONTRACT_ERROR.value
+    assert payload["ok"] is True
+    assert payload["route"]["kind"] == LoopXTurnRoute.READY_FOR_HOST.value
+    assert payload["turn_envelope"]["compaction"]["within_budget"] is False
 
 
 def test_scheduler_followup_binding_preserves_turn_lineage(
@@ -657,7 +1772,7 @@ def test_scheduler_followup_binding_preserves_turn_lineage(
 ) -> None:
     payload = {
         "scheduler_hint": {
-            "codex_app": {"ack_hint": {"cli_args": ["quota", "scheduler-ack-current"]}}
+            "app_automation": {"ack_hint": {"cli_args": ["quota", "scheduler-ack-current"]}}
         }
     }
 
@@ -668,7 +1783,7 @@ def test_scheduler_followup_binding_preserves_turn_lineage(
         source="loopx_turn_plan",
     )
 
-    ack_hint = payload["scheduler_hint"]["codex_app"]["ack_hint"]
+    ack_hint = payload["scheduler_hint"]["app_automation"]["ack_hint"]
     assert ack_hint["cli_args"][:2] == ["--registry", str(tmp_path / "registry.json")]
     assert ack_hint["route_binding"]["source"] == "loopx_turn_plan"
 
@@ -678,6 +1793,8 @@ def _write_live_fixture(
     *,
     todo_metadata_extra: str = "",
     extra_agent_todo_lines: tuple[str, ...] = (),
+    provider: str = "file",
+    handoff_mode: str = "soft_claim",
 ) -> tuple[Path, Path, Path]:
     project = root / "project"
     runtime = root / "runtime"
@@ -733,6 +1850,7 @@ def _write_live_fixture(
                         },
                         "quota": {"compute": 1.0, "window_hours": 24},
                         "coordination": {
+                            **({"handoff_mode": handoff_mode} if handoff_mode != "soft_claim" else {}),
                             "agent_model": "peer_v1",
                             "registered_agents": ["codex-fixture"],
                             "agent_profiles": {
@@ -751,6 +1869,22 @@ def _write_live_fixture(
         )
         + "\n",
         encoding="utf-8",
+    )
+    parsed = parse_active_state_todos(
+        state.read_text(encoding="utf-8"),
+        item_limit=None,
+    )
+    projection = build_todo_runtime_shadow_projection(
+        goal_id="loopx-turn-fixture",
+        handoff_mode=handoff_mode,
+        todos=parsed["agent_todos"]["items"],
+    )
+    initialize_canonical_authority(
+        runtime,
+        "loopx-turn-fixture",
+        projection,
+        state_path=state,
+        provider=provider,
     )
     return project, runtime, registry
 
@@ -782,17 +1916,15 @@ def test_quota_cli_projects_outer_controller_without_codex_app_action(
                 "outer_controller",
                 "--execution-mode",
                 "isolated_headless",
-                "--scan-root",
-                str(project),
             ]
         )
 
-    payload = json.loads(output.getvalue())
+    payload = read_cli_policy_payload(output.getvalue(), returncode=exit_code)
     hint = payload["scheduler_hint"]
     assert exit_code == 0, payload
     assert hint["execution_context"]["codex_app_applicability"] == "not_applicable"
-    assert hint["codex_app"]["applicability"] == "not_applicable"
-    assert "stateful_backoff" not in hint["codex_app"]
+    assert hint["app_automation"]["applicability"] == "not_applicable"
+    assert "stateful_backoff" not in hint["app_automation"]
     assert hint["execution_phase"]["scheduler_owner"] == "outer_controller"
     assert hint["execution_phase"]["completed"] is True
     assert hint["execution_phase"]["apply_needed"] is False
@@ -818,19 +1950,18 @@ def test_quota_cli_without_scheduler_context_fails_closed(tmp_path: Path) -> Non
                 "loopx-turn-fixture",
                 "--agent-id",
                 "codex-fixture",
-                "--scan-root",
-                str(project),
             ]
         )
 
-    payload = json.loads(output.getvalue())
+    payload = read_cli_policy_payload(output.getvalue(), returncode=exit_code)
     hint = payload["scheduler_hint"]
     assert exit_code == 0, payload
     assert hint["action"] == "repair_scheduler_execution_context"
     assert hint["execution_context"]["valid"] is False
-    assert hint["codex_app"]["applicability"] == "blocked_invalid_context"
+    assert hint["app_automation"]["applicability"] == "blocked_invalid_context"
 
 
+@pytest.mark.parametrize("context_delivery", ["off", "on"])
 @pytest.mark.parametrize(
     "profile_args",
     (
@@ -841,38 +1972,84 @@ def test_quota_cli_without_scheduler_context_fails_closed(tmp_path: Path) -> Non
 def test_quota_cli_codex_app_profile_is_explicit_and_applicable(
     tmp_path: Path,
     profile_args: list[str],
+    context_delivery: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import hashlib
+    from tests.control_plane.codex_checkpoint_fixture import reference_metadata_oracle
+    from loopx.control_plane.turn_driver.codex_context import codex_context_hook
+
+    monkeypatch.setenv("CODEX_THREAD_ID", "profile-fixture")
+    monkeypatch.delenv("CODEX_ROLLOUT_TRACE_ROOT", raising=False)
     project, runtime, registry = _write_live_fixture(tmp_path)
-    output = io.StringIO()
+    state = project / ".codex/goals/loopx-turn-fixture/ACTIVE_GOAL_STATE.md"
+    original = state.read_bytes()
 
-    with contextlib.redirect_stdout(output):
-        exit_code = cli_main(
-            [
-                "--registry",
-                str(registry),
-                "--runtime-root",
-                str(runtime),
-                "--format",
-                "json",
-                "quota",
-                "should-run",
-                "--goal-id",
-                "loopx-turn-fixture",
-                "--agent-id",
-                "codex-fixture",
-                *profile_args,
-                "--scan-root",
-                str(project),
-            ]
+    def invoke(arguments: list[str]) -> tuple[int, dict[str, Any]]:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cli_main(
+                ["--registry", str(registry), "--runtime-root", str(runtime),
+                 "--format", "json", *arguments]
+            )
+        return code, json.loads(output.getvalue())
+
+    native_args = []
+    if context_delivery == "on":
+        context, captures = tmp_path / "context", tmp_path / "captures"
+        context.mkdir(mode=0o700)
+        captures.mkdir(mode=0o700)
+        codex_context_hook(str(context), {
+            "session_id": "profile-fixture", "cwd": str(project),
+            "hook_event_name": "SessionStart", "source": "startup",
+        })
+        native_args = ["--codex-context-dir", str(context),
+                       "--decision-output-root", str(captures)]
+
+    exit_code, payload = invoke([
+        "quota", "should-run", "--goal-id", "loopx-turn-fixture",
+        "--agent-id", "codex-fixture", "--turn-instance-id", "profile-turn",
+        "--context-delivery", context_delivery, *profile_args, *native_args,
+    ])
+    assert exit_code == 0 and payload["ok"], payload
+    ledger = runtime / "goals/loopx-turn-fixture/rollout-event-log.jsonl"
+    recorded = ledger.read_bytes()
+    admissions = [event for line in recorded.splitlines()
+                  if (event := json.loads(line))["event_kind"] == "quota_should_run"
+                  and event.get("run_id") == "profile-turn"]
+    assert len(admissions) == 1
+    if context_delivery == "on":
+        assert payload["mode"] == "full"
+        command, observed = payload["recovery"]["command"], b""
+        recovery = reference_metadata_oracle(payload)["recovery"]
+        while True:
+            reader = subprocess.run(shlex.split(command), capture_output=True, text=True, timeout=60)
+            assert reader.returncode == 0, reader.stderr
+            page = json.loads(reader.stdout)
+            assert page["ok"] and page["offset"] == len(observed)
+            observed += page["content"].encode("utf-8")
+            if page["eof"]:
+                assert len(observed) == page["total_bytes"]
+                break
+            command = page["next_command"]
+        assert hashlib.sha256(observed).hexdigest() == recovery["sha256"]
+        payload = json.loads(observed)
+        assert payload["heartbeat_receipt"]["turn_instance_id"] == "profile-turn"
+    else:
+        assert "recovery" not in payload
+    assert ledger.read_bytes() == recorded
+    assert state.read_bytes() == original
+    runs = runtime / "goals/loopx-turn-fixture/runs/index.jsonl"
+    if runs.exists():
+        assert not any(
+            json.loads(line).get("classification") == "quota_slot_spent"
+            for line in runs.read_text().splitlines()
         )
-
-    payload = json.loads(output.getvalue())
     hint = payload["scheduler_hint"]
-    assert exit_code == 0, payload
     assert "execution_context" not in hint
     assert "execution_phase" not in hint
-    assert hint["codex_app"]["applicability"] == "applicable"
-    assert "stateful_backoff" in hint["codex_app"]
+    assert hint["app_automation"]["applicability"] == "applicable"
+    assert "stateful_backoff" in hint["app_automation"]
 
 
 def test_quota_cli_short_context_flags_preserve_all_typed_fields(
@@ -902,12 +2079,10 @@ def test_quota_cli_short_context_flags_preserve_all_typed_fields(
                 "agent_cli_loop",
                 "-M",
                 "interactive",
-                "--scan-root",
-                str(project),
             ]
         )
 
-    payload = json.loads(output.getvalue())
+    payload = read_cli_policy_payload(output.getvalue(), returncode=exit_code)
     context = payload["scheduler_hint"]["execution_context"]
     assert exit_code == 0, payload
     assert context["host_surface"] == "generic_cli"
@@ -943,8 +2118,9 @@ def test_heartbeat_cli_codex_app_alias_reaches_generated_quota_guard(
 
     payload = json.loads(output.getvalue())
     assert exit_code == 0, payload
-    assert payload["runtime_profile"] == "codex_app_heartbeat"
-    assert "--codex-app" in payload["quota_guard_command"]
+    assert payload["schema_version"] == "heartbeat_agent_input_v1"
+    assert "runtime_profile" not in payload
+    assert "quota_guard_command" not in payload
     assert "--codex-app" in payload["task_body"]
 
 
@@ -970,8 +2146,6 @@ def test_turn_cli_consumes_live_state_without_writes(
                 "loopx-turn-fixture",
                 "--agent-id",
                 "codex-fixture",
-                "--scan-root",
-                str(project),
                 "--include-transaction-detail",
             ]
         )
@@ -982,9 +2156,298 @@ def test_turn_cli_consumes_live_state_without_writes(
     assert payload["route"]["kind"] == LoopXTurnRoute.READY_FOR_HOST.value
     assert payload["session"]["action"] == "start_new"
     assert "settlement_plan" not in payload["transaction"]
-    assert payload["turn_envelope"]["action_signature"]["matches"] is True
+    assert payload["schema_version"] == "loopx_turn_plan_v1" and "turn_envelope" not in payload
+    from loopx.control_plane.turn_driver.driver import turn_host_lineage
+
+    assert turn_host_lineage(payload) == {"goal_id": "loopx-turn-fixture", "agent_id": "codex-fixture",
+                                       "todo_id": "todo_fixture0001"}
     assert payload["effects"]["state_written"] is False
     assert before == after
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("transaction_detail", [False, True])
+def test_turn_cli_inspection_cannot_become_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str,
+    transaction_detail: bool,
+) -> None:
+    from loopx.cli_commands import turn
+
+    _, runtime, registry = _write_live_fixture(tmp_path, provider=provider)
+    original_plans: list[dict[str, Any]] = []
+    real_plan = turn.build_loopx_turn_plan
+    compose = turn.compose_turn_decision
+
+    def with_future_observation(source, **kwargs):
+        return compose({**source, "future_fixture_observation": {
+            "text": 'Complete unknown data: 保留 "quoted" text\nand the final line.',
+            "numbers": [1.0, -0.0, 2**60 + 1],
+        }}, **kwargs)
+
+    def retain_executor_plan(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        planned = real_plan(*args, **kwargs)
+        # Preserve the actual executor input independently of CLI formatting.
+        original_plans.append(json.loads(json.dumps(planned)))
+        return planned
+
+    monkeypatch.setattr(turn, "build_loopx_turn_plan", retain_executor_plan)
+    monkeypatch.setattr(turn, "compose_turn_decision", with_future_observation)
+    output = io.StringIO()
+    args = ["--registry", str(registry), "--runtime-root", str(runtime),
+            "--format", "json", "turn", "plan", "--goal-id", "loopx-turn-fixture",
+            "--agent-id", "codex-fixture"]
+    if transaction_detail:
+        args.append("--include-transaction-detail")
+    with contextlib.redirect_stdout(output):
+        code = cli_main(args)
+    inspection = json.loads(output.getvalue())
+    assert code == 0, inspection
+    assert inspection["route"] == original_plans[0]["route"]
+    assert inspection["schema_version"] == "loopx_turn_plan_v1" and "turn_envelope" not in inspection
+    recovered = inspection["work_contract"]
+    if not transaction_detail and recovered.get("schema_version") != "loopx_turn_envelope_v1":
+        from tests.control_plane.cli_output_fixture import read_pinned_cli_body
+
+        body, _, _ = read_pinned_cli_body(inspection["detail_ref"]["command"])
+        recovered = json.loads(body)
+        assert "future_fixture_observation" not in inspection["work_contract"]
+    assert json.dumps(recovered, sort_keys=True) == json.dumps(
+        original_plans[0]["work_contract"], sort_keys=True)
+    assert recovered["future_fixture_observation"]["numbers"][-1] == 2**60 + 1
+    if transaction_detail:
+        # Explicit detail retains transport metadata, never a second source.
+        detailed = build_loopx_turn_host_request(inspection)
+        assert detailed["work_contract"] == original_plans[0]["work_contract"]
+    else:
+        # Even restoring valid transaction detail cannot promote inspection.
+        inspection["transaction"] = original_plans[0]["transaction"]
+        inspection["session"] = original_plans[0]["session"]
+        with pytest.raises(ValueError, match="CLI inspection"):
+            build_loopx_turn_host_request(inspection)
+        # Reading the exact complete source grants no execution authority.
+        inspection["work_contract"] = recovered
+        with pytest.raises(ValueError, match="CLI inspection"):
+            build_loopx_turn_host_request(inspection)
+    request = build_loopx_turn_host_request(original_plans[0])
+    assert request["work_contract"]["schema_version"] == "loopx_turn_envelope_v1"
+    assert request["work_contract"] == original_plans[0]["work_contract"]
+
+
+def test_turn_cli_resolves_its_decision_through_the_shared_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``turn`` must not re-inline the chain it shares with the managed step.
+
+    A private copy inside ``loopx/cli_commands/turn.py`` is not a formatting
+    problem: adding one decision input to the shared owner would then move only
+    one subcommand, and ``run-once`` and ``managed-step`` would disagree about
+    what the current Turn should do. Reading the live status through the shared
+    owner is the fact that identifies a private copy.
+    """
+
+    from loopx.cli_commands import turn_decision
+
+    project, runtime, registry = _write_live_fixture(tmp_path)
+    status_reads: list[dict[str, Any]] = []
+    real_collect_status = turn_decision.collect_status
+
+    def recording_collect_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        status_reads.append(dict(kwargs))
+        return real_collect_status(*args, **kwargs)
+
+    monkeypatch.setattr(turn_decision, "collect_status", recording_collect_status)
+    output = io.StringIO()
+
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(
+            [
+                "--registry",
+                str(registry),
+                "--runtime-root",
+                str(runtime),
+                "--format",
+                "json",
+                "turn",
+                "plan",
+                "--goal-id",
+                "loopx-turn-fixture",
+                "--agent-id",
+                "codex-fixture",
+            ]
+        )
+
+    payload = json.loads(output.getvalue())
+    assert exit_code == 0, payload
+    source = payload["work_contract"]
+    if source.get("schema_version") != "loopx_turn_envelope_v1":
+        from tests.control_plane.cli_output_fixture import read_pinned_cli_body
+
+        body, _, _ = read_pinned_cli_body(payload["detail_ref"]["command"])
+        source = json.loads(body)
+    assert source["schema_version"] == "loopx_turn_envelope_v1"
+    assert "turn_envelope" not in payload
+    assert len(status_reads) == 1, (
+        "`turn` must read its live status through the shared Turn decision "
+        "owner so run-once and managed-step cannot drift; shared-owner status "
+        f"reads: {len(status_reads)}"
+    )
+
+
+@pytest.mark.parametrize("provider", ("file", "sqlite"))
+def test_turn_cli_projects_explicit_fresh_iteration_context(
+    tmp_path: Path, provider: str,
+) -> None:
+    _, runtime, registry = _write_live_fixture(tmp_path, provider=provider)
+    # Use the CLI entrypoint in a fresh process. In-process
+    # callers and test collection may already have selected these providers.
+    process = subprocess.run(
+        [
+            sys.executable, "-c", "\n".join((
+                "import sys",
+                "from loopx.entrypoint import main",
+                "status = main(sys.argv[1:])",
+                "unselected = {'loopx.capabilities.semantic_preference.contract',",
+                "              'loopx.capabilities.semantic_preference.reward_memory'}",
+                "assert not unselected & sys.modules.keys(), unselected & sys.modules.keys()",
+                "raise SystemExit(status)",
+            )),
+            "--registry", str(registry),
+            "--runtime-root", str(runtime),
+            "--format", "json",
+            "turn", "plan",
+            "--goal-id", "loopx-turn-fixture",
+            "--agent-id", "codex-fixture",
+            "--iteration-context", "fresh",
+            "--include-transaction-detail",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "LOOPX_USAGE_PING": "0"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert process.returncode == 0, process.stdout + process.stderr
+    payload = json.loads(process.stdout)
+    assert payload["session"]["action"] == "start_new"
+    assert payload["session"]["context_policy"] == {
+        "schema_version": "loopx_iteration_context_policy_v0",
+        "mode": "fresh",
+        "scope": "iteration",
+        "binding_scope": "agent",
+    }
+
+
+def test_turn_cli_binds_advisory_primary_without_hiding_portfolio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        turn_run_once_command,
+        "execute_turn_run_once",
+        lambda *_args, **_kwargs: pytest.fail(
+            "turn plan must not call the run-once execution owner"
+        ),
+    )
+    project, runtime, registry = _write_live_fixture(
+        tmp_path,
+        todo_metadata_extra="successor_todo_ids=todo_fixture0002",
+        extra_agent_todo_lines=(
+            "- [ ] [P2] Continue the public fixture.",
+            "  <!-- loopx:todo todo_id=todo_fixture0002 status=open "
+            "task_class=advancement_task priority=P2 -->",
+        ),
+    )
+    output = io.StringIO()
+
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(
+            [
+                "--registry",
+                str(registry),
+                "--runtime-root",
+                str(runtime),
+                "--format",
+                "json",
+                "turn",
+                "plan",
+                "--goal-id",
+                "loopx-turn-fixture",
+                "--agent-id",
+                "codex-fixture",
+            ]
+        )
+
+    payload = json.loads(output.getvalue())
+    assert exit_code == 0, payload
+    assert payload["route"]["kind"] == LoopXTurnRoute.READY_FOR_HOST.value
+    source = payload["work_contract"]
+    assert source["interaction_contract"]["agent_channel"]["delivery_allowed"] is True
+    assert source["selected_todo"]["selected_by"] == (
+        "turn_controller_advisory_primary"
+    )
+    portfolio = source["action_portfolio"]
+    assert portfolio["schema_version"] == "quota_action_portfolio_v2"
+    assert portfolio["primary"]["todo_id"] == "todo_fixture0001"
+    assert portfolio["selection_policy"]["requires_explicit_turn_binding"] is True
+    assert source["interaction_contract"]["cli_channel"].get("selection_required") is None
+
+
+@pytest.mark.parametrize("selection", [None, "todo_fixture0002", "todo_missing"])
+def test_turn_cli_explicit_todo_keeps_default_and_never_falls_back(tmp_path, selection):
+    project, runtime, registry = _write_live_fixture(tmp_path, extra_agent_todo_lines=(
+        "- [ ] [P2] Check the second public fixture.",
+        "  <!-- loopx:todo todo_id=todo_fixture0002 status=open task_class=advancement_task "
+        "action_kind=fixture claimed_by=codex-fixture priority=P2 -->",
+    ))
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = cli_main(["--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+                         "turn", "plan", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+                          *(["--todo-id", selection] if selection else [])])
+    result = json.loads(output.getvalue())
+    if selection == "todo_missing":
+        assert code == 1
+        assert "no alternate task" in result["error"]
+    else:
+        assert code == 0, result
+        selected = result["work_contract"]["selected_todo"]
+        assert selected["todo_id"] == (selection or "todo_fixture0001")
+        assert selected["selected_by"] == ("turn_explicit_todo" if selection else "turn_controller_advisory_primary")
+
+
+@pytest.mark.parametrize("extra", [
+    ["--resume-turn-key", "sha256:fixture"],
+    ["--resume-goal-id", "loopx-turn-fixture", "--resume-agent-id", "codex-fixture",
+     "--resume-todo-id", "todo_fixture0001"],
+])
+def test_turn_explicit_selection_cannot_retarget_resumption(tmp_path, extra):
+    project, runtime, registry = _write_live_fixture(tmp_path)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = cli_main(["--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+                         "turn", "run-once", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+                         "--project", str(project),  "--todo-id", "todo_fixture0002", *extra])
+    assert code == 1
+    assert "cannot retarget" in json.loads(output.getvalue())["error"]
+
+
+@pytest.mark.parametrize("status,claim", [("done", "codex-fixture"), ("open", "other-agent")])
+def test_explicit_turn_todo_does_not_bypass_completion_or_actor_scope(tmp_path, status, claim):
+    project, runtime, registry = _write_live_fixture(tmp_path, extra_agent_todo_lines=(
+        f"- [{'x' if status == 'done' else ' '}] [P2] Scoped second fixture.",
+        f"  <!-- loopx:todo todo_id=todo_fixture0002 status={status} task_class=advancement_task "
+        f"action_kind=fixture claimed_by={claim} priority=P2 -->",
+    ))
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = cli_main(["--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+                         "turn", "plan", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+                          "--todo-id", "todo_fixture0002"])
+    result = json.loads(output.getvalue())
+    assert code == 1, result
+    assert "no alternate task" in result["error"]
 
 
 def test_turn_cli_omits_transaction_detail_by_default(tmp_path: Path) -> None:
@@ -1006,8 +2469,6 @@ def test_turn_cli_omits_transaction_detail_by_default(tmp_path: Path) -> None:
                 "loopx-turn-fixture",
                 "--agent-id",
                 "codex-fixture",
-                "--scan-root",
-                str(project),
             ]
         )
 
@@ -1039,8 +2500,6 @@ def test_turn_cli_requires_complete_resume_identity(tmp_path: Path) -> None:
                 "codex-fixture",
                 "--resume-goal-id",
                 "loopx-turn-fixture",
-                "--scan-root",
-                str(project),
             ]
         )
 
@@ -1050,11 +2509,52 @@ def test_turn_cli_requires_complete_resume_identity(tmp_path: Path) -> None:
     assert "requires --resume-goal-id" in payload["error"]
 
 
-def test_turn_run_once_cli_commits_validated_result_and_one_quota_slot(
+@pytest.mark.parametrize("checkpoint_fault", [None, "writeback", "quota_spend"])
+def test_turn_run_once_cli_commits_distinct_host_guidance_without_task_step_edit(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_fault: str | None,
 ) -> None:
+    from loopx.control_plane.turn_driver import executor
+
+    persist = executor._write_journal
+    interrupted = False
+
+    def interrupt_checkpoint(path, journal):
+        nonlocal interrupted
+        if checkpoint_fault and not interrupted and checkpoint_fault in journal:
+            interrupted = True
+            raise RuntimeError("injected interruption before provider checkpoint")
+        persist(path, journal)
+
+    monkeypatch.setattr(executor, "_write_journal", interrupt_checkpoint)
     project, runtime, registry = _write_live_fixture(tmp_path)
-    host_project = tmp_path / "isolated-host-workspace"
+    policy_output = io.StringIO()
+    with contextlib.redirect_stdout(policy_output):
+        policy_code = cli_main(
+            [
+                "--registry",
+                str(registry),
+                "--runtime-root",
+                str(runtime),
+                "--format",
+                "json",
+                "automation-cadence",
+                "--goal-id",
+                "loopx-turn-fixture",
+                "--agent-id",
+                "codex-fixture",
+                "--min-interval-minutes",
+                "1440",
+                "--expected-revision",
+                "0",
+                "--owner-reference",
+                "fixture-owner",
+                "--execute",
+            ]
+        )
+    assert policy_code == 0, policy_output.getvalue()
+    host_project = project / "isolated-host-workspace"
     host_project.mkdir()
     host_script = """
 import json
@@ -1087,36 +2587,55 @@ raise SystemExit(0 if artifact.read_text(encoding="utf-8") == "validated" else 7
     output = io.StringIO()
 
     with contextlib.redirect_stdout(output):
-        exit_code = cli_main(
-            [
-                "--registry",
-                str(registry),
-                "--runtime-root",
-                str(runtime),
-                "--format",
-                "json",
-                "turn",
-                "run-once",
-                "--goal-id",
-                "loopx-turn-fixture",
-                "--agent-id",
-                "codex-fixture",
-                "--project",
-                str(host_project),
-                "--host-adapter-command-json",
-                json.dumps([sys.executable, "-c", host_script]),
-                "--validation-command-json",
-                json.dumps([sys.executable, "-c", validation_script]),
-                "--scan-root",
-                str(project),
-                "--no-global-sync",
-                "--execute",
-            ]
-        )
+        args = [
+            "--registry",
+            str(registry),
+            "--runtime-root",
+            str(runtime),
+            "--format",
+            "json",
+            "turn",
+            "run-once",
+            "--host",
+            "generic-cli",
+            "--goal-id",
+            "loopx-turn-fixture",
+            "--agent-id",
+            "codex-fixture",
+            "--project",
+            str(host_project),
+            "--host-adapter-request-schema", "loopx_turn_host_request_v1",
+            "--host-adapter-command-json",
+            json.dumps([sys.executable, "-c", host_script]),
+            "--validation-command-json",
+            json.dumps([sys.executable, "-c", validation_script]),
+            "--no-global-sync",
+            "--execute",
+        ]
+        exit_code = cli_main(args)
 
     payload = json.loads(output.getvalue())
+    if checkpoint_fault:
+        assert exit_code == 1, payload
+        assert interrupted
+        journal_paths = [
+            path
+            for path in (runtime / "goals" / "loopx-turn-fixture" / "turns").glob(
+                "*.json"
+            )
+            if not path.name.endswith(".lock.holder.json")
+        ]
+        assert len(journal_paths) == 1
+        stored = json.loads(journal_paths[0].read_text(encoding="utf-8"))
+        assert checkpoint_fault not in stored
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exit_code = cli_main([*args, "--resume-turn-key", stored["turn_key"]])
+        payload = json.loads(output.getvalue())
     assert exit_code == 0, payload
     assert payload["status"] == "committed"
+    assert payload["admission"]["reserved"] is True
+    assert payload["admission"]["pre_model_admission"] == "managed_turn_only"
     assert payload["receipt"]["status"] == "committed"
     assert payload["receipt"]["next_phase"] is None
     assert payload["validation"]["status"] == "passed"
@@ -1134,8 +2653,8 @@ raise SystemExit(0 if artifact.read_text(encoding="utf-8") == "validated" else 7
         "completion_reason": "selected scheduler owner requires no Codex App apply or ACK",
     }
     assert payload["effects"] == {
-        "host_invoked": True,
-        "state_written": True,
+        "host_invoked": checkpoint_fault is None,
+        "state_written": checkpoint_fault != "quota_spend",
         "quota_spent": True,
         "scheduler_acknowledged": False,
     }
@@ -1146,13 +2665,23 @@ raise SystemExit(0 if artifact.read_text(encoding="utf-8") == "validated" else 7
         / "loopx-turn-fixture"
         / "ACTIVE_GOAL_STATE.md"
     )
-    assert "Run the next public fixture check" in state_path.read_text(encoding="utf-8")
+    assert "Run the next public fixture check" not in state_path.read_text(encoding="utf-8")
+    journal_path = runtime / "goals" / "loopx-turn-fixture" / "turns" / (
+        payload["resume_turn_key"].removeprefix("sha256:") + ".json"
+    )
+    # The host texts have distinct meanings and survive replay without becoming
+    # an implicit task-step write or replacing shared compatibility prose.
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["host_result"]["recommended_action"] == "Continue the public fixture"
+    assert journal["host_result"]["next_action"] == "Run the next public fixture check"
     index_path = runtime / "goals" / "loopx-turn-fixture" / "runs" / "index.jsonl"
     rows = [json.loads(line) for line in index_path.read_text(encoding="utf-8").splitlines()]
     assert [row["classification"] for row in rows] == [
         "fixture_progress",
         "quota_slot_spent",
     ]
+    assert rows[0]["recommended_action"] == "Continue the public fixture"
+    assert not rows[0]["recommended_action_resolution"].get("step_revision")
 
     resumed_output = io.StringIO()
     with contextlib.redirect_stdout(resumed_output):
@@ -1166,18 +2695,19 @@ raise SystemExit(0 if artifact.read_text(encoding="utf-8") == "validated" else 7
                 "json",
                 "turn",
                 "run-once",
+                "--host",
+                "generic-cli",
                 "--goal-id",
                 "loopx-turn-fixture",
                 "--agent-id",
                 "codex-fixture",
                 "--project",
                 str(host_project),
+                "--host-adapter-request-schema", "loopx_turn_host_request_v1",
                 "--host-command-json",
                 json.dumps([sys.executable, "-c", host_script]),
                 "--validation-command-json",
                 json.dumps([sys.executable, "-c", validation_script]),
-                "--scan-root",
-                str(project),
                 "--no-global-sync",
                 "--resume-turn-key",
                 payload["resume_turn_key"],
@@ -1203,12 +2733,383 @@ raise SystemExit(0 if artifact.read_text(encoding="utf-8") == "validated" else 7
         "quota_slot_spent",
     ]
 
+    next_output = io.StringIO()
+    with contextlib.redirect_stdout(next_output):
+        next_code = cli_main([
+            "--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+            "turn", "run-once", "--host", "generic-cli", "--goal-id", "loopx-turn-fixture",
+            "--agent-id", "codex-fixture", "--turn-instance-id", "next-cadence-fixture",
+            "--project", str(host_project), "--host-adapter-request-schema", "loopx_turn_host_request_v1", "--host-command-json",
+            json.dumps([sys.executable, "-c", host_script]), "--validation-command-json",
+            json.dumps([sys.executable, "-c", validation_script]),
+            "--no-global-sync", "--execute",
+        ])
+    waiting = json.loads(next_output.getvalue())
+    assert next_code == 1, waiting
+    assert waiting["status"] == "interval_wait"
+    assert waiting["admission"]["next_eligible_at_ms"] > 0
+    assert waiting["effects"]["host_invoked"] is False
+    assert waiting["effects"]["quota_spent"] is False
+    assert "- next_eligible_at: " in render_loopx_turn_execution_markdown(waiting)
+    assert [json.loads(line)["classification"] for line in index_path.read_text(encoding="utf-8").splitlines()] == [
+        "fixture_progress", "quota_slot_spent",
+    ]
 
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("fault", [
+    "initial_before", "initial_after", "attempt_before", "attempt_after",
+    "confirm_before", "confirm_after",
+])
+def test_managed_start_interruption_preserves_reservation_and_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str, fault: str,
+) -> None:
+    from loopx.cli_commands import turn_cadence
+    from loopx.control_plane.effect_runtime import effect_runtime_result
+    from loopx.control_plane.turn_driver import executor
+
+    project, runtime, registry = _write_live_fixture(tmp_path, provider=provider)
+    scope = {"runtime_root": str(runtime), "goal_id": "loopx-turn-fixture",
+             "agent_id": "codex-fixture", "automation_id": None}
+    configured = effect_runtime_result("quota.automation_cadence.manage", {
+        **scope, "operation": "configure", "min_interval_minutes": 3,
+        "expected_revision": 0, "owner_reference": "fixture-owner", "execute": True,
+    })
+    assert configured["eligible_now"] is True
+    now_ns = turn_cadence.time.time_ns()
+    monkeypatch.setattr(turn_cadence.time, "time_ns", lambda: now_ns)
+    marker = project / "host-starts.txt"
+    host_script = (
+        "from pathlib import Path; import sys; sys.stdin.read(); "
+        f"p=Path({str(marker)!r}); p.write_text(p.read_text()+'x' if p.exists() else 'x'); "
+        "raise SystemExit(7)"
+    )
+    args = ["--registry", str(registry), "--runtime-root", str(runtime),
+            "--format", "json", "turn", "run-once", "--host", "generic-cli",
+            "--goal-id", scope["goal_id"], "--agent-id", scope["agent_id"],
+            "--turn-instance-id", "start-checkpoint-fixture", "--project", str(project),
+            "--host-adapter-request-schema", "loopx_turn_host_request_v1",
+            "--host-adapter-command-json", json.dumps([sys.executable, "-c", host_script]),
+            "--no-global-sync", "--execute"]
+    persist, make_cadence = executor._write_journal, turn_cadence.managed_cadence_start
+    interrupted = False
+    attempts, admissions, confirmations = [], [], []
+
+    def interrupt() -> None:
+        nonlocal interrupted
+        interrupted = True
+        raise RuntimeError("fixture start interruption")
+
+    def checkpoint(path, journal):
+        phase = "initial" if journal["host_attempt_count"] == 0 else "attempt"
+        if not interrupted and fault == phase + "_before":
+            interrupt()
+        persist(path, journal)
+        if not interrupted and fault == phase + "_after":
+            interrupt()
+
+    def fresh_cadence(**kwargs):
+        cadence = make_cadence(**kwargs)
+
+        def admit(identity):
+            attempts.append(dict(identity))
+            admission = cadence.admit(identity)
+            admissions.append(dict(admission))
+            return admission
+
+        def confirm():
+            # Confirmation must observe the independently durable attempt.
+            assert _turn_journal(runtime)["host_attempt_count"] == 1
+            if not interrupted and fault == "confirm_before":
+                interrupt()
+            cadence.confirm()
+            confirmations.append(True)
+            if not interrupted and fault == "confirm_after":
+                interrupt()
+
+        return turn_cadence.ManagedCadenceStart(admit, confirm)
+
+    monkeypatch.setattr(executor, "_write_journal", checkpoint)
+    monkeypatch.setattr(turn_run_once_command, "managed_cadence_start", fresh_cadence)
+
+    def run(extra=()):
+        invocation = list(args)
+        if "--resume-turn-key" in extra:
+            index = invocation.index("--turn-instance-id")
+            del invocation[index:index + 2]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cli_main([*invocation, *extra])
+        return code, json.loads(output.getvalue())
+
+    code, failure = run()
+    assert code == 1 and interrupted, failure
+    assert not marker.exists()
+    first = effect_runtime_result("quota.automation_cadence.manage", {
+        **scope, "operation": "read",
+    })
+    next_eligible = first["next_eligible_at_ms"]
+    assert next_eligible is not None
+    capture_path = runtime / "goals" / scope["goal_id"] / "turns" / "decisions" / (
+        attempts[0]["turn_key"].removeprefix("sha256:") + ".json"
+    )
+    original_capture = capture_path.read_bytes()
+    now_ns += 1_000_000_000
+    if fault == "initial_before":
+        resume = ()  # No journal was committed; the original Turn identity remains.
+        state = project / ".codex/goals/loopx-turn-fixture/ACTIVE_GOAL_STATE.md"
+        state.write_text(state.read_text() + "\n## Constraints\n\nPreserve the revised fixture requirement.\n")
+    else:
+        saved = _turn_journal(runtime)
+        resume = ("--resume-turn-key", saved["turn_key"])
+    code, resumed = run(resume)
+    assert code == 1, resumed
+    assert attempts[0]["attempt"] == 1
+    durable_attempt = fault in {"attempt_after", "confirm_before", "confirm_after"}
+    if fault == "initial_before":
+        # No journal can pin the original plan. Regenerating a capture must
+        # refuse changed observations rather than overwrite its commitment.
+        if len(attempts) == 2:
+            # A source-bound plan may give the revised work a different key.
+            # Its fresh reservation must still respect the original interval.
+            assert attempts[1]["turn_key"] != attempts[0]["turn_key"]
+            assert admissions[-1]["admitted"] is False
+            assert resumed["status"] == "interval_wait"
+        else:
+            assert len(attempts) == 1
+            assert "capture does not match the original observation" in resumed["error"]
+        assert not marker.exists()
+        assert not list((runtime / "goals" / scope["goal_id"] / "turns").glob("*.json"))
+        assert capture_path.read_bytes() == original_capture
+    elif durable_attempt:
+        # The recovery owner cannot infer non-execution from a missing reply.
+        # It refuses before another reservation, confirmation or Host attempt.
+        assert len(attempts) == 1
+        assert resumed["recovery_decision"]["reason"] == "host_outcome_unknown"
+        assert resumed["recovery_decision"]["reinvoke_host"] is False
+        assert not marker.exists()
+        assert len(confirmations) == (1 if fault == "confirm_after" else 0)
+    else:
+        assert len(attempts) == 2, resumed
+        assert attempts[1]["turn_key"] == attempts[0]["turn_key"]
+        assert attempts[1]["attempt"] == 1
+        assert admissions[-1]["resumed"] is True
+        assert resumed["effects"]["host_invoked"] is True
+        assert marker.read_text() == "x"
+        assert len(confirmations) == 1
+        code, replay = run(("--resume-turn-key", resumed["resume_turn_key"]))
+        assert code == 1 and replay["replayed"] is True, replay
+        assert replay["effects"]["host_invoked"] is False
+        assert marker.read_text() == "x"
+    if fault != "initial_before":
+        assert _turn_journal(runtime)["host_attempt_count"] == 1
+    current = effect_runtime_result("quota.automation_cadence.manage", {
+        **scope, "operation": "read",
+    })
+    assert current["next_eligible_at_ms"] == next_eligible
+    # A CLI exception correctly leaves effect observation unknown. The fixture
+    # separately observes no settlement record, rather than changing it to 0.
+    index_path = runtime / "goals" / scope["goal_id"] / "runs" / "index.jsonl"
+    assert not index_path.exists()
+
+
+def test_turn_run_once_cli_dsh_fresh_sessions_and_iteration_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_builder = turn_run_once_command.build_dsh_host_runner
+    builder_calls: list[Path] = []
+
+    def patched_builder(*args: Any, **kwargs: Any) -> Any:
+        builder_calls.append(kwargs["workspace"])
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(turn_run_once_command, "build_dsh_host_runner", patched_builder)
+    project, runtime, registry = _write_live_fixture(tmp_path)
+    host_project = tmp_path / "isolated-dsh-workspace"
+    host_project.mkdir()
+    runner = tmp_path / "recording_dsh_runner.py"
+    runner.write_text(
+        """
+import json
+from pathlib import Path
+
+def run_dsh_turn(**kwargs):
+    output = Path(kwargs["workspace"]) / "dsh-session-ids.txt"
+    with output.open("a", encoding="utf-8") as stream:
+        stream.write(kwargs["session_id"] + "\\n")
+    return json.dumps({
+        "result_kind": "iteration_failed",
+        "classification": "fixture_iteration_failed",
+        "summary": "The bounded fixture iteration did not complete.",
+        "next_action": "Await a new controller-authorized iteration.",
+    })
+""",
+        encoding="utf-8",
+    )
+    state_path = (
+        project
+        / ".codex"
+        / "goals"
+        / "loopx-turn-fixture"
+        / "ACTIVE_GOAL_STATE.md"
+    )
+    before_state = state_path.read_text(encoding="utf-8")
+
+    def run(turn_instance_id: str, context: str) -> dict[str, object]:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exit_code = cli_main(
+                [
+                    "--registry",
+                    str(registry),
+                    "--runtime-root",
+                    str(runtime),
+                    "--format",
+                    "json",
+                    "turn",
+                    "run-once",
+                    "--goal-id",
+                    "loopx-turn-fixture",
+                    "--agent-id",
+                    "codex-fixture",
+                    "--host",
+                    "dsh",
+                    "--project",
+                    str(host_project),
+                    "--dsh-runner",
+                    str(runner),
+                    "--turn-instance-id",
+                    turn_instance_id,
+                    "--iteration-context",
+                    context,
+                    "--no-global-sync",
+                    "--execute",
+                ]
+            )
+        payload = json.loads(output.getvalue())
+        assert exit_code == 0, json.dumps(payload, indent=2)
+        assert payload["result_kind"] == "iteration_failed"
+        assert payload["status"] == "stopped"
+        assert payload["effects"]["state_written"] is False
+        assert payload["effects"]["quota_spent"] is False
+        return payload
+
+    run("fresh-fixture-1", "fresh")
+    run("fresh-fixture-2", "fresh")
+    run("resume-fixture-1", "resume")
+    run("resume-fixture-2", "resume")
+    assert builder_calls == [host_project] * 4
+
+    session_ids = (host_project / "dsh-session-ids.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert session_ids[0].startswith("dsh-iteration-v1-")
+    assert session_ids[0] != session_ids[1]
+    assert session_ids[2].startswith("dsh-lineage-v1-")
+    assert session_ids[2] == session_ids[3]
+    assert state_path.read_text(encoding="utf-8") == before_state
+
+
+@pytest.mark.parametrize("malformed_packet", [False, True], ids=["material-replan", "invalid-json-array"])
+def test_turn_run_once_cli_dsh_preserves_material_path_delta(
+    tmp_path: Path, malformed_packet: bool,
+) -> None:
+    project, runtime, registry = _write_live_fixture(
+        tmp_path,
+        todo_metadata_extra="no_followup=true",
+    )
+    state_path = project / ".codex/goals/loopx-turn-fixture/ACTIVE_GOAL_STATE.md"
+    host_project = project / "isolated-dsh-workspace"
+    host_project.mkdir()
+    vision = {
+        "schema_version": "goal_vision_replan_contract_v0",
+        "state": "active",
+        "vision_patch": {
+            "vision_summary": "Continue the next bounded fixture check.",
+            "acceptance_summary": "Validate the next fixture outcome independently.",
+        },
+        "path_delta": {
+            "schema_version": "goal_path_delta_v0",
+            "outcome": "replan",
+            "prior_assumption": "The prior fixture stage remained open.",
+            "observed_reality": "The prior stage passed its local validation.",
+            "evidence_refs": ["fixture:validated-closed-stage"],
+            "changed": ["Advance the next bounded fixture check."],
+        },
+    }
+    candidate = {
+        "result_kind": "replan_required",
+        "classification": "fixture_replan_successor",
+        "summary": "The prior stage closed and an active successor was authored.",
+        "recommended_action": "Continue the validated successor stage.",
+        "next_action": "Validate the next bounded fixture check.",
+        "delivery_batch_scale": "implementation",
+        "delivery_outcome": "outcome_progress",
+        "work_evidence": ["artifact:validated-artifact"],
+        "validation_evidence": ["check:material-replan-validation"],
+        "path_delta_mode": "material_replan",
+        "agent_vision_json": "[]" if malformed_packet else json.dumps(vision),
+    }
+    runner = tmp_path / "material_replan_dsh_runner.py"
+    runner.write_text(
+        "import json\nfrom pathlib import Path\n"
+        f"candidate = {candidate!r}\n"
+        "def run_dsh_turn(**kwargs):\n"
+        "    counter = Path(kwargs['workspace']) / 'host-count.txt'\n"
+        "    counter.write_text(str(int(counter.read_text()) + 1 if counter.exists() else 1))\n"
+        "    Path(kwargs['workspace'], 'validated-artifact.txt').write_text('validated')\n"
+        "    return json.dumps(candidate)\n",
+        encoding="utf-8",
+    )
+    validator = (
+        "import pathlib; raise SystemExit(0 if "
+        "pathlib.Path('validated-artifact.txt').read_text() == 'validated' else 7)"
+    )
+    args = [
+        "--registry", str(registry), "--runtime-root", str(runtime),
+        "--format", "json", "turn", "run-once", "--goal-id",
+        "loopx-turn-fixture", "--agent-id", "codex-fixture", "--host", "dsh",
+        "--project", str(host_project), "--dsh-runner", str(runner),
+        "--validation-command-json", json.dumps([sys.executable, "-c", validator]),
+        "--execution-mode", "isolated-headless",
+        "--no-global-sync", "--execute",
+    ]
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(args)
+    payload = json.loads(output.getvalue())
+    assert (host_project / "host-count.txt").read_text(encoding="utf-8") == "1"
+    if malformed_packet:
+        assert exit_code == 1, payload
+        assert payload["effects"]["host_invoked"] is True
+        assert payload["effects"]["state_written"] is False
+        assert payload["effects"]["quota_spent"] is False
+        assert "agent_vision_json" in json.dumps(payload)
+        assert state_path.read_text(encoding="utf-8").find("successor") == -1
+    else:
+        assert exit_code == 0, payload
+        assert payload["status"] == "committed"
+        assert payload["result_kind"] == "replan_required"
+        assert payload["effects"]["state_written"] is True
+        assert payload["effects"]["quota_spent"] is True
+        rows_path = runtime / "goals/loopx-turn-fixture/runs/index.jsonl"
+        rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
+        durable = next(row for row in rows if row.get("classification") == "fixture_replan_successor")
+        recorded = json.loads(Path(durable["json_path"]).read_text(encoding="utf-8"))
+        assert recorded["agent_vision"]["path_delta"]["outcome"] == "replan"
+
+
+@pytest.mark.parametrize(
+    "next_action",
+    ["Select the next Todo from a fresh decision.", "Assess remaining work."],
+)
 def test_turn_run_once_cli_completes_selected_todo_after_validation(
     tmp_path: Path,
+    next_action: str,
 ) -> None:
     project, runtime, registry = _write_live_fixture(tmp_path)
-    host_project = tmp_path / "isolated-host-workspace"
+    host_project = project / "isolated-host-workspace"
     host_project.mkdir()
     host_script = """
 import json
@@ -1230,6 +3131,9 @@ json.dump({
     "summary": "One public fixture completed."
 }, sys.stdout)
 """
+    host_script = host_script.replace(
+        "Select the next Todo from a fresh decision.", next_action,
+    )
     validation_script = """
 import json
 import pathlib
@@ -1248,18 +3152,19 @@ raise SystemExit(0 if artifact.read_text(encoding="utf-8") == "completed" else 7
         "json",
         "turn",
         "run-once",
+        "--host",
+        "generic-cli",
         "--goal-id",
         "loopx-turn-fixture",
         "--agent-id",
         "codex-fixture",
         "--project",
         str(host_project),
+        "--host-adapter-request-schema", "loopx_turn_host_request_v1",
         "--host-adapter-command-json",
         json.dumps([sys.executable, "-c", host_script]),
         "--validation-command-json",
         json.dumps([sys.executable, "-c", validation_script]),
-        "--scan-root",
-        str(project),
         "--no-global-sync",
         "--execute",
     ]
@@ -1290,6 +3195,27 @@ raise SystemExit(0 if artifact.read_text(encoding="utf-8") == "completed" else 7
     assert "todo_id=todo_fixture0001 status=done" in state
     assert "LoopX%20Turn%20validated%20completion" in state
     assert f"completion_turn_key={payload['resume_turn_key']}" in state
+    guard_events = [
+        event
+        for event in (
+            json.loads(line)
+            for line in (
+                runtime
+                / "goals"
+                / "loopx-turn-fixture"
+                / "rollout-event-log.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        if event.get("event_kind") == "quota_should_run"
+        and event.get("run_id") == payload["resume_turn_key"]
+    ]
+    assert len(guard_events) == 1
+    # Managed Turn uses the same explicit semantic-replan guard as ordinary
+    # quota should-run.  Null means this admitted Turn selected no obligation;
+    # an obligation opened while its host runs belongs to the next Turn.
+    assert guard_events[0]["details"]["semantic_replan_obligation_id"] is None
 
     next_plan_output = io.StringIO()
     with contextlib.redirect_stdout(next_plan_output):
@@ -1313,33 +3239,20 @@ raise SystemExit(0 if artifact.read_text(encoding="utf-8") == "completed" else 7
                 "outer_controller",
                 "--execution-mode",
                 "isolated-headless",
-                "--scan-root",
-                str(project),
             ]
         )
     next_plan = json.loads(next_plan_output.getvalue())
-    assert next_plan_exit_code == 0, next_plan
+    assert next_plan_exit_code == 0, json.dumps(next_plan, indent=2)
     # The completion-created obligation is deferred only for the causal
     # closeout write.  It must be visible immediately at the next decision;
     # Turn itself stays blocked until that replan creates a runnable successor.
     assert next_plan["route"]["kind"] == "blocked"
     assert (
-        next_plan["turn_envelope"]["effective_action"]
+        next_plan["work_contract"]["effective_action"]
         == "autonomous_replan_required"
     )
-    next_obligation = next_plan["turn_envelope"]["replan_action_packet"]
+    next_obligation = next_plan["work_contract"]["replan_action_packet"]
     assert next_obligation["decision"] == "replan_required"
-
-    recovered_completion = complete_goal_todo(
-        registry_path=registry,
-        goal_id="loopx-turn-fixture",
-        todo_id="todo_fixture0001",
-        role="agent",
-        agent_id="codex-fixture",
-        completion_turn_key=payload["resume_turn_key"],
-    )
-    assert recovered_completion["idempotent_replay"] is True
-    assert recovered_completion["changed"] is False
 
     replayed_output = io.StringIO()
     with contextlib.redirect_stdout(replayed_output):
@@ -1355,6 +3268,99 @@ raise SystemExit(0 if artifact.read_text(encoding="utf-8") == "completed" else 7
     assert replayed_exit_code == 0, replayed
     assert replayed["replayed"] is True
     assert not any(replayed["effects"].values())
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_promoted_turn_completion_replays_after_commit_before_journal_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+) -> None:
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(tmp_path, provider=provider)
+    host_project = project / "isolated-host-workspace"
+    host_project.mkdir()
+    host_script, validation_script = _completion_host_and_validation_scripts()
+    argv = _turn_run_once_completion_argv(
+        host_project,
+        runtime,
+        registry,
+        host_script,
+        validation_script,
+    )
+    real_completion = turn_run_once_command.write_turn_validated_completion
+    committed_results: list[dict[str, object]] = []
+
+    def crash_after_canonical_completion(**kwargs: object) -> dict[str, object]:
+        result = real_completion(**kwargs)
+        committed_results.append(result)
+        if len(committed_results) == 1:
+            raise OSError("injected crash after canonical Todo commit")
+        return result
+
+    monkeypatch.setattr(
+        turn_run_once_command,
+        "write_turn_validated_completion",
+        crash_after_canonical_completion,
+    )
+    first_output = io.StringIO()
+    with contextlib.redirect_stdout(first_output):
+        first_exit_code = cli_main(argv)
+    first = json.loads(first_output.getvalue())
+
+    assert first_exit_code == 1, first
+    assert first["error"] == "injected crash after canonical Todo commit"
+    assert first["effects"]["host_invoked"] is None
+    observation = first["journal_observation"]
+    assert observation["scope"] == "original_turn"
+    assert observation["recorded_effects"]["host_invoked"] is True
+    assert observation["recorded_effects"]["state_written"] is None
+    assert observation["recorded_effects"]["quota_spent"] is False
+    assert observation["recovery_decision"]["reinvoke_host"] is False
+    assert committed_results[0]["status"] == "done"
+    assert committed_results[0]["provider_status"] == "applied"
+    assert committed_results[0]["idempotent_replay"] is False
+    interrupted = _turn_journal(runtime)
+    assert interrupted["effect_attempts"]["durable_writeback"]["status"] == "prepared"
+    turn_key = str(interrupted["turn_key"])
+
+    resumed_output = io.StringIO()
+    with contextlib.redirect_stdout(resumed_output):
+        resumed_exit_code = cli_main(
+            [
+                *argv[:-1],
+                "--resume-turn-key",
+                turn_key,
+                "--execute",
+            ]
+        )
+    resumed = json.loads(resumed_output.getvalue())
+
+    assert resumed_exit_code == 0, json.dumps(resumed, indent=2)
+    assert resumed["status"] == "committed"
+    assert resumed["effects"]["host_invoked"] is False
+    # The exact canonical completion is read back after the lost response.
+    # Reissuing completion would carry a lease already retired by its commit.
+    assert len(committed_results) == 1
+    assert _turn_journal(runtime)["writeback"]["completion"] == {
+        "todo_id": "todo_fixture0001",
+        "continuation": "active_goal",
+    }
+    event_path = (
+        runtime
+        / "goals"
+        / "loopx-turn-fixture"
+        / "rollout-event-log.jsonl"
+    )
+    events = [
+        json.loads(line)
+        for line in event_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sum(
+        event.get("event_kind") == "todo_complete"
+        and event.get("run_id") == turn_key
+        for event in events
+    ) == 1
 
 
 def _completion_host_and_validation_scripts() -> tuple[str, str]:
@@ -1405,18 +3411,19 @@ def _turn_run_once_completion_argv(
         "json",
         "turn",
         "run-once",
+        "--host",
+        "generic-cli",
         "--goal-id",
         "loopx-turn-fixture",
         "--agent-id",
         "codex-fixture",
         "--project",
         str(project),
+        "--host-adapter-request-schema", "loopx_turn_host_request_v1",
         "--host-adapter-command-json",
         json.dumps([sys.executable, "-c", host_script]),
         "--validation-command-json",
         json.dumps([sys.executable, "-c", validation_script]),
-        "--scan-root",
-        str(project),
         "--no-global-sync",
         "--execute",
     ]
@@ -1434,7 +3441,7 @@ def test_turn_run_once_cli_repairs_committed_quota_spend_after_receipt_crash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, runtime, registry = _write_live_fixture(tmp_path)
-    host_project = tmp_path / "isolated-host-workspace"
+    host_project = project / "isolated-host-workspace"
     host_project.mkdir()
     host_script, validation_script = _completion_host_and_validation_scripts()
     argv = _turn_run_once_completion_argv(
@@ -1444,7 +3451,7 @@ def test_turn_run_once_cli_repairs_committed_quota_spend_after_receipt_crash(
         host_script,
         validation_script,
     )
-    append_rollout_event = turn_command.append_cli_rollout_event
+    append_rollout_event = turn_run_once_command.append_cli_rollout_event
 
     def crash_before_quota_receipt(
         payload: dict[str, object],
@@ -1455,7 +3462,7 @@ def test_turn_run_once_cli_repairs_committed_quota_spend_after_receipt_crash(
         return append_rollout_event(payload, **kwargs)
 
     monkeypatch.setattr(
-        turn_command,
+        turn_run_once_command,
         "append_cli_rollout_event",
         crash_before_quota_receipt,
     )
@@ -1488,7 +3495,7 @@ def test_turn_run_once_cli_repairs_committed_quota_spend_after_receipt_crash(
     assert quota_rows[0]["agent_id"] == "codex-fixture"
 
     monkeypatch.setattr(
-        turn_command,
+        turn_run_once_command,
         "append_cli_rollout_event",
         append_rollout_event,
     )
@@ -1541,7 +3548,7 @@ def test_turn_run_once_cli_projects_declared_successor_continuation(
             "task_class=advancement_task priority=P2 -->",
         ),
     )
-    host_project = tmp_path / "isolated-host-workspace"
+    host_project = project / "isolated-host-workspace"
     host_project.mkdir()
     host_script, validation_script = _completion_host_and_validation_scripts()
     output = io.StringIO()
@@ -1573,7 +3580,7 @@ def test_turn_run_once_cli_projects_durable_no_followup_continuation(
         tmp_path,
         todo_metadata_extra="no_followup=true",
     )
-    host_project = tmp_path / "isolated-host-workspace"
+    host_project = project / "isolated-host-workspace"
     host_project.mkdir()
     host_script, validation_script = _completion_host_and_validation_scripts()
     output = io.StringIO()
@@ -1598,19 +3605,24 @@ def test_turn_run_once_cli_projects_durable_no_followup_continuation(
 
 
 @pytest.mark.parametrize(
-    "durable_completion_turn_key",
+    "display_completion_turn_key",
     [None, "sha256:different-turn"],
     ids=["missing-turn-key", "different-turn-key"],
 )
-def test_turn_run_once_cli_terminal_recovery_rejects_unowned_completion(
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_turn_run_once_cli_terminal_recovery_ignores_stale_display_identity(
     tmp_path: Path,
-    durable_completion_turn_key: str | None,
+    display_completion_turn_key: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
 ) -> None:
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
     project, runtime, registry = _write_live_fixture(
         tmp_path,
         todo_metadata_extra="no_followup=true",
+        provider=provider,
     )
-    host_project = tmp_path / "isolated-host-workspace"
+    host_project = project / "isolated-host-workspace"
     host_project.mkdir()
     host_script, validation_script = _completion_host_and_validation_scripts()
     argv = _turn_run_once_completion_argv(
@@ -1639,8 +3651,8 @@ def test_turn_run_once_cli_terminal_recovery_rejects_unowned_completion(
     assert current_turn_field in state
     replacement = (
         ""
-        if durable_completion_turn_key is None
-        else f" completion_turn_key={durable_completion_turn_key}"
+        if display_completion_turn_key is None
+        else f" completion_turn_key={display_completion_turn_key}"
     )
     state_path.write_text(
         state.replace(current_turn_field, replacement),
@@ -1709,19 +3721,32 @@ def test_turn_run_once_cli_terminal_recovery_rejects_unowned_completion(
         )
     resumed = json.loads(resumed_output.getvalue())
 
-    assert resumed_exit_code == 1, resumed
-    assert resumed["settlement_result"]["failure"] == {
-        "kind": "effect_outcome_unknown",
-        "step_kind": "terminal_closeout",
-        "reason": "closeout readback failed",
+    assert resumed_exit_code == 0, resumed
+    assert resumed["status"] == "committed"
+    assert resumed["settlement_result"]["failure"] is None
+    assert not any(resumed["effects"].values())
+    assert resumed["todo_completion"] == {
+        "todo_id": "todo_fixture0001",
+        "continuation": "no_followup",
     }
     recovered_events = [
         json.loads(line)
         for line in event_path.read_text(encoding="utf-8").splitlines()
     ]
+    terminal_events = [
+        event
+        for event in recovered_events
+        if (
+            event.get("event_kind") == "todo_complete"
+            and event.get("run_id") == turn_key
+        )
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0]["status"] == "terminal_no_followup"
+    assert terminal_events[0]["details"]["command"] == "turn recovery probe"
     assert not any(
         event.get("event_kind") == "todo_complete"
-        and event.get("run_id") == turn_key
+        and event.get("run_id") != turn_key
         for event in recovered_events
     )
 
@@ -1733,7 +3758,7 @@ def test_turn_run_once_cli_fails_closed_on_dangling_declared_successor(
         tmp_path,
         todo_metadata_extra="successor_todo_ids=todo_missing999",
     )
-    host_project = tmp_path / "isolated-host-workspace"
+    host_project = project / "isolated-host-workspace"
     host_project.mkdir()
     host_script, validation_script = _completion_host_and_validation_scripts()
     output = io.StringIO()
@@ -1775,7 +3800,7 @@ def test_turn_run_once_cli_replays_declared_successor_after_interruption(
             "task_class=advancement_task priority=P2 -->",
         ),
     )
-    host_project = tmp_path / "isolated-host-workspace"
+    host_project = project / "isolated-host-workspace"
     host_project.mkdir()
     host_script, validation_script = _completion_host_and_validation_scripts()
     argv = _turn_run_once_completion_argv(
@@ -1837,6 +3862,8 @@ def test_turn_run_once_commits_independently_validated_progress(
         host="generic-cli",
         execution_mode="isolated-headless",
     )
+    from tests.control_plane.reward_memory_host_fixture import enable_plan_memory
+    enable_plan_memory(plan)
 
     def host_runner(request: dict[str, object]) -> dict[str, object]:
         return {
@@ -1851,6 +3878,57 @@ def test_turn_run_once_commits_independently_validated_progress(
             "delivery_outcome": "outcome_progress",
             "vision_unchanged_reason": "The fixture objective remains open.",
             "summary": "One intermediate fixture step passed validation.",
+            "reward_memory_reflection_json": json.dumps(
+                {
+                    "schema_version": "turn_reward_memory_reflection_v1",
+                    "status": "eligible",
+                    "surface_id": "agent_workflow.turn_admission",
+                    "outcome_kind": "engineering",
+                    "content_summary": "Reuse the verified fixture sequence.",
+                    "reasoning_summary": "The independent validator passed.",
+                    "confidence": "high",
+                    "evidence_refs": ["artifact:fixture-validation"],
+                    "experience": {
+                        "schema_version": "procedural_experience_contract_v0",
+                        "applicability": ["Repeating the validated fixture sequence"],
+                        "observed_outcome": (
+                            "The independent validator accepted the fixture sequence."
+                        ),
+                        "attribution": (
+                            "The result is bound to the exact fixture validation artifact."
+                        ),
+                        "future_behavior": {
+                            "trigger": "The same fixture sequence must be repeated.",
+                            "action": "Reuse the verified fixture sequence.",
+                            "validation": "Run the independent fixture validator.",
+                            "stop_condition": (
+                                "Stop reuse when the fixture revision or validator changes."
+                            ),
+                        },
+                        "limitations": [
+                            "The sequence applies only to the validated fixture revision."
+                        ],
+                        "evidence_refs": ["artifact:fixture-validation"],
+                    },
+                }
+            ),
+        }
+
+    observed_reflections: list[str] = []
+    observed_settlement_evidence: list[Mapping[str, Any]] = []
+
+    def post_settlement(
+        _plan: Mapping[str, Any],
+        result: Mapping[str, Any],
+        settlement_evidence: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        observed_reflections.append(str(result["reward_memory_reflection_json"]))
+        observed_settlement_evidence.append(settlement_evidence)
+        return {
+            "ok": True,
+            "schema_version": "turn_reward_memory_ingest_v0",
+            "status": "activated",
+            "source_event_id": "fixture-event",
         }
 
     execution = run_loopx_turn_once(
@@ -1861,11 +3939,19 @@ def test_turn_run_once_commits_independently_validated_progress(
         goal_id="fixture-goal",
         timeout_seconds=10,
         execute=True,
-        task_validator=lambda _plan, _result: {
+        task_validator=lambda _plan, result: {
             "status": "progress",
             "validator_kind": "fixture",
             "summary": "intermediate fixture progress is independently valid",
             "exit_code": 10,
+            "reward_memory_reflection_validation": {
+                "schema_version": "reward_memory_reflection_validation_v0",
+                "status": "validated",
+                "reflection_digest": reward_memory_reflection_digest(
+                    result["reward_memory_reflection_json"]
+                ),
+                "evidence_refs": ["artifact:fixture-validation"],
+            },
         },
         writeback=lambda _result: {"ok": True, "appended": True},
         spend=lambda: {"ok": True, "appended": True, "slots": 1},
@@ -1875,20 +3961,69 @@ def test_turn_run_once_commits_independently_validated_progress(
             "acknowledged": False,
             "apply_needed": False,
         },
+        post_settlement=post_settlement,
     )
 
     assert execution["status"] == "committed"
     assert execution["validation"]["status"] == "progress"
     assert execution["validation"]["exit_code"] == 10
     assert execution["quota_slot_spend_count"] == 1
+    assert execution["post_settlement"]["status"] == "activated"
+    assert len(observed_reflections) == 1
+    assert observed_settlement_evidence == [
+        {
+            "schema_version": "turn_post_settlement_evidence_v0",
+            "task_validation": execution["validation"],
+            "writeback": {"ok": True, "appended": True},
+            "quota_spend": {"ok": True, "appended": True, "slots": 1},
+            "previous_post_settlement": {},
+        }
+    ]
     assert loopx_turn_execution_committed(execution) is True
+
+    replay = run_loopx_turn_once(
+        plan,
+        host_runner=host_runner,
+        project=tmp_path,
+        runtime_root=tmp_path / "runtime",
+        goal_id="fixture-goal",
+        timeout_seconds=10,
+        execute=True,
+        task_validator=lambda _plan, result: {
+            "status": "progress",
+            "validator_kind": "fixture",
+            "summary": "intermediate fixture progress is independently valid",
+            "exit_code": 10,
+            "reward_memory_reflection_validation": {
+                "schema_version": "reward_memory_reflection_validation_v0",
+                "status": "validated",
+                "reflection_digest": reward_memory_reflection_digest(
+                    result["reward_memory_reflection_json"]
+                ),
+                "evidence_refs": ["artifact:fixture-validation"],
+            },
+        },
+        writeback=lambda _result: {"ok": True, "appended": True},
+        spend=lambda: {"ok": True, "appended": True, "slots": 1},
+        scheduler=lambda _spend: {
+            "disposition": "outer_controller_owned",
+            "completed": True,
+            "acknowledged": False,
+            "apply_needed": False,
+        },
+        post_settlement=post_settlement,
+    )
+    assert replay["replayed"] is True
+    assert replay["post_settlement"]["status"] == "activated"
+    assert len(observed_reflections) == 1
+    assert len(observed_settlement_evidence) == 1
 
 
 def test_turn_run_once_cli_rejects_unproven_host_claim_before_writeback(
     tmp_path: Path,
 ) -> None:
     project, runtime, registry = _write_live_fixture(tmp_path)
-    host_project = tmp_path / "isolated-host-workspace"
+    host_project = project / "isolated-host-workspace"
     host_project.mkdir()
     host_script = """
 import json
@@ -1936,20 +4071,21 @@ raise SystemExit(0 if pathlib.Path("claimed-artifact.txt").is_file() else 9)
                 "json",
                 "turn",
                 "run-once",
+                "--host",
+                "generic-cli",
                 "--goal-id",
                 "loopx-turn-fixture",
                 "--agent-id",
                 "codex-fixture",
                 "--project",
                 str(host_project),
+                "--host-adapter-request-schema", "loopx_turn_host_request_v1",
                 "--host-command-json",
                 json.dumps([sys.executable, "-c", host_script]),
                 "--validation-command-json",
                 json.dumps([sys.executable, "-c", validation_script]),
                 "--validation-failure-kind",
                 "replan_required",
-                "--scan-root",
-                str(project),
                 "--no-global-sync",
                 "--execute",
             ]
@@ -1972,16 +4108,18 @@ raise SystemExit(0 if pathlib.Path("claimed-artifact.txt").is_file() else 9)
 @pytest.mark.parametrize(
     "result_kind", ["validated_progress", "repair_required", "replan_required"]
 )
+@pytest.mark.parametrize("verified_source", [False, True])
 def test_turn_run_once_cli_uses_built_in_codex_host_and_typed_writeback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     result_kind: str,
+    verified_source: bool,
 ) -> None:
-    from loopx.cli_commands.turn import (
-        build_turn_envelope as real_build_turn_envelope,
+    from copy import deepcopy
+    from loopx.cli_commands.turn import compose_turn_decision as real_compose_turn_decision
+    from loopx.cli_commands.turn_run_once import (
         refresh_state_run as real_refresh_state_run,
         spend_quota_slot as real_spend_quota_slot,
-        update_goal_todo as real_update_goal_todo,
     )
 
     project, runtime, registry = _write_live_fixture(tmp_path)
@@ -2021,35 +4159,44 @@ def test_turn_run_once_cli_uses_built_in_codex_host_and_typed_writeback(
     )
     refresh_workspace_paths: list[Path | None] = []
     spend_workspace_paths: list[Path | None] = []
-    updated_todo_ids: list[str] = []
+    refresh_todo_ids: list[str] = []
 
-    def adaptive_turn_envelope(*args: object, **kwargs: object) -> dict[str, object]:
-        envelope = real_build_turn_envelope(*args, **kwargs)
-        envelope["action"]["selected_todo"] = {
+    def adaptive_turn_decision(source: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
+        # Build the stale-selection scenario before signing either projection.
+        # The adaptive primary, not the provisional selection, owns writeback.
+        decision = deepcopy(source)
+        # This pre-orchestration selection is not a verified completion source.
+        # Preserve the historical unverified-selection case; claiming verified
+        # text for a different Todo must still reject in captured_todo_text_sha256.
+        if not verified_source:
+            decision["interaction_contract"]["agent_channel"]["work_context"].pop(
+                "selected_todo_text_verified", None
+            )
+        decision["selected_todo"] = {
             "todo_id": "todo_stale_selection",
             "text": "A stale pre-orchestration selection",
         }
-        envelope["task_orchestration_contract"] = {
+        decision["task_orchestration_contract"] = {
             "schema_version": "task_orchestration_contract_v2",
             "mode": "adaptive",
             "primary_todo_id": "todo_fixture0001",
             "eligible_child_lanes": [],
         }
-        return envelope
+        return real_compose_turn_decision(decision, **kwargs)
 
     def recording_refresh_state_run(*args: object, **kwargs: object) -> dict[str, object]:
         refresh_workspace_paths.append(kwargs.get("delivery_workspace_path"))
+        refresh_todo_ids.append(str(kwargs.get("todo_id") or ""))
         return real_refresh_state_run(*args, **kwargs)
 
     def recording_spend_quota_slot(*args: object, **kwargs: object) -> dict[str, object]:
         spend_workspace_paths.append(kwargs.get("workspace_path"))
         return real_spend_quota_slot(*args, **kwargs)
 
-    def recording_update_goal_todo(*args: object, **kwargs: object) -> dict[str, object]:
-        updated_todo_ids.append(str(kwargs.get("todo_id") or ""))
-        return real_update_goal_todo(*args, **kwargs)
+    host_calls: list[str] = []
 
     def fake_codex_host(request: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        host_calls.append(str(request["turn_key"]))
         return {
             "schema_version": "loopx_turn_result_v0",
             "turn_key": request["turn_key"],
@@ -2064,22 +4211,21 @@ def test_turn_run_once_cli_uses_built_in_codex_host_and_typed_writeback(
             "summary": "One public fixture advanced.",
         }
 
-    monkeypatch.setattr("loopx.cli_commands.turn.run_codex_cli_host", fake_codex_host)
     monkeypatch.setattr(
-        "loopx.cli_commands.turn.build_turn_envelope",
-        adaptive_turn_envelope,
+        "loopx.cli_commands.turn_run_once.run_codex_cli_host",
+        fake_codex_host,
     )
     monkeypatch.setattr(
-        "loopx.cli_commands.turn.refresh_state_run",
+        "loopx.cli_commands.turn.compose_turn_decision",
+        adaptive_turn_decision,
+    )
+    monkeypatch.setattr(
+        "loopx.cli_commands.turn_run_once.refresh_state_run",
         recording_refresh_state_run,
     )
     monkeypatch.setattr(
-        "loopx.cli_commands.turn.spend_quota_slot",
+        "loopx.cli_commands.turn_run_once.spend_quota_slot",
         recording_spend_quota_slot,
-    )
-    monkeypatch.setattr(
-        "loopx.cli_commands.turn.update_goal_todo",
-        recording_update_goal_todo,
     )
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
@@ -2109,23 +4255,25 @@ def test_turn_run_once_cli_uses_built_in_codex_host_and_typed_writeback(
                         "import json, sys; json.load(sys.stdin)",
                     ]
                 ),
-                "--scan-root",
-                str(project),
                 "--no-global-sync",
                 "--execute",
             ]
         )
 
     payload = json.loads(output.getvalue())
+    if verified_source:
+        assert exit_code == 1, payload
+        assert "Turn task source does not match" in payload["error"]
+        assert not host_calls and not refresh_workspace_paths and not spend_workspace_paths
+        return
+    assert len(host_calls) == 1
     assert exit_code == 0, payload
     assert payload["host"] == {"executable": "built-in", "kind": "codex-cli"}
     assert payload["effects"]["state_written"] is True
     assert payload["effects"]["quota_spent"] is True
     assert refresh_workspace_paths == [project]
     assert spend_workspace_paths == [project]
-    assert updated_todo_ids == (
-        [] if result_kind == "validated_progress" else ["todo_fixture0001"]
-    )
+    assert refresh_todo_ids == ["todo_fixture0001"]
     state = (
         project
         / ".codex"
@@ -2133,9 +4281,245 @@ def test_turn_run_once_cli_uses_built_in_codex_host_and_typed_writeback(
         / "loopx-turn-fixture"
         / "ACTIVE_GOAL_STATE.md"
     ).read_text(encoding="utf-8")
-    assert "Run one revised public fixture check" in state
-    if result_kind != "validated_progress":
-        assert f"LoopX%20Turn%20{result_kind}" in state
+    journal_path = runtime / "goals" / "loopx-turn-fixture" / "turns" / (
+        payload["resume_turn_key"].removeprefix("sha256:") + ".json"
+    )
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["host_result"]["next_action"] == "Run one revised public fixture check"
+    assert journal["host_result"]["recommended_action"] != journal["host_result"]["next_action"]
+    assert "Run one revised public fixture check" not in state
+    assert journal["host_result"]["summary"] == "One public fixture advanced."
+    assert "One%20public%20fixture%20advanced" not in state
+
+
+@pytest.mark.parametrize("memory_path", ["callback", "owned", "owned_lost_reply", "ordinary_validator"])
+@pytest.mark.parametrize("host_kind", ["codex-cli", "dsh", "generic-cli"])
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_turn_run_once_host_wires_validated_reflection_post_settlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_kind: str,
+    provider: str,
+    memory_path: str,
+) -> None:
+    from tests.control_plane.canonical_authority_fixture import isolate_sqlite_runtime
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(tmp_path, provider=provider)
+    from tests.control_plane.reward_memory_host_fixture import enable_live_memory
+    enable_live_memory(registry, validated_ingest=memory_path != "callback")
+    reflection = json.dumps(
+        {
+            "schema_version": "turn_reward_memory_reflection_v1",
+            "status": "eligible",
+            "surface_id": "agent_workflow.turn_admission",
+            "outcome_kind": "engineering",
+            "content_summary": "Reuse the validated Codex CLI sequence.",
+            "reasoning_summary": "The independent validator passed.",
+            "confidence": "high",
+            "evidence_refs": ["receipt:codex-cli-validator"],
+            "experience": {
+                "schema_version": "procedural_experience_contract_v0",
+                "applicability": ["Running the validated Codex CLI sequence"],
+                "observed_outcome": (
+                    "The independent validator accepted the Codex CLI sequence."
+                ),
+                "attribution": "The outcome is bound to the exact validator receipt.",
+                "future_behavior": {
+                    "trigger": "The same Codex CLI sequence is considered again.",
+                    "action": "Reuse the validated Codex CLI sequence.",
+                    "validation": "Require the exact Codex CLI validator receipt.",
+                    "stop_condition": (
+                        "Stop reuse when the sequence or validator revision changes."
+                    ),
+                },
+                "limitations": [
+                    "The result applies only to the validated CLI sequence."
+                ],
+                "evidence_refs": ["receipt:codex-cli-validator"],
+            },
+        },
+        separators=(",", ":"),
+    )
+    validator = project / "validate_codex_cli_reflection.py"
+    validator.write_text(
+        "import hashlib, json, sys\n"
+        "result = json.load(sys.stdin)\n"
+        "reflection = json.loads(result['reward_memory_reflection_json'])\n"
+        "canonical = json.dumps(reflection, sort_keys=True, separators=(',', ':'))\n"
+        "json.dump({\n"
+        "  'schema_version': 'reward_memory_reflection_validation_v0',\n"
+        "  'status': 'validated',\n"
+        "  'reflection_digest': 'sha256:' + hashlib.sha256(canonical.encode()).hexdigest(),\n"
+        "  'evidence_refs': reflection['evidence_refs'],\n"
+        "}, sys.stdout)\n",
+        encoding="utf-8",
+    )
+
+    def fake_codex_host(
+        request: Mapping[str, Any],
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": "loopx_turn_result_v0",
+            "turn_key": request["turn_key"],
+            "result_kind": "validated_progress",
+            "completed_phases": ["host_execute", "typed_result"],
+            "classification": "codex_cli_reward_memory_progress",
+            "recommended_action": "Continue the public fixture",
+            "next_action": "Run the next bounded fixture Turn",
+            "delivery_batch_scale": "single_surface",
+            "delivery_outcome": "outcome_progress",
+            "vision_unchanged_reason": "The fixture objective remains open.",
+            "summary": "One Codex CLI fixture step passed validation.",
+            "work_evidence": ["artifact:fixture-host-result"],
+            "validation_evidence": ["check:fixture-independent-validator"],
+            "reward_memory_reflection_json": reflection,
+        }
+
+    from loopx.capabilities import reward_memory
+    from tests.capabilities.test_reward_memory_ingestion import FakeProvider
+    actual_ingest = reward_memory.run_configured_turn_outcome_ingest_fail_open
+    memory_provider = FakeProvider()
+    observed: list[dict[str, Any]] = []
+
+    def fake_ingest(**kwargs: object) -> dict[str, object]:
+        observed.append(dict(kwargs))
+        if memory_path != "callback":
+            receipt = actual_ingest(**kwargs, provider=memory_provider)
+            if memory_path == "owned_lost_reply" and len(observed) == 1:
+                # The memory owner committed, but its caller lost the response.
+                raise OSError("provider owner response lost before Turn receipt")
+            return receipt
+        return {
+            "ok": True,
+            "schema_version": "turn_reward_memory_ingest_v0",
+            "status": "activated",
+            "host_wiring": "codex_cli_turn_post_settlement",
+            "provider_sync_count": 1,
+            "exact_readback_verified": True,
+        }
+
+    monkeypatch.setattr(
+        "loopx.cli_commands.turn_run_once.run_codex_cli_host",
+        fake_codex_host,
+    )
+    monkeypatch.setattr(
+        (
+            "loopx.capabilities.reward_memory."
+            "run_configured_turn_outcome_ingest_fail_open"
+        ),
+        fake_ingest,
+    )
+    host_args = ["--host", host_kind]
+    if host_kind == "dsh":
+        runner = tmp_path / "reflection_runner.py"
+        candidate = fake_codex_host({"turn_key": "unused"})
+        runner.write_text(
+            "import json\n"
+            "def run_dsh_turn(**kwargs):\n"
+            f"    return {json.dumps(candidate)!r}\n",
+            encoding="utf-8",
+        )
+        host_args += ["--dsh-runner", str(runner), "--dsh-home", str(tmp_path / "dsh-home")]
+    elif host_kind == "generic-cli":
+        runner = tmp_path / "generic_reflection_runner.py"
+        candidate = fake_codex_host({"turn_key": "unused"})
+        runner.write_text(
+            "import json, sys\n"
+            "request = json.load(sys.stdin)\n"
+            f"result = json.loads({json.dumps(candidate)!r})\n"
+            "result['turn_key'] = request['turn_key']\n"
+            "json.dump(result, sys.stdout)\n",
+            encoding="utf-8",
+        )
+        host_args += ["--host-adapter-request-schema", "loopx_turn_host_request_v1",
+                      "--host-adapter-command-json", json.dumps([sys.executable, str(runner)])]
+    args = [
+        "--registry",
+        str(registry),
+        "--runtime-root",
+        str(runtime),
+        "--format",
+        "json",
+        "turn",
+        "run-once",
+        "--goal-id",
+        "loopx-turn-fixture",
+        "--agent-id",
+        "codex-fixture",
+        *host_args,
+        "--project",
+        str(project),
+        "--validation-command-json",
+        json.dumps([sys.executable, "-c", "pass"] if memory_path == "ordinary_validator" else [sys.executable, str(validator)]),
+        "--no-global-sync",
+        "--execute",
+    ]
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(args)
+
+    payload = json.loads(output.getvalue())
+    assert exit_code == 0, payload
+    receipt = payload["post_settlement"]["results"]["reward-memory.outcome-ingest"]
+    if memory_path == "owned_lost_reply":
+        assert receipt["status"] == "runtime_unavailable", receipt
+        assert receipt["external_writes_performed"] is None
+        assert memory_provider.sync_calls == memory_provider.retrieve_calls == 1
+    elif memory_path == "owned":
+        assert receipt["status"] == "activated", receipt
+        assert receipt["exact_readback_verified"] is True
+        assert memory_provider.sync_calls == 1
+        assert memory_provider.retrieve_calls == 1
+    elif memory_path == "ordinary_validator":
+        assert receipt["status"] == "evidence_validation_required", receipt
+        assert receipt["external_writes_performed"] is False
+        assert memory_provider.sync_calls == memory_provider.retrieve_calls == 0
+    else:
+        assert receipt == {
+        "ok": True,
+        "schema_version": "turn_reward_memory_ingest_v0",
+        "status": "activated",
+        "host_wiring": "codex_cli_turn_post_settlement",
+        "provider_sync_count": 1,
+        "exact_readback_verified": True,
+    }
+    assert len(observed) == 1
+    assert observed[0]["host_result"]["reward_memory_reflection_json"] == reflection
+    evidence = observed[0]["settlement_evidence"]
+    if memory_path != "ordinary_validator":
+        assert evidence["task_validation"]["reward_memory_reflection_validation"]["status"] == "validated"
+    else:
+        assert "reward_memory_reflection_validation" not in evidence["task_validation"]
+    assert evidence["writeback"]["appended"] is True
+    assert evidence["quota_spend"]["appended"] is True
+
+    # The terminal Turn remains immutable. Each resume can read the capability
+    # owner's durable receipt, without repeating provider IO or settlement.
+    journal_path = runtime / "goals" / "loopx-turn-fixture" / "turns" / (
+        payload["resume_turn_key"].removeprefix("sha256:") + ".json"
+    )
+    terminal_journal = journal_path.read_bytes()
+    for _ in range(2):
+        replay_output = io.StringIO()
+        with contextlib.redirect_stdout(replay_output):
+            replay_code = cli_main([*args, "--resume-turn-key", payload["resume_turn_key"]])
+        replay = json.loads(replay_output.getvalue())
+        assert replay_code == 0, replay
+        assert replay["replayed"] is True
+        assert not any(replay["effects"].values())
+        assert journal_path.read_bytes() == terminal_journal
+        assert replay["post_settlement"] == payload["post_settlement"]
+        if memory_path == "owned_lost_reply":
+            recovered = replay["post_settlement_recovery"]["results"]["reward-memory.outcome-ingest"]
+            assert recovered["status"] == "activated", recovered
+            assert recovered["deduplicated"] is True
+            assert recovered["sidecar_receipt_reused"] is True
+            assert recovered["external_writes_performed"] is False
+        else:
+            assert "post_settlement_recovery" not in replay
+        assert memory_provider.sync_calls == memory_provider.retrieve_calls == (0 if memory_path in {"callback", "ordinary_validator"} else 1)
+    assert len(observed) == (3 if memory_path == "owned_lost_reply" else 1)
 
 
 def test_turn_run_once_cli_resumes_session_from_recoverable_failed_turn(
@@ -2145,11 +4529,21 @@ def test_turn_run_once_cli_resumes_session_from_recoverable_failed_turn(
     project, runtime, registry = _write_live_fixture(tmp_path)
     session_available = False
     session_actions: list[str] = []
+    session_binding_calls = 0
+    session_sources: list[dict[str, object]] = []
 
     def fake_session_binding(
         _runtime_root: Path,
-        _turn_envelope: dict[str, object],
+        **_kwargs: object,
     ) -> dict[str, str] | None:
+        nonlocal session_binding_calls
+        session_binding_calls += 1
+        assert "turn_envelope" not in _kwargs
+        source = _kwargs.get("work_contract")
+        assert isinstance(source, dict)
+        assert source.get("schema_version") == "loopx_turn_envelope_v1"
+        assert source.get("goal_id") == "loopx-turn-fixture"
+        session_sources.append(source)
         if not session_available:
             return None
         return {
@@ -2181,11 +4575,15 @@ def test_turn_run_once_cli_resumes_session_from_recoverable_failed_turn(
         }
 
     monkeypatch.setattr(
-        "loopx.cli_commands.turn.codex_cli_session_binding",
+        "loopx.control_plane.turn_driver.codex_cli.codex_cli_session_binding",
         fake_session_binding,
     )
     monkeypatch.setattr(
-        "loopx.cli_commands.turn.run_codex_cli_host",
+        "loopx.cli_commands.turn_run_once.codex_cli_session_binding",
+        fake_session_binding,
+    )
+    monkeypatch.setattr(
+        "loopx.cli_commands.turn_run_once.run_codex_cli_host",
         fake_codex_host,
     )
     argv = [
@@ -2204,8 +4602,6 @@ def test_turn_run_once_cli_resumes_session_from_recoverable_failed_turn(
         "--host",
         "codex-cli",
         "--project",
-        str(project),
-        "--scan-root",
         str(project),
         "--no-global-sync",
         "--execute",
@@ -2235,3 +4631,334 @@ def test_turn_run_once_cli_resumes_session_from_recoverable_failed_turn(
     assert recovered["status"] == "stopped"
     assert recovered["quota_slot_spend_count"] == 0
     assert session_actions == ["start_new", "resume"]
+    # A journal resume resolves the saved Turn before consulting Codex session
+    # state.  Rebuilding a binding from the fresh decision can fail after the
+    # selected Todo has already completed and disappeared from the live route.
+    assert session_binding_calls == 2
+    assert session_sources[0] == session_sources[1]
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("refusal", ["invalid_json", "invalid_argv", "interval_wait"])
+def test_builtin_claim_preflight_refusal_preserves_lease_receipts_and_journal(
+    tmp_path, monkeypatch, provider, refusal,
+):
+    from tests.test_loopx_turn_codex_cli import _fake_codex
+    from loopx.rollout_event_log import rollout_event_log_path
+
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(
+        tmp_path, provider=provider, handoff_mode="hard_lease",
+        extra_agent_todo_lines=(
+            "- [ ] [P1] Advance the next independent fixture.",
+            "  <!-- loopx:todo todo_id=todo_fixture0002 status=open "
+            "task_class=advancement_task action_kind=fixture claimed_by=codex-fixture priority=P1 -->",
+        ),
+    )
+    binary, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("LOOPX_RELEASE_ROOT", str(Path(__file__).resolve().parents[1]))
+    route = ["--registry", str(registry), "--runtime-root", str(runtime), "--format", "json"]
+
+    def invoke(arguments):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cli_main([*route, *arguments])
+        return code, json.loads(output.getvalue())
+
+    command = ["turn", "run-once", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+               "--host", "codex-cli", "--project", str(project), "--codex-bin", str(binary),
+               "--codex-model", "fixture-model", "--codex-reasoning-effort", "high",
+               "--codex-sandbox", "read-only", "--no-global-sync", "--execute"]
+    validator = json.dumps([sys.executable, "-c", "import sys; sys.stdin.read()"])
+    if refusal == "interval_wait":
+        code, policy = invoke(["automation-cadence", "--goal-id", "loopx-turn-fixture",
+            "--agent-id", "codex-fixture", "--min-interval-minutes", "1440", "--expected-revision", "0",
+            "--owner-reference", "fixture-owner", "--execute"])
+        assert code == 0, policy
+        code, first = invoke([*command, "--todo-id", "todo_fixture0001", "--turn-instance-id", "first-start",
+                              "--validation-command-json", validator])
+        assert code == 0 and first["status"] == "committed", first
+        rejected_validator = validator
+    else:
+        rejected_validator = "{" if refusal == "invalid_json" else json.dumps([1])
+    lease_command = ["task-lease", "inspect", "--goal-id", "loopx-turn-fixture", "--todo-id", "todo_fixture0002"]
+    _, before_lease = invoke(lease_command)
+    assert before_lease["lease"] is None and before_lease["active"] is False
+    event_path = rollout_event_log_path(runtime, "loopx-turn-fixture")
+    before_events = event_path.read_bytes() if event_path.exists() else b""
+    before_host = log.read_bytes() if log.exists() else b""
+    journal_root = runtime / "goals" / "loopx-turn-fixture" / "turns"
+    before_journals = {p.name: p.read_bytes() for p in journal_root.glob("*.json")}
+    code, result = invoke([*command, "--todo-id", "todo_fixture0002", "--turn-instance-id", "refused-start",
+                          "--validation-command-json", rejected_validator])
+    assert code == 1, result
+    if refusal == "interval_wait":
+        assert result["status"] == "interval_wait", result
+        assert result["admission"]["next_eligible_at_ms"] > 0
+    assert all(value is False for value in result["effects"].values()), result
+    _, after_lease = invoke(lease_command)
+    assert after_lease["lease"] is None and after_lease["active"] is False
+    assert (event_path.read_bytes() if event_path.exists() else b"") == before_events
+    assert (log.read_bytes() if log.exists() else b"") == before_host
+    assert {p.name: p.read_bytes() for p in journal_root.glob("*.json")} == before_journals
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_claim_ack_loss_before_journal_resumes_the_original_cadence_reservation(
+    tmp_path, monkeypatch, provider,
+):
+    from tests.test_loopx_turn_codex_cli import _fake_codex
+    from loopx.control_plane.turn_driver import codex_execution_preparation
+    from loopx.rollout_event_log import rollout_event_log_path
+
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(tmp_path, provider=provider, handoff_mode="hard_lease")
+    binary, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("LOOPX_RELEASE_ROOT", str(Path(__file__).resolve().parents[1]))
+    route = ["--registry", str(registry), "--runtime-root", str(runtime), "--format", "json"]
+
+    def invoke(arguments):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cli_main([*route, *arguments])
+        return code, json.loads(output.getvalue())
+
+    code, policy = invoke(["automation-cadence", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+        "--min-interval-minutes", "1440", "--expected-revision", "0", "--owner-reference", "fixture-owner", "--execute"])
+    assert code == 0, policy
+    command = ["turn", "run-once", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+        "--host", "codex-cli", "--project", str(project), "--codex-bin", str(binary),
+        "--codex-model", "fixture-model", "--codex-reasoning-effort", "high", "--codex-sandbox", "read-only",
+        "--no-global-sync", "--execute", "--turn-instance-id", "interrupted-preparation",
+        "--validation-command-json", json.dumps([sys.executable, "-c", "import sys; sys.stdin.read()"])]
+    claim = codex_execution_preparation._run_json
+    claims = 0
+
+    def lose_claim_ack(*args, **kwargs):
+        nonlocal claims
+        claim(*args, **kwargs)
+        claims += 1
+        raise RuntimeError("injected lost acknowledgement after the ordinary claim")
+
+    monkeypatch.setattr(codex_execution_preparation, "_run_json", lose_claim_ack)
+    code, interrupted = invoke(command)
+    assert code == 1 and interrupted["error_code"] == "turn_execution_preparation_claim_failed", interrupted
+    assert interrupted["effects"] == {
+        "host_invoked": False, "state_written": None, "quota_spent": False, "scheduler_acknowledged": False,
+    }
+    assert not log.exists()
+    assert not list((runtime / "goals/loopx-turn-fixture/turns").glob("*.json"))
+    lease_command = ["task-lease", "inspect", "--goal-id", "loopx-turn-fixture", "--todo-id", "todo_fixture0001"]
+    _, lease = invoke(lease_command)
+    assert lease["active"] is True
+    monkeypatch.setattr(codex_execution_preparation, "_run_json", claim)
+    code, recovered = invoke(command)
+    assert code == 0 and recovered["status"] == "committed", recovered
+    assert claims == 1 and len(log.read_text().splitlines()) == 1
+    _, recovered_lease = invoke(lease_command)
+    assert recovered_lease["lease"] == lease["lease"]
+    rows = [json.loads(line) for line in rollout_event_log_path(runtime, "loopx-turn-fixture").read_text().splitlines()]
+    assert sum(row.get("classification") == "quota_slot_spent" for row in rows) == 1
+    # Fresh planning is not journal recovery. It may refuse the settled Turn,
+    # but cannot repeat its confirmed Host; resume uses the recorded key.
+    invoke(command)
+    assert len(log.read_text().splitlines()) == 1
+    resume_command = [item for index, item in enumerate(command)
+                      if item != "--turn-instance-id" and (index == 0 or command[index - 1] != "--turn-instance-id")]
+    code, replay = invoke([*resume_command, "--resume-turn-key", recovered["resume_turn_key"]])
+    assert code == 0 and replay["replayed"] is True, replay
+    assert all(value is False for value in replay["effects"].values()), replay
+    assert len(log.read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("guard_entry", ["loopx.entrypoint", "loopx.cli"])
+def test_concurrent_guard_cannot_reserve_the_other_todos_start(
+    tmp_path, monkeypatch, provider, guard_entry,
+):
+    import subprocess
+    import time
+    from tests.test_loopx_turn_codex_cli import _fake_codex
+    from loopx.cli_commands import turn_cadence
+
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(tmp_path, provider=provider, handoff_mode="hard_lease",
+        extra_agent_todo_lines=(
+            "- [ ] [P1] Complete the concurrent second fixture.",
+            "  <!-- loopx:todo todo_id=todo_fixture0002 status=open task_class=advancement_task "
+            "action_kind=fixture claimed_by=codex-fixture priority=P1 -->",
+        ))
+    binary, log = _fake_codex(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    monkeypatch.setenv("LOOPX_RELEASE_ROOT", str(Path(__file__).resolve().parents[1]))
+    prefix = ["--registry", str(registry), "--runtime-root", str(runtime), "--format", "json"]
+
+    def invoke(arguments):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cli_main([*prefix, *arguments])
+        return code, json.loads(output.getvalue())
+
+    code, policy = invoke(["automation-cadence", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+        "--min-interval-minutes", "1440", "--expected-revision", "0", "--owner-reference", "fixture-owner", "--execute"])
+    assert code == 0, policy
+    make = turn_cadence.managed_cadence_start
+    guard = None
+    guard_reply = None
+    ready = tmp_path / "guard-ready"
+
+    def with_competing_guard(**kwargs):
+        cadence = make(**kwargs)
+
+        def admit(identity):
+            nonlocal guard, guard_reply
+            admission = cadence.admit(identity)
+            if guard is None and admission.get("admitted") is True:
+                arguments = [*prefix, "quota", "should-run", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+                    "--todo-id", "todo_fixture0001", "--turn-instance-id", "competing-start", "--context-delivery", "off"]
+                script = (f"import json,sys;from pathlib import Path;from {guard_entry} import main;"
+                          "Path(sys.argv[1]).write_text('ready');raise SystemExit(main(json.loads(sys.argv[2])))")
+                guard = subprocess.Popen([sys.executable, "-c", script, str(ready), json.dumps(arguments)],
+                    cwd=project, env=os.environ.copy(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                deadline = time.monotonic() + 10
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert ready.exists(), "the competing CLI did not reach its entrypoint"
+                try:
+                    # The old unlocked ordering lets A commit here. The binding
+                    # lock holds A until B has reserved its matching identity.
+                    guard_reply = guard.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+            return admission
+
+        return turn_cadence.ManagedCadenceStart(admit, cadence.confirm)
+
+    monkeypatch.setattr(turn_cadence, "managed_cadence_start", with_competing_guard)
+    command = ["turn", "run-once", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture", "--host", "codex-cli",
+        "--project", str(project), "--codex-bin", str(binary), "--codex-model", "fixture-model", "--codex-reasoning-effort", "high",
+        "--codex-sandbox", "read-only", "--no-global-sync", "--execute", "--turn-instance-id", "competing-start",
+        "--validation-command-json", json.dumps([sys.executable, "-c", "import sys;sys.stdin.read()"])]
+    try:
+        code_b, result_b = invoke([*command, "--todo-id", "todo_fixture0002"])
+        assert guard is not None
+        if guard_reply is None:
+            guard_reply = guard.communicate(timeout=20)
+        if code_b == 0:
+            assert result_b["status"] == "committed", result_b
+            # Guard readback is not execution authority. A conflicting start
+            # must still refuse, including a guard's existing-receipt replay.
+            code_a, result_a = invoke([*command, "--todo-id", "todo_fixture0001"])
+            assert code_a == 1, result_a
+            unclaimed_todo = "todo_fixture0001"
+        else:
+            assert guard.returncode == 0, guard_reply
+            code_a, result_a = invoke([*command, "--todo-id", "todo_fixture0001"])
+            assert code_a == 0 and result_a["status"] == "committed", {
+                "loser": result_b, "winner_status": result_a.get("status"), "winner_admission": result_a.get("admission")}
+            unclaimed_todo = "todo_fixture0002"
+        _, unclaimed = invoke(["task-lease", "inspect", "--goal-id", "loopx-turn-fixture", "--todo-id", unclaimed_todo])
+        assert unclaimed["active"] is False and unclaimed["lease"] is None
+        assert len(log.read_text().splitlines()) == 1
+    finally:
+        if guard is not None and guard.poll() is None:
+            guard.kill()
+            guard.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_settled_turn_does_not_reclaim_a_released_todo(tmp_path, monkeypatch, provider):
+    from tests.test_loopx_turn_codex_cli import _fake_codex
+
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(tmp_path, provider=provider, handoff_mode="hard_lease")
+    binary, log = _fake_codex(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    monkeypatch.setenv("LOOPX_RELEASE_ROOT", str(Path(__file__).resolve().parents[1]))
+    prefix = ["--registry", str(registry), "--runtime-root", str(runtime), "--format", "json"]
+
+    def invoke(arguments):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cli_main([*prefix, *arguments])
+        return code, json.loads(output.getvalue())
+
+    command = ["turn", "run-once", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture", "--host", "codex-cli",
+        "--project", str(project), "--codex-bin", str(binary), "--codex-model", "fixture-model", "--codex-reasoning-effort", "high",
+        "--codex-sandbox", "read-only", "--no-global-sync", "--execute", "--turn-instance-id", "settled-preparation",
+        "--validation-command-json", json.dumps([sys.executable, "-c", "import sys;sys.stdin.read()"])]
+    code, first = invoke(command)
+    assert code == 0 and first["status"] == "committed", first
+    inspection = ["task-lease", "inspect", "--goal-id", "loopx-turn-fixture", "--todo-id", "todo_fixture0001"]
+    _, lease = invoke(inspection)
+    code, released = invoke(["task-lease", "release", "--goal-id", "loopx-turn-fixture", "--todo-id", "todo_fixture0001",
+        "--owner", "codex-fixture", "--idempotency-key", lease["lease"]["idempotency_key"],
+        "--expected-version", str(lease["lease"]["version"])])
+    assert code == 0, released
+    _, before = invoke(inspection)
+    code, refused = invoke(command)
+    assert code == 1 and "--resume-turn-instance-id" in refused["error"], refused
+    _, after = invoke(inspection)
+    assert after["active"] is False and after["lease"] == before["lease"]
+    assert len(log.read_text().splitlines()) == 1
+    resume = [item for index, item in enumerate(command)
+              if item != "--turn-instance-id" and (index == 0 or command[index - 1] != "--turn-instance-id")]
+    code, replay = invoke([*resume, "--resume-turn-key", first["resume_turn_key"]])
+    assert code == 0 and replay["replayed"] is True, replay
+    assert all(value is False for value in replay["effects"].values())
+    assert len(log.read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_claim_effect_remains_visible_when_codex_is_unavailable(tmp_path, monkeypatch, provider):
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(tmp_path, provider=provider, handoff_mode="hard_lease")
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setenv("LOOPX_RELEASE_ROOT", str(Path(__file__).resolve().parents[1]))
+    prefix = ["--registry", str(registry), "--runtime-root", str(runtime), "--format", "json"]
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = cli_main([*prefix, "turn", "run-once", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+            "--host", "codex-cli", "--project", str(project), "--codex-bin", str(tmp_path / "missing-codex"),
+            "--codex-model", "fixture-model", "--no-global-sync", "--execute", "--turn-instance-id", "missing-host",
+            "--validation-command-json", json.dumps([sys.executable, "-c", "import sys;sys.stdin.read()"])])
+    result = json.loads(output.getvalue())
+    assert code == 1 and result["effects"]["state_written"] is True, result
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = cli_main([*prefix, "task-lease", "inspect", "--goal-id", "loopx-turn-fixture", "--todo-id", "todo_fixture0001"])
+    assert code == 0 and json.loads(output.getvalue())["active"] is True
+    assert result["effects"]["quota_spent"] is False
+
+
+def test_uses_effect_bound_start_identity_requires_validator_for_generic_cli() -> None:
+    from loopx.cli_commands.turn_cadence import uses_effect_bound_start_identity
+    from loopx.control_plane.quota.turn_envelope import COMPLETE_TURN_HOST_REQUEST_SCHEMA
+
+    assert uses_effect_bound_start_identity("codex-cli", None) is True
+    assert uses_effect_bound_start_identity("generic-cli", COMPLETE_TURN_HOST_REQUEST_SCHEMA, None) is False
+    assert uses_effect_bound_start_identity("generic-cli", COMPLETE_TURN_HOST_REQUEST_SCHEMA, "") is False
+    assert uses_effect_bound_start_identity(
+        "generic-cli", COMPLETE_TURN_HOST_REQUEST_SCHEMA, '["python3", "-c", "pass"]',
+    ) is True

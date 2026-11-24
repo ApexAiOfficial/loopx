@@ -1,0 +1,1718 @@
+use super::*;
+
+#[cfg(unix)]
+fn installation_probe_fixture(body: &str) -> (tempfile::TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().expect("fixture directory");
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).expect("fixture bin");
+    let executable = bin.join("loopx");
+    fs::write(
+        &executable,
+        format!("#!/bin/sh\n[ \"$*\" = \"--format json doctor --installation-only\" ] || exit 2\n{body}\n"),
+    )
+    .expect("fixture executable");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    (root, executable)
+}
+
+#[test]
+#[cfg(unix)]
+fn installation_probe_allows_cold_qualification_beyond_version_budget() {
+    let expected = serde_json::json!({
+        "schema_version": "loopx_runtime_identity_v1",
+        "package_version": "1.4.1", "release_id": null, "source_revision": null,
+        "package_fingerprint": format!("sha256:{}", "a".repeat(64)),
+    });
+    let payload = serde_json::json!({
+        "ok": true, "scope": "installation_only", "service_runtime_identity": expected,
+    });
+    let (_root, executable) =
+        installation_probe_fixture(&format!("sleep 1.2\nprintf '%s\\n' '{payload}'"));
+    assert_eq!(
+        runtime_identity_for_executable(executable.to_str().unwrap()),
+        Some(expected),
+        "slow, fully qualified wheels must not be treated as missing runtimes"
+    );
+    let mut banner = Command::new("sh");
+    banner.args(["-c", "sleep 2; printf 'Python 3.12.0\\n'"]);
+    assert!(
+        timed_output(banner).is_none(),
+        "version probes keep their short bound"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn installation_probe_still_bounds_and_reaps_hung_qualification() {
+    let (root, executable) = installation_probe_fixture("echo $$ > \"$0.pid\"\nexec sleep 30");
+    let started = Instant::now();
+    assert!(runtime_identity_for_executable(executable.to_str().unwrap()).is_none());
+    assert!(
+        started.elapsed() < Duration::from_secs(13),
+        "qualification must remain bounded"
+    );
+    let pid = fs::read_to_string(root.path().join("bin/loopx.pid")).unwrap();
+    assert!(
+        !Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success(),
+        "timed out probe must be reaped"
+    );
+}
+
+#[test]
+fn status_readiness_is_explicit_and_fails_closed() {
+    assert_eq!(ServiceKind::Status.probe_path(), "/?readiness=1");
+    for (readiness, expected) in [
+        (
+            serde_json::json!({"schema_version":"loopx_status_readiness_v0","state":"ready","reason":"registry_readable"}),
+            Probe::Matching,
+        ),
+        (
+            serde_json::json!({"schema_version":"loopx_status_readiness_v0","state":"failed","reason":"registry_invalid"}),
+            Probe::NotReady,
+        ),
+        (
+            serde_json::json!({"schema_version":"loopx_status_readiness_v0","state":"failed","reason":"registry_unavailable"}),
+            Probe::NotReady,
+        ),
+        (
+            serde_json::json!({"schema_version":"loopx_status_readiness_v0","state":"ready","reason":"registry_invalid"}),
+            Probe::Foreign,
+        ),
+        (
+            serde_json::json!({"schema_version":"future","state":"ready","reason":"registry_readable"}),
+            Probe::Foreign,
+        ),
+        (serde_json::Value::Null, Probe::Foreign),
+    ] {
+        let body = serde_json::json!({"source":"serve-status","readiness":readiness});
+        let response = format!("HTTP/1.1 200 OK\r\n\r\n{body}");
+        assert_eq!(
+            classify_response(ServiceKind::Status, &response, None),
+            expected
+        );
+    }
+    assert_eq!(classify_response(
+        ServiceKind::Status,
+        "HTTP/1.1 200 OK\r\n\r\n{\"source\":\"serve-status\",\"readiness_url\":\"/?readiness=1\"}",
+        None,
+    ), Probe::Foreign);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn finder_runtime_path_includes_tools_without_loading_shell_profiles() {
+    // An nvm-activated test shell would prepend its own NVM_BIN to this
+    // fixture home's search path, so the fixed-position assertions below only
+    // hold for a process started without that activation.
+    if ambient_nvm_activation() {
+        return;
+    }
+    let path = runtime_search_path(
+        Some("/fixture/user".into()),
+        Some("/usr/bin:/bin:/usr/sbin:/sbin".into()),
+    );
+    let paths: Vec<_> = env::split_paths(&path).collect();
+    assert_eq!(paths[0], PathBuf::from("/fixture/user/.local/bin"));
+    assert!(
+        paths
+            .iter()
+            .position(|p| p == Path::new("/opt/homebrew/bin"))
+            .unwrap()
+            < paths
+                .iter()
+                .position(|p| p == Path::new("/usr/bin"))
+                .unwrap()
+    );
+    assert!(paths.contains(&PathBuf::from("/usr/local/bin")));
+    for prefix in ["/opt/homebrew", "/usr/local"] {
+        for version in ["24", "22"] {
+            assert!(paths.contains(&PathBuf::from(format!("{prefix}/opt/node@{version}/bin"))));
+        }
+    }
+    assert!(paths.contains(&PathBuf::from("/sbin")));
+    let again = runtime_search_path(Some("/fixture/user".into()), Some(path.clone()));
+    assert_eq!(again, path, "tool search must be idempotent");
+}
+
+#[cfg(unix)]
+fn nvm_fixture(root: &Path, default: &str) -> PathBuf {
+    let versions = root.join("versions/node");
+    for version in ["v24.22.1", "v22.14.0", "v20.18.0"] {
+        fs::create_dir_all(versions.join(version).join("bin")).expect("nvm version bin");
+    }
+    let alias = root.join("alias");
+    fs::create_dir_all(alias.join("lts")).expect("nvm alias directory");
+    fs::write(alias.join("default"), format!("{default}\n")).expect("default alias");
+    fs::write(alias.join("lts/*"), "lts/krypton\n").expect("lts alias");
+    fs::write(alias.join("lts/krypton"), "v24.22.1\n").expect("lts codename alias");
+    root.to_path_buf()
+}
+
+// A real Node stand-in so a resolution assertion doubles as a version
+// qualification: the search order decides which executable Core would probe.
+#[cfg(unix)]
+fn node_fixture(bin: &Path, version: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(bin).expect("node fixture bin");
+    let executable = bin.join("node");
+    fs::write(&executable, format!("#!/bin/sh\nprintf 'v{version}\\n'\n"))
+        .expect("node fixture executable");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).expect("node fixture mode");
+    executable
+}
+
+// An nvm-activated test shell would resolve this fixture home against the
+// developer's own NVM_DIR/NVM_BIN, so the fixed-position assertions below only
+// hold for a process started without that activation.
+#[cfg(unix)]
+fn ambient_nvm_activation() -> bool {
+    env::var_os("NVM_DIR").is_some() || env::var_os("NVM_BIN").is_some()
+}
+
+#[test]
+#[cfg(unix)]
+fn finder_runtime_path_finds_nvm_managed_node() {
+    let home = tempfile::tempdir().expect("home fixture");
+    let nvm_root = nvm_fixture(&home.path().join(".nvm"), "v24.22.1");
+    let path = runtime_search_path_from(
+        Some(home.path().to_path_buf().into()),
+        Some("/usr/bin:/bin:/usr/sbin:/sbin".into()),
+        Some(&nvm_root),
+        None,
+    );
+    let paths: Vec<_> = env::split_paths(&path).collect();
+    let default_bin = nvm_root.join("versions/node/v24.22.1/bin");
+    let position = |candidate: &Path| {
+        paths
+            .iter()
+            .position(|p| p == candidate)
+            .unwrap_or_else(|| panic!("{} missing from tool search", candidate.display()))
+    };
+    assert_eq!(paths[0], home.path().join(".local/bin"));
+    // A host whose only Node is nvm-managed must still be found from Finder.
+    assert!(paths.contains(&default_bin));
+    // Inferred nvm is the last resort: behind every candidate the host already
+    // provides, and behind the inherited PATH a terminal launch contributes.
+    // The Homebrew entries are only added on macOS, so they are asserted there.
+    let mut existing: Vec<&Path> = vec![Path::new("/usr/bin"), Path::new("/bin")];
+    #[cfg(target_os = "macos")]
+    existing.extend([
+        Path::new("/opt/homebrew/bin"),
+        Path::new("/usr/local/bin"),
+        Path::new("/opt/homebrew/opt/node@24/bin"),
+        Path::new("/usr/local/opt/node@24/bin"),
+        Path::new("/opt/homebrew/opt/node@22/bin"),
+        Path::new("/usr/local/opt/node@22/bin"),
+    ]);
+    for existing in existing {
+        assert!(
+            position(existing) < position(&default_bin),
+            "inferred nvm must stay behind the existing candidate {}",
+            existing.display()
+        );
+    }
+    assert!(
+        position(&nvm_root.join("versions/node/v22.14.0/bin")) > position(&default_bin),
+        "the recorded default alias leads the discovered versions"
+    );
+    assert!(
+        position(&nvm_root.join("versions/node/v20.18.0/bin"))
+            > position(&nvm_root.join("versions/node/v22.14.0/bin")),
+        "installed nvm versions are discovered newest-first"
+    );
+    let mut unique = paths.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        paths.len(),
+        "one tool search must not repeat a directory: {paths:?}"
+    );
+    assert_eq!(
+        paths.iter().filter(|p| *p == &default_bin).count(),
+        1,
+        "the recorded default alias is also an installed version and must appear once"
+    );
+    let again = runtime_search_path_from(
+        Some(home.path().to_path_buf().into()),
+        Some(path.clone()),
+        Some(&nvm_root),
+        None,
+    );
+    assert_eq!(again, path, "tool search must be idempotent");
+}
+
+// A recorded `default` alias that predates the supported floor must not hide a
+// newer installed version: with no other Node on the host, the qualified newer
+// version leads so Core's qualification succeeds instead of reporting the old
+// default as unsupported.
+#[test]
+#[cfg(unix)]
+fn old_default_alias_does_not_hide_a_newer_supported_version() {
+    let root = tempfile::tempdir().expect("nvm fixture");
+    let nvm_root = nvm_fixture(root.path(), "v20.18.0");
+    let v24 = nvm_root.join("versions/node/v24.22.1/bin");
+    let v22 = nvm_root.join("versions/node/v22.14.0/bin");
+    let v20 = nvm_root.join("versions/node/v20.18.0/bin");
+
+    let discovered = discovered_nvm_directories(&nvm_root, None);
+    assert_eq!(
+        discovered.first(),
+        Some(&v24),
+        "a supported newer version leads over an old recorded default"
+    );
+    let position = |directory: &Path| {
+        discovered
+            .iter()
+            .position(|candidate| candidate == directory)
+            .unwrap_or_else(|| panic!("{} missing", directory.display()))
+    };
+    assert!(position(&v24) < position(&v22));
+    assert!(
+        position(&v22) < position(&v20),
+        "the old default is not promoted"
+    );
+
+    // The full search path reflects the same lead: the qualified newer version
+    // precedes the old default, so resolving `node` cannot pick the old one.
+    let home = tempfile::tempdir().expect("home fixture");
+    let nvm_root = nvm_fixture(&home.path().join(".nvm"), "v20.18.0");
+    node_fixture(&nvm_root.join("versions/node/v24.22.1/bin"), "24.22.1");
+    node_fixture(&nvm_root.join("versions/node/v20.18.0/bin"), "20.18.0");
+    let path = runtime_search_path_from(
+        Some(home.path().to_path_buf().into()),
+        Some("/usr/bin:/bin".into()),
+        Some(&nvm_root),
+        None,
+    );
+    let paths: Vec<_> = env::split_paths(&path).collect();
+    let nvm_lead = paths
+        .iter()
+        .find(|candidate| candidate.starts_with(&nvm_root))
+        .expect("the nvm tree appears in the search");
+    assert_eq!(
+        nvm_lead,
+        &nvm_root.join("versions/node/v24.22.1/bin"),
+        "the first nvm entry is the qualified newer version, not the old default"
+    );
+}
+
+// A terminal activation is authoritative only while it still matches the Node
+// the inherited PATH selects. A shell that put another Node first after `nvm
+// use` leaves a stale `NVM_BIN` behind, and preferring it would replace a
+// working Node with an unsupported one.
+#[test]
+#[cfg(unix)]
+fn stale_nvm_bin_yields_to_the_node_the_shell_selected() {
+    let home = tempfile::tempdir().expect("home fixture");
+    let nvm_root = nvm_fixture(&home.path().join(".nvm"), "v24.22.1");
+    let stale = nvm_root.join("versions/node/v20.18.0/bin");
+    node_fixture(&stale, "20.18.0");
+    let selected = node_fixture(&home.path().join("selected/node/bin"), "24.22.1");
+    let selected_bin = selected.parent().expect("selected bin").to_path_buf();
+
+    // Still the selected Node: the activation keeps terminal-launch precedence.
+    let agreed = runtime_search_path_from(
+        Some(home.path().to_path_buf().into()),
+        Some(selected_bin.to_string_lossy().into_owned().into()),
+        Some(&nvm_root),
+        Some(selected_bin.as_os_str()),
+    );
+    let agreed_paths: Vec<_> = env::split_paths(&agreed).collect();
+    let position = |candidate: &Path| {
+        agreed_paths
+            .iter()
+            .position(|p| p == candidate)
+            .unwrap_or_else(|| panic!("{} missing from tool search", candidate.display()))
+    };
+    assert_eq!(
+        position(selected_bin.as_path()),
+        1,
+        "an activation that still matches the selected Node keeps its precedence"
+    );
+    assert_demoted_nvm_bin_is_last_resort(&nvm_root, &selected, agreed.as_os_str());
+
+    // No longer the selected Node: the stale directory becomes a last resort.
+    let stale_nvm_bin = stale.as_os_str();
+    let demoted = runtime_search_path_from(
+        Some(home.path().to_path_buf().into()),
+        Some(selected_bin.to_string_lossy().into_owned().into()),
+        Some(&nvm_root),
+        Some(stale_nvm_bin),
+    );
+    let demoted_paths: Vec<_> = env::split_paths(&demoted).collect();
+    let demoted_position = |candidate: &Path| {
+        demoted_paths
+            .iter()
+            .position(|p| p == candidate)
+            .unwrap_or_else(|| panic!("{} missing from tool search", candidate.display()))
+    };
+    assert!(
+        demoted_position(selected_bin.as_path()) < demoted_position(&stale),
+        "a stale NVM_BIN must not precede the Node the shell selected"
+    );
+    assert!(
+        demoted_position(&nvm_root.join("versions/node/v24.22.1/bin")) < demoted_position(&stale),
+        "a newer installed version outranks a demoted NVM_BIN"
+    );
+    assert_demoted_nvm_bin_is_last_resort(&nvm_root, &selected, demoted.as_os_str());
+
+    // A PATH that resolves no Node at all: `NVM_BIN` is not evidence the shell
+    // still selects that version, so it is demoted — yet still discovered, so
+    // an nvm-only host keeps working.
+    let no_node_on_path = home.path().join("empty-bin");
+    fs::create_dir_all(&no_node_on_path).expect("empty bin fixture");
+    let only_nvm = runtime_search_path_from(
+        Some(home.path().to_path_buf().into()),
+        Some(no_node_on_path.to_string_lossy().into_owned().into()),
+        Some(&nvm_root),
+        Some(stale_nvm_bin),
+    );
+    let only_nvm_paths: Vec<_> = env::split_paths(&only_nvm).collect();
+    assert!(
+        only_nvm_paths.contains(&stale),
+        "an activation with no competing Node stays in the search"
+    );
+    assert_ne!(
+        only_nvm_paths.first(),
+        Some(&stale),
+        "a stale NVM_BIN must not take the promoted activation position"
+    );
+    assert!(
+        only_nvm_paths
+            .iter()
+            .position(|directory| directory == &stale)
+            > only_nvm_paths
+                .iter()
+                .position(|directory| directory == &nvm_root.join("versions/node/v24.22.1/bin")),
+        "a stale NVM_BIN ranks behind a discovered qualified version"
+    );
+    let mut unique = only_nvm_paths.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        only_nvm_paths.len(),
+        "no duplicate directories"
+    );
+}
+
+// The reviewer's regression: a launch with a minimal PATH that resolves no
+// Node and a residual `NVM_BIN` pointing at an unsupported version. Promoting
+// the residual variable would place it ahead of the standard Homebrew entries
+// and break a host whose Homebrew Node qualified before.
+#[test]
+#[cfg(unix)]
+fn residual_nvm_bin_does_not_outrank_the_standard_host_node() {
+    let home = tempfile::tempdir().expect("home fixture");
+    let nvm_root = nvm_fixture(&home.path().join(".nvm"), "v24.22.1");
+    let stale = nvm_root.join("versions/node/v20.18.0/bin");
+    node_fixture(&stale, "20.18.0");
+    let qualified_node = node_fixture(&nvm_root.join("versions/node/v24.22.1/bin"), "24.22.1");
+    let empty_bin = home.path().join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin fixture");
+    let inherited: std::ffi::OsString = empty_bin.clone().into_os_string();
+    assert!(
+        resolve_executable_path("node", Some(inherited.as_os_str())).is_none(),
+        "the inherited PATH must resolve no Node for this scenario"
+    );
+
+    let search = runtime_search_path_from(
+        Some(home.path().to_path_buf().into()),
+        Some(inherited),
+        Some(&nvm_root),
+        Some(stale.as_os_str()),
+    );
+    let paths: Vec<_> = env::split_paths(&search).collect();
+    let position = |candidate: &Path| {
+        paths
+            .iter()
+            .position(|p| p == candidate)
+            .unwrap_or_else(|| panic!("{} missing from tool search", candidate.display()))
+    };
+    // The promoted activation position belongs to `~/.local/bin` only; the
+    // residual variable must rank behind every standard host entry.
+    assert_eq!(paths[0], home.path().join(".local/bin"));
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            position(Path::new("/opt/homebrew/bin")) < position(&stale),
+            "a residual NVM_BIN must not precede the standard Homebrew Node"
+        );
+        assert!(
+            position(Path::new("/usr/local/bin")) < position(&stale),
+            "a residual NVM_BIN must not precede /usr/local/bin"
+        );
+    }
+    assert!(
+        position(&nvm_root.join("versions/node/v24.22.1/bin")) < position(&stale),
+        "a residual NVM_BIN must rank behind a discovered qualified version"
+    );
+    assert!(
+        paths
+            .iter()
+            .filter(|directory| *directory == &stale)
+            .count()
+            == 1,
+        "the demoted NVM_BIN appears once: {paths:?}"
+    );
+
+    // Core qualifies the Node the search resolves first: the residual directory
+    // must not win while the host provides a Node, and when it does not the
+    // discovered qualified version must win. The oracle checks the host so it
+    // holds on a machine with a real Homebrew Node too.
+    assert_demoted_nvm_bin_is_last_resort(&nvm_root, &qualified_node, search.as_os_str());
+
+    // An nvm-only host with nothing else still finds the residual directory, so
+    // the demotion never makes nvm invisible.
+    let isolated_root = tempfile::tempdir().expect("isolated nvm fixture");
+    let isolated_nvm = isolated_root.path().join(".nvm");
+    let isolated = isolated_nvm.join("versions/node/v20.18.0/bin");
+    fs::create_dir_all(&isolated).expect("isolated nvm version bin");
+    fs::create_dir_all(isolated_nvm.join("alias")).expect("isolated alias directory");
+    fs::write(isolated_nvm.join("alias/default"), "v20.18.0\n").expect("isolated default");
+    node_fixture(&isolated, "20.18.0");
+    let isolated_search = runtime_search_path_from(
+        Some(home.path().to_path_buf().into()),
+        Some(empty_bin.clone().into_os_string()),
+        Some(&isolated_nvm),
+        Some(isolated.as_os_str()),
+    );
+    assert!(
+        env::split_paths(&isolated_search).any(|directory| directory == isolated),
+        "a residual NVM_BIN is still discovered when nothing else provides Node"
+    );
+    let isolated_node = isolated.join("node");
+    match env::split_paths(&isolated_search)
+        .find(|directory| !directory.starts_with(&isolated_nvm) && directory.join("node").is_file())
+    {
+        Some(directory) => assert_eq!(
+            resolve_executable_path("node", Some(isolated_search.as_os_str())),
+            Some(directory.join("node")),
+            "a residual NVM_BIN must yield to a Node the host provides"
+        ),
+        None => assert_eq!(
+            resolve_executable_path("node", Some(isolated_search.as_os_str())),
+            Some(isolated_node),
+            "an nvm-only host resolves its only Node"
+        ),
+    }
+}
+
+// An inferred nvm candidate may only be selected when no other candidate
+// exists on the host. That rule must hold on any machine, with or without a
+// Homebrew Node, so the oracle checks the host instead of assuming one.
+#[cfg(unix)]
+fn assert_inferred_nvm_never_displaces_existing(
+    nvm_root: &Path,
+    stale_default_bin: &Path,
+    search: &std::ffi::OsStr,
+) {
+    let resolved =
+        resolve_executable_path("node", Some(search)).expect("the search must resolve a Node");
+    let host_has_other_node = env::split_paths(search)
+        .any(|directory| !directory.starts_with(nvm_root) && directory.join("node").is_file());
+    if host_has_other_node {
+        assert_ne!(
+            resolved,
+            stale_default_bin.join("node"),
+            "an inferred stale nvm default must not displace a candidate the host already provides"
+        );
+        assert!(
+            !resolved.starts_with(nvm_root),
+            "resolution must come from an existing candidate, not the inferred default: {}",
+            resolved.display()
+        );
+    } else {
+        assert_eq!(
+            resolved,
+            stale_default_bin.join("node"),
+            "nvm-managed Node stays discoverable when nothing else provides one"
+        );
+    }
+}
+
+// A demoted `NVM_BIN` may only be selected when nothing else can be: a Node
+// the host provides, or a newer nvm install, must win first. The oracle reads
+// the host instead of assuming which candidate that is, so it holds on a
+// machine with a real Homebrew Node as well as on a bare one. `fallback` is the
+// executable the search must resolve to when the host provides no Node.
+#[cfg(unix)]
+fn assert_demoted_nvm_bin_is_last_resort(
+    nvm_root: &Path,
+    fallback: &Path,
+    search: &std::ffi::OsStr,
+) {
+    let resolved =
+        resolve_executable_path("node", Some(search)).expect("the search must resolve a Node");
+    let host_candidate = env::split_paths(search)
+        .find(|directory| !directory.starts_with(nvm_root) && directory.join("node").is_file());
+    match host_candidate {
+        Some(directory) => assert_eq!(
+            resolved,
+            directory.join("node"),
+            "a demoted NVM_BIN must yield to the Node the host provides"
+        ),
+        None => assert_eq!(
+            resolved, fallback,
+            "a demoted NVM_BIN may only be selected when nothing else can be"
+        ),
+    }
+}
+
+// The reviewer's regression: a Finder launch with no NVM_BIN, an nvm `default`
+// that predates the supported minimum, and a Node the host already provides.
+// The inferred default must be discovered, never preferred.
+#[test]
+#[cfg(unix)]
+fn inferred_nvm_default_cannot_shadow_an_existing_qualified_node() {
+    let home = tempfile::tempdir().expect("home fixture");
+    let nvm_root = nvm_fixture(&home.path().join(".nvm"), "v20.18.0");
+    let stale_default = nvm_root.join("versions/node/v20.18.0/bin");
+    node_fixture(&stale_default, "20.18.0");
+    // A supported Node the host already provides, the way Homebrew or an
+    // inherited terminal PATH would.
+    let qualified = node_fixture(&home.path().join("qualified/node/bin"), "24.22.1");
+    let qualified_bin = qualified.parent().expect("qualified bin").to_path_buf();
+    let with_candidate = runtime_search_path_from(
+        Some(home.path().to_path_buf().into()),
+        Some(qualified_bin.to_string_lossy().into_owned().into()),
+        Some(&nvm_root),
+        None,
+    );
+    assert_inferred_nvm_never_displaces_existing(
+        &nvm_root,
+        &stale_default,
+        with_candidate.as_os_str(),
+    );
+
+    // The ordering guarantee behind that resolution: every non-nvm candidate,
+    // including the Homebrew entries this App adds, precedes the inferred one.
+    let paths: Vec<_> = env::split_paths(&with_candidate).collect();
+    let position = |candidate: &Path| {
+        paths
+            .iter()
+            .position(|p| p == candidate)
+            .unwrap_or_else(|| panic!("{} missing from tool search", candidate.display()))
+    };
+    // The Homebrew entries only exist on macOS, so they are asserted there.
+    let local_bin = home.path().join(".local/bin");
+    let mut existing: Vec<&Path> = vec![local_bin.as_path(), qualified_bin.as_path()];
+    #[cfg(target_os = "macos")]
+    existing.extend([
+        Path::new("/opt/homebrew/bin"),
+        Path::new("/usr/local/bin"),
+        Path::new("/opt/homebrew/opt/node@24/bin"),
+        Path::new("/usr/local/opt/node@24/bin"),
+        Path::new("/opt/homebrew/opt/node@22/bin"),
+        Path::new("/usr/local/opt/node@22/bin"),
+    ]);
+    for existing in existing {
+        assert!(
+            position(existing) < position(&stale_default),
+            "inferred nvm must stay behind the existing candidate {}",
+            existing.display()
+        );
+    }
+
+    // Without any other Node on the host, the same stale default is still the
+    // only candidate, so nvm remains discoverable rather than invisible.
+    let isolated = runtime_search_path_from(
+        Some(home.path().to_path_buf().into()),
+        Some("/usr/bin:/bin".into()),
+        Some(&nvm_root),
+        None,
+    );
+    assert!(env::split_paths(&isolated).any(|directory| directory == stale_default));
+    assert_inferred_nvm_never_displaces_existing(&nvm_root, &stale_default, isolated.as_os_str());
+}
+
+#[test]
+#[cfg(unix)]
+fn nvm_alias_chain_resolves_versions_and_rejects_escapes() {
+    let root = tempfile::tempdir().expect("nvm fixture");
+    let nvm_root = nvm_fixture(root.path(), "lts/*");
+    assert_eq!(
+        resolve_nvm_alias(&nvm_root, "default", 0).as_deref(),
+        Some("v24.22.1"),
+        "the default alias chain resolves to the recorded version"
+    );
+    assert_eq!(
+        resolve_nvm_alias(&nvm_root, "22.14.0", 0).as_deref(),
+        Some("v22.14.0"),
+        "a version without the v prefix still names nvm's directory"
+    );
+    for alias in ["", "missing", "../outside", "/etc/passwd", "lts/../default"] {
+        assert_eq!(
+            resolve_nvm_alias(&nvm_root, alias, 0),
+            None,
+            "alias {alias:?} must not resolve"
+        );
+    }
+    fs::write(nvm_root.join("alias/cycle"), "cycle").expect("cyclic alias");
+    assert_eq!(resolve_nvm_alias(&nvm_root, "cycle", 0), None);
+    assert!(installed_nvm_versions(&nvm_root)
+        .iter()
+        .zip(["v24.22.1", "v22.14.0", "v20.18.0"])
+        .all(|(found, expected)| found == expected));
+    assert_eq!(nvm_version("v24.22.1"), Some((24, 22, 1)));
+    assert_eq!(nvm_version("not-a-version"), None);
+    assert_eq!(nvm_version("v24.22"), None);
+}
+
+#[test]
+#[cfg(unix)]
+fn nvm_root_follows_configured_directory_and_conventional_home() {
+    match env::var_os("NVM_DIR").filter(|value| !value.is_empty()) {
+        Some(configured) => assert_eq!(nvm_root(None), Some(PathBuf::from(configured))),
+        None => assert_eq!(
+            nvm_root(Some(std::ffi::OsStr::new("/fixture/user"))),
+            Some(PathBuf::from("/fixture/user/.nvm")),
+            "an unset NVM_DIR keeps the conventional location"
+        ),
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_listener_fixture(
+    executable: &Path,
+    command: &str,
+    payload: &str,
+) -> (std::process::Child, u16) {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Keep the OS reservation through exec; releasing a port number before
+    // Python binds it lets unrelated concurrent tests steal the fixture port.
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve loopback listener");
+    let port = listener
+        .local_addr()
+        .expect("reserved loopback address")
+        .port();
+    let source = format!(
+        r#"#!/usr/bin/env python3
+import socket
+import time
+
+payload = {payload:?}.encode("utf-8")
+server = socket.socket(fileno=0)
+server.listen(8)
+while True:
+    connection, _ = server.accept()
+    connection.recv(65536)
+    if not payload:
+        time.sleep(60)
+        continue
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        + f"Content-Length: {{len(payload)}}\r\n".encode("ascii")
+        + b"Connection: close\r\n\r\n"
+        + payload
+    )
+    connection.sendall(response)
+    connection.close()
+"#
+    );
+    fs::write(executable, source).expect("write listener fixture");
+    let mut permissions = fs::metadata(executable)
+        .expect("listener fixture metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(executable, permissions).expect("make listener fixture executable");
+    let child = Command::new(executable)
+        .args([command, "--host", "127.0.0.1", "--port", &port.to_string()])
+        .stdin(Stdio::from(OwnedFd::from(listener)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn listener fixture");
+    (child, port)
+}
+
+#[cfg(not(windows))]
+fn wait_for_probe(
+    kind: ServiceKind,
+    port: u16,
+    expected_runtime_identity: Option<&serde_json::Value>,
+    expected_probe: Probe,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if probe_on_port(kind, port, expected_runtime_identity) == expected_probe {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("fixture on port {port} did not reach {expected_probe:?}");
+}
+
+#[test]
+fn stale_listener_process_must_match_loopx_command_and_port() {
+    let executable = "/fixture/bin/loopx";
+    assert!(is_expected_loopx_listener_command(
+        ServiceKind::Status,
+        executable,
+        8766,
+        "/usr/bin/python3 /fixture/bin/loopx serve-status --global-registry --host 127.0.0.1 --port 8766",
+    ));
+    assert!(is_expected_loopx_listener_command(
+        ServiceKind::Chat,
+        executable,
+        8767,
+        "/usr/bin/python3 -m loopx.cli chat --global-registry --host 127.0.0.1 --port=8767 --no-open",
+    ));
+    assert!(is_expected_loopx_listener_command(
+        ServiceKind::Status,
+        executable,
+        8766,
+        r#"/opt/loopx/bin/python -c import os\012import runpy\012release_root = os.environ["LOOPX_RELEASE_ROOT"]\012runpy.run_module("loopx.cli", run_name="__main__")\012 --registry /tmp/registry.json serve-status --global-registry --host 127.0.0.1 --port 8766 --limit 80"#,
+    ));
+    assert!(is_expected_loopx_listener_command(
+        ServiceKind::Status,
+        executable,
+        8766,
+        r#"/opt/loopx/bin/python -c import os\012import runpy\012release_root = os.environ["LOOPX_RELEASE_ROOT"]\012sys.argv[0] = os.path.join(release_root, "scripts", "loopx")\012module = (\012    "loopx.entrypoint"\012    if os.path.isfile(os.path.join(release_root, "loopx", "entrypoint.py"))\012    else "loopx.cli"\012)\012runpy.run_module(module, run_name="__main__")\012 --registry /tmp/registry.json serve-status --global-registry --host 127.0.0.1 --port 8766 --limit 80"#,
+    ));
+    assert!(is_expected_loopx_listener_command(
+        ServiceKind::Chat,
+        executable,
+        8767,
+        r#"/opt/loopx/bin/python -c LOOPX_MANAGED_RELEASE_LAUNCHER_V1 = True\012release_root = os.environ["LOOPX_RELEASE_ROOT"]\012runpy.run_module(next_module, run_name="__main__")\012 --registry /tmp/registry.json chat --global-registry --host 127.0.0.1 --port 8767 --no-open"#,
+    ));
+    assert!(!is_expected_loopx_listener_command(
+        ServiceKind::Status,
+        executable,
+        8766,
+        "/tmp/not-loopx serve-status --port 8766",
+    ));
+    assert!(!is_expected_loopx_listener_command(
+        ServiceKind::Status,
+        executable,
+        8766,
+        "/tmp/not-loopx --config /fixture/bin/loopx serve-status --port 8766",
+    ));
+    assert!(!is_expected_loopx_listener_command(
+        ServiceKind::Status,
+        executable,
+        8766,
+        "/bin/sh -m loopx.cli serve-status --port 8766",
+    ));
+    assert!(!is_expected_loopx_listener_command(
+        ServiceKind::Status,
+        executable,
+        8766,
+        "/usr/bin/python3 /fixture/bin/loopx chat --port 8766",
+    ));
+    assert!(!is_expected_loopx_listener_command(
+        ServiceKind::Status,
+        executable,
+        8766,
+        "/usr/bin/python3 /fixture/bin/loopx serve-status --port 8767",
+    ));
+    assert!(!is_expected_loopx_listener_command(
+        ServiceKind::Status,
+        executable,
+        8766,
+        r#"/opt/loopx/bin/python -c runpy.run_module("other.cli", run_name="__main__") serve-status --port 8766"#,
+    ));
+    assert!(!is_expected_loopx_listener_command(
+        ServiceKind::Status,
+        executable,
+        8766,
+        r#"/opt/loopx/bin/python -c release_root = os.environ["LOOPX_RELEASE_ROOT"]\012print("loopx.entrypoint")\012runpy.run_module(module, run_name="__main__") serve-status --port 8766"#,
+    ));
+}
+
+#[test]
+fn release_launchers_publish_the_stable_process_fingerprint() {
+    let posix_launcher = include_str!("../../../../../scripts/loopx");
+    let portable_entry = include_str!("../../../../../scripts/loopx_entry.py");
+
+    assert!(posix_launcher.contains(MANAGED_RELEASE_LAUNCHER_MARKER));
+    assert!(portable_entry.contains(MANAGED_RELEASE_LAUNCHER_MARKER));
+}
+
+#[test]
+fn platform_managed_services_have_stable_launchd_labels() {
+    assert_eq!(
+        platform_managed_service_label(ServiceKind::Status),
+        "com.loopx.status"
+    );
+    assert_eq!(
+        platform_managed_service_label(ServiceKind::Chat),
+        "com.loopx.chat"
+    );
+}
+
+#[test]
+fn stale_listener_verification_rejects_the_entire_pid_set_on_mismatch() {
+    let executable = "/fixture/bin/loopx";
+    let confirmed = ListenerProcess {
+        pid: 11,
+        command_line: format!("{executable} serve-status --port 8766"),
+    };
+    assert_eq!(
+        verified_loopx_listener_pids(ServiceKind::Status, executable, 8766, &[confirmed])
+            .expect("confirmed LoopX listener"),
+        vec![11]
+    );
+
+    let mixed = [
+        ListenerProcess {
+            pid: 11,
+            command_line: format!("{executable} serve-status --port 8766"),
+        },
+        ListenerProcess {
+            pid: 12,
+            command_line: "foreign-server --port 8766".to_string(),
+        },
+    ];
+    let error = verified_loopx_listener_pids(ServiceKind::Status, executable, 8766, &mixed)
+        .expect_err("mixed ownership must fail closed");
+    assert!(error.to_string().contains("refusing to stop"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn service_supervisor_reuses_matching_replaces_stale_and_rejects_foreign() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock must follow the Unix epoch")
+        .as_nanos();
+    let fixture_root = env::temp_dir().join(format!(
+        "loopx-service-supervisor-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&fixture_root).expect("create service supervisor fixture");
+    let current_identity = serde_json::json!({
+        "schema_version": "loopx_runtime_identity_v1",
+        "package_version": "0.5.1",
+        "release_id": "current-release",
+        "source_revision": "current-revision",
+    });
+
+    let matching_executable = fixture_root.join("matching-loopx");
+    let matching_payload = serde_json::json!({
+        "source": "serve-status",
+        "runtime_identity": current_identity,
+    })
+    .to_string();
+    let (mut matching, matching_port) =
+        spawn_listener_fixture(&matching_executable, "serve-status", &matching_payload);
+    wait_for_probe(
+        ServiceKind::Status,
+        matching_port,
+        Some(&current_identity),
+        Probe::Matching,
+    );
+    assert!(matching
+        .try_wait()
+        .expect("matching fixture status")
+        .is_none());
+    matching.kill().expect("stop matching fixture");
+    matching.wait().expect("reap matching fixture");
+
+    let stale_executable = fixture_root.join("loopx");
+    let stale_payload = serde_json::json!({
+        "source": "serve-status",
+        "runtime_identity": {
+            "schema_version": "loopx_runtime_identity_v1",
+            "package_version": "0.5.0",
+            "release_id": "stale-release",
+            "source_revision": "stale-revision",
+        },
+    })
+    .to_string();
+    let (mut stale, stale_port) =
+        spawn_listener_fixture(&stale_executable, "serve-status", &stale_payload);
+    wait_for_probe(
+        ServiceKind::Status,
+        stale_port,
+        Some(&current_identity),
+        Probe::Stale,
+    );
+    let stale_processes = listener_processes(stale_port).expect("inspect stale listener fixture");
+    assert!(
+        stale_processes
+            .iter()
+            .all(|process| is_expected_loopx_listener_command(
+                ServiceKind::Status,
+                stale_executable.to_string_lossy().as_ref(),
+                stale_port,
+                &process.command_line,
+            )),
+        "fixture process must classify as LoopX: {stale_processes:?}"
+    );
+    terminate_verified_listener(
+        ServiceKind::Status,
+        stale_executable.to_string_lossy().as_ref(),
+        stale_port,
+    )
+    .expect("replace confirmed stale LoopX listener");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && stale.try_wait().expect("stale fixture status").is_none() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(stale
+        .try_wait()
+        .expect("stale fixture final status")
+        .is_some());
+
+    let foreign_executable = fixture_root.join("foreign-server");
+    let (mut foreign, foreign_port) =
+        spawn_listener_fixture(&foreign_executable, "serve-status", r#"{"source":"other"}"#);
+    wait_for_probe(
+        ServiceKind::Status,
+        foreign_port,
+        Some(&current_identity),
+        Probe::Foreign,
+    );
+    let error = terminate_verified_listener(
+        ServiceKind::Status,
+        stale_executable.to_string_lossy().as_ref(),
+        foreign_port,
+    )
+    .expect_err("foreign listener must be rejected");
+    assert!(error.to_string().contains("refusing to stop"));
+    assert!(foreign
+        .try_wait()
+        .expect("foreign fixture status")
+        .is_none());
+    foreign.kill().expect("stop foreign fixture");
+    foreign.wait().expect("reap foreign fixture");
+
+    // A silent listener must be distinct from a foreign HTTP response. Only
+    // the expected LoopX process may be terminated after the startup grace.
+    for confirmed in [true, false] {
+        let executable = fixture_root.join(if confirmed { "loopx" } else { "silent-foreign" });
+        let (mut silent, port) = spawn_listener_fixture(&executable, "chat", "");
+        wait_for_probe(
+            ServiceKind::Chat,
+            port,
+            Some(&current_identity),
+            Probe::Unresponsive,
+        );
+        let result = terminate_verified_listener(
+            ServiceKind::Chat,
+            stale_executable.to_string_lossy().as_ref(),
+            port,
+        );
+        if confirmed && !cfg!(target_os = "macos") {
+            result.expect("replace a confirmed but unresponsive LoopX service");
+        } else {
+            // On macOS even a matching Chat command needs Core's original
+            // manager and accepted-work proof. A fixture socket grants none.
+            assert!(result.is_err());
+            assert!(silent
+                .try_wait()
+                .expect("foreign listener status")
+                .is_none());
+            silent.kill().expect("clean up foreign fixture");
+        }
+        silent.wait().expect("reap silent fixture");
+    }
+
+    fs::remove_dir_all(&fixture_root).expect("remove service supervisor fixture");
+}
+
+#[test]
+fn pending_service_label_names_one_service_and_the_concurrent_set() {
+    // A single pending service keeps its own name so a stalled connection is
+    // still diagnosable; a set that is connecting together has no single name.
+    assert_eq!(ServiceKind::pending_label(&[ServiceKind::Status]), "status");
+    assert_eq!(ServiceKind::pending_label(&[ServiceKind::Chat]), "chat");
+    assert_eq!(ServiceKind::pending_label(&SERVICE_KINDS), "local");
+    assert_eq!(ServiceKind::pending_label(&[]), "local");
+}
+
+#[test]
+fn chat_activation_receipts_preserve_busy_unknown_and_exit_status() {
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+    let output = |payload: serde_json::Value, succeeded| {
+        Some(std::process::Output {
+            status: std::process::ExitStatus::from_raw(if succeeded { 0 } else { 256 }),
+            stdout: serde_json::to_vec(&payload).unwrap(),
+            stderr: Vec::new(),
+        })
+    };
+    let good = serde_json::json!({"schema_version":"loopx_runtime_service_activation_v1",
+        "service":"chat","ok":true,"status":"restart_requested","readiness_verified":false});
+    assert!(managed_chat_activation_result(output(good.clone(), true)).is_ok());
+    assert!(managed_chat_activation_result(output(good.clone(), false)).is_err());
+    for (reason, expected) in [
+        ("chat_work_pending", "chat_work_pending"),
+        ("chat_state_unverified", "chat_state_unverified"),
+        ("private diagnostic", "chat_state_unverified"),
+    ] {
+        let receipt = serde_json::json!({"schema_version":"loopx_runtime_service_activation_v1",
+            "service":"chat","ok":false,"status":"deferred","reason":reason});
+        assert_eq!(
+            managed_chat_activation_result(output(receipt, false))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+    for (key, value) in [
+        ("schema_version", "unknown"),
+        ("service", "status"),
+        ("status", "unknown"),
+    ] {
+        let mut receipt = good.clone();
+        receipt[key] = value.into();
+        assert_eq!(
+            managed_chat_activation_result(output(receipt, true))
+                .unwrap_err()
+                .to_string(),
+            "chat_service_unverified"
+        );
+    }
+    assert!(managed_chat_activation_result(None).is_err());
+}
+
+#[test]
+fn chat_readiness_retains_identity_and_state_checks() {
+    let identity = serde_json::json!({"source_revision":"current"});
+    let ready = serde_json::json!({"ok":true,"schema_version":"loopx_chat_readiness_v1",
+        "state":"ready","runtime_identity":identity});
+    let response = |body: &serde_json::Value| format!("HTTP/1.1 200 OK\r\n\r\n{body}");
+    assert_eq!(
+        classify_response(ServiceKind::Chat, &response(&ready), Some(&identity)),
+        Probe::Matching
+    );
+    assert_eq!(
+        classify_response(
+            ServiceKind::Chat,
+            &response(&ready),
+            Some(&serde_json::json!({"source_revision":"other"}))
+        ),
+        Probe::Stale
+    );
+    for state in [serde_json::Value::Null, "unknown".into(), false.into()] {
+        let mut invalid = ready.clone();
+        invalid["state"] = state;
+        assert_eq!(
+            classify_response(ServiceKind::Chat, &response(&invalid), Some(&identity)),
+            Probe::Foreign
+        );
+    }
+}
+
+fn read_probe_request(stream: &mut TcpStream, path: &str) -> bool {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n\r\n") {
+        let mut buffer = [0; 512];
+        let Ok(read) = stream.read(&mut buffer) else {
+            return false;
+        };
+        if read == 0 {
+            return false;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    String::from_utf8(bytes)
+        .unwrap()
+        .starts_with(&format!("GET {path} HTTP/1.1"))
+}
+
+#[test]
+fn a_trickling_readiness_response_cannot_extend_the_deadline() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let responder = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        assert!(read_probe_request(&mut stream, "/api/chat/readiness"));
+        let fragments: &[&[u8]] = &[
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+            b"{\"ok\":true,",
+            b"\"schema_version\":",
+            b"\"loopx_chat_readiness_v1\",",
+            b"\"state\":",
+            b"\"ready\"}",
+        ];
+        for (index, fragment) in fragments.iter().enumerate() {
+            if index > 0 {
+                thread::sleep(Duration::from_millis(150));
+            }
+            if stream.write_all(fragment).is_err() {
+                break;
+            }
+        }
+    });
+    let actual = probe_on_port(ServiceKind::Chat, port, None);
+    responder.join().unwrap();
+    assert_eq!(actual, Probe::Unresponsive);
+}
+
+#[test]
+fn legacy_chat_fallback_shares_the_original_readiness_deadline() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let responder = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        assert!(read_probe_request(&mut stream, "/api/chat/readiness"));
+        thread::sleep(Duration::from_millis(300));
+        if stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .is_err()
+        {
+            return;
+        }
+        drop(stream);
+        // Do not block the test if the first attempt has already timed out.
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fallback accept: {error}"),
+            }
+        };
+        if !read_probe_request(&mut stream, "/api/chat/capabilities") {
+            return;
+        }
+        thread::sleep(Duration::from_millis(300));
+        let body = r#"{"ok":true,"schema_version":"loopx_chat_capabilities_v1"}"#;
+        let _ = write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}");
+    });
+    let actual = probe_on_port(ServiceKind::Chat, port, None);
+    responder.join().unwrap();
+    assert_eq!(actual, Probe::Unresponsive);
+}
+
+#[test]
+fn legacy_chat_readiness_uses_the_original_capabilities_fallback() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let identity = serde_json::json!({"source_revision":"current"});
+    let expected = identity.clone();
+    let responder = thread::spawn(move || {
+        for path in ["/api/chat/readiness", "/api/chat/capabilities"] {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_probe_request(&mut stream, path));
+            let response = if path.ends_with("readiness") {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            } else {
+                let body = serde_json::json!({"ok":true,"schema_version":"loopx_chat_capabilities_v1","runtime_identity":identity}).to_string();
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    assert_eq!(
+        probe_on_port(ServiceKind::Chat, port, Some(&expected)),
+        Probe::Matching
+    );
+    responder.join().unwrap();
+}
+
+#[test]
+fn service_connections_run_concurrently_and_name_the_remaining_service() {
+    // Concurrency is the contract, not a timing coincidence: each connection
+    // must be able to observe its peer in flight. A sequential implementation
+    // can never satisfy the peer wait, and fails on the bounded timeout
+    // instead of hanging the suite.
+    let in_flight = std::sync::Mutex::new(0usize);
+    let peer_arrived = std::sync::Condvar::new();
+    let saw_peer = Mutex::new(Vec::new());
+    let published = Mutex::new(Vec::new());
+
+    let outcomes = connect_all(
+        SERVICE_KINDS,
+        |kind| {
+            let mut count = in_flight.lock().expect("in-flight lock");
+            *count += 1;
+            peer_arrived.notify_all();
+            let mut timed_out = false;
+            while *count < SERVICE_KINDS.len() && !timed_out {
+                let (waited, timeout) = peer_arrived
+                    .wait_timeout(count, Duration::from_secs(10))
+                    .expect("peer wait");
+                count = waited;
+                timed_out = timeout.timed_out();
+            }
+            let observed = *count >= SERVICE_KINDS.len();
+            drop(count);
+            saw_peer
+                .lock()
+                .expect("observation lock")
+                .push((kind, observed));
+            ServiceOutcome {
+                owned: None,
+                healed: false,
+                result: Ok(()),
+            }
+        },
+        |pending| {
+            published
+                .lock()
+                .expect("published lock")
+                .push(pending.to_vec())
+        },
+    );
+
+    assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+    let saw_peer = saw_peer.into_inner().expect("observation lock");
+    assert_eq!(saw_peer.len(), SERVICE_KINDS.len());
+    assert!(
+        saw_peer.iter().all(|(_, observed)| *observed),
+        "every service must connect while its peer is still in flight: {saw_peer:?}"
+    );
+
+    // The boot page first sees the set connecting together, then the single
+    // service whose connection outlived its peer. A finished set publishes
+    // nothing, because there is no remaining service to name.
+    let published = published.into_inner().expect("published lock");
+    assert_eq!(published.len(), 2, "{published:?}");
+    assert_eq!(published[0], SERVICE_KINDS.to_vec());
+    assert_eq!(published[1].len(), 1, "{published:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_service_set_stops_the_child_its_peer_started() {
+    // Ownership must travel with every outcome: a peer that failed still
+    // leaves this App responsible for the process it already spawned.
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "exec sleep 30"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = command.group_spawn().expect("spawn owned service fixture");
+    let pid = child.id();
+
+    let Err(error) = ServiceSet::collect(
+        [
+            ServiceOutcome {
+                owned: Some(OwnedService {
+                    child,
+                    kind: ServiceKind::Status,
+                }),
+                healed: false,
+                result: Ok(()),
+            },
+            ServiceOutcome {
+                owned: None,
+                healed: false,
+                result: Err(ServiceError("LoopX chat did not become ready".into())),
+            },
+        ],
+        SelectedRuntime {
+            executable: "unused".into(),
+            identity: None,
+        },
+    ) else {
+        panic!("a failed peer must fail the whole set");
+    };
+    assert!(error.to_string().contains("did not become ready"));
+
+    let mut alive = true;
+    for _ in 0..50 {
+        if !Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill -0")
+            .success()
+        {
+            alive = false;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!alive, "owned service {pid} outlived the failed set");
+}
+
+#[cfg(unix)]
+static PRIVATE_RECOVERY_FIXTURE: Mutex<()> = Mutex::new(());
+
+#[cfg(unix)]
+fn private_recovery_fixture() -> (tempfile::TempDir, SelectedRuntime, ServiceEndpoints) {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("loopx");
+    let identity = serde_json::json!({"schema_version":"loopx_runtime_identity_v1",
+        "package_version":"1.4.1","release_id":"fixture","source_revision":"1".repeat(40)});
+    fs::write(&executable, format!(r#"#!/usr/bin/env python3
+import json, os, socket, sys
+kind = sys.argv[1]
+port = int(sys.argv[sys.argv.index('--port') + 1])
+payload = {{'runtime_identity': json.loads({identity:?})}}
+if kind == 'chat':
+    payload['schema_version'] = 'loopx_chat_capabilities_v1'
+else:
+    payload.update(source='serve-status', readiness={{'schema_version':'loopx_status_readiness_v0','state':'ready','reason':'registry_readable'}})
+body = json.dumps(payload).encode()
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(('127.0.0.1', port))
+server.listen(8)
+with open(__file__ + ('.chat.pid' if kind == 'chat' else '.status.pid'), 'w') as output:
+    output.write(str(os.getpid()))
+while True:
+    connection, _ = server.accept()
+    connection.recv(65536)
+    connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\nConnection: close\r\n\r\n' + body)
+    connection.close()
+"#, identity=identity.to_string())).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    (
+        root,
+        SelectedRuntime {
+            executable: executable.to_string_lossy().into_owned(),
+            identity: Some(identity),
+        },
+        ServiceEndpoints::allocate_recovery_fixture().unwrap(),
+    )
+}
+
+#[cfg(unix)]
+fn exit_private_service(root: &Path, kind: ServiceKind, services: &mut ServiceSet) {
+    // Kill the actual listener rather than assuming the supervised leader is
+    // the Core process. macOS's native lifetime helper is a separate parent.
+    let pid = fs::read_to_string(root.join(format!("loopx.{}.pid", kind.label()))).unwrap();
+    assert!(Command::new("kill")
+        .args(["-KILL", pid.trim()])
+        .status()
+        .unwrap()
+        .success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let failed = services.owned.iter_mut().find(|s| s.kind == kind).unwrap();
+    while failed.child.inner().try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "service exit did not reach its supervisor"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exited_owned_children_recover_individually_with_the_frozen_identity() {
+    let _fixture = PRIVATE_RECOVERY_FIXTURE.lock().unwrap();
+    let (root, runtime, endpoints) = private_recovery_fixture();
+    let mut services = ServiceSet::start(&runtime, &endpoints, |_| {}).unwrap();
+    assert!(!services.recover_exited(&endpoints, Instant::now()).unwrap());
+    for kind in SERVICE_KINDS {
+        let peer = services
+            .owned
+            .iter()
+            .find(|s| s.kind != kind)
+            .unwrap()
+            .child
+            .id();
+        let failed = services.owned.iter_mut().find(|s| s.kind == kind).unwrap();
+        let old = failed.child.id();
+        exit_private_service(root.path(), kind, &mut services);
+        services.last_recovery_attempt = None;
+        let mut development = endpoints;
+        development.isolated = false;
+        // Ownership, rather than private/shared mode, authorizes recovery.
+        // Keep ephemeral fixture ports so this cannot touch machine services.
+        assert!(services
+            .recover_exited(&development, Instant::now())
+            .unwrap());
+        assert!(!services.recover_exited(&endpoints, Instant::now()).unwrap());
+        assert_ne!(
+            services
+                .owned
+                .iter()
+                .find(|s| s.kind == kind)
+                .unwrap()
+                .child
+                .id(),
+            old
+        );
+        assert_eq!(
+            services
+                .owned
+                .iter()
+                .find(|s| s.kind != kind)
+                .unwrap()
+                .child
+                .id(),
+            peer
+        );
+        assert_eq!(
+            probe_on_port(kind, endpoints.port(kind), runtime.identity.as_ref()),
+            Probe::Matching
+        );
+        assert_eq!(services.runtime.executable, runtime.executable);
+        assert_eq!(services.runtime.identity, runtime.identity);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn private_recovery_keeps_foreign_listeners_and_healthy_peers_and_bounds_retry() {
+    let _fixture = PRIVATE_RECOVERY_FIXTURE.lock().unwrap();
+    let (root, runtime, endpoints) = private_recovery_fixture();
+    let mut services = ServiceSet::start(&runtime, &endpoints, |_| {}).unwrap();
+    let peer = services
+        .owned
+        .iter()
+        .find(|s| s.kind == ServiceKind::Status)
+        .unwrap()
+        .child
+        .id();
+    exit_private_service(root.path(), ServiceKind::Chat, &mut services);
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", endpoints.port(ServiceKind::Chat))).unwrap();
+    let now = Instant::now();
+    let error = services.recover_exited(&endpoints, now).unwrap_err();
+    assert!(error.to_string().contains("already occupied"));
+    assert!(TcpStream::connect(listener.local_addr().unwrap()).is_ok());
+    assert_eq!(
+        services
+            .owned
+            .iter()
+            .find(|s| s.kind == ServiceKind::Status)
+            .unwrap()
+            .child
+            .id(),
+        peer
+    );
+    drop(listener);
+    assert!(!services
+        .recover_exited(&endpoints, now + Duration::from_secs(1))
+        .unwrap());
+    assert!(services
+        .recover_exited(&endpoints, now + Duration::from_secs(3))
+        .unwrap());
+    assert_eq!(
+        probe_on_port(
+            ServiceKind::Chat,
+            endpoints.port(ServiceKind::Chat),
+            runtime.identity.as_ref()
+        ),
+        Probe::Matching
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exited_native_lifetime_helper_drains_old_listener_before_recovery() {
+    let _fixture = PRIVATE_RECOVERY_FIXTURE.lock().unwrap();
+    let (root, runtime, endpoints) = private_recovery_fixture();
+    let mut services = ServiceSet::start(&runtime, &endpoints, |_| {}).unwrap();
+    let old_listener = fs::read_to_string(root.path().join("loopx.chat.pid")).unwrap();
+    let healthy = services
+        .owned
+        .iter()
+        .find(|service| service.kind == ServiceKind::Status)
+        .unwrap()
+        .child
+        .id();
+    let helper = services
+        .owned
+        .iter_mut()
+        .find(|service| service.kind == ServiceKind::Chat)
+        .unwrap();
+    helper.child.inner().kill().unwrap();
+    helper.child.inner().wait().unwrap();
+
+    assert!(services.recover_exited(&endpoints, Instant::now()).unwrap());
+    assert_ne!(
+        fs::read_to_string(root.path().join("loopx.chat.pid")).unwrap(),
+        old_listener
+    );
+    assert_eq!(
+        services
+            .owned
+            .iter()
+            .find(|service| service.kind == ServiceKind::Status)
+            .unwrap()
+            .child
+            .id(),
+        healthy
+    );
+    assert_eq!(
+        probe_on_port(
+            ServiceKind::Chat,
+            endpoints.port(ServiceKind::Chat),
+            runtime.identity.as_ref()
+        ),
+        Probe::Matching
+    );
+}
+
+#[test]
+fn private_recovery_cannot_start_an_unowned_or_development_service() {
+    let mut services = ServiceSet::collect(
+        SERVICE_KINDS.map(|_| ServiceOutcome {
+            owned: None,
+            healed: false,
+            result: Ok(()),
+        }),
+        SelectedRuntime {
+            executable: "must-not-run".into(),
+            identity: None,
+        },
+    )
+    .unwrap();
+    assert!(!services
+        .recover_exited(&ServiceEndpoints::allocate(true).unwrap(), Instant::now())
+        .unwrap());
+    assert!(!services
+        .recover_exited(&ServiceEndpoints::allocate(false).unwrap(), Instant::now())
+        .unwrap());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn declared_machine_source_remains_authoritative_while_unloaded() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(!platform_managed_service_declared(
+        Some(root.path().as_os_str()),
+        ServiceKind::Chat
+    ));
+    let launch_agents = root.path().join("Library/LaunchAgents");
+    fs::create_dir_all(&launch_agents).unwrap();
+    // Even a damaged declaration must not admit a different empty Chat store.
+    fs::write(
+        launch_agents.join("com.loopx.chat.plist"),
+        b"damaged declaration",
+    )
+    .unwrap();
+    assert!(platform_managed_service_declared(
+        Some(root.path().as_os_str()),
+        ServiceKind::Chat
+    ));
+    assert!(!platform_managed_service_declared(
+        Some(root.path().as_os_str()),
+        ServiceKind::Status
+    ));
+}
+#[test]
+#[cfg(unix)]
+fn runtime_alignment_requires_exact_identity_and_keeps_recovery_codes() {
+    use std::os::unix::process::ExitStatusExt;
+    let identity = serde_json::json!({"release_id":"selected"});
+    let output = |payload: serde_json::Value, exit| {
+        Some(std::process::Output {
+            status: std::process::ExitStatus::from_raw(exit),
+            stdout: serde_json::to_vec(&payload).unwrap(),
+            stderr: vec![],
+        })
+    };
+    let mut payload = serde_json::json!({"schema_version":"loopx_runtime_service_activation_v1",
+        "service":"all", "ok":true, "status":"aligned", "readiness_verified":true, "runtime_identity":identity});
+    assert!(managed_runtime_alignment_result(output(payload.clone(), 0), Some(&identity)).is_ok());
+    assert!(managed_runtime_alignment_result(output(payload.clone(), 1), Some(&identity)).is_err());
+    payload["readiness_verified"] = false.into();
+    assert!(managed_runtime_alignment_result(output(payload.clone(), 0), Some(&identity)).is_err());
+    payload["readiness_verified"] = true.into();
+    payload["runtime_identity"] = serde_json::json!({"release_id":"old"});
+    assert!(managed_runtime_alignment_result(output(payload.clone(), 0), Some(&identity)).is_err());
+    for reason in [
+        "native_account_work_pending",
+        "native_observer_provider_binding_required",
+        "native_observer_provider_upgrade_required",
+        "native_observer_requires_target_runtime",
+        "chat_work_pending",
+        "chat_state_unverified",
+        "service_runtime_route_unverified",
+        "service_runtime_alignment_failed",
+        "service_runtime_rollback_failed",
+    ] {
+        payload["ok"] = false.into();
+        payload["status"] = "deferred".into();
+        payload["reason"] = reason.into();
+        assert_eq!(
+            managed_runtime_alignment_result(output(payload.clone(), 1), Some(&identity))
+                .unwrap_err()
+                .to_string(),
+            reason
+        );
+    }
+    assert_eq!(
+        managed_runtime_alignment_result(None, Some(&identity))
+            .unwrap_err()
+            .to_string(),
+        "service_runtime_alignment_unavailable"
+    );
+}
+
+#[test]
+fn connected_runtime_requires_both_healthy_exact_identity_listeners() {
+    let identity = serde_json::json!({"schema_version":"loopx_runtime_identity_v1",
+        "release_id":"qualified", "source_revision":"a".repeat(40), "package_version":"2.3.0"});
+    let runtime = SelectedRuntime {
+        executable: "unused-discovery-candidate".into(),
+        identity: Some(identity.clone()),
+    };
+    for (chat_identity, status_ready, expected) in [
+        (identity.clone(), true, true),
+        (serde_json::json!({"release_id":"other"}), true, false),
+        (identity.clone(), false, false),
+    ] {
+        let endpoints = ServiceEndpoints::allocate(true).unwrap();
+        let servers: Vec<_> = SERVICE_KINDS.into_iter().map(|kind| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", endpoints.port(kind))).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let payload = match kind {
+                ServiceKind::Status => serde_json::json!({"source":"serve-status", "runtime_identity":identity,
+                    "readiness":{"schema_version":"loopx_status_readiness_v0",
+                        "state":if status_ready { "ready" } else { "failed" },
+                        "reason":if status_ready { "registry_readable" } else { "registry_invalid" }}}),
+                ServiceKind::Chat => serde_json::json!({"ok":true,"schema_version":"loopx_chat_readiness_v1",
+                    "state":"ready","runtime_identity":chat_identity}),
+            };
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if let Ok((mut stream, _)) = listener.accept() {
+                        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                        let mut request = [0; 1024];
+                        let _ = stream.read(&mut request);
+                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{payload}");
+                        return;
+                    }
+                    if Instant::now() >= deadline { return; }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            })
+        }).collect();
+        assert_eq!(runtime_ready(&runtime, &endpoints), expected);
+        for server in servers {
+            server.join().unwrap();
+        }
+    }
+    let endpoints = ServiceEndpoints::allocate(true).unwrap();
+    assert!(
+        !runtime_ready(&runtime, &endpoints),
+        "a qualified install alone is not readiness"
+    );
+    assert!(!runtime_ready(
+        &SelectedRuntime {
+            executable: "unused".into(),
+            identity: None
+        },
+        &endpoints
+    ));
+}

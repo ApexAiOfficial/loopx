@@ -4,12 +4,53 @@ This area holds public research and inspectable evidence. It is not the source
 of truth for current product behavior; stable conclusions should be promoted
 into product, architecture, or reference documentation with source links.
 
-- [Benchmark research workspace](https://github.com/huangruiteng/loopx/blob/main/benchmark/README.md): current protocols,
+## Featured Result: LHTB
+
+**GPT-5.6 Sol + LoopX 1.0.3 Heartbeat: 0.4948 mean reward across 46 tasks**,
+versus 0.4218 for Plain Codex (**+17.3%**) and 0.4475 for native Codex Goal
+(**+10.6%**). Strict solves (reward ≥0.95) are **7 / 7 / 4** for LoopX / Plain /
+Goal. Supplementary pass rates at reward ≥0.80 are **15/46 (32.6%) / 12/46
+(26.1%) / 14/46 (30.4%)** in that same order. This post-hoc threshold does not
+replace the strict solved metric; no score equals 0.80 in this study.
+The tasks extend beyond coding to research, science, multimodal analysis,
+games, and professional workflows.
+
+This is a same-model exploratory system comparison: one effective trial per
+task-arm, designated replacements, and unequal runtime/budgets. It does not
+establish an equal-budget efficiency gain or a general performance guarantee.
+
+[Interactive brief](https://loopx-project.github.io/loopx/benchmarks/lhtb/)
+· [LHTB official website](https://zli12321.github.io/LHTB/index.html)
+· [中文](https://loopx-project.github.io/loopx/benchmarks/lhtb/?lang=zh)
+· [Study, all five arms and limitations](../../benchmark/LHTB/studies/five-arm-gpt56sol-max/README.md)
+· [Task-level scores](../../benchmark/LHTB/studies/five-arm-gpt56sol-max/data.json)
+
+## Research Index
+
+- [Benchmark portfolio priority ranking and Bitter-Lesson boundary (2026-11)](../architecture/rfcs/long-horizon-harness-benchmark-research-program-v0.md#38-external-benchmark-survey-and-priority-ranking-2026-11)
+  ([中文](../architecture/rfcs/long-horizon-harness-benchmark-research-program-v0.zh-CN.md#38-外部-benchmark-调研与优先级排序2026-11-更新)):
+  updated P0/P1/P2/Control-Only ranking across EdgeBench and 20 external
+  benchmarks, engineering readiness and platform constraints, and the
+  Raw-Artifact Reset Baseline contract requiring matched, fully costed evidence
+  for causal claims while separating self-authored retrieval from the five
+  governed control-plane failure regimes.
+- [Budgeted research planning: goals, theory and design rationale](budgeted-research-planning.md)
+  ([中文](budgeted-research-planning.zh-CN.md)): why conditional plans, costly
+  measurements and causal comparisons serve better long-budget outcomes; links
+  the existing Stride/Yardstick owners to the EdgeBench pilot and later learning.
+- [Benchmark research workspace](https://github.com/loopx-project/loopx/blob/main/benchmark/README.md): current protocols,
   benchmark-specific practice, and links to the governing research RFC.
-- [Legacy benchmark archive](https://github.com/huangruiteng/loopx/blob/main/deprecate/benchmark-legacy/README.md):
-  non-active runners, adapters, and historical packets retained for archaeology.
+- [Legacy benchmark history](https://github.com/loopx-project/loopx/tree/54d42da44283bb414b24f71d16642c25cbcaf5dd/deprecate/benchmark-legacy):
+  retired runners, adapters, and historical packets removed from the working
+  tree and retained in Git history for archaeology.
 - [Agent workflow audits](agent-workflow-audits/): bounded reviews of external
   agent workflow patterns.
+- [Jev external evidence supplement v0 (Chinese)](agent-workflow-audits/jev-external-evidence-supplement-v0.zh-CN.md):
+  non-normative evidence about model quality, evaluation limits, and integration
+  patterns for the Jev RFC.
+- [RSI-Harness adoption assessment (Chinese)](agent-workflow-audits/rsi-harness-adoption-v0.zh-CN.md):
+  tested configuration and history-reader patterns, adoption boundaries, and
+  complete streaming usage accounting without importing another harness owner.
 
 Raw private runs, trajectories, credentials, local paths, internal links, and
 non-public source material do not belong in this directory.

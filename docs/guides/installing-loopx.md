@@ -10,22 +10,187 @@ loopx workflow-skills --install
 loopx doctor
 ```
 
+Choose one installation owner and keep it authoritative:
+
+| Use case | Owner | Install or acquire | Upgrade |
+| --- | --- | --- | --- |
+| Normal release | Python package environment | `python3 -m pip install loopx` | `loopx update apply` or the manual pip sequence below |
+| Isolated CLI on an externally managed machine | `pipx` | `pipx install loopx` | `pipx upgrade loopx`, then refresh LoopX host material |
+| Existing uv tool environment | `uv` | `uv tool install loopx` | `uv tool upgrade loopx`, then refresh LoopX host material |
+| Contributor or source qualification | Git checkout | clone/fetch plus `scripts/install-local.sh` | update the checkout explicitly, rerun the installer, validate `loopx-canary` before promotion |
+| No-clone CLI or main preview | LoopX runtime snapshot | published installer with a prebuilt runtime | `loopx update apply` |
+
+PyPI is the canonical source for normal releases. A source checkout is a
+development and qualification surface, not a second implicit package channel.
+The archive snapshot remains a recovery path rather than a competing default.
+
+### Stable, main and source builds
+
+`loopx update apply` and `loopx upgrade` preserve the installation owner. pip
+and pipx continue to use their own environment and configured package index;
+they do not become archive installs. Stable PyPI wheels already contain Chat's
+frontend. Node is needed for the TypeScript runtime described below, but npm
+and a local frontend build are not part of a normal package upgrade.
+
+Managed snapshots inherit their recorded repo and ref, including a pinned SHA.
+New snapshots default to stable. Stable snapshots use the runtime attached to
+the latest stable release; main uses the latest **qualified** main snapshot,
+which can lag the branch while CI runs. The plan records its exact revision,
+version, size and SHA-256 before downloading. Missing metadata or a missing
+artifact stops the update without starting a source build. An older, diverged
+or unverified target requires explicit `--allow-downgrade` intent.
+
+```bash
+loopx update plan
+loopx upgrade --ref main             # snapshot installs only
+loopx update apply --ref stable --allow-downgrade
+loopx upgrade --ref main --source    # explicit source download + local build
+```
+
+To acquire a main snapshot without a checkout, use the published installer
+with `LOOPX_REF=main`. To build another ref, set
+`LOOPX_BUILD_FROM_SOURCE=1 LOOPX_REF=<ref>` before running that installer, or
+use the existing checkout installer. `LOOPX_ARCHIVE_URL` remains an explicit
+developer archive path. These choices never silently replace a pip/pipx or
+live-checkout owner. App updates continue through the native signed updater;
+a CLI-only installation does not install a Desktop App.
+
+Updates run in an owned background worker even when the caller waits for the
+result. A terminal/Agent disconnect does not cancel it. Repeating apply while
+that installation's update is running observes the existing operation. To
+return immediately and read back later:
+
+```bash
+loopx --format json upgrade --background
+loopx --format json update status
+loopx --format json update status --operation-id <returned-id>
+```
+
+Windows console launchers retain their existing self-uninstall protection in
+the original process. Follow the printed `python -m loopx.entrypoint` retry
+to update safely and use the durable worker; a worker never hides a locked
+console executable from that guard.
+
+JSON stdout contains the final result (or background operation descriptor).
+Progress is NDJSON on stderr: operation id, phase, downloaded bytes, total
+(`null` when unknown), observed rate, elapsed time and last progress time.
+The worker refreshes observation every five seconds and marks ten seconds
+without progress explicitly; a heartbeat is not a new byte or completed stage.
+Native App downloads show bytes, unknown totals, rate and stalled observation
+in **LoopX updates**, with existing check/install/recovery actions unchanged.
+
+Runtime downloads cache hash-verified bytes across invocations. Partial data
+is appended only with a matching strong ETag, origin, exact Content-Range and
+length; ignored/rejected Range restarts within the bounded budget. A complete
+cache hit is verified again before use. `LOOPX_UPDATE_CACHE` selects the cache;
+`LOOPX_UPDATE_STATE_DIR` selects private operation readback. Failed or killed
+workers remain failed/interrupted, and status reads never replay installation.
+Normal HTTP(S) proxy environment variables remain authoritative. Optional
+`LOOPX_DOWNLOAD_MIRRORS` is a comma-separated list of operator-trusted HTTPS
+base URLs serving identical filenames; publisher-listed sources are also
+supported. Timeouts or sustained low throughput can switch sources, always
+with the same expected revision/hash/size. This is not a claim that regional
+mirrors have been deployed or that any country's latency has been measured.
+
+The prebuilt runtime retains CLI/runtime code, skills and references, text
+documentation, developer smokes and the verified frontend. Named presentation
+videos/screenshots and frontend development sources are in the accompanying
+optional resource archive; illustrations remain available in versioned online
+docs. The release inventory lists every retained
+and optional file. Installers validate a candidate before activation and restore
+owned executable links on activation failure. Data-format migrations retain
+their independent receipts/backups; restoring an executable does not reverse
+migrated data. Existing managed-service ownership and pending-work restart
+guards still apply.
+
+中文：普通 stable 用户继续使用 PyPI；pip/pipx 保留原环境和索引。snapshot 沿用
+既有 main/stable/固定 SHA，默认取带前端的预构建包。main 指最新通过 CI 的快照；
+源码构建须显式 `--source`，不会静默降级到整仓下载。旧版本或无法核实的目标须
+明确 `--allow-downgrade`。`--background` 返回 operation id，断线后用
+`update status` 回读原升级；JSON 结果在 stdout，持续进度在 stderr。下载缓存、
+续传和可选可信镜像都校验同一制品；代理沿用用户配置。恢复旧可执行文件不回滚
+已迁移的数据。无 Node 时无需构建前端，但运行控制平面仍需下面要求的 Node。
+
+Release rollout: publish and qualify the stable runtime before deploying the
+new public bootstrap. The Pages lane checks this dependency and retains the
+previous deployed site if it is unavailable. `runtime-snapshots.yml` builds
+main artifacts; `release-artifacts.yml` reuses the release frontend/wheel lane
+for stable. New main archives and revision-addressed metadata use one prerelease
+per revision, `runtime-main-<full SHA>`, so the channel cannot exhaust GitHub's
+1,000-assets-per-release limit. `runtime-main/loopx-runtime.json` remains the
+latest-channel endpoint; only that metadata is replaced, after all immutable
+assets are uploaded and checked. Historical assets in `runtime-main` stay
+available, and current clients fall back to their old SHA address only on HTTP
+404. Older clients can follow the unchanged `main` endpoint, but must update
+before pinning a newly published SHA. Stable release selection still excludes
+these prereleases; the existing all-release pagination grows with snapshot
+history. No historical assets are deleted or moved by this publisher.
+
+中文：新 main 快照各自使用 `runtime-main-<完整 SHA>` 预发布，避免单个 release
+达到 1,000 个资产上限。最新入口仍为 `runtime-main/loopx-runtime.json`，所有不可变
+资产完成后才更新；旧资产不删除、不迁移。新版客户端仅在新 SHA 地址返回 404 时
+回读旧地址。旧客户端可先升级 main，再固定新发布的 SHA。stable 仍排除这些预发布，
+但现有 release 全量分页的开销会随快照历史增长。
+
+Clean
+install/upgrade, package contents, byte size, provenance and
+phase timings are release evidence. A 20 MiB runtime is an evaluation target,
+not a waived dependency check or a global p50/p95 promise.
+
 LoopX's Effect Program core runs in a managed, idle-exiting TypeScript runtime
-and requires Node.js 22.6 or later. LoopX starts and reuses that local runtime
-automatically; users do not run a daemon manually. The runtime binds only to
-loopback, authenticates requests with a user-private token, rotates when the
-packaged Effect core changes, and exits after an idle period. `loopx doctor`
+and requires Node.js 22.22.3 or later; Node.js 24 LTS is the recommended primary
+runtime. LoopX starts and reuses that local runtime automatically; users do not
+run a daemon manually. The runtime binds only to loopback, authenticates
+requests with a user-private token, rotates when the packaged Effect core
+changes, and exits after an idle period. `loopx doctor`
 reports it as `ready`, `missing`, `unsupported`, or `probe_failed`; a missing
 or stale runtime fails closed instead of falling back to a second Python rule
 engine. The same doctor projection exposes `runtime_lifecycle.state` as
 `running`, `stopped`, or `unavailable`, plus a public-safe `diagnostic_code`;
 the App can render this projection without inventing a second health model.
 `stopped` is healthy and means the idle-exited runtime will restart on the next
-control-plane request. Validate Node before installing or upgrading LoopX:
+control-plane request. Validate Node before installing or upgrading LoopX.
+The lifecycle also reports `locator_state` (`missing`, `valid`, or `invalid`)
+and `recorded_pid_alive`. An invalid locator is not treated as an absent one:
+if its loopback endpoint and token still authenticate the recorded PID and
+source revision, the existing runtime is reused instead of starting a second
+daemon. Otherwise the next request cold-starts, while doctor retains the
+locator diagnostic for readback.
+Upgrading from an older Node 22 installation requires restarting the managed
+runtime with `loopx doctor --restart-runtime` after the new Node is on `PATH`.
+New unconfigured Goals use canonical SQLite with hard leases. Explicit choices
+and existing Goals retain their own configuration; installing the package does
+not migrate their authority. SQLite checks the actual embedded SQLite version
+before opening authority state. See the [2.0 upgrade guide](../product/releases/v2.0.0.md)
+before updating a Goal that still uses the old Markdown writer.
+
+A managed runtime that cannot publish its startup locator returns the existing
+safe filesystem/lock diagnostic code, such as `mutation_lock_timeout`,
+`io_is_directory`, or Windows `io_permission_denied` for an occupied locator
+directory, instead of only an exit status. The message does not echo
+locator paths, tokens or Node stack traces. Inspect the named local ownership
+or filesystem problem before retrying. It does not identify every possible
+startup crash: an exit without a typed envelope remains `runtime_exited_before_ready`.
+
+中文：启动 locator 发布失败会返回既有文件系统/锁诊断码，不回显路径、token 或
+Node 堆栈。先核对本机对应的占用或文件系统问题；诊断不会删除活进程持有的锁、
+修复未知 locator，也不证明所有启动退出都已归因。没有 typed envelope 的退出仍
+保留 `runtime_exited_before_ready`。
+
+中文：`runtime_lifecycle` 同时报告 `locator_state`（`missing`、`valid` 或
+`invalid`）与 `recorded_pid_alive`。无效 locator 不会被当作不存在：若记录的
+loopback 端点与 token 仍能认证相同 PID 和源码修订，则复用现有 runtime，不再
+启动第二个 daemon；否则下一次请求冷启动，同时 doctor 保留 locator 诊断供回读。
+
+The CI and release lanes use Node.js 24 LTS. Node.js 26 remains a non-blocking
+forward-compatibility probe and is not a supported-version promise. After the
+Node.js 22 maintenance window ends, a separate policy change will raise the
+minimum to Node.js 24.12 or newer and remove no-longer-needed experimental
+flags.
 
 ```bash
 node --version
-# v22.6.0 or newer
+# v22.22.3 or newer
 ```
 
 Use `loopx doctor --deep` after installation to start the managed runtime and
@@ -44,6 +209,86 @@ loopx workflow-skills --install
 loopx doctor
 ```
 
+## macOS service identity and workspace selection
+
+Use the existing `scripts/macos-dashboard-launchagent.sh` from a matching
+checkout to manage the status and Chat services. `LOOPX_BIN_DIR` selects the
+single installed CLI owner; the helper asks that command's installation-only
+doctor for its Python executable and service identity. It does not install a
+second model runner or read registered projects to qualify the package.
+
+```bash
+LOOPX_GLOBAL_REGISTRY="$HOME/.loopx/registry.global.json" \
+LOOPX_CHAT_CODEX_HOME="$HOME/.codex" \
+LOOPX_CHAT_SCAN_PATHS_JSON='["/absolute/path/to/project-one", "/absolute/path/to/project-two"]' \
+bash scripts/macos-dashboard-launchagent.sh install
+bash scripts/macos-dashboard-launchagent.sh status
+```
+
+The generated Chat plist preserves the registry, selected Codex home and
+workspace directory array across `install`/`restart`; an explicit environment
+override changes that selection. Paths must be existing absolute directories;
+up to 32 are accepted. Selection enables discovery, while Core authorization
+still owns conversation grants. An empty array retains the CLI's default
+scan behavior. Existing plists without a workspace array also retain that
+behavior until an operator explicitly selects directories. Missing or malformed
+selected paths fail before either plist is replaced. The resolved registry is
+passed verbatim, including when its filename differs from the default global
+registry filename.
+
+For an existing Chat service with an explicit `--runtime-root`, set
+`LOOPX_CHAT_RUNTIME_ROOT` to that same absolute directory at its first managed
+install. Optional `LOOPX_CHAT_IDLE_TIMEOUT_SECONDS` and
+`LOOPX_CHAT_HARD_TIMEOUT_SECONDS` preserve its positive execution timeouts.
+The helper records these selections in the Chat plist and retains them on
+later installs when overrides are omitted, including legacy explicit command
+arguments. Without a selection, the CLI defaults remain in effect.
+
+The Chat root is independent of the global status registry. Selecting it does
+not copy sessions, grant workspace access or change the status service's root.
+Invalid selections fail before either plist changes. Quiesce the previous owned
+Chat listener before switching to launchd, and read back the original Sessions
+and one consumer per App. A generated plist alone does not qualify recovery
+after logout or reboot.
+
+The managed Chat replacement entry also checks accepted work before sending
+SIGTERM. It resolves the existing listener's runtime from its live macOS
+LaunchAgent and holds the same ingress fence used by update activation; a new
+command's empty runtime cannot authorize stopping a different busy store.
+Queued, running or completing work defers replacement with `chat_work_pending`.
+An unknown manager, route or unreadable store returns `chat_state_unverified`
+and leaves the listener running. A free port still starts normally. This check
+does not intercept external `launchctl bootout` or operating-system termination.
+
+中文：受管 Chat 的显式替换入口同样先检查已受理任务。它按现有 listener 的真实
+macOS LaunchAgent 确定运行目录，并持有升级激活共用的准入锁；新命令的空目录不能
+作为停止另一份忙碌状态的依据。排队、运行中或结算中的任务使替换延期；管理器、路由
+或状态无法核验时保留原进程。空闲端口仍可正常启动；外部 `launchctl bootout` 和操作
+系统终止不受此入口拦截。
+
+The helper reads the full `/status.json` contract with a one-second connection
+deadline and a 15-second total deadline. A responding feed that takes longer
+than five seconds can therefore still show its schema and write-API setting.
+HTTP failures and feeds that miss the deadline remain unavailable; old schemas
+still carry the restart warning. This bounded diagnostic allowance does not
+reduce feed latency or qualify sustained service performance.
+
+Snapshot identities retain their release id and source revision. A non-editable
+wheel instead exposes an additive `package_fingerprint` in the existing
+`loopx_runtime_identity_v1`: SHA-256 over its actual RECORD-owned LoopX package
+files, including Python, TypeScript and frontend assets. Editable, unowned,
+redirected or incomplete packages cannot claim this fingerprint. It distinguishes
+same-version artifacts for local service reuse. Both services capture their identity at startup, so
+an in-place upgrade cannot make an old process report the replacement's identity.
+An unqualified install fails before the helper stops an existing service.
+
+After upgrading with the chosen package manager, use `restart` to replace the
+owned local services and verify the exact running Chat identity. `stop` unloads
+them; `uninstall` also removes their two plists. Restoring a prior package through
+the same installation owner and restarting provides rollback. Source and
+synthetic canary evidence do not establish actual login-after-reboot or provider
+message acceptance.
+
 ## Native Windows PowerShell 7
 
 The PyPI distribution is also the default native Windows path. From PowerShell
@@ -60,7 +305,7 @@ trusted checkout can install the native PowerShell launcher without Bash,
 POSIX symlinks, or WSL:
 
 ```powershell
-git clone https://github.com/huangruiteng/loopx.git "$HOME/loopx"
+git clone https://github.com/loopx-project/loopx.git "$HOME/loopx"
 Set-Location "$HOME/loopx"
 pwsh -NoLogo -NoProfile -File .\scripts\install-windows.ps1 `
   -Python (Get-Command python).Source `
@@ -97,7 +342,7 @@ If installation used `-AddToUserPath`, remove the chosen `BinDir` from the
 Windows user PATH through Windows Environment Variables after uninstalling.
 Installation and PATH opt-in only expose local command and skill files. They do
 not grant repository, network, credential, external-system, or merge authority,
-and uninstall does not delete project-local `.loopx/`, `.codex/goals/`, or
+and uninstall does not delete project-local `.loopx/`, legacy `.codex/goals/`, or
 evidence state.
 
 ## Host Command Surfaces
@@ -116,10 +361,199 @@ one. Host integration changes command discovery only. It does not grant LoopX
 permission to write a repository, contact external systems, or bypass a user
 gate.
 
+Every host skill root exposes only canonical `loopx-*` skills. Install and
+uninstall retire older LoopX-managed `loop-global-*` skill files; unmarked
+user-owned files are preserved and reported. This prevents cross-host imports
+from republishing a deprecated facade beside its canonical outcome.
+
+**Invocation migration:** on Claude Code and Kiro, the skill is also the slash
+command, so use `/loopx-global-summary`, `/loopx-global-gates`,
+`/loopx-global-todos` and `/loopx-global-risks` instead of `/loop-global-*`.
+Other skill-backed hosts likewise expose only the canonical names. OpenCode
+alone retains independently installed `commands/loop-global-*.md` when legacy
+aliases are enabled. `--no-legacy-aliases` omits those command files from new
+installs; it does not retire existing native command files. The command catalog
+still describes aliases, but a catalog row does not install a host invocation.
+Goal execution and write authority are unchanged.
+
+Both workflow and command installation reconcile managed duplicates between
+`CODEX_HOME/skills` (default `~/.codex/skills`) and `~/.agents/skills`.
+The selected installation root wins only when a replacement exists; a command
+facade cannot replace a rich workflow. Modified receipts, user-owned metadata,
+extra files, sole copies, and skill symlinks are preserved and reported under
+`skill_reconciliation` or `codex_skill_reconciliation`. The fixed installer permits
+`LOOPX_SKILL_DEDUPE_OTHER_ROOT=0` for intentionally separate host roots.
+
+To inspect and repair command discovery for the current Codex profile:
+
+```bash
+loopx --format json slash-commands --surface codex --dry-run
+loopx --format json slash-commands --surface codex --install
+```
+
+Read the reconciliation result and resolve preserved conflicts explicitly.
+
+If duplicates return after successful reconciliation, inspect the host's
+external-agent import history. Importing Claude Code skills can recreate
+LoopX command facades in the shared `.agents/skills` root after installation,
+including legacy aliases. Exclude LoopX from subsequent imports when its
+Codex skills are already installed, then rerun the repair above. LoopX's
+installer does not control a host's later import jobs or import settings.
+Generated Codex entries include `agents/openai.yaml` with the `LoopX` display
+name and explicit-invocation policy; `workflow-skills --install` also repairs
+missing managed entry metadata while preserving user-owned metadata.
+
+A running session may retain its original skill catalog; reload the host or
+open a new task before checking discovery again. Installation cannot rewrite
+instructions already loaded into a conversation.
+
+## Skill Discovery Scope
+
+Default workflow installation keeps `loopx-project`, `loopx-self-repair`,
+`loopx-pr-review`, `loopx-pr-program`, `loopx-doc-registry`, and `loopx-benchmark`
+globally visible in the selected host profile, alongside the generated
+`loopx` entry. These are reusable LoopX instructions: connection and repair
+must work before project setup, PR workflows can span repositories, and
+document/benchmark workflows retain their existing connected-project or
+LoopX-task triggers. Visibility does not activate a capability or authorize
+state changes, external publication, or benchmark jobs.
+
+The `loopx-global-summary`, `loopx-global-gates`, `loopx-global-todos`, and
+`loopx-global-risks` command skills also belong in the global host root. Install
+and inspect them through `loopx slash-commands --surface codex --install` and
+`loopx slash-commands --surface codex --dry-run`. They inspect the registry
+visible to the current user; discovery never expands account or project access.
+They remain optional command facades, separate from default workflow delivery.
+
+`loopx-material` and `loopx-change-quality` remain project-only by default.
+The release's `.loopx-skill-scope` marker declares `global` or `project`;
+both declared scopes support an explicit managed project copy:
+
+```bash
+loopx project-skill install --project . --skill loopx-self-repair --surface codex
+loopx project-skill install --project . --skill loopx-self-repair --surface codex --execute
+loopx project-skill status --project . --skill loopx-self-repair --surface codex
+loopx project-skill uninstall --project . --skill loopx-self-repair --surface codex --execute
+```
+
+Use a project copy only for an intentional override or isolated host. It leaves
+global copies untouched and retains project connection, ownership, digest,
+and containment checks. Missing or unknown source markers still fail closed.
+See [Project Skill Delivery](../../loopx/capabilities/project_skill_delivery/README.md)
+for lifecycle details. `loopx doctor` continues to require the complete default
+workflow set.
+
 ## Upgrade And Repair
 
-Upgrade the Python distribution first, then refresh the host material from the
-same version:
+For an existing installation, use one command:
+
+```bash
+loopx upgrade
+```
+
+This updates the CLI through its existing archive, pip or pipx owner, refreshes
+managed host material, and updates/restarts an installed macOS App through its
+native signed updater. A CLI-only machine stays CLI-only. Archive installations
+retain their recorded source ref, including Main or a pinned commit; package
+manager installations retain their package index. To select Main explicitly
+for an archive installation and its App:
+
+```bash
+loopx upgrade --ref main
+```
+
+`loopx upgrade --dry-run` previews the same installed surfaces without changing
+them. Text output reports the current stage and elapsed waiting time every ten
+seconds; `--format json` keeps stdout as one structured result. Completion
+requires native App update and service readback, not just a successful launch.
+An unavailable feed, signature failure or partial upgrade returns a nonzero
+exit code and preserves the separate CLI and App outcomes. Main's App channel
+follows its latest complete signed build and may lag Git HEAD. Older Apps
+without terminal-upgrade readback can follow their existing startup updater,
+but remain unqualified until an updated App returns that readback. Existing
+Recovery & updates controls remain the recovery entry point.
+
+Multiple standard App installations require resolving that ambiguity before
+any update. Unsupported installation owners retain their existing instructions;
+the command does not rewrite a source checkout, switch a package-manager install
+to an archive, or add Windows native-update support.
+
+已有安装可直接执行 `loopx upgrade`，统一更新 CLI 与已安装的 macOS App。
+默认沿用原安装来源；归档安装使用 `--ref main` 可选择 Main。终端持续显示当前阶段
+与等待时长，并分别读回 CLI、App 和服务结果；部分失败不会显示为全部完成。
+
+`loopx update` is the channel-aware upgrade entry point. Its actions have the
+same meaning for humans and agents:
+
+```bash
+loopx update check       # read-only freshness and installation-owner check
+loopx update plan        # read-only command, validation, and rollback plan
+loopx update apply       # explicit local-environment mutation
+```
+
+An upgrade does not move local state directories. Existing installations keep
+their selected legacy `$HOME/.codex/loopx` route and registered Goal state;
+fresh installations use `$HOME/.loopx`. Check `local_state_route` in
+`loopx --format json doctor` before and after upgrading. Directory migration is
+optional, separate from `update apply`, and requires the explicit offline
+[preview and recovery procedure](../product/migrations/local-state-path-migration.md).
+If both default runtime roots contain state, implicit routing refuses the
+conflict; use explicit `--registry` and `--runtime-root` for diagnosis or
+independent work until the conflict is resolved.
+
+For archive installs, `update apply` downloads the bootstrap installer to a
+private temporary file before executing it. Downloading is limited to three
+attempts, a 60-second total download budget (or the smaller command timeout),
+and 20 seconds per transfer, with 1- and 2-second retry delays. Transient
+403/408/429/500/502/503/504 responses and selected connection/transfer failures
+are retried; 401/404 and certificate-verification failures stop immediately.
+Installer execution is never retried, and partial downloads are never executed.
+The command timeout covers downloading and installer execution together.
+
+JSON `execution.installer_download` and the text execution report show the
+stage and each attempt's HTTP status and curl exit code. HTTP `0` means no
+usable HTTP status was received. Download diagnostics exclude URLs, response
+bodies, headers, and raw curl errors so proxy credentials and signed parameters
+cannot leak. These retries cover the bootstrap download, not subsequent
+archive downloads or a failed installation. Pip/pipx and read-only plans keep
+their existing behavior.
+
+Bare `loopx update` remains a read-only plan. The older `--check`, `--dry-run`,
+and `--execute` spellings remain compatibility aliases, but new instructions
+should use the named actions.
+
+Human-readable output starts with **No update was applied** and a copyable
+**Next Action** command. JSON output exposes the same decision as
+`requested_action`, `changes_applied`, and a typed `next_action` object with
+mutation and explicit-approval fields. Agents should inspect those fields instead
+of inferring authority from prose.
+
+For a PyPI distribution installed by pip, `update apply` asks the exact Python
+interpreter that owns LoopX to upgrade its environment, then starts fresh
+processes to install workflow skills and slash commands, runs doctor, revalidates
+enabled extensions, and restarts managed local LoopX services. It does not
+switch the installation to an archive snapshot.
+
+On Windows, an update requested through the pip/pipx `loopx.exe` launcher is
+refused before installation starts: the running launcher would prevent pip
+from replacing it and can leave a partially uninstalled package. Follow the
+returned command, which uses the owning Python interpreter's module entry and
+preserves the original arguments, including registry and runtime routes:
+
+```powershell
+python -m loopx.entrypoint --format json update apply
+```
+
+Linked pipx application aliases, such as `loopx-preview.exe` installed with
+`--suffix=-preview`, receive the same protection when they refer to the owning
+environment's `loopx.exe` file.
+
+Use the interpreter printed in the refusal rather than an unrelated `python`
+from PATH. Read-only `update check` and `update plan` remain available. If a
+previous update already damaged the installation, repair it with that owning
+interpreter's pip first; a module entry cannot import a missing package.
+
+The equivalent manual sequence is:
 
 ```bash
 python3 -m pip install --upgrade loopx
@@ -127,6 +561,56 @@ loopx workflow-skills --install
 loopx slash-commands --install
 loopx doctor
 ```
+
+The first command is the package transaction; the remaining commands are the
+LoopX activation and readback contract. Running only `pip install` can leave
+host material from the previous version active.
+
+### Verify The Active Layers
+
+An upgrade is not fully qualified just because the package-manager step exits
+successfully. Read back each layer that can remain stale independently:
+
+| Layer | Readback | What success proves | Recovery when it is not ready |
+| --- | --- | --- | --- |
+| Installation owner and package | `loopx update check` | The active executable, package owner, freshness, and next action are identified without mutation. | Follow the reported owner command; do not mix pip, pipx, archive, and source-checkout upgrade paths. |
+| Host material | `loopx --format json doctor` | `skill_delivery.status` describes the workflow-skill delivery used by the active host. | Run `loopx workflow-skills --install`; refresh `loopx slash-commands --install` when those facades are in use, then restart the host. |
+| Managed Effect runtime | `loopx doctor --deep` | The packaged TypeScript Effect runtime can start and answer the deep probe. An idle-exited `stopped` lifecycle remains healthy. | Apply the doctor recommendation or reinstall the selected package version; do not substitute a second Python rule path. |
+| Enabled extensions | `loopx extension doctor --all-enabled --execute --format json` | Every enabled extension has a current runtime identity and passes its readiness checks. | Repair the named provider or extension and rerun its doctor; a failed provider remains closed. |
+
+`loopx update apply` runs the host-material refresh, core doctor, and enabled
+extension doctor after the owning package or archive update succeeds. The
+standalone commands above are still useful as independent readbacks and
+recovery entry points; rerunning them does not change the installation owner.
+
+These checks also prevent a common release mistake: code merged to `main` is
+not necessarily active in an installed release. Archive maintainers may use
+`loopx update check --ref main` to inspect
+`runtime_activation_qualification`; ordinary pip and pipx users should stay on
+the tagged package channel and wait for the corresponding release instead of
+trying to switch an installed distribution to `main`.
+
+For an archive snapshot, `update check` and `update plan` resolve a selected
+moving GitHub ref to its current commit before saying that no update is needed.
+Matching package versions and a recent install timestamp do not establish
+source equality. If the ref lookup is unavailable, the plan reports activation
+as unqualified; retry online or select a trusted full commit SHA. A custom
+archive URL is likewise not proven by the GitHub repo/ref alone.
+An injected `--installed-doctor-json` snapshot is diagnostic input, not a live
+remote-ref check: it can qualify an immutable SHA but cannot claim a moving ref
+is currently installed.
+
+An install taken from a pinned full commit SHA needs no separate lineage
+lookup: `loopx update check --ref <40-hex-commit>` compares that commit with the
+installed manifest source commit and reports `runtime_active` when they match,
+so the readback you would use to confirm your own pinned install stays
+actionable.
+
+For an installation owned by another Python package manager, `update plan`
+reports that owner and its command; LoopX fails closed instead of guessing a
+pip mutation. For a live source checkout, it reports the contributor installer
+and never performs `git pull` or rewrites the worktree. Source acquisition and
+repository mutation remain explicit human or authorized-agent actions.
 
 `loopx doctor` reports `install_kind: python_distribution` for this path and
 returns the same pip-native repair sequence when packaged skills are missing or
@@ -151,14 +635,24 @@ Python package environment is unavailable or the CLI is too damaged to run its
 own repair path:
 
 ```bash
-curl -fsSL https://huangruiteng.github.io/loopx/install.sh | bash
+curl -fsSL https://loopx-project.github.io/loopx/install.sh | bash
 export PATH="$HOME/.local/bin:$PATH"
 loopx doctor
 ```
 
 This fallback installs an archive snapshot, wrapper, man page, and host
-materials together. Its update path remains `loopx update`; do not mix the
-archive and PyPI upgrade mechanisms for the same active executable.
+materials together. LoopX owns that snapshot lifecycle, so its update path is:
+
+```bash
+loopx update check
+loopx update plan
+loopx update apply
+```
+
+Archive apply retains the atomic release pointer, doctor validation, extension
+readback, managed-service restart, and first-class snapshot rollback. The
+installation-owner projection prevents this path from being mixed with an
+active PyPI executable.
 
 ## Uninstall
 
@@ -171,7 +665,7 @@ python3 -m pip uninstall loopx
 ```
 
 Both host uninstallers preserve same-name files whose content changed after
-LoopX installed them. Project-local `.loopx/`, `.codex/goals/`, evidence, and
+LoopX installed them. Project-local `.loopx/`, legacy `.codex/goals/`, evidence, and
 runtime state are not deleted by package uninstall.
 
 Contributors who need a live canary should use a real checkout and

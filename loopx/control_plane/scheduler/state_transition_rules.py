@@ -35,6 +35,58 @@ class SchedulerCadenceDecision:
     current_cadence_acknowledged: bool
 
 
+@dataclass(frozen=True)
+class MonitorScheduleProjection:
+    next_due_at: str | None
+    schedule_source: str
+    cadence_seconds: int | None
+
+
+def project_monitor_todo_schedule(
+    *,
+    generated_at: str,
+    cadence: Any = None,
+    explicit_next_due_at: Any = None,
+) -> MonitorScheduleProjection:
+    """Project monitor schedule facts through the TypeScript scheduler owner."""
+
+    result = _runtime_result(
+        {
+            "schema_version": SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+            "operation": "monitor_schedule",
+            "generated_at": generated_at,
+            "cadence": None if cadence is None else str(cadence),
+            "explicit_next_due_at": (
+                None
+                if explicit_next_due_at is None
+                else str(explicit_next_due_at)
+            ),
+        }
+    )
+    next_due_at = result.get("next_due_at")
+    schedule_source = result.get("schedule_source")
+    cadence_seconds = result.get("cadence_seconds")
+    if (
+        result.get("operation") != "monitor_schedule"
+        or (next_due_at is not None and not isinstance(next_due_at, str))
+        or schedule_source not in {"explicit", "cadence", "none"}
+        or (
+            cadence_seconds is not None
+            and (
+                isinstance(cadence_seconds, bool)
+                or not isinstance(cadence_seconds, int)
+                or cadence_seconds <= 0
+            )
+        )
+    ):
+        raise RuntimeError("TypeScript monitor schedule result shape mismatch")
+    return MonitorScheduleProjection(
+        next_due_at=next_due_at,
+        schedule_source=str(schedule_source),
+        cadence_seconds=cadence_seconds,
+    )
+
+
 def _runtime_result(params: dict[str, Any]) -> Mapping[str, Any]:
     try:
         result = effect_runtime_result("scheduler.state_transition.evaluate", params)
@@ -224,15 +276,10 @@ def decide_scheduler_backoff_state(
     state_acknowledges_rrule = result.get(
         "scheduler_state_acknowledges_current_rrule"
     )
-    string_fields = {
-        key: result.get(key)
-        for key in (
-            "current_rrule",
-            "last_applied_rrule",
-            "observed_host_rrule",
-            "effective_host_rrule",
-        )
-    }
+    current_rrule = result.get("current_rrule")
+    last_applied_rrule = result.get("last_applied_rrule")
+    observed_result_rrule = result.get("observed_host_rrule")
+    effective_host_rrule = result.get("effective_host_rrule")
     recorded_failure = result.get("recorded_host_failure")
     if (
         result.get("operation") != "backoff"
@@ -248,7 +295,10 @@ def decide_scheduler_backoff_state(
         or not isinstance(repeated_failed_pair, bool)
         or not isinstance(current_rrule_applied, bool)
         or not isinstance(state_acknowledges_rrule, bool)
-        or any(not isinstance(value, str) for value in string_fields.values())
+        or not isinstance(current_rrule, str)
+        or not isinstance(last_applied_rrule, str)
+        or not isinstance(observed_result_rrule, str)
+        or not isinstance(effective_host_rrule, str)
         or (recorded_failure is not None and not isinstance(recorded_failure, dict))
     ):
         raise RuntimeError("TypeScript scheduler backoff result shape mismatch")
@@ -267,10 +317,10 @@ def decide_scheduler_backoff_state(
         cadence=cadence,
         host=host,
         current_interval_minutes=current_interval,
-        current_rrule=string_fields["current_rrule"],
-        last_applied_rrule=string_fields["last_applied_rrule"],
-        observed_host_rrule=string_fields["observed_host_rrule"],
-        effective_host_rrule=string_fields["effective_host_rrule"],
+        current_rrule=current_rrule,
+        last_applied_rrule=last_applied_rrule,
+        observed_host_rrule=observed_result_rrule,
+        effective_host_rrule=effective_host_rrule,
         all_host_update_failures=_object_tuple(
             result.get("all_host_update_failures"),
             label="scheduler all-host failure cache",

@@ -1,21 +1,31 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from collections.abc import Mapping
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from enum import Enum
+from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, ParamSpec, TypeVar
 
 from ...control_plane.runtime.public_safety import public_safe_compact_text
 from ...registry import registry_goals
+from ...file_lock import exclusive_file_lock
 from .private_json import write_private_json_atomic
 
 
 GOAL_CHANNEL_BINDING_SCHEMA_VERSION = "loopx_goal_channel_lark_binding_v0"
 GOAL_CHANNEL_OPERATION_SCHEMA_VERSION = "loopx_goal_channel_operation_v0"
+GOAL_CHANNEL_CONNECTION_SET_SCHEMA_VERSION = "loopx_goal_channel_connection_set_v0"
+# Compatibility export for older callers. Scheduler-projected reminder windows
+# now own repeat-notification timing.
 DEFAULT_GATE_COOLDOWN_SECONDS = 3600
 HUMAN_GATE_AUTO_NOTIFY_SETTING = "human_gate_auto_notify_enabled"
+BLOCKED_NOTICE_AUTO_NOTIFY_SETTING = "blocked_notice_auto_notify_enabled"
+BLOCKED_NOTICE_AUTO_NOTIFY_MARKER_SCHEMA_VERSION = "loopx_goal_channel_blocked_notice_marker_v0"
 HUMAN_GATE_AUTO_NOTIFY_MARKER_SCHEMA_VERSION = (
     "loopx_goal_channel_auto_notify_marker_v0"
 )
@@ -29,6 +39,100 @@ PRIVATE_PACKET_KEYS = {
     "sender_profile",
     "table_id",
 }
+
+
+
+class BlockedNoticeReceiptState(str, Enum):
+    """Provider delivery lifecycle; it does not mutate canonical Todo state."""
+
+    PENDING = "pending"
+    SENT_UNVERIFIED = "sent_unverified"
+    DELIVERED = "delivered"
+    RESUMED = "resumed"
+    RESOLVED = "resolved"
+    SUPERSEDED = "superseded"
+
+
+BLOCKED_NOTICE_RETIRED_STATES = frozenset({
+    BlockedNoticeReceiptState.RESUMED,
+    BlockedNoticeReceiptState.RESOLVED,
+    BlockedNoticeReceiptState.SUPERSEDED,
+})
+
+
+def blocked_notice_receipt_matches_target(
+    key: str, receipt: Mapping[str, Any], *, goal_id: str, chat_id: str,
+) -> bool:
+    if not chat_id or receipt.get("kind") != "blocked_notice":
+        return False
+    if receipt.get("chat_id"):
+        return receipt["chat_id"] == chat_id
+    # Older initial receipts encode the destination in their semantic key.
+    # An unbound historical/reopened receipt cannot prove this target's delivery.
+    return key == semantic_key(
+        goal_id, "lark", "blocked_notice", str(receipt.get("blocker_identity") or ""),
+        str(receipt.get("blocker_revision") or ""), chat_id,
+    )
+
+
+class LarkTopicEventDecisionReason(str, Enum):
+    """Typed, content-free outcome of Goal Topic routing."""
+
+    MATCHED = "matched"
+    INVALID_EVENT = "invalid_event"
+    BINDING_UNAVAILABLE = "binding_unavailable"
+    CHAT_MISMATCH = "chat_mismatch"
+    TOPIC_MISMATCH = "topic_mismatch"
+    ROUTE_AMBIGUOUS = "route_ambiguous"
+    SELF_MESSAGE = "self_message"
+    INVALID_ROUTING_STATE = "invalid_routing_state"
+    NOT_ADDRESSED = "not_addressed"
+    HISTORICAL_CONTEXT_ONLY = "historical_context_only"
+    BOT_MESSAGE = "bot_message"
+    HUMAN_IDENTITY_UNVERIFIED = "human_identity_unverified"
+
+
+LARK_TOPIC_EVENT_REJECTION_REASONS = {
+    item.value
+    for item in LarkTopicEventDecisionReason
+    if item is not LarkTopicEventDecisionReason.MATCHED
+}
+
+
+def normalize_lark_topic_event_rejection_reason(value: Any) -> str | None:
+    normalized = str(value or "").strip()
+    return normalized if normalized in LARK_TOPIC_EVENT_REJECTION_REASONS else None
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def serialize_goal_binding_mutation(function: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Serialize a complete binding read/effect/write transaction.
+
+    All public binding writers share this lock, including setup recovery and
+    notification receipts. Locking only the final rename cannot protect the
+    snapshot read before a provider call. Preview remains non-mutating.
+    Decorate entrypoints, not save helpers, to avoid nested kernel locks.
+    """
+    execute_parameter = inspect.signature(function).parameters.get("execute")
+    execute_default = execute_parameter.default if execute_parameter else True
+
+    @wraps(function)
+    def serialized(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        binding_path = kwargs["binding_path"]
+        if not isinstance(binding_path, Path):
+            raise TypeError("binding_path must be a Path")
+        lock = (
+            exclusive_file_lock(binding_path, operation="lark_goal_binding")
+            if kwargs.get("execute", execute_default)
+            else nullcontext()
+        )
+        with lock:
+            return function(*args, **kwargs)
+
+    return serialized
 
 
 def default_goal_channel_binding_path(registry_path: Path) -> Path:
@@ -52,8 +156,7 @@ def read_goal_channel_binding(path: Path) -> dict[str, Any]:
         raise ValueError("Goal Channel binding root must be a JSON object")
     if payload.get("schema_version") != GOAL_CHANNEL_BINDING_SCHEMA_VERSION:
         raise ValueError(
-            "Goal Channel binding must use "
-            f"{GOAL_CHANNEL_BINDING_SCHEMA_VERSION}"
+            f"Goal Channel binding must use {GOAL_CHANNEL_BINDING_SCHEMA_VERSION}"
         )
     bindings = payload.get("bindings")
     if not isinstance(bindings, dict):
@@ -87,16 +190,54 @@ def goal_from_registry(
     return match
 
 
-def binding_for_goal(
+def goal_channel_connection_id(goal_id: str, agent_id: str | None) -> str:
+    """Return a stable public-safe identity for one Goal recipient route."""
+    lane = str(agent_id or "notification-default").strip()
+    digest = hashlib.sha256(f"{goal_id}\0{lane}".encode()).hexdigest()[:20]
+    return f"lark_{digest}"
+
+
+def bindings_for_goal(
     payload: Mapping[str, Any],
     goal_id: str,
     *,
     provider_target: Mapping[str, Any] | None = None,
-) -> dict[str, Any] | None:
+) -> list[dict[str, Any]]:
     bindings = payload.get("bindings")
-    binding = bindings.get(goal_id) if isinstance(bindings, Mapping) else None
-    if not isinstance(binding, Mapping):
-        return None
+    stored = bindings.get(goal_id) if isinstance(bindings, Mapping) else None
+    if not isinstance(stored, Mapping):
+        return []
+    raw_connections = stored.get("connections")
+    if stored.get(
+        "schema_version"
+    ) == GOAL_CHANNEL_CONNECTION_SET_SCHEMA_VERSION and isinstance(
+        raw_connections, Mapping
+    ):
+        candidates = [
+            {**dict(item), "connection_id": str(connection_id)}
+            for connection_id, item in raw_connections.items()
+            if isinstance(item, Mapping)
+        ]
+    else:
+        candidates = [
+            {
+                **dict(stored),
+                "connection_id": goal_channel_connection_id(
+                    goal_id, str(stored.get("agent_id") or "") or None
+                ),
+            }
+        ]
+    return [
+        _resolve_goal_binding(candidate, provider_target=provider_target)
+        for candidate in candidates
+    ]
+
+
+def _resolve_goal_binding(
+    binding: Mapping[str, Any],
+    *,
+    provider_target: Mapping[str, Any] | None,
+) -> dict[str, Any]:
     resolved = dict(binding)
     target_ref = str(resolved.get("target_ref") or "")
     if not target_ref or provider_target is None:
@@ -129,6 +270,60 @@ def binding_for_goal(
     return resolved
 
 
+def binding_for_goal(
+    payload: Mapping[str, Any],
+    goal_id: str,
+    *,
+    provider_target: Mapping[str, Any] | None = None,
+    agent_id: str | None = None,
+    connection_id: str | None = None,
+) -> dict[str, Any] | None:
+    # Select one raw connection before resolving its provider target. A target
+    # belongs to one connection; applying it to every sibling lets an unrelated
+    # Agent's target invalidate the requested Agent's otherwise valid binding.
+    candidates = bindings_for_goal(payload, goal_id)
+    selected: dict[str, Any] | None = None
+    if connection_id:
+        selected = next(
+            (item for item in candidates if item.get("connection_id") == connection_id),
+            None,
+        )
+    elif agent_id is not None:
+        selected = next(
+            (item for item in candidates if item.get("agent_id") == agent_id),
+            None,
+        )
+    else:
+        bindings = payload.get("bindings")
+        stored = bindings.get(goal_id) if isinstance(bindings, Mapping) else None
+        default_id = (
+            str(stored.get("default_connection_id") or "")
+            if isinstance(stored, Mapping)
+            else ""
+        )
+        if default_id:
+            selected = next(
+                (
+                    item
+                    for item in candidates
+                    if item.get("connection_id") == default_id
+                ),
+                None,
+            )
+        if selected is None and candidates:
+            # Keep the invalid-default fallback aligned with the writer in
+            # _without_goal_topic_connection, which promotes min(connection_id).
+            selected = min(
+                candidates,
+                key=lambda item: str(item.get("connection_id") or ""),
+            )
+    return (
+        _resolve_goal_binding(selected, provider_target=provider_target)
+        if selected is not None
+        else None
+    )
+
+
 def human_gate_auto_notify_enabled(binding: Mapping[str, Any] | None) -> bool:
     automation = (
         binding.get("automation")
@@ -137,6 +332,16 @@ def human_gate_auto_notify_enabled(binding: Mapping[str, Any] | None) -> bool:
         else {}
     )
     return automation.get(HUMAN_GATE_AUTO_NOTIFY_SETTING) is True
+
+
+def blocked_notice_auto_notify_enabled(binding: Mapping[str, Any] | None) -> bool:
+    automation = (
+        binding.get("automation")
+        if isinstance(binding, Mapping)
+        and isinstance(binding.get("automation"), Mapping)
+        else {}
+    )
+    return automation.get(BLOCKED_NOTICE_AUTO_NOTIFY_SETTING) is True
 
 
 def human_gate_auto_notify_marker_path(
@@ -186,6 +391,46 @@ def clear_human_gate_auto_notify_marker(path: Path) -> None:
     path.expanduser().unlink(missing_ok=True)
 
 
+def blocked_notice_auto_notify_marker_path(binding_path: Path, goal_id: str) -> Path:
+    human_marker = human_gate_auto_notify_marker_path(binding_path, goal_id)
+    return human_marker.with_name(
+        human_marker.name.replace(
+            ".human-gate-auto-notify.json", ".blocked-notice-auto-notify.json"
+        )
+    )
+
+
+def blocked_notice_auto_notify_marker_enabled(path: Path) -> bool:
+    marker_path = path.expanduser()
+    if not marker_path.exists():
+        return False
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # A damaged enabled marker must leave the sink visibly failed.
+        return True
+    return bool(
+        isinstance(payload, Mapping)
+        and payload.get("schema_version")
+        == BLOCKED_NOTICE_AUTO_NOTIFY_MARKER_SCHEMA_VERSION
+        and payload.get("enabled") is True
+    )
+
+
+def write_blocked_notice_auto_notify_marker(path: Path) -> None:
+    write_private_json_atomic(
+        path,
+        {
+            "schema_version": BLOCKED_NOTICE_AUTO_NOTIFY_MARKER_SCHEMA_VERSION,
+            "enabled": True,
+        },
+    )
+
+
+def clear_blocked_notice_auto_notify_marker(path: Path) -> None:
+    path.expanduser().unlink(missing_ok=True)
+
+
 def quota_human_gate_identity(quota_packet: Mapping[str, Any]) -> str:
     summary = quota_packet.get("user_todo_summary")
     summary = summary if isinstance(summary, Mapping) else {}
@@ -206,7 +451,149 @@ def quota_human_gate_identity(quota_packet: Mapping[str, Any]) -> str:
     ).strip()
 
 
+def _quota_human_gate_items(
+    quota_packet: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    summary = quota_packet.get("user_todo_summary")
+    summary = summary if isinstance(summary, Mapping) else {}
+    for key in ("gate_open_items", "first_open_items"):
+        raw_items = summary.get(key)
+        if not isinstance(raw_items, list):
+            continue
+        items = [dict(item) for item in raw_items if isinstance(item, Mapping)]
+        if items:
+            return items[:3]
+    return []
+
+
+def notification_request_snapshot(status: Mapping[str, Any], goal_id: str) -> dict[str, Any]:
+    """Adapt the existing complete same-read Goal Todo projection for transport.
+
+    This never admits requests: the shared TS owner joins only already selected
+    quota IDs and verifies their version/lifecycle before taking display fields.
+    """
+    queue = status.get("attention_queue") or {}
+    rows = [row for row in queue.get("items", [])
+            if isinstance(row, Mapping) and row.get("goal_id") == goal_id]
+    summary = (rows[0].get("user_todos") or {}) if len(rows) == 1 else {}
+    return {"goal_id": goal_id, "items": summary.get("items", [])}
+
+
+def quota_human_gate_state_generation(
+    quota_packet: Mapping[str, Any],
+) -> str:
+    """Fingerprint the material state of the currently projected human gate."""
+
+    material_items = []
+    for item in _quota_human_gate_items(quota_packet):
+        material_items.append(
+            {
+                key: item.get(key)
+                for key in (
+                    "todo_id",
+                    "gate_id",
+                    "status",
+                    "task_class",
+                    "updated_at",
+                    "material_change_generation",
+                    "decision_scope",
+                    "decision_outcome",
+                    "blocks_agent",
+                    "global_gate",
+                    "unblocks_todo_id",
+                )
+                if item.get(key) is not None
+            }
+        )
+        text = public_safe_compact_text(
+            item.get("text") or item.get("title"),
+            limit=300,
+        )
+        if text:
+            material_items[-1]["text"] = text
+    material: dict[str, Any] = {
+        "gate_identity": quota_human_gate_identity(quota_packet),
+        "items": material_items,
+    }
+    if "request_snapshot" in quota_packet:
+        # Delivery idempotency must cover the complete selected display body,
+        # not only the first 180/300 characters of a scheduling label.
+        material["request_content"] = _gate_notice_projection(
+            quota_packet=quota_packet, goal_id=str(quota_packet.get("goal_id") or ""),
+        )
+    if not material_items:
+        material["state"] = str(quota_packet.get("state") or "")
+        material["question"] = public_safe_compact_text(
+            quota_packet.get("gate_prompt")
+            or quota_packet.get("operator_question")
+            or quota_packet.get("reason"),
+            limit=900,
+        )
+    return semantic_key(
+        "human_gate_state_v0",
+        json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def quota_human_gate_reminder_generation(
+    quota_packet: Mapping[str, Any],
+) -> str | None:
+    cooldown = quota_packet.get("user_gate_notification_cooldown")
+    if (
+        not isinstance(cooldown, Mapping)
+        or cooldown.get("notification_due") is not True
+    ):
+        return None
+    reminder_identity = {
+        key: cooldown.get(key)
+        for key in (
+            "policy",
+            "failed_at",
+            "next_reminder_at",
+            "cooldown_minutes",
+            "reminder_window_minutes",
+        )
+        if cooldown.get(key) is not None
+    }
+    return semantic_key(
+        "human_gate_reminder_v0",
+        json.dumps(
+            reminder_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def quota_human_gate_notification_suppressed(
+    quota_packet: Mapping[str, Any],
+) -> bool:
+    cooldown = quota_packet.get("user_gate_notification_cooldown")
+    return bool(
+        isinstance(cooldown, Mapping)
+        and cooldown.get("notification_suppressed") is True
+    )
+
+
 def quota_selects_human_gate(quota_packet: Mapping[str, Any]) -> bool:
+    if quota_human_gate_notification_suppressed(quota_packet):
+        return False
+    interaction = quota_packet.get("interaction_contract")
+    if isinstance(interaction, Mapping):
+        user_channel = interaction.get("user_channel")
+        if isinstance(user_channel, Mapping):
+            if user_channel.get("notify") != "NOTIFY":
+                return False
+            if user_channel.get("action_required") is True or bool(
+                user_channel.get("actions")
+            ):
+                return True
     return bool(
         quota_packet.get("state") == "operator_gate"
         or quota_packet.get("notify_user_on_gate") is True
@@ -221,7 +608,29 @@ def save_goal_binding(
     goal_id: str,
     binding: Mapping[str, Any],
 ) -> None:
+    """Compatibility writer for the Goal's explicit default connection.
+
+    Existing notification/setup callers intentionally address the default
+    route. Preserve peer Agent routes when the Goal has migrated to a
+    connection set instead of collapsing the set back to v0.
+    """
     bindings = payload.get("bindings")
+    stored = bindings.get(goal_id) if isinstance(bindings, Mapping) else None
+    if (
+        isinstance(stored, Mapping)
+        and stored.get("schema_version") == GOAL_CHANNEL_CONNECTION_SET_SCHEMA_VERSION
+    ):
+        save_goal_connection(
+            binding_path=binding_path,
+            payload=payload,
+            goal_id=goal_id,
+            binding={
+                **dict(binding),
+                "connection_id": str(stored.get("default_connection_id") or ""),
+            },
+            make_default=True,
+        )
+        return
     mutable_bindings = dict(bindings) if isinstance(bindings, Mapping) else {}
     mutable_bindings[goal_id] = dict(binding)
     write_goal_channel_binding(
@@ -231,6 +640,62 @@ def save_goal_binding(
             "bindings": mutable_bindings,
         },
     )
+
+
+def save_goal_connection(
+    *,
+    binding_path: Path,
+    payload: Mapping[str, Any],
+    goal_id: str,
+    binding: Mapping[str, Any],
+    make_default: bool = False,
+) -> str:
+    """Upsert one Agent route while retaining v0 single-binding read compatibility."""
+    connection_id = str(
+        binding.get("connection_id") or ""
+    ) or goal_channel_connection_id(
+        goal_id,
+        str(binding.get("agent_id") or "") or None,
+    )
+    all_bindings = payload.get("bindings")
+    mutable_bindings = dict(all_bindings) if isinstance(all_bindings, Mapping) else {}
+    stored = mutable_bindings.get(goal_id)
+    if (
+        isinstance(stored, Mapping)
+        and stored.get("schema_version") == GOAL_CHANNEL_CONNECTION_SET_SCHEMA_VERSION
+        and isinstance(stored.get("connections"), Mapping)
+    ):
+        connections = dict(stored["connections"])
+        default_id = str(stored.get("default_connection_id") or "")
+    else:
+        connections = {}
+        default_id = ""
+        if isinstance(stored, Mapping):
+            legacy_id = goal_channel_connection_id(
+                goal_id,
+                str(stored.get("agent_id") or "") or None,
+            )
+            connections[legacy_id] = dict(stored)
+            default_id = legacy_id
+    connections[connection_id] = {
+        **dict(binding),
+        "connection_id": connection_id,
+    }
+    if make_default or not default_id:
+        default_id = connection_id
+    mutable_bindings[goal_id] = {
+        "schema_version": GOAL_CHANNEL_CONNECTION_SET_SCHEMA_VERSION,
+        "default_connection_id": default_id,
+        "connections": connections,
+    }
+    write_goal_channel_binding(
+        binding_path,
+        {
+            "schema_version": GOAL_CHANNEL_BINDING_SCHEMA_VERSION,
+            "bindings": mutable_bindings,
+        },
+    )
+    return connection_id
 
 
 def semantic_key(*parts: str) -> str:
@@ -340,49 +805,76 @@ def control_message(
     return "\n".join(lines)
 
 
-def gate_message(
-    *,
+def _gate_notice_projection(
+    *, goal_id: str, quota_packet: Mapping[str, Any],
+) -> dict[str, Any]:
+    # Scheduling labels cannot substitute for a decision request body.
+    from ...control_plane.effect_runtime import effect_runtime_result
+
+    from ...capabilities.manager_context.goal_attention import notice_request_fields
+
+    requests = []
+    for item in _quota_human_gate_items(quota_packet):
+        fields = notice_request_fields(item)
+        fields["request_id"] = public_safe_compact_text(item.get("todo_id") or item.get("gate_id"), limit=120)
+        fields["reason"] = fields["note"]
+        requests.append(fields)
+    notice_input: dict[str, Any] = {"goal_id": goal_id, "requests": requests}
+    if "request_snapshot" in quota_packet:
+        snapshot = quota_packet.get("request_snapshot") or {}
+        notice_input["request_snapshot"] = {
+            "goal_id": snapshot.get("goal_id"),
+            "items": [notice_request_fields(item) for item in snapshot.get("items", [])
+                      if isinstance(item, Mapping)],
+        }
+    return dict(effect_runtime_result("presentation.decision_notice.project", notice_input))
+
+
+def reusable_goal_topic_root(
+    payload: Mapping[str, Any],
     goal_id: str,
-    objective: str,
-    quota_packet: Mapping[str, Any],
-    kanban_url: str,
-) -> tuple[str, str]:
-    question = public_safe_compact_text(
-        quota_packet.get("gate_prompt")
-        or quota_packet.get("operator_question")
-        or quota_packet.get("reason")
-        or "A human decision is required.",
-        limit=900,
-    )
-    summary = quota_packet.get("user_todo_summary")
-    summary = summary if isinstance(summary, Mapping) else {}
-    raw_items = summary.get("first_executable_items") or summary.get(
-        "first_open_items"
-    )
-    items = raw_items if isinstance(raw_items, list) else []
-    todo_lines = [
-        public_safe_compact_text(
-            item.get("text") or item.get("title"),
-            limit=300,
+    *,
+    connection_id: str,
+    provider_target: Mapping[str, Any] | None,
+    chat_id: str,
+) -> str:
+    """Return the established topic root when reconnect may adopt it.
+
+    A reconnect may skip sending a fresh Goal Topic only when the stored
+    connection for this ``connection_id`` is enabled, still resolves through
+    ``provider_target`` (target_ref/provider/chat all validated by the typed
+    reader), and its stored root is a well-formed message id for this chat.
+    Anything else returns "" so the caller sends a new topic.
+    """
+
+    from .goal_channel_transport import MESSAGE_ID_PATTERN
+
+    try:
+        existing = binding_for_goal(
+            payload,
+            goal_id,
+            connection_id=connection_id,
         )
-        for item in items[:3]
-        if isinstance(item, Mapping)
-    ]
-    lines = [
-        f"LoopX human gate for {goal_id}",
-        f"Objective: {objective}",
-        f"Action required: {question}",
-    ]
-    if todo_lines:
-        lines.append("Open user actions:")
-        lines.extend(f"- {line}" for line in todo_lines if line)
-    lines.append("Reply with the requested decision or context; LoopX will validate it.")
-    next_action = public_safe_compact_text(
-        quota_packet.get("recommended_action"),
-        limit=300,
+        if existing is not None:
+            existing = _resolve_goal_binding(existing, provider_target=provider_target)
+    except ValueError:
+        return ""
+    if not existing or existing.get("enabled") is not True:
+        return ""
+    prior_topic = (
+        existing.get("topic") if isinstance(existing.get("topic"), Mapping) else {}
     )
-    if next_action:
-        lines.append(f"Next safe action while waiting: {next_action}")
-    if kanban_url:
-        lines.append(f"Kanban: {kanban_url}")
-    return "\n".join(lines), question
+    prior_channel = (
+        existing.get("channel") if isinstance(existing.get("channel"), Mapping) else {}
+    )
+    candidate_root = str(
+        prior_topic.get("root_message_id")
+        or prior_channel.get("pinned_message_id")
+        or ""
+    )
+    if (
+        MESSAGE_ID_PATTERN.fullmatch(candidate_root)
+        and str(prior_channel.get("chat_id") or "") == chat_id
+    ):
+        return candidate_root
+    return ""

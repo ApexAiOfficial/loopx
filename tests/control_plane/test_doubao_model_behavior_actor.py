@@ -11,6 +11,7 @@ import pytest
 from loopx.control_plane.testing.doubao_model_behavior_actor import (
     DOUBAO_2_1_PRO_MODEL,
     DOUBAO_CHAT_COMPLETIONS_ENDPOINT,
+    DOUBAO_SEED_EVOLVING_MODEL,
     MODEL_BEHAVIOR_PROVIDER_INPUT_SCHEMA_VERSION,
     DoubaoActorTransportError,
     DoubaoModelBehaviorActor,
@@ -55,7 +56,20 @@ def test_provider_input_does_not_select_a_diagnostic_todo() -> None:
         {
             "mode": "should-run",
             "goal_id": "fixture-goal",
-            "interaction_contract": {},
+            "interaction_contract": {
+                "schema_version": "loopx_interaction_contract_v0",
+                "mode": "waiting",
+                "user_channel": {
+                    "action_required": False,
+                    "notify": "DONT_NOTIFY",
+                },
+                "agent_channel": {
+                    "must_attempt": False,
+                    "delivery_allowed": False,
+                    "quiet_noop_allowed": True,
+                },
+                "cli_channel": {"next_cli_actions": []},
+            },
             "selected_todo": None,
             "agent_todo_summary": {
                 "first_executable_items": [{"todo_id": "todo_diagnostic001"}]
@@ -67,7 +81,7 @@ def test_provider_input_does_not_select_a_diagnostic_todo() -> None:
 
     provider_input = _provider_input(request)
 
-    assert provider_input["canonical_selected_todo_id"] is None
+    assert "canonical_selected_todo_id" not in provider_input
     assert (
         provider_input["packet"]["agent_todo_summary"]["first_executable_items"][0][
             "todo_id"
@@ -88,6 +102,19 @@ def test_semantic_instruction_requires_exact_peer_route() -> None:
     assert "same_agent_non_delivery" in instruction
 
 
+def test_todo_validation_does_not_extend_the_actor_result_vocabulary() -> None:
+    for arm in ("full_packet", "candidate_packet"):
+        instruction = _decision_instruction(arm=arm, semantic_contract_required=False)
+        assert "Represent\nvalidation as test" in instruction
+    decision = _decision()
+    decision["intended_action_kinds"] = ["validate"]
+    with pytest.raises(ValueError, match="unknown action kind"):
+        normalize_model_behavior_actor_result({
+            "schema_version": "model_behavior_actor_result_v0",
+            "actor_ref": "fixture-validation", "decision": decision, "tool_calls": [],
+        })
+
+
 def test_semantic_instruction_preserves_candidate_scheduler_and_vision_exactly() -> (
     None
 ):
@@ -101,6 +128,8 @@ def test_semantic_instruction_preserves_candidate_scheduler_and_vision_exactly()
     assert "without filtering or reconstruction" in instruction
     assert "packet.contract_capsule.vision_continuation_audit exactly" in instruction
     assert "including trigger_kinds" in instruction
+    assert "summarize packet.action.planning_horizon" in instruction
+    assert "begin intended_action_kinds with inspect" in instruction
     assert "full packet" not in instruction
 
 
@@ -113,7 +142,85 @@ def test_semantic_instruction_is_arm_scoped() -> None:
 
     assert "first interaction_contract.user_channel.actions value" in full_instruction
     assert "project scheduler_hint" in full_instruction
+    assert "summarize packet.planning_horizon" in full_instruction
     assert "copy packet.scheduler exactly" not in full_instruction
+
+
+@pytest.mark.parametrize("fulfilled", [False, True])
+def test_generated_hook_reads_reach_both_actor_arms_without_legacy_fallback(tmp_path, fulfilled):
+    from loopx.control_plane.capability_hooks import TurnStartHookRegistration, dispatch_turn_start_hooks
+    from loopx.control_plane.quota.live_decision import build_live_quota_should_run_decision
+    from loopx.control_plane.quota.turn_envelope import build_turn_envelope
+    from loopx.control_plane.testing.canary_harness import write_fixture_registry
+    from loopx.control_plane.testing.model_behavior_qualification import model_behavior_semantic_contract_from_packet
+    from loopx.control_plane.testing.quota_fixtures import quota_status_payload
+    from tests.control_plane.test_turn_start_capability_hooks import _result
+
+    registry, runtime, state = tmp_path / "registry.json", tmp_path / "runtime", tmp_path / "state.md"
+    state.write_text("# Goal\n## Objective\nPreserve the complete work contract.\n## Agent Todo\n")
+    write_fixture_registry(project=tmp_path, runtime_root=runtime, registry_path=registry,
+        goal_id="fixture-goal", domain="software", adapter_kind="generic_project_goal_v0",
+        state_file=str(state), registered_agents=["agent-a"], quota_allowed_slots=None)
+    hooks = []
+    expected = []
+    for index in range(8):
+        hook_id = f"fixture.context{index}"
+        read = {"kind": "fixture_context", "command": f"loopx context read --item {index}",
+            "reason": "Read the full evidence. " * 8 + f"Tail {index}", "ordering": "before_work"}
+        hooks.append(TurnStartHookRegistration(hook_id=hook_id, capability_id="operator-inbox",
+            requested_read_scope=("provider_history",), requested_write_scope=(),
+            producer=lambda h=hook_id: _result(hook_id=h, external_reads_performed=False,
+                local_private_state_mutated=False), required_read=read,
+            context_reader=(lambda: {"ok": True, "text": "Full source."}) if fulfilled else None))
+        expected.append({**read, "source": "turn_start_capability_hook", "hook_id": hook_id,
+            "capability_id": "operator-inbox"})
+    dispatch = dispatch_turn_start_hooks(hooks)
+    assert not dispatch["failures"]
+    status = quota_status_payload(goal_id="fixture-goal", status="active",
+        recommended_action="Continue authorized work", coordination={"registered_agents": ["agent-a"]},
+        # Keep selected-Todo admission reads out of this hook-only contract test.
+        agent_todo_items=[])
+    full = build_live_quota_should_run_decision(status, goal_id="fixture-goal", agent_id="agent-a",
+        available_capabilities=["shell"], include_scheduler_detail=False, codex_app_current_rrule=None,
+        registry_path=registry, runtime_root=runtime, turn_start_hook_dispatch=dispatch)
+    # Public synthetic fixture routes only; neither arm invokes a live model.
+    full = json.loads(json.dumps(full).replace(str(tmp_path), "fixture"))
+    # Stale carriers must not override the authoritative list, including [].
+    full["interaction_contract"]["required_reads"] = [{"command": "obsolete root read"}]
+    full["required_reads"] = [{"command": "obsolete payload read"}]
+    expected = [] if fulfilled else expected
+    assert full["interaction_contract"]["agent_channel"]["required_reads"] == expected
+    for arm, packet in [("full_packet", full), ("candidate_packet", build_turn_envelope(full))]:
+        request = build_model_behavior_actor_request(packet, qualification_id=f"reads-{arm}", arm=arm,
+            semantic_contract_required=True, semantic_contract_fields=("required_reads",))
+        provider = _provider_input(request)
+        delivered = provider["packet"]
+        reads = (delivered["interaction_contract"]["agent_channel"]["required_reads"]
+            if arm == "full_packet" else delivered["required_reads"])
+        assert reads == expected
+        assert model_behavior_semantic_contract_from_packet(packet, arm=arm)["required_reads"] == expected
+        instruction = " ".join(_decision_instruction(arm=arm, semantic_contract_required=True,
+            semantic_contract_fields=("required_reads",)).split())
+        if arm == "full_packet":
+            assert "interaction_contract.agent_channel.required_reads, including an empty list" in instruction
+            assert "ordering, hook_id, capability_id and explicit prompt_budget_bytes exactly" in instruction
+            assert "never cap the list at five" in instruction
+
+
+def test_planning_horizon_instruction_excludes_unrelated_semantic_fields() -> None:
+    instruction = " ".join(
+        _decision_instruction(
+            arm="full_packet",
+            semantic_contract_required=True,
+            semantic_contract_fields=("planning_horizon",),
+        ).split()
+    )
+
+    assert "exactly these semantic_contract fields: planning_horizon" in instruction
+    assert "summarize packet.planning_horizon" in instruction
+    assert '"planning_horizon"' in instruction
+    assert "peer_route" not in instruction
+    assert "scheduler_action" not in instruction
 
 
 def test_direct_actor_uses_canonical_endpoint_without_tools_or_raw_retention() -> None:
@@ -152,7 +259,7 @@ def test_direct_actor_uses_canonical_endpoint_without_tools_or_raw_retention() -
     assert captured["timeout_seconds"] == 12
     system_instruction = captured["body"]["messages"][0]["content"]
     compact_instruction = " ".join(system_instruction.lower().split())
-    assert "canonical_selected_todo_id exactly" in compact_instruction
+    assert "canonical_selected_todo_id" not in compact_instruction
     assert "never infer a todo id from summaries" in compact_instruction
     assert "follow any packet response_plan exactly" in compact_instruction
     assert "when user_action_required=true, choose decision=ask_user" not in (
@@ -162,8 +269,8 @@ def test_direct_actor_uses_canonical_endpoint_without_tools_or_raw_retention() -
     assert provider_input == {
         "schema_version": MODEL_BEHAVIOR_PROVIDER_INPUT_SCHEMA_VERSION,
         "arm": "candidate_packet",
-        "canonical_selected_todo_id": "todo_fixture001",
         "semantic_contract_required": False,
+        "semantic_contract_fields": [],
         "packet": {
             "schema_version": "loopx_turn_envelope_v0",
             "action": {"selected_todo": {"todo_id": "todo_fixture001"}},
@@ -214,13 +321,29 @@ def test_environment_factory_fails_closed_without_injected_key() -> None:
     with pytest.raises(RuntimeError, match="ARK_API_KEY is not injected"):
         DoubaoModelBehaviorActor.from_environment(environ={})
 
-    with pytest.raises(ValueError, match="allowlisted Doubao 2.1"):
+    with pytest.raises(ValueError, match="explicitly allowlisted"):
         DoubaoModelBehaviorActor.from_environment(
             environ={
                 "ARK_API_KEY": "fixture-key-not-a-secret",
                 "LOOPX_MODEL_BEHAVIOR_MODEL": "future-model-v9",
             }
         )
+
+
+def test_environment_factory_accepts_doubao_seed_evolving() -> None:
+    actor = DoubaoModelBehaviorActor.from_environment(
+        environ={
+            "ARK_API_KEY": "fixture-key-not-a-secret",
+            "LOOPX_MODEL_BEHAVIOR_MODEL": DOUBAO_SEED_EVOLVING_MODEL,
+        },
+        transport=lambda **_: {
+            "choices": [{"message": {"content": json.dumps(_decision())}}]
+        },
+    )
+
+    result = normalize_model_behavior_actor_result(actor(_request()))
+
+    assert result["actor_ref"] == f"ark:{DOUBAO_SEED_EVOLVING_MODEL}"
 
 
 @pytest.mark.parametrize(
@@ -268,8 +391,16 @@ def test_actor_sanitizes_unexpected_transport_errors() -> None:
             "provider_authentication_failed",
             "Doubao actor authentication failed; refresh ARK_API_KEY before retrying",
         ),
-        (403, "provider_http_error", "Doubao actor request failed with HTTP status 403"),
-        (429, "provider_http_error", "Doubao actor request failed with HTTP status 429"),
+        (
+            403,
+            "provider_http_error",
+            "Doubao actor request failed with HTTP status 403",
+        ),
+        (
+            429,
+            "provider_http_error",
+            "Doubao actor request failed with HTTP status 429",
+        ),
     ],
 )
 def test_direct_transport_classifies_http_errors_without_exposing_response(
@@ -326,3 +457,36 @@ def test_actor_rejects_noncanonical_request_before_transport() -> None:
     with pytest.raises(ValueError, match="canonical no-write contract"):
         actor(request)
     assert called is False
+
+
+@pytest.mark.parametrize("arm", ["full_packet", "candidate_packet"])
+def test_direct_actor_delivers_complete_source_with_matching_field_instructions(arm: str) -> None:
+    from loopx.control_plane.quota.turn_envelope import compose_turn_decision
+    from tests.control_plane.test_model_behavior_qualification import _full_packet
+
+    packet = compose_turn_decision(_full_packet())
+    captured = []
+    def transport(**kwargs):
+        captured.append(json.loads(kwargs["body"]))
+        return {"choices": [{"message": {"content": json.dumps(_decision())}}]}
+    actor = DoubaoModelBehaviorActor(api_key="fixture-key-not-a-secret", transport=transport)
+    request = build_model_behavior_actor_request(packet, qualification_id="current-provider-wire",
+        arm=arm, semantic_contract_required=True,
+        semantic_contract_fields=("required_reads", "peer_route", "write_scope"))
+    actor(request)
+    assert len(captured) == 1
+    body = captured[0]
+    wire = json.loads(body["messages"][1]["content"])
+    assert wire["arm"] == arm
+    assert wire["packet"] == packet
+    assert wire["packet"]["selected_todo"]["todo_id"] == "todo_fixture001"
+    assert "tools" not in body
+    instruction = " ".join(body["messages"][0]["content"].split())
+    assert "interaction_contract.agent_channel" in instruction
+    assert "packet.agent_identity.agent_id" in instruction
+    assert "packet.selected_todo" in instruction
+    assert "goal_boundary.write_scope" in instruction
+    assert "copy packet.required_reads exactly" not in instruction
+    assert "use packet.action and packet.writeback" not in instruction
+    assert "action signature" not in instruction
+    assert "simulator has no external-effect authority" in instruction

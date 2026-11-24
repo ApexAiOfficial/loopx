@@ -50,7 +50,10 @@ work_dir=$3
 profile_root=$4
 executable=$5
 setpriv_bin=$6
-shift 6
+init_bin=$7
+shift 7
+runtime_file_count=$1
+shift
 
 mount --make-rprivate /
 sandbox_root="$work_dir/.sandbox-root"
@@ -125,23 +128,34 @@ if [ -n "$profile_root" ]; then
     mount --bind "$profile_root" "$sandbox_root$profile_root"
 fi
 
-# A test launcher or alternate Codex binary may live outside the shared system
-# runtime, work directory, or formal profile.  Re-expose only the resolved file.
-bind_executable=1
-case "$executable" in
-    /usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|"$work_dir"/*) bind_executable=0 ;;
-esac
-if [ -n "$profile_root" ]; then
-    case "$executable" in
-        "$profile_root"/*) bind_executable=0 ;;
+# A test launcher, alternate Codex binary, or init may live outside the shared
+# system runtime, work directory, or formal profile.  Re-expose only each
+# resolved file.
+bind_runtime_file() {
+    runtime_file=$1
+    bind_file=1
+    case "$runtime_file" in
+        /usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|"$work_dir"/*) bind_file=0 ;;
     esac
-fi
-if [ "$bind_executable" = 1 ]; then
-    mkdir -p "$sandbox_root$(dirname "$executable")"
-    touch "$sandbox_root$executable"
-    mount --bind "$executable" "$sandbox_root$executable"
-    mount -o remount,bind,ro "$sandbox_root$executable"
-fi
+    if [ -n "$profile_root" ]; then
+        case "$runtime_file" in
+            "$profile_root"/*) bind_file=0 ;;
+        esac
+    fi
+    if [ "$bind_file" = 1 ]; then
+        mkdir -p "$sandbox_root$(dirname "$runtime_file")"
+        touch "$sandbox_root$runtime_file"
+        mount --bind "$runtime_file" "$sandbox_root$runtime_file"
+        mount -o remount,bind,ro "$sandbox_root$runtime_file"
+    fi
+}
+bind_runtime_file "$executable"
+bind_runtime_file "$init_bin"
+while [ "$runtime_file_count" -gt 0 ]; do
+    bind_runtime_file "$1"
+    shift
+    runtime_file_count=$((runtime_file_count - 1))
+done
 
 mkdir -p "$sandbox_root/.old-root"
 cd "$sandbox_root"
@@ -157,7 +171,9 @@ cd "$work_dir"
 
 # Capabilities exist only inside the fresh user namespace so Codex can install
 # its nested workspace/network sandbox.  They cannot reach the host namespace.
-exec "$setpriv_bin" --no-new-privs "$executable" "$@"
+# Keep a real init as PID 1 so orphaned command subprocesses are reaped during
+# long-running Goal workers instead of accumulating as defunct processes.
+exec "$init_bin" -s -- "$setpriv_bin" --no-new-privs "$executable" "$@"
 """
 
 
@@ -279,7 +295,10 @@ def _atomic_write_text(path: Path, text: str) -> None:
     )
     temporary_path = Path(temporary)
     try:
-        os.fchmod(descriptor, path.stat().st_mode & 0o777)
+        # Windows has no fchmod; the POSIX permission bits of the source file do
+        # not exist there either, so the copy keeps the platform default.
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, path.stat().st_mode & 0o777)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(text)
             stream.flush()
@@ -456,6 +475,7 @@ def build_native_codex_isolation_envelope(
     unshare = _resolve_executable("unshare", error="native_codex_unshare_missing")
     setpriv = _resolve_executable("setpriv", error="native_codex_setpriv_missing")
     shell = _resolve_executable("sh", error="native_codex_shell_missing")
+    init = _resolve_executable("tini", error="native_codex_init_missing")
     resolved_executable = _resolve_executable(
         executable, error="native_codex_executable_missing"
     )
@@ -470,6 +490,39 @@ def build_native_codex_isolation_envelope(
         raise NativeCodexIsolationError(
             "native_codex_executable_inside_workspace_source"
         )
+    if init == resolved_private_root or resolved_private_root in init.parents:
+        raise NativeCodexIsolationError("native_codex_init_inside_private_root")
+    # Standalone Codex invokes these companions after app-server startup.
+    # Bind exact files, never their containing distribution directory.
+    runtime_files: list[Path] = []
+    for candidate in (
+        resolved_executable.parent / "codex-resources" / "bwrap",
+        resolved_executable.parent.parent / "codex-resources" / "bwrap",
+        resolved_executable.with_name("codex-code-mode-host"),
+    ):
+        if not candidate.exists() and not candidate.is_symlink():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise NativeCodexIsolationError("native_codex_companion_invalid") from exc
+        if resolved != candidate or not resolved.is_file():
+            raise NativeCodexIsolationError("native_codex_companion_invalid")
+        if any(
+            root is not None and (resolved == root or root in resolved.parents)
+            for root in (resolved_private_root, resolved_workspace)
+        ):
+            raise NativeCodexIsolationError(
+                "native_codex_companion_inside_restricted_root"
+            )
+        runtime_files.append(resolved)
+    mutable_roots = [resolved_work_dir]
+    if resolved_workspace is not None:
+        mutable_roots.append(resolved_workspace)
+    if resolved_profile is not None:
+        mutable_roots.append(resolved_profile)
+    if any(init == root or root in init.parents for root in mutable_roots):
+        raise NativeCodexIsolationError("native_codex_init_inside_mutable_root")
     if workspace_alias is not None:
         workspace_alias.mkdir(parents=True, exist_ok=True)
 
@@ -491,6 +544,9 @@ def build_native_codex_isolation_envelope(
         profile_raw,
         str(resolved_executable),
         str(setpriv),
+        str(init),
+        str(len(runtime_files)),
+        *(str(path) for path in runtime_files),
         *(str(value) for value in process_args),
     )
     return NativeCodexIsolationEnvelope(

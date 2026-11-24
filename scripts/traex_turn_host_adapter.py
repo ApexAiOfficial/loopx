@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Thin TraeX host adapter for the LoopX governed Turn contract.
 
-LoopX runs this adapter with one ``loopx_turn_host_request_v0`` JSON object on
-stdin. The adapter:
+LoopX supplies the versioned Turn Host request on stdin. The adapter:
 
-1. extracts the bounded action text from the Turn envelope,
+1. checks the recorded request version and renders the governed Turn input,
 2. invokes one headless ``traex exec`` in the governed workspace,
 3. asks TraeX for one schema-constrained public-safe result file,
 4. emits exactly one ``loopx_turn_result_v0`` JSON object on stdout.
@@ -17,7 +16,6 @@ stay in ``loopx turn run-once``; this is a dumb translation layer.
 from __future__ import annotations
 
 import argparse
-from hashlib import sha256
 import json
 import os
 import sys
@@ -34,13 +32,28 @@ from loopx.extensions.process_runtime import (  # noqa: E402
     CappedProcessResult,
     run_capped_process,
 )
-from loopx.control_plane.quota.turn_envelope import (  # noqa: E402
-    turn_envelope_action_signature_document,
+from loopx.control_plane.turn_driver.executor import (  # noqa: E402
+    HOST_AGENT_VISION_JSON_MAX_CHARS,
+    HOST_PATH_DELTA_MODES,
+    HOST_PROGRESS_OBSERVATION_JSON_MAX_CHARS,
+    HOST_RESULT_EVIDENCE_LIMITS,
+)
+from loopx.control_plane.turn_driver.host_candidate import (  # noqa: E402
+    ACCEPTED_RESULT_KINDS as COMPLETE_RESULT_KINDS,
+    LOOPX_TURN_HOST_REQUEST_SCHEMA as LOOPX_TURN_HOST_REQUEST_SCHEMA,
+    COMPLETED_PHASES as COMPLETED_PHASES,
+    assert_turn_host_request_version,
+    LOOPX_TURN_RESULT_SCHEMA as LOOPX_TURN_RESULT_SCHEMA,
+    TEXT_LIMITS,
+    build_result as build_host_result,
+    extract_action_text as extract_action_text,
+    extract_turn_authority,
+    render_prompt as render_host_prompt,
 )
 
-LOOPX_TURN_HOST_REQUEST_SCHEMA = "loopx_turn_host_request_v0"
-LOOPX_TURN_RESULT_SCHEMA = "loopx_turn_result_v0"
-COMPLETED_PHASES = ["host_execute", "typed_result"]
+from loopx.control_plane.work_items.delivery_batch_scale import DELIVERY_BATCH_SCALE_CHOICES  # noqa: E402
+from loopx.control_plane.work_items.delivery_outcome import DELIVERY_OUTCOME_CHOICES  # noqa: E402
+
 TRAEX_OUTPUT_LIMIT_BYTES = 1_000_000
 
 ACCEPTED_RESULT_KINDS = {
@@ -50,78 +63,6 @@ ACCEPTED_RESULT_KINDS = {
     "user_action_required",
     "wait",
 }
-MATERIAL_KINDS = {"validated_progress", "repair_required", "replan_required"}
-
-TEXT_LIMITS = {
-    "classification": 120,
-    "recommended_action": 1_200,
-    "next_action": 1_200,
-    "vision_unchanged_reason": 240,
-    "summary": 400,
-}
-
-def _bounded(value: Any, *, limit: int) -> str:
-    text = str(value or "").strip()
-    if len(text) > limit:
-        return text[: limit - 3].rstrip() + "..."
-    return text
-
-
-def _mapping(value: Any) -> dict[str, Any]:
-    return dict(value) if isinstance(value, Mapping) else {}
-
-
-def _canonical_hash(value: Any) -> str:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return "sha256:" + sha256(encoded).hexdigest()
-
-
-def extract_turn_authority(request: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the signed action and safety boundary exactly as projected."""
-
-    envelope = _mapping(request.get("turn_envelope"))
-    signature = _mapping(envelope.get("action_signature"))
-    source_hash = str(signature.get("source_hash") or "")
-    envelope_hash = str(signature.get("envelope_hash") or "")
-    computed_envelope_hash = _canonical_hash(
-        turn_envelope_action_signature_document(envelope)
-    )
-    if (
-        signature.get("matches") is not True
-        or not source_hash
-        or source_hash != envelope_hash
-        or envelope_hash != computed_envelope_hash
-    ):
-        raise ValueError("TurnEnvelope action signature is missing or does not match")
-
-    action = _mapping(envelope.get("action"))
-    primary_action = _bounded(
-        action.get("primary_action"),
-        limit=TEXT_LIMITS["recommended_action"],
-    )
-    if not primary_action:
-        raise ValueError("signed TurnEnvelope has no primary_action")
-
-    boundary = _mapping(envelope.get("boundary"))
-    required_reads = envelope.get("required_reads")
-    write_scope = boundary.get("write_scope")
-    return {
-        "primary_action": primary_action,
-        "required_reads": list(required_reads) if isinstance(required_reads, list) else [],
-        "write_scope": list(write_scope) if isinstance(write_scope, list) else [],
-        "workspace_guard": _mapping(boundary.get("workspace_guard")),
-    }
-
-
-def extract_action_text(request: Mapping[str, Any]) -> str:
-    """Return the bounded, control-plane-authored task body for the host."""
-
-    return str(extract_turn_authority(request)["primary_action"])
 
 
 def render_prompt(authority: Mapping[str, Any]) -> str:
@@ -131,11 +72,10 @@ def render_prompt(authority: Mapping[str, Any]) -> str:
     reads back as a typed candidate. It stays public-safe and bounded.
     """
 
+    if "_model_input" in authority:
+        return render_host_prompt(authority)
     authority_json = json.dumps(
-        dict(authority),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+        dict(authority), ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
     return (
         "You are executing one bounded LoopX-governed work segment.\n"
@@ -159,34 +99,45 @@ def render_prompt(authority: Mapping[str, Any]) -> str:
     )
 
 
-def traex_result_schema() -> dict[str, Any]:
-    properties = {
+def traex_result_schema(*, complete: bool = False) -> dict[str, Any]:
+    properties: dict[str, Any] = {
         "result_kind": {
             "type": "string",
-            "enum": sorted(ACCEPTED_RESULT_KINDS),
+            "enum": sorted(COMPLETE_RESULT_KINDS if complete else ACCEPTED_RESULT_KINDS),
         },
         **{
             field: {"type": "string", "maxLength": limit}
             for field, limit in TEXT_LIMITS.items()
         },
     }
+    if complete:
+        properties.update({
+            "delivery_batch_scale": {"type": "string", "enum": list(DELIVERY_BATCH_SCALE_CHOICES)},
+            "delivery_outcome": {"type": "string", "enum": list(DELIVERY_OUTCOME_CHOICES)},
+            "path_delta_mode": {"type": "string", "enum": sorted(HOST_PATH_DELTA_MODES - {""})},
+            "agent_vision_json": {"type": "string", "maxLength": HOST_AGENT_VISION_JSON_MAX_CHARS},
+            "progress_observation_json": {"type": "string", "maxLength": HOST_PROGRESS_OBSERVATION_JSON_MAX_CHARS},
+            **{
+                name: {"type": "array", "minItems": 1, "maxItems": count,
+                       "items": {"type": "string", "minLength": 1, "maxLength": width}}
+                for name, (count, width, _) in HOST_RESULT_EVIDENCE_LIMITS.items()
+            },
+        })
     return {
         "type": "object",
         "properties": properties,
-        "required": list(properties),
+        "required": ["result_kind"] if complete else list(properties),
         "additionalProperties": False,
     }
 
 
-def read_structured_result(path: Path) -> dict[str, Any] | None:
+def read_structured_result(path: Path, *, complete: bool = False) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if (
-        not isinstance(value, dict)
-        or str(value.get("result_kind") or "") not in ACCEPTED_RESULT_KINDS
-    ):
+    accepted_kinds = COMPLETE_RESULT_KINDS if complete else ACCEPTED_RESULT_KINDS
+    if not isinstance(value, dict) or str(value.get("result_kind") or "") not in accepted_kinds:
         return None
     return value
 
@@ -199,73 +150,13 @@ def build_result(
 ) -> dict[str, Any]:
     """Shape a model result block into a valid loopx_turn_result_v0."""
 
-    turn_key = str(request.get("turn_key") or "")
-    if candidate is None:
-        # Fail closed: no typed material claim means a stop, never fabricated
-        # progress. This spends no quota.
-        return {
-            "schema_version": LOOPX_TURN_RESULT_SCHEMA,
-            "turn_key": turn_key,
-            "result_kind": "wait",
-            "completed_phases": list(COMPLETED_PHASES),
-            "classification": "no_typed_host_result",
-            "next_action": _bounded(
-                fallback_reason
-                or "TraeX returned no typed result block; rerun or inspect the host session.",
-                limit=TEXT_LIMITS["next_action"],
-            ),
-            "vision_unchanged_reason": _bounded(
-                "host adapter could not confirm a material change",
-                limit=TEXT_LIMITS["vision_unchanged_reason"],
-            ),
-        }
-
-    kind = str(candidate.get("result_kind") or "").strip()
-    result: dict[str, Any] = {
-        "schema_version": LOOPX_TURN_RESULT_SCHEMA,
-        "turn_key": turn_key,
-        "result_kind": kind,
-        "completed_phases": list(COMPLETED_PHASES),
-    }
-    for field, limit in TEXT_LIMITS.items():
-        if field == "vision_unchanged_reason":
-            continue
-        value = candidate.get(field)
-        text = _bounded(value, limit=limit) if value else ""
-        if text:
-            result[field] = text
-
-    if kind in MATERIAL_KINDS:
-        result["delivery_batch_scale"] = "single_surface"
-        result["delivery_outcome"] = "outcome_progress"
-        # Material results require these bounded text fields; fill them from
-        # adjacent fields if the model returned a sparse block.
-        if not result.get("recommended_action"):
-            result["recommended_action"] = _bounded(
-                result.get("next_action") or result.get("classification") or kind,
-                limit=TEXT_LIMITS["recommended_action"],
-            )
-        if not result.get("next_action"):
-            result["next_action"] = _bounded(
-                result.get("recommended_action"),
-                limit=TEXT_LIMITS["next_action"],
-            )
-        if not result.get("classification"):
-            result["classification"] = _bounded(
-                kind, limit=TEXT_LIMITS["classification"]
-            )
-    # This adapter has no goal-vision packet, so the executor treats the path
-    # delta as unchanged and requires a bounded reason for material results.
-    result["vision_unchanged_reason"] = _bounded(
-        candidate.get("vision_unchanged_reason")
-        or (
-            "host reported material work without a goal vision replan packet"
-            if kind in MATERIAL_KINDS
-            else "host reported no material change"
+    return build_host_result(
+        request, candidate, host_name="TraeX",
+        fallback_reason=fallback_reason or (
+            "TraeX returned no typed result block; rerun or inspect the host session."
+            if candidate is None else ""
         ),
-        limit=TEXT_LIMITS["vision_unchanged_reason"],
     )
-    return result
 
 
 def run_traex(
@@ -275,7 +166,8 @@ def run_traex(
     workspace: Path,
     schema_path: Path,
     output_path: Path,
-    permission_mode: str,
+    permission_mode: str | None,
+    sandbox: str,
     model: str | None,
     timeout_seconds: float,
     skip_git_repo_check: bool,
@@ -283,7 +175,9 @@ def run_traex(
     argv: list[str] = [traex_bin, "exec"]
     if skip_git_repo_check:
         argv.append("--skip-git-repo-check")
-    argv.extend(["--permission-mode", permission_mode])
+    if permission_mode:
+        argv.extend(["--permission-mode", permission_mode])
+    argv.extend(["--sandbox", sandbox])
     argv.extend(["--output-schema", str(schema_path)])
     argv.extend(["--output-last-message", str(output_path)])
     if model:
@@ -304,9 +198,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--workspace", default=os.getcwd())
     parser.add_argument(
         "--permission-mode",
-        default="default",
-        choices=("default", "auto", "bypass_permissions", "custom"),
-        help="TraeX exec permission mode; defaults to workspace-safe agent permissions",
+        default=None,
+        choices=("bypass_permissions", "custom"),
+        help=(
+            "Explicit TraeX exec permission mode. By default the adapter omits "
+            "this flag so TraeX applies its non-interactive headless policy."
+        ),
+    )
+    parser.add_argument(
+        "--sandbox",
+        default="workspace-write",
+        choices=("read-only", "workspace-write", "danger-full-access"),
+        help="TraeX sandbox; defaults to writes inside the governed workspace.",
     )
     parser.add_argument("-m", "--model", default=None)
     parser.add_argument("--timeout-seconds", type=float, default=600.0)
@@ -322,23 +225,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"adapter: invalid request JSON on stdin: {exc}", file=sys.stderr)
         return 2
-    if not isinstance(request, dict) or request.get("schema_version") != LOOPX_TURN_HOST_REQUEST_SCHEMA:
-        print("adapter: stdin is not a loopx_turn_host_request_v0 object", file=sys.stderr)
-        return 2
-
     try:
+        if not isinstance(request, dict):
+            raise ValueError("Host request must be an object")
+        assert_turn_host_request_version(request)
         authority = extract_turn_authority(request)
-    except ValueError as exc:
-        print(f"adapter: invalid TurnEnvelope authority: {exc}", file=sys.stderr)
+    except (ValueError, RuntimeError) as exc:
+        print(f"adapter: invalid LoopX Turn Host request: {exc}", file=sys.stderr)
         return 2
 
+    complete = "_model_input" in authority
     with tempfile.TemporaryDirectory(prefix="loopx-turn-traex-") as directory:
         temporary = Path(directory)
         schema_path = temporary / "result-schema.json"
         output_path = temporary / "last-message.json"
         schema_path.write_text(
             json.dumps(
-                traex_result_schema(),
+                traex_result_schema(complete=complete),
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -353,6 +256,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 schema_path=schema_path,
                 output_path=output_path,
                 permission_mode=args.permission_mode,
+                sandbox=args.sandbox,
                 model=args.model,
                 timeout_seconds=args.timeout_seconds,
                 skip_git_repo_check=args.skip_git_repo_check,
@@ -374,7 +278,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return completed.returncode if completed.returncode > 0 else 1
 
-        candidate = read_structured_result(output_path)
+        candidate = read_structured_result(output_path, complete=complete)
     result = build_result(request, candidate)
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")), flush=True)
     return 0

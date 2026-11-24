@@ -111,7 +111,9 @@ def test_runtime_capability_gap_returns_verified_reentry_packet() -> None:
             "quota spend-slot",
             "quota monitor-poll",
         ],
-        "session_scoped": True,
+        "session_scoped": False,
+        "observation_scope": "host_registry_goal_agent",
+        "remembers": ["benchmark_runner", "network", "external_evidence_poll", "worker_bridge", "cli_bridge"],
         "durable_grant_written": False,
     }
     candidate = reentry["candidates"][0]
@@ -142,6 +144,45 @@ def test_runtime_capability_gap_returns_verified_reentry_packet() -> None:
         and "spend-slot" not in action
         for action in contract["cli_channel"]["next_cli_actions"]
     )
+
+
+def test_runtime_capability_reentry_preserves_visible_goal_turn() -> None:
+    turn_instance_id = "guided-start:fixture-turn"
+    contract = build_interaction_contract(
+        _blocked_payload(missing=["network"]),
+        available_capabilities=["shell"],
+        scheduler_execution_context=MANAGED_AGENT_CONTEXT,
+        turn_instance_id=turn_instance_id,
+    )
+
+    candidate = contract["cli_channel"]["runtime_capability_reentry"][
+        "candidates"
+    ][0]
+    assert candidate["command"] == (
+        "loopx --format json quota should-run --goal-id "
+        f"{GOAL_ID} --agent-id {AGENT_ID} "
+        f"--turn-instance-id {turn_instance_id} "
+        "--available-capability shell --available-capability network "
+        "--runtime-profile ark_managed_agent_goal"
+    )
+    assert contract["cli_channel"]["next_cli_actions"] == [candidate["command"]]
+
+
+def test_runtime_capability_reentry_keeps_runtime_root() -> None:
+    runtime_root = "/tmp/loopx-runtime-capability-reentry"
+    contract = build_interaction_contract(
+        _blocked_payload(missing=["network"]),
+        available_capabilities=["shell"],
+        scheduler_execution_context=MANAGED_AGENT_CONTEXT,
+        turn_instance_id="guided-start:fixture-turn",
+        runtime_root=runtime_root,
+    )
+
+    candidate = contract["cli_channel"]["runtime_capability_reentry"][
+        "candidates"
+    ][0]
+    assert candidate["command"].startswith(f"loopx --runtime-root {runtime_root} ")
+    assert contract["cli_channel"]["next_cli_actions"] == [candidate["command"]]
 
 
 def test_runtime_capability_reentry_does_not_switch_from_selected_todo() -> None:

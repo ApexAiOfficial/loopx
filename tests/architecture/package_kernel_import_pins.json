@@ -1,0 +1,34 @@
+{
+  "schema": "loopx_package_kernel_import_pins_v0",
+  "baseline_commit": "aee77700812dd60e75375e8b329e552493da8069",
+  "note": "Exact pin of every `loopx.*` module imported by a co-located package. The supported-host-integration decision in the monorepo-distribution-split RFC Section 5 defines the public host facade used by MemT and Ark and the shared file-lock API. Pre-existing private edges remain pinned migration debt. Remove an entry in the PR that removes the import. Adding an entry needs a recorded design decision.",
+  "imports": {
+    "loopx-codex-provider-routing": [
+      "loopx.extensions.chat_service_guard"
+    ],
+    "loopx-ark-turn": [
+      "loopx.control_plane.turn_driver.host_candidate",
+      "loopx.extensions.turn_host",
+      "loopx.file_lock"
+    ],
+    "loopx-finance-value-discovery": [
+      "loopx.extensions.lark.presentation.message_card",
+      "loopx.extensions.presentation"
+    ],
+    "loopx-jev": [
+      "loopx.capabilities.progress_review.receipt",
+      "loopx.control_plane.effect_runtime",
+      "loopx.control_plane.goals.acceptance",
+      "loopx.control_plane.work_items.autonomous_replan_ack",
+      "loopx.control_plane.work_items.external_progress_review",
+      "loopx.control_plane.work_items.progress_observation",
+      "loopx.control_plane.work_items.progress_result",
+      "loopx.entrypoint",
+      "loopx.file_lock"
+    ],
+    "loopx-memt-turn": [
+      "loopx.extensions.turn_host",
+      "loopx.file_lock"
+    ]
+  }
+}

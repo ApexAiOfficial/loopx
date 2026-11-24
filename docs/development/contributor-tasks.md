@@ -10,26 +10,68 @@ It is intentionally different from `.local` active goal state:
 - private benchmark traces, verifier output, raw agent sessions, credentials,
   internal document links, and local machine paths must not be copied here.
 
-The goal is to make important work discoverable without turning the repository
-into a mirror of maintainer scratch state.
+Landed context, the product-manager cut, the maintainer progress log and the
+Turn Loop Controller plan moved to
+[contributor-tasks-history.md](contributor-tasks-history.md) on 2026-09-26 so
+that this board only lists work that is still open and anchored.
+
+## Task Admission Rule
+
+This curated board lists work with **one canonical anchor**, **one gap** and
+**one exit**. Ordinary self-contained contributions may go directly to a PR
+under [CONTRIBUTING](../../CONTRIBUTING.md#find-work) without a pre-existing
+issue, roadmap card or RFC. Merged active RFCs are Accepted, qualified design
+bases and available to claim; implementation evidence and live authorization
+remain separate under the [RFC lifecycle contract](../architecture/rfcs/README.md#how-to-read-this-index).
+
+| Anchor type | What to cite | Example |
+| --- | --- | --- |
+| Roadmap | An S stream, G milestone or R card in the [overall roadmap](../architecture/rfcs/loopx-overall-roadmap-v0.md), plus the sentence in that card that the task closes | `R1 · "confirmed commitments survive materialization"` |
+| RFC obligation | An RFC in [docs/architecture/rfcs](../architecture/rfcs/README.md) with status Accepted, plus the section or invariant the task implements or pins | `shared-goal-authority-state-provider-v0 · §lease transfer` |
+| Reproduced adoption defect | A public issue with a reproduction from a real install, first run, upgrade, host or platform, opened by or confirmed with a user | `#4941 Windows non-UTF-8 locale` |
+
+The **gap** states who is blocked without the change and what they can do
+after it. The **exit** states when the row closes. A row without all three is
+not a task; it is a discussion.
+
+The following do not establish a useful task by themselves. Name the concrete
+gap and consumer they serve; curated rows also need a canonical anchor:
+
+- a new entry in the [interaction pattern catalog](../concepts/interaction-pattern-catalog.md)
+  (see its admission note);
+- a test that pins current behavior without reproducing a public defect or an
+  RFC invariant named in the row;
+- another dimension, provider arm or fixture row on an existing conformance
+  fixture without a named invariant it newly covers;
+- renaming, re-wording or restating existing text without correcting a demonstrated defect or serving a concrete maintenance outcome;
+- a module split, extraction or "own X in its own module" change without a
+  budget, boundary test or caller it unblocks.
+
+Maintainers route such proposals to a Discussion or fold them into the row that
+needs them. Review credits the gap closed, not the PR count; release notes list
+contributors by anchored rows.
 
 ## Status Legend
 
 | Status | Meaning |
 | --- | --- |
-| Available | Ready for someone to comment on the linked issue or open a small PR. |
+| Available | Ready for a contributor to claim the linked outcome and deliver a cohesive PR. |
 | Claimed | Someone has said they are working on it, or a maintainer assigned it. |
 | Maintainer-owned | Active work is happening in maintainer/local automation; ask before touching. |
 | Needs design | Discussion is welcome, but implementation needs agreement first. |
 | Blocked | Waiting on a decision, dependency, or maintainer writeback. |
-| Done | Completed and ready to archive from this board. |
+| Done | Completed; moved to [history](contributor-tasks-history.md). |
 
 ## How To Claim Work
 
+For first-review contacts, accepted subsystem owners and voluntary scope
+confirmation, use the [governance review roster](../../.github/GOVERNANCE.md#first-review-responsibilities).
+Request the closest contact before escalating to the lead maintainer.
+
 1. Prefer a linked GitHub issue. If there is no issue yet, open one with the
-   contributor task template.
+   contributor task template; it asks for the anchor and the gap.
 2. Comment that you would like to work on the task. Maintainers will mark it
-   `claimed` or suggest a smaller slice.
+   `claimed` or agree a complete, independently verifiable slice.
 3. For docs-only typo fixes or obviously tiny cleanups, opening a direct PR is
    fine.
 4. If a claimed task has no update for 14 days, maintainers may release it back
@@ -37,163 +79,73 @@ into a mirror of maintainer scratch state.
 5. If a task is `Maintainer-owned`, do not duplicate the work. Ask whether
    there is a public helper slice instead.
 
-## Current Technical Directions
+Before claiming a row, reconcile its anchor with latest main, related PRs and
+the roadmap. Historical rows are not proof that a missing feature remains
+unimplemented or a proposed slice is still useful. The
+[Technical Directions map](../project/technical-directions.md) owns contributor
+routing and current maturity; this board does not keep a second copy.
 
-The canonical [Technical Directions map](../project/technical-directions.md)
-explains outcomes, maturity, ownership boundaries, and promotion gates. This
-board lists bounded work; it does not redefine those directions.
+Status values are `Available`, `Claimed`, `Needs design` and `Blocked`, with
+an optional parenthesized qualifier or `: reason`. `Needs design` names a
+pending task-specific scope decision; it never means a merged RFC is a draft.
+`Available` and `Claimed` RFC work require an Accepted canonical design. A
+completed row belongs in history, even if an earlier PR is still referenced.
 
-| Direction | Current stage | Contributor entry | Boundary |
-| --- | --- | --- | --- |
-| Long-Horizon Benchmarks and Evidence | Active research | [#3243](https://github.com/huangruiteng/loopx/issues/3243) | Work on public-safe fixtures, treatment integrity, reducers, and docs; live cases and scoring remain maintainer-owned. |
-| Operator Surface and IM Integration | Incubating on `frontend-control-plane-im-prototype-rfc` | [#3244](https://github.com/huangruiteng/loopx/issues/3244) | State the target base branch; UI remains a projection and promotion to `main` is staged. |
-| Shared Goal Authority and Cross-host Coordination | Draft contract / provider qualification | [#3245](https://github.com/huangruiteng/loopx/issues/3245) | Start provider-neutral and file-backed; NoKV is an unpromoted candidate, not authority. |
-| Architecture and Research Incubator | Mixed by RFC | [#3246](https://github.com/huangruiteng/loopx/issues/3246) | Read the per-exploration stage; an RFC alone does not make implementation claimable. |
+## Lane A: Adoption Defects (P0)
 
-Core control-plane reliability remains the shared shipped foundation. Effect
-Program hardening, verified transitions, recovery, observability,
-maintainability, and contributor experience continue through the focused rows
-below and the existing `control-plane` label.
+Real installs, first runs, upgrades and hosts are the demand signal LoopX has
+the least of. A reproduced defect from one of them outranks any internal
+polish. Anchor: S12 release/DX hygiene and G0/G5 in the roadmap, plus the
+issue.
 
-## Priority Queue
-
-| Priority | Direction | Slice | Issue / PR | Status |
+| ID | Anchor | Gap and exit | Validation | Status |
 | --- | --- | --- | --- | --- |
-| P0 | Core hardening | Wire caller-approved `validation_command` into the remaining self-report entry points | #3082 | Available |
-| P0 | Core hardening | Complete exact-head review of remote execution and terminal writeback fencing | #3074 | Claimed |
-| P1 | Benchmark evidence | Implement the public-safe non-SkillsBench `public_trajectory_summary_v0` slice | #3282 | Claimed |
-| P1 | Benchmark evidence | Split one deterministic adapter-fidelity or treatment-integrity fixture | #3243 | Needs design |
-| P1 | Operator surface / IM | Split one projection or session-contract characterization unit from the incubation branch | #3244 | Needs design |
-| P1 | Shared coordination | Define the first provider-neutral, file-backed `claim_work` parity slice | #3245 | Needs design |
-| P1 | Core hardening | One budget-aware CLI output ergonomics slice | #2881 | Needs design |
-| P2 | Project docs | Release docs install, activation, and recovery guidance through v0.4.8 | GH-C04 | Available |
-| P2 | Maintainability | CLI ownership and hot-module extraction | GH-C06 | Available |
+| GH-A01 | S12 · [#4941](https://github.com/loopx-project/loopx/issues/4941) | Product fixes and the package-wide UTF-8 text-I/O guard are merged, including [#5160](https://github.com/loopx-project/loopx/pull/5160). The remaining gap is native reporter verification and issue closeout. Exit: confirm the repaired read/write paths on a `cp936` host and close #4941; reuse the landed guard instead of implementing another one. | `uv run --extra test python -m pytest -q tests/test_loopx_text_io_utf8.py tests/capabilities/test_connector_registry_encoding.py tests/test_runtime_subprocess_utf8.py`; reporter's native-host readback | Blocked: reporter verification and issue closeout |
+| GH-A02 | S4/S10 · [#3927](https://github.com/loopx-project/loopx/issues/3927) | A Codex App automation that silently stops delivering scheduled prompts is indistinguishable from a healthy quiet goal; the owner learns days later. Exit: `loopx doctor` or the heartbeat readback reports a missed-delivery window as a typed diagnosis with the last observed tick. | `python3 -m pytest -q tests/test_doctor_installation_scope.py` plus a missed-window fixture; `loopx doctor --deep` readback | Needs design |
+| GH-A03 | S3 · [#4336](https://github.com/loopx-project/loopx/issues/4336) | Issue #4336 was closed, while [#4397](https://github.com/loopx-project/loopx/pull/4397) remains open with requested changes and [#5162](https://github.com/loopx-project/loopx/pull/5162) closed without merge. Typed progress already owns the runtime rule. Exit: reconcile the closed issue with the current PR review before claiming another regression is required; retain one canonical negative case and upgrade guidance only if that review confirms the gap. | Current `quota should-run` typed/prose regression and the existing PR's focused tests; exact-head review readback | Blocked: closed issue and PR review reconciliation |
+| GH-A04 | S5 · [#4381](https://github.com/loopx-project/loopx/issues/4381) | Users have to open the dashboard to learn why a task is blocked and what unblocks it; the projection already knows. Exit: the existing blocker projection is delivered through the goal channel / status readback with the recovery action, without a second notifier. | `python3 examples/issue-fix-outcome-projection-smoke.py`, focused status readback smoke | Needs design |
 
-## Product Manager Cut
+Closed defects that show the lane's shape: #4155 and #4997 (Windows), #4012
+(macOS 26.5 app), #3796 / #3867 / #4195 (DSH plugin install), #4051
+(PyInstaller skills), #4082 (skill version marker), #4892 (symlinked runtime
+root). New reports go through the bug-report or first-run templates and are
+promoted here when reproduced.
 
-LoopX is converging from a control-plane library into a management surface for
-long-running agent work. Product-capability contributions should prefer slices
-that make existing kernel objects understandable to users instead of adding
-another source of truth.
+## Lane B: Roadmap Gaps (R1 / R2 / G1)
 
-| Product slice | Current substrate | Contributor-sized next cut |
-| --- | --- | --- |
-| Management frontstage | Goals, todos, gates, claims, evidence, quota, run history, `goal_channel_projection_v0`, `task_graph_projection_v0`, `issue_fix_outcome_projection_v0`, `agent_management_projection_v0`, and same-source Explore views are already compact read models. The public homepage, hosted docs, and localized dashboard now expose these surfaces. | Translate the read models into stable operator concepts such as work item, owner, decision, evidence, budget, risk, and next action; preserve lineage, keep raw machine fields in drill-downs, and do not create a second task or case store. Changes to a public first viewport remain maintainer-preview work. |
-| Conversational commands | The four canonical global manager CLI commands are shipped: `/loopx-global-summary`, `/loopx-global-gates`, `/loopx-global-todos`, and `/loopx-global-risks`; legacy `/loop-global-*` forms are only migration aliases. | Keep their focused read-only contracts and public-safe smokes aligned. `/loop-goal-summary` remains host-only and outside this contributor slice; do not invent another manager command or alias family. |
-| Runtime connector modes | `host_mode_plan_v0` selects visible, isolated-headless, gateway, service, and hybrid modes over the connector catalog. Host-loop activation now covers Codex surfaces, Claude Code, OpenCode 1/2 goal loops, TraeX, Pi, Gemini, Cursor, DeepSeek Harness, and custom agents; a scheduler-hint-aware external worker demonstrates one signed headless route. LoopX Turn remains one isolated request/effect/receipt transaction rather than a recurring loop. | Add one provider-neutral parity slice for route preservation, skill delivery/readback, continuation deadlines, signed primary actions, or stage/receipt visibility. Keep host wake/process ownership outside LoopX core and do not create a second scheduler or duplicate controller. |
-| Planner-worker mode | The experimental planner-worker contract now supports one bounded plan, one selected worker step, an allowlisted validation set, a clean-worktree boundary, and a typed receipt; the TraeX probe is only one extension provider. | Add provider-neutral usage and failure guidance around the shipped fake runtime. Keep model routing explicit, validation caller-approved, and recurring scheduling or broad multi-agent orchestration outside this mode. |
-| Visible governance | Quota, scheduler hints, authoritative interaction contracts, decision scopes, user gates, peer claims, optional task leases, a repository change-window gate with a pending ledger (#3319), interface budgets, and provider-neutral PR program snapshots already exist in machine contracts. A shared-goal authority/state-provider RFC now defines the next coordination boundary without making the proposal runtime authority. | Show who can act, who must approve, which decision scope applies, what budget was spent, and how pause/override/terminate decisions map back to LoopX state; add one provider-neutral negative fixture proving a locked repository window rejects writes and pending ledger rows resolve with a typed lifecycle after merge or close. Keep proposal state, claims, leases, and PR program observations from becoming a new runtime hierarchy or write authority. |
-| Decision and material quality | Decision Context and Material Lifecycle are experimental, built-in, default-off capabilities. They separate revision-bound evidence, advisory proposals, material planning, owner-gated apply, and private cursor/source state. | Build synthetic, no-provider walkthroughs that make these boundaries visible. Do not add private adapters, source bodies, provider payloads, or a second lifecycle store. |
-| Memory and content workflows | Agent Turn Recall composes quota-selected work with scoped Reward Memory whose post-outcome utility attribution is advisory and read-only (#3280), while `content_ops_item_v0` preserves stable item identity, revision-bound approval, delivery/readback receipts, and supersession. Both remain advisory or preview-level and add no provider authority. | Add synthetic walkthroughs and negative fixtures that prove identity, revision, and failure boundaries. Keep provider payloads, draft bodies, credentials, raw sessions, and external writes outside LoopX state. |
-| Extensions and change qualification | Standalone `extension init` scaffolding and managed zero-permission execution demonstrate optional provider delivery; a `loopx-repo-health` provider publishes public repository-health snapshots (#3272). Exact-diff Change Quality is separately goal-scoped, simplify-first, and enforced through fresh receipts when enabled. | Improve one existing provider or validation seam at a time. Do not invent a capability for installability, auto-run discovered repository tasks, or weaken exact-scope receipt checks. |
+These rows close a sentence in an R card. The roadmap's first resource
+ordering is R1 commitments and recovery, then G1 small-team qualification.
 
-## Recent Maintainer Progress
+| ID | Anchor | Gap and exit | Validation | Status |
+| --- | --- | --- | --- | --- |
+| GH-R2A | R2 · "one steward drives 2–3 bound managed workers" / [#4574](https://github.com/loopx-project/loopx/issues/4574) [#4339](https://github.com/loopx-project/loopx/issues/4339) | Team-plan confirmation writes commitments but the R1 confirmed-team commitment/readback gap is not closed, so R2 real peer dependency handoff cannot be qualified. Exit: independent readback distinguishes all-gap / partial / stale / rejected / committed; then one real two-worker dependency cycle. | Maintainer-agreed slice first; R1 counterexample fixtures, then packaged frontend and CLI readback | Needs design |
+| GH-C88 | S12 · "reduce review effort for useful changes" / [#2881](https://github.com/loopx-project/loopx/issues/2881) | Default CLI summaries exceed the hot-path payload budget on one command family, so agents spend tokens on readback. Exit: shorter default summaries with a typed `--json` escape hatch on that family; budgets and differential allowances intact. | `python3 examples/control_plane/cli-output-budget-regression-smoke.py`, focused command smoke, `loopx check --scan-path docs/status-data-contract.md` | Needs design |
+| GH-C35 | S4 · runtime connector boundary | Design the next provider-neutral external-host adapter on top of LoopX Turn and TurnEnvelope, using the shipped external worker, Pi, and TraeX routes as conformance examples rather than special cases. Map compact session events into requests, planned effects, committed receipts, independent validation, recovery, and attention items while keeping raw transcripts, credentials, billing, permissions, and product frontstage outside LoopX. Exit: a public design note with an adapter-neutral fake-host smoke plan. | `loopx check --scan-path docs/integrations/runtime-connector-catalog.md --scan-path docs/development/contributor-tasks.md` | Needs design |
 
-These public milestones changed which tasks are still useful contributor entry
-points:
+## Lane C: RFC Obligations
 
-| Area | Landed | Contributor implication |
-| --- | --- | --- |
-| Turn and settlement | Typed settlement now covers CLI, Codex App, task leases, and todo completion: caller-approved `validation_command` commits verified completion receipts (#3142), a shared typed settlement receipt-chain driver unifies replay (#3199), M7 parity fixtures plus a read-only journal inspection/`interpret_turn_journal` lens shipped (#3189, #3193, #3205), per-todo validation timeouts override the 20s default (#3210), and replan typed semantic exits settle exhausted-goal and future-monitor reentry (#3213). Failed-session recovery now resumes preserved sessions without weakening drift checks (#3262, #3266) and same-turn terminal closeout recovers (#3261), closing #3228; ambiguous quota-spend retries and terminal no-followup ordering are also settled (#3258, #3250). Fencing remote execution and terminal writeback (#3074) is still under review. | Add receipt-chain drift or replay-identity negatives on the shared driver, or wire caller-approved validation into the remaining self-report entry point from #3082. No second settlement ledger, model call, or double quota spend. |
-| Effect program runtime | A shared typed Effect Program drives quota, Turn, task-lease, and todo-completion settlement. The Dev Book course teaches the current runtime (#3097), M7.1 parity fixtures and the read-only replay lens shipped (#3189, #3193), and the turn driver is the second consumer of the settlement algebra. The scheduler remains outside settlement. | Add receipt-chain drift or replay-identity negative cases on the shared driver; do not extract a shared executor until two adapters share execution ownership or build an interpreter protocol before both consume the same plan/receipt algebra. |
-| Review quality | PR review now requires scope-fit evidence for production surface changes (#3090), the execution contract carries four self-dev review lenses (#3123), example-only PRs need durable smoke-value evidence (#3134), and age-fair exact-head scheduling persists across restarts (#3317). | Add synthetic conformance and negative cases around scope-fit evidence, causal chains, exact-head review packets, and durable-smoke-value claims. |
-| Task leases | Typed task-lease CLI with preserved legacy error codes landed (#3095); on-disk hard leases surface in goal-channel projection (#3039); Turn fencing uses lease fences plus an append-only journal, and the OpenCode 2 goal worker fences its own live worker lease. | Adopt the shipped `task_lease_v0` in one more host integration (for example Pi or TraeX) or add a transfer/overlap-write-scope fixture. Keep soft-claim routing and undeclared-lease authority unchanged. |
-| Status, quota, monitors | Replan context is host-projected from the evidence ledger; two equivalent typed progress observations create an obligation, maintenance writes fail closed against the same full goal-frontier reducer used by quota, and an exact runnable-successor Todo carries the obligation-bound semantic receipt and turn boundary. Heartbeat todos survive capability reentry (#3321), Todo identity filtering and UTC ordering are corrected (#3311), unbound `/loopx` sessions inherit existing agent identity (#3315), and declared validation gates run on user-role done updates (#3291, #3293). Manual evidence reads, prose ACKs, and historical repair-delta claims are diagnostic only. Compact scheduler-hint and heartbeat-prompt budgets plus todo-detail cold paths remain the reference. | Extend one measured performance, detail-readback, lock-timeout, malformed-state, typed progress, or obligation-bound semantic-transition case. Keep default output bounded and cold-path detail available. |
-| Governance and productization | A synthetic visible-governance slice landed (#3086); decision-context evidence cursors settle (#3079); the React homepage rebuild (#3098) landed; a deterministic project registry (#3170) serializes global sync; per-goal handoff mode gates claim/lease authority (#3164) and hard-lease gates auto-acquire completion keys (#3198); a repository change-window gate and pending ledger ship (#3319); a read-only stride shadow observation M1 (#3207), a synthetic stride-boundary shadow fixture (#3290), and the hierarchical stride RFC (#3204) open the next boundary; goal-artifact lifecycle projection (#3136) proposes a read-model boundary and post-outcome memory utility attribution from RFC #3215 is implemented (#3280). | Add one synthetic lifecycle or stride-boundary fixture, or extend the visible-governance walkthrough with a missing negative case. Keep activation explicit and leave source bodies, draft bodies, review text, provider payloads, private locators, cursor state, and apply/publish authority outside public fixtures. |
-| Security boundaries | Four merged hardening fixes contain state-file override writes (#3140), reject shell metacharacters in launcher worker commands (#3139), validate `goal_id` in reward routes (#3138), and stop ACAO:* on unauthenticated status reads (#3137). Shipped negative fixtures now cover each boundary (`tests/test_state_file_containment.py`, `tests/test_worker_command_validation.py`, `tests/test_feedback_goal_id_validation.py`, `tests/test_status_server_cors.py`). | Add one missing mutation case per boundary with the shipped tests as the reference; keep credentials, private reproduction details, and advisory coordination out of public fixtures. |
-| Runtime connectors and content workflows | DeepSeek Harness Turn adapter with real e2e smoke landed (#3188); OpenCode 1 and OpenCode 2 continuous goal loops ship (#3151); content-ops gained a layout template library and dense-cover defaults (#3222, #3223); provider-neutral PR program snapshots ship (#2814); `computer_use_runtime_v0` is now a machine-checkable protocol contract (#3279); a `loopx-community-discussion` public source provider (#3299) and a `loopx-repo-health` provider (#3272) extend public source coverage; host parity, skill-delivery, and observable-handle thin pytest now cover the expanded host list. | Add one provider-neutral parity slice for DeepSeek Harness, OpenCode 1/2, or content-ops delivery/readback; keep raw transcripts, provider payloads, credentials, and host-local paths out of fixtures. |
-| Benchmark boundary | Benchmark research was reset around native runners (#3267): native Codex Goal connects to the real runtime (#3271), workers are isolated from the host (#3277), provider env binds to installed Goal profiles (#3276) with formally verified treatments (#3275) and live continuations (#3273), runtime evidence binds to the exact container (#3303), a post-run case analyst brief ships (#3289), an integrity qualification toolkit landed (#3241), source-env usage is distinguished from credential probes (#3298, #3278), and accountable closeout requires Todo validation (#3229). Shared lifecycle, readiness, ledger, and reducer contracts remain the public seam; generic Effect Program conformance and replay tests harden settlement infrastructure but do not change benchmark scoring or authorize live runs. Live scored comparisons stay held until a fresh task-free runner lifecycle receipt proves readiness. | Extend synthetic setup/termination attribution, implement the GH-C16 public trajectory summary (#3282), or add a SWE adapter only when a second SWE route needs shared launch/observe/ingest behavior. Do not launch scoring, duplicate the controller, or expose raw task text, logs, trajectories, verifier tails, credentials, uploads, or local paths. |
-| Validation and change quality | Python tests are green on the latest runtime-bearing `main` change; public smoke parity and the frontstage Pages build are restored, with Codex App fallback receipt identity isolated (#3233); public smoke reliability was restored again (#3302), stargazer history now fetches through REST (#3320), and a repository-hygiene smoke plus release-timeline ratchet landed (#3249). The KNN timing oracle still needs deterministic coverage. | Replace timing as a semantic oracle, retain negative/mutation coverage, and distinguish infrastructure outages from product regressions. Keep live model/provider checks explicit and low-frequency. |
-| Release and install | v0.4.8 is the latest public tag and package version (v0.4.6, v0.4.7, and v0.4.8 landed after the last board refresh). PyPI is now the default complete install path (#3301), canonical project links are published (#3253), derived capability/manpage surfaces are synced (#3254), and the public release timeline covers v0.1.3 through v0.4.8. | Keep install, activation, and recovery guidance aligned with the PyPI default and tagged stable versus post-tag `main`, and continue contributor-safe update recovery without adding a parallel release checklist. |
-| Public docs and onboarding | Hosted docs, a public homepage, the Dev Book, localized dashboard copy, public/private boundary examples, GitHub issue forms, and a PR/issue label taxonomy have landed. Slash-command installation now exposes all four canonical global manager commands through their shipped CLI wrappers; fresh-project onboarding and its regression fixture landed (#3093, #3103), and harness-above positioning (#3202), ecosystem adoption and derivatives inventory (#3224), GitHub maintenance and ops automation best practices (#3227), long-horizon/commercialization strategy docs (#3217-#3220), the TypeScript control-plane migration RFC (#3226), the open strategy review process (#3295), stale-issue reminders without auto-close (#3297), welcome-all-contribution-shapes guidance (#3294), consolidated community policy (#3238), Apache-2.0 open-core adoption (#3235), a capability implementation code map (#3252) with co-located docs (#3265), outcome/extension path clarifications (#3242), the NoKV semantic-authority RFC (#3263), the long-horizon benchmark research program RFC (#3240), the published technical directions (#3248), and a DCO sign-off reminder (#3316) are public. | Keep contributor, release, protocol, course, showcase, and RFC surfaces concise and linked to public evidence; add navigation, locale, and RFC-compatibility checks without appending status narratives or aliases. |
+Rows here implement or pin a named section of an Accepted RFC. Merge qualifies
+the design for claiming; a row still respects its implementation entry gates. Name
+the section; "extend the fixture" is not an obligation.
 
-## Turn Loop Controller Plan
+| ID | Anchor | Gap and exit | Validation | Status |
+| --- | --- | --- | --- | --- |
+| GH-R5A | R5 / [shared-goal-authority-state-provider-v0](../architecture/rfcs/shared-goal-authority-state-provider-v0.md) · D2 durability / [#4224](https://github.com/loopx-project/loopx/issues/4224) [#3245](https://github.com/loopx-project/loopx/issues/3245) | Existing contributor-owned capacity and process-recovery work includes merged #4328 and read-proof optimization [#4931](https://github.com/loopx-project/loopx/pull/4931). D2 still lacks complete reference-profile reruns, large-history recovery/consumer-lag, restore/upgrade/runtime coverage and elapsed-soak evidence. Exit: reconcile the RFC §7.2 passed/failed/missing ledger against the merged source while retaining the original failed budgets and separate promotion holds. | Declared reference-runtime capacity profiles and real SQLite process/recovery suites; independently recorded platform and >=10-day elapsed-soak evidence | Claimed |
+| GH-B01 | S11 / [long-horizon benchmark research program](../architecture/rfcs/long-horizon-harness-benchmark-research-program-v0.md) · treatment integrity / [#3243](https://github.com/loopx-project/loopx/issues/3243) | Adapter-fidelity and treatment-integrity gaps are asserted but not reproducible from public fixtures. Exit: one reproducible gap with the existing focused fixtures, reported without live scoring. | Deterministic fixtures in `tests/capabilities/test_benchmark_toolkit.py`; no live runs | Needs design |
 
-`loopx turn run-once` remains the atomic governed executor: decide, execute one
-bounded host segment, validate independently, write back, spend once, and
-project the latest scheduler contract. Host-loop activation, the external
-scheduler worker, and visible Pi/TraeX integrations provide concrete outer
-loops, but they do not make LoopX a resident scheduler. The maintainer-owned
-pure controller and replan transition are still in hardening, so contributors
-should focus on independently derived decision tables, cross-host parity,
-fail-closed fixtures, or docs that clarify the boundary below.
+## Retired Task Generators
 
-| Priority | Planned slice | Required boundary and proof |
-| --- | --- | --- |
-| P0 | Harden the maintainer-owned pure Turn Loop Controller transition contract over one typed settlement receipt plus a fresh quota/scheduler decision. | Return exactly one typed disposition such as `run_now`, `wait`, `user_action_required`, `repair`, `replan`, or `terminal`; reject malformed receipts, legacy plans without a typed settlement, stale continuation, and invalid budgets without invoking a model, sleeping, mutating a host scheduler, writing state, or spending quota. |
-| P0 | Make `replan_required` a real continuation boundary. | Before another Turn, write a bounded todo or vision delta, obtain a fresh TurnEnvelope, and preserve the causal agent/todo frontier. Never rerun the same stale todo merely because a host session is resumable. Reuse the existing autonomous-replan and two-stall contracts. |
-| P1 | Qualify host-loop activation and skill-delivery parity. | Compare Codex, Claude Code, OpenCode 1/2, TraeX, Pi, Gemini, Cursor, DeepSeek Harness, and custom-agent packets against one provider-neutral fixture. Required skills and readback must come from the canonical release/goal contract rather than ambient host state; install dedupe and cwd isolation keep canonical manifests the source of truth. |
-| P1 | Extend scheduler-owner and monitor parity from the shipped external worker. | Apply signed `primary_action`, `scheduler_hint` wake/backoff/terminal-stop, concrete user routing, and quiet no-spend monitor decisions through the declared runtime owner. `run-once` remains the only delivery transaction. |
-| P2 | Qualify parity with Codex App heartbeat and adaptive child admission. | Use deterministic fixtures across active work, wait, user gate, repair, replan, child admission/conflict, monitor, and terminal states, followed by one explicit opt-in real-host qualification. Preserve independent validation and exclude raw prompts, transcripts, credentials, and host-local paths. |
+These rows were open-ended and produced volume without a gap. They are closed
+as standalone tasks; the work they described is admitted only through an
+anchored row above.
 
-Do not open a second implementation PR for the pure transition contract while
-the maintainer-owned slice is active. Scheduler process management,
-host-specific wake APIs, and operator presentation remain later adapters so
-each slice stays reviewable and reversible.
-
-### Starter / Good First
-
-Low setup, docs-first, or narrow fixture work. These should be good entry
-points for contributors who are still learning the repository.
-
-| ID | Area | Task | Validation |
+| Former ID | Was | Why retired | Where the work goes now |
 | --- | --- | --- | --- |
-| GH-C02 | tests | Add or extend a focused smoke test around todo archive/completion behavior. Prefer copying the style of `examples/control_plane/todo-lifecycle-cli-smoke.py`. Currently claimed in issue #3056; coordinate before duplicating. | `python3 examples/control_plane/todo-lifecycle-cli-smoke.py` and `python3 -m py_compile loopx/*.py` |
-| GH-C04 | docs | Keep release docs current through v0.4.8: align install, activation, and recovery guidance with the PyPI default complete install path (#3301), preserve tagged stable vs post-tag `main` and release-snapshot vs canary distinctions, cover installed-runtime activation recovery, and keep the public release timeline (v0.1.3-v0.4.8) in sync with tagged evidence instead of duplicating the release body's bilingual optional-capability usage guidance. | `python3 examples/fresh-clone-quickstart-smoke.py`, `python3 examples/loopx-update-smoke.py`, `python3 examples/release/release-readiness-doc-smoke.py`, `python3 examples/release/release-version-contract-smoke.py`, and `loopx check --scan-path docs/product/release-readiness.md --scan-path CONTRIBUTING.md` |
-| GH-C80 | docs | Add a hosted-docs navigation and locale-parity check across `mkdocs.yaml`, `docs/index.md`, `docs/book/index.md`, the docs catalog, and stable README entry links. Catch broken or orphaned public pages without changing the README or homepage first viewport. | `python3 examples/docs-governance-smoke.py`, `python3 examples/frontstage-pages-workflow-smoke.py`, a strict MkDocs build, and `loopx check --scan-path docs --scan-path mkdocs.yaml --scan-path README.md --scan-path README.zh-CN.md` |
-| GH-C64 | release docs | Add a contributor-safe atomic-promotion failure matrix around the shipped release lock/concurrency smoke: explain which failures happen before the symlink swap, how a waiter recovers, and when contributors must stop before maintainer-only promotion state. Extend the existing fixture only for a durable missing case. | `python3 examples/release/release-promotion-concurrency-smoke.py`, `python3 examples/release/local-install-promotion-boundary-smoke.py`, and `loopx check --scan-path docs/product/release-readiness.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C75 | runtime docs | Add a public operator guide for the experimental planner-worker mode using the shipped provider-neutral fake runtime. Explain the clean-worktree requirement, explicit model routes, caller-approved validation commands, one-step typed receipt, incomplete-cost semantics, provider opt-in, and how to stop without presenting it as a resident scheduler or default multi-agent runtime. | `python3 examples/experiments/planner_worker/contract-smoke.py`, `python3 examples/experiments/planner_worker/runtime-smoke.py`, and `loopx check --scan-path docs/integrations/runtime-connector-catalog.md --scan-path docs/development/contributor-tasks.md` |
+| GH-C37 | "Curate the interaction pattern catalog with one new public-safe case" | Eight IP entries landed in three weeks with no consuming controller, dashboard copy or test named; the catalog is 3,300 lines and its own admission note now applies. | A new IP is part of the anchored row that consumes it; cite the code, test or copy that reads the pattern. |
+| GH-C102 (open form) | "Extend the shared coordination fixture with one more dimension" | Dimensions were added because the fixture accepted them, not because an invariant was uncovered. | Retired as a claimable template: admit future work only after it names a specific accepted invariant, consumer, gap, and exit. |
+| Progress-log "contributor implication" hints | "Add one synthetic fixture / negative case / walkthrough" | Hints named a shape, not a gap; they generated test-pin PRs. | Read them in [history](contributor-tasks-history.md); open an anchored issue if a hint maps to an RFC invariant or defect. |
 
-### Focused Implementation
-
-Small-to-medium code changes with a clear validation surface. These are good
-for contributors who can run local CLI smokes and keep changes scoped.
-
-| ID | Area | Task | Validation |
-| --- | --- | --- | --- |
-| GH-C06 | cli | Characterize one remaining oversized CLI ownership seam after the recent quota, status, todo, history, and scheduler command-plumbing extractions, then move only a cohesive command or rule group into its bounded module. Preserve public invocations, avoid compatibility wrappers without a real caller, and keep the module-size/import budget honest. | Command-specific smoke, `python3 examples/cli-command-module-size-ownership-command-modularization-smoke.py`, `python3 regression/cli-command-module-contract.py`, and focused pytest if rules move |
-| GH-C16 | benchmark / docs | Implement the public-safe non-SkillsBench trajectory summary (issue #3282): add a `public_trajectory_summary_v0` path for one existing non-SkillsBench adapter on main, derive a typed summary from compact lifecycle facts, and document the contract. No live runs, scoring, uploads, or submissions. Currently claimed in issue #3282; coordinate before duplicating. | Deterministic fake-fixture coverage for expected, malformed, and missing input; focused pytest; and `loopx check --scan-path docs/status-data-contract.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C85 | validation | Wire caller-approved `validation_command` into the remaining self-report completion entry points (#3082). The todo completion path now runs caller-approved validation with typed receipts and negative fixtures (`tests/control_plane/test_todo_completion_validation.py`); extend the same contract to other self-report paths such as the MCP `complete_task` route, keep the no-command fast path unchanged, and fail closed with a typed receipt on malformed or failing commands. | Focused pytest with a negative case, `python3 examples/loopx-turn-fake-host-walkthrough-smoke.py`, and `loopx check --scan-path loopx/capabilities/issue_fix --scan-path docs/development/contributor-tasks.md` |
-| GH-C90 | validation / security | Audit the shipped security-boundary negative fixtures (#3137-#3140: `tests/test_state_file_containment.py`, `tests/test_worker_command_validation.py`, `tests/test_feedback_goal_id_validation.py`, `tests/test_status_server_cors.py`) and add one missing mutation case per boundary: state-file override containment, launcher worker-command metacharacter rejection, serve-status `goal_id` path-traversal validation, and ACAO-free unauthenticated read responses. Keep credentials and private reproduction details out, and coordinate timing with maintainer advisory disclosure. | `python3 -m pytest -q tests/test_state_file_containment.py tests/test_worker_command_validation.py tests/test_feedback_goal_id_validation.py tests/test_status_server_cors.py`, `python3 examples/full-public-smokes-workflow-smoke.py`, and `loopx check --scan-path loopx/status_server.py --scan-path loopx/state_refresh.py --scan-path loopx/visible_multi_agent_launcher.py --scan-path docs/development/contributor-tasks.md` |
-| GH-C94 | control plane | Triage and fix #3196: event projection drops `completion_turn_key`, so replaying the same Turn is misjudged as a conflict. Add a projection parity fixture that preserves the key through commit/replay and keeps conflict classification typed and fail-closed. | Focused pytest, `python3 examples/control_plane/todo-lifecycle-cli-smoke.py`, and `loopx check --scan-path docs/status-data-contract.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C95 | cost ledger | Implement real per-run usage ingest for the cost ledger (#3163): read compact accounting rows from existing run history, keep the ledger the single source of truth, and fail closed on malformed or negative usage without provider payloads or a second ledger. | New focused pytest and `loopx check --scan-path docs/status-data-contract.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C86 | dashboard | Surface per-goal token/cost/duration in the existing dashboard from compact quota/run-history projections (#3085). Keep raw machine fields in drill-downs, add an explicit projection source, and do not create a second ledger. | Frontstage route/browser smokes plus `loopx check --scan-path apps/presentation/dashboard --scan-path docs/development/contributor-tasks.md` |
-| GH-C88 | cli | Implement one budget-aware CLI output ergonomics slice for #2881: shorter default summaries with a typed `--json` escape hatch on one command family, keeping hot-path payload budgets and differential allowances intact. | `python3 examples/control_plane/cli-output-budget-regression-smoke.py`, focused command smoke, and `loopx check --scan-path docs/status-data-contract.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C97 | cli | Fix `todo add --note` being silently accepted but dropped: pass the note through the add command and state writer, project it on readback, and add focused CLI regression coverage. Open an issue with the contributor task template first. | `python3 examples/control_plane/todo-lifecycle-cli-smoke.py`, focused CLI regression pytest with a negative case, and `loopx check --scan-path docs/status-data-contract.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C43 | showcase | Add a contributor-facing walkthrough for the shipped Auto Research stop/takeover and state-aware wake transitions. Reuse the current command path and synthetic/redacted evidence; do not add a second launcher or alter the README first screen without maintainer preview. | `python3 examples/showcase-catalog-smoke.py`, `python3 examples/auto-research-demo-e2e-worker-loop-smoke.py`, `python3 examples/auto-research-visible-worker-hook-smoke.py`, `python3 examples/auto-research-stop-marker-smoke.py`, `python3 examples/auto-research-state-aware-wake-smoke.py`, `python3 examples/auto-research-quota-pause-smoke.py`, and `loopx check --scan-path docs/showcases --scan-path docs/guides` |
-| GH-C49 | dashboard | Polish the shipped `/frontstage` goal-channel board: improve visual acceptance, local demo fixture clarity, and operator onboarding while keeping browser data read-only and making outcome, lease, capability-wait, and workspace-repair states legible. | `npm run smoke:frontstage-route`, `npm run smoke:frontstage-browser`, and `loopx check --scan-path apps/presentation/dashboard --scan-path docs/product/roadmaps/dashboard-frontend-selection.md` |
-| GH-C74 | productization | Add one public synthetic walkthrough from a revision-bound Decision Context packet to a Material Lifecycle rerank preview. Prove stale/conflicting evidence stays visible, source bodies and private locators stay absent, and apply/cursor commits remain separate owner-gated actions. | `python3 examples/decision-context-contract-smoke.py`, `python3 examples/material-lifecycle-contract-smoke.py`, focused capability pytest, and `loopx check --scan-path loopx/capabilities/decision_context --scan-path loopx/capabilities/material_lifecycle --scan-path docs/development/contributor-tasks.md` |
-| GH-C60 | workflow | Add one focused fake-fixture parity slice across Codex App heartbeat, Codex CLI TUI, LoopX Turn, Claude Code, OpenCode 1/2 goal loops, TraeX, Pi, Gemini, Cursor, Ark Managed Agent, DeepSeek Harness, the external shell worker, HTTP webhook, and worker bridge. Cover one missing explicit capability route, signed primary action, scoped identity, skill delivery/readback, typed Goal continuation, runtime-owned cadence, no-spend transition, workspace repair, or private-boundary case. | `python3 examples/host-mode-plan-smoke.py`, `python3 examples/project/host-mode-plan-cli-smoke.py`, `python3 examples/control_plane/agent-onboard-host-loop-activation-smoke.py`, focused host bridge tests, `python3 -m pytest -q tests/test_host_parity_smoke.py tests/test_skill_delivery_parity.py tests/test_loopx_turn_transaction.py tests/test_external_scheduler_worker.py tests/test_pi_goal_mode.py tests/test_gemini_cursor_host_surfaces.py`, and `loopx check --scan-path docs/integrations/runtime-connector-catalog.md --scan-path docs/reference/protocols/host-mode-plan-v0.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C62 | governance | Add a synthetic visible-governance slice that relates per-goal/per-agent claims, optional task leases, quota, scheduler hints, decision scopes, and the shared-goal RFC's proposed authority/state-provider boundary. Make proposal versus shipped truth explicit; do not add a browser write API, infer scopes from prose, or present provider observations or leases as runtime authority. | Focused fixture smoke, `python3 -m pytest -q tests/control_plane/test_todo_decision_scope_lifecycle.py`, and `loopx check --scan-path docs/status-data-contract.md --scan-path docs/architecture/rfcs/shared-goal-authority-state-provider-v0.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C68 | validation | Move the stable pure rules from one oversized control-plane smoke, preferably `quota-scheduler-state-ack-smoke.py`, into independently derived pytest decision tables while retaining a thin CLI/public-behavior seam. Add at least one negative or mutation case so current implementation output cannot become the oracle. Currently claimed in PR #3288; coordinate before duplicating. | Focused pytest, the retained smoke, `python3 examples/full-public-smokes-workflow-smoke.py`, and `git diff --check` |
-| GH-C70 | runtime | Add a provider-neutral host-loop parity walkthrough that runs the same synthetic task through the external scheduler worker plus one visible host such as Pi or TraeX. Compare signed action selection, compact Turn receipts, independent validation, recoverable timeout/termination, replan, and terminal no-followup behavior without retaining raw sessions or host-local paths. | Focused fake-host smoke, `python3 -m pytest -q tests/test_loopx_turn_driver.py tests/test_external_scheduler_worker.py tests/test_pi_goal_mode.py`, and `loopx check --scan-path docs/reference/protocols/loopx-turn-v0.md --scan-path docs/integrations/runtime-connector-catalog.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C71 | learning | Add a contributor-safe walkthrough from corpus health and candidate review through opt-in Agent Turn Recall, Reward Memory application, and scoped feedback. Use synthetic quota/todo packets, keep hints advisory, fail closed without activation, and prove agent/project/session scope without requiring an external sink or retaining provider payloads. | `python3 examples/reward-memory-corpus-registry-smoke.py`, `python3 examples/reward-memory-candidate-review-smoke.py`, `python3 examples/reward-memory-recall-application-smoke.py`, `python3 -m pytest -q tests/capabilities/test_agent_turn_recall.py`, and `loopx check --scan-path loopx/capabilities/agent_turn_recall --scan-path loopx/capabilities/reward_memory/README.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C76 | workflow | The integration-branch lifecycle tests are shipped (`tests/capabilities/test_integration_branch.py`); add the thin public CLI smoke for the shipped local integration-branch capability. Cover ignored plan state, read-only preview, ordered source updates, reviewed-candidate adoption, and fail-closed dirty/conflict cases without fetching, pushing, rewriting source branches, or changing protected bases. | New focused smoke, `python3 -m pytest -q tests/capabilities/test_integration_branch.py`, and `loopx check --scan-path loopx/capabilities/integration_branch --scan-path docs/development/contributor-tasks.md` |
-| GH-C77 | validation / showcase | Make the Auto Research KNN evidence-normalization smoke deterministic across supported CI hosts. Replace wall-clock speedup as the test oracle with a semantics-derived fixture or calibrated deterministic contract while preserving improved/contradicted evidence normalization and protected-scope checks. | Repeat `python3 examples/auto-research-knn-evidence-normalization-smoke.py` across supported Python versions, run `python3 examples/auto-research-demo-e2e-worker-loop-smoke.py`, and use `loopx check --scan-path examples/auto-research-knn-evidence-normalization-smoke.py --scan-path docs/development/contributor-tasks.md` |
-
-### Advanced Implementation
-
-Shared-state, adapter, or benchmark-control changes. Please open an issue first
-and keep the first PR as a narrow slice.
-
-| ID | Area | Task | Validation |
-| --- | --- | --- | --- |
-| GH-C07 | state | Global registry sync now writes inside a lock (`tests/test_global_registry_write_serialization.py`); extend the same lock or optimistic-revision guard to per-goal todo/refresh/history writers and include a concurrent todo add/update regression. | New concurrency regression plus `python3 -m py_compile loopx/*.py` |
-| GH-C47 | state | Task leases now back Turn fencing and typed CLI acquire/release, and the OpenCode 2 goal worker fences its own live worker lease. Adopt the shipped `task_lease_v0` in one more real host integration (for example Pi or TraeX): advertise the capability explicitly, preserve soft-claim routing, expose acquire/renew/transfer/release outcomes, and prove overlapping write scopes fail without making `quota should-run` enforce undeclared lease authority. | `python3 examples/control_plane/task-lease-runtime-smoke.py`, `python3 -m pytest -q tests/control_plane/test_task_lease.py tests/test_loopx_turn_driver.py`, and a host-focused fake fixture |
-
-### Design / RFC
-
-Direction-setting work. These tasks should usually produce a doc or issue
-before implementation.
-
-| ID | Area | Task | Validation |
-| --- | --- | --- | --- |
-| GH-C89 | governance | Respond to the AGE-style attractor proposal (#2831): anchor goal direction to repository owner docs so the control plane can validate semantic drift, not just execution state. Define the read boundary, the drift signal, and what must remain advisory; do not make repository docs a write authority. | Public design note with a synthetic drift fixture plan plus `loopx check --scan-path docs/architecture/rfcs --scan-path docs/development/contributor-tasks.md` |
-| GH-C96 | design / migration | Review the TypeScript control-plane migration RFC (#3225, #3226) for compatibility completeness: verify typed state rules, domain neutrality, behavior-change disclosure, and the public/private boundary, then publish concise migration-compatibility notes without starting the migration. | `python3 examples/docs-governance-smoke.py` and `loopx check --scan-path docs/architecture/rfcs/typescript-control-plane-migration-v0.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C35 | integration | Design the next provider-neutral external-host adapter on top of LoopX Turn and TurnEnvelope, using the shipped external worker, Pi, and TraeX routes as conformance examples rather than special cases. Map compact session events into requests, planned effects, committed receipts, independent validation, recovery, and attention items while keeping raw transcripts, credentials, billing, permissions, and product frontstage outside LoopX. | Public design note with adapter-neutral fake-host smoke plan plus `loopx check --scan-path docs/integrations/runtime-connector-catalog.md --scan-path docs/development/contributor-tasks.md` |
-| GH-C37 | interaction model | Curate the interaction pattern catalog with one new public-safe good/bad case, including trigger signals, user channel, agent channel, state contract, bad smell, and validation reference. Do not copy raw chat, private benchmark artifacts, or internal links. | `loopx check --scan-path docs/concepts/interaction-pattern-catalog.md` |
-
-### Maintainer-Owned / Coordination Required
+## Maintainer-Owned / Coordination Required
 
 Visible work that should not be duplicated. Ask for a public helper slice
 instead of launching private runs or broad product changes.
@@ -202,20 +154,18 @@ instead of launching private runs or broad product changes.
 | --- | --- | --- | --- |
 | GH-C72 | workflow runtime | The pure Turn Loop Controller and its fail-closed repair remain maintainer-owned even though host-loop activation, the external worker, Pi, TraeX, and typed settlement are shipped. Do not duplicate the controller. Public helpers may independently review decision-table semantics or propose synthetic malformed-receipt/cross-host fixtures; do not launch hosts, alter scheduler ownership, or weaken validation to make a candidate pass. | Maintainer-run focused controller pytest, LoopX Turn transaction tests, autonomous-replan and bounded monitor no-change smokes, and risk-based premerge canary |
 | GH-C67 | issue-fix | The first operator rendering of `issue_fix_outcome_projection_v0` is an active coordination lane. Do not build a competing case ledger or operator surface. Ask for a synthetic fixture, accessibility, or projection-parity helper slice that keeps provider, sink, and private notification state out. | `python3 examples/issue-fix-outcome-projection-smoke.py`, the selected public surface smoke, and `loopx check --scan-path loopx/capabilities/issue_fix --scan-path docs/development/contributor-tasks.md` |
+| GH-C101 | dashboard | Dashboard Chat turn completion and single-command startup remain maintainer-owned live fixes (#3758): retryable Codex app-server Turns must render replies and one supported command must bring status backend plus UI up together. Do not build a competing dashboard or chat route; ask for a synthetic app-server protocol fixture or a regression smoke instead. | Maintainer-run packaged dashboard smoke, real app-server protocol v2 flow, and `loopx check --scan-path apps/presentation/dashboard --scan-path docs/development/contributor-tasks.md` |
 | GH-C18 | benchmark | Long-horizon benchmark evidence program, including live local no-upload cases, runner contracts, trace retention, score accounting, and good/bad case attribution. Do not duplicate live runs or inspect private artifacts unless maintainers split out a public helper issue. | Maintainer-run benchmark ledger and public/private scan |
-| GH-C19 | benchmark | Main-table SkillsBench product-mode comparison: raw Codex autonomous max5 versus the qualified LoopX Turn route, no verifier feedback to either arm, stop on reward 1 or declared done. Scoring stays held until a fresh task-free runner lifecycle receipt proves readiness; the native-runner research reset (#3267) and the GH-C16 trajectory summary (#3282) define the current public helper boundaries. Live matched pairs and official/countable receipt review remain maintainer-owned; external contributors can help with synthetic schema, docs, reducers, and smokes only. | Maintainer-run readiness receipt, compact ledger, case-analysis update, and public receipt/boundary scan |
+| GH-C19 | benchmark | Main-table SkillsBench product-mode comparison: raw Codex autonomous max5 versus the qualified LoopX Turn route, no verifier feedback to either arm, stop on reward 1 or declared done. Scoring stays held until a fresh task-free runner lifecycle receipt proves readiness. Live matched pairs and official/countable receipt review remain maintainer-owned; external contributors can help with synthetic schema, docs, reducers, and smokes only. | Maintainer-run readiness receipt, compact ledger, case-analysis update, and public receipt/boundary scan |
 
 ## Projection Sources
 
 This board is maintained from public-safe projections of:
 
 - the local `loopx-meta` Agent Todo list;
-- public docs under `docs/`, especially the state interaction model, status
-  data contract, quota allocation, integration guide, product vision, the
-  repository change-window gate contract (#3319), and benchmark research docs,
-  the goal artifact lifecycle projection RFC (#3136), the hierarchical stride,
-  post-outcome memory utility, human-attention, and TypeScript migration RFCs,
-  the Dev Book and control-plane course, and the PR/issue label taxonomy;
+- the [overall roadmap](../architecture/rfcs/loopx-overall-roadmap-v0.md) R
+  cards and G milestones, the [RFC index](../architecture/rfcs/README.md) and
+  public issues with reproductions;
 - recent maintainer review of which work is externally claimable versus
   maintainer-owned live automation.
 
@@ -226,8 +176,8 @@ Projection rules:
   explicitly publish a runnable issue;
 - mark live benchmark, release, and automation lanes as `Maintainer-owned`
   when duplicate work would waste compute or weaken evidence;
-- prefer tasks that name likely files and validation, so contributors can start
-  without reading local active state.
+- every claimable row carries an anchor, a gap and an exit; rows without them
+  are not published.
 
 ## Suggested Labels
 
@@ -246,14 +196,15 @@ and through the `triage` or `workflow-audit` lifecycle labels.
 
 ## Maintainer Update Rules
 
-- Keep this board curated. If it grows beyond roughly 35 open rows, move older
-  or lower-priority work into GitHub issues and keep only the best entry points
-  here.
-- Every public task should include a scope, expected validation, and owner
-  state.
+- Keep this board curated: at most 25 claimable rows across Lanes A–C. Move
+  landed rows to [history](contributor-tasks-history.md); move lower-priority
+  work into GitHub issues.
+- Every claimable row names an anchor (roadmap S/G/R sentence, RFC section, or
+  reproduced public issue), a gap (who is blocked) and an exit (when it
+  closes). `examples/docs-governance-smoke.py` checks the anchor column.
 - Do not publish private/local state. Summarize it into a public task only when
   the work is safe for the repository.
 - After a meaningful internal milestone, update this board manually if there is
-  a new contributor-sized slice.
+  a new contributor-sized slice; put the landed context in history, not here.
 - Remove or refresh stale tasks instead of leaving obsolete "good first issue"
   entries in place.

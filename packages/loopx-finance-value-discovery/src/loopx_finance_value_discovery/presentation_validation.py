@@ -10,16 +10,29 @@ from collections.abc import Mapping
 from datetime import date, datetime
 import math
 import re
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qsl, urlparse
+
+_find_public_safe_local_path: Callable[[str | None], re.Pattern[str] | None] | None
+try:
+    from loopx.extensions.presentation import (
+        find_public_safe_local_path as _find_public_safe_local_path,
+    )
+except (ImportError, ModuleNotFoundError):
+    # Non-presentation Finance operations still support older Core versions.
+    _find_public_safe_local_path = None
 
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 ANCHOR_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 _MARKUP_RE = re.compile(r"<[^>]*>|javascript:", re.IGNORECASE)
-_LOCAL_PATH_RE = re.compile(
+_LEGACY_LOCAL_PATH_RE = re.compile(
     r"(?:^|[\s(])(?:~[/\\]|/+(?:Users|home|tmp|private|var|etc|opt)/|"
     r"[A-Za-z]:[\\/])"
+)
+_LEGACY_MULTISLASH_LOCAL_PATH_RE = re.compile(
+    r"(?:^|[\s:=('])/{2,}(?:Users|home|tmp|private|var|etc|opt)/",
+    re.IGNORECASE,
 )
 _PRIVATE_RELATIVE_PATH_RE = re.compile(
     r"(?:^|[\s:=('/\\])\.(?:codex|git|local)(?:[/\\]|$)",
@@ -40,6 +53,17 @@ _FORBIDDEN_KEY_TOKENS = {
     "cookie", "order_id", "order_request", "portfolio", "portfolio_holdings",
     "position_size", "raw_provider", "raw_request", "raw_response", "secret", "token",
 }
+
+
+def contains_local_path(value: str) -> bool:
+    """Apply the shared public-path classifier and retain Finance's legacy edge."""
+
+    if _find_public_safe_local_path is None:
+        return bool(_LEGACY_LOCAL_PATH_RE.search(value))
+    return bool(
+        _find_public_safe_local_path(value)
+        or _LEGACY_MULTISLASH_LOCAL_PATH_RE.search(value)
+    )
 
 
 def _is_forbidden_key_name(value: Any) -> bool:
@@ -71,7 +95,7 @@ def plain_text(value: Any, *, context: str, max_length: int = 600, allow_empty: 
         raise ValueError(f"{context} must contain at most {max_length} characters")
     if "\x00" in text or _MARKUP_RE.search(text):
         raise ValueError(f"{context} must be plain text without markup")
-    if _LOCAL_PATH_RE.search(text) or _PRIVATE_RELATIVE_PATH_RE.search(text):
+    if contains_local_path(text) or _PRIVATE_RELATIVE_PATH_RE.search(text):
         raise ValueError(f"{context} must not contain a local path")
     if _CREDENTIAL_RE.search(text) or _SENSITIVE_TEXT_RE.search(text):
         raise ValueError(f"{context} must not contain sensitive material")
@@ -183,3 +207,17 @@ def evidence_reference(value: Any, *, context: str) -> str:
     if any(_is_forbidden_key_name(field) for field in fields):
         raise ValueError(f"{context} contains an unsafe evidence reference")
     return reference
+
+
+def public_reference_tree(value: Any, context: str = "input") -> None:
+    """Keep embedded references under the existing publication URL boundary."""
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            path = f"{context}.{key}"
+            if child is not None and (key == "ref" or key.endswith("_ref")):
+                evidence_reference(child, context=path)
+            else:
+                public_reference_tree(child, path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            public_reference_tree(child, f"{context}[{index}]")

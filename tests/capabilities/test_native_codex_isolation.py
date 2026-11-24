@@ -40,6 +40,81 @@ def _namespace_mounts_supported() -> bool:
     return probe.returncode == 0
 
 
+def _native_codex_isolation_supported() -> bool:
+    return _namespace_mounts_supported() and shutil.which("tini") is not None
+
+
+@pytest.mark.skipif(
+    not _native_codex_isolation_supported(), reason="Linux namespace mounts required"
+)
+@pytest.mark.parametrize("resource_parent", ["bin", "distribution"])
+def test_standalone_companions_visible_but_distribution_neighbors_hidden(
+    tmp_path, resource_parent
+):
+    private = tmp_path / "private"
+    work = tmp_path / "work"
+    binary_dir = tmp_path / "distribution" / "bin"
+    for directory in (private, work, binary_dir / "codex-resources"):
+        directory.mkdir(parents=True)
+    binary = binary_dir / "codex"
+    companion_root = binary_dir if resource_parent == "bin" else binary_dir.parent
+    (companion_root / "codex-resources").mkdir(exist_ok=True)
+    companion = companion_root / "codex-resources" / "bwrap"
+    code_host = binary_dir / "codex-code-mode-host"
+    neighbor = binary_dir / "unrelated-data"
+    neighbor.write_text("must remain hidden")
+    companion.write_text("#!/bin/sh\nexit 0\n")
+    code_host.write_text("#!/bin/sh\nexit 0\n")
+    binary.write_text(
+        '#!/bin/sh\nset -eu\n"$1"\n"$2"\n'
+        '[ ! -e "$3" ]\n[ "$4" = "argument with spaces" ]\n'
+    )
+    for path in (binary, companion, code_host):
+        path.chmod(0o755)
+    envelope = build_native_codex_isolation_envelope(
+        executable=str(binary),
+        process_args=[
+            str(companion),
+            str(code_host),
+            str(neighbor),
+            "argument with spaces",
+        ],
+        work_dir=work,
+        private_root=private,
+    )
+    result = subprocess.run(
+        envelope.process_command, capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("tini") is None, reason="tini required")
+@pytest.mark.parametrize("target_kind", ["private_file", "directory", "missing"])
+def test_standalone_companion_rejects_symlink_or_non_file(tmp_path, target_kind):
+    private = tmp_path / "private"
+    work = tmp_path / "work"
+    binary_dir = tmp_path / "distribution" / "bin"
+    for directory in (private, work, binary_dir / "codex-resources"):
+        directory.mkdir(parents=True)
+    binary = binary_dir / "codex"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    companion = binary_dir / "codex-resources" / "bwrap"
+    if target_kind == "directory":
+        companion.mkdir()
+    else:
+        target = private / "runtime"
+        if target_kind == "private_file":
+            target.write_text("restricted")
+        companion.symlink_to(target)
+    with pytest.raises(
+        NativeCodexIsolationError, match="native_codex_companion_invalid"
+    ):
+        build_native_codex_isolation_envelope(
+            executable=str(binary), process_args=[], work_dir=work, private_root=private
+        )
+
+
 def test_native_codex_isolation_rejects_overlapping_authority_roots(
     tmp_path: Path,
 ) -> None:
@@ -229,8 +304,8 @@ def test_native_codex_loopx_state_rebase_requires_complete_registry_pair(
 
 
 @pytest.mark.skipif(
-    not _namespace_mounts_supported(),
-    reason="unprivileged user/mount namespaces are unavailable",
+    not _native_codex_isolation_supported(),
+    reason="native Codex isolation prerequisites are unavailable",
 )
 def test_native_codex_isolation_exposes_only_workspace_profile_and_work_children(
     tmp_path: Path,
@@ -306,8 +381,83 @@ def test_native_codex_isolation_exposes_only_workspace_profile_and_work_children
 
 
 @pytest.mark.skipif(
-    not _namespace_mounts_supported(),
-    reason="unprivileged user/mount namespaces are unavailable",
+    not _native_codex_isolation_supported(),
+    reason="native Codex isolation prerequisites are unavailable",
+)
+def test_native_codex_isolation_hides_runner_provider_authority_from_shell_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_root = tmp_path / "controller-private"
+    private_root.mkdir()
+    private_secret_file = private_root / "provider-secret.txt"
+    private_secret_file.write_text("fixture-upstream-secret", encoding="utf-8")
+    workspace = tmp_path / "task-workspace"
+    workspace.mkdir()
+    profile_root = tmp_path / "installed-profile"
+    home = profile_root / "home"
+    codex_home = profile_root / "codex-home"
+    codex_home.mkdir(parents=True)
+    home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'env_key = "LOOPX_MODEL_PROVIDER_SENTINEL"\n',
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "run-work"
+    work_dir.mkdir()
+    monkeypatch.setenv("ARK_OPENAI_API_KEY", "fixture-upstream-secret")
+
+    probe = textwrap.dedent(
+        """
+        set -eu
+        private_secret_file=$1
+        test -z "${ARK_OPENAI_API_KEY+x}"
+        for process_environment in /proc/[0-9]*/environ; do
+            [ -r "$process_environment" ] || continue
+            ! tr '\\0' '\\n' < "$process_environment" \
+                | grep -a -F 'ARK_OPENAI_API_KEY='
+        done
+        test ! -e "$private_secret_file"
+        ! grep -R -a -F 'ARK_OPENAI_API_KEY=' "$HOME" "$CODEX_HOME"
+        test "$(cat "$CODEX_HOME/config.toml")" = \
+            'env_key = "LOOPX_MODEL_PROVIDER_SENTINEL"'
+        printf 'credential-boundary-isolated\n'
+        """
+    )
+    envelope = build_native_codex_isolation_envelope(
+        executable="sh",
+        process_args=["-ceu", probe, "sh", str(private_secret_file)],
+        work_dir=work_dir,
+        private_root=private_root,
+        workspace_source=workspace,
+        profile_root=profile_root,
+    )
+    isolated_env = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": str(home),
+        "CODEX_HOME": str(codex_home),
+        "LOOPX_MODEL_PROVIDER_SENTINEL": "runner-owned-gateway-no-upstream-secret",
+    }
+
+    completed = subprocess.run(
+        envelope.process_command,
+        env=isolated_env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "credential-boundary-isolated\n"
+    for authority_root in (home, codex_home):
+        for path in authority_root.rglob("*"):
+            if path.is_file():
+                assert b"fixture-upstream-secret" not in path.read_bytes()
+
+
+@pytest.mark.skipif(
+    not _native_codex_isolation_supported(),
+    reason="native Codex isolation prerequisites are unavailable",
 )
 def test_native_codex_isolation_rejects_symlinked_work_children(
     tmp_path: Path,
@@ -332,3 +482,69 @@ def test_native_codex_isolation_rejects_symlinked_work_children(
     )
 
     assert completed.returncode == 64
+
+
+@pytest.mark.skipif(
+    not _native_codex_isolation_supported(),
+    reason="native Codex isolation prerequisites are unavailable",
+)
+def test_native_codex_isolation_reaps_orphaned_command_processes(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "controller-private"
+    private_root.mkdir()
+    work_dir = tmp_path / "run-work"
+    work_dir.mkdir()
+    probe = textwrap.dedent(
+        """
+        import os
+        import time
+
+        child = os.fork()
+        if child == 0:
+            grandchild = os.fork()
+            if grandchild == 0:
+                time.sleep(0.05)
+                os._exit(0)
+            os._exit(0)
+        os.waitpid(child, 0)
+        time.sleep(0.5)
+
+        zombies = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                fields = {}
+                with open(f"/proc/{entry}/status", encoding="utf-8") as handle:
+                    for line in handle:
+                        if ":" in line:
+                            key, value = line.split(":", 1)
+                            fields[key] = value.strip()
+                if (
+                    fields.get("PPid") == "1"
+                    and fields.get("State", "").startswith("Z")
+                ):
+                    zombies.append(entry)
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                pass
+        print(len(zombies))
+        """
+    )
+    envelope = build_native_codex_isolation_envelope(
+        executable="python3",
+        process_args=["-c", probe],
+        work_dir=work_dir,
+        private_root=private_root,
+    )
+
+    completed = subprocess.run(
+        envelope.process_command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "0\n"

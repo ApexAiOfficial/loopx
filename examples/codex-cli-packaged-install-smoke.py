@@ -94,7 +94,7 @@ def main() -> None:
         assert "ok: `True`" in doctor.stdout, doctor.stdout
         assert "## Install Freshness" in doctor.stdout, doctor.stdout
         assert "release_manifest_available: `True`" in doctor.stdout, doctor.stdout
-        assert "huangruiteng.github.io/loopx/install.sh" in doctor.stdout, doctor.stdout
+        assert "loopx-project.github.io/loopx/install.sh" in doctor.stdout, doctor.stdout
         doctor_json = subprocess.run(
             [str(installed), "--format", "json", "doctor"],
             check=True,
@@ -110,7 +110,7 @@ def main() -> None:
         assert manifest["source"]["promotion_mode"] == "trusted_github_archive", manifest
         assert manifest["schema_version"] == "loopx_release_manifest_v0", manifest
         assert manifest["source"]["kind"] == "github_archive", manifest
-        assert manifest["source"]["repo"] == "huangruiteng/loopx", manifest
+        assert manifest["source"]["repo"] == "loopx-project/loopx", manifest
         assert manifest["source"]["ref"] == "stable", manifest
         assert manifest["source"]["archive_url"] == f"file://{archive}", manifest
         assert manifest["source"]["archive_sha256"], manifest
@@ -131,6 +131,13 @@ def main() -> None:
 
         assert not (home / ".local" / "bin" / "loopx-canary").exists()
         assert not (home / ".local" / "bin" / "goal-harness-canary").exists()
+        # Retire this disposable installed runtime before its HOME is removed;
+        # an idle server can otherwise publish an exit-time cache during rmtree.
+        subprocess.run([sys.executable, "-c",
+            "from loopx.control_plane.effect_runtime import restart_effect_runtime; "
+            "restart_effect_runtime(wait_for_exit=True)"],
+            env={**env, "PYTHONPATH": str(release_root)}, cwd=release_root,
+            check=True, timeout=15, stdout=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

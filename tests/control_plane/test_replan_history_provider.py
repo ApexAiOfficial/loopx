@@ -1,0 +1,178 @@
+"""Real canonical stores feed the public quota consumer, including retry history."""
+from copy import deepcopy
+import json
+import shlex
+
+import pytest
+
+from canonical_authority_fixture import empty_todo_display, initialize_canonical_authority, isolate_sqlite_runtime
+from test_canonical_frontier_revision import _fixture
+from test_goal_amendment_proposal import _write_fixture, _stall_runs, _ack_run, GOAL_ID
+from loopx.control_plane.testing.canary_harness import run_json_cli_result
+from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
+from loopx.control_plane.todos.active_state_todo_parser import parse_todo_source
+from loopx.control_plane.todos.todo_summary import structured_todo_item
+from loopx.status import active_state_todo_fields, autonomous_replan_obligation_from_runs
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_complex_provider_snapshot_replan_and_quota_readback(tmp_path, monkeypatch, provider):
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    paths = _write_fixture(tmp_path, runs=[], initialize=False)
+    projection = _fixture()
+    initialize_canonical_authority(paths["runtime"], GOAL_ID, projection,
+                                   state_path=paths["state_file"], provider=provider)
+    # Missing Goal intent is a rejection case, separate from absent Todo display.
+    original_source = paths["state_file"].read_bytes()
+    paths["state_file"].unlink()
+    goal = json.loads(paths["registry"].read_text())["goals"][0]
+    summary = active_state_todo_fields(goal, runtime_root=paths["runtime"])["agent_todos"]
+    history = list(reversed(_stall_runs()))
+    current = autonomous_replan_obligation_from_runs(history, agent_todos=summary, agent_id="agent-a")
+    assert current["triggers"][0]["kind"] == "typed_progress_repeat"
+    assert autonomous_replan_obligation_from_runs([history[0]] * 8,
+        agent_todos=summary, agent_id="agent-a") is None
+    ack = _ack_run(current["obligation_id"])
+    assert autonomous_replan_obligation_from_runs([ack, *history],
+        agent_todos=summary, agent_id="agent-a") is None
+    peer_ack = {**deepcopy(ack), "agent_id": "agent-b"}
+    assert autonomous_replan_obligation_from_runs([peer_ack, *history],
+        agent_todos=summary, agent_id="agent-a") == current
+    index = paths["runtime"] / "goals" / GOAL_ID / "runs" / "index.jsonl"
+    index.parent.mkdir(parents=True, exist_ok=True)
+    index.write_text("".join(json.dumps(row) + "\n" for row in reversed(history)))
+    original_history = index.read_bytes()
+    code, result = run_json_cli_result("quota", "should-run", "--goal-id", GOAL_ID,
+        "--agent-id", "agent-a", registry_path=paths["registry"])
+    assert code == 1 and result["ok"] is False, result
+    assert result["decision"] == "skip" and result["should_run"] is False
+    assert result["reason"] == "Complete Goal source is required before host dispatch"
+    assert not paths["state_file"].exists()
+    assert index.read_bytes() == original_history
+    assert active_state_todo_fields(goal, runtime_root=paths["runtime"])["agent_todos"] == summary
+
+    paths["state_file"].write_bytes(original_source)
+    empty_todo_display(paths["state_file"])
+    display = paths["state_file"].read_bytes()
+    assert b"todo_stage2_a" not in display
+    code, result = run_json_cli_result("quota", "should-run", "--goal-id", GOAL_ID,
+        "--agent-id", "agent-a", registry_path=paths["registry"])
+    assert code == 0, result
+    assert "typed_progress_repeat" in json.dumps(result)
+    assert active_state_todo_fields(goal, runtime_root=paths["runtime"])["agent_todos"] == summary
+    assert paths["state_file"].read_bytes() == display
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_quota_shared_evidence_command_reads_exact_history_and_preserves_scope(tmp_path, monkeypatch, provider):
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    paths = _write_fixture(tmp_path, runs=[], initialize=False)
+    initialize_canonical_authority(paths["runtime"], GOAL_ID, _fixture(),
+                                   state_path=paths["state_file"], provider=provider)
+    history = [{**row, "health_check": f"Observation {i}\nFull tail constraint."}
+               for i, row in enumerate(_stall_runs())]
+    index = paths["runtime"] / "goals" / GOAL_ID / "runs" / "index.jsonl"
+    index.parent.mkdir(parents=True, exist_ok=True)
+    original = "".join(json.dumps(row) + "\n" for row in history)
+    index.write_text(original)
+    code, guard = run_json_cli_result("quota", "should-run", "--goal-id", GOAL_ID,
+        "--agent-id", "agent-a", registry_path=paths["registry"])
+    assert code == 0, guard
+    context = guard["autonomous_replan_obligation"]["replan_context"]
+    template = context["evidence_read_action_template"]
+    assert len(context["evidence"]) > 1
+    for evidence in context["evidence"]:
+        assert "read_action" not in evidence
+        args = shlex.split(template.replace("{evidence_ref}", evidence["evidence_ref"]))[1:]
+        code, result = run_json_cli_result(*args, registry_path=paths["registry"])
+        assert code == 0, result
+        assert result["evidence"]["health_check"] in [row["health_check"] for row in history]
+        assert result["evidence"]["health_check"] in evidence["summary"]
+    assert index.read_text() == original
+    wrong_agent = ["agent-b" if arg == "agent-a" else arg for arg in args]
+    code, result = run_json_cli_result(*wrong_agent, registry_path=paths["registry"])
+    assert code == 1 and "unavailable" in result["error"]
+    index.write_text("")
+    code, result = run_json_cli_result(*args, registry_path=paths["registry"])
+    assert code == 1 and "unavailable" in result["error"]
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_explicit_completed_todo_fallback_retains_twenty_record_threshold(
+    tmp_path, monkeypatch, provider,
+):
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    paths = _write_fixture(tmp_path, runs=[], initialize=False)
+    registry = json.loads(paths["registry"].read_text())
+    registry["goals"][0]["adapter"] = {"kind": "harness_self_improvement"}
+    paths["registry"].write_text(json.dumps(registry))
+    todos, _, sections = parse_todo_source(paths["state_file"].read_text())
+    projection = build_todo_runtime_shadow_projection(
+        goal_id=GOAL_ID,
+        todos=[structured_todo_item(row, role=role, source_section=sections[role], text_limit=None)
+               for role in ("user", "agent") for row in todos[role]],
+        handoff_mode="soft_claim",
+    )
+    initialize_canonical_authority(paths["runtime"], GOAL_ID, projection,
+                                   state_path=paths["state_file"], provider=provider)
+    paths["state_file"].unlink()
+    index = paths["runtime"] / "goals" / GOAL_ID / "runs" / "index.jsonl"
+    index.parent.mkdir(parents=True, exist_ok=True)
+
+    def call(*args):
+        code, result = run_json_cli_result(*args, registry_path=paths["registry"])
+        assert code == 0, result
+        return result
+
+    def obligation():
+        status = call("status", "--agent-id", "agent-a", "--limit", "30",
+                      )
+        return next((obligation for row in status["attention_queue"]["items"]
+                     if row["goal_id"] == GOAL_ID
+                     if (obligation := row.get("autonomous_replan_obligations_by_agent", {})
+                         .get("agent-a")) is not None), None)
+
+    def history(count, *, retry=False, peer=False, classification="bounded_iteration"):
+        index.write_text("".join(json.dumps({
+            "goal_id": GOAL_ID, "agent_id": "agent-b" if peer else "agent-a",
+            "generated_at": f"2026-09-01T03:{n:02d}:00Z",
+            "turn_instance_id": "one-retried-turn" if retry else f"turn-{n}",
+            "classification": classification, "delivery_outcome": "outcome_progress",
+        }) + "\n" for n in range(count)))
+
+    history(20)
+    assert obligation() is None, "unsettled history is not effective-Turn evidence"
+    call("configure-goal", "--goal-id", GOAL_ID,
+         "--execution-replan-after-todos", "5", "--execute")
+    for classification in ("replan_noop", "repair_noop"):
+        history(20, classification=classification)
+        assert obligation() is None, "unsuccessful reviews cannot create another periodic review"
+    history(19)
+    assert obligation() is None
+    history(20, retry=True)
+    assert obligation() is None, "retries cannot meet the twenty-Turn fallback"
+    history(20, peer=True)
+    assert obligation() is None, "a peer cannot trigger the current Agent's review"
+    history(20)
+    original = obligation()
+    trigger = original["triggers"][0]
+    assert trigger["kind"] == "periodic_review_due"
+    assert trigger["run_count"] == trigger["threshold"] == 20
+    assert trigger["agent_id"] == "agent-a"
+    with index.open("a") as stream:
+        for n in range(200):
+            stream.write(json.dumps({
+                "goal_id": GOAL_ID, "agent_id": "agent-a",
+                "generated_at": f"2026-09-01T04:{n // 60:02d}:{n % 60:02d}Z",
+                "turn_instance_id": f"renamed-review-{n}",
+                "classification": "replan_noop" if n % 2 else "repair_noop",
+                "health_check": f"No new decision; revised description {n}.",
+                "delivery_outcome": "outcome_gap",
+            }) + "\n")
+    repeated = obligation()
+    assert repeated["obligation_id"] == original["obligation_id"]
+    assert repeated["triggers"] == original["triggers"]
+    call("configure-goal", "--goal-id", GOAL_ID,
+         "--clear-execution-replan-after-todos", "--execute")
+    assert obligation() is None
+    assert not paths["state_file"].exists(), "readback must retain canonical authority"

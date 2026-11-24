@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .assembler import DecisionEvidenceRecords
 from .architecture import build_decision_context_architecture_packet
+from .freshness import render_source_freshness_markdown
 from .profile import resolve_decision_context_activation
 from .private_state import (
     load_private_pending_decision_settlement,
@@ -17,6 +18,7 @@ from .review_settlement import settle_profile_decision_review
 from .runtime import (
     assemble_profile_decision_evidence,
     decision_evidence_records_from_mapping,
+    recall_profile_decision_context,
 )
 from .sources import build_decision_source_manifest
 
@@ -51,6 +53,10 @@ def _render(payload: dict[str, object]) -> str:
         if isinstance(capability, dict)
         else "decision_context"
     )
+    assembly = payload.get("assembly")
+    freshness = payload.get("source_freshness") or (
+        assembly.get("source_freshness") if isinstance(assembly, dict) else None
+    )
     return "\n".join(
         [
             "# Decision Context",
@@ -61,6 +67,11 @@ def _render(payload: dict[str, object]) -> str:
             f"- source_schemas: `{_collection_size(payload.get('source_schemas'))}`",
             f"- source_count: `{payload.get('source_count', 0)}`",
             "",
+            *(
+                render_source_freshness_markdown(freshness)
+                if isinstance(freshness, dict)
+                else []
+            ),
         ]
     )
 
@@ -74,6 +85,53 @@ def register_decision_context_commands(
         help="Inspect the provider-neutral decision evidence and outcome contract.",
     )
     commands = parser.add_subparsers(dest="decision_context_command", required=True)
+    for name in ("capture-diagnose", "capture-recovery"):
+        recovery = commands.add_parser(
+            name, help="Diagnose or explicitly recover one private capture source."
+        )
+        add_subcommand_format(recovery)
+        for field in (
+            "goal-id",
+            "agent-id",
+            "profile",
+            "spool",
+            "cursor-state",
+            "source-id",
+        ):
+            recovery.add_argument("--" + field, required=True)
+        if name == "capture-diagnose":
+            recovery.add_argument(
+                "--probe",
+                action="store_true",
+                help="Exact-read transiently to check replay; never settle.",
+            )
+        else:
+            recovery.add_argument(
+                "--action", choices=("hold", "restart", "rollback"), required=True
+            )
+            recovery.add_argument("--expected-token")
+            recovery.add_argument(
+                "--recovery-id", help="Applied receipt id to roll back."
+            )
+            recovery.add_argument("--execute", action="store_true")
+    for name in ("capture", "capture-status", "prepare-captured"):
+        capture = commands.add_parser(
+            name, help="Operate the opt-in private source-reference spool."
+        )
+        add_subcommand_format(capture)
+        capture.add_argument("--goal-id", required=True)
+        capture.add_argument("--agent-id", required=True)
+        capture.add_argument("--profile", required=True)
+        capture.add_argument("--spool", required=True)
+        capture.add_argument("--cursor-state")
+        if name == "capture":
+            capture.add_argument("--execute", action="store_true")
+        if name == "prepare-captured":
+            capture.add_argument("--batch-id", type=int, required=True)
+            capture.add_argument("--decision-id", required=True)
+            capture.add_argument("--rebase-json", required=True)
+            capture.add_argument("--pending-settlement", required=True)
+            capture.add_argument("--execute", action="store_true")
     architecture = commands.add_parser(
         "architecture",
         help="Render the default-off Stage-0 Decision Context contract.",
@@ -140,6 +198,23 @@ def register_decision_context_commands(
         type=float,
         help="Optional bounded provider timeout override.",
     )
+    recall = commands.add_parser(
+        "recall-context",
+        help=(
+            "Read one transient advisory scope without profile mutation, source "
+            "scans, cursors, or settlement."
+        ),
+    )
+    add_subcommand_format(recall)
+    recall.add_argument("--goal-id", required=True)
+    recall.add_argument("--agent-id", required=True)
+    recall.add_argument("--profile", required=True)
+    recall.add_argument("--context-scope-ref", required=True)
+    recall.add_argument("--query", required=True)
+    recall.add_argument("--query-summary", required=True)
+    recall.add_argument("--max-results", type=int)
+    recall.add_argument("--timeout-seconds", type=float)
+    recall.add_argument("--observed-at")
     prepare_review = commands.add_parser(
         "prepare-review",
         help=(
@@ -168,7 +243,7 @@ def register_decision_context_commands(
     settle_review = commands.add_parser(
         "settle-review",
         help=(
-            "Exact-read a user-gate event or semantic no-change result, append "
+            "Validate a user-gate decision or evidence-only review, append "
             "validated writeback, and CAS-commit private cursors."
         ),
     )
@@ -181,6 +256,15 @@ def register_decision_context_commands(
     settle_review.add_argument("--event-log", required=True)
     settle_review.add_argument("--proposal-json")
     settle_review.add_argument("--source-event-id")
+    settle_review.add_argument(
+        "--disposition",
+        choices=("no_change", "observed"),
+        help=(
+            "Evidence-only review: observed records new facts without action "
+            "authority; no_change requires explicit no-change proof. Omit for "
+            "a user-gate decision, whose disposition is read from its event."
+        ),
+    )
     settle_review.add_argument("--actor-ref", required=True)
     settle_review.add_argument("--reason-code", required=True)
     settle_review.add_argument("--summary", required=True)
@@ -194,13 +278,94 @@ def register_decision_context_commands(
 def handle_decision_context_command(
     args: argparse.Namespace,
     *,
+    runtime_root: Path | None,
     output_format: FormatSelector,
     print_payload: PrintPayload,
 ) -> int | None:
     if args.command != "decision-context":
         return None
-    if args.decision_context_command == "architecture":
+    if args.decision_context_command in {"capture-diagnose", "capture-recovery"}:
+        from .capture_recovery import diagnose_capture_source, recover_capture_source
+
+        recovery_args = dict(
+            goal_id=args.goal_id,
+            agent_id=args.agent_id,
+            profile_path=Path(args.profile),
+            spool_path=Path(args.spool),
+            cursor_path=Path(args.cursor_state),
+            source_id=args.source_id,
+        )
+        if args.decision_context_command == "capture-diagnose":
+            payload = diagnose_capture_source(**recovery_args, probe=args.probe)
+        else:
+            payload = recover_capture_source(
+                **recovery_args,
+                action=args.action,
+                execute=args.execute,
+                expected_token=args.expected_token,
+                recovery_id=args.recovery_id,
+            )
+    elif args.decision_context_command in {
+        "capture",
+        "capture-status",
+        "prepare-captured",
+    }:
+        from .capture import (
+            capture_profile_sources,
+            assemble_captured_decision_evidence,
+        )
+
+        capture_args = dict(
+            goal_id=args.goal_id,
+            agent_id=args.agent_id,
+            profile_path=Path(args.profile),
+            spool_path=Path(args.spool),
+            cursor_path=Path(args.cursor_state) if args.cursor_state else None,
+        )
+        if args.decision_context_command == "prepare-captured":
+            records = decision_evidence_records_from_mapping(
+                _load_json_mapping(args.rebase_json, label="rebase JSON")
+            )
+            assembly = assemble_captured_decision_evidence(
+                **capture_args,
+                batch_id=args.batch_id,
+                decision_id=args.decision_id,
+                rebase=lambda _collection: records,
+            )
+            if args.execute:
+                write_private_pending_decision_settlement(
+                    Path(args.pending_settlement), assembly
+                )
+            payload = {
+                "assembly": assembly.public_packet(),
+                "pending_settlement_written": args.execute,
+                "cursor_state_mutated": False,
+            }
+        else:
+            payload = capture_profile_sources(
+                **capture_args,
+                execute=bool(getattr(args, "execute", False)),
+                health_runtime_root=runtime_root,
+            )
+    elif args.decision_context_command == "architecture":
         payload = build_decision_context_architecture_packet()
+    elif args.decision_context_command == "recall-context":
+        observed_at = (
+            str(getattr(args, "observed_at", None) or "").strip()
+            or datetime.now(timezone.utc).isoformat()
+        )
+        payload = recall_profile_decision_context(
+            goal_id=args.goal_id,
+            agent_id=args.agent_id,
+            profile_path=Path(args.profile),
+            context_scope_ref=args.context_scope_ref,
+            query=args.query,
+            query_summary=args.query_summary,
+            observed_at=observed_at,
+            max_results=args.max_results,
+            timeout_seconds=args.timeout_seconds,
+            runtime_root=runtime_root,
+        )
     elif args.decision_context_command in {"prepare-evidence", "prepare-review"}:
         now = datetime.now(timezone.utc).isoformat()
         observed_at = str(getattr(args, "observed_at", None) or "").strip() or now
@@ -232,10 +397,9 @@ def handle_decision_context_command(
             ),
             rebase=lambda _collection: records,
             timeout_seconds=getattr(args, "timeout_seconds", None),
+            runtime_root=runtime_root,
         )
-        settlement_required = bool(
-            assembly is not None and assembly.proposed_cursors
-        )
+        settlement_required = bool(assembly is not None and assembly.proposed_cursors)
         pending_written = False
         if prepare_review and settlement_required and bool(args.execute):
             write_private_pending_decision_settlement(
@@ -272,6 +436,7 @@ def handle_decision_context_command(
             actor_ref=args.actor_ref,
             reason_code=args.reason_code,
             summary=args.summary,
+            disposition=args.disposition,
             proposal=proposal,
             source_event_id=(
                 str(args.source_event_id).strip()

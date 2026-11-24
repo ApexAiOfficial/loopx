@@ -1,0 +1,441 @@
+from __future__ import annotations
+
+import asyncio
+from dataclasses import replace
+from hashlib import sha256
+import json
+from pathlib import Path
+import sys
+import copy
+
+import httpx
+import pytest
+from arkruntime import AsyncArk
+
+from tests.control_plane.test_turn_host_decision_capture import complete_host_request as complete_host_request
+from tests.control_plane.host_process_fixture import assert_host_task_context
+
+from loopx.control_plane.quota.turn_envelope import turn_envelope_action_signature_document
+from loopx_ark_turn.config import AdapterError, Config, digest
+from loopx_ark_turn.host import run, config_digest
+from loopx_ark_turn.receipt import Receipt
+
+
+def request() -> dict:
+    envelope = {
+        "schema_version": "loopx_turn_envelope_v0", "goal_id": "public-goal", "agent_id": "analyst",
+        "action": {"primary_action": "Write the observation, then return a progress candidate.", "selected_todo": {"todo_id": "todo_fixture"}},
+        "required_reads": [], "boundary": {"write_scope": ["observation.json"], "workspace_guard": {}},
+    }
+    signature = "sha256:" + sha256(json.dumps(turn_envelope_action_signature_document(envelope), sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    envelope["action_signature"] = {"matches": True, "source_hash": signature, "envelope_hash": signature}
+    return {
+        "schema_version": "loopx_turn_host_request_v0", "turn_key": "sha256:" + "1" * 64,
+        "session": {"context_policy": {"mode": "fresh"}}, "turn_envelope": envelope,
+    }
+
+
+def config(tmp_path: Path, *, tools: bool = True) -> Config:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    return Config(
+        model="public-model", environment_id="env-fixture", workspace=workspace,
+        state_dir=tmp_path / "receipts", timeout_seconds=10, tool_timeout_seconds=5,
+        poll_interval_seconds=0.01,
+        mcp_command=(sys.executable, str(Path(__file__).with_name("fixture_server.py"))) if tools else (),
+        tool_names=("write_observation",) if tools else (),
+    )
+
+
+def event(event_id: str, kind: str, **fields) -> dict:
+    return {"id": event_id, "type": kind, **fields}
+
+
+def tool_event(event_id: str = "e1", *, value: int = 42, name: str = "write_observation") -> dict:
+    return event(event_id, "agent.custom_tool_use", session_thread_id="thread-root", name=name, input={"value": value})
+
+
+class Provider:
+    """Public wire fixtures exercised through the real SDK, not a fake SDK API."""
+    def __init__(self, events: list[dict] | None = None) -> None:
+        candidate = json.dumps({"result_kind": "validated_progress", "classification": "observation_written", "summary": "Observation recorded.", "next_action": "Independently validate the observation."})
+        self.before = events if events is not None else [tool_event(), event("e2", "session.status_idle", stop_reason={"type": "requires_action"})]
+        self.after = [event("e3", "agent.message", session_thread_id="thread-root", content=[{"type": "text", "text": candidate}]), event("e4", "session.status_idle", stop_reason={"type": "end_turn"})]
+        self.calls: list[tuple[str, str, dict]] = []
+        self.deleted: set[str] = set()
+        self.results: list[dict] = []
+        self.bad_binding = False
+        self.bad_capabilities = False
+        self.agent_snapshot = {}
+        self.fail_delete = False
+        self.fail_create = False
+        self.empty_forever = False
+
+    def __call__(self, req: httpx.Request) -> httpx.Response:
+        path = req.url.path.removeprefix("/api/v3")
+        body = json.loads(req.content) if req.content else {}
+        self.calls.append((req.method, path, body))
+        if req.method == "DELETE":
+            if self.fail_delete:
+                return httpx.Response(503, json={"error": {"message": "synthetic unavailable"}})
+            self.deleted.add(path)
+            return httpx.Response(200, json={"deleted": True, "id": path.split("/")[-1]})
+        if req.method == "GET" and path in self.deleted:
+            return httpx.Response(404, json={"error": {"message": "not found"}})
+        if path == "/agents" and req.method == "POST":
+            if self.fail_create:
+                raise httpx.ReadTimeout("synthetic ambiguous create", request=req)
+            assert all(t["type"] == "custom" for t in body["tools"])
+            self.agent_snapshot = body
+            return httpx.Response(200, json={"id": "agnt-fixture", "type": "agent", **body})
+        if path == "/sessions" and req.method == "POST":
+            return httpx.Response(200, json={"id": "sesn-fixture", "type": "session", "status": "idle", "agent": {"id": "agnt-fixture"}, "environment_id": "env-fixture"})
+        if path == "/sessions/sesn-fixture" and req.method == "GET":
+            if self.bad_capabilities:
+                self.agent_snapshot["tools"] = [{"type": "agent_toolset_20260701"}]
+            return httpx.Response(200, json={"id": "sesn-fixture", "type": "session", "status": "idle", "agent": {"id": "other" if self.bad_binding else "agnt-fixture", **self.agent_snapshot}, "environment_id": "env-fixture", "usage": {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 0}})
+        if path.endswith("/events") and req.method == "POST":
+            sent = body["events"][0]
+            if sent["type"] == "user.custom_tool_result":
+                self.results.append(sent)
+                return httpx.Response(200, json={"data": [{"id": "result1", **sent}]})
+            assert sent["type"] == "user.message"
+            return httpx.Response(200, json={"data": [{"id": "e0", "type": "user.message", "session_thread_id": "thread-root"}]})
+        if path.endswith("/events") and req.method == "GET":
+            assert "after" not in req.url.params
+            offset = int(req.url.params.get("page", "opaque-0").removeprefix("opaque-"))
+            history = [event("startup", "session.status_idle", stop_reason={"type": "end_turn"}),
+                       event("e0", "user.message", session_thread_id="thread-root")]
+            if not self.empty_forever:
+                history += self.before
+                if self.results or not self.before:
+                    history += self.after
+            page = history[offset:offset + 100]
+            next_page = "opaque-" + str(offset + 100) if len(history) > offset + 100 else None
+            return httpx.Response(200, json={"data": page, "next_page": next_page})
+        raise AssertionError((req.method, path))
+
+
+async def execute(provider: Provider, cfg: Config, req: dict | None = None) -> dict:
+    async with AsyncArk(api_key="public-fixture", max_retries=0, http_client=httpx.AsyncClient(transport=httpx.MockTransport(provider))) as client:
+        return await run(req or request(), cfg, client)
+
+
+@pytest.mark.parametrize("checkpoint", ["running", "terminal"])
+def test_original_cloud_checkpoint_resumes_without_new_input_or_tool_effect(tmp_path, monkeypatch, checkpoint):
+    cfg = config(tmp_path)
+    provider = Provider()
+    captured = []
+    save = Receipt.save
+
+    def capture(receipt):
+        save(receipt)
+        if receipt.data["stage"] == checkpoint and receipt.data.get("tools", {}).get("e1", {}).get("stage") == "sent":
+            captured.append(copy.deepcopy(receipt.data))
+
+    monkeypatch.setattr(Receipt, "save", capture)
+    asyncio.run(execute(provider, cfg))
+    assert captured
+    # Restore an actual persisted execution checkpoint. The fixture provider
+    # retains the already accepted effect and original event history.
+    state = next(row for row in captured if not row.get("cleanup") and not row.get("candidate"))
+    path = Receipt(cfg.state_dir, request()["turn_key"]).path
+    path.write_text(json.dumps(state))
+    provider.deleted.clear()
+    count = len(provider.calls)
+    assert asyncio.run(execute(provider, cfg))["result_kind"] == "validated_progress"
+    assert not [row for row in provider.calls[count:] if row[0] == "POST"]
+    assert json.loads((cfg.workspace / "observation.json").read_text())["calls"] == 1
+
+
+def test_uncertain_tool_checkpoint_preserves_resources_for_reconciliation(tmp_path, monkeypatch):
+    cfg = config(tmp_path)
+    provider = Provider()
+    captured = []
+    save = Receipt.save
+
+    def capture(receipt):
+        save(receipt)
+        if receipt.data.get("tools", {}).get("e1", {}).get("stage") == "executing":
+            captured.append(copy.deepcopy(receipt.data))
+
+    monkeypatch.setattr(Receipt, "save", capture)
+    asyncio.run(execute(provider, cfg))
+    Receipt(cfg.state_dir, request()["turn_key"]).path.write_text(json.dumps(captured[0]))
+    provider.deleted.clear()
+    count = len(provider.calls)
+    with pytest.raises(AdapterError, match="requires_reconciliation"):
+        asyncio.run(execute(provider, cfg))
+    assert provider.calls[count:] == []
+    assert json.loads((cfg.workspace / "observation.json").read_text())["calls"] == 1
+
+
+def test_real_stdio_tools_are_bound_and_pending_tool_idle_is_not_completion(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARK_API_KEY", "must-not-reach-tool")
+    cfg = config(tmp_path)
+    provider = Provider()
+    result = asyncio.run(execute(provider, cfg))
+    assert result["result_kind"] == "validated_progress"
+    assert result["turn_key"] == request()["turn_key"]
+    observed = json.loads((cfg.workspace / "observation.json").read_text())
+    assert observed == {"value": 42, "calls": 1, "agent": "analyst", "goal": "public-goal", "todo": "todo_fixture", "provider_credential_present": False}
+    assert provider.results[0]["custom_tool_use_id"] == "e1"
+    assert provider.results[0]["session_thread_id"] == "thread-root"
+    assert provider.deleted == {"/sessions/sesn-fixture", "/agents/agnt-fixture"}
+    receipt = json.loads(Receipt(cfg.state_dir, request()["turn_key"]).path.read_text())
+    assert receipt["provider_usage"]["output_tokens"] == 20
+    assert receipt["stage"] == "finished"
+    before = len(provider.calls)
+    assert asyncio.run(execute(provider, cfg)) == result
+    assert len(provider.calls) == before  # Exact replay neither launches nor repeats a tool.
+
+
+@pytest.mark.parametrize("mutation", ["signature", "context", "identity"])
+def test_invalid_request_never_starts_provider(tmp_path, mutation):
+    cfg = config(tmp_path, tools=False)
+    req = request()
+    if mutation == "signature":
+        req["turn_envelope"]["action"]["primary_action"] = "Forged change"
+    elif mutation == "context":
+        req["session"]["context_policy"]["mode"] = "resume"
+    else:
+        req["turn_key"] = "not-a-turn-key"
+    provider = Provider([])
+    with pytest.raises(ValueError):
+        asyncio.run(execute(provider, cfg, req))
+    assert provider.calls == []
+
+
+def test_duplicate_tool_identity_does_not_repeat_effect(tmp_path):
+    cfg = config(tmp_path)
+    provider = Provider([tool_event(), tool_event()])
+    asyncio.run(execute(provider, cfg))
+    assert len(provider.results) == 1
+    assert json.loads((cfg.workspace / "observation.json").read_text())["calls"] == 1
+
+
+def test_page_based_history_reaches_tools_beyond_first_page(tmp_path):
+    provider = Provider([*[event("span" + str(i), "span.model_request_start") for i in range(205)], tool_event()])
+    asyncio.run(execute(provider, config(tmp_path)))
+    assert len(provider.results) == 1
+    assert provider.results[0]["custom_tool_use_id"] == "e1"
+
+
+@pytest.mark.parametrize("events,error", [
+    ([tool_event(), tool_event(value=7)], "event_identity_conflict"),
+    ([tool_event(name="unselected_tool")], "tool_not_in_bound_selection"),
+    ([event("e1", "session.status_idle", stop_reason={"type": "end_turn"})], "terminal_without_candidate"),
+    ([event("e1", "session.status_idle", stop_reason={"type": "user_interrupt"})], "unsupported_provider_stop_reason"),
+    ([event("e1", "session.error")], "provider_execution_failed"),
+])
+def test_negative_event_paths_reject_and_retire_owned_resources(tmp_path, events, error):
+    cfg = config(tmp_path)
+    provider = Provider(events)
+    with pytest.raises(Exception, match=error):
+        asyncio.run(execute(provider, cfg))
+    assert provider.deleted == {"/sessions/sesn-fixture", "/agents/agnt-fixture"}
+
+
+def test_cleanup_failure_withholds_candidate_and_exact_retry_only_cleans_up(tmp_path):
+    cfg = config(tmp_path, tools=False)
+    provider = Provider([])
+    provider.fail_delete = True
+    with pytest.raises(AdapterError, match="cleanup"):
+        asyncio.run(execute(provider, cfg))
+    assert provider.deleted == set()
+    provider.fail_delete = False
+    result = asyncio.run(execute(provider, cfg))
+    assert result["result_kind"] == "validated_progress"
+    assert sum(method == "POST" and path == "/sessions" for method, path, _ in provider.calls) == 1
+
+
+def test_changed_same_key_is_rejected_without_provider_calls(tmp_path):
+    cfg = config(tmp_path, tools=False)
+    provider = Provider([])
+    asyncio.run(execute(provider, cfg))
+    before = len(provider.calls)
+    with pytest.raises(AdapterError, match="binding_mismatch"):
+        asyncio.run(execute(provider, replace(cfg, model="another-model")))
+    assert len(provider.calls) == before
+
+
+def test_wrong_session_binding_is_rejected_before_input(tmp_path):
+    cfg = config(tmp_path, tools=False)
+    provider = Provider([])
+    provider.bad_binding = True
+    with pytest.raises(AdapterError, match="binding_mismatch"):
+        asyncio.run(execute(provider, cfg))
+    assert not any(path.endswith("/events") for _, path, _ in provider.calls)
+
+
+def test_unexpected_provider_capabilities_are_rejected_before_input(tmp_path):
+    provider = Provider([])
+    provider.bad_capabilities = True
+    with pytest.raises(AdapterError, match="capabilities_mismatch"):
+        asyncio.run(execute(provider, config(tmp_path, tools=False)))
+    assert not any(path.endswith("/events") for _, path, _ in provider.calls)
+
+
+def test_ambiguous_create_is_not_automatically_retried(tmp_path):
+    cfg = config(tmp_path, tools=False)
+    provider = Provider([])
+    provider.fail_create = True
+    with pytest.raises(Exception):
+        asyncio.run(execute(provider, cfg))
+    with pytest.raises(AdapterError, match="reconciliation"):
+        asyncio.run(execute(provider, cfg))
+    assert len(provider.calls) == 1
+    receipt = json.loads(Receipt(cfg.state_dir, request()["turn_key"]).path.read_text())
+    assert receipt["cleanup"]["unknown_creation"] == "reconcile_required"
+
+
+def test_tool_budget_prevents_second_effect(tmp_path):
+    cfg = replace(config(tmp_path), max_tool_calls=1)
+    provider = Provider([tool_event(), tool_event("e2")])
+    with pytest.raises(Exception, match="tool_call_budget"):
+        asyncio.run(execute(provider, cfg))
+    assert json.loads((cfg.workspace / "observation.json").read_text())["calls"] == 1
+
+
+def test_timeout_does_not_return_progress_and_cleans_resources(tmp_path):
+    cfg = replace(config(tmp_path, tools=False), timeout_seconds=0.1)
+    provider = Provider([])
+    provider.empty_forever = True
+    with pytest.raises(TimeoutError):
+        asyncio.run(execute(provider, cfg))
+    assert provider.deleted == {"/sessions/sesn-fixture", "/agents/agnt-fixture"}
+
+
+def test_cancel_and_competing_start_do_not_launch_another_session(tmp_path):
+    from loopx.file_lock import LockAcquireTimeoutError
+
+    cfg = config(tmp_path, tools=False)
+    provider = Provider([])
+    provider.empty_forever = True
+
+    async def exercise():
+        active = asyncio.create_task(execute(provider, cfg))
+        async with asyncio.timeout(5):
+            while not any(path.endswith("/events") for _, path, _ in provider.calls):
+                await asyncio.sleep(0.01)
+        before = len(provider.calls)
+        with pytest.raises(LockAcquireTimeoutError):
+            await execute(provider, cfg)
+        assert len(provider.calls) == before
+        active.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+
+    asyncio.run(exercise())
+    assert sum(method == "POST" and path == "/sessions" for method, path, _ in provider.calls) == 1
+    assert provider.deleted == {"/sessions/sesn-fixture", "/agents/agnt-fixture"}
+
+
+@pytest.mark.parametrize("override", [
+    {"mcp_env": ("ARK_API_KEY",)}, {"mcp_env": ("LOOPX_TURN_AGENT_ID",)},
+    {"timeout_seconds": float("nan")}, {"max_tool_calls": 0},
+    {"base_url": "https://user:password@example.com/api/v3"},
+])
+def test_unsafe_configuration_is_rejected(tmp_path, override):
+    with pytest.raises(AdapterError):
+        replace(config(tmp_path, tools=False), **override)
+
+
+@pytest.mark.parametrize("checkpoint", ["completed", "running"])
+@pytest.mark.parametrize("wire", [False, True])
+def test_complete_cli_task_context_reaches_sdk_and_replays_original_receipt(tmp_path, monkeypatch, complete_host_request, checkpoint, wire):
+    req, contract = complete_host_request
+    if wire:
+        from loopx.control_plane.turn_driver.host_candidate import complete_host_input
+        req = complete_host_input(req)
+        assert req["schema_version"] == "loopx_turn_host_request_v1" and "turn_envelope" not in req
+    cfg = config(tmp_path, tools=False)
+    original = copy.deepcopy(req)
+    expected_binding = digest([original, config_digest(cfg)])
+    provider = Provider([])
+    checkpoints = []
+    save = Receipt.save
+
+    def capture(receipt):
+        save(receipt)
+        if receipt.data["stage"] == "running":
+            checkpoints.append(copy.deepcopy(receipt.data))
+
+    monkeypatch.setattr(Receipt, "save", capture)
+    result = asyncio.run(execute(provider, cfg, req))
+    sent = [body["events"][0] for method, path, body in provider.calls
+            if method == "POST" and path.endswith("/events")]
+    assert len(sent) == 1 and sent[0]["type"] == "user.message"
+    prompt = sent[0]["content"][0]["text"]
+    model_input, _ = json.JSONDecoder().raw_decode(prompt.split("Turn request:\n", 1)[1])
+    assert_host_task_context(model_input, contract)
+    assert req == original
+    receipt = Receipt(cfg.state_dir, req["turn_key"])
+    receipt.read()
+    assert receipt.data["binding"] == expected_binding
+    assert result["turn_key"] == req["turn_key"]
+    if checkpoint == "running":
+        # Replay a real persisted checkpoint; the provider retains the original
+        # input and result. Recovery must observe it instead of submitting again.
+        assert checkpoints
+        Receipt(cfg.state_dir, req["turn_key"]).path.write_text(json.dumps(checkpoints[0]))
+        provider.deleted.clear()
+    calls = len(provider.calls)
+    assert asyncio.run(execute(provider, cfg, req)) == result
+    if checkpoint == "completed":
+        assert len(provider.calls) == calls
+    else:
+        assert not [row for row in provider.calls[calls:] if row[0] == "POST"]
+
+
+@pytest.mark.parametrize("mutation", ["source", "version", "binding", "missing"])
+@pytest.mark.parametrize("wire", [False, True])
+def test_complete_cli_input_rejects_corruption_before_provider(tmp_path, complete_host_request, mutation, wire):
+    original, _ = complete_host_request
+    if wire:
+        from loopx.control_plane.turn_driver.host_candidate import complete_host_input
+        original = complete_host_input(original)
+    req = copy.deepcopy(original)
+    if mutation == "source":
+        req["work_contract"]["goal_id"] = "different-goal"
+    elif mutation == "version":
+        req["work_contract"]["schema_version"] = "unsupported-contract"
+    elif mutation == "binding":
+        req["work_contract"]["contract_binding"]["scheduler_execution_args"] = "different-host"
+    else:
+        req["work_contract"] = None
+    cfg = config(tmp_path, tools=False)
+    provider = Provider([])
+    with pytest.raises(ValueError, match="complete Turn contract rejected"):
+        asyncio.run(execute(provider, cfg, req))
+    assert provider.calls == []
+    assert not cfg.state_dir.exists()
+
+
+def test_complete_tool_identity_uses_the_shared_source_owner(complete_host_request):
+    from loopx_ark_turn.config import require_request
+    from tests.control_plane.test_turn_host_decision_capture import _fixture_module
+
+    class ExecutorLayout(dict):
+        def get(self, key, *default):
+            if key in {"goal_id", "agent_id", "action"}:
+                raise AssertionError("provider decoded the historical executor layout")
+            return super().get(key, *default)
+
+    request, _ = complete_host_request
+    request = {**request, "turn_envelope": ExecutorLayout(request["turn_envelope"])}
+    fixture = _fixture_module()
+    assert require_request(request) == {"KEY": request["turn_key"],
+        "GOAL_ID": fixture.GOAL_ID, "AGENT_ID": fixture.AGENT_ID, "TODO_ID": fixture.TODO_ID}
+
+
+def test_unknown_host_version_never_reaches_provider(tmp_path, complete_host_request):
+    from loopx.control_plane.turn_driver.host_candidate import complete_host_input
+
+    request, _ = complete_host_request
+    cfg, provider = config(tmp_path, tools=False), Provider([])
+    for original in (request, complete_host_input(request)):
+        for version in ("unsupported_host_fixture", "loopx_turn_model_context_v0"):
+            with pytest.raises(AdapterError, match="request_schema_mismatch"):
+                asyncio.run(execute(provider, cfg, {**original, "schema_version": version}))
+    assert provider.calls == [] and not cfg.state_dir.exists()

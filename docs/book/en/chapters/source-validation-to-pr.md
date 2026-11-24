@@ -47,7 +47,7 @@ PR.
 ## Six evidence layers
 
 The official
-[Testing and Quality](https://github.com/huangruiteng/loopx/blob/main/docs/development/testing-and-quality.md)
+[Testing and Quality](https://github.com/loopx-project/loopx/blob/main/docs/development/testing-and-quality.md)
 guide defines the current quality system. For external contributors, organize it around the job.
 
 ### 1. Unit and contract tests
@@ -64,8 +64,7 @@ ambiguous scope -> typed repair
 explicit global scope -> global Gate
 ```
 
-This layer is the closest proof of an invariant. It does not prove that CLI, projection, and scheduler are
-connected correctly.
+This layer is the closest proof of an invariant.
 
 ### 2. Focused deterministic smoke
 
@@ -237,16 +236,21 @@ If the fake violates the real contract, repair test infrastructure before diagno
 
 ## Choose local validation commands by risk
 
-The official fast baseline includes:
+The official contribution baseline (see the [testing and quality guide](/loopx/docs/development/testing-and-quality/))
+starts with `uv sync --extra test` and runs inside the checkout with the selected interpreter:
 
 ```bash
-python -m pip install -e ".[test]"
-python -m ruff check tests loopx/canary loopx/control_plane loopx/domain_packs loopx/presentation
-python -m mypy
-python examples/control_plane/cli-output-budget-regression-smoke.py
-python -m pytest -q
+uv sync --extra test
+uv run --extra test python -m ruff check tests loopx/canary loopx/control_plane loopx/domain_packs loopx/presentation
+uv run --extra test python -m mypy
+uv run --extra test python examples/control_plane/cli-output-budget-regression-smoke.py
+uv run --extra test python -m pytest -q
 git diff --check
 ```
+
+An explicit environment that already has this checkout installed may run the same `python -m ...`
+commands directly; a bare `python` may point at another installation, so confirm `sys.executable` and
+`loopx --version` first.
 
 During development, start closer to the change:
 
@@ -343,7 +347,7 @@ Git hygiene is part of the public/private contract.
 | Product code | Protocol policy, writer, projection | Commit when required by this PR |
 | Public docs | Protocol, contributor guide | Commit when it explains current behavior |
 | Durable validation | Contract test, public-safe smoke | Commit when it protects the rule |
-| Local/private state | `.loopx/`, `.codex/goals/`, live state | Never commit |
+| Local/private state | `.loopx/`, `.loopx/goals/`, live state | Never commit |
 | Generated/raw evidence | Logs, transcripts, verifier tails | Never commit |
 | Unrelated artifact | Another experiment or formatter churn | Keep outside the PR |
 
@@ -439,7 +443,7 @@ What remains owner-held?
 ## Link public work, not local runtime state
 
 Nontrivial contributions should link
-[`CONTRIBUTOR_TASKS.md`](https://github.com/huangruiteng/loopx/blob/main/docs/development/contributor-tasks.md)
+the [Contributor Task Board](https://github.com/loopx-project/loopx/blob/main/docs/development/contributor-tasks.md)
 or a GitHub Issue:
 
 - state the intended slice before a large change;
@@ -478,9 +482,79 @@ Do not implement every comment mechanically. Ask:
 
 If review exposes protocol ambiguity, agree on semantics first. Do not make two contradictory tests pass.
 
+## Two real community contribution cases
+
+This section and its Chinese counterpart are semantic mirrors. A material difference in case facts,
+conclusions, link targets, or risk boundaries is a documentation defect.
+
+<!-- community-casebook:small-pr:start -->
+<!-- community-casebook:small-pr-problem -->
+
+### Case one: turn a CLI inconsistency into a complete small PR
+
+[PR #3540](https://github.com/huangruiteng/loopx/pull/3540)
+started from a real first-run and deep-use observation: `loopx --format json doctor` worked, while the more
+intuitive `loopx doctor --format json` failed during argparse processing. The contributor reused the
+existing subcommand format contract instead of creating a second renderer.
+
+<!-- community-casebook:small-pr-scope -->
+
+The final change covered only parser wiring, the doctor handler, and one end-to-end CLI regression.
+Validation covered:
+
+- the new subcommand argument position;
+- the existing global argument position;
+- precedence when both forms appear;
+- fail-closed rejection of an invalid format before diagnostics run.
+
+<!-- community-casebook:small-pr-lesson -->
+
+The value of this case is not that it changed only a few lines. It completed the whole chain:
+
+```text
+real user friction
+  -> existing public contract
+  -> correct owner
+  -> positive, compatibility, and negative validation
+  -> independently reviewable result
+```
+
+A small PR is not a lower-standard PR. It keeps one user outcome easier to validate and reverse.
+<!-- community-casebook:small-pr:end -->
+
+<!-- community-casebook:review-repair:start -->
+<!-- community-casebook:review-repair-problem -->
+
+### Case two: review high-risk state writes with counterexamples
+
+[PR #3529](https://github.com/huangruiteng/loopx/pull/3529)
+implemented a provider-neutral Stage 2 slice for shared-goal coordination: the aggregate head, file
+provider, and `claim_work` executor. The first revision already had broad positive coverage, but review
+still produced stronger illegal states: a partial write reported as `applied`, a corrupt receipt escaping
+as an untyped exception, an oversized TTL crossing the typed boundary, a lock implementation that could
+not import on Windows, and persisted naive timestamps or bool-as-int generations.
+
+<!-- community-casebook:review-repair-response -->
+
+The author did not add string checks for each example. The repair strengthened the shared trust boundary:
+
+- durable writes use write-all, fsync, and atomic replace, returning `ambiguous` when the outcome cannot be
+  proven;
+- persisted receipts, timestamps, and generations pass typed validation before the executor consumes them;
+- locking reuses the repository's existing cross-platform owner;
+- the RFC, negative tests, and CI describe the same machine-enforced obligation.
+
+<!-- community-casebook:review-repair-lesson -->
+
+This case shows that review is not style feedback after implementation. A high-value review supplies a
+concrete counterexample that breaks the intended invariant and asks for the repair at the real owner. The
+author then adds negative evidence proving that the same class of illegal state cannot re-enter the
+semantic core. The final `APPROVE` applies only to the revalidated exact head.
+<!-- community-casebook:review-repair:end -->
+
 ## Distinguish merge, release, deployment, and observation
 
-A merged PR does not prove a release, deployment, or every external Host update. Follow-up may include:
+Follow-up may include:
 
 - full-public smoke on `main`;
 - release qualification;
@@ -510,7 +584,7 @@ Before opening the PR, confirm:
 - [ ] Fakes, fixtures, and snapshots do not invent product semantics.
 - [ ] Validation failures are classified accurately.
 - [ ] Every changed path is classified and staged explicitly.
-- [ ] `.loopx/`, `.codex/goals/`, live state, credentials, private links, raw logs, and machine paths are absent.
+- [ ] `.loopx/`, `.loopx/goals/`, live state, credentials, private links, raw logs, and machine paths are absent.
 - [ ] Commits and PR text are organized around protocol results, not function lists.
 - [ ] Compatibility, recovery, unverified items, and owner Gates are explicit.
 - [ ] The PR links public work and does not duplicate maintainer-owned execution.

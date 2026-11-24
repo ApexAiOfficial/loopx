@@ -1,0 +1,944 @@
+"""Shared Harbor adapter. Native tasks, phases, feedback and scoring stay in Harbor."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import shlex
+import tempfile
+import time
+from pathlib import Path, PurePosixPath
+from typing import Iterable
+
+from harbor.agents.installed.base import with_prompt_template
+from harbor.environments.base import BaseEnvironment
+from harbor.models.agent.context import AgentContext
+from harbor.models.trajectories import FinalMetrics, Trajectory
+from harbor.utils.trajectory_utils import format_trajectory_json
+
+from loopx.control_plane.work_items.stride_policy_codec import LIVE_STRIDE_STRATEGY
+from loopx.control_plane.goals.goal_vision_policy import DEFAULT_PLANNING_HORIZON_GOAL
+
+from .codex_offline import MODEL_CATALOG_REMOTE, CodexOffline, stage_portable_python
+from .codex import DEFAULT_REPLAN_AFTER_TURNS, Execution, normalize_claim_ttl_seconds
+from .layout import _ROOT, _SRC, _CONTROL, _CODEX_HOME, _REGISTRY, _LOOPX_RUNTIME
+from .scheduler import phase_work_reserve
+
+
+_PYTHON = f"{_ROOT}/python"
+_NODE = f"{_ROOT}/node"
+_PROFILE = f"{_ROOT}/profile"
+_PROFILE_HOME = f"{_PROFILE}/home"
+_SHARED_CODEX_HOME = f"{_PROFILE}/codex-home"
+_SHARED_SKILLS = f"{_SHARED_CODEX_HOME}/skills"
+_CLI = f"{_PROFILE}/bin/loopx"
+_SCHEDULER_STATE = f"{_CONTROL}/scheduler-state.json"
+_TASK_DOC = f"{_CONTROL}/task.md"
+_BASH_ENV = f"{_CONTROL}/bash-env"
+_WORKER_MODULE = "benchmark.runtime.worker"
+_WAKE_LOG_DIR = "/logs/agent/wakes"
+_GOAL_ID = "benchmark-goal"
+_AGENT_ID = "benchmark-agent"
+
+
+# Non-LoopX workers stage only these paths; keep this list closed over the
+# native Host and process-cleanup imports (see the staged-source test).
+NATIVE_GOAL_SOURCE_PATHS = (
+    "benchmark/runtime",
+    "loopx/capabilities/benchmark_toolkit/native_codex_goal.py",
+    "loopx/capabilities/benchmark_toolkit/native_codex_process.py",
+    "loopx/control_plane/turn_driver/codex_stdio.py",
+    "loopx/extensions/process_runtime.py",
+)
+
+
+class BenchmarkCodex(CodexOffline):
+    """One independent LoopX control plane per Harbor trial."""
+
+    def __init__(
+        self,
+        *args,
+        execution_mode="heartbeat",
+        iteration_context=None,
+        codex_sandbox="danger-full-access",
+        validation_command=None,
+        turn_timeout_sec=None,
+        scheduler_timeout_sec=5080,
+        replan_after_todos=None,
+        replan_after_turns=None,
+        planning_horizon_goal=None,
+        checkpoint_request_path=None,
+        checkpoint_request=None,
+        task_entry=None,
+        planning_timeout_sec=None,
+        turn_envelope=False,
+        context_delivery=None,
+        native_child_limit=None,
+        provider_request_admission=False,
+        native_goal_continue=False,
+        task_objective=None,
+        execution_observation=None,
+        goal_id=_GOAL_ID,
+        agent_id=_AGENT_ID,
+        defer_codex_home=False,
+        complete_turn=False,
+        official_stop_hook=False,
+        claim_ttl_seconds=None,
+        **kwargs,
+    ):
+        if "research_loop" in kwargs:
+            raise ValueError(
+                "research_loop has been removed; remove it from the adapter kwargs. "
+                "Use ordinary Goal/Todo planning and select "
+                "execution_observation='local_probe' only when needed."
+            )
+        if "stride_strategy" in kwargs:
+            raise ValueError(
+                "stride_strategy has been removed; remove it from the adapter kwargs. "
+                f"LoopX execution modes always run {LIVE_STRIDE_STRATEGY}."
+            )
+        if isinstance(validation_command, str):
+            raise ValueError("validation_command must be an argv list, not shell text")
+        self.execution = Execution(
+            execution_mode,
+            iteration_context,
+            codex_sandbox,
+            None if turn_timeout_sec is None else float(turn_timeout_sec),
+            validation_command if validation_command is not None else (),
+            task_entry,
+            turn_envelope,
+            context_delivery,
+            native_child_limit,
+            complete_turn=complete_turn,
+            official_stop_hook=official_stop_hook,
+        )
+        if type(provider_request_admission) is not bool:
+            raise ValueError("provider_request_admission must be a boolean opt-in")
+        if provider_request_admission and self.execution.mode != "heartbeat":
+            raise ValueError("provider_request_admission requires heartbeat execution")
+        self.provider_request_admission = provider_request_admission
+        if planning_timeout_sec is not None:
+            raise ValueError(
+                "Remove planning_timeout_sec; planning shares scheduler_timeout_sec with execution"
+            )
+        self.scheduler_timeout = int(scheduler_timeout_sec)
+        if self.scheduler_timeout <= 0:
+            raise ValueError("scheduler timeout must be positive")
+        if self.execution.timeout_seconds is not None and self.scheduler_timeout <= self.execution.timeout_seconds + 150:
+            raise ValueError(
+                "scheduler timeout must exceed turn timeout plus cleanup allowance"
+            )
+        if replan_after_turns is not None and replan_after_todos is not None:
+            raise ValueError("Choose replan_after_turns or replan_after_todos, not both")
+        if replan_after_turns is not None:
+            if (type(replan_after_turns) is not int or
+                    not 1 <= replan_after_turns <= 6):
+                raise ValueError("replan_after_turns must be an integer between 1 and 6")
+            if not self.execution.uses_loopx:
+                raise ValueError("replan_after_turns requires a LoopX execution mode")
+        if replan_after_turns is None and replan_after_todos is None and self.execution.uses_loopx:
+            replan_after_turns = DEFAULT_REPLAN_AFTER_TURNS
+        self.replan_after_turns = replan_after_turns
+        self.replan_after_todos = int(3 if replan_after_todos is None else replan_after_todos)
+        if not 1 <= self.replan_after_todos <= 5:
+            raise ValueError("replan_after_todos must be between 1 and 5")
+        # Recorded, not selected: LoopX always runs the live stride policy.
+        self.stride_strategy = LIVE_STRIDE_STRATEGY if self.execution.uses_loopx else None
+        if planning_horizon_goal is not None:
+            if not isinstance(planning_horizon_goal, bool):
+                raise ValueError("planning_horizon_goal must be a boolean")
+            if not self.execution.uses_loopx:
+                raise ValueError("planning_horizon_goal requires a LoopX execution mode")
+        self.planning_horizon_goal = (
+            DEFAULT_PLANNING_HORIZON_GOAL if planning_horizon_goal is None and self.execution.uses_loopx
+            else planning_horizon_goal
+        )
+        from .research_probe import resolve_execution_observation
+
+        self.execution_observation = resolve_execution_observation(execution_observation)
+        if self.execution_observation is not None and self.execution.mode != "heartbeat":
+            raise ValueError("execution_observation requires heartbeat execution")
+        self.checkpoint_request_path = None
+        self._checkpoint_declaration = None
+        if checkpoint_request is not None:
+            if checkpoint_request_path is None:
+                raise ValueError("checkpoint_request requires its staged guest path")
+            from .checkpoint import parse_checkpoint_request
+            self._checkpoint_declaration = parse_checkpoint_request(checkpoint_request)
+            if self._checkpoint_declaration.get("trigger") == "fresh_replan":
+                expected = PurePosixPath(_WAKE_LOG_DIR).parent / "checkpoints"
+                if PurePosixPath(self._checkpoint_declaration["destination"]) != expected:
+                    raise ValueError(f"fresh_replan destination must be {expected} in the worker")
+        if checkpoint_request_path is not None:
+            if self.execution.mode not in {"heartbeat", "turn"}:
+                raise ValueError("checkpoint_request_path requires a settled-work worker")
+            from .checkpoint import normalize_checkpoint_request_path
+            self.checkpoint_request_path = normalize_checkpoint_request_path(checkpoint_request_path)
+        if not isinstance(native_goal_continue, bool):
+            raise ValueError("native_goal_continue must be a boolean opt-in")
+        if native_goal_continue and not self.execution.native_goal:
+            raise ValueError("native_goal_continue requires a native-Goal execution mode")
+        self.native_goal_continue = native_goal_continue
+        self.goal_id, self.agent_id = goal_id, agent_id
+        self.defer_codex_home = defer_codex_home
+        self.claim_ttl_seconds = normalize_claim_ttl_seconds(claim_ttl_seconds)
+        self._task_path = "/usr/local/bin:/usr/bin:/bin"
+        self._phase_number = 0
+        self._seeded_todo_id: str | None = None
+        if task_objective is not None and (not isinstance(task_objective, str)
+                                          or not task_objective.strip()):
+            raise ValueError("Task objective must be a non-empty string")
+        self.task_objective = task_objective
+        super().__init__(*args, **kwargs)
+        if self.provider_request_admission:
+            if not (self._get_env("OPENAI_BASE_URL") or "").strip() or not (
+                self._get_env("OPENAI_API_KEY") or ""
+            ).strip():
+                raise ValueError("provider_request_admission requires a custom provider URL and API key")
+            if (self._get_env("CODEX_WIRE_API") or "responses") != "responses":
+                raise ValueError("provider_request_admission requires the Responses wire API")
+
+    def _host_context_receipt(self) -> dict:
+        return {**({"native_child_limit": self.execution.native_child_limit}
+                   if self.execution.native_child_limit is not None else {}),
+                **({"context_delivery": "on"} if self.execution.context_delivery != "off" else {})}
+
+    def _planning_receipt(self) -> dict:
+        return {"native_goal_continue": True} if self.native_goal_continue else {}
+
+    def _replan_configuration(self) -> tuple[str, str, int]:
+        # Transport existing Goal fields; the typed control plane owns counting.
+        if self.replan_after_turns is not None:
+            return ("replan_after_effective_turns", "--execution-replan-after-turns",
+                    self.replan_after_turns)
+        return ("replan_after_completed_todos", "--execution-replan-after-todos",
+                self.replan_after_todos)
+
+    def _replan_receipt(self) -> dict[str, int | str]:
+        key, _, value = self._replan_configuration()
+        return {key: value, **({"stride_strategy": self.stride_strategy}
+                             if self.stride_strategy is not None else {}),
+                **({"planning_horizon_goal": self.planning_horizon_goal}
+                   if self.planning_horizon_goal is not None else {})}
+
+    @staticmethod
+    def name() -> str:
+        return "benchmark-codex"
+
+    async def _stage_source(self, environment: BaseEnvironment, source: Path) -> str:
+        from .source import archive_source, source_pins
+
+        runner = Path(os.environ.get("LOOPX_RUNNER_SRC_DIR", str(source))).resolve()
+        if Path(__file__).resolve() != runner / "benchmark/runtime/harbor.py":
+            raise RuntimeError("Import the adapter from the pinned runner checkout")
+        head, runner_head = source_pins(
+            source, runner, os.environ.get("LOOPX_EXPECTED_COMMIT"),
+            os.environ.get("LOOPX_EXPECTED_RUNNER_COMMIT"),
+        )
+        if self.execution_observation is not None:
+            from .source import require_candidate_content
+
+            require_candidate_content(source, head)
+        self._runner_commit = runner_head
+        with tempfile.TemporaryDirectory(prefix="benchmark-source-") as directory:
+            archive = Path(directory) / "source.tar"
+            paths = () if self.execution.uses_loopx else NATIVE_GOAL_SOURCE_PATHS
+            archive_source(source, head, archive, paths)
+            await environment.upload_file(archive, f"{_ROOT}/source.tar")
+            await self.exec_as_root(environment, command=(
+                f"tar -xf {_ROOT}/source.tar -C {_SRC} && rm {_ROOT}/source.tar"
+            ), timeout_sec=180)
+            if runner != source:
+                # Only research runtime code is overlaid; LoopX product code
+                # and its installer remain exactly at the product revision.
+                archive_source(runner, runner_head, archive, ("benchmark/runtime",))
+                await environment.upload_file(archive, f"{_ROOT}/runner.tar")
+                await self.exec_as_root(environment, command=(
+                    f"tar -xf {_ROOT}/runner.tar -C {_SRC} && rm {_ROOT}/runner.tar"
+                ), timeout_sec=180)
+        return head
+
+    async def _install_research_entrypoint(self, environment, name: str, module: str,
+                                           help_flag: str, failure: str) -> None:
+        # Keep the task cwd without importing executable code or dependencies
+        # from the task workspace or user site.
+        entrypoint = f"{_SRC}/benchmark/runtime/{module}"
+        bootstrap = (
+            "import runpy\nimport sys\n"
+            f"sys.path.insert(0, {_SRC!r})\n"
+            f"runpy.run_path({entrypoint!r}, run_name='__main__')\n"
+        )
+        launcher = shlex.join([f"{_PYTHON}/bin/python3", "-I", "-c", bootstrap])
+        wrapper = f"#!/bin/sh\nexec {launcher} \"$@\"\n"
+        executable = shlex.quote(f"{_PROFILE}/bin/{name}")
+        installed = await self.exec_as_agent(
+            environment, env=self._profile_env(), timeout_sec=30,
+            command=f"test ! -L {executable} && printf %s {shlex.quote(wrapper)} > {executable} && "
+                    f"chmod 0755 {executable} && {executable} --help",
+        )
+        if installed.return_code or help_flag not in (installed.stdout or ""):
+            raise RuntimeError(failure)
+
+    def _profile_env(self) -> dict[str, str]:
+        return {
+            "HOME": _PROFILE_HOME,
+            "CODEX_HOME": _SHARED_CODEX_HOME,
+            "PATH": f"{_NODE}/bin:{_PROFILE}/bin:{self._task_path}",
+            "LOOPX_PYTHON": f"{_PYTHON}/bin/python3",
+            "LOOPX_PROMOTE_DEFAULT": "1",
+            "LOOPX_INSTALL_CANARY": "0",
+            "LOOPX_BIN_DIR": f"{_PROFILE}/bin",
+            "LOOPX_RELEASES_DIR": f"{_PROFILE}/releases",
+            "LOOPX_RELEASE_ID": "benchmark-runtime",
+            "LOOPX_MAN_ROOT": f"{_PROFILE}/man",
+            "LOOPX_MAN_DIR": f"{_PROFILE}/man/man1",
+            "LOOPX_SHELL_PROFILE": f"{_PROFILE_HOME}/.profile",
+            "LOOPX_SKILLS_DIR": _SHARED_SKILLS,
+            "LOOPX_INSTALL_SLASH_COMMANDS": "0",
+            "LOOPX_INSTALL_OPENCODE": "0",
+            "LOOPX_INSTALL_CLAUDE": "0",
+            "LOOPX_SKILL_DEDUPE_OTHER_ROOT": "0",
+            # Research trials do not send background usage statistics. Keep
+            # setup and control commands under the same trial policy as tools.
+            "LOOPX_USAGE_PING": "0",
+            # Codex tool calls use `bash -lc`, whose login profile may replace
+            # PATH. BASH_ENV restores staged tools and the task image toolchain.
+            "BASH_ENV": _BASH_ENV,
+        }
+
+    def _shell_path_restore(self) -> str:
+        # Keep login-profile additions after the pinned runtime and image tools.
+        path = (self._profile_env()["PATH"] if self.execution.uses_loopx
+                else self._task_path)
+        return f'export PATH={shlex.quote(path)}:"$PATH"'
+
+    async def _capture_task_path(self, environment: BaseEnvironment) -> None:
+        # Read inside the task container, before applying the isolated profile.
+        # Never import the operator host PATH or the rest of the task environment.
+        task_path = await environment.exec(command='printf "%s" "$PATH"', timeout_sec=30)
+        if task_path.return_code or not task_path.stdout:
+            raise RuntimeError("Could not read the task container PATH before installation")
+        self._task_path = task_path.stdout
+
+    async def install(self, environment: BaseEnvironment) -> None:
+        await self._capture_task_path(environment)
+        await super().install(environment)
+
+        loopx_src = Path(os.environ["LOOPX_SRC_DIR"]).resolve()
+        node_root = Path(os.environ["LOOPX_NODE_DIR"]).resolve()
+        await self.exec_as_root(
+            environment,
+            command=(
+                f"mkdir -p {_SRC} {_PYTHON} {_NODE} {_PROFILE_HOME} "
+                f"{_SHARED_CODEX_HOME} {_PROFILE}/bin {_PROFILE}/releases {_PROFILE}/man "
+                f"{_CONTROL} "
+                f"{_LOOPX_RUNTIME} {'' if self.defer_codex_home else _CODEX_HOME} "
+                f"{_WAKE_LOG_DIR}; chmod -R 0777 {_ROOT} {_WAKE_LOG_DIR}"
+            ),
+            timeout_sec=180,
+        )
+        actual_commit = await self._stage_source(environment, loopx_src)
+        await stage_portable_python(environment, _PYTHON)
+        if self.execution.uses_loopx:
+            await environment.upload_dir(node_root, _NODE)
+        await self.exec_as_root(
+            environment,
+            command=(
+                f"printf '%s\\n' {shlex.quote(self._shell_path_restore())} > {_BASH_ENV}; "
+                f"chmod 0644 {_BASH_ENV}; "
+                f"find {_SRC} -maxdepth 2 \\( -name '*.egg-info' -o "
+                f"-name '*.dist-info' \\) -exec rm -rf {{}} +; "
+                # The formal source installer builds generated frontend assets
+                # as the environment user; the archive is extracted by root.
+                f"chown -R {shlex.quote(str(environment.default_user or 'root'))} {_SRC}; "
+                f"chmod -R a+rX {_SRC} {_PYTHON} {_NODE}; "
+                f"chmod -R a+rwX {_PROFILE} {_CONTROL} {'' if self.defer_codex_home else _CODEX_HOME} {_WAKE_LOG_DIR}"
+            ),
+            timeout_sec=300,
+        )
+        auth_path = self._get_env("CODEX_AUTH_JSON_PATH")
+        if auth_path and not self.defer_codex_home:
+            await environment.upload_file(
+                Path(auth_path).resolve(), f"{_CODEX_HOME}/auth.json"
+            )
+            owner = shlex.quote(str(environment.default_user or "root"))
+            await self.exec_as_root(
+                environment,
+                command=(
+                    f"chown {owner} {_CODEX_HOME}/auth.json && chmod 0600 {_CODEX_HOME}/auth.json"
+                ),
+            )
+        if self.execution.uses_loopx:
+            install = await self.exec_as_agent(
+                environment,
+                command=f"bash {_SRC}/scripts/install-local.sh",
+                # Task containers may lack git; the chat bundle build records
+                # the staged source revision from this environment fallback.
+                env={
+                    **self._profile_env(),
+                    "LOOPX_RESOLVED_SOURCE_GIT_COMMIT": actual_commit,
+                },
+                timeout_sec=1200,
+            )
+            if "error" in (install.stderr or "").lower():
+                self.logger.debug("LoopX installer stderr: %s", install.stderr[-1000:])
+
+            # Ownership is needed only for the trusted build. Restore the
+            # staged source boundary before any solver/worker starts.
+            await self.exec_as_root(
+                environment, command=f"chown -R root {_SRC}", timeout_sec=180,
+            )
+
+            doctor = await self.exec_as_agent(
+                environment,
+                command=f"{_CLI} --format json doctor --agent-type codex-cli",
+                env=self._profile_env(),
+                timeout_sec=300,
+            )
+            try:
+                doctor_payload = json.loads(doctor.stdout or "")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("LoopX doctor returned invalid JSON") from exc
+            if doctor_payload.get("ok") is not True:
+                raise RuntimeError(f"LoopX doctor failed: {doctor_payload}")
+            if self.execution_observation is not None:
+                await self._install_research_entrypoint(
+                    environment, "loopx-research-probe", "research_probe.py", "--candidate-file",
+                    "Local execution probe is unavailable to the benchmark worker",
+                )
+
+        receipt = {
+            "loopx_commit": actual_commit,
+            "runner_commit": self._runner_commit,
+            "runtime_profile": "generic_cli",
+            "execution_mode": self.execution.mode,
+            "iteration_context": self.execution.context,
+            "task_entry": self.execution.task_entry,
+            **({"execution_observation": self.execution_observation}
+               if self.execution_observation is not None else {}),
+            **self._host_context_receipt(),
+            **self._planning_receipt(),
+            **({"official_stop_hook": True} if self.execution.official_stop_hook else {}),
+            **({"provider_request_admission": "on"} if self.provider_request_admission else {}),
+            "home_scope": "trial",
+            "loopx_usage_ping_enabled": False,
+            "login_shell_node_path": _BASH_ENV,
+            "scheduler_terminal_packet_compatibility": True,
+            **self._replan_receipt(),
+        }
+        await self.exec_as_agent(
+            environment,
+            command=(
+                f"printf %s {shlex.quote(json.dumps(receipt, sort_keys=True))} "
+                f"> /logs/agent/loopx-install.json"
+            ),
+            env=self._profile_env(),
+        )
+
+    async def _write_task_document(
+        self, environment: BaseEnvironment, instruction: str
+    ) -> None:
+        descriptor, name = tempfile.mkstemp(prefix="benchmark-task-", suffix=".md")
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write("# Current benchmark task\n\n")
+                handle.write(instruction.strip())
+                handle.write("\n")
+            await environment.upload_file(Path(name), _TASK_DOC)
+            await environment.upload_file(Path(name), self._task_document)
+            await self.exec_as_root(
+                environment,
+                command=f"chmod 0644 {_TASK_DOC} {self._task_document}",
+            )
+        finally:
+            Path(name).unlink(missing_ok=True)
+
+    @property
+    def _task_document(self) -> str:
+        # Existing Todos keep their original input when Harbor supplies a new phase.
+        return f"{_CONTROL}/task-phase-{self._phase_number:03d}.md"
+
+    async def _loopx(
+        self,
+        environment: BaseEnvironment,
+        args: list[str],
+        *,
+        cwd: str,
+        require_ok: bool = True,
+    ) -> dict:
+        argv = [
+            _CLI,
+            "--format",
+            "json",
+            "--registry",
+            _REGISTRY,
+            "--runtime-root",
+            _LOOPX_RUNTIME,
+            *args,
+        ]
+        result = await self.exec_as_agent(
+            environment,
+            command=shlex.join(argv),
+            env=self._profile_env(),
+            cwd=cwd,
+            timeout_sec=300,
+        )
+        text = (result.stdout or "").strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"LoopX command returned invalid JSON: {text[:300]}"
+            ) from exc
+        if require_ok and payload.get("ok") is False:
+            raise RuntimeError(f"LoopX command failed: {payload.get('error')}")
+        return payload
+
+    async def _registry_exists(self, environment: BaseEnvironment) -> bool:
+        result = await environment.exec(command=f"test -s {_REGISTRY}")
+        return result.return_code == 0
+
+    async def _prepare_phase(
+        self, environment: BaseEnvironment, instruction: str, *, cwd: str
+    ) -> None:
+        key, option, expected = self._replan_configuration()
+        horizon_args = []
+        if self.planning_horizon_goal is not None:
+            horizon_args.append("--execution-planning-horizon-goal" if self.planning_horizon_goal
+                               else "--no-execution-planning-horizon-goal")
+        pending = await environment.exec(
+            command=f"test -e {_LOOPX_RUNTIME}/benchmark-pending-turn.json"
+        )
+        if pending.return_code == 0:
+            raise RuntimeError("Resolve the pending Turn before entering another task phase")
+        # Check explicitly requested capacity before replacing any task document.
+        registry_exists = (await self._registry_exists(environment)
+                           if self.execution.native_child_limit is not None else None)
+        if registry_exists:
+            retained = await self._loopx(
+                environment, ["configure-goal", "--goal-id", self.goal_id], cwd=cwd,
+            )
+            self._verify_native_child_configuration(retained.get("after") or retained.get("before") or {})
+        await self._write_task_document(environment, instruction)
+        if registry_exists is None:
+            registry_exists = await self._registry_exists(environment)
+        if not registry_exists:
+            await self._loopx(
+                environment,
+                [
+                    "bootstrap",
+                    "--project",
+                    ".",
+                    "--goal-id",
+                    self.goal_id,
+                    "--objective",
+                    # Phase feedback can replace task.md, but not the original Goal.
+                    self.task_objective or instruction.strip(),
+                    "--goal-doc",
+                    _TASK_DOC,
+                    "--adapter-kind",
+                    "read_only_project_map_v0",
+                    "--adapter-status",
+                    "connected-read-only",
+                    "--write-scope",
+                    "**",
+                    "--no-global-sync",
+                    *(["--spawn-allowed", "--max-children", str(self.execution.native_child_limit)]
+                      if self.execution.native_child_limit is not None else []),
+                ],
+                cwd=cwd,
+            )
+            await self._loopx(
+                environment,
+                [
+                    "configure-goal",
+                    "--goal-id",
+                    self.goal_id,
+                    "--registered-agent",
+                    self.agent_id,
+                    "--boundary-authority-scope",
+                    "**",
+                    "--boundary-authority-source",
+                    "harbor-task-workspace",
+                    "--boundary-authority-decision-id",
+                    "trial-workspace",
+                    option,
+                    str(expected),
+                    *horizon_args,
+                    "--agent-work-mode",
+                    f"{self.agent_id}=active",
+                    "--execute",
+                ],
+                cwd=cwd,
+            )
+        else:
+            # New input is not evidence that an existing wait or gate was resolved.
+            await self._loopx(
+                environment,
+                [
+                    "configure-goal",
+                    "--goal-id",
+                    self.goal_id,
+                    option,
+                    str(expected),
+                    *horizon_args,
+                    "--execute",
+                ],
+                cwd=cwd,
+            )
+
+        if self.execution.task_entry == "seeded-todo":
+            await self._seed_phase(environment, cwd=cwd)
+
+        await self._verify_phase_configuration(environment, cwd=cwd)
+
+    async def _verify_phase_configuration(self, environment: BaseEnvironment, *, cwd: str) -> None:
+        """Read the treatment without reconfiguring a restored Goal or its queue."""
+        key, _, expected = self._replan_configuration()
+        cadence = await self._loopx(
+            environment, ["configure-goal", "--goal-id", self.goal_id], cwd=cwd,
+        )
+        configured_state = cadence.get("after") or cadence.get("before") or {}
+        self._verify_native_child_configuration(configured_state)
+        configured = configured_state.get("execution_profile", {}).get(key)
+        if configured != expected:
+            raise RuntimeError(
+                f"replan cadence readback mismatch for {key}: expected {expected}, got {configured!r}"
+            )
+        actual_horizon = configured_state.get("execution_profile", {}).get("planning_horizon_goal")
+        if type(actual_horizon) is not bool or actual_horizon != self.planning_horizon_goal:
+            raise RuntimeError("planning_horizon_goal readback mismatch")
+
+    def _verify_native_child_configuration(self, configured_state: dict) -> None:
+        if self.execution.native_child_limit is None:
+            return
+        orchestration = configured_state.get("orchestration") or {}
+        if (orchestration.get("mode") != "multi_subagent"
+                or orchestration.get("spawn_allowed") is not True
+                or orchestration.get("max_children") != self.execution.native_child_limit):
+            raise RuntimeError("Native child authorization differs from the existing Goal; use a new trial")
+
+    async def _seed_phase(self, environment: BaseEnvironment, *, cwd: str) -> None:
+        text = (
+            f"[P0] Complete the task in {self._task_document}. Inspect the workspace, "
+            "implement and validate against the task's full requirements and acceptance "
+            "criteria. Keep unmet requirements explicit when judging task completion."
+        )
+        if self._seeded_todo_id:
+            listed = await self._loopx(environment, [
+                "todo", "list", "--goal-id", self.goal_id, "--role", "agent",
+                "--todo-id", self._seeded_todo_id,
+            ], cwd=cwd)
+            current = listed["todo"]
+            if current and current.get("status") in {"open", "blocked"}:
+                if current.get("claimed_by") != self.agent_id:
+                    raise RuntimeError("Seeded task Todo is no longer owned by this agent")
+                # New phase input revises our still-live generic task; do not
+                # strand it behind an unfinished predecessor or clear a wait.
+                await self._loopx(environment, [
+                    "todo", "update", "--goal-id", self.goal_id,
+                    "--todo-id", self._seeded_todo_id, "--agent-id", self.agent_id,
+                    "--text", text, "--execute",
+                ], cwd=cwd)
+                return
+        created = await self._loopx(
+            environment,
+            [
+                "todo",
+                "add",
+                "--goal-id",
+                self.goal_id,
+                "--role",
+                "agent",
+                "--text",
+                text,
+                "--task-class",
+                "advancement_task",
+                "--action-kind",
+                "benchmark_task",
+                "--claimed-by",
+                self.agent_id,
+                "--status",
+                "open",
+                "--execute",
+            ],
+            cwd=cwd,
+        )
+        self._seeded_todo_id = created["todo_id"]
+
+    def _worker_env(self, *, cwd: str) -> dict[str, str]:
+        env = self._profile_env()
+        if not self.execution.uses_loopx:
+            env["PATH"] = self._task_path
+        env.update(
+            {
+                "PYTHONPATH": _SRC,
+                "LOOPX_CLI": _CLI,
+                "LOOPX_REGISTRY": _REGISTRY,
+                "LOOPX_RUNTIME_ROOT": _LOOPX_RUNTIME,
+                "LOOPX_GOAL_ID": self.goal_id,
+                "LOOPX_AGENT_ID": self.agent_id,
+                "LOOPX_PROJECT": cwd,
+                "LOOPX_TASK_DOC": self._task_document,
+                "LOOPX_WAKE_LOG_DIR": _WAKE_LOG_DIR,
+                "LOOPX_CODEX_HOME": _CODEX_HOME,
+                "LOOPX_SHARED_SKILLS": _SHARED_SKILLS,
+                "LOOPX_EXECUTION_MODE": self.execution.mode,
+                "LOOPX_TASK_ENTRY": self.execution.task_entry,
+                **({"LOOPX_EXECUTION_OBSERVATION": self.execution_observation}
+                   if self.execution_observation is not None else {}),
+                **({"LOOPX_CHECKPOINT_REQUEST": self.checkpoint_request_path}
+                   if self.checkpoint_request_path is not None else {}),
+                "LOOPX_CONTEXT_DELIVERY": self.execution.context_delivery,
+                "LOOPX_OFFICIAL_STOP_HOOK": "1" if self.execution.official_stop_hook else "0",
+                # A trial's explicit None must not inherit a container opt-in.
+                "LOOPX_NATIVE_CHILD_LIMIT": (
+                    str(self.execution.native_child_limit)
+                    if self.execution.native_child_limit is not None else ""
+                ),
+                **({"LOOPX_PROVIDER_REQUEST_ADMISSION": "on"} if self.provider_request_admission else {}),
+                **({"LOOPX_NATIVE_GOAL_CONTINUE": "1"} if self.native_goal_continue else {}),
+                "LOOPX_ITERATION_CONTEXT": self.execution.context,
+                "LOOPX_CODEX_SANDBOX": self.execution.sandbox,
+                "LOOPX_VALIDATION_COMMAND_JSON": json.dumps(
+                    self.execution.validation_command
+                ),
+                **({"LOOPX_CODEX_TURN_TIMEOUT_SEC": str(self.execution.timeout_seconds)}
+                   if self.execution.timeout_seconds is not None else {}),
+                **({"LOOPX_BENCHMARK_CLAIM_TTL_SECONDS": str(self.claim_ttl_seconds)}
+                   if self.claim_ttl_seconds is not None else {}),
+                "CODEX_BIN": "/usr/local/bin/codex",
+                "MODEL_NAME": (self.model_name or "").split("/", 1)[-1],
+                "REASONING_EFFORT": str(
+                    self._resolved_flags.get("reasoning_effort", "max")
+                ),
+                "OPENAI_BASE_URL": self._get_env("OPENAI_BASE_URL") or "",
+                "OPENAI_API_KEY": self._get_env("OPENAI_API_KEY") or "",
+                "CODEX_WIRE_API": self._get_env("CODEX_WIRE_API") or "responses",
+                "LOOPX_WEB_SEARCH": self._web_search,
+                "LOOPX_MODEL_CATALOG": (
+                    MODEL_CATALOG_REMOTE if self._model_catalog_staged else ""
+                ),
+            }
+        )
+        return env
+
+    def _session_trajectories(self, roots: Iterable[Path]) -> list[Trajectory]:
+        sessions: set[Path] = set()
+        for root in roots:
+            if root.is_dir():
+                sessions.update(root.glob("sessions/**/*.jsonl"))
+        trajectories: list[Trajectory] = []
+        for session in sorted(sessions):
+            # Harbor's parser takes a directory. Isolate each native rollout
+            # so two sessions on the same date cannot collapse into one.
+            with tempfile.TemporaryDirectory(prefix="benchmark-session-") as directory:
+                (Path(directory) / session.name).symlink_to(session.resolve())
+                trajectory = self._convert_events_to_trajectory(Path(directory))
+                if trajectory is not None:
+                    trajectories.append(trajectory)
+        return trajectories
+
+    @staticmethod
+    def _totals(trajectories: Iterable[Trajectory]) -> dict[str, int | float | None]:
+        # These are Harbor's converted session metrics, not a proof of raw-log
+        # or billing coverage. A partial field must never become a run total.
+        metrics = [trajectory.final_metrics for trajectory in trajectories]
+        fields = {
+            "prompt": "total_prompt_tokens",
+            "completion": "total_completion_tokens",
+            "cached": "total_cached_tokens",
+            "cost": "total_cost_usd",
+        }
+        totals: dict[str, int | float | None] = {}
+        for key, field in fields.items():
+            values = [getattr(metric, field, None) for metric in metrics]
+            if not values or any(
+                type(value) not in ((int, float) if key == "cost" else (int,))
+                or value < 0
+                or (isinstance(value, float) and not math.isfinite(value))
+                for value in values
+            ):
+                totals[key] = None
+                continue
+            total = sum(values)
+            totals[key] = (
+                None if isinstance(total, float) and not math.isfinite(total) else total
+            )
+        return totals
+
+    def _write_aggregate_trajectory(
+        self, trajectories: list[Trajectory] | None = None
+    ) -> list[Trajectory]:
+        if trajectories is None:
+            trajectories = self._session_trajectories([self.logs_dir])
+        if not trajectories:
+            return []
+        steps = []
+        for trajectory in trajectories:
+            for step in trajectory.steps:
+                copied = step.model_copy(deep=True)
+                copied.step_id = len(steps) + 1
+                steps.append(copied)
+        totals = self._totals(trajectories)
+        aggregate = Trajectory(
+            schema_version="ATIF-v1.5",
+            session_id=f"benchmark-{self.logs_dir.parent.name}",
+            agent=trajectories[0].agent,
+            steps=steps,
+            final_metrics=FinalMetrics(
+                total_prompt_tokens=totals["prompt"],
+                total_completion_tokens=totals["completion"],
+                total_cached_tokens=totals["cached"],
+                total_cost_usd=totals["cost"],
+                total_steps=len(steps),
+                extra={"native_sessions": len(trajectories)},
+            ),
+        )
+        (self.logs_dir / "trajectory.json").write_text(
+            format_trajectory_json(aggregate.to_json_dict()), encoding="utf-8"
+        )
+        return trajectories
+
+    def _populate_context(
+        self, context: AgentContext, before: dict | None = None
+    ) -> None:
+        trajectories = self._session_trajectories([self.logs_dir])
+        totals = self._totals(trajectories)
+
+        def delta(key: str) -> int | float | None:
+            current = totals[key]
+            # Only an absent pre-phase observation means cumulative reporting.
+            # A present but incomplete baseline cannot establish a phase delta.
+            previous = 0 if before is None else before.get(key)
+            if current is None or previous is None or current < previous:
+                return None
+            return current - previous
+
+        def token_delta(key: str) -> int | None:
+            value = delta(key)
+            return value if type(value) is int else None
+
+        context.n_input_tokens = token_delta("prompt")
+        context.n_output_tokens = token_delta("completion")
+        context.n_cache_tokens = token_delta("cached")
+        context.cost_usd = delta("cost")
+        context.metadata = {
+            "execution_mode": self.execution.mode,
+            "iteration_context": self.execution.context,
+            "task_entry": self.execution.task_entry,
+            **self._host_context_receipt(),
+            **self._planning_receipt(),
+            **({"official_stop_hook": True} if self.execution.official_stop_hook else {}),
+            **({"provider_request_admission": "on"} if self.provider_request_admission else {}),
+            "home_scope": "trial",
+            **self._replan_receipt(),
+            "benchmark_phase": self._phase_number,
+        }
+        self._write_aggregate_trajectory(trajectories)
+
+    def populate_context_post_run(self, context: AgentContext) -> None:
+        self._populate_context(context)
+
+    @with_prompt_template
+    async def run(
+        self,
+        instruction: str,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        if not self.model_name:
+            raise ValueError("model_name is required")
+        self._phase_number += 1
+        deadline = time.monotonic() + self.scheduler_timeout
+        pwd = await self.exec_as_agent(environment, command="pwd", timeout_sec=30)
+        cwd = (pwd.stdout or "").strip()
+        if not cwd.startswith("/"):
+            raise RuntimeError(
+                f"could not resolve container working directory: {cwd!r}"
+            )
+
+        before = self._totals(self._session_trajectories([self.logs_dir]))
+        # A genuinely empty pre-phase log set has no prior session usage. An
+        # existing rollout that Harbor cannot convert is not a zero baseline.
+        if not any(self.logs_dir.glob("sessions/**/*.jsonl")):
+            before = None
+        try:
+            if self.execution.uses_loopx:
+                await self._prepare_phase(environment, instruction, cwd=cwd)
+            else:
+                await self._write_task_document(environment, instruction)
+            wake_command = [f"{_PYTHON}/bin/python3", "-m", _WORKER_MODULE]
+            env = self._worker_env(cwd=cwd)
+            if self.execution.task_entry == "loopx-planned":
+                result_path = f"{_CONTROL}/planning-phase-{self._phase_number:03d}.json"
+                remaining = int(deadline - time.monotonic())
+                if remaining <= phase_work_reserve(self.execution.mode):
+                    raise TimeoutError("Task budget exhausted before planning")
+                await self.exec_as_agent(
+                    environment,
+                    command=(
+                        # Use the remote task clock, as the execution path does.
+                        f"export LOOPX_PHASE_DEADLINE_EPOCH=$(( $(date +%s) + {remaining} )); "
+                        f"{shlex.join(wake_command)}"
+                    ),
+                    cwd=cwd,
+                    env=env | {
+                        "LOOPX_TASK_STAGE": "plan",
+                        "LOOPX_PLANNING_RESULT": result_path,
+                    },
+                    timeout_sec=remaining + 30,
+                )
+                observed = await environment.exec(command=f"cat {result_path}")
+                entry = json.loads(observed.stdout or "")
+                if entry.get("state_readback_verified") is not True:
+                    raise RuntimeError("Planning did not return verified Todo readback")
+                if entry["status"] == "blocked":
+                    return
+            remaining = int(deadline - time.monotonic())
+            reserve = phase_work_reserve(self.execution.mode, official_stop_hook=self.execution.official_stop_hook)
+            if remaining <= reserve:
+                raise TimeoutError("Task budget exhausted before execution handoff")
+            # Planning, admission and work share one absolute phase clock.
+            host_timeout = remaining - reserve
+            if self.execution.timeout_seconds is not None:
+                host_timeout = min(self.execution.timeout_seconds, host_timeout)
+                env["LOOPX_CODEX_TURN_TIMEOUT_SEC"] = str(host_timeout)
+            from .scheduler import worker_command
+
+            command = worker_command(
+                env, python=f"{_PYTHON}/bin/python3", source=_SRC,
+                state_file=_SCHEDULER_STATE, host_timeout=host_timeout,
+                resume_budget_stop=self._phase_number > 1,
+            )
+            phase_log = f"/logs/agent/worker-phase-{self._phase_number:03d}.log"
+            supervisor_timeout = remaining + (30 if self.execution.official_stop_hook else 0)
+            shell = (
+                "set +e; "
+                # Use the task environment's clock, including remote backends.
+                f"export LOOPX_PHASE_DEADLINE_EPOCH=$(( $(date +%s) + {remaining} )); "
+                f"timeout --signal=TERM --kill-after=30 {supervisor_timeout}s "
+                f"{shlex.join(command)} >> {shlex.quote(phase_log)} 2>&1; "
+                "rc=$?; "
+                # Budget exhaustion retains partial artifacts for native scoring.
+                'if [ "$rc" -eq 124 ]; then exit 0; fi; exit "$rc"'
+            )
+            await self.exec_as_agent(
+                environment,
+                command=shell,
+                env=env,
+                cwd=cwd,
+                timeout_sec=supervisor_timeout + 60,
+            )
+        finally:
+            # Remote Harbor backends download logs after run(). Read them now
+            # before populating a non-empty context, which Harbor will retain.
+            mounted = getattr(environment, "is_mounted", None)
+            if mounted is None:
+                mounted = environment.capabilities.mounted
+            if not mounted:
+                await environment.download_dir("/logs/agent", self.logs_dir)
+            self._populate_context(context, before)

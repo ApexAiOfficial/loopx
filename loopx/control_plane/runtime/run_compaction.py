@@ -5,6 +5,7 @@ from typing import Any, Callable, Optional
 
 HUMAN_REWARD_COMPACT_FIELDS = (
     "recorded_at",
+    "actor_kind",
     "decision",
     "reward",
     "reason_summary",
@@ -84,6 +85,7 @@ RUN_BASE_COMPACT_FIELDS = (
     "turn_instance_id",
     "replan_obligation_id",
     "goal_id",
+    "goal_ref",
     "parent_run_id",
     "spawned_by_goal_id",
     "agent_role",
@@ -93,6 +95,7 @@ RUN_BASE_COMPACT_FIELDS = (
     "progress_scope",
     "todo_id",
     "progress_observation",
+    "blocked_retry",
     "delivery_batch_scale",
     "delivery_outcome",
     "lifecycle_phase",
@@ -107,6 +110,7 @@ RUN_BASE_COMPACT_FIELDS = (
     "project_map",
     "json_exists",
     "markdown_exists",
+    "usage",
 )
 
 CompactProjection = Callable[[Any], Optional[dict[str, Any]]]
@@ -354,6 +358,13 @@ def compact_run_base(
         compact["subagents"] = subagents[:max_subagent_activity_items]
         compact["subagent_count"] = len(subagents)
 
+    if isinstance(run.get("recommended_action_resolution"), dict):
+        from ..work_items.recommendation_source_io import recommendation_run_decision
+
+        if recommendation_run_decision(run) is not None:
+            compact["recommended_action_resolution"] = dict(run["recommended_action_resolution"])
+            if "json_path" in run:
+                compact["json_path"] = run["json_path"]
     return compact
 
 

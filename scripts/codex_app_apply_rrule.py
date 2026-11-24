@@ -4,7 +4,8 @@
 Fallback host bridge for hosts where the Codex App does not expose
 ``automation_update``. The script:
 
-1. reads ``loopx quota should-run`` and its ``scheduler_hint.codex_app``;
+1. replays the original registry, runtime and Turn through ``loopx quota
+   should-run`` and consumes ``scheduler_hint.app_automation``;
 2. when ``stateful_backoff.apply_needed=true`` and ``recommended_rrule`` is
    present, creates the automation TOML and ``automations`` row when they are
    missing, backs up the Codex App automation SQLite database, and updates
@@ -19,16 +20,19 @@ overridden for tests or alternate installations.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 
+from loopx.control_plane.quota.turn_envelope import COMPLETE_TURN_DECISION_VERSION
+from loopx.paths import codex_automation_database, global_registry_path, select_default_runtime_root
 from loopx.turn_identity import normalize_turn_instance_id
 
 
@@ -53,14 +57,20 @@ def _subprocess_failure_detail(completed: subprocess.CompletedProcess[str]) -> s
         ("stdout", completed.stdout),
         ("stderr", completed.stderr),
     ):
-        bounded = _bounded_failure_output(value or "")
+        if value is None:
+            # A decoder failure in CPython's reader thread leaves the stream
+            # unset instead of raising here, so the decode must not be reported
+            # as the CLI having printed nothing.
+            details.append(f"{label}=<not decoded as UTF-8>")
+            continue
+        bounded = _bounded_failure_output(value)
         if bounded:
             details.append(f"{label}={bounded}")
     return "; ".join(details) or "no diagnostic output"
 
 
 def _scheduler_hint_turn_instance_id(parent_turn_instance_id: str) -> str:
-    """Derive one replay-safe child receipt identity for the fallback query."""
+    """Reuse the host Turn so the fallback query replays its quota receipt."""
 
     try:
         normalized = normalize_turn_instance_id(parent_turn_instance_id)
@@ -68,8 +78,14 @@ def _scheduler_hint_turn_instance_id(parent_turn_instance_id: str) -> str:
         raise SystemExit(str(exc)) from exc
     if not normalized:
         raise SystemExit("--turn-instance-id must not be empty")
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
-    return f"apply-rrule:{digest}"
+    return normalized
+
+
+def _codex_home() -> Path:
+    """Resolve the active Codex App home without changing LoopX registry roots."""
+
+    configured = os.environ.get("CODEX_HOME", "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".codex"
 
 
 def _load_registry_goal(registry: Path, goal_id: str) -> dict[str, Any]:
@@ -86,19 +102,22 @@ def _load_registry_goal(registry: Path, goal_id: str) -> dict[str, Any]:
     return {}
 
 
+def _loopx_json_route(loopx: str, registry: Path, runtime_root: Path | None) -> list[str]:
+    command = [loopx, "--format", "json", "--registry", str(registry)]
+    if runtime_root is not None:
+        command.extend(["--runtime-root", str(runtime_root)])
+    return command
+
+
 def _heartbeat_task_body(
     *,
     loopx: str,
     registry: Path,
     goal_id: str,
     agent_id: str,
+    runtime_root: Path | None = None,
 ) -> str:
-    command = [
-        loopx,
-        "--format",
-        "json",
-        "--registry",
-        str(registry),
+    command = _loopx_json_route(loopx, registry, runtime_root) + [
         "heartbeat-prompt",
         "--thin",
         "--goal-id",
@@ -112,10 +131,16 @@ def _heartbeat_task_body(
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     if completed.returncode != 0:
         raise SystemExit(
             f"loopx heartbeat-prompt failed ({completed.returncode}): "
+            f"{_subprocess_failure_detail(completed)}"
+        )
+    if completed.stdout is None:
+        raise SystemExit(
+            f"loopx heartbeat-prompt output could not be decoded as UTF-8: "
             f"{_subprocess_failure_detail(completed)}"
         )
     try:
@@ -125,9 +150,13 @@ def _heartbeat_task_body(
     body = payload.get("task_body") if isinstance(payload, dict) else None
     if not isinstance(body, str) or not body.strip():
         raise SystemExit("loopx heartbeat-prompt returned no task_body")
-    if '"""' in body:
-        raise SystemExit("loopx heartbeat-prompt task_body contains triple quotes")
     return body
+
+
+def _toml_string(value: str) -> str:
+    """Encode a string in the JSON-compatible subset of TOML basic strings."""
+
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _write_automation_toml(
@@ -142,17 +171,26 @@ def _write_automation_toml(
     path.parent.mkdir(parents=True, exist_ok=True)
     text = (
         "version = 1\n"
-        f'id = "{automation_id}"\n'
+        f"id = {_toml_string(automation_id)}\n"
         'kind = "heartbeat"\n'
-        f'name = "{name}"\n'
-        f'prompt = """{prompt}"""\n'
+        f"name = {_toml_string(name)}\n"
+        f"prompt = {_toml_string(prompt)}\n"
         'status = "ACTIVE"\n'
-        f'rrule = "{rrule}"\n'
-        f'target_thread_id = "{thread_id}"\n'
+        f"rrule = {_toml_string(rrule)}\n"
+        f"target_thread_id = {_toml_string(thread_id)}\n"
         f"created_at = {_now_ms()}\n"
         f"updated_at = {_now_ms()}\n"
     )
     path.write_text(text, encoding="utf-8")
+
+
+def _read_automation_prompt(path: Path) -> str | None:
+    try:
+        automation = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise SystemExit(f"automation TOML is unreadable or invalid: {path}") from exc
+    prompt = automation.get("prompt")
+    return prompt if isinstance(prompt, str) and prompt.strip() else None
 
 
 def _sqlite_row_exists(db_path: Path, automation_id: str) -> bool:
@@ -251,6 +289,48 @@ def _ensure_sqlite_row(
         connection.close()
 
 
+def _resolve_bound_thread_id(
+    goal: dict[str, Any],
+    *,
+    goal_id: str,
+    agent_id: str,
+    automation_id: str,
+) -> str:
+    """Resolve the one bound host thread this automation must target.
+
+    The installed manifest carries its target thread, and host-side readback
+    resolves a goal's threads through the goal's ``thread_agent_bindings``.
+    Installing with an unresolved thread therefore writes an automation that no
+    readback can observe, so an unbound or ambiguous binding is refused here
+    instead of being persisted as an empty value.
+    """
+    bindings = (goal.get("coordination") or {}).get("thread_agent_bindings")
+    matches: list[str] = []
+    for binding in bindings if isinstance(bindings, list) else []:
+        if not isinstance(binding, dict):
+            continue
+        if str(binding.get("agent_id") or "") != agent_id:
+            continue
+        thread_id = str(binding.get("thread_id") or "").strip()
+        if thread_id:
+            matches.append(thread_id)
+    if len(matches) != 1:
+        # The recovery command must be runnable as printed: ``bind-agent-thread``
+        # is registered at the root, and without ``--execute`` it only previews
+        # the binding it is asked to write.
+        raise SystemExit(
+            f"{automation_id}: expected exactly one bound host thread for agent "
+            f"{agent_id!r}, found {len(matches)}; bind one with "
+            f"`loopx bind-agent-thread --goal-id {goal_id} --agent-id {agent_id} "
+            "--host-surface codex-app --thread-id <host-thread-id> --execute`, or "
+            "remove an extra binding with "
+            f"`loopx unbind-agent-thread --goal-id {goal_id} --agent-id {agent_id} "
+            "--host-surface codex-app --thread-id <host-thread-id> --execute`, "
+            "before installing the Codex App automation"
+        )
+    return matches[0]
+
+
 def _ensure_automation(
     *,
     loopx: str,
@@ -262,32 +342,27 @@ def _ensure_automation(
     agent_id: str,
     rrule: str,
     backup_path: Path | None,
+    runtime_root: Path | None = None,
 ) -> bool:
     toml_path = automations_root / automation_id / "automation.toml"
     if toml_path.exists() and _sqlite_row_exists(db_path, automation_id):
         return False
     goal = _load_registry_goal(registry, goal_id)
-    thread_id = ""
-    bindings = (goal.get("coordination") or {}).get("thread_agent_bindings") or []
-    if isinstance(bindings, list):
-        matches = [
-            binding
-            for binding in bindings
-            if isinstance(binding, dict)
-            and str(binding.get("agent_id") or "") == agent_id
-        ]
-        if len(matches) == 1:
-            thread_id = str(matches[0].get("thread_id") or "")
+    thread_id = _resolve_bound_thread_id(
+        goal,
+        goal_id=goal_id,
+        agent_id=agent_id,
+        automation_id=automation_id,
+    )
     cwd = str(goal.get("repo") or "")
     name = f"{goal_id} LoopX"
     if toml_path.exists():
-        text = toml_path.read_text(encoding="utf-8")
-        match = re.search(r'prompt = """(.*?)"""', text, re.DOTALL)
-        prompt = match.group(1) if match else _heartbeat_task_body(
+        prompt = _read_automation_prompt(toml_path) or _heartbeat_task_body(
             loopx=loopx,
             registry=registry,
             goal_id=goal_id,
             agent_id=agent_id,
+            runtime_root=runtime_root,
         )
     else:
         prompt = _heartbeat_task_body(
@@ -295,6 +370,7 @@ def _ensure_automation(
             registry=registry,
             goal_id=goal_id,
             agent_id=agent_id,
+            runtime_root=runtime_root,
         )
         _write_automation_toml(
             toml_path,
@@ -324,14 +400,10 @@ def _load_scheduler_hint(
     agent_id: str,
     parent_turn_instance_id: str,
     capabilities: list[str],
+    runtime_root: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     turn_instance_id = _scheduler_hint_turn_instance_id(parent_turn_instance_id)
-    command = [
-        loopx,
-        "--format",
-        "json",
-        "--registry",
-        str(registry),
+    command = _loopx_json_route(loopx, registry, runtime_root) + [
         "quota",
         "should-run",
         "--goal-id",
@@ -349,24 +421,35 @@ def _load_scheduler_hint(
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        env={**os.environ, "LOOPX_CONTEXT_DELIVERY": "off"},
     )
     if completed.returncode != 0:
         raise SystemExit(
             f"loopx should-run failed ({completed.returncode}): "
             f"{_subprocess_failure_detail(completed)}"
         )
+    if completed.stdout is None:
+        raise SystemExit(
+            f"loopx should-run output could not be decoded as UTF-8: "
+            f"{_subprocess_failure_detail(completed)}"
+        )
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise SystemExit(f"loopx should-run returned invalid JSON: {exc}") from exc
-    hint = payload.get("scheduler_hint", {})
-    codex_app = hint.get("codex_app", {})
-    if not isinstance(codex_app, dict):
-        codex_app = {}
-    stateful = codex_app.get("stateful_backoff", {})
+    hint = payload.get("scheduler_hint") if isinstance(payload, dict) else None
+    if not isinstance(hint, dict):
+        return {}, {}
+    app = hint.get("app_automation")
+    if "app_automation" not in hint and payload.get("schema_version") != COMPLETE_TURN_DECISION_VERSION:
+        app = hint.get("codex_app")
+    if not isinstance(app, dict):
+        return {}, {}
+    stateful = app.get("stateful_backoff", {})
     if not isinstance(stateful, dict):
         stateful = {}
-    return codex_app, stateful
+    return app, stateful
 
 
 def _update_toml(toml_path: Path, rrule: str) -> None:
@@ -374,8 +457,9 @@ def _update_toml(toml_path: Path, rrule: str) -> None:
     pattern = re.compile(r'^rrule\s*=\s*".*?"', re.MULTILINE)
     if not pattern.search(text):
         raise SystemExit(f"automation TOML has no rrule field: {toml_path}")
+    replacement = f"rrule = {_toml_string(rrule)}"
     toml_path.write_text(
-        pattern.sub(f'rrule = "{rrule}"', text),
+        pattern.sub(lambda _: replacement, text),
         encoding="utf-8",
     )
 
@@ -419,6 +503,7 @@ def _run_ack(loopx: str, ack_args: list[str]) -> None:
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     if completed.returncode != 0:
         raise SystemExit(
@@ -435,54 +520,67 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         )
     )
     parser.add_argument("--goal-id", default="loopx-meta")
-    parser.add_argument("--agent-id", default="codex-side-bypass")
+    parser.add_argument(
+        "--agent-id",
+        required=True,
+        help="Registered LoopX Agent that owns this scheduler mutation.",
+    )
     parser.add_argument(
         "--registry",
         type=Path,
-        default=Path.home() / ".codex/loopx/registry.global.json",
+        help="Global registry; defaults to the selected LoopX local state route.",
+    )
+    parser.add_argument(
+        "--runtime-root",
+        type=Path,
+        help="Original runtime root of the parent Turn. Defaults to the registry route.",
     )
     parser.add_argument("--automation-id", default="loopx")
     parser.add_argument(
         "--automations-root",
         type=Path,
-        default=Path.home() / ".codex/automations",
+        default=_codex_home() / "automations",
     )
     parser.add_argument(
         "--db-path",
         type=Path,
-        default=Path.home() / ".codex/sqlite/codex-dev.db",
+        default=codex_automation_database(_codex_home()),
     )
     parser.add_argument("--loopx", default="loopx")
     parser.add_argument(
         "--capability",
         action="append",
-        default=["network", "external_evidence_poll"],
+        default=[],
     )
     parser.add_argument(
         "--turn-instance-id",
         default=f"apply-rrule-{_now_ms()}",
         help=(
-            "outer host turn identity; the bridge derives a stable child identity "
-            "for its internal quota query"
+            "outer host turn identity; the bridge reuses it when replaying the "
+            "scheduler hint"
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.registry is None:
+        args.registry = global_registry_path(args.runtime_root or select_default_runtime_root())
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
-    codex_app, stateful = _load_scheduler_hint(
+    app, stateful = _load_scheduler_hint(
         loopx=args.loopx,
         registry=args.registry,
         goal_id=args.goal_id,
         agent_id=args.agent_id,
         parent_turn_instance_id=args.turn_instance_id,
         capabilities=args.capability,
+        runtime_root=args.runtime_root,
     )
     apply_needed = stateful.get("apply_needed") is True
-    rrule = codex_app.get("recommended_rrule") or stateful.get("current_rrule")
-    ack_hint = codex_app.get("ack_hint", {})
+    rrule = app.get("recommended_rrule") or stateful.get("current_rrule")
+    ack_hint = app.get("ack_hint", {})
     ack_args = ack_hint.get("cli_args") if isinstance(ack_hint, dict) else None
     toml_path = args.automations_root / args.automation_id / "automation.toml"
     toml_missing = not toml_path.exists()
@@ -539,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
             agent_id=args.agent_id,
             rrule=rrule,
             backup_path=backup_path,
+            runtime_root=args.runtime_root,
         )
         print(f"created missing automation: {args.automation_id}")
     _update_toml(toml_path, rrule)

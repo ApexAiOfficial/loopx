@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from loopx.file_lock import exclusive_file_lock
+from loopx.control_plane.goals.first_party_host_admission import (
+    FirstPartyHostGoalAdmission,
+    capture_first_party_host_goal_ref,
+)
 from loopx.kunluncode_goal_mode.app_server import (
     NATIVE_GOAL_MODES,
     KunlunAppServerClient,
@@ -234,16 +238,20 @@ def _new_state(
     todo_id: str,
     mode: str,
     objective_sha256: str,
+    goal_ref: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     timestamp = _now()
+    binding = {
+        "goal_id": str(context.get("goal_id") or ""),
+        "agent_id": str(context.get("agent_id") or ""),
+    }
+    if goal_ref is not None:
+        binding["goal_instance_id"] = goal_ref["goal_instance_id"]
     return {
         "schema_version": RUNTIME_STATE_SCHEMA_VERSION,
         "created_at": timestamp,
         "updated_at": timestamp,
-        "binding": {
-            "goal_id": str(context.get("goal_id") or ""),
-            "agent_id": str(context.get("agent_id") or ""),
-        },
+        "binding": binding,
         "todo_id": todo_id,
         "native": {
             "mode": mode,
@@ -280,6 +288,24 @@ def _validate_binding(state: Mapping[str, Any], context: Mapping[str, Any]) -> N
         )
 
 
+def _runtime_goal_ref(state: Mapping[str, Any]) -> object:
+    binding = state.get("binding")
+    if not isinstance(binding, Mapping):
+        return {"malformed": True}
+    goal_ref = {"goal_id": binding.get("goal_id")}
+    if "goal_instance_id" in binding:
+        goal_ref["goal_instance_id"] = binding.get("goal_instance_id")
+    return goal_ref
+
+
+def _commit_runtime_state(
+    project: Path,
+    state: dict[str, Any],
+    goal_admission: FirstPartyHostGoalAdmission,
+) -> Path:
+    return goal_admission.accept_result(lambda: write_runtime_state(project, state))
+
+
 def _compact_receipt(
     payload: Mapping[str, Any], fields: tuple[str, ...]
 ) -> dict[str, Any]:
@@ -290,14 +316,18 @@ def _reconcile_writeback_evidence(
     project: Path,
     state: dict[str, Any],
     control: LoopXControlPlane,
+    goal_admission: FirstPartyHostGoalAdmission,
 ) -> None:
     native = state["native"]
     since = str(native.get("verified_at") or "")
     if not since:
         return
     todo_id = str(state.get("todo_id") or "")
+    goal_admission.require_current()
     payload = control.evidence_since(since, todo_id=todo_id)
-    ledger = payload.get("ledger") if isinstance(payload.get("ledger"), list) else []
+    if payload.get("schema_version") != "agent_scoped_evidence_log_v0" or not isinstance(payload.get("ledger"), list):
+        raise KunlunNativeGoalRuntimeError("invalid internal writeback evidence schema")
+    ledger = payload["ledger"]
     writeback = state["writeback"]
     classification = VERIFIED_CLASSIFICATIONS[str(native.get("mode") or "goal-pro")]
     for event in ledger:
@@ -315,7 +345,7 @@ def _reconcile_writeback_evidence(
             writeback["todo_completed"] = True
         if event_kind in {"quota_spend", "quota_slot_spent"}:
             writeback["quota_spent"] = True
-    write_runtime_state(project, state)
+    _commit_runtime_state(project, state, goal_admission)
 
 
 def _verified_evidence(state: Mapping[str, Any]) -> str:
@@ -335,11 +365,14 @@ def _closeout_writeback(
     project: Path,
     state: dict[str, Any],
     control: LoopXControlPlane,
+    goal_admission: FirstPartyHostGoalAdmission,
 ) -> None:
-    _reconcile_writeback_evidence(project, state, control)
+    goal_admission.require_current()
+    _reconcile_writeback_evidence(project, state, control, goal_admission)
     writeback = state["writeback"]
     mode = str(state["native"]["mode"])
     if writeback.get("delivery_recorded") is not True:
+        goal_admission.require_current()
         payload = control.record_verified_delivery(
             mode=mode,
             todo_id=str(state["todo_id"]),
@@ -352,8 +385,9 @@ def _closeout_writeback(
         writeback["delivery_receipt"] = _compact_receipt(
             payload, ("classification", "generated_at", "appended")
         )
-        write_runtime_state(project, state)
+        _commit_runtime_state(project, state, goal_admission)
     if writeback.get("todo_completed") is not True:
+        goal_admission.require_current()
         payload = control.complete(
             str(state["todo_id"]), evidence=_verified_evidence(state)
         )
@@ -365,8 +399,9 @@ def _closeout_writeback(
         writeback["todo_receipt"] = _compact_receipt(
             payload, ("todo_id", "status", "status_changed", "changed")
         )
-        write_runtime_state(project, state)
+        _commit_runtime_state(project, state, goal_admission)
     if writeback.get("quota_spent") is not True:
+        goal_admission.require_current()
         payload = control.spend(todo_id=str(state["todo_id"]))
         if payload.get("appended") is not True:
             raise KunlunNativeGoalRuntimeError(
@@ -377,7 +412,7 @@ def _closeout_writeback(
         writeback["quota_receipt"] = _compact_receipt(
             payload, ("classification", "generated_at", "appended", "slots")
         )
-        write_runtime_state(project, state)
+        _commit_runtime_state(project, state, goal_admission)
 
 
 def _update_native_from_goal(state: dict[str, Any], goal: Mapping[str, Any]) -> None:
@@ -427,6 +462,7 @@ def _run_native_host(
     token_budget: int | None,
     scenario: str | None,
     client_factory: Callable[..., Any],
+    goal_admission: FirstPartyHostGoalAdmission,
 ) -> None:
     command = build_app_server_command(
         kunluncode_bin,
@@ -449,6 +485,7 @@ def _run_native_host(
             event_counts[method] = event_counts.get(method, 0) + 1
 
     native = state["native"]
+    goal_admission.require_current()
     with client_factory(
         command,
         cwd=project,
@@ -466,7 +503,7 @@ def _run_native_host(
             thread_id = client.start_thread(project)
             native["thread_id"] = thread_id
             native["status"] = "thread_started"
-            write_runtime_state(project, state)
+            _commit_runtime_state(project, state, goal_admission)
         elif native.get("goal_id"):
             goal = client.get_goal(thread_id)
             _validate_native_identity(state, goal)
@@ -486,10 +523,10 @@ def _run_native_host(
             )
             _validate_native_identity(state, goal)
             _update_native_from_goal(state, goal)
-            write_runtime_state(project, state)
+            _commit_runtime_state(project, state, goal_admission)
         else:
             _update_native_from_goal(state, goal)
-            write_runtime_state(project, state)
+            _commit_runtime_state(project, state, goal_admission)
 
         if not native_goal_success(goal, mode=str(native["mode"])):
             status = str(goal.get("status") or "")
@@ -510,14 +547,14 @@ def _run_native_host(
             _update_native_from_goal(state, goal)
         native["event_counts"] = dict(sorted(event_counts.items()))
         if not native_goal_success(goal, mode=str(native["mode"])):
-            write_runtime_state(project, state)
+            _commit_runtime_state(project, state, goal_admission)
             raise KunlunNativeGoalRuntimeError(
                 "KunlunCode native goal did not reach an accepted terminal state: "
                 + json.dumps(compact_goal(goal), ensure_ascii=False, sort_keys=True)
             )
         native["verified"] = True
         native["verified_at"] = native.get("verified_at") or _now()
-        write_runtime_state(project, state)
+        _commit_runtime_state(project, state, goal_admission)
 
 
 def run_native_goal(
@@ -556,20 +593,41 @@ def run_native_goal(
     if not binary:
         raise KunlunNativeGoalRuntimeError("kunluncode is not on PATH")
     control = control_plane or LoopXControlPlane(project, context)
+    goal_id = str(context.get("goal_id") or "")
+    registry_path = Path(
+        str(context.get("registry") or project / ".loopx" / "registry.json")
+    )
+    goal_ref = capture_first_party_host_goal_ref(
+        registry_path=registry_path,
+        goal_id=goal_id,
+    )
+    goal_admission = FirstPartyHostGoalAdmission.for_plan(
+        registry_path=registry_path,
+        goal_id=goal_id,
+        planned_goal_ref=goal_ref,
+    )
     journal_path = runtime_state_path(project)
     with exclusive_file_lock(
         journal_path,
         agent_id=str(context.get("agent_id") or ""),
         operation="kunluncode_native_goal",
     ):
-        state = read_runtime_state(project)
+        state = goal_admission.select_state(
+            read_state=lambda: read_runtime_state(project),
+            goal_ref_of=_runtime_goal_ref,
+        )
         if state is not None:
             _validate_binding(state, context)
             if (
                 state["native"].get("verified") is True
                 and runtime_phase(state) != "committed"
             ):
-                _closeout_writeback(project, state, control)
+                _closeout_writeback(
+                    project,
+                    state,
+                    control,
+                    goal_admission,
+                )
                 return {
                     "ok": True,
                     "status": "committed",
@@ -591,6 +649,36 @@ def run_native_goal(
                 "LoopX allowed a KunlunCode turn without selecting an agent todo"
             )
         todo_id = str(todo.get("todo_id") or "")
+        preparation = (
+            decision.get("execution_preparation")
+            if isinstance(decision.get("execution_preparation"), Mapping)
+            else {}
+        )
+        if preparation.get("state") == "claim_required":
+            # The Host performs the projected atomic claim before any model
+            # work.  A fresh guard must observe the resulting lease; the
+            # preview itself never grants execution authority.
+            goal_admission.require_current()
+            control.claim(todo_id)
+            decision = control.should_run()
+            if decision.get("should_run") is not True:
+                raise KunlunNativeGoalRuntimeError(
+                    "LoopX did not admit execution after automatic task preparation"
+                )
+            todo = decision.get("selected_todo")
+            preparation = (
+                decision.get("execution_preparation")
+                if isinstance(decision.get("execution_preparation"), Mapping)
+                else {}
+            )
+            if (
+                not isinstance(todo, Mapping)
+                or str(todo.get("todo_id") or "") != todo_id
+                or preparation.get("state") != "ready"
+            ):
+                raise KunlunNativeGoalRuntimeError(
+                    "LoopX automatic task preparation did not preserve the selected Todo and current lease"
+                )
         claimed_by = str(todo.get("claimed_by") or "")
         agent_id = str(context.get("agent_id") or "")
         if claimed_by and claimed_by != agent_id:
@@ -619,9 +707,11 @@ def run_native_goal(
                 todo_id=todo_id,
                 mode=mode,
                 objective_sha256=objective_sha256,
+                goal_ref=goal_ref,
             )
-            write_runtime_state(project, state)
+            _commit_runtime_state(project, state, goal_admission)
         if not claimed_by:
+            goal_admission.require_current()
             control.claim(todo_id)
         _run_native_host(
             project,
@@ -634,8 +724,15 @@ def run_native_goal(
             token_budget=token_budget,
             scenario=scenario,
             client_factory=client_factory,
+            goal_admission=goal_admission,
         )
-        _closeout_writeback(project, state, control)
+        goal_admission.require_current()
+        _closeout_writeback(
+            project,
+            state,
+            control,
+            goal_admission,
+        )
         return {
             "ok": True,
             "status": "committed",

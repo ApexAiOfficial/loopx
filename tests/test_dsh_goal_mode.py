@@ -6,12 +6,22 @@ import subprocess
 import sys
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from loopx import dsh_goal_mode
+from loopx.cli_commands import turn_dsh_host
 from loopx.control_plane.quota.turn_envelope import (
     turn_envelope_action_signature_document,
 )
-from loopx.dsh_goal_mode import turn_host_adapter
+from loopx.control_plane.turn_driver.executor import validate_loopx_turn_host_result
+from loopx.control_plane.turn_driver.codex_cli import codex_cli_result_schema, normalize_codex_result
+from loopx.control_plane.turn_driver.host_failure import (
+    BuiltInHostError,
+    build_host_failure_record,
+)
+from loopx.dsh_goal_mode import host_failure_map, turn_host_adapter
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPAT_LAUNCHER = REPO_ROOT / "scripts" / "dsh_turn_host_adapter.py"
@@ -21,16 +31,21 @@ TURN_KEY = "sha256:" + "0" * 64
 def _signed_request(
     *,
     primary_action: str = "Do the signed thing.",
+    goal_id: str = "g",
+    agent_id: str = "a",
+    todo_id: str | None = None,
+    boundary: dict | None = None,
+    execution_profile: dict | None = None,
 ) -> dict:
     request = {
         "schema_version": dsh_goal_mode.LOOPX_TURN_HOST_REQUEST_SCHEMA,
         "turn_key": TURN_KEY,
         "route": "primary_delivery",
-        "session": {"goal_id": "g", "agent_id": "a"},
+        "session": {"goal_id": goal_id, "agent_id": agent_id},
         "turn_envelope": {
             "schema_version": "loopx_turn_envelope_v0",
-            "goal_id": "g",
-            "agent_id": "a",
+            "goal_id": goal_id,
+            "agent_id": agent_id,
             "action": {
                 "recommended_action": "legacy action must not win",
                 "primary_action": primary_action,
@@ -61,6 +76,14 @@ def _signed_request(
             "completed_phases": list(dsh_goal_mode.COMPLETED_PHASES),
         },
     }
+    if todo_id is not None:
+        request["turn_envelope"]["action"]["selected_todo"] = {"todo_id": todo_id}
+    if boundary is not None:
+        request["turn_envelope"]["boundary"].update(boundary)
+    if execution_profile is not None:
+        request["turn_envelope"]["contract_capsule"] = {
+            "execution_profile": execution_profile
+        }
     signature = turn_envelope_action_signature_document(
         request["turn_envelope"]
     )
@@ -79,6 +102,213 @@ def _signed_request(
         }
     )
     return request
+
+
+def _lineage_request(
+    *, goal_id: object = None, agent_id: object = None, todo_id: object = None
+) -> dict:
+    envelope: dict[str, object] = {"action": {}}
+    if goal_id is not None:
+        envelope["goal_id"] = goal_id
+    if agent_id is not None:
+        envelope["agent_id"] = agent_id
+    if todo_id is not None:
+        envelope["action"] = {"selected_todo": {"todo_id": todo_id}}
+    return {"turn_envelope": envelope}
+
+
+def test_dsh_session_id_uses_a_versioned_lineage_digest() -> None:
+    # Hyphen-delimited fields are ambiguous: both inputs produced
+    # "goal-a-worker-todo_b-todo_abc" under the historical naming scheme.
+    first = _lineage_request(
+        goal_id="goal-a", agent_id="worker", todo_id="todo_b-todo_abc"
+    )
+    second = _lineage_request(
+        goal_id="goal-a-worker", agent_id="todo_b", todo_id="todo_abc"
+    )
+
+    first_id = turn_host_adapter._derive_session_id(first, TURN_KEY)
+    second_id = turn_host_adapter._derive_session_id(second, TURN_KEY)
+    expected = "dsh-lineage-v1-" + sha256(
+        json.dumps(
+            ["goal-a", "worker", "todo_b-todo_abc"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert first_id.startswith("dsh-lineage-v1-")
+    assert second_id.startswith("dsh-lineage-v1-")
+    assert first_id == expected
+    assert first_id != second_id
+    assert first_id == turn_host_adapter._derive_session_id(first, TURN_KEY)
+
+
+def test_dsh_source_session_id_is_scoped_to_the_exact_goal_instance() -> None:
+    instance_a = _lineage_request(
+        goal_id="goal",
+        agent_id="agent",
+        todo_id="todo",
+    )
+    instance_a["goal_ref"] = {
+        "goal_id": "goal",
+        "goal_instance_id": "ginst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }
+    instance_b = {
+        **instance_a,
+        "goal_ref": {
+            "goal_id": "goal",
+            "goal_instance_id": "ginst_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        },
+    }
+
+    first_id = turn_host_adapter._derive_session_id(instance_a, TURN_KEY)
+    second_id = turn_host_adapter._derive_session_id(instance_b, TURN_KEY)
+
+    assert first_id.startswith("dsh-lineage-v2-")
+    assert first_id != second_id
+
+
+def test_dsh_session_id_preserves_missing_lineage_component_positions() -> None:
+    missing_agent = _lineage_request(goal_id="goal", todo_id="todo")
+    missing_todo = _lineage_request(goal_id="goal", agent_id="todo")
+
+    assert turn_host_adapter._derive_session_id(
+        missing_agent, TURN_KEY
+    ) != turn_host_adapter._derive_session_id(missing_todo, TURN_KEY)
+    assert turn_host_adapter._derive_session_id(
+        _lineage_request(), TURN_KEY
+    ) == "dsh-" + "0" * 24
+    assert turn_host_adapter._derive_session_id(
+        _lineage_request(goal_id=False, agent_id=0, todo_id=""), TURN_KEY
+    ) == "dsh-" + "0" * 24
+
+
+def test_dsh_fresh_iteration_session_id_is_scoped_to_the_turn_key() -> None:
+    request = _lineage_request(goal_id="goal", agent_id="agent", todo_id="todo")
+    request["session"] = {
+        "context_policy": {
+            "schema_version": "loopx_iteration_context_policy_v0",
+            "mode": "fresh",
+            "scope": "iteration",
+        }
+    }
+    first_key = "sha256:" + "1" * 64
+    second_key = "sha256:" + "2" * 64
+
+    first_id = turn_host_adapter._derive_session_id(request, first_key)
+    assert first_id.startswith("dsh-iteration-v1-")
+    assert first_id == turn_host_adapter._derive_session_id(request, first_key)
+    assert first_id != turn_host_adapter._derive_session_id(request, second_key)
+
+
+def test_dsh_host_passes_lineage_session_id_to_the_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    requests = [
+        _signed_request(
+            goal_id="goal-a", agent_id="worker", todo_id="todo_b-todo_abc"
+        ),
+        _signed_request(
+            goal_id="goal-a-worker", agent_id="todo_b", todo_id="todo_abc"
+        ),
+        _signed_request(
+            goal_id="goal-a", agent_id="worker", todo_id="todo_b-todo_abc"
+        ),
+    ]
+    session_ids: list[str] = []
+
+    def run_fake_dsh_turn(**kwargs: object) -> str:
+        session_ids.append(str(kwargs["session_id"]))
+        return '{"result_kind":"wait"}'
+
+    monkeypatch.setattr(turn_host_adapter, "run_dsh_turn", run_fake_dsh_turn)
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path)
+    for request in requests:
+        turn_host_adapter.run_dsh_host(request, config=config)
+
+    assert session_ids[0] != session_ids[1]
+    assert session_ids[0] == session_ids[2]
+
+
+def test_dsh_host_forwards_the_resolved_credential_to_the_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def run_fake_dsh_turn(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return '{"result_kind":"wait"}'
+
+    monkeypatch.setattr(turn_host_adapter, "run_dsh_turn", run_fake_dsh_turn)
+    credential = {
+        "DEEPSEEK_API_KEY": "fixture-machine-key",
+        "DEEPSEEK_BASE_URL": "https://provider.invalid",
+    }
+    config = turn_host_adapter.DshHostConfig(
+        workspace=tmp_path,
+        env=credential,
+    )
+
+    turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+
+    assert calls[0]["env"] == {
+        **credential,
+        "LOOPX_TURN_KEY": TURN_KEY,
+        "LOOPX_TURN_GOAL_ID": "g",
+        "LOOPX_TURN_AGENT_ID": "a",
+        "LOOPX_TURN_TODO_ID": "",
+        "LOOPX_TURN_WORKSPACE": str(tmp_path.resolve()),
+    }
+    assert calls[0]["env"] is not credential
+
+
+@pytest.mark.parametrize(
+    "resolved,expected",
+    [
+        ({"DEEPSEEK_API_KEY": "fixture-machine-key"},
+         {"DEEPSEEK_API_KEY": "fixture-machine-key"}),
+        ({"DEEPSEEK_API_KEY": "fixture-env-key",
+          "DEEPSEEK_BASE_URL": "https://provider.invalid",
+          "UNRELATED_SERVICE_SECRET": "must-not-travel"},
+         {"DEEPSEEK_API_KEY": "fixture-env-key",
+          "DEEPSEEK_BASE_URL": "https://provider.invalid"}),
+        ({"UNRELATED_SERVICE_SECRET": "must-not-travel"}, {}),
+    ],
+)
+def test_turn_runner_projects_only_the_resolved_operator_provider_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resolved: dict[str, str],
+    expected: dict[str, str],
+) -> None:
+    captured: list[turn_host_adapter.DshHostConfig] = []
+
+    def capture(_request: object, *, config: turn_host_adapter.DshHostConfig) -> dict:
+        captured.append(config)
+        return {"ok": True}
+
+    monkeypatch.setattr(turn_dsh_host, "run_dsh_host", capture)
+    args = SimpleNamespace(
+        dsh_provider=None,
+        dsh_model=None,
+        dsh_reasoning_effort=None,
+        dsh_max_tokens=16_384,
+        dsh_home=None,
+        dsh_cordis=None,
+        dsh_runtime_bin=None,
+        timeout_seconds=60,
+        dsh_runner=None,
+    )
+    runner = turn_dsh_host.build_dsh_host_runner(
+        args,
+        workspace=tmp_path,
+        environ=resolved,
+    )
+
+    assert runner({}) == {"ok": True}
+    assert dict(captured[0].env or {}) == expected
 
 
 def test_dsh_goal_mode_is_a_first_class_subpackage() -> None:
@@ -138,9 +368,33 @@ def test_prompt_requests_one_typed_public_safe_json_result() -> None:
     assert "primary_action" in prompt
     assert "result_kind" in prompt
     assert "validated_progress" in prompt
+    assert "iteration_failed" in prompt
     # Boundary discipline stays in the prompt text.
     assert "write_scope" in prompt
     assert "credentials" in prompt
+    assert "material_replan" in prompt and "goal_path_delta_v0" in prompt
+    assert "These fields describe the result only; they grant no authority." in prompt
+    assert "For stop results (wait, user_action_required, iteration_failed), omit both path_delta_mode and agent_vision_json." in prompt
+
+
+def test_prompt_carries_the_signed_authority_without_prose_reconstruction() -> None:
+    request = _signed_request()
+    authority = turn_host_adapter.extract_turn_authority(request)
+    envelope = request["turn_envelope"]
+    assert authority["primary_action"] == "Do the signed thing."
+    assert authority["required_reads"] == envelope["required_reads"]
+    assert authority["write_scope"] == envelope["boundary"]["write_scope"]
+    assert authority["workspace_guard"] == envelope["boundary"]["workspace_guard"]
+
+    prompt = turn_host_adapter.render_prompt(authority)
+    assert "legacy action must not win" not in prompt
+    for expected in (
+        '"primary_action":"Do the signed thing."',
+        '"command":"git status --short"',
+        '"write_scope":["docs/**","tests/**"]',
+        '"workspace_guard":{"action":"continue"',
+    ):
+        assert expected in prompt, expected
 
 
 def test_parse_model_json_tolerates_prose_and_fences() -> None:
@@ -152,6 +406,43 @@ def test_parse_model_json_tolerates_prose_and_fences() -> None:
     assert turn_host_adapter.parse_model_json(prose) == payload
     assert turn_host_adapter.parse_model_json("") is None
     assert turn_host_adapter.parse_model_json("no json at all") is None
+
+
+def test_parse_model_json_repairs_minor_delimiters_and_preserves_strings() -> None:
+    complex_payload = {
+        "result_kind": "validated_completion",
+        "details": [
+            {"label": "literal", "text": "Keep ,}, and }]}}]}} intact inside string literals."},
+            {"label": "second", "text": "Trailing text"},
+        ],
+    }
+    raw_trailing_comma = (
+        '{"result_kind": "validated_completion", "details": ['
+        '{"label": "literal", "text": "Keep ,}, and }]}}]}} intact inside string literals.",}, '
+        '{"label": "second", "text": "Trailing text",},'
+        '],}'
+    )
+    assert turn_host_adapter.parse_model_json(raw_trailing_comma) == complex_payload
+    # Extra } inside terminal closer run when outer expectation is ] followed by }
+    raw_extra_before_array_close = (
+        '{"result_kind": "validated_completion", "nested": {"sections": ['
+        '{"items": [{"summary": "ok",}]}]}]}}'
+    )
+    assert turn_host_adapter.parse_model_json(raw_extra_before_array_close) == {
+        "result_kind": "validated_completion",
+        "nested": {"sections": [{"items": [{"summary": "ok"}]}]},
+    }
+    raw_extra_outer_brace = '{"result_kind": "wait", "nested": {"a": [1,]}}}'
+    assert turn_host_adapter.parse_model_json(raw_extra_outer_brace) == {
+        "result_kind": "wait",
+        "nested": {"a": [1]},
+    }
+    # Truncated, unclosed string, mid-object mismatch, or >2 stray closers must fail closed.
+    assert turn_host_adapter.parse_model_json('{"result_kind": "wait", "items": [{"a": 1}') is None
+    assert turn_host_adapter.parse_model_json('{"result_kind": "wait", "items": [{"a": 1}}') is None
+    assert turn_host_adapter.parse_model_json('{"result_kind": "wait", "text": "unterminated}') is None
+    assert turn_host_adapter.parse_model_json('{"a": [1}, "b": 2}') is None
+    assert turn_host_adapter.parse_model_json('{"result_kind": "wait"}}}}') is None
 
 
 def test_build_result_fails_closed_without_a_typed_candidate() -> None:
@@ -173,6 +464,23 @@ def test_build_result_rejects_unsupported_result_kinds() -> None:
     assert result["classification"] == "unsupported_host_result_kind"
 
 
+def test_build_result_preserves_iteration_failed_as_a_typed_stop() -> None:
+    request = _signed_request()
+    result = turn_host_adapter.build_result(
+        request,
+        {
+            "result_kind": "iteration_failed",
+            "classification": "iteration check failed",
+            "summary": "the bounded attempt did not validate",
+            "next_action": "start a new controller-authorized iteration",
+        },
+    )
+
+    assert result["result_kind"] == "iteration_failed"
+    assert result["classification"] == "iteration check failed"
+    assert "delivery_outcome" not in result
+
+
 def test_build_result_shapes_material_results_with_required_fields() -> None:
     request = _signed_request()
     result = turn_host_adapter.build_result(
@@ -190,6 +498,456 @@ def test_build_result_shapes_material_results_with_required_fields() -> None:
     # Sparse material blocks get bounded fallbacks, never empty authority text.
     assert result["recommended_action"]
     assert result["vision_unchanged_reason"]
+    assert "path_delta_mode" not in result
+    assert "agent_vision_json" not in result
+
+
+@pytest.mark.parametrize("kind", ["validated_progress", "repair_required", "replan_required"])
+@pytest.mark.parametrize("field,value,valid", [
+    ("delivery_batch_scale", "test_only", True),
+    ("delivery_batch_scale", "multi_surface", True),
+    ("delivery_batch_scale", "implementation", True),
+    ("delivery_outcome", "surface_only", False),
+    ("delivery_outcome", "outcome_gap", False),
+    ("delivery_outcome", "primary_goal_outcome", True),
+    ("delivery_batch_scale", "single_segment", False),
+    ("delivery_batch_scale", "bounded_segment", False),
+    *[(field, value, False)
+      for field in ("delivery_batch_scale", "delivery_outcome")
+      for value in (None, False, 0, {}, [], "", "unknown")],
+])
+def test_explicit_delivery_metadata_reaches_its_existing_validator(kind, field, value, valid):
+    request = _signed_request()
+    base = {
+        "result_kind": kind, "classification": "artifact_checked",
+        "next_action": "Continue the accepted task.",
+        "vision_unchanged_reason": "The accepted Goal remains unchanged.",
+    }
+    adapted = turn_host_adapter.build_result(request, {**base, field: value})
+    assert type(adapted[field]) is type(value) and adapted[field] == value
+    direct = {**turn_host_adapter.build_result(request, base), field: value}
+    # Legal outcome names alone cannot settle a material Turn. The current
+    # Host result has no typed blocker observation, so outcome_gap is refused.
+    for result in (adapted, direct):
+        verdict = validate_loopx_turn_host_result(_turn_plan(request), result)
+        assert verdict["ok"] is valid, verdict["errors"]
+def test_material_result_preserves_profile_classification_and_evidence() -> None:
+    request = _signed_request(
+        execution_profile={
+            "minimum_scale": "multi_surface_or_implementation",
+            "must_include": ["coherent_artifact", "targeted_validation"],
+        }
+    )
+    result = turn_host_adapter.build_result(
+        request,
+        {
+            "result_kind": "validated_progress",
+            "classification": "implementation completed",
+            "summary": "The bounded implementation and validation completed.",
+            "next_action": "Review the validated implementation.",
+            "delivery_batch_scale": "implementation",
+            "delivery_outcome": "primary_goal_outcome",
+            "vision_unchanged_reason": "The accepted outcome remains unchanged.",
+            "work_evidence": ["artifact:implementation-change"],
+            "validation_evidence": ["check:targeted-tests"],
+        },
+    )
+
+    assert result["delivery_batch_scale"] == "implementation"
+    assert result["delivery_outcome"] == "primary_goal_outcome"
+    assert result["work_evidence"] == ["artifact:implementation-change"]
+    assert result["validation_evidence"] == ["check:targeted-tests"]
+    verdict = validate_loopx_turn_host_result(_turn_plan(request), result)
+    assert verdict["ok"], verdict["errors"]
+    assert verdict["result"]["delivery_batch_scale"] == "implementation"
+    assert verdict["result"]["delivery_outcome"] == "primary_goal_outcome"
+    assert verdict["result"]["work_evidence"] == result["work_evidence"]
+    assert verdict["result"]["validation_evidence"] == result["validation_evidence"]
+
+
+def test_execution_readback_projects_host_evidence() -> None:
+    from loopx.control_plane.turn_driver.execution_readback import execution_payload
+
+    request = _signed_request()
+    payload = execution_payload(
+        _turn_plan(request),
+        {
+            "status": "committed",
+            "host_result": {
+                "work_evidence": ["artifact:change"],
+                "validation_evidence": ["check:targeted-tests"],
+            },
+        },
+        execute=True,
+        replayed=False,
+        effects={},
+    )
+
+    assert payload["host_evidence"] == {
+        "work_evidence": ["artifact:change"],
+        "validation_evidence": ["check:targeted-tests"],
+    }
+
+
+def test_shared_host_fails_closed_without_profile_evidence() -> None:
+    request = _signed_request(
+        execution_profile={"minimum_scale": "multi_surface_or_implementation"}
+    )
+    result = turn_host_adapter.build_result(
+        request,
+        {
+            "result_kind": "validated_progress",
+            "classification": "implementation completed",
+            "next_action": "Review the implementation.",
+            "delivery_batch_scale": "implementation",
+            "delivery_outcome": "primary_goal_outcome",
+        },
+    )
+
+    assert result["result_kind"] == "wait"
+    assert result["classification"] == "missing_host_execution_evidence"
+    assert "work_evidence and validation_evidence" in result["next_action"]
+    verdict = validate_loopx_turn_host_result(_turn_plan(request), result)
+    assert verdict["ok"], verdict["errors"]
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_error"),
+    [
+        ({"work_evidence": "artifact:change"}, "work_evidence must be an array"),
+        ({"validation_evidence": [""]}, "validation_evidence must contain"),
+        ({"work_evidence": ["x" * 241]}, "work_evidence items"),
+        (
+            {"validation_evidence": [f"check:{index}" for index in range(9)]},
+            "validation_evidence must contain at most 8 items",
+        ),
+        (
+            {"work_evidence": ["/Users/example/private.txt"]},
+            "work_evidence[0]",
+        ),
+    ],
+)
+def test_profile_material_result_rejects_unbounded_or_unsafe_evidence(
+    change: dict[str, object], expected_error: str,
+) -> None:
+    request = _signed_request(
+        execution_profile={"minimum_scale": "multi_surface_or_implementation"}
+    )
+    candidate: dict[str, object] = {
+        "result_kind": "validated_progress",
+        "classification": "implementation completed",
+        "next_action": "Review the implementation.",
+        "delivery_batch_scale": "implementation",
+        "delivery_outcome": "primary_goal_outcome",
+        "work_evidence": ["artifact:change"],
+        "validation_evidence": ["check:targeted-tests"],
+    }
+    candidate.update(change)
+    result = turn_host_adapter.build_result(request, candidate)
+
+    verdict = validate_loopx_turn_host_result(_turn_plan(request), result)
+    assert not verdict["ok"]
+    assert expected_error in " ".join(verdict["errors"])
+
+
+def _material_replan_candidate() -> tuple[dict[str, object], str]:
+    vision = {
+        "schema_version": "goal_vision_replan_contract_v0",
+        "state": "active",
+        "vision_patch": {
+            "vision_summary": "Continue the next bounded fixture check.",
+            "acceptance_summary": "Validate the next fixture outcome independently.",
+        },
+        "path_delta": {
+            "schema_version": "goal_path_delta_v0",
+            "outcome": "replan",
+            "prior_assumption": "The prior fixture stage remained open. " + "a" * 250,
+            "observed_reality": "The prior stage passed its local validation. " + "b" * 250,
+            "evidence_refs": [f"fixture:{index}-" + "e" * 120 for index in range(4)],
+            "changed": [f"Advance bounded fixture check {index}-" + "c" * 70 for index in range(3)],
+        },
+    }
+    vision_json = json.dumps(vision, indent=2)
+    candidate: dict[str, object] = {
+        "result_kind": "replan_required",
+        "classification": "fixture replan",
+        "recommended_action": "Continue the validated successor stage.",
+        "next_action": "Validate the next bounded fixture check.",
+        "path_delta_mode": "material_replan",
+        "agent_vision_json": vision_json,
+    }
+    return candidate, vision_json
+
+
+def test_build_result_preserves_material_replan_for_the_executor() -> None:
+    candidate, vision_json = _material_replan_candidate()
+    result = turn_host_adapter.build_result(_signed_request(), candidate)
+
+    assert result["path_delta_mode"] == "material_replan"
+    assert result["agent_vision_json"] == vision_json
+    assert len(vision_json) > 400
+    assert "vision_unchanged_reason" not in result
+    verdict = validate_loopx_turn_host_result(
+        _turn_plan(_signed_request()), result
+    )
+    assert verdict["ok"], verdict["errors"]
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_error"),
+    [
+        ({"agent_vision_json": ["not a string"]}, "agent_vision_json must be a JSON string"),
+        ({"agent_vision_json": None}, "agent_vision_json must be a JSON string"),
+        ({"agent_vision_json": "{"}, "invalid agent_vision_json"),
+        ({"agent_vision_json": "[]"}, "agent_vision_json must decode to a JSON object"),
+        ({"agent_vision_json": "x" * 3_201}, "agent_vision_json exceeds 3200 characters"),
+        ({"path_delta_mode": "unexpected"}, "path_delta_mode must be unchanged or material_replan"),
+        ({"path_delta_mode": False}, "path_delta_mode must be a string"),
+        ({"path_delta_mode": None}, "path_delta_mode must be a string"),
+        ({"result_kind": "validated_progress"}, "material_replan path_delta_mode requires result_kind replan_required"),
+        ({"vision_unchanged_reason": "The goal path is unchanged."}, "material_replan cannot also declare vision_unchanged_reason"),
+    ],
+    ids=["wrong-json-type", "null-json", "malformed-json", "nonobject-json", "oversized-json", "wrong-mode", "wrong-mode-type", "null-mode", "wrong-kind", "conflicting-reason"],
+)
+def test_build_result_preserves_invalid_replan_for_executor_rejection(
+    change: dict[str, object], expected_error: str,
+) -> None:
+    candidate, _vision_json = _material_replan_candidate()
+    candidate.update(change)
+    result = turn_host_adapter.build_result(_signed_request(), candidate)
+    for field in ("agent_vision_json", "path_delta_mode"):
+        if field in change:
+            assert result[field] == change[field]
+
+    verdict = validate_loopx_turn_host_result(_turn_plan(_signed_request()), result)
+    assert not verdict["ok"]
+    assert expected_error in " ".join(verdict["errors"])
+
+
+@pytest.mark.parametrize("kind", ["wait", "user_action_required", "iteration_failed"])
+def test_stop_candidates_omit_path_delta_fields_and_pass_executor(kind: str) -> None:
+    candidate = {
+        "result_kind": kind,
+        "classification": "bounded stop",
+        "next_action": "Await the next authorized iteration.",
+    }
+    result = turn_host_adapter.build_result(_signed_request(), candidate)
+
+    assert "path_delta_mode" not in result
+    assert "agent_vision_json" not in result
+    verdict = validate_loopx_turn_host_result(_turn_plan(_signed_request()), result)
+    assert verdict["ok"], verdict["errors"]
+
+
+@pytest.mark.parametrize("kind", ["wait", "user_action_required", "iteration_failed"])
+def test_stop_candidates_cannot_smuggle_material_path_fields(kind: str) -> None:
+    candidate, vision_json = _material_replan_candidate()
+    candidate["result_kind"] = kind
+    result = turn_host_adapter.build_result(_signed_request(), candidate)
+
+    assert result["path_delta_mode"] == "material_replan"
+    assert result["agent_vision_json"] == vision_json
+    verdict = validate_loopx_turn_host_result(_turn_plan(_signed_request()), result)
+    assert not verdict["ok"]
+    assert "non-material host results cannot declare path_delta_mode or agent_vision_json" in " ".join(verdict["errors"])
+
+
+@pytest.mark.parametrize("kind", ["wait", "user_action_required", "iteration_failed"])
+def test_stop_candidates_cannot_declare_work_or_validation_evidence(kind: str) -> None:
+    result = turn_host_adapter.build_result(
+        _signed_request(),
+        {
+            "result_kind": kind,
+            "classification": "bounded stop",
+            "next_action": "Await the next authorized iteration.",
+            "work_evidence": ["artifact:unexpected"],
+            "validation_evidence": ["check:unexpected"],
+        },
+    )
+
+    verdict = validate_loopx_turn_host_result(_turn_plan(_signed_request()), result)
+    assert not verdict["ok"]
+    assert "work/validation evidence" in " ".join(verdict["errors"])
+
+
+@pytest.mark.parametrize("kind", ["wait", "user_action_required", "iteration_failed"])
+@pytest.mark.parametrize("with_profile", [False, True])
+@pytest.mark.parametrize("evidence", [None, [], False, ["artifact:unexpected"]])
+def test_codex_schema_stop_with_required_empty_path_fields_passes_executor(kind, with_profile, evidence) -> None:
+    request = _signed_request(execution_profile={"work_kind": "engineering_change"} if with_profile else None)
+    schema = codex_cli_result_schema(request)
+    required = schema["required"]
+    properties = schema["properties"]
+    assert "path_delta_mode" in required and "agent_vision_json" in required
+    assert properties["path_delta_mode"]["type"] == "string"
+    assert properties["agent_vision_json"]["type"] == "string"
+    assert "work_evidence" in required and "validation_evidence" in required
+    value = {field: "" for field in required}
+    value.update(
+        {
+            "schema_version": properties["schema_version"]["enum"][0],
+            "turn_key": request["turn_key"],
+            "result_kind": kind,
+            "completed_phases": ["host_execute", "typed_result"],
+            "classification": "bounded stop",
+            "next_action": "Await the next authorized iteration.",
+            "work_evidence": evidence,
+            "validation_evidence": evidence,
+        }
+    )
+
+    adapted = normalize_codex_result(request, value)
+    verdict = validate_loopx_turn_host_result(_turn_plan(request), adapted)
+    assert verdict["ok"] is (evidence is None), verdict["errors"]
+    # Only null placeholders disappear; real/invalid evidence remains visible.
+    assert value["work_evidence"] is evidence
+    if evidence is not None:
+        assert adapted == value
+    else:
+        assert "work_evidence" not in adapted and "validation_evidence" not in adapted
+
+
+@pytest.mark.parametrize("kind", ["validated_progress", "repair_required", "replan_required"])
+@pytest.mark.parametrize("with_profile", [False, True])
+@pytest.mark.parametrize("field", ["work_evidence", "validation_evidence"])
+@pytest.mark.parametrize("evidence", ["missing", None, [], False, {}, ["artifact:checked"]])
+def test_codex_material_evidence_keeps_profile_and_legacy_rules(kind, with_profile, field, evidence):
+    request = _signed_request(execution_profile={"work_kind": "engineering_change"} if with_profile else None)
+    value = turn_host_adapter.build_result(request, {
+        "result_kind": kind, "classification": "artifact_checked",
+        "next_action": "Continue the accepted task.",
+        "vision_unchanged_reason": "The accepted Goal remains unchanged.",
+        "work_evidence": ["artifact:checked"], "validation_evidence": ["check:independent"],
+    })
+    if evidence == "missing":
+        value.pop(field)
+    else:
+        value[field] = evidence
+    if with_profile and (evidence is None or evidence == "missing"):
+        with pytest.raises(BuiltInHostError, match="codex_material_result_missing_evidence"):
+            normalize_codex_result(request, value)
+        return
+    adapted = normalize_codex_result(request, value)
+    assert adapted == value
+    verdict = validate_loopx_turn_host_result(_turn_plan(request), adapted)
+    expected = evidence is None or evidence == "missing" or isinstance(evidence, list) and bool(evidence)
+    assert verdict["ok"] is expected, verdict["errors"]
+
+
+def _turn_plan(request: dict) -> dict:
+    return {
+        "transaction": {"turn_key": request["turn_key"]},
+        "turn_envelope": request["turn_envelope"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected_kind"),
+    [
+        (
+            {
+                "result_kind": "validated_progress",
+                "classification": "single surface change",
+                "summary": "edited one file",
+                "next_action": "review the diff",
+            },
+            "validated_progress",
+        ),
+        (
+            {
+                "result_kind": "wait",
+                "classification": "throttled",
+                "next_action": "retry after cadence",
+            },
+            "wait",
+        ),
+        (None, "wait"),
+        ({"result_kind": "not_a_loopx_kind", "summary": "bad"}, "wait"),
+    ],
+    ids=["material", "wait", "missing_block", "unsupported_kind"],
+)
+def test_build_result_is_accepted_by_the_real_host_result_validator(
+    candidate: dict | None, expected_kind: str
+) -> None:
+    # Shaping alone is not enough: every adapter output, including fail-closed
+    # waits, must pass the same validator the Turn executor applies.
+    request = _signed_request()
+    result = turn_host_adapter.build_result(request, candidate)
+    assert result["result_kind"] == expected_kind
+    if expected_kind == "wait":
+        assert "delivery_batch_scale" not in result
+    verdict = validate_loopx_turn_host_result(_turn_plan(request), result)
+    assert verdict["ok"], verdict["errors"]
+
+
+@pytest.mark.parametrize("field,limit", [
+    ("classification", 120), ("summary", 400), ("next_action", 1_200),
+    ("recommended_action", 1_200), ("vision_unchanged_reason", 240),
+])
+@pytest.mark.parametrize("kind", ["validated_progress", "wait"])
+@pytest.mark.parametrize("extra", [0, 1])
+def test_candidate_text_reaches_executor_limits_without_losing_its_tail(
+    field: str, limit: int, kind: str, extra: int,
+) -> None:
+    # Independent limits from the Turn result contract. A trailing restriction
+    # must reach the validator, including on stop and legacy unchanged paths.
+    tail = "Stop before publication."
+    value = "验" * (limit + extra - len(tail)) + tail
+    candidate = {
+        "result_kind": kind, "classification": "implementation_refined",
+        "summary": "The isolated artifact was checked.",
+        "next_action": "Continue the accepted work.",
+        "recommended_action": "Read the next current decision.",
+        "vision_unchanged_reason": "The accepted Goal remains unchanged.",
+        field: value,
+    }
+    request = _signed_request()
+    result = turn_host_adapter.build_result(
+        request, candidate,
+    )
+    assert result[field] == value
+    verdict = validate_loopx_turn_host_result(_turn_plan(request), result)
+    assert verdict["ok"] is (extra == 0), verdict["errors"]
+    if extra:
+        assert f"{field} exceeds {limit} characters" in verdict["errors"]
+
+
+@pytest.mark.parametrize("field", [
+    "classification", "summary", "next_action", "recommended_action", "vision_unchanged_reason",
+])
+@pytest.mark.parametrize("value", [True, False, 42, 0, 1.25, {}, [], {"action": "Continue"}, ["Continue"]])
+@pytest.mark.parametrize("kind", ["validated_progress", "wait"])
+def test_nontext_candidate_fields_reach_the_executor_without_coercion(field, value, kind):
+    request = _signed_request()
+    valid = {
+        "result_kind": kind, "classification": "artifact_checked", "summary": "Evidence checked.",
+        "next_action": "Continue the accepted task.", "recommended_action": "Read current requirements.",
+        "vision_unchanged_reason": "The accepted Goal is unchanged.",
+    }
+    adapted = turn_host_adapter.build_result(request, {**valid, field: value})
+    assert type(adapted[field]) is type(value) and adapted[field] == value
+    # The generic host route must reject the same raw JSON type even without
+    # the shared DSH/Ark adapter. A transport cannot repair malformed meaning.
+    direct = {**turn_host_adapter.build_result(request, valid), field: value}
+    for result in (adapted, direct):
+        verdict = validate_loopx_turn_host_result(_turn_plan(request), result)
+        assert not verdict["ok"]
+        assert f"{field} must be a string" in verdict["errors"]
+
+
+@pytest.mark.parametrize("field", [
+    "classification", "summary", "next_action", "recommended_action", "vision_unchanged_reason",
+])
+@pytest.mark.parametrize("kind", ["validated_progress", "wait"])
+def test_legacy_null_candidate_text_still_uses_the_existing_absent_field_behavior(field, kind):
+    request = _signed_request()
+    result = turn_host_adapter.build_result(request, {
+        "result_kind": kind, "classification": "artifact_checked", "summary": "Evidence checked.",
+        "next_action": "Continue the accepted task.", "recommended_action": "Read current requirements.",
+        "vision_unchanged_reason": "The accepted Goal is unchanged.", field: None,
+    })
+    verdict = validate_loopx_turn_host_result(_turn_plan(request), result)
+    assert verdict["ok"], verdict["errors"]
 
 
 def test_adapter_runs_hermetically_through_the_module_entry() -> None:
@@ -218,6 +976,581 @@ def test_adapter_runs_hermetically_through_the_module_entry() -> None:
     assert result["classification"] == "fake dsh typed result"
 
 
+def test_module_entry_delivers_complete_signed_boundary_and_refuses_tampering(tmp_path) -> None:
+    boundary = {
+        "guards": ["Preserve complete evidence.\n" * 20 + "Do not publish private material."],
+        "stop_condition": "Read current authority.\n" * 20 + "Stop when approval is missing.",
+        "requires_parent_approval": ["write", "publish", "production-action"],
+        "checkpointed_boundary_authority": {
+            "schema_version": "checkpointed_boundary_authority_v0", "active_count": 1,
+            "active_write_scope": ["docs/**"],
+        },
+    }
+    runner = tmp_path / "boundary_runner.py"
+    runner.write_text(
+        "import json\nfrom tests.dsh_goal_mode_fake_runner import run_dsh_turn as original\n"
+        f"EXPECTED = {boundary!r}\n"
+        "def run_dsh_turn(**kwargs):\n"
+        "    wire = kwargs['prompt'].split('Turn authority JSON:\\n', 1)[1]\n"
+        "    authority, _ = json.JSONDecoder().raw_decode(wire)\n"
+        "    assert authority['boundary'] == EXPECTED\n"
+        "    assert authority['write_scope'] == ['docs/**', 'tests/**']\n"
+        "    return original(**kwargs)\n",
+        encoding="utf-8",
+    )
+    request = _signed_request(boundary=boundary)
+    argv = [sys.executable, "-m", "loopx.dsh_goal_mode", "--dsh-runner", str(runner)]
+    completed = subprocess.run(argv, input=json.dumps(request), text=True,
+                               capture_output=True, cwd=REPO_ROOT, check=False)
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["result_kind"] == "validated_progress"
+    request["turn_envelope"]["boundary"]["stop_condition"] = "Continue without approval."
+    rejected = subprocess.run(argv, input=json.dumps(request), text=True,
+                              capture_output=True, cwd=REPO_ROOT, check=False)
+    assert rejected.returncode != 0
+    assert "action signature" in rejected.stderr
+
+
+def test_classify_dsh_failure_maps_each_known_signal() -> None:
+    class _StatusError(Exception):
+        def __init__(self, status_code: int) -> None:
+            super().__init__("provider rejected the request")
+            self.status_code = status_code
+
+    cases = [
+        (_StatusError(429), "rate_limited"),
+        (_StatusError(402), "quota_exhausted"),
+        (_StatusError(401), "auth_failed"),
+        (_StatusError(503), "provider_overloaded"),
+        (RuntimeError("selected model is at capacity"), "provider_capacity"),
+        (TimeoutError("request stalled"), "executor_timeout"),
+        (ConnectionResetError("peer went away"), "transport_lost"),
+        (RuntimeError("something else entirely"), "unknown"),
+    ]
+    for exc, expected in cases:
+        assert host_failure_map.classify_dsh_failure(exc) == expected, expected
+
+
+def test_classify_known_code_wins_over_http_status() -> None:
+    # loopx-turn-v0: a known error.code wins over HTTP status, so a quota
+    # exhaustion stays non-retryable even when transported as HTTP 429.
+    class _StatusFirst(Exception):
+        status_code = 429
+        code = "insufficient_balance"
+
+    class _CodeFirst(Exception):
+        code = "QUOTA_EXCEEDED"
+        status_code = 429
+
+    assert (
+        host_failure_map.classify_dsh_failure(_StatusFirst("x")) == "quota_exhausted"
+    )
+    assert (
+        host_failure_map.classify_dsh_failure(_CodeFirst("x")) == "quota_exhausted"
+    )
+
+
+def test_classify_server_code_is_a_stable_provider_overload_signal() -> None:
+    class _ServerError(Exception):
+        code = "SERVER"
+
+    assert (
+        host_failure_map.classify_dsh_failure(_ServerError("x"))
+        == "provider_overloaded"
+    )
+
+
+def test_classify_conflicting_known_codes_fold_closed() -> None:
+    class _TwoCodes(Exception):
+        code = "QUOTA_EXCEEDED"
+        error_code = "RATE_LIMIT"
+
+    assert host_failure_map.classify_dsh_failure(_TwoCodes("x")) == "unknown"
+
+
+def test_classify_transport_closed_exception_type() -> None:
+    class TransportClosedError(Exception):
+        pass
+
+    assert (
+        host_failure_map.classify_dsh_failure(TransportClosedError("gone"))
+        == "transport_lost"
+    )
+
+
+def test_classify_terminal_reason_uses_structured_error() -> None:
+    reason = {
+        "kind": "error",
+        "error": {"code": "RATE_LIMIT", "status": 429, "message": "slow down"},
+    }
+    assert host_failure_map.classify_dsh_terminal_reason(reason) == "rate_limited"
+    assert host_failure_map.classify_dsh_terminal_reason({"kind": "error"}) == (
+        "unknown"
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("TRANSPORT", "transport_lost"),
+        ("MISSING_CREDENTIAL", "auth_failed"),
+        ("INVALID_CREDENTIAL", "auth_failed"),
+        ("QUOTA", "quota_exhausted"),
+        ("TIMEOUT", "executor_timeout"),
+        ("EMPTY_RESPONSE", "transport_lost"),
+        ("INVALID_REQUEST", "contract_rejected"),
+        ("CONTEXT_WINDOW_EXCEEDED", "contract_rejected"),
+        ("UNSUPPORTED_CONTENT", "contract_rejected"),
+        ("UNSUPPORTED_REASONING_EFFORT", "contract_rejected"),
+        ("REQUEST_EXTENSION", "contract_rejected"),
+        ("STREAM_CLOSED", "contract_rejected"),
+        ("MALFORMED_RESPONSE", "contract_rejected"),
+        ("ABORTED", "unknown"),
+    ],
+)
+def test_classify_official_dsh_terminal_codes(code: str, expected: str) -> None:
+    reason = {
+        "kind": "error",
+        "error": {"code": code, "message": "provider-controlled detail"},
+    }
+    assert host_failure_map.classify_dsh_terminal_reason(reason) == expected
+
+
+def test_server_code_without_status_does_not_need_prose_fallback() -> None:
+    reason = {
+        "kind": "error",
+        "error": {
+            "code": "SERVER",
+            "message": "selected model is at capacity",
+        },
+    }
+    assert (
+        host_failure_map.classify_dsh_terminal_reason(reason)
+        == "provider_overloaded"
+    )
+
+
+def test_classify_unknown_structured_code_never_falls_back_to_prose() -> None:
+    class _UnknownCode(Exception):
+        code = "mystery_condition"
+
+    exc = _UnknownCode("rate limit exceeded while the model is at capacity")
+    assert host_failure_map.classify_dsh_failure(exc) == "unknown"
+
+
+def test_classify_dsh_failure_folds_conflicting_prose_closed() -> None:
+    exc = RuntimeError("rate limit reached while the model is at capacity")
+    assert host_failure_map.classify_dsh_failure(exc) == "unknown"
+
+
+def test_run_dsh_host_returns_the_typed_result_in_process(tmp_path: Path) -> None:
+    runner = Path(__file__).parent / "dsh_goal_mode_fake_runner.py"
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path, dsh_runner=runner)
+    result = turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+    assert result["schema_version"] == dsh_goal_mode.LOOPX_TURN_RESULT_SCHEMA
+    assert result["result_kind"] == "validated_progress"
+    assert result["completed_phases"] == list(dsh_goal_mode.COMPLETED_PHASES)
+    assert (tmp_path / ".local" / ".dsh-sessions").is_dir()
+
+
+def test_run_dsh_host_maps_terminal_provider_failure_without_an_exception(
+    tmp_path: Path,
+) -> None:
+    # The SDK reports provider failures as RunResult(finish_reason="error"),
+    # not as a raised exception; the adapter must still surface a typed kind.
+    runner = Path(__file__).parent / "dsh_goal_mode_capacity_runner.py"
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path, dsh_runner=runner)
+    with pytest.raises(BuiltInHostError) as excinfo:
+        turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+    assert excinfo.value.reason == "dsh_execution_failed"
+    assert excinfo.value.failure_kind == "provider_capacity"
+    record = build_host_failure_record(excinfo.value.failure_kind, attempt=1)
+    assert record["retryable"] is True
+    assert record["retry"]["backoff_seconds"] == 30
+    assert "selected model is at capacity" not in json.dumps(record)
+    assert "selected model is at capacity" not in str(excinfo.value)
+
+
+def test_run_dsh_host_maps_official_transport_terminal_failure(
+    tmp_path: Path,
+) -> None:
+    runner = Path(__file__).parent / "dsh_goal_mode_transport_runner.py"
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path, dsh_runner=runner)
+    with pytest.raises(BuiltInHostError) as excinfo:
+        turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+    assert excinfo.value.failure_kind == "transport_lost"
+    record = build_host_failure_record(excinfo.value.failure_kind, attempt=1)
+    assert record["retryable"] is True
+    assert record["retry"]["backoff_seconds"] == 10
+
+
+def test_run_dsh_host_maps_raised_capacity_prose_to_a_typed_retryable_kind(
+    tmp_path: Path,
+) -> None:
+    runner = Path(__file__).parent / "dsh_goal_mode_raising_runner.py"
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path, dsh_runner=runner)
+    with pytest.raises(BuiltInHostError) as excinfo:
+        turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+    assert excinfo.value.failure_kind == "provider_capacity"
+    assert (
+        build_host_failure_record("provider_capacity", attempt=1)["retryable"]
+        is True
+    )
+
+
+def test_build_sdk_config_targets_the_current_sdk_surface(tmp_path: Path) -> None:
+    dsh_home = tmp_path / "dsh-home"
+    cordis = tmp_path / "config" / ".." / "cordis.yml"
+    config = turn_host_adapter.build_sdk_config(
+        provider="deepseek-official",
+        model="deepseek-v4-flash",
+        reasoning_effort="high",
+        workspace=tmp_path,
+        dsh_home=dsh_home,
+        max_tokens=1024,
+        cordis=cordis,
+        runtime_bin="/opt/dsh/bin/dsh",
+        request_timeout_seconds=90.0,
+    )
+    assert set(config) <= {
+        "provider",
+        "model",
+        "reasoning_effort",
+        "cwd",
+        "dsh_home",
+        "max_tokens",
+        "patches",
+        "dsh_bin",
+        "request_timeout_seconds",
+    }
+    assert config["reasoning_effort"] == "high"
+    assert config["dsh_home"] == str(dsh_home)
+    assert config["dsh_bin"] == "/opt/dsh/bin/dsh"
+    assert config["patches"] == (str(cordis.expanduser().resolve()),)
+    for legacy_field in ("session_root", "cordis", "runtime_bin"):
+        assert legacy_field not in config
+
+
+def test_build_sdk_config_omits_an_unset_reasoning_effort(tmp_path: Path) -> None:
+    # A caller that explicitly passes no effort must not have one invented for
+    # it: the SDK distinguishes "provider default" from a named effort.
+    config = turn_host_adapter.build_sdk_config(
+        provider="deepseek-official",
+        model="deepseek-v4-flash",
+        reasoning_effort=None,
+        workspace=tmp_path,
+        dsh_home=tmp_path / "dsh-home",
+        max_tokens=None,
+        cordis=None,
+        runtime_bin=None,
+        request_timeout_seconds=None,
+    )
+    assert "reasoning_effort" not in config
+
+
+def test_build_sdk_config_carries_a_caller_pinned_runtime_environment(
+    tmp_path: Path,
+) -> None:
+    # A Chat channel pins its own segments read-only through the runtime
+    # environment; the adapter forwards it instead of reinterpreting it.
+    config = turn_host_adapter.build_sdk_config(
+        provider="deepseek-official",
+        model="deepseek-v4-flash",
+        reasoning_effort="high",
+        workspace=tmp_path,
+        dsh_home=tmp_path / "dsh-home",
+        max_tokens=None,
+        cordis=None,
+        runtime_bin=None,
+        request_timeout_seconds=None,
+        env={"DSH_PERMISSION_MODE": "read-only"},
+    )
+    assert config["env"] == {"DSH_PERMISSION_MODE": "read-only"}
+
+    unpinned = turn_host_adapter.build_sdk_config(
+        provider="deepseek-official",
+        model="deepseek-v4-flash",
+        reasoning_effort="high",
+        workspace=tmp_path,
+        dsh_home=tmp_path / "dsh-home",
+        max_tokens=None,
+        cordis=None,
+        runtime_bin=None,
+        request_timeout_seconds=None,
+    )
+    assert "env" not in unpinned
+
+
+def test_host_config_resolves_the_shared_managed_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LOOPX_TURN_MODEL", raising=False)
+    monkeypatch.delenv("DSH_MODEL", raising=False)
+    profile = turn_host_adapter.DshHostConfig(workspace=tmp_path).resolved_profile()
+    assert (
+        profile["provider"],
+        profile["model"],
+        profile["reasoning_effort"],
+    ) == (
+        turn_host_adapter.DEFAULT_PROVIDER,
+        turn_host_adapter.DEFAULT_MODEL,
+        turn_host_adapter.DEFAULT_REASONING_EFFORT,
+    )
+    assert profile["model_source"] == "product_default"
+
+    monkeypatch.setenv("LOOPX_TURN_MODEL", "fixture-model")
+    overridden = turn_host_adapter.DshHostConfig(
+        workspace=tmp_path, model="argument-model"
+    ).resolved_profile()
+    assert overridden["model"] == "argument-model"
+    assert overridden["model_source"] == "explicit_argument"
+    # An explicit field wins alone: the others still follow the environment.
+    assert overridden["reasoning_effort"] == turn_host_adapter.DEFAULT_REASONING_EFFORT
+
+
+def test_dsh_home_resolution_prefers_config_then_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    configured = tmp_path / "configured-home"
+    environment = tmp_path / "environment-home"
+    monkeypatch.setenv("DSH_HOME", str(environment))
+
+    assert turn_host_adapter.resolve_dsh_home(workspace, configured) == configured
+    assert turn_host_adapter.resolve_dsh_home(workspace, None) == environment
+
+    monkeypatch.delenv("DSH_HOME")
+    assert turn_host_adapter.resolve_dsh_home(workspace, None) == (
+        workspace / ".local" / ".dsh-sessions"
+    )
+
+
+def test_terminal_error_reason_extraction() -> None:
+    success = {"final_response": "{}", "finish_reason": "stop", "events": []}
+    assert turn_host_adapter.terminal_error_reason(success) is None
+    bare_error = {"final_response": "", "finish_reason": "error", "events": []}
+    assert turn_host_adapter.terminal_error_reason(bare_error) == {"kind": "error"}
+    contradictory = {
+        "final_response": "",
+        "finish_reason": "error",
+        "events": [
+            {
+                "type": "turn/end",
+                "data": {"reason": {"kind": "stop", "status": 200}},
+            }
+        ],
+    }
+    with pytest.raises(turn_host_adapter.DshHostResultError):
+        turn_host_adapter.normalize_runner_outcome(contradictory)
+    assert turn_host_adapter.normalize_runner_outcome("just text") == {
+        "final_response": "just text",
+        "finish_reason": None,
+        "events": [],
+    }
+
+    sdk_result = SimpleNamespace(
+        final_response='{"result_kind":"wait"}',
+        finish_reason="completed",
+        events=[
+            {
+                "type": "turn/end",
+                "data": {"reason": {"kind": "completed"}},
+            }
+        ],
+    )
+    normalized = turn_host_adapter.normalize_runner_outcome(sdk_result)
+    assert normalized["finish_reason"] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("final_response", "expected"),
+    [("", "no_final"), ("  ", "no_final"), ('{"result_kind":', "partial")],
+)
+def test_terminal_output_budget_state_rejects_every_max_token_fragment(
+    final_response: str,
+    expected: str,
+) -> None:
+    assert (
+        turn_host_adapter.terminal_output_budget_state(
+            {
+                "final_response": final_response,
+                "finish_reason": "max-tokens",
+                "events": [],
+            }
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("final_response", "expected_reason"),
+    [
+        ("", "dsh_output_budget_exhausted_no_final"),
+        ('{"result_kind":"validated_progress"}', "dsh_output_budget_exhausted_partial"),
+    ],
+)
+def test_run_dsh_host_maps_max_tokens_to_non_retryable_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    final_response: str,
+    expected_reason: str,
+) -> None:
+    monkeypatch.setattr(
+        turn_host_adapter,
+        "run_dsh_turn",
+        lambda **_kwargs: {
+            "final_response": final_response,
+            "finish_reason": "max-tokens",
+            "events": [
+                {
+                    "type": "turn/end",
+                    "data": {"reason": {"kind": "max-tokens"}},
+                }
+            ],
+        },
+    )
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path)
+
+    with pytest.raises(BuiltInHostError) as excinfo:
+        turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+
+    assert excinfo.value.reason == expected_reason
+    assert excinfo.value.failure_kind == "output_budget_exhausted"
+    assert build_host_failure_record(excinfo.value.failure_kind, attempt=1) == {
+        "schema_version": "loopx_turn_host_failure_v0",
+        "kind": "output_budget_exhausted",
+        "attempt": 1,
+        "retryable": False,
+    }
+
+
+def test_generic_adapter_returns_typed_iteration_failure_on_max_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        turn_host_adapter,
+        "run_dsh_turn",
+        lambda **_kwargs: {
+            "final_response": "",
+            "finish_reason": "max-tokens",
+            "events": [],
+        },
+    )
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path)
+    request = _signed_request()
+
+    result = turn_host_adapter._execute_turn_host_request(
+        request,
+        turn_host_adapter.extract_turn_authority(request),
+        config=config,
+        terminal_errors_as_host_failure=False,
+    )
+
+    assert result["result_kind"] == "iteration_failed"
+    assert result["classification"] == "dsh_output_budget_exhausted_no_final"
+    assert "blindly rerun" in result["next_action"]
+
+
+def test_dsh_host_config_has_a_bounded_product_default(tmp_path: Path) -> None:
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path)
+
+    assert config.max_tokens == 16_384
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True])
+def test_dsh_host_rejects_invalid_output_token_limit_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    invalid: object,
+) -> None:
+    invoked = False
+
+    def runner(**_kwargs: object) -> dict[str, object]:
+        nonlocal invoked
+        invoked = True
+        return {"final_response": "", "finish_reason": "completed", "events": []}
+
+    monkeypatch.setattr(turn_host_adapter, "run_dsh_turn", runner)
+    config = turn_host_adapter.DshHostConfig(
+        workspace=tmp_path,
+        max_tokens=invalid,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(BuiltInHostError) as excinfo:
+        turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+
+    assert excinfo.value.reason == "dsh_output_token_limit_rejected"
+    assert excinfo.value.failure_kind == "contract_rejected"
+    assert invoked is False
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        {},
+        {"final_response": 42, "finish_reason": "completed", "events": []},
+        {"final_response": "{}", "finish_reason": 42, "events": []},
+        {"final_response": "{}", "finish_reason": None, "events": "bad"},
+        {"final_response": "{}", "finish_reason": "error", "events": [None]},
+        {
+            "final_response": "{}",
+            "finish_reason": "error",
+            "events": [{"type": "turn/end", "data": {}}],
+        },
+        {
+            "final_response": "{}",
+            "finish_reason": "error",
+            "events": [
+                {"type": "turn/end", "data": {"reason": {"kind": 42}}}
+            ],
+        },
+    ],
+)
+def test_normalize_runner_outcome_rejects_invalid_shapes(outcome: object) -> None:
+    with pytest.raises(turn_host_adapter.DshHostResultError):
+        turn_host_adapter.normalize_runner_outcome(outcome)
+
+
+def test_run_dsh_host_rejects_untyped_requests_as_contract_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path)
+    with pytest.raises(BuiltInHostError) as excinfo:
+        turn_host_adapter.run_dsh_host({"schema_version": "nope"}, config=config)
+    assert excinfo.value.failure_kind == "contract_rejected"
+
+    tampered = _signed_request()
+    tampered["turn_envelope"]["action"]["primary_action"] = "tampered"
+    with pytest.raises(BuiltInHostError) as excinfo:
+        turn_host_adapter.run_dsh_host(tampered, config=config)
+    assert excinfo.value.failure_kind == "contract_rejected"
+
+    monkeypatch.setattr(turn_host_adapter, "run_dsh_turn", lambda **_kwargs: {})
+    with pytest.raises(BuiltInHostError) as excinfo:
+        turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+    assert excinfo.value.reason == "dsh_host_result_rejected"
+    assert excinfo.value.failure_kind == "contract_rejected"
+
+    monkeypatch.setattr(
+        turn_host_adapter,
+        "run_dsh_turn",
+        lambda **_kwargs: '{"result_kind":"wait"}',
+    )
+
+    def _raise_result_shape_error(*_args: object, **_kwargs: object) -> dict:
+        raise RuntimeError("result shaping failed")
+
+    monkeypatch.setattr(turn_host_adapter, "build_result", _raise_result_shape_error)
+    with pytest.raises(BuiltInHostError) as excinfo:
+        turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+    assert excinfo.value.reason == "dsh_host_result_rejected"
+    assert excinfo.value.failure_kind == "contract_rejected"
+
+
 def test_legacy_launcher_runs_the_same_contract() -> None:
     runner = Path(__file__).parent / "dsh_goal_mode_fake_runner.py"
     completed = subprocess.run(
@@ -237,3 +1570,81 @@ def test_legacy_launcher_runs_the_same_contract() -> None:
     result = json.loads(completed.stdout)
     assert result["schema_version"] == dsh_goal_mode.LOOPX_TURN_RESULT_SCHEMA
     assert result["result_kind"] == "validated_progress"
+
+
+def test_subprocess_terminal_error_keeps_the_legacy_wait_contract() -> None:
+    runner = Path(__file__).parent / "dsh_goal_mode_capacity_runner.py"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loopx.dsh_goal_mode",
+            "--dsh-runner",
+            str(runner),
+        ],
+        input=json.dumps(_signed_request()),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(REPO_ROOT),
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["result_kind"] == "wait"
+    assert result["classification"] == "no_typed_host_result"
+    assert "dsh execution failed" not in completed.stderr
+
+
+def test_dsh_sdk_overrides_follow_each_verified_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = []
+    monkeypatch.setenv("LOOPX_TURN_KEY", "ambient-wrong-turn")
+    monkeypatch.setenv("LOOPX_TURN_GOAL_ID", "ambient-wrong-goal")
+
+    def runner(**kwargs):
+        calls.append(kwargs["env"])
+        return '{"result_kind":"wait"}'
+
+    monkeypatch.setattr(turn_host_adapter, "run_dsh_turn", runner)
+    pinned = {"LOOPX_TURN_KEY": "stale-turn", "LOOPX_TURN_TODO_ID": "stale-todo",
+              "DSH_PERMISSION_MODE": "read-only"}
+    config = turn_host_adapter.DshHostConfig(workspace=tmp_path, env=pinned)
+    turn_host_adapter.run_dsh_host(_signed_request(todo_id="first"), config=config)
+    turn_host_adapter.run_dsh_host(_signed_request(todo_id="second"), config=config)
+    turn_host_adapter.run_dsh_host(_signed_request(), config=config)
+    assert [env["LOOPX_TURN_TODO_ID"] for env in calls] == ["first", "second", ""]
+    for env in calls:
+        assert env["LOOPX_TURN_KEY"] == TURN_KEY
+        assert env["LOOPX_TURN_GOAL_ID"] == "g"
+        assert env["LOOPX_TURN_AGENT_ID"] == "a"
+        assert env["LOOPX_TURN_WORKSPACE"] == str(tmp_path.resolve())
+        assert env["DSH_PERMISSION_MODE"] == "read-only"
+    assert pinned["LOOPX_TURN_TODO_ID"] == "stale-todo"
+    assert pinned["LOOPX_TURN_KEY"] == "stale-turn"
+
+
+@pytest.mark.parametrize("goal,agent,todo", [
+    (" goal ", " agent ", " todo "), (17, True, 23), (False, 0, ""),
+])
+def test_dsh_historical_runner_retains_raw_lineage_and_tool_coercion(
+    tmp_path, monkeypatch, goal, agent, todo,
+):
+    calls = []
+
+    def runner(**kwargs):
+        calls.append(kwargs)
+        return '{"result_kind":"wait"}'
+
+    monkeypatch.setattr(turn_host_adapter, "run_dsh_turn", runner)
+    request = _signed_request(goal_id=goal, agent_id=agent, todo_id=todo)
+    turn_host_adapter.run_dsh_host(request, config=turn_host_adapter.DshHostConfig(workspace=tmp_path))
+    [call] = calls
+    raw = [value if value else None for value in (goal, agent, todo)]
+    expected = ("dsh-lineage-v1-" + sha256(json.dumps(raw, ensure_ascii=False,
+                sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                if any(raw) else "dsh-" + TURN_KEY.removeprefix("sha256:")[:24])
+    assert call["session_id"] == expected
+    assert [call["env"][key] for key in ("LOOPX_TURN_GOAL_ID", "LOOPX_TURN_AGENT_ID", "LOOPX_TURN_TODO_ID")] == [
+        str(value or "") for value in (goal, agent, todo)]

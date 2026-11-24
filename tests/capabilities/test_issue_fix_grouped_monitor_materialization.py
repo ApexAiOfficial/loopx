@@ -27,7 +27,8 @@ from loopx.control_plane.scheduler.monitor_poll_writeback import (
 from loopx.domain_packs.issue_fix import (
     upsert_issue_fix_pr_lifecycle_ledger_jsonl,
 )
-from loopx.todos import list_goal_todos
+from loopx.todos import list_goal_todos, update_goal_todo
+from loopx.control_plane.todos.resume_condition import evaluate_todo_resume_conditions
 
 GOAL_ID = "issue-fix-monitor-goal"
 AGENT_ID = "issue-fix-worker"
@@ -52,6 +53,7 @@ def _fixture(
     registry.write_text(
         json.dumps(
             {
+                "common_runtime_root": str(tmp_path),
                 "goals": [
                     {
                         "id": GOAL_ID,
@@ -70,6 +72,16 @@ def _fixture(
         encoding="utf-8",
     )
     return project, state, registry
+
+
+def _use_provider(state, registry, provider, monkeypatch, *, handoff_mode="soft_claim"):
+    if handoff_mode == "hard_lease":
+        state.write_text("---\nhandoff_mode: hard_lease\n---\n" + state.read_text())
+    from tests.control_plane.canonical_authority_fixture import initialize_canonical_source_fixture, isolate_sqlite_runtime
+    isolate_sqlite_runtime(registry.parent, monkeypatch)
+    initialize_canonical_source_fixture(registry.parent, GOAL_ID,
+        state_path=state, provider=provider, handoff_mode=handoff_mode)
+    state.unlink()
 
 
 def _monitor_todos(registry: Path, project: Path) -> list[dict]:
@@ -110,10 +122,13 @@ def _packet(
     )
 
 
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("handoff_mode", ["soft_claim", "hard_lease"])
 def test_grouped_monitor_materialization_is_one_per_bucket_and_retires_empty_bucket(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch, provider, handoff_mode,
 ) -> None:
     project, state, registry = _fixture(tmp_path)
+    _use_provider(state, registry, provider, monkeypatch, handoff_mode=handoff_mode)
     ledger = tmp_path / "pr-lifecycle.jsonl"
     first = _packet(101)
     second = _packet(102)
@@ -172,10 +187,16 @@ def test_grouped_monitor_materialization_is_one_per_bucket_and_retires_empty_buc
     assert retired["write_performed"] is True
     final_state = state.read_text(encoding="utf-8")
     assert "status=done" in final_state
-    assert (
-        "evidence=Issue-fix%20PR%20lifecycle%20bucket%20"
-        "github-pr-state-huangruiteng--loopx-checks-pending%20is%20empty."
-    ) in final_state
+    # Full evidence belongs to the authority; the bounded projection may link it.
+    retired_monitors = _monitor_todos(registry, project)
+    assert len(retired_monitors) == 1
+    retired_monitor = retired_monitors[0]
+    assert retired_monitor["status"] == "done"
+    assert retired_monitor["no_followup"] is True
+    assert retired_monitor["evidence"] == (
+        "Issue-fix PR lifecycle bucket "
+        "github-pr-state-huangruiteng--loopx-checks-pending is empty."
+    )
 
     upsert_issue_fix_pr_lifecycle_ledger_jsonl(ledger, _packet(103))
     reopened = materialize_issue_fix_grouped_monitors(
@@ -185,17 +206,58 @@ def test_grouped_monitor_materialization_is_one_per_bucket_and_retires_empty_buc
         ledger_path=ledger,
         claimed_by=AGENT_ID,
         cadence="30m",
-        generated_at="2026-08-01T16:03:00Z",
+        # Completion uses the runtime clock; this new observation follows it.
+        generated_at="2030-08-01T16:03:00Z",
     )
     assert reopened["write_performed"] is True
     reopened_state = state.read_text(encoding="utf-8")
     assert reopened_state.count("task_class=continuous_monitor") == 1
     assert "status=open" in reopened_state
     assert "no_followup=true" not in reopened_state
+    reopened_monitor = _monitor_todos(registry, project)[0]
+    assert reopened_monitor["todo_id"] == retired_monitor["todo_id"]
+    assert reopened_monitor["status"] == "open"
+    assert not reopened_monitor.get("no_followup", False)
+    assert reopened["projection_delivery"] in {"delivered", "current"}
 
 
-def test_grouped_monitors_are_isolated_per_repository(tmp_path: Path) -> None:
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_group_membership_change_advances_monitor_generation(tmp_path: Path, monkeypatch, provider) -> None:
     project, state, registry = _fixture(tmp_path)
+    _use_provider(state, registry, provider, monkeypatch)
+    ledger = tmp_path / "pr-lifecycle.jsonl"
+    upsert_issue_fix_pr_lifecycle_ledger_jsonl(ledger, _packet(101))
+    arguments = dict(registry_path=registry, goal_id=GOAL_ID, project=project,
+                     ledger_path=ledger, claimed_by=AGENT_ID, cadence="30m")
+    materialize_issue_fix_grouped_monitors(**arguments, generated_at="2030-01-01T01:00:00Z")
+    before = _monitor_todos(registry, project)[0]
+    baseline = int(before.get("material_change_generation") or 0)
+    waiting = {"todo_id": "todo_waiting", "role": "agent", "status": "open",
+               "task_class": "advancement_task", "resume_when": f"monitor_changed:{before['todo_id']}",
+               "resume_monitor_generation": baseline}
+    assert evaluate_todo_resume_conditions([waiting], source_items=[before])["todo_waiting"]["satisfied"] is False
+    # Observations must preserve an explicitly bounded existing watch policy,
+    # rather than resetting it to the capability's initial create default.
+    update_goal_todo(registry_path=registry, goal_id=GOAL_ID, todo_id=before["todo_id"],
+                    agent_id=AGENT_ID, project=project,
+                    monitor_metadata={"watch_only": "false", "expires_at": "2031-01-01T00:00:00Z"})
+    upsert_issue_fix_pr_lifecycle_ledger_jsonl(ledger, _packet(102))
+    materialize_issue_fix_grouped_monitors(**arguments, generated_at="2030-01-01T02:00:00Z")
+    after = _monitor_todos(registry, project)[0]
+    assert after["todo_id"] == before["todo_id"]
+    assert after["result_hash"] != before["result_hash"]
+    assert after["material_change_generation"] == baseline + 1
+    assert str(after["watch_only"]).lower() == "false"
+    assert after["expires_at"] == "2031-01-01T00:00:00Z"
+    assert evaluate_todo_resume_conditions([waiting], source_items=[after])["todo_waiting"]["satisfied"] is True
+    unchanged = state.read_bytes()
+    materialize_issue_fix_grouped_monitors(**arguments, generated_at="2030-01-01T03:00:00Z")
+    assert state.read_bytes() == unchanged
+
+
+def test_grouped_monitors_are_isolated_per_repository(tmp_path: Path, monkeypatch) -> None:
+    project, state, registry = _fixture(tmp_path)
+    _use_provider(state, registry, "file", monkeypatch)
     ledger = tmp_path / "pr-lifecycle.jsonl"
     upsert_issue_fix_pr_lifecycle_ledger_jsonl(ledger, _packet(101))
     upsert_issue_fix_pr_lifecycle_ledger_jsonl(
@@ -223,11 +285,13 @@ def test_grouped_monitors_are_isolated_per_repository(tmp_path: Path) -> None:
 
 def test_grouped_monitor_keeps_creator_ownership_across_turns_and_due_poll(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     project, state, registry = _fixture(
         tmp_path,
         registered_agents=[AGENT_ID, PEER_AGENT_ID],
     )
+    _use_provider(state, registry, "file", monkeypatch)
     ledger = tmp_path / "pr-lifecycle.jsonl"
     upsert_issue_fix_pr_lifecycle_ledger_jsonl(ledger, _packet(101))
 
@@ -248,9 +312,13 @@ def test_grouped_monitor_keeps_creator_ownership_across_turns_and_due_poll(
     todo_id = monitor["todo_id"]
 
     state_before_peer_poll = state.read_text(encoding="utf-8")
-    with pytest.raises(ValueError, match=f"claimed_by={AGENT_ID!r}"):
+    with pytest.raises(
+        ValueError,
+        match="outside the actor's registered owner/binding scope",
+    ):
         write_monitor_poll_todo_state(
             registry_path=registry,
+            runtime_root=tmp_path,
             goal_id=GOAL_ID,
             todo_id=todo_id,
             result_hash=monitor["result_hash"],
@@ -262,6 +330,7 @@ def test_grouped_monitor_keeps_creator_ownership_across_turns_and_due_poll(
 
     polled = write_monitor_poll_todo_state(
         registry_path=registry,
+        runtime_root=tmp_path,
         goal_id=GOAL_ID,
         todo_id=todo_id,
         result_hash=monitor["result_hash"],
@@ -270,16 +339,18 @@ def test_grouped_monitor_keeps_creator_ownership_across_turns_and_due_poll(
         agent_id=AGENT_ID,
     )
     assert polled is not None
-    assert polled["todo_update"]["mutation_authority"]["actor_agent_id"] == (
-        AGENT_ID
-    )
+    assert polled["source_authority"] in {"file_v0", "sqlite_v0"}
+    assert polled["todo_update"]["todo_id"] == todo_id
     assert datetime.fromisoformat(polled["next_due_at"]).timestamp() == (
         datetime.fromisoformat("2026-08-01T17:00:00+00:00").timestamp()
     )
 
     upsert_issue_fix_pr_lifecycle_ledger_jsonl(ledger, _packet(102))
     state_before_peer_attempt = state.read_text(encoding="utf-8")
-    with pytest.raises(ValueError, match=f"claimed_by={AGENT_ID!r}"):
+    with pytest.raises(
+        ValueError,
+        match="claimed_by does not grant this actor update authority",
+    ):
         materialize_issue_fix_grouped_monitors(
             registry_path=registry,
             goal_id=GOAL_ID,
@@ -328,7 +399,7 @@ def test_grouped_monitor_keeps_creator_ownership_across_turns_and_due_poll(
         ledger_path=ledger,
         claimed_by=AGENT_ID,
         cadence="30m",
-        generated_at="2026-08-01T16:33:00Z",
+        generated_at="2030-08-01T16:33:00Z",
     )
     assert reopened_by_creator["write_performed"] is True
     reopened = _monitor_todos(registry, project)[0]
@@ -369,10 +440,12 @@ def test_pr_lifecycle_command_contract_is_shared_by_all_operator_surfaces() -> N
         assert "--fetch-metadata" not in command
 
 
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
 def test_pr_lifecycle_execute_materializes_pending_monitor_and_keeps_goal_runnable(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch, provider,
 ) -> None:
     project, state, registry = _fixture(tmp_path)
+    _use_provider(state, registry, provider, monkeypatch)
     metadata = tmp_path / "pr.json"
     metadata.write_text(
         json.dumps(
@@ -440,11 +513,39 @@ def test_pr_lifecycle_execute_materializes_pending_monitor_and_keeps_goal_runnab
     assert "task_class=advancement_task" in active
 
 
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_unchanged_group_retries_display_without_repeating_business(tmp_path, monkeypatch, provider):
+    from loopx.control_plane.todos import provider_projection as delivery
+    from loopx.control_plane.coordination.local_authority import read_canonical_todos_if_promoted
+    project, state, registry = _fixture(tmp_path)
+    _use_provider(state, registry, provider, monkeypatch)
+    ledger = tmp_path / "lifecycle.jsonl"
+    upsert_issue_fix_pr_lifecycle_ledger_jsonl(ledger, _packet(101))
+    args = dict(registry_path=registry, goal_id=GOAL_ID, project=project,
+        ledger_path=ledger, claimed_by=AGENT_ID, cadence="30m", generated_at="2030-01-01T00:00:00Z")
+    original = delivery.project_current_canonical_todos
+    def unavailable(**kwargs):
+        raise OSError("isolated display failure")
+    monkeypatch.setattr(delivery, "project_current_canonical_todos", unavailable)
+    first = materialize_issue_fix_grouped_monitors(**args)
+    assert first["projection_delivery"] == "pending"
+    assert first["projection_outbox"]["retry_business_mutation"] is False
+    before = read_canonical_todos_if_promoted(runtime_root=tmp_path, goal_id=GOAL_ID)
+    assert not state.exists()
+    monkeypatch.setattr(delivery, "project_current_canonical_todos", original)
+    recovered = materialize_issue_fix_grouped_monitors(**args)
+    assert recovered["write_performed"] is False
+    assert recovered["projection_delivery"] == "delivered"
+    assert read_canonical_todos_if_promoted(runtime_root=tmp_path, goal_id=GOAL_ID) == before
+    assert "[P2] Monitor" in state.read_text()
+
+
 def test_pr_lifecycle_execute_fetches_public_metadata_by_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, state, registry = _fixture(tmp_path)
+    _use_provider(state, registry, "file", monkeypatch)
 
     def fake_fetch(reference: dict, *, timeout_seconds: int) -> dict:
         assert reference["repo"] == "huangruiteng/loopx"

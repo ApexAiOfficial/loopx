@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from ...control_plane.content_digest import ENVELOPED_SHA256_PATTERN
+from ...control_plane.digest_envelope import sha256_envelope
+from ...public_safe_text import PUBLIC_SAFE_SLUG_PATTERN
 from .adapters import ARTIFACT_SCHEMA, DOCUMENT_SCHEMA
 from .core import _normalize_trigger_receipt, _reject_raw_keys
 
@@ -22,9 +24,6 @@ ARCHIVE_BUNDLE_SCHEMA = "periodic_report_archive_bundle_v0"
 ARCHIVE_MANIFEST_SCHEMA = "periodic_report_archive_manifest_v0"
 ARCHIVE_RECEIPT_SCHEMA = "periodic_report_archive_receipt_v0"
 MEMORY_REFERENCE_SCHEMA = "periodic_report_memory_reference_v0"
-
-_TOKEN_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
-_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 ArchiveReadback = Callable[[str], Mapping[str, Any]]
 
@@ -61,14 +60,14 @@ def _content(value: object, label: str, *, maximum: int) -> str:
 
 def _token(value: object, label: str) -> str:
     token = _text(value, label, maximum=128).lower()
-    if not _TOKEN_RE.fullmatch(token):
+    if not PUBLIC_SAFE_SLUG_PATTERN.fullmatch(token):
         raise ValueError(f"{label} must be a lower-snake-like public token")
     return token
 
 
 def _sha256(value: object, label: str) -> str:
     digest = _text(value, label, maximum=80)
-    if not _SHA256_RE.fullmatch(digest):
+    if not ENVELOPED_SHA256_PATTERN.fullmatch(digest):
         raise ValueError(f"{label} must use sha256")
     return digest
 
@@ -83,7 +82,7 @@ def _canonical_json(value: object) -> str:
 
 
 def _content_digest(content: str) -> str:
-    return f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
+    return sha256_envelope(content.encode("utf-8"))
 
 
 def _resource_root(value: object) -> str:

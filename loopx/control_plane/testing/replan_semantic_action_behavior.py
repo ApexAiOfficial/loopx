@@ -3,43 +3,71 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 from ...heartbeat_prompt import build_heartbeat_prompt
+from ..quota.effective_action import EffectiveAction
 from ..quota.turn_envelope import quota_action_signature_document
-from ..work_items.progress_observation import (
-    ProgressResultClass,
-    semantic_delta_from_writeback,
-)
-from .doubao_model_behavior_actor import (
-    ARK_API_KEY_ENV,
-    DOUBAO_2_1_PRO_MODEL,
-    DOUBAO_MODEL_ENV,
-    DoubaoActorTransport,
-    _direct_ark_transport,
-)
+from ..work_items.progress_observation import ProgressResultClass
 from .model_tool_behavior import (
+    _module_reader_tokens,
+    DoubaoExecToolBehaviorActorBase,
     DoubaoExecToolClient,
+    LoopxCliExecutionError,
+    QuotaToolContext,
+    append_exec_tool_exchange,
     argument_value,
+    build_qualification_receipt,
     digest_text,
+    execute_bounded_read_steps,
     execute_loopx_cli,
+    hermetic_clock_output,
+    is_context_read_command,
+    is_fixture_quota_guard,
     loopx_command_tokens,
+    qualification_turn_instance_id,
+    replan_view_command_tokens,
 )
 from .selected_todo_tool_behavior import bounded_workspace_read_plan
+from .replan_vision_closeout_behavior import (
+    dispatch_vision_closeout, VISION_HOST_INSTRUCTION, VISION_EXEC_TOOL_DESCRIPTION,
+    REQUIRED_VISION_CLOSEOUT_MAX_CALLS,
+    observe_shell_evidence,
+)
+from .vision_shell_host import VisionShellHost
 
 REPLAN_SEMANTIC_ACTION_BEHAVIOR_RECEIPT_SCHEMA_VERSION = (
     "replan_semantic_action_behavior_receipt_v0"
 )
+# Native progressive delivery adds three bounded reads (capture, review, and
+# writeback) to the same semantic action path. Keep the original seven-call
+# behavior budget for ordinary work and grant a separate allowance only after
+# the quota result identifies a native capture.
 REPLAN_SEMANTIC_ACTION_BEHAVIOR_MAX_CALLS = 7
+REPLAN_SEMANTIC_ACTION_NATIVE_READ_MAX_CALLS = 3
+_NATIVE_CONTEXT_READ_KINDS = frozenset({"context_read", "replan_context_read"})
+_MAX_HOST_TOOL_ERROR_OUTPUT_CHARS = 8192
+
+
+class _HostToolError(RuntimeError):
+    """A host tool result that supplies no semantic acceptance or extra budget."""
+
+    def __init__(self, code: str, output: str, exit_code: int) -> None:
+        super().__init__(code)
+        self.code = code
+        self.output = output
+        self.exit_code = exit_code
 
 _FIXTURE_GOAL_ID = "replan-semantic-action-fixture"
 _FIXTURE_AGENT_ID = "codex-replan-semantic-action"
-_FIXTURE_WORK_ITEM_ID = "todo-replan-semantic-action"
+_FIXTURE_WORK_ITEM_OPERATION_ID = "fixture-replan-semantic-monitor"
+_FIXTURE_WORK_ITEM_ID = (
+    "todo_" + sha256(_FIXTURE_WORK_ITEM_OPERATION_ID.encode()).hexdigest()[:24]
+)
 _FIXTURE_FRONTIER_FILE = "replan-frontier.json"
 _FIXTURE_SOURCE_FILE = "fixture/permission-config.json"
 _FIXTURE_NEW_SURFACE_ID = "surface-permission-config"
@@ -61,6 +89,7 @@ class _ReplanSemanticActionFixture:
     work_source_target: Path
     composition_experiment_ref: str | None = None
     frontier_exhausted: bool = False
+    required_vision: bool = False
 
 
 @dataclass
@@ -70,17 +99,47 @@ class _QualificationState:
     steps: list[dict[str, Any]]
     turn_instance_id: str
     quota_packet: dict[str, Any] | None = None
+    quota_context: QuotaToolContext | None = None
     quota_observation: dict[str, Any] | None = None
     semantic_delta: dict[str, Any] | None = None
     seen_quota: bool = False
     seen_clock: bool = False
     seen_refresh_state_help: bool = False
     read_only_host_commands_executed: bool = False
+    delivery_context_read: bool = False
+    replan_context_read: bool = False
+    replan_writeback_read: bool = False
     frontier_context_read: bool = False
     work_source_read: bool = False
     created_successor_id: str | None = None
+    successor_transition: dict[str, Any] | None = None
     successor_reentry_observation: dict[str, Any] | None = None
     semantic_reentry_observation: dict[str, Any] | None = None
+    vision_closeout: dict[str, Any] | None = None
+    settlement_command: str | None = None
+    semantic_result_class: str | None = None
+    draft_shell_executed: bool = False
+    replan_recovery_context: QuotaToolContext | None = None
+
+    @property
+    def tool_call_limit(self) -> int:
+        if self.fixture.required_vision:
+            return REQUIRED_VISION_CLOSEOUT_MAX_CALLS
+        return REPLAN_SEMANTIC_ACTION_BEHAVIOR_MAX_CALLS + (
+            REPLAN_SEMANTIC_ACTION_NATIVE_READ_MAX_CALLS
+            if self.quota_context is not None
+            and self.quota_context.capture_path is not None
+            else 0
+        )
+
+    @property
+    def maximum_tool_call_limit(self) -> int:
+        if self.fixture.required_vision:
+            return REQUIRED_VISION_CLOSEOUT_MAX_CALLS
+        return (
+            REPLAN_SEMANTIC_ACTION_BEHAVIOR_MAX_CALLS
+            + REPLAN_SEMANTIC_ACTION_NATIVE_READ_MAX_CALLS
+        )
 
 
 def _digest(value: str) -> str:
@@ -92,6 +151,7 @@ def _build_fixture(
     *,
     composition_frontier: bool = False,
     exhausted_frontier: bool = False,
+    required_vision: bool = False,
 ) -> _ReplanSemanticActionFixture:
     source_root = Path(__file__).resolve().parents[3]
     project_root = root / "project"
@@ -178,20 +238,11 @@ def _build_fixture(
             "refresh-state."
         )
     )
-    fixture_agent_todo = (
-        "- [ ] [P1-monitor] Observe the bounded fixture until its frontier "
-        "changes.\n"
-        "  <!-- loopx:todo "
-        f"todo_id={_FIXTURE_WORK_ITEM_ID} status=open "
-        "task_class=continuous_monitor action_kind=observe_fixture "
-        f"claimed_by={_FIXTURE_AGENT_ID} "
-        "target_key=replan-semantic-fixture "
-        "cadence=1d next_due_at=2999-01-01T00%3A00%3A00Z -->\n"
-    )
     state_path.write_text(
         "---\n"
         "status: active\n"
         "owner_mode: goal\n"
+        "handoff_mode: soft_claim\n"
         f'objective: "{fixture_objective}"\n'
         "updated_at: 2026-08-13T00:00:00+08:00\n"
         "---\n\n"
@@ -200,8 +251,7 @@ def _build_fixture(
         f"{fixture_objective}\n\n"
         "## Next Action\n\n"
         f"- {fixture_next_action}\n\n"
-        "## Agent Todo\n\n"
-        f"{fixture_agent_todo}",
+        "## Agent Todo\n",
         encoding="utf-8",
     )
     registry_goal: dict[str, Any] = {
@@ -215,16 +265,24 @@ def _build_fixture(
             "status": "connected-delivery",
         },
         "coordination": {
-            "registered_agents": [_FIXTURE_AGENT_ID],
+            "registered_agents": [_FIXTURE_AGENT_ID, "codex-fixture-peer"] if required_vision else [_FIXTURE_AGENT_ID],
             "agent_model": "peer_v1",
+            "storage_target": {
+                "schema_version": "loopx_new_goal_storage_target_v1",
+                "provider": "file",
+                "handoff_mode": "soft_claim",
+            },
             "agent_profiles": {
                 _FIXTURE_AGENT_ID: {
                     "schema_version": "agent_profile_v1",
                     "agent_id": _FIXTURE_AGENT_ID,
                     "profile_role": "quality-qualification",
                     "scope_summary": "Qualify one bounded semantic replan.",
-                    "default_task_classes": ["continuous_monitor"],
-                    "vision_requirement": "optional",
+                    "default_task_classes": (
+                        ["advancement_task", "continuous_monitor"]
+                        if required_vision else ["continuous_monitor"]
+                    ),
+                    "vision_requirement": "required" if required_vision else "optional",
                 }
             },
         },
@@ -234,6 +292,7 @@ def _build_fixture(
             "window_hours": 24,
             "allowed_slots": 5,
         },
+        "creation_operation_id": "goal-create:replan-semantic-action-fixture",
     }
     if composition_frontier:
         registry_goal["spawn_policy"] = {
@@ -250,10 +309,60 @@ def _build_fixture(
         registry_path.parent.mkdir(parents=True, exist_ok=True)
         registry_path.write_text(registry_text + "\n", encoding="utf-8")
 
+    from ..coordination.goal_storage_initialization import (
+        initialize_goal_storage_target,
+    )
+    from ..todos.mutation_api import add_goal_todo
+
+    initialized = initialize_goal_storage_target(
+        runtime_root,
+        registry_goal,
+        registry_path=global_registry_path,
+    )
+    if not isinstance(initialized, dict) or (
+        initialized.get("authority_initialized") is not True
+        or initialized.get("legacy_fallback_used") is not False
+    ):
+        raise AssertionError("fixture did not initialize canonical File authority")
+    monitor = add_goal_todo(
+        registry_path=global_registry_path,
+        runtime_root_arg=str(runtime_root),
+        goal_id=_FIXTURE_GOAL_ID,
+        role="agent",
+        text="Observe the bounded fixture until its frontier changes.",
+        priority="P1",
+        task_class="continuous_monitor",
+        action_kind="observe_fixture",
+        claimed_by=_FIXTURE_AGENT_ID,
+        agent_id=_FIXTURE_AGENT_ID,
+        monitor_metadata={
+            "target_key": "replan-semantic-fixture",
+            "cadence": "1d",
+            "next_due_at": "2999-01-01T00:00:00Z",
+            "watch_only": "true",
+        },
+        operation_id=_FIXTURE_WORK_ITEM_OPERATION_ID,
+    )
+    if monitor.get("todo_id") != _FIXTURE_WORK_ITEM_ID:
+        raise AssertionError("fixture monitor identity is not deterministic")
+    if required_vision:
+        add_goal_todo(
+            registry_path=global_registry_path,
+            runtime_root_arg=str(runtime_root),
+            goal_id=_FIXTURE_GOAL_ID,
+            role="agent",
+            text="Continue the peer-owned implementation.",
+            priority="P0",
+            task_class="advancement_task",
+            claimed_by="codex-fixture-peer",
+            agent_id="codex-fixture-peer",
+            operation_id="fixture-replan-peer-implementation",
+        )
+
     runs_dir = runtime_root / "goals" / _FIXTURE_GOAL_ID / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
     prior_runs: list[dict[str, Any]] = []
-    for minute in (2, 1):
+    for minute in (() if required_vision else (2, 1)):
         generated_at = f"2026-08-13T00:0{minute}:00+00:00"
         run = {
             "generated_at": generated_at,
@@ -386,6 +495,7 @@ def _build_fixture(
             "filesystem_write",
         ],
         runtime_profile="codex_app_heartbeat",
+        registry_path=os.path.relpath(global_registry_path, project_root),
     )
     quota_guard_command = str(prompt["quota_guard_command"])
     if quota_guard_command not in str(prompt["task_body"]):
@@ -403,41 +513,23 @@ def _build_fixture(
             _FIXTURE_COMPOSITION_EXPERIMENT_ID if composition_frontier else None
         ),
         frontier_exhausted=exhausted_frontier,
+        required_vision=required_vision,
     )
 
 
 def _clock_output(command: str) -> str | None:
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return None
-    if not tokens or Path(tokens[0]).name != "date" or len(tokens) > 4:
-        return None
-    if any(
-        token in {";", "&&", "||", "|"}
-        or (index > 0 and not token.startswith(("-", "+")))
-        for index, token in enumerate(tokens)
-    ):
-        return None
-    if "-u" in tokens or "--utc" in tokens:
-        return "2026-08-12T16:00:00Z\n"
-    return "2026-08-13T00:00:00+08:00\n"
+    return hermetic_clock_output(
+        command,
+        utc_output="2026-08-12T16:00:00Z\n",
+        local_output="2026-08-13T00:00:00+08:00\n",
+    )
 
 
 def _is_quota_guard(command: str) -> bool:
-    tokens = loopx_command_tokens(command)
-    if not tokens:
-        return False
-    try:
-        quota_index = tokens.index("quota")
-    except ValueError:
-        return False
-    return bool(
-        tokens[quota_index : quota_index + 2] == ["quota", "should-run"]
-        and argument_value(tokens, "--goal-id") == _FIXTURE_GOAL_ID
-        and argument_value(tokens, "--agent-id") == _FIXTURE_AGENT_ID
-        and "--codex-app" in tokens
-        and argument_value(tokens, "--turn-instance-id")
+    return is_fixture_quota_guard(
+        command,
+        goal_id=_FIXTURE_GOAL_ID,
+        agent_id=_FIXTURE_AGENT_ID,
     )
 
 
@@ -498,7 +590,54 @@ def _is_replan_successor_create(command: str) -> bool:
     )
 
 
-def _quota_behavior_observation(packet: Mapping[str, Any]) -> dict[str, Any]:
+def _required_explore_read_command(packet: Mapping[str, Any]) -> str | None:
+    """Accept only this fixture's current, scoped turn-start read contract."""
+    interaction = packet.get("interaction_contract")
+    agent_channel = (
+        interaction.get("agent_channel")
+        if isinstance(interaction, Mapping)
+        else None
+    )
+    raw_reads = (
+        agent_channel.get("required_reads")
+        if isinstance(agent_channel, Mapping)
+        else None
+    )
+    if not isinstance(raw_reads, list):
+        raw_reads = packet.get("required_reads")
+    reads = [
+        read for read in raw_reads or []
+        if isinstance(read, Mapping) and read.get("kind") == "explore_turn_context"
+    ]
+    if not reads:
+        return None
+    if not isinstance(reads, list) or len(reads) != 1:
+        raise ValueError("unexpected_command")
+    read = reads[0]
+    if not isinstance(read, Mapping) or (
+        read.get("kind") != "explore_turn_context"
+        or read.get("source") != "turn_start_capability_hook"
+        or read.get("ordering") != "before_work"
+    ):
+        raise ValueError("unexpected_command")
+    command = str(read.get("command") or "")
+    tokens = loopx_command_tokens(command) or []
+    if "explore" not in tokens or (
+        tokens[tokens.index("explore"):tokens.index("explore") + 2]
+        != ["explore", "turn-context"]
+        or argument_value(tokens, "--goal-id") != _FIXTURE_GOAL_ID
+        or argument_value(tokens, "--agent-id") != _FIXTURE_AGENT_ID
+    ):
+        raise ValueError("unexpected_command")
+    return command
+
+
+def _quota_behavior_observation(
+    packet: Mapping[str, Any],
+    *,
+    replan_view: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    _required_explore_read_command(packet)
     signature = quota_action_signature_document(packet)
     action = dict(signature.get("action") or {})
     user = dict(signature.get("user") or {})
@@ -507,40 +646,76 @@ def _quota_behavior_observation(packet: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(obligation, Mapping) or not isinstance(replan_action, Mapping):
         raise TypeError("quota must project an obligation and replan action packet")
     context = obligation.get("replan_context")
+    progressive_view = not isinstance(context, Mapping)
+    if progressive_view:
+        context = replan_view
     if not isinstance(context, Mapping):
-        raise TypeError("quota must host-project the replan coverage context")
+        raise TypeError("quota must deliver the replan coverage context")
+    novelty = obligation.get("replan_novelty_policy")
+    delivery = (
+        str(novelty.get("delivery") or "")
+        if progressive_view and isinstance(novelty, Mapping)
+        else str(context.get("delivery") or "")
+    )
+    evidence_source = (
+        str(novelty.get("evidence_source") or "")
+        if progressive_view and isinstance(novelty, Mapping)
+        else str(context.get("evidence_source") or "")
+    )
+    progressive_identity_valid = bool(
+        progressive_view
+        and context.get("ok") is True
+        and context.get("stage") == "review"
+        and context.get("goal_id") == _FIXTURE_GOAL_ID
+        and context.get("agent_id") == _FIXTURE_AGENT_ID
+        and context.get("obligation_id") == obligation.get("obligation_id")
+        and str(context.get("source_hash") or "").startswith("sha256:")
+    )
+    inline_delivery_valid = bool(
+        not progressive_view
+        and dict(context.get("delivery_receipt") or {}).get("status") == "delivered"
+    )
     if (
         packet.get("decision") != "autonomous_replan_required"
         or replan_action.get("decision") != "replan_required"
         or replan_action.get("obligation_id") != obligation.get("obligation_id")
-        or context.get("delivery") != "host_projected"
-        or context.get("evidence_source") != "agent_scoped_evidence_log"
-        or dict(context.get("delivery_receipt") or {}).get("status") != "delivered"
-        or packet.get("required_reads") not in (None, [])
+        or delivery != "host_projected"
+        or evidence_source != "compact_run_history"
+        or not (progressive_identity_valid or inline_delivery_valid)
     ):
         raise ValueError("quota does not expose the semantic replan contract")
     if not (
         action.get("must_attempt") is True
-        and action.get("delivery_allowed") is True
+        and action.get("delivery_allowed") is False
         and action.get("quiet_noop_allowed") is False
     ):
-        raise ValueError("semantic replan must require one executable action")
+        raise ValueError("semantic replan must require its Host action without ordinary delivery authority")
     return {
         "decision": "execute",
         "selected_todo_id": None,
         "user_action_required": bool(user.get("action_required")),
         "must_attempt_work": True,
-        "delivery_allowed": True,
+        "delivery_allowed": False,
         "quiet_noop_allowed": False,
         "external_write_requested": False,
         "replan_obligation_id": obligation.get("obligation_id"),
-        "context_delivery": "host_projected",
+        "context_delivery": (
+            "progressive_replan_view" if progressive_view else "host_projected"
+        ),
         "required_semantic_outcomes": list(
-            dict(replan_action.get("uncovered_frontier") or {}).get(
+            dict(
+                (
+                    context.get("uncovered_frontier")
+                    if progressive_view
+                    else replan_action.get("uncovered_frontier")
+                )
+                or {}
+            ).get(
                 "required_any_of"
             )
             or []
         ),
+        "trigger_kinds": sorted({str(trigger["kind"]) for trigger in obligation.get("triggers", [])}),
     }
 
 
@@ -561,7 +736,7 @@ def _successor_reentry_observation(
         raise ValueError("successor_reentry_replan_not_closed")
     if not (
         packet.get("decision") == "run"
-        and packet.get("effective_action") == "normal_run"
+        and packet.get("effective_action") == EffectiveAction.NORMAL_RUN.value
     ):
         raise ValueError("successor_reentry_not_runnable")
 
@@ -599,6 +774,7 @@ def _semantic_reentry_observation(
     packet: Mapping[str, Any],
     *,
     obligation_id: str,
+    result_class: str,
 ) -> dict[str, Any]:
     obligation = packet.get("autonomous_replan_obligation")
     if (
@@ -622,7 +798,7 @@ def _semantic_reentry_observation(
         else None
     )
     future_monitor_wait = bool(
-        packet.get("effective_action") == "monitor_quiet_skip"
+        packet.get("effective_action") == EffectiveAction.MONITOR_QUIET_SKIP.value
         and isinstance(frontier, Mapping)
         and frontier.get("replan_required") is False
         and isinstance(monitor_lanes, Mapping)
@@ -631,12 +807,29 @@ def _semantic_reentry_observation(
         and int(normalized_progress.get("agent_monitor_open_count") or 0) > 0
         and int(normalized_progress.get("agent_monitor_due_count") or 0) == 0
     )
-    if not future_monitor_wait:
+    terminal_coverage_exit = bool(
+        result_class in {
+            ProgressResultClass.EXPLORATION_EXHAUSTED.value,
+            ProgressResultClass.NO_FOLLOWUP.value,
+        }
+        and packet.get("effective_action") == EffectiveAction.MONITOR_QUIET_SKIP.value
+        and isinstance(frontier, Mapping)
+        and frontier.get("replan_required") is False
+        and isinstance(monitor_lanes, Mapping)
+        and monitor_lanes.get("present") is False
+        and isinstance(normalized_progress, Mapping)
+        and int(normalized_progress.get("agent_open_count") or 0) == 0
+    )
+    if not future_monitor_wait and not terminal_coverage_exit:
         raise ValueError("semantic_reentry_not_future_monitor_wait")
     return {
         "decision": packet.get("decision"),
         "effective_action": packet.get("effective_action"),
-        "replan_rule": "future_monitor_wait",
+        "replan_rule": (
+            "future_monitor_wait"
+            if future_monitor_wait
+            else "terminal_coverage_exhausted"
+        ),
         "replan_closed": True,
         "exited": True,
     }
@@ -648,16 +841,33 @@ def _execute_loopx(
     fixture: _ReplanSemanticActionFixture,
     turn_instance_id: str,
 ) -> str:
-    return execute_loopx_cli(
-        command,
-        source_root=fixture.source_root,
-        project_root=fixture.project_root,
-        argument_overrides={
-            "--registry": str(fixture.global_registry_path),
-            "--runtime-root": str(fixture.runtime_root),
-            "--turn-instance-id": turn_instance_id,
-        },
-    )
+    tokens = loopx_command_tokens(command)
+    if tokens is None:
+        raise ValueError("fixture requires one bounded LoopX command")
+    # Scope adapter context even when a projected command relies on cwd defaults.
+    # Never supply missing semantic/binding fields on the actor's behalf.
+    if "--registry" not in tokens:
+        tokens[1:1] = ["--registry", str(fixture.global_registry_path)]
+    if "refresh-state" in tokens:
+        tokens.extend(["--no-global-sync", "--suppress-external-sinks"])
+    try:
+        return execute_loopx_cli(
+            shlex.join(tokens),
+            source_root=fixture.source_root,
+            project_root=fixture.project_root,
+            argument_overrides={
+                "--registry": str(fixture.global_registry_path),
+                "--runtime-root": str(fixture.runtime_root),
+                "--turn-instance-id": turn_instance_id,
+            },
+        )
+    except LoopxCliExecutionError as exc:
+        if not fixture.required_vision:
+            raise
+        # The real writer puts its refusal and recovery in stdout. Keep the
+        # nonzero status and let the shell's existing feedback bound apply.
+        feedback = exc.stdout.strip() if "refresh-state" in tokens else ""
+        raise _HostToolError("loopx_cli_nonzero", feedback or str(exc), exc.returncode) from None
 
 
 def _bounded_workspace_read_plan(
@@ -707,44 +917,22 @@ def _execute_workspace_read(
     plan = _bounded_workspace_read_plan(command, fixture=fixture)
     if plan is None:
         raise ValueError("workspace read is outside the hermetic fixture")
-    outputs: list[str] = []
-    status = 0
-    frontier_read = False
-    work_source_read = False
-    for step in plan:
-        should_run = bool(
-            step.operator == ";"
-            or (step.operator == "&&" and status == 0)
-            or (step.operator == "||" and status != 0)
-        )
-        if not should_run:
-            continue
-        completed = subprocess.run(
-            list(step.argv),
-            cwd=fixture.project_root,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        status = completed.returncode
-        output = completed.stdout
-        if step.line_limit is not None:
-            output = "".join(output.splitlines(keepends=True)[: step.line_limit])
-        outputs.append(output)
-        frontier_read = frontier_read or (
-            status == 0
-            and step.target is not None
-            and step.target.resolve() == fixture.frontier_target.resolve()
-        )
-        work_source_read = work_source_read or (
-            status == 0
-            and step.target is not None
-            and step.target.resolve() == fixture.work_source_target.resolve()
-        )
+    results, status = execute_bounded_read_steps(plan, cwd=fixture.project_root)
+    frontier_read = any(
+        step_status == 0
+        and step.target is not None
+        and step.target.resolve() == fixture.frontier_target.resolve()
+        for step, step_status, _ in results
+    )
+    work_source_read = any(
+        step_status == 0
+        and step.target is not None
+        and step.target.resolve() == fixture.work_source_target.resolve()
+        for step, step_status, _ in results
+    )
     if status != 0:
         raise RuntimeError(f"workspace read failed with exit={status}")
-    return "".join(outputs), frontier_read, work_source_read
+    return "".join(output for _, _, output in results), frontier_read, work_source_read
 
 
 def _receipt(
@@ -759,32 +947,27 @@ def _receipt(
     local_fixture_writes_executed: bool,
     read_only_host_commands_executed: bool,
 ) -> dict[str, Any]:
-    receipt = {
-        "schema_version": REPLAN_SEMANTIC_ACTION_BEHAVIOR_RECEIPT_SCHEMA_VERSION,
-        "qualification_id": qualification_id,
-        "actor_ref": actor_ref,
-        "qualification_passed": passed,
-        "failure_code": failure_code,
-        "observed_tool_sequence": [step["kind"] for step in steps],
-        "tool_call_count": len(steps),
-        "semantic_action_accepted": bool(
-            passed and semantic_delta and semantic_delta.get("accepted") is True
-        ),
-        "selected_semantic_outcomes": list(
-            (semantic_delta or {}).get("satisfying_outcomes") or []
-        ),
-        "tool_call_receipts": steps,
-        "boundary": {
-            "raw_prompt_persisted": False,
-            "raw_provider_response_persisted": False,
-            "raw_command_persisted": False,
+    receipt = build_qualification_receipt(
+        schema_version=REPLAN_SEMANTIC_ACTION_BEHAVIOR_RECEIPT_SCHEMA_VERSION,
+        qualification_id=qualification_id,
+        actor_ref=actor_ref,
+        passed=passed,
+        failure_code=failure_code,
+        steps=steps,
+        extra_fields={
+            "semantic_action_accepted": bool(
+                passed and semantic_delta and semantic_delta.get("accepted") is True
+            ),
+            "selected_semantic_outcomes": list(
+                (semantic_delta or {}).get("satisfying_outcomes") or []
+            ),
+        },
+        boundary={
             "filesystem_writes_executed": local_fixture_writes_executed,
             "writes_limited_to_temporary_fixture": local_fixture_writes_executed,
-            "external_writes_executed": False,
-            "shell_commands_executed": False,
             "read_only_host_commands_executed": read_only_host_commands_executed,
         },
-    }
+    )
     if quota_observation is not None:
         receipt.update(dict(quota_observation))
     return receipt
@@ -798,6 +981,9 @@ def _qualification_receipt(
     passed: bool,
     failure_code: str | None,
 ) -> dict[str, Any]:
+    if passed and state.fixture.required_vision and not (state.vision_closeout or {}).get("settled"):
+        passed = False
+        failure_code = "required_vision_closeout_incomplete"
     receipt = _receipt(
         qualification_id=qualification_id,
         actor_ref=actor_ref,
@@ -811,8 +997,31 @@ def _qualification_receipt(
     )
     if state.successor_reentry_observation is not None:
         receipt["successor_reentry"] = state.successor_reentry_observation
+    if state.successor_transition is not None:
+        receipt["successor_transition"] = state.successor_transition
     if state.semantic_reentry_observation is not None:
         receipt["semantic_reentry"] = state.semantic_reentry_observation
+    receipt["qualification_scope"] = (
+        "required_vision_closeout" if state.fixture.required_vision else "semantic_action"
+    )
+    receipt["tool_call_limit"] = state.tool_call_limit
+    if not state.fixture.required_vision:
+        receipt["ordinary_tool_call_limit"] = (
+            REPLAN_SEMANTIC_ACTION_BEHAVIOR_MAX_CALLS
+        )
+        receipt["native_context_read_call_limit"] = (
+            REPLAN_SEMANTIC_ACTION_NATIVE_READ_MAX_CALLS
+            if state.tool_call_limit > REPLAN_SEMANTIC_ACTION_BEHAVIOR_MAX_CALLS
+            else 0
+        )
+    if state.fixture.required_vision:
+        receipt["execution_host"] = "os_isolated_shell"
+        receipt["boundary"]["shell_commands_executed"] = bool(state.steps)
+    elif state.draft_shell_executed:
+        receipt["boundary"]["shell_commands_executed"] = True
+    if state.vision_closeout is not None:
+        receipt["vision_closeout"] = state.vision_closeout
+        receipt["semantic_action_accepted"] = bool(state.semantic_delta and state.semantic_delta.get("accepted"))
     return receipt
 
 
@@ -821,12 +1030,15 @@ def _record_tool_step(
     *,
     kind: str,
     command: str,
+    exit_code: int | None = None,
+    error_code: str | None = None,
 ) -> None:
     state.steps.append(
         {
             "ordinal": len(state.steps) + 1,
             "kind": kind,
             "command_digest": _digest(command),
+            **({"exit_code": exit_code, "error_code": error_code} if error_code else {}),
         }
     )
 
@@ -839,12 +1051,102 @@ def _handle_quota_command(command: str, state: _QualificationState) -> str:
         fixture=state.fixture,
         turn_instance_id=state.turn_instance_id,
     )
-    decoded = json.loads(output)
-    if not isinstance(decoded, dict):
-        raise ValueError("quota result must be an object")
+    state.quota_context = QuotaToolContext.from_output(output)
+    decoded = state.quota_context.packet
     state.quota_packet = decoded
-    state.quota_observation = _quota_behavior_observation(decoded)
+    obligation = decoded.get("autonomous_replan_obligation")
+    if isinstance(obligation, Mapping) and isinstance(
+        obligation.get("replan_context"), Mapping
+    ):
+        state.quota_observation = _quota_behavior_observation(decoded)
+    elif not (
+        state.quota_context.capture_path is not None
+        and isinstance(obligation, Mapping)
+        and isinstance(obligation.get("context_read"), str)
+        and obligation.get("context_read")
+    ):
+        raise TypeError("quota must deliver or reference the replan coverage context")
+    if (
+        state.fixture.required_vision
+        and state.quota_observation is not None
+        and "required_agent_vision_missing"
+        not in state.quota_observation["trigger_kinds"]
+    ):
+        raise ValueError("required_vision_fixture_trigger_mismatch")
     state.seen_quota = True
+    state.read_only_host_commands_executed = True
+    return output
+
+
+def _handle_context_read(command: str, state: _QualificationState) -> str:
+    if state.quota_context is None:
+        raise ValueError("context read before quota")
+    context = state.replan_recovery_context or state.quota_context
+    output = context.read(command, source_root=state.fixture.source_root,
+        project_root=state.fixture.project_root)
+    state.delivery_context_read = True
+    state.read_only_host_commands_executed = True
+    return output
+
+
+def _handle_replan_context_read(command: str, state: _QualificationState) -> str:
+    if state.quota_packet is None or state.quota_context is None:
+        raise ValueError("replan_context_read_before_quota")
+    if state.quota_context.capture_path is not None and not state.delivery_context_read:
+        raise ValueError("replan_context_read_before_delivery_context")
+    obligation = state.quota_packet.get("autonomous_replan_obligation")
+    review_command = (
+        str(obligation.get("context_read") or "")
+        if isinstance(obligation, Mapping)
+        else ""
+    )
+    action = state.quota_packet.get("replan_action_packet")
+    writeback_command = (
+        str(action.get("writeback") or "") if isinstance(action, Mapping) else ""
+    )
+    normalized = replan_view_command_tokens(command)
+    if normalized is None or command not in {review_command, writeback_command}:
+        raise ValueError("unexpected_replan_context_read")
+    is_writeback = command == writeback_command and command != review_command
+    if is_writeback and not state.replan_context_read:
+        raise ValueError("replan_writeback_read_before_review")
+    if is_writeback and state.replan_writeback_read:
+        raise ValueError("repeated_replan_writeback_read")
+    if not is_writeback and state.replan_context_read:
+        raise ValueError("repeated_replan_context_read")
+    output = execute_loopx_cli(
+        shlex.join(normalized),
+        source_root=state.fixture.source_root,
+        project_root=state.fixture.project_root,
+    )
+    view = json.loads(output)
+    if not isinstance(view, Mapping):
+        raise ValueError("replan_context_read_invalid")
+    if is_writeback:
+        expected_obligation_id = (
+            obligation.get("obligation_id")
+            if isinstance(obligation, Mapping)
+            else None
+        )
+        if (
+            view.get("stage") != "writeback"
+            or view.get("obligation_id") != expected_obligation_id
+            or not isinstance(view.get("writeback_contract"), Mapping)
+        ):
+            raise ValueError("replan_writeback_read_invalid")
+        state.replan_writeback_read = True
+    else:
+        state.quota_observation = _quota_behavior_observation(
+            state.quota_packet,
+            replan_view=view,
+        )
+        if (
+            state.fixture.required_vision
+            and "required_agent_vision_missing"
+            not in state.quota_observation["trigger_kinds"]
+        ):
+            raise ValueError("required_vision_fixture_trigger_mismatch")
+        state.replan_context_read = True
     state.read_only_host_commands_executed = True
     return output
 
@@ -906,10 +1208,20 @@ def _require_observed_frontier(
 ) -> None:
     if state.quota_packet is None:
         raise ValueError(f"{prefix}_before_quota")
+    if state.quota_context is not None and state.quota_context.capture_path is not None:
+        if not state.delivery_context_read:
+            raise ValueError(f"{prefix}_before_delivery_context_read")
+    if state.quota_observation is None:
+        raise ValueError(f"{prefix}_before_replan_context_read")
     if not state.frontier_context_read:
         raise ValueError(f"{prefix}_before_frontier_read")
     if work_source_required and not state.work_source_read:
         raise ValueError(f"{prefix}_before_work_source_read")
+    if (
+        state.quota_observation.get("context_delivery") == "progressive_replan_view"
+        and not state.replan_writeback_read
+    ):
+        raise ValueError(f"{prefix}_before_replan_writeback_read")
 
 
 def _handle_successor_command(command: str, state: _QualificationState) -> str:
@@ -923,6 +1235,8 @@ def _handle_successor_command(command: str, state: _QualificationState) -> str:
     )
     if requested_obligation_id != expected_obligation_id:
         raise ValueError("successor_create_obligation_mismatch")
+    if argument_value(loopx_command_tokens(command) or [], "--turn-instance-id") != state.turn_instance_id:
+        raise ValueError("successor_create_turn_mismatch")
     if state.fixture.composition_experiment_ref:
         requested_experiment_ref = argument_value(
             loopx_command_tokens(command) or [],
@@ -946,7 +1260,6 @@ def _handle_successor_command(command: str, state: _QualificationState) -> str:
         and decoded.get("ok") is True
         and decoded.get("added") is True
         and state.created_successor_id
-        and decoded.get("host_action") == "end_current_heartbeat"
     ):
         raise ValueError("successor_create_failed")
     transition = decoded.get("replan_transition")
@@ -958,24 +1271,128 @@ def _handle_successor_command(command: str, state: _QualificationState) -> str:
         and transition.get("outcome") == "new_runnable_successor"
     ):
         raise ValueError("successor_transition_missing")
+    immediate_end = (
+        transition.get("turn_boundary") == "end_current_heartbeat"
+        and decoded.get("host_action") == "end_current_heartbeat"
+    )
+    settle_then_end = (
+        transition.get("turn_boundary") == "settle_original_turn_before_end"
+        and isinstance(decoded.get("settlement_identity"), Mapping)
+        and isinstance(decoded.get("settlement_plan"), Mapping)
+    )
+    if not (immediate_end or settle_then_end):
+        raise ValueError("successor_create_failed")
+    state.successor_transition = {key: transition[key] for key in (
+        "recorded", "obligation_id", "successor_todo_id", "outcome", "turn_boundary",
+    )}
     state.semantic_delta = {
         "accepted": True,
         "satisfying_outcomes": ["new_runnable_successor"],
     }
-    reentry_output = _execute_loopx(
-        state.fixture.quota_guard_command,
-        fixture=state.fixture,
-        turn_instance_id=f"{state.turn_instance_id}-successor",
-    )
-    reentry_packet = json.loads(reentry_output)
-    if not isinstance(reentry_packet, dict):
-        raise ValueError("successor_reentry_quota_invalid")
-    state.successor_reentry_observation = _successor_reentry_observation(
-        reentry_packet,
-        successor_todo_id=state.created_successor_id,
-        composition_experiment_ref=state.fixture.composition_experiment_ref,
-    )
+    # A created successor is not an original-Turn settlement. Return the native
+    # plan to the actor; only its later writeback/spend permits fresh re-entry.
     state.read_only_host_commands_executed = True
+    return output
+
+
+def _fixture_runs(state: _QualificationState) -> list[dict[str, Any]]:
+    index = (state.fixture.runtime_root / "goals" / _FIXTURE_GOAL_ID
+             / "runs" / "index.jsonl")
+    return [json.loads(line) for line in index.read_text(encoding="utf-8").splitlines() if line]
+
+
+def _authored_vision(command: str, state: _QualificationState) -> dict[str, Any]:
+    tokens = loopx_command_tokens(command) or []
+    path = argument_value(tokens, "--agent-vision-json")
+    if (not path or tokens.count("--agent-vision-json") != 1
+            or any(token.startswith("--agent-vision-json=") for token in tokens)):
+        raise ValueError("semantic_writeback_requires_authored_draft")
+    draft = (state.fixture.project_root / path).resolve()
+    if not draft.is_relative_to(state.fixture.project_root.resolve()) or not draft.is_file():
+        raise ValueError("semantic_writeback_draft_outside_fixture")
+    value = json.loads(draft.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("semantic_writeback_requires_authored_draft")
+    return value
+
+
+def _bound_semantic_writeback(command: str, state: _QualificationState) -> str:
+    """Observe the real writer; never construct the actor's Vision or binding."""
+    tokens = loopx_command_tokens(command) or []
+    if (argument_value(tokens, "--replan-obligation-id") != _expected_obligation_id(state)
+            or argument_value(tokens, "--turn-instance-id") != state.turn_instance_id):
+        raise ValueError("semantic_writeback_binding_mismatch")
+    _authored_vision(command, state)
+    try:
+        output = _execute_loopx(command, fixture=state.fixture, turn_instance_id=state.turn_instance_id)
+    except LoopxCliExecutionError as exc:
+        # Only a refusal from this bound real writer can authorize another
+        # captured reader. Shell text and model-selected paths grant nothing.
+        rejected = json.loads(exc.stdout)
+        transition = rejected.get("replan_transition") or {}
+        recovery = transition.get("context_recovery") or {}
+        path, digest = recovery.get("path"), recovery.get("sha256")
+        if (rejected.get("ok") is not False or rejected.get("appended") is not False
+                or transition.get("obligation_id") != _expected_obligation_id(state)
+                or not isinstance(path, str) or not isinstance(digest, str)
+                or not Path(path).resolve().is_relative_to(state.fixture.runtime_root.resolve())):
+            raise
+        state.replan_recovery_context = QuotaToolContext(
+            packet=rejected, output=exc.stdout, capture_path=Path(path).resolve(), capture_sha256=digest,
+        )
+        raise _HostToolError("loopx_cli_nonzero", exc.stdout, exc.returncode) from None
+    decoded = json.loads(output)
+    if not isinstance(decoded, dict) or decoded.get("ok") is not True:
+        raise ValueError("semantic_writeback_failed")
+    row = _fixture_runs(state)[-1]
+    semantic = dict(row.get("autonomous_replan_ack") or {}).get("semantic_delta") or {}
+    identity = dict((state.quota_packet or {}).get("heartbeat_receipt") or {}).get("settlement_identity")
+    if not (semantic.get("accepted") is True
+            and semantic.get("obligation_id") == _expected_obligation_id(state)
+            and dict(row.get("vision_checkpoint") or {}).get("satisfied") is True
+            and row.get("settlement_identity") == identity):
+        raise ValueError("semantic_writeback_durable_receipt_missing")
+    owed = decoded.get("settlement_owed")
+    if not isinstance(owed, Mapping) or not isinstance(owed.get("command"), str):
+        raise ValueError("semantic_writeback_settlement_missing")
+    state.settlement_command = owed["command"]
+    state.semantic_delta = semantic
+    return output
+
+
+def _handle_semantic_spend(command: str, state: _QualificationState) -> str:
+    if not state.settlement_command:
+        raise ValueError("semantic_spend_before_writeback")
+    if loopx_command_tokens(command) != loopx_command_tokens(state.settlement_command):
+        raise ValueError("semantic_spend_identity_mismatch")
+    output = _execute_loopx(command, fixture=state.fixture, turn_instance_id=state.turn_instance_id)
+    replay = QuotaToolContext.from_output(_execute_loopx(
+        state.fixture.quota_guard_command, fixture=state.fixture,
+        turn_instance_id=state.turn_instance_id,
+    )).packet
+    spends = [row for row in _fixture_runs(state) if row.get("classification") == "quota_slot_spent"]
+    if replay.get("effective_action") != EffectiveAction.HEARTBEAT_SETTLED_SKIP.value or len(spends) != 1:
+        raise ValueError("semantic_settlement_readback_failed")
+    following = QuotaToolContext.from_output(_execute_loopx(
+        state.fixture.quota_guard_command, fixture=state.fixture,
+        turn_instance_id=f"{state.turn_instance_id}-readback",
+    )).packet
+    if dict(following.get("autonomous_replan_obligation") or {}).get("obligation_id") == _expected_obligation_id(state):
+        raise ValueError("semantic_reentry_replan_not_closed")
+    if state.created_successor_id:
+        state.successor_reentry_observation = _successor_reentry_observation(
+            following, successor_todo_id=state.created_successor_id,
+            composition_experiment_ref=state.fixture.composition_experiment_ref,
+        )
+    elif state.semantic_result_class in {
+        ProgressResultClass.EXPLORATION_EXHAUSTED.value, ProgressResultClass.NO_FOLLOWUP.value,
+    }:
+        state.semantic_reentry_observation = _semantic_reentry_observation(
+            following, obligation_id=_expected_obligation_id(state),
+            result_class=state.semantic_result_class,
+        )
+    state.vision_closeout = {"checkpoint_satisfied": True, "bound_writeback": True,
+                            "settled": True, "spend_count": 1, "original_obligation_closed": True}
     return output
 
 
@@ -984,7 +1401,6 @@ def _handle_semantic_writeback(
     observation: Mapping[str, Any],
     state: _QualificationState,
 ) -> str:
-    obligation_id = _expected_obligation_id(state)
     result_class = str(observation.get("result_class") or "")
     terminal_result = result_class in {
         ProgressResultClass.BLOCKED.value,
@@ -1005,43 +1421,10 @@ def _handle_semantic_writeback(
         )
         if not matches_observed_surface:
             raise ValueError("semantic_action_misses_uncovered_frontier")
-    obligation = dict(
-        (state.quota_packet or {}).get("autonomous_replan_obligation") or {}
-    )
-    if obligation.get("obligation_id") != obligation_id:
-        raise ValueError("quota_obligation_missing")
-    state.semantic_delta = semantic_delta_from_writeback(
-        obligation=obligation,
-        progress_observation=observation,
-    )
-    if state.semantic_delta.get("accepted") is not True:
-        raise ValueError("non_semantic_replan_action")
-    output = _execute_loopx(
-        command,
-        fixture=state.fixture,
-        turn_instance_id=state.turn_instance_id,
-    )
-    decoded = json.loads(output)
-    if not isinstance(decoded, dict) or decoded.get("ok") is not True:
-        raise ValueError("semantic_writeback_failed")
-    if result_class in {
-        ProgressResultClass.EXPLORATION_EXHAUSTED.value,
-        ProgressResultClass.NO_FOLLOWUP.value,
-    }:
-        reentry_output = _execute_loopx(
-            state.fixture.quota_guard_command,
-            fixture=state.fixture,
-            turn_instance_id=f"{state.turn_instance_id}-semantic-reentry",
-        )
-        reentry_packet = json.loads(reentry_output)
-        if not isinstance(reentry_packet, dict):
-            raise ValueError("semantic_reentry_quota_invalid")
-        state.semantic_reentry_observation = _semantic_reentry_observation(
-            reentry_packet,
-            obligation_id=obligation_id,
-        )
-        state.read_only_host_commands_executed = True
-    return output
+    # The writer owns semantic acceptance and recovery for the original Turn.
+    # A compact admission packet may omit the review basis that it resolves.
+    state.semantic_result_class = result_class
+    return _bound_semantic_writeback(command, state)
 
 
 def _dispatch_behavior_command(
@@ -1050,6 +1433,31 @@ def _dispatch_behavior_command(
 ) -> tuple[str, str, bool]:
     if _is_quota_guard(command):
         return _handle_quota_command(command, state), "quota_should_run", False
+    if is_context_read_command(command):
+        kind = "replan_context_recovery" if state.replan_recovery_context else "context_read"
+        return _handle_context_read(command, state), kind, False
+    if replan_view_command_tokens(command) is not None:
+        return (
+            _handle_replan_context_read(command, state),
+            "replan_context_read",
+            False,
+        )
+    if state.quota_packet is not None and (
+        required := _required_explore_read_command(state.quota_packet)
+    ):
+        observed = any(step["kind"] == "explore_turn_context" for step in state.steps)
+        if shlex.split(command) == shlex.split(required):
+            if observed:
+                raise ValueError("repeated_explore_turn_context")
+            output = _execute_loopx(
+                command, fixture=state.fixture, turn_instance_id=state.turn_instance_id
+            )
+            context = json.loads(output)
+            if context.get("goal_id") != _FIXTURE_GOAL_ID or context.get("agent_id") != _FIXTURE_AGENT_ID:
+                raise ValueError("unexpected_command")
+            return output, "explore_turn_context", False
+        if not observed:
+            raise ValueError("required_explore_turn_context_missing")
     if (clock_output := _clock_output(command)) is not None:
         return _handle_clock_command(clock_output, state), "clock", False
     if _bounded_workspace_read_plan(command, fixture=state.fixture) is not None:
@@ -1061,14 +1469,19 @@ def _dispatch_behavior_command(
             False,
         )
     if _is_replan_successor_create(command):
-        return _handle_successor_command(command, state), "replan_successor_create", True
+        return _handle_successor_command(command, state), "replan_successor_create", False
+    tokens = loopx_command_tokens(command) or []
+    if "spend-slot" in tokens:
+        return _handle_semantic_spend(command, state), "quota_spend_slot", True
+    if state.created_successor_id and "refresh-state" in tokens:
+        return _bound_semantic_writeback(command, state), "semantic_replan_writeback", False
     if (observation := _progress_observation_from_command(command)) is not None:
         return (
             _handle_semantic_writeback(command, observation, state),
             "semantic_replan_writeback",
-            True,
+            False,
         )
-    if "evidence-log" in command:
+    if "history" in shlex.split(command):
         raise ValueError("manual_evidence_read_is_not_replan")
     raise ValueError("unexpected_command")
 
@@ -1081,6 +1494,14 @@ def _behavior_command_kind(
 
     if _is_quota_guard(command):
         return "quota_should_run"
+    if is_context_read_command(command):
+        return "replan_context_recovery" if state.replan_recovery_context else "context_read"
+    if replan_view_command_tokens(command) is not None:
+        return "replan_context_read"
+    if state.quota_packet is not None and (
+        required := _required_explore_read_command(state.quota_packet)
+    ) and shlex.split(command) == shlex.split(required):
+        return "explore_turn_context"
     if _clock_output(command) is not None:
         return "clock"
     if _bounded_workspace_read_plan(command, fixture=state.fixture) is not None:
@@ -1092,25 +1513,37 @@ def _behavior_command_kind(
     tokens = loopx_command_tokens(command) or []
     if "refresh-state" in tokens:
         return "semantic_replan_writeback"
+    if "spend-slot" in tokens:
+        return "quota_spend_slot"
     return "unexpected_command"
 
 
 _EXPECTED_BEHAVIOR_FAILURES = frozenset(
     {
+        "repeated_explore_turn_context",
+        "required_explore_turn_context_missing",
         "repeated_quota_should_run",
         "repeated_clock",
         "semantic_action_before_quota",
+        "semantic_action_before_delivery_context_read",
+        "semantic_action_before_replan_context_read",
         "semantic_action_before_frontier_read",
         "semantic_action_before_work_source_read",
+        "semantic_action_before_replan_writeback_read",
         "semantic_action_misses_uncovered_frontier",
         "refresh_state_help_before_quota",
         "refresh_state_help_before_frontier_read",
         "refresh_state_help_before_work_source_read",
+        "refresh_state_help_before_replan_writeback_read",
         "repeated_refresh_state_help",
         "successor_create_before_quota",
+        "successor_create_before_delivery_context_read",
+        "successor_create_before_replan_context_read",
         "successor_create_before_frontier_read",
         "successor_create_before_work_source_read",
+        "successor_create_before_replan_writeback_read",
         "successor_create_obligation_mismatch",
+        "successor_create_turn_mismatch",
         "successor_create_composition_binding_mismatch",
         "repeated_successor_create",
         "successor_create_failed",
@@ -1122,13 +1555,28 @@ _EXPECTED_BEHAVIOR_FAILURES = frozenset(
         "successor_reentry_not_runnable",
         "successor_reentry_composition_not_scheduled",
         "quota_obligation_missing",
-        "non_semantic_replan_action",
         "semantic_writeback_failed",
+        "semantic_writeback_binding_mismatch",
+        "semantic_writeback_requires_authored_draft",
+        "semantic_writeback_draft_outside_fixture",
+        "semantic_writeback_durable_receipt_missing",
+        "semantic_writeback_settlement_missing",
+        "semantic_spend_before_writeback",
+        "semantic_spend_identity_mismatch",
+        "semantic_settlement_readback_failed",
         "semantic_reentry_quota_invalid",
         "semantic_reentry_replan_not_closed",
         "semantic_reentry_not_future_monitor_wait",
         "semantic_reentry_did_not_exit",
         "manual_evidence_read_is_not_replan",
+        "replan_context_read_before_quota",
+        "replan_context_read_before_delivery_context",
+        "replan_writeback_read_before_review",
+        "repeated_replan_context_read",
+        "repeated_replan_writeback_read",
+        "replan_writeback_read_invalid",
+        "unexpected_replan_context_read",
+        "replan_context_read_invalid",
         "unexpected_command",
     }
 )
@@ -1145,19 +1593,36 @@ def _append_tool_response(
     tool_call: Any,
     output: str,
 ) -> None:
-    state.messages.extend(
-        [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [tool_call.provider_value],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": tool_call.call_id,
-                "content": output,
-            },
-        ]
+    append_exec_tool_exchange(
+        state.messages, tool_call, output, include_assistant_content=False
+    )
+
+
+def _tool_call_budget_exhausted(state: _QualificationState) -> bool:
+    if state.fixture.required_vision:
+        return len(state.steps) >= REQUIRED_VISION_CLOSEOUT_MAX_CALLS
+    ordinary_calls = sum(
+        step.get("kind") not in _NATIVE_CONTEXT_READ_KINDS
+        for step in state.steps
+    )
+    return (
+        ordinary_calls >= REPLAN_SEMANTIC_ACTION_BEHAVIOR_MAX_CALLS
+        or len(state.steps) >= state.maximum_tool_call_limit
+    )
+
+
+def _standalone_cli(command: str) -> bool:
+    """Do not discard a requested shell prefix when extracting a CLI suffix."""
+    if "\n" in command:
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    parsed = loopx_command_tokens(command)
+    return parsed is not None and (
+        tokens == parsed or _module_reader_tokens(tokens) is not None
+        or (tokens[0].startswith("LOOPX_TURN=") and tokens[1:] == parsed)
     )
 
 
@@ -1166,24 +1631,66 @@ def _run_qualification_loop(
     state: _QualificationState,
     *,
     qualification_id: str,
+    shell: VisionShellHost | None = None,
+    author_shell: Callable[[str], tuple[str, int]] | None = None,
 ) -> dict[str, Any]:
-    for _ in range(REPLAN_SEMANTIC_ACTION_BEHAVIOR_MAX_CALLS):
-        tool_call = client.next_tool_call(state.messages)
+    for _ in range(state.maximum_tool_call_limit):
+        if _tool_call_budget_exhausted(state):
+            break
+        tool_call = client.next_tool_call(
+            state.messages,
+            tool_description=VISION_EXEC_TOOL_DESCRIPTION if state.fixture.required_vision else None,
+        )
         if tool_call is None:
             return _qualification_receipt(
                 state,
                 qualification_id=qualification_id,
                 actor_ref=client.actor_ref,
                 passed=False,
-                failure_code="model_returned_without_semantic_action",
+                failure_code=("semantic_closeout_incomplete" if state.settlement_command or state.created_successor_id
+                              else "model_returned_without_semantic_action"),
             )
-        kind = _behavior_command_kind(tool_call.command, state)
+        kind = "shell" if shell else _behavior_command_kind(tool_call.command, state)
+        if not shell and loopx_command_tokens(tool_call.command) is not None and not _standalone_cli(tool_call.command):
+            kind = "draft_shell"
         try:
-            output, dispatched_kind, completed = _dispatch_behavior_command(
-                tool_call.command,
-                state,
-            )
-            kind = dispatched_kind
+            if shell:
+                # A captured module reader uses the same supervised CLI bridge,
+                # without allowing the shell to import the source checkout.
+                reader = replan_view_command_tokens(tool_call.command)
+                if reader is None:
+                    try:
+                        reader = _module_reader_tokens(shlex.split(tool_call.command))
+                    except ValueError:
+                        pass  # Let the shell report its original syntax error.
+                command = shlex.join(reader) if reader is not None else tool_call.command
+                output, exit_code = shell.execute(command)
+                observe_shell_evidence(output, state)
+                state.read_only_host_commands_executed = True
+                if exit_code:
+                    raise _HostToolError("shell_nonzero", output, exit_code)
+                completed = bool((state.vision_closeout or {}).get("settled"))
+            else:
+                if author_shell and (kind == "draft_shell" or (kind == "unexpected_command" and loopx_command_tokens(tool_call.command) is None)):
+                    _require_observed_frontier(state, prefix="semantic_action",
+                                               work_source_required=not state.fixture.frontier_exhausted)
+                    kind = "draft_shell"
+                    output, exit_code = author_shell(tool_call.command)
+                    state.draft_shell_executed = True
+                    if exit_code:
+                        raise _HostToolError("shell_nonzero", output, exit_code)
+                    completed = bool((state.vision_closeout or {}).get("settled"))
+                else:
+                    output, kind, completed = _dispatch_behavior_command(tool_call.command, state)
+        except _HostToolError as exc:
+            _record_tool_step(state, kind=kind, command=tool_call.command,
+                              exit_code=exc.exit_code, error_code=exc.code)
+            _append_tool_response(state, tool_call=tool_call, output=json.dumps({
+                "error_code": exc.code, "exit_code": exc.exit_code,
+                "output": exc.output[:_MAX_HOST_TOOL_ERROR_OUTPUT_CHARS],
+                "truncated": len(exc.output) > _MAX_HOST_TOOL_ERROR_OUTPUT_CHARS,
+            }))
+            continue
         except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
             _record_tool_step(state, kind=kind, command=tool_call.command)
             return _qualification_receipt(
@@ -1212,44 +1719,8 @@ def _run_qualification_loop(
     )
 
 
-class DoubaoReplanSemanticActionBehaviorActor:
+class DoubaoReplanSemanticActionBehaviorActor(DoubaoExecToolBehaviorActorBase):
     """Qualify a model-selected semantic replan through the real CLI boundary."""
-
-    def __init__(
-        self,
-        *,
-        api_key: str,
-        model: str = DOUBAO_2_1_PRO_MODEL,
-        timeout_seconds: float = 90.0,
-        transport: DoubaoActorTransport = _direct_ark_transport,
-    ) -> None:
-        self._client = DoubaoExecToolClient(
-            api_key=api_key,
-            model=model,
-            timeout_seconds=timeout_seconds,
-            transport=transport,
-        )
-
-    @classmethod
-    def from_environment(
-        cls,
-        *,
-        environ: Mapping[str, str] | None = None,
-        transport: DoubaoActorTransport = _direct_ark_transport,
-        timeout_seconds: float = 90.0,
-    ) -> DoubaoReplanSemanticActionBehaviorActor:
-        values = os.environ if environ is None else environ
-        api_key = values.get(ARK_API_KEY_ENV, "")
-        if not api_key.strip():
-            raise RuntimeError(
-                "ARK_API_KEY is not injected; live Doubao qualification is unavailable"
-            )
-        return cls(
-            api_key=api_key,
-            model=values.get(DOUBAO_MODEL_ENV, DOUBAO_2_1_PRO_MODEL),
-            timeout_seconds=timeout_seconds,
-            transport=transport,
-        )
 
     def qualify(
         self,
@@ -1258,21 +1729,30 @@ class DoubaoReplanSemanticActionBehaviorActor:
         fixture_root: Path,
         composition_frontier: bool = False,
         exhausted_frontier: bool = False,
+        required_vision: bool = False,
     ) -> dict[str, Any]:
         fixture = _build_fixture(
             fixture_root,
             composition_frontier=composition_frontier,
             exhausted_frontier=exhausted_frontier,
+            required_vision=required_vision,
         )
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
-                "content": (
+                "content": VISION_HOST_INSTRUCTION if required_vision else (
                     "You are Codex running one LoopX heartbeat against a hermetic "
                     "project. Follow the heartbeat task and use the shell tool. "
                     "The shell working directory is the connected goal project "
                     "root; relative paths in the active-state action resolve there. "
-                    "Treat the quota packet as the control-plane authority. Complete "
+                    "Treat the quota packet as the control-plane authority. If the "
+                    "guard returns native context navigation, execute its recovery "
+                    "reader before acting. If the delivered replan obligation names "
+                    "a context_read command, execute that exact command before "
+                    "choosing a semantic result. Read the work evidence. "
+                    "If the current replan_action_packet supplies a writeback command, "
+                    "execute that exact command to obtain the typed action contract. "
+                    "Otherwise use its inline writeback_contract. Complete "
                     "one bounded in-scope action and persist its result through the "
                     "real LoopX CLI. After quota, `cat` only the exact path named "
                     "in active_state_next_action, then `cat` only the source_ref "
@@ -1280,23 +1760,88 @@ class DoubaoReplanSemanticActionBehaviorActor:
                     "interaction_contract.cli_channel.next_cli_actions[0]. Do not "
                     "use ls, find, rg, or paged help. If refresh-state syntax is "
                     "still unclear, run exactly `loopx refresh-state --help` once, "
-                    "then execute the projected typed writeback. This scenario has "
-                    "a direct refresh-state outcome: execute exactly one loopx "
-                    "refresh-state command; do not create a Todo, chain commands, "
-                    "or combine actions."
+                    "then execute the projected typed writeback. Author the "
+                    "evidence-linked Vision and current stride decision in a "
+                    "project draft using the ordinary shell. Draft commands run "
+                    "in OS isolation; original inputs, authority and private data "
+                    "are protected. Shell composition may call only the same "
+                    "bounded CLI operations. Follow the "
+                    "current writeback contract for a direct outcome or a bound "
+                    "successor, then execute the returned original-Turn settlement "
+                    "command. Creating a successor does not settle the Turn or "
+                    "authorize executing that successor in this Turn."
                 ),
             },
             {"role": "user", "content": fixture.task_body},
         ]
-        digest = sha256(qualification_id.encode()).hexdigest()[:16]
         state = _QualificationState(
             fixture=fixture,
             messages=messages,
             steps=[],
-            turn_instance_id=f"qualification-{digest}",
+            turn_instance_id=qualification_turn_instance_id(qualification_id),
         )
-        return _run_qualification_loop(
-            self._client,
-            state,
-            qualification_id=qualification_id,
-        )
+        if required_vision:
+            def invoke(argv: list[str], cwd: Path, output: str) -> str:
+                observe_shell_evidence(output, state)
+                tokens = ["loopx", *argv]
+                if "--agent-vision-json" in tokens:
+                    index = tokens.index("--agent-vision-json") + 1
+                    if index < len(tokens):
+                        tokens[index] = str((cwd / tokens[index]).resolve())
+                command = shlex.join(tokens)
+                if "--help" in argv or "-h" in argv:
+                    return _execute_loopx(command, fixture=fixture, turn_instance_id=state.turn_instance_id)
+                if _is_quota_guard(command):
+                    return (_execute_loopx(command, fixture=fixture, turn_instance_id=state.turn_instance_id)
+                            if state.seen_quota else _handle_quota_command(command, state))
+                if is_context_read_command(command):
+                    return _handle_context_read(command, state)
+                if (reader := replan_view_command_tokens(command)) is not None:
+                    packet = state.quota_packet or {}
+                    obligation = packet.get("autonomous_replan_obligation")
+                    action = packet.get("replan_action_packet")
+                    for expected in (
+                        obligation.get("context_read") if isinstance(obligation, Mapping) else None,
+                        action.get("writeback") if isinstance(action, Mapping) else None,
+                    ):
+                        if isinstance(expected, str) and replan_view_command_tokens(expected) == reader:
+                            return _handle_replan_context_read(expected, state)
+                    raise ValueError("unexpected_replan_context_read")
+                result = dispatch_vision_closeout(command, state, execute=_execute_loopx)
+                if result is None:
+                    raise ValueError("This fixture grants CLI authority for quota, help, vision refresh and settlement only")
+                return result[0]
+
+            shell = VisionShellHost(fixture.project_root, invoke, turn_instance_id=state.turn_instance_id)
+            try:
+                return _run_qualification_loop(self._client, state, qualification_id=qualification_id, shell=shell)
+            finally:
+                shell.close()
+        draft_hosts: list[VisionShellHost] = []
+
+        def draft_cli(argv: list[str], cwd: Path, _output: str) -> str:
+            if (state.vision_closeout or {}).get("settled"):
+                raise ValueError("The original Turn is settled; no later CLI action is admitted")
+            tokens = ["loopx", *argv]
+            if "--agent-vision-json" in tokens:
+                index = tokens.index("--agent-vision-json") + 1
+                if index < len(tokens):
+                    tokens[index] = str((cwd / tokens[index]).resolve())
+            output, _kind, _completed = _dispatch_behavior_command(shlex.join(tokens), state)
+            return output
+
+        def author_shell(command: str) -> tuple[str, int]:
+            if not draft_hosts:
+                draft_hosts.append(VisionShellHost(
+                    fixture.project_root, draft_cli, turn_instance_id=state.turn_instance_id,
+                ))
+            return draft_hosts[0].execute(command)
+
+        try:
+            return _run_qualification_loop(
+                self._client, state, qualification_id=qualification_id,
+                author_shell=author_shell,
+            )
+        finally:
+            for host in draft_hosts:
+                host.close()

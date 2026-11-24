@@ -5,16 +5,26 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..contract import check_contract, render_contract_markdown
+from ..contract import (
+    check_contract,
+    display_report_value,
+    render_contract_markdown,
+)
+from ..paths import display_path_text
+from ..control_plane.coordination.local_authority import LocalCoordinationAuthorityUnavailable
 from ..control_plane.runtime.status_projection_cache import (
     load_status_projection_cache,
     resolve_status_projection_cache_runtime_root,
     write_status_projection_cache,
 )
+from ..control_plane.post_writeback_composition_retry import (
+    collect_pending_composition_retry_projection,
+)
 from ..control_plane.status.agent_lane_projection import (
     compact_agent_lane_status_payload_for_display,
 )
 from ..control_plane.todos.contract import normalize_todo_claimed_by
+from ..control_plane.quota.goal_boundary import registry_goal_by_id
 from ..control_plane.todos.quota_summary import (
     compact_agent_lane_todos_for_status_display,
 )
@@ -22,10 +32,15 @@ from ..control_plane.todos.todo_index import (
     compact_agent_lane_todo_index_for_status_display,
 )
 from ..diagnose import collect_diagnosis, render_diagnosis_markdown
+from ..control_plane.handoff.project_agent_context import build_project_agent_handoff
+from ..control_plane.handoff.handoff_fragments import render_handoff_transport
 from ..handoff_budget import build_handoff_interface_budget
 from ..presentation.renderers.status_markdown import render_status_markdown
 from ..quota import build_quota_should_run
-from ..review_packet import build_review_packet, render_review_packet_markdown
+from ..review_packet import (
+    build_review_packet,
+    render_review_packet_markdown,
+)
 from ..status import AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK, collect_status
 from .status_registration import register_status_commands as register_status_commands
 
@@ -41,7 +56,9 @@ def _scan_roots(args: argparse.Namespace) -> list[Path]:
     return scan_roots or [Path(args.scan_root).expanduser()]
 
 
-def _status_collection_limit_for_agent_lane(*, requested_limit: int, agent_id: str | None) -> int:
+def _status_collection_limit_for_agent_lane(
+    *, requested_limit: int, agent_id: str | None
+) -> int:
     safe_limit = max(0, int(requested_limit or 0))
     if str(agent_id or "").strip():
         return max(safe_limit, AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK)
@@ -118,8 +135,9 @@ def review_packet_handoff_only_payload(payload: dict[str, object]) -> dict[str, 
             "project_agent_command": payload.get("project_agent_command"),
             "project_agent_handoff": handoff_text,
             "handoff_text": handoff_text,
-            "project_agent_required_reads": payload.get("project_agent_required_reads") or [],
-            "operator_gate_approved_handoff": payload.get("operator_gate_approved_handoff"),
+            "operator_gate_approved_handoff": payload.get(
+                "operator_gate_approved_handoff"
+            ),
             "connected_delivery_handoff": payload.get("connected_delivery_handoff"),
             "handoff_delivery_contract": agent_contract,
             "handoff_interface_budget": handoff_budget,
@@ -128,6 +146,12 @@ def review_packet_handoff_only_payload(payload: dict[str, object]) -> dict[str, 
             "within_budget": handoff_budget.get("within_budget"),
         }
     )
+    fragment_texts = payload.get("project_agent_handoff_fragments")
+    if isinstance(fragment_texts, list) and fragment_texts:
+        result["project_agent_handoff_fragments"] = fragment_texts
+        result["handoff_fragment_manifest"] = payload.get(
+            "handoff_fragment_manifest"
+        )
     return result
 
 
@@ -148,17 +172,24 @@ def handle_check_command(
             allow_missing_registry=allow_missing_registry,
         )
     except Exception as exc:
+        scan_roots = args.scan_path or [args.scan_root]
         payload = {
             "ok": False,
-            "registry": str(registry_path),
-            "runtime_root": runtime_root_arg,
-            "scan_roots": args.scan_path or [args.scan_root],
+            "registry": display_path_text(registry_path),
+            "runtime_root": (
+                display_path_text(runtime_root_arg)
+                if runtime_root_arg is not None
+                else None
+            ),
+            "scan_roots": [display_path_text(path) for path in scan_roots],
             "summary": {"errors": 1, "warnings": 0, "checks": 0},
             "errors": [str(exc)],
             "warnings": [],
             "checks": [],
         }
-    print_payload(payload, args.format, render_contract_markdown)
+    print_payload(
+        display_report_value(payload), args.format, render_contract_markdown
+    )
     return 0 if payload.get("ok") else 1
 
 
@@ -171,7 +202,6 @@ def handle_status_command(
     print_payload: PrintPayload,
 ) -> int:
     try:
-        scan_roots = _scan_roots(args)
         display_limit = max(0, args.limit)
         collection_limit = _status_collection_limit_for_agent_lane(
             requested_limit=display_limit,
@@ -187,34 +217,34 @@ def handle_status_command(
             payload, cache_metadata = load_status_projection_cache(
                 registry_path=registry_path,
                 runtime_root=runtime_root,
-                scan_roots=scan_roots,
                 limit=collection_limit,
                 include_task_graph=args.include_task_graph,
                 goal_id=args.goal_id,
                 max_age_seconds=args.projection_cache_ttl_seconds,
                 available_capabilities=args.available_capabilities,
+                agent_lane_id=args.agent_id,
             )
         if payload is None:
             payload = collect_status(
                 registry_path=registry_path,
                 runtime_root_override=runtime_root_arg,
-                scan_roots=scan_roots,
                 limit=collection_limit,
                 include_task_graph=args.include_task_graph,
                 goal_id=args.goal_id,
                 available_capabilities=args.available_capabilities,
+                agent_lane_id=args.agent_id,
             )
             if args.write_projection_cache:
                 cache_metadata = write_status_projection_cache(
                     registry_path=registry_path,
                     runtime_root=runtime_root,
-                    scan_roots=scan_roots,
                     limit=collection_limit,
                     include_task_graph=args.include_task_graph,
                     goal_id=args.goal_id,
                     payload=payload,
                     max_age_seconds=args.projection_cache_ttl_seconds,
                     available_capabilities=args.available_capabilities,
+                    agent_lane_id=args.agent_id,
                 )
                 payload["projection_cache"] = cache_metadata
             elif cache_metadata:
@@ -232,6 +262,17 @@ def handle_status_command(
                 agent_id=args.agent_id,
             )
             compact_agent_lane_todo_index_for_status_display(payload)
+        pending_composition_retries = collect_pending_composition_retry_projection(
+            runtime_root, args.goal_id, agent_id=args.agent_id
+        )
+        if pending_composition_retries is not None:
+            payload["pending_composition_retry_receipts"] = pending_composition_retries
+        # Source facts feed the typed recommendation reducer before display.
+        # They are not another operator-facing plan or a second copy of its basis.
+        for item in payload.get("attention_queue", {}).get("items", []):
+            item.pop("recommendation_context", None)
+            # The selected route (or explicit peer detail) already carries it.
+            item.pop("next_action_basis", None)
     except Exception as exc:
         payload = {
             "ok": False,
@@ -256,7 +297,14 @@ def handle_status_command(
                 ],
             },
         }
-    print_payload(payload, output_format(args), render_status_markdown)
+        if isinstance(exc, LocalCoordinationAuthorityUnavailable):
+            payload["error_code"] = exc.code
+            payload["authority_read"] = exc.payload
+    print_payload(
+        display_report_value(payload),
+        output_format(args),
+        render_status_markdown,
+    )
     return 0 if payload.get("ok") else 1
 
 
@@ -363,7 +411,9 @@ def _build_agent_member_projection(
     identity = guard.get("agent_identity")
     if not isinstance(identity, dict):
         return None
-    coordination = item.get("coordination") if isinstance(item.get("coordination"), dict) else {}
+    coordination = (
+        item.get("coordination") if isinstance(item.get("coordination"), dict) else {}
+    )
     profile = _agent_profile_for(coordination, agent_id)
     role = _compact_member_text(profile.get("profile_role"), limit=80)
     claims = _current_claims_with_selected_lane(item, guard=guard, agent_id=agent_id)
@@ -371,7 +421,9 @@ def _build_agent_member_projection(
         "schema_version": "agent_member_v1",
         "agent_id": agent_id,
         "agent_model": "peer_v1",
-        "profile_source": "registry.coordination.agent_profiles" if profile else "quota.agent_identity",
+        "profile_source": "registry.coordination.agent_profiles"
+        if profile
+        else "quota.agent_identity",
         "authority_source": "registry+quota_should_run+todo_projection",
         "current_claims": claims[:10],
         "current_claim_count": len(claims),
@@ -459,7 +511,11 @@ def _build_agent_interaction_summary(
     }
     if isinstance(cli_channel, dict):
         summary["spend_after_validation"] = cli_channel.get("spend_after_validation")
-        summary["spend_policy"] = cli_channel.get("spend_policy")
+        summary["spend_policy"] = (
+            "bind eligible Todo before delivery/spend"
+            if cli_channel.get("selection_required") is True
+            else cli_channel.get("spend_policy")
+        )
     return summary
 
 
@@ -529,22 +585,20 @@ def _sync_agent_replan_obligation_from_guard(
     """Keep agent-scoped status guidance identical to the quota decision."""
 
     targets = (item, project_asset)
-    if not any(
+    obligation = guard.get("autonomous_replan_obligation")
+    capability_obligation = isinstance(obligation, dict) and bool(obligation.get("capability_guard"))
+    if not capability_obligation and not any(
         isinstance(target, dict)
         and (
             "autonomous_replan_obligation" in target
             or (
-                isinstance(
-                    target.get("autonomous_replan_obligations_by_agent"), dict
-                )
-                and agent_id
-                in target["autonomous_replan_obligations_by_agent"]
+                isinstance(target.get("autonomous_replan_obligations_by_agent"), dict)
+                and agent_id in target["autonomous_replan_obligations_by_agent"]
             )
         )
         for target in targets
     ):
         return
-    obligation = guard.get("autonomous_replan_obligation")
     for target in targets:
         if not isinstance(target, dict):
             continue
@@ -589,11 +643,20 @@ def _agent_reward_memory_projection(
         "configured_for_agent",
         "experiment_status",
         "experiment_available",
+        "reason_code",
+        "repair",
         "config_schema_version",
         "automatic_ingest",
         "automatic_recall",
         "fail_open",
         "automation_projection_source",
+        "automation_intent",
+        "host_coverage",
+        "isolation_mode",
+        "enablement_receipt_status",
+        "actor_binding_verified",
+        "writability_verified",
+        "exact_readback_verified",
     ):
         if key in reward_memory:
             compact[key] = reward_memory[key]
@@ -624,25 +687,43 @@ def attach_agent_lane_next_actions(
             "agent_member",
             "agent_interaction_summary",
             "agent_reward_memory",
+            "bounded_research_frontier",
         ),
         0,
     )
     current_agent_next_action: dict[str, Any] | None = None
+    goals = registry_goal_by_id(payload)
     for item in items:
         if not isinstance(item, dict):
             continue
         goal_id = str(item.get("goal_id") or "").strip()
         if not goal_id:
             continue
+        decision_payload = payload
+        frontier = None
+        goal = goals.get(goal_id) or {}
+        harness = (goal.get("spawn_policy") or {}).get("explore_harness") or {}
+        if harness.get("enabled") is True and harness.get("composition_mode") == "explicit_only":
+            from ..capabilities.explore.composition_frontier import project_live_explore_composition_frontier
+            frontier = project_live_explore_composition_frontier(
+                runtime_root=Path(str(payload["runtime_root"])), goal_id=goal_id,
+                agent_id=safe_agent_id, status_payload=payload)
+            decision_payload = {**payload, "bounded_research_frontier": frontier}
         try:
             guard = build_quota_should_run(
-                payload,
+                decision_payload,
                 goal_id=goal_id,
                 agent_id=safe_agent_id,
             )
+            selected = guard.get("replan_action_packet") or {}
+            obligation = (frontier or {}).get("obligation") or {}
+            if selected.get("capability_guard") and selected.get("obligation_id") == obligation.get("obligation_id"):
+                guard["autonomous_replan_obligation"] = obligation
         except Exception:
             continue
         next_action = guard.get("agent_lane_next_action")
+        if isinstance(next_action, dict) and next_action.get("next_action_basis"):
+            item["next_action_basis"] = next_action["next_action_basis"]
         project_asset = item.get("project_asset")
         agent_member = _build_agent_member_projection(
             item,
@@ -674,6 +755,7 @@ def attach_agent_lane_next_actions(
                 "agent_member": agent_member,
                 "agent_interaction_summary": interaction_summary,
                 "agent_reward_memory": reward_memory_projection,
+                "bounded_research_frontier": guard.get("bounded_research_frontier"),
             },
         )
         for field in attached_fields:
@@ -791,7 +873,6 @@ def handle_diagnose_command(
         payload = collect_diagnosis(
             registry_path=registry_path,
             runtime_root_override=runtime_root_arg,
-            scan_roots=_scan_roots(args),
             limit=max(1, args.limit),
             goal_id=args.goal_id,
             agent_id=args.agent_id,
@@ -837,20 +918,23 @@ def handle_review_packet_command(
         status_payload = collect_status(
             registry_path=registry_path,
             runtime_root_override=runtime_root_arg,
-            scan_roots=_scan_roots(args),
             limit=max(0, args.limit),
             include_task_graph=not args.handoff_only,
             goal_id=args.goal_id,
             available_capabilities=args.available_capabilities,
+            agent_lane_id=args.agent_id,
         )
         if args.agent_id:
             attach_agent_lane_next_actions(status_payload, agent_id=args.agent_id)
-        payload = build_review_packet(
-            status_payload,
-            goal_id=args.goal_id,
-            action_kind=args.action_kind,
-            review_url=args.review_url,
-        )
+        if args.handoff_only:
+            payload = build_project_agent_handoff(
+                status_payload, goal_id=args.goal_id, action_kind=args.action_kind,
+            )
+        else:
+            payload = build_review_packet(
+                status_payload, goal_id=args.goal_id, action_kind=args.action_kind,
+                review_url=args.review_url,
+            )
     except Exception as exc:
         payload = {
             "ok": False,
@@ -860,7 +944,14 @@ def handle_review_packet_command(
     if args.handoff_only:
         payload = review_packet_handoff_only_payload(payload)
     if args.handoff_only and selected_format != "json" and payload.get("ok"):
-        print(str(payload.get("handoff_text") or ""))
+        fragment_texts = payload.get("project_agent_handoff_fragments")
+        if not isinstance(fragment_texts, list):
+            fragment_texts = []
+        print(
+            render_handoff_transport(
+                str(payload.get("handoff_text") or ""), fragment_texts
+            )
+        )
     else:
         print_payload(payload, selected_format, render_review_packet_markdown)
     return 0 if payload.get("ok") else 1

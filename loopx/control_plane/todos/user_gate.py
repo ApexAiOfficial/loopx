@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from .contract import TODO_TASK_CLASS_USER_GATE
-from .projection import todo_item_task_class
-
+from ..quota.effective_action import EffectiveAction
+from .contract import TODO_TASK_CLASS_USER_ACTION, TODO_TASK_CLASS_USER_GATE
+from .todo_semantics import todo_item_task_class
 
 USER_GATE_ACTION_KIND_HINTS = (
     "approval",
@@ -70,6 +70,43 @@ def has_open_user_gate_todo(summary: dict[str, Any] | None) -> bool:
     return bool(open_user_gate_todo_items(summary))
 
 
+def has_only_open_user_actions(summary: dict[str, Any] | None) -> bool:
+    """Return whether every open user Todo is an explicit non-gating action."""
+
+    if not isinstance(summary, dict) or has_open_user_gate_todo(summary):
+        return False
+    # ``open_count`` is already the complete Todo frontier for the current
+    # Agent after quota scope filtering.  ``all_open_count`` remains a
+    # Goal-wide diagnostic and must not be compared with Agent-scoped action
+    # rows.
+    expected_count = open_todo_count(summary)
+    if expected_count <= 0:
+        return False
+    try:
+        if int(summary.get("user_action_open_count") or 0) == expected_count:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    # Small or legacy summaries may not project the aggregate count.  Only
+    # infer the same fact when the visible items account for the full frontier;
+    # compacted partial lists must remain fail-closed.
+    visible: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for key in ("first_open_items", "items", "backlog_items"):
+        rows = summary.get(key)
+        if not isinstance(rows, list):
+            continue
+        for item in rows:
+            if not isinstance(item, dict) or item.get("done") is True:
+                continue
+            identity = (item.get("todo_id"), item.get("index"), item.get("text"))
+            visible[identity] = item
+    return len(visible) == expected_count and all(
+        todo_item_task_class(item) == TODO_TASK_CLASS_USER_ACTION
+        for item in visible.values()
+    )
+
+
 def user_gate_todo_notify_reason(summary: dict[str, Any] | None) -> str:
     items = open_user_gate_todo_items(summary)
     if not items:
@@ -90,6 +127,8 @@ def should_notify_user_on_open_todo(
     if state == "operator_gate":
         return False
     if open_todo_count(user_todo_summary) <= 0:
+        return False
+    if has_only_open_user_actions(user_todo_summary):
         return False
     if state in {"focus_wait", "waiting"}:
         return True
@@ -145,6 +184,19 @@ def build_user_todo_notification(
     }
 
 
+def scoped_user_gate_fallback_fields() -> dict[str, Any]:
+    """Project the existing scoped-fallback readback independently of execution."""
+    return {
+        "safe_bypass_allowed": True,
+        "safe_bypass_kind": "scoped_user_gate_fallback",
+        "safe_bypass_policy": (
+            "The user gate blocks only the matched agent action scope. Surface "
+            "that gate, then advance the selected non-gated fallback; spend only "
+            "after validated writeback."
+        ),
+    }
+
+
 def apply_scoped_user_gate_fallback_projection(
     payload: dict[str, Any],
     *,
@@ -156,15 +208,21 @@ def apply_scoped_user_gate_fallback_projection(
 
     projected = dict(payload)
     projected["scoped_user_gate_fallback"] = fallback
+    if projected.get("effective_action") == EffectiveAction.AGENT_WORKSPACE_REPAIR.value:
+        # Independence from the user gate is not workspace admission. Preserve
+        # the selected repair obligation and its explicit delivery=False so the
+        # same Todo can bind for repair and reenter after moving workspaces.
+        return projected
     projected["should_run"] = True
     if projected.get("decision") == "skip":
         projected["decision"] = "safe_bypass_user_gate_fallback"
-    if projected.get("effective_action") in {"skip", "monitor_quiet_skip", None}:
-        projected["effective_action"] = "scoped_user_gate_fallback"
+    if projected.get("effective_action") in {EffectiveAction.QUOTA_SKIP.value, EffectiveAction.MONITOR_QUIET_SKIP.value, None}:
+        projected["effective_action"] = EffectiveAction.SCOPED_USER_GATE_FALLBACK.value
 
+    raw_execution_obligation = projected.get("execution_obligation")
     execution_obligation = (
-        dict(projected.get("execution_obligation"))
-        if isinstance(projected.get("execution_obligation"), dict)
+        dict(raw_execution_obligation)
+        if isinstance(raw_execution_obligation, dict)
         else {}
     )
     execution_obligation.update(
@@ -180,13 +238,7 @@ def apply_scoped_user_gate_fallback_projection(
         }
     )
     projected["execution_obligation"] = execution_obligation
-    projected["safe_bypass_allowed"] = True
-    projected["safe_bypass_kind"] = "scoped_user_gate_fallback"
-    projected["safe_bypass_policy"] = (
-        "The user gate blocks only the matched agent action scope. Surface "
-        "that gate, then advance the selected non-gated fallback; spend only "
-        "after validated writeback."
-    )
+    projected.update(scoped_user_gate_fallback_fields())
     projected["actionable_by_codex"] = True
     return projected
 
@@ -199,9 +251,10 @@ def build_gate_prompt(
     question = str(item.get("operator_question") or "").strip()
     recommended_action = str(item.get("recommended_action") or "").strip()
     next_handoff_condition = str(item.get("next_handoff_condition") or "").strip()
+    raw_missing_gates = item.get("missing_gates")
     missing_gates = [
         str(gate).strip()
-        for gate in (item.get("missing_gates") if isinstance(item.get("missing_gates"), list) else [])
+        for gate in (raw_missing_gates if isinstance(raw_missing_gates, list) else [])
         if str(gate).strip()
     ]
     if user_todo_summary is None:

@@ -1,0 +1,218 @@
+"""Filesystem boundary for canonical LoopX Turn journals."""
+
+from __future__ import annotations
+
+from typing import Any, cast
+
+import json
+import re
+from collections.abc import Mapping
+from pathlib import Path
+
+from ...file_lock import exclusive_cross_runtime_file_lock, exclusive_file_lock
+from ..coordination.shadow_management import (
+    runtime_artifact_lock_target,
+    shadow_maintenance_lock_target,
+)
+from ..effect_runtime import EffectRuntimeConflict, EffectRuntimeRejected, effect_runtime_result
+from .turn_journal_runtime import (
+    write_turn_journal,
+)
+
+
+LOOPX_TURN_JOURNAL_SCHEMA_VERSION = "loopx_turn_journal_v0"
+TURN_KEY_RE = re.compile(r"^sha256:(?P<digest>[0-9a-f]{64})$")
+
+
+def turn_journal_path(runtime_root: Path, *, goal_id: str, turn_key: str) -> Path:
+    match = TURN_KEY_RE.fullmatch(turn_key)
+    if not match:
+        raise ValueError("turn_key must be a sha256 digest")
+    return runtime_root / "goals" / goal_id / "turns" / f"{match.group('digest')}.json"
+
+
+def load_turn_journal(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != LOOPX_TURN_JOURNAL_SCHEMA_VERSION
+    ):
+        raise ValueError("LoopX Turn journal has an unsupported schema")
+    return value
+
+
+def journal_committed_effect_id(journal: Mapping[str, Any]) -> str | None:
+    """Return the typed settlement identity when this is not a legacy journal."""
+
+    stored_plan = journal.get("plan")
+    if not isinstance(stored_plan, Mapping):
+        return None
+    transaction = stored_plan.get("transaction")
+    if not isinstance(transaction, Mapping):
+        return None
+    settlement_plan = transaction.get("settlement_plan")
+    if not isinstance(settlement_plan, Mapping):
+        return None
+    identity = settlement_plan.get("identity")
+    if not isinstance(identity, Mapping):
+        return None
+    effect_id = str(identity.get("effect_id") or "").strip()
+    return effect_id or None
+
+
+def _turn_journal_goal_route(path: Path) -> tuple[Path, str] | None:
+    resolved = path.expanduser().resolve()
+    turns_dir = resolved.parent
+    goal_dir = turns_dir.parent
+    goals_dir = goal_dir.parent
+    if turns_dir.name != "turns" or goals_dir.name != "goals":
+        return None
+    return goals_dir.parent, goal_dir.name
+
+
+def write_turn_journal_checkpoint(
+    path: Path,
+    journal: Mapping[str, Any],
+    *,
+    source_admission: Mapping[str, Any] | None = None,
+) -> None:
+    def write() -> None:
+        write_turn_journal(
+            str(path),
+            journal,
+            expected_effect_id=journal_committed_effect_id(journal),
+            source_admission=source_admission,
+        )
+
+    route = _turn_journal_goal_route(path)
+    if route is None:
+        write()
+        return
+    runtime_root, goal_id = route
+
+    def write_under_maintenance() -> None:
+        with exclusive_cross_runtime_file_lock(
+            shadow_maintenance_lock_target(runtime_root, goal_id),
+            operation="turn_journal_runtime_artifact_commit",
+        ):
+            write()
+
+    if source_admission is not None:
+        write_under_maintenance()
+        return
+    with exclusive_cross_runtime_file_lock(
+        runtime_artifact_lock_target(runtime_root, goal_id),
+        operation="turn_journal_runtime_artifact_guard",
+    ):
+        write_under_maintenance()
+
+
+def load_loopx_turn_plan_from_journal(
+    runtime_root: Path,
+    *,
+    goal_id: str,
+    turn_key: str,
+    agent_id: str | None = None,
+) -> dict[str, Any]:
+    path = turn_journal_path(runtime_root, goal_id=goal_id, turn_key=turn_key)
+    with exclusive_file_lock(path):
+        journal = load_turn_journal(path)
+    if journal is None:
+        raise ValueError("LoopX Turn resume journal does not exist")
+    plan = journal.get("plan")
+    if not isinstance(plan, dict):
+        raise TypeError("LoopX Turn resume journal does not contain a plan")
+    transaction = (
+        cast(dict[str, Any], plan.get("transaction")) if isinstance(plan.get("transaction"), dict) else {}
+    )
+    if transaction.get("turn_key") != turn_key or journal.get("turn_key") != turn_key:
+        raise ValueError("LoopX Turn resume journal has mismatched turn lineage")
+    from ..quota.turn_envelope import read_recorded_turn_plan_lineage
+
+    try:
+        identity = read_recorded_turn_plan_lineage(plan)
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from exc
+    if identity.get("goal_id") != goal_id or journal.get("goal_id") != goal_id:
+        raise ValueError("LoopX Turn resume journal belongs to another goal")
+    if agent_id is not None and identity.get("agent_id") != agent_id:
+        raise ValueError("LoopX Turn resume journal belongs to another agent")
+    return dict(plan)
+
+
+def find_loopx_turn_key_by_settlement_identity(
+    runtime_root: Path,
+    *,
+    goal_id: str,
+    agent_id: str,
+    todo_id: str | None,
+    turn_instance_id: str,
+    request_subject: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Find one validated history; unreadable or conflicting history blocks retry."""
+
+    return _find_turn_key("turn_journal.find_settlement", {
+        "runtime_root": str(runtime_root.resolve()),
+        "goal_id": goal_id,
+        "agent_id": agent_id,
+        "todo_id": todo_id,
+        "turn_instance_id": turn_instance_id,
+        **({"request_subject": dict(request_subject)} if request_subject is not None else {}),
+    })
+
+
+def find_loopx_turn_key_by_instance(
+    runtime_root: Path, *, goal_id: str, agent_id: str, turn_instance_id: str,
+) -> str | None:
+    """Recover a unique original journal locator after a lost reply."""
+    return _find_turn_key("turn_journal.find_instance", {
+        "runtime_root": str(runtime_root.resolve()),
+        "goal_id": goal_id, "agent_id": agent_id, "turn_instance_id": turn_instance_id,
+    })
+
+
+def _find_turn_key(method: str, params: dict[str, Any]) -> str | None:
+    try:
+        payload = effect_runtime_result(method, params)
+    except EffectRuntimeConflict as exc:
+        # Preserve the public ambiguity exception; the native owner also
+        # rejects incomplete history rather than authorizing a fresh Turn.
+        raise ValueError(str(exc)) from exc
+    if not isinstance(payload, dict) or set(payload) != {"turn_key"}:
+        raise RuntimeError("TypeScript Turn journal lookup shape mismatch")
+    key = payload["turn_key"]
+    if key is not None and (not isinstance(key, str) or not TURN_KEY_RE.fullmatch(key)):
+        raise RuntimeError("TypeScript Turn journal lookup key mismatch")
+    return key
+
+
+def turn_journal_observed_capabilities(
+    runtime_root: Path,
+    *,
+    settlement_identity: Mapping[str, Any],
+    goal_ref: Mapping[str, Any] | None = None,
+) -> list[str] | None:
+    """Read exact terminal Turn evidence through the native journal owner.
+
+    Missing, unreadable, contradictory, or ambiguous history lends no
+    capabilities. Historical evidence never grants current execution authority.
+    """
+
+    request = {
+        "runtime_root": str(runtime_root.resolve()),
+        "settlement_identity": dict(settlement_identity),
+    }
+    if goal_ref is not None:
+        request["goal_ref"] = dict(goal_ref)
+    try:
+        payload = effect_runtime_result("turn_journal.observed_capabilities", request)
+    except (RuntimeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or set(payload) != {"observed_capabilities"}:
+        return None
+    observed = payload["observed_capabilities"]
+    if not isinstance(observed, list) or not all(isinstance(item, str) for item in observed):
+        return None
+    return observed

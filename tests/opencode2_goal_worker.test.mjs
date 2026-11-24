@@ -12,7 +12,9 @@ import {
   createStateStore,
   isTerminalNoFollowup,
   leaseIsLive,
+  parseExecFailure,
   parseWorkerArgs,
+  pidIsAlive,
   retryPlan,
   runWorker,
   sanitizedStateName,
@@ -329,7 +331,7 @@ test("retryPlan backs off exponentially with a ceiling", () => {
 
 test("decision helpers recognize terminal closure and run_now", () => {
   assert.equal(isTerminalNoFollowup(terminalDecision()), true)
-  assert.equal(shouldRunNow({ scheduler_hint: { action: "run_now" } }), true)
+  assert.equal(shouldRunNow({ should_run: true, scheduler_hint: { action: "run_now" } }), true)
   assert.equal(shouldRunNow({ should_run: true }), false)
   assert.equal(shouldRunNow({ should_run: false }), false)
   assert.equal(
@@ -339,7 +341,7 @@ test("decision helpers recognize terminal closure and run_now", () => {
 })
 
 
-test("worker drives a full loop: task prompt, run_now continuation, standby, then goal gone", async () => {
+test("worker admits initial and continuation prompts then stops at validated closure", async () => {
   const stateStore = memoryStateStore()
   const transport = fakeTransport()
   const sleepMs = []
@@ -348,6 +350,7 @@ test("worker drives a full loop: task prompt, run_now continuation, standby, the
     stateStore,
     sleepMs,
     decisions: [
+      { should_run: true, scheduler_hint: { action: "run_now" } },
       { should_run: true, scheduler_hint: { action: "run_now" } },
       terminalDecision(),
       goalNotFoundDecision(),
@@ -359,13 +362,14 @@ test("worker drives a full loop: task prompt, run_now continuation, standby, the
     taskBody: "Ship the task.",
     ...overrides,
   })
-  assert.equal(result.kind, "goal_gone")
+  assert.equal(result.kind, "paused_state")
   assert.deepEqual(transport.calls.prompts, ["Ship the task.", continuationPrompt("/workspace")])
-  assert.ok(transport.calls.synthetics.some((text) => text.includes("stays attached")))
+  assert.equal(transport.calls.synthetics.length, 0)
   const state = await stateStore.read("goal-e2e")
-  assert.equal(state.phase, "goal_gone")
+  assert.equal(state.phase, "paused")
   assert.equal(state.turnCount, 2)
-  assert.ok(sleepMs.includes("slept"))
+  assert.equal(sleepMs.length, 0)
+  assert.equal(state.autoResume, false)
 })
 
 
@@ -380,12 +384,12 @@ test("worker waits quietly between quota polls without prompting", async () => {
     decisions: [waitDecision(), terminalDecision(), goalNotFoundDecision()],
   })
   const result = await runWorker({ goalId: "goal-wait", directory: "/workspace", taskBody: "Task.", ...overrides })
-  assert.equal(result.kind, "goal_gone")
-  assert.equal(transport.calls.prompts.length, 1)
+  assert.equal(result.kind, "paused_state")
+  assert.equal(transport.calls.prompts.length, 0)
   assert.ok(sleepMs.length >= 1)
   const state = await stateStore.read("goal-wait")
-  assert.equal(state.phase, "goal_gone")
-  assert.equal(state.standbyPolls, 1)
+  assert.equal(state.phase, "paused")
+  assert.equal(state.autoResume, false)
 })
 
 
@@ -413,7 +417,7 @@ test("worker pauses visibly when the unchanged-poll limit stops the loop", async
   })
   const result = await runWorker({ goalId: "goal-stop", directory: "/workspace", taskBody: "Task.", ...overrides })
   assert.equal(result.kind, "limit_stopped")
-  assert.equal(transport.calls.prompts.length, 1)
+  assert.equal(transport.calls.prompts.length, 0)
   assert.ok(transport.calls.synthetics.some((text) => text.includes("unchanged-poll limit")))
   const state = await stateStore.read("goal-stop")
   assert.equal(state.phase, "limit_stopped")
@@ -430,12 +434,13 @@ test("worker keeps looping after an external user message", async () => {
     stateStore,
     decisions: [
       { should_run: true, scheduler_hint: { action: "run_now" } },
+      { should_run: true, scheduler_hint: { action: "run_now" } },
       goalNotFoundDecision(),
     ],
   })
   const run = runWorker({ goalId: "goal-user-msg", directory: "/workspace", taskBody: "Task.", ...overrides })
   await new Promise((resolve) => setTimeout(resolve, 0))
-  transport.addUserMessage("hold on")
+  transport.addUserMessage("What is the current status?")
   const result = await run
   assert.equal(result.kind, "goal_gone")
   assert.equal(transport.calls.prompts.length, 2)
@@ -478,10 +483,11 @@ test("worker backs off quota probe failures and resets on success", async () => 
   ]
   const overrides = makeWorkerOverrides({ transport, stateStore, sleepMs, decisions })
   const result = await runWorker({ goalId: "goal-probe-fail", directory: "/workspace", taskBody: "Task.", ...overrides })
-  assert.equal(result.kind, "goal_gone")
+  assert.equal(result.kind, "paused_state")
   const state = await stateStore.read("goal-probe-fail")
   assert.equal(state.probeRetryCount, 0)
-  assert.equal(state.standbyPolls, 1)
+  assert.equal(state.autoResume, false)
+  assert.deepEqual(transport.calls.prompts, ["Task."])
 })
 
 
@@ -575,7 +581,7 @@ test("worker stops after the turn budget and posts a visible notice", async () =
 test("first prompt counts toward the turn budget and its turn finishes before stopping", async () => {
   const stateStore = memoryStateStore()
   const transport = fakeTransport()
-  const overrides = makeWorkerOverrides({ transport, stateStore, decisions: [] })
+  const overrides = makeWorkerOverrides({ transport, stateStore, decisions: [{ should_run: true, scheduler_hint: { action: "run_now" } }] })
   const result = await runWorker({
     goalId: "goal-first-turn",
     directory: "/workspace",
@@ -620,11 +626,70 @@ test("createApiTransport probes the opencode2 api CLI shape", () => {
 })
 
 
+test("parseExecFailure reads the HTTP status the opencode2 api CLI reports", () => {
+  const error = new Error("Command failed: opencode2 api post /api/session/x/wait")
+  error.stderr = "HTTP 404 Not Found"
+  assert.equal(parseExecFailure(error).status, 404)
+  assert.equal(parseExecFailure({ stderr: "status: 500 server error" }).status, 500)
+})
+
+
+test("createApiTransport falls back to the experimental wait route when the stable route is missing", async () => {
+  const paths = []
+  const execFileImpl = async (_bin, args) => {
+    paths.push(args[2])
+    if (args[2] === "/api/session/ses_test/wait") {
+      const error = new Error("Command failed")
+      error.stderr = "HTTP 404 Not Found"
+      throw error
+    }
+    return { stdout: "{}" }
+  }
+  const transport = createApiTransport({ execFileImpl })
+
+  assert.equal(await transport.waitForSession("ses_test"), true)
+  assert.deepEqual(paths, [
+    "/api/session/ses_test/wait",
+    "/api/experimental/session/ses_test/wait",
+  ])
+
+  paths.length = 0
+  assert.equal(await transport.waitForSession("ses_test"), true)
+  assert.deepEqual(paths, ["/api/experimental/session/ses_test/wait"])
+})
+
+
+test("createApiTransport keeps the stable wait route when the server serves it", async () => {
+  const paths = []
+  const execFileImpl = async (_bin, args) => {
+    paths.push(args[2])
+    return { stdout: "{}" }
+  }
+  const transport = createApiTransport({ execFileImpl })
+
+  assert.equal(await transport.waitForSession("ses_test"), true)
+  assert.deepEqual(paths, ["/api/session/ses_test/wait"])
+})
+
+
+test("createApiTransport surfaces a wait failure that is not a missing route", async () => {
+  const execFileImpl = async () => {
+    const error = new Error("Command failed")
+    error.stderr = "HTTP 500 Internal Server Error"
+    throw error
+  }
+  const transport = createApiTransport({ execFileImpl })
+
+  await assert.rejects(() => transport.waitForSession("ses_test"), /Command failed/)
+})
+
+
 test("worker entry runs main() even when argv[1] goes through a symlinked path", async () => {
   const workerFile = path.resolve(
     path.join(import.meta.dirname, "..", "loopx", "opencode2_goal_mode", "opencode2-goal-worker.mjs"),
   )
   const linkDir = path.join(os.tmpdir(), `loopx-worker-entry-${process.pid}`)
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "loopx-worker-entry-state-"))
   await fs.rm(linkDir, { recursive: true, force: true })
   await fs.mkdir(path.dirname(workerFile), { recursive: true })
   await fs.symlink(path.dirname(workerFile), linkDir)
@@ -634,6 +699,7 @@ test("worker entry runs main() even when argv[1] goes through a symlinked path",
     let exitCode = 0
     try {
       const result = await execFile(process.execPath, [argvPath, "--goal-id", "x", "--directory", "/tmp"], {
+        env: { ...process.env, XDG_STATE_HOME: stateDir },
         timeout: 30_000,
         maxBuffer: 4 * 1024 * 1024,
       })
@@ -652,6 +718,7 @@ test("worker entry runs main() even when argv[1] goes through a symlinked path",
     )
   } finally {
     await fs.rm(linkDir, { recursive: true, force: true })
+    await fs.rm(stateDir, { recursive: true, force: true })
   }
 })
 
@@ -714,7 +781,7 @@ test("worker pauses when the session stops making progress", async () => {
   const overrides = makeWorkerOverrides({
     transport,
     stateStore,
-    decisions: [],
+    decisions: [{ should_run: true, scheduler_hint: { action: "run_now" } }],
   })
   const result = await runWorker({
     goalId: "goal-stalled",
@@ -759,7 +826,7 @@ test("worker holds quietly during a user pause and resumes when activity returns
   const overrides = makeWorkerOverrides({
     transport,
     stateStore,
-    decisions: [terminalDecision(), goalNotFoundDecision()],
+    decisions: [{ should_run: true, scheduler_hint: { action: "run_now" } }, terminalDecision()],
   })
   const running = runWorker({
     goalId: "goal-hold",
@@ -784,9 +851,9 @@ test("worker holds quietly during a user pause and resumes when activity returns
   )
   sessionPaused = false
   const result = await running
-  assert.equal(result.kind, "goal_gone")
+  assert.equal(result.kind, "paused_state")
   const state = await stateStore.read("goal-hold")
-  assert.equal(state.phase, "goal_gone")
+  assert.equal(state.phase, "paused")
 })
 
 
@@ -823,7 +890,7 @@ test("worker resumes by prompting when quota grants run_now and no turn is pendi
     directory: "/workspace",
     ...overrides,
   })
-  assert.equal(result.kind, "goal_gone")
+  assert.equal(result.kind, "paused_state")
   assert.equal(
     transport.calls.prompts.length,
     1,
@@ -831,4 +898,103 @@ test("worker resumes by prompting when quota grants run_now and no turn is pendi
   )
   const state = await stateStore.read("goal-resume")
   assert.equal(state.turnCount, 4)
+})
+
+test("initial task is gated before any model prompt and hard pause is durable", async () => {
+  const stateStore = memoryStateStore()
+  const transport = fakeTransport()
+  let probes = 0
+  const args = { goalId: "initial-pause", directory: "/workspace", taskBody: "Task", stateStore, transport,
+    quotaProbe: async () => { probes++; return { should_run: false, scheduler_hint: { action: "stop_until_explicit_resume" } } } }
+  await runWorker(args)
+  assert.equal(transport.calls.prompts.length, 0)
+  assert.equal((await stateStore.read("initial-pause")).autoResume, false)
+  await runWorker(args)
+  assert.equal(probes, 1)
+})
+
+test("pause during quota probe survives both success and failed probe", async () => {
+  for (const fail of [false, true]) {
+    const stateStore = memoryStateStore()
+    const transport = fakeTransport()
+    await runWorker({ goalId: "probe-pause", directory: "/workspace", taskBody: "Task", stateStore, transport,
+      quotaProbe: async () => {
+        const state = await stateStore.read("probe-pause")
+        await stateStore.write("probe-pause", { ...state, autoResume: false })
+        if (fail) throw new Error("probe unavailable")
+        return { should_run: true, scheduler_hint: { action: "run_now" } }
+      } })
+    assert.equal(transport.calls.prompts.length, 0)
+    assert.equal((await stateStore.read("probe-pause")).autoResume, false)
+  }
+})
+
+test("force resume cannot bypass a still-paused Core goal", async () => {
+  const stateStore = memoryStateStore()
+  const transport = fakeTransport()
+  await stateStore.write("resume-denied", { directory: "/workspace", autoResume: false, turnCount: 0, pendingTurn: false })
+  await runWorker({ goalId: "resume-denied", directory: "/workspace", taskBody: "Task", forceResume: true, stateStore, transport,
+    quotaProbe: async () => ({ should_run: false, scheduler_hint: { action: "stop_until_explicit_resume" } }) })
+  assert.equal(transport.calls.prompts.length, 0)
+  assert.equal((await stateStore.read("resume-denied")).autoResume, false)
+})
+
+test("restart after denied initial dispatch preserves the original private task", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "worker-pause-"))
+  try {
+    const transport = fakeTransport()
+    const args = { goalId: "restart", directory: "/workspace", transport, maxTurns: 1 }
+    await runWorker({ ...args, taskBody: "Original task", stateStore: createStateStore({ root }),
+      quotaProbe: async () => ({ should_run: false, scheduler_hint: { action: "stop_until_explicit_resume" } }) })
+    assert.equal(transport.calls.prompts.length, 0)
+    await runWorker({ ...args, forceResume: true, stateStore: createStateStore({ root }),
+      quotaProbe: async () => ({ should_run: true, scheduler_hint: { action: "run_now" } }) })
+    assert.deepEqual(transport.calls.prompts, ["Original task"])
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+
+test("waitPlan honors real scheduler_hint cold_path_detail and pid <= 0 lock rejection", async () => {
+  assert.equal(pidIsAlive(0), false)
+  assert.equal(pidIsAlive(-1), false)
+  const decision = {
+    should_run: false,
+    scheduler_hint: {
+      action: "backoff_waiting_for_user",
+      reset_policy: { reset_token: "hint-2" },
+      cold_path_detail: {
+        local_scheduler: {
+          recommended_interval_minutes: 3,
+          example_progression_minutes: [3, 6],
+        },
+      },
+      unchanged_poll: {
+        limits: { local_scheduler: 2 },
+        after_limits: { local_scheduler: "stop_tick_loop" },
+      },
+    },
+  }
+  const first = waitPlan(decision, { schedulerToken: "", unchangedPolls: 0 })
+  assert.deepEqual(first, {
+    stop: false,
+    minutes: 3,
+    schedulerToken: "hint-2",
+    unchangedPolls: 1,
+  })
+  assert.deepEqual(waitPlan(decision, first), { stop: true })
+
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "worker-lock-pid-"))
+  try {
+    const store = createStateStore({ root })
+    await fs.writeFile(
+      store.lockPath("goal-zero"),
+      `${JSON.stringify({ pid: -1, heartbeatAt: new Date(0).toISOString() })}\n`,
+      "utf8",
+    )
+    const acquired = await store.acquireLock("goal-zero")
+    assert.equal(acquired.acquired, true)
+    await acquired.release()
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
 })

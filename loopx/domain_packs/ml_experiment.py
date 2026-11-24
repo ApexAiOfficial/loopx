@@ -6,7 +6,11 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..control_plane.runtime.public_safety import REMOTE_LOCATION_SURFACE_PATTERN
 from ..domain_state import default_domain_state_file_path, upsert_domain_state_jsonl
+from ..public_safe_text import (
+    LETTER_LED_COMPACT_TOKEN_PATTERN as _TOKEN_RE,
+)
 
 
 DOMAIN_PACK_CONTRACT_SCHEMA_VERSION = "domain_pack_contract_v0"
@@ -34,13 +38,11 @@ VOLC_MLP_TASK_STATES = (
     "Unknown",
 )
 
-_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
 _ABSOLUTE_PATH_RE = re.compile(
     r"(^|[\s:=])(?:"
     + "/" + "Users/"
     + "|/private/|/tmp/|~[/\\s]|[A-Za-z]:\\\\)"
 )
-_URL_OR_REMOTE_PATH_RE = re.compile(r"(?i)\b(?:https?|file|s3|gs|tos|hdfs)://")
 _PRIVATE_MARKER_TERMS = [
     "author" + "ization:",
     r"bearer\s+[A-Za-z0-9._-]+",
@@ -65,7 +67,7 @@ def _compact_public_text(value: str, *, field: str, max_len: int = 160) -> str:
         raise ValueError(f"{field} must not contain parent-directory markers")
     if _ABSOLUTE_PATH_RE.search(text) or text.startswith(("/", "~")):
         raise ValueError(f"{field} must use a public alias, not a local/private path")
-    if _URL_OR_REMOTE_PATH_RE.search(text):
+    if REMOTE_LOCATION_SURFACE_PATTERN.search(text):
         raise ValueError(f"{field} must use a public alias, not a raw URL or remote path")
     if _PRIVATE_MARKER_RE.search(text):
         raise ValueError(f"{field} contains a private or credential-like marker")

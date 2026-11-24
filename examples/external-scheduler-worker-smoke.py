@@ -39,36 +39,42 @@ def _hint_payload(
     should_run: bool = False,
     cadence_class: str = "quiet_wait",
     reason: str = "synthetic",
+    local_scheduler_directive: str | None = None,
 ) -> dict:
+    scheduler_hint = {
+        "action": action,
+        "cadence_class": cadence_class,
+        "reason": reason,
+        "reset_policy": {"reset_token": reset_token},
+        "cold_path_detail": {
+            "local_scheduler": {
+                "recommended_interval_minutes": initial,
+                "example_progression_minutes": progression,
+                "unchanged_poll_limit": limit,
+                "after_limit": after_limit,
+                "final_quota_replan_check": {
+                    "enabled": limit is not None,
+                    "trigger": "before_unchanged_poll_after_limit",
+                    "action": "rerun_quota_should_run_once",
+                    "if_changed": "follow_new_scheduler_hint",
+                    "if_run_now": "execute_new_quota_contract",
+                    "if_unchanged": "apply_after_limit_without_spend",
+                },
+            }
+        },
+    }
+    if local_scheduler_directive is not None:
+        scheduler_hint["unchanged_poll"] = {
+            "local_scheduler": local_scheduler_directive
+        }
     return {
         "should_run": should_run,
         "effective_action": action,
-        "scheduler_hint": {
-            "action": action,
-            "cadence_class": cadence_class,
-            "reason": reason,
-            "reset_policy": {"reset_token": reset_token},
-            "cold_path_detail": {
-                "local_scheduler": {
-                    "recommended_interval_minutes": initial,
-                    "example_progression_minutes": progression,
-                    "unchanged_poll_limit": limit,
-                    "after_limit": after_limit,
-                    "final_quota_replan_check": {
-                        "enabled": limit is not None,
-                        "trigger": "before_unchanged_poll_after_limit",
-                        "action": "rerun_quota_should_run_once",
-                        "if_changed": "follow_new_scheduler_hint",
-                        "if_run_now": "execute_new_quota_contract",
-                        "if_unchanged": "apply_after_limit_without_spend",
-                    },
-                }
-            },
-        },
+        "scheduler_hint": scheduler_hint,
     }
 
 
-def test_active_work_uses_initial_interval() -> None:
+def test_active_observation_uses_initial_interval() -> None:
     payload = _hint_payload(
         action="run_now",
         initial=3,
@@ -114,15 +120,24 @@ def test_new_reset_token_resets_progression() -> None:
 
 
 def test_terminal_action_is_terminal() -> None:
-    payload = _hint_payload(
-        action="stop_until_explicit_resume",
-        initial=0,
-        progression=[0],
-        limit=None,
-        cadence_class="terminal_no_followup",
-    )
-    decision = parse_tick(payload)
-    assert decision.terminal is True
+    for action in (
+        "stop_until_explicit_resume",
+        "return_to_owner_until_material_change",
+    ):
+        payload = _hint_payload(
+            action=action,
+            initial=0,
+            progression=[0],
+            limit=None,
+            cadence_class="terminal_no_followup",
+            local_scheduler_directive="stop",
+        )
+        del payload["scheduler_hint"]["cold_path_detail"]
+        decision = parse_tick(payload)
+        assert decision.terminal is True
+        assert decision.action == action
+        assert decision.after_limit == "stop_tick_loop"
+        assert decision.unchanged_limit is None
 
 
 def test_missing_detail_fails_closed() -> None:
@@ -185,7 +200,9 @@ def test_launchd_program_arguments_match_worker_entrypoint(tmp_path: Path) -> No
         progression=[0],
         limit=None,
         cadence_class="terminal_no_followup",
+        local_scheduler_directive="stop",
     )
+    del terminal["scheduler_hint"]["cold_path_detail"]
     fake_cli = tmp_path / "launchd" / "fake-loopx"
     _write_fake_cli(fake_cli, [terminal])
 
@@ -244,24 +261,19 @@ def test_end_to_end_loop_stops_after_limit(tmp_path: Path) -> None:
     _write_fake_cli(fake_cli, [waiting("tok-a"), waiting("tok-a"), waiting("tok-a")])
 
     slept: list[float] = []
-    original_sleep = worker.time.sleep
-    worker.time.sleep = lambda seconds: slept.append(seconds)  # type: ignore[assignment]
-    try:
-        args = argparse.Namespace(
-            cli_bin=str(fake_cli),
-            registry=str(registry),
-            runtime_root=None,
-            runtime_profile="generic_cli",
-            goal_id="g",
-            agent_id="a",
-            state_file=str(state_file),
-            wake_cmd=None,
-            once=False,
-            error_backoff_seconds=5.0,
-        )
-        rc = run_worker(args)
-    finally:
-        worker.time.sleep = original_sleep  # type: ignore[assignment]
+    args = argparse.Namespace(
+        cli_bin=str(fake_cli),
+        registry=str(registry),
+        runtime_root=None,
+        runtime_profile="generic_cli",
+        goal_id="g",
+        agent_id="a",
+        state_file=str(state_file),
+        wake_cmd=None,
+        once=False,
+        error_backoff_seconds=5.0,
+    )
+    rc = run_worker(args, sleep=slept.append)
 
     assert rc == 0
     # Tick 1 waits at progression[0]; tick 2 reaches the limit and stops before
@@ -291,55 +303,53 @@ def test_end_to_end_token_change_resets_count(tmp_path: Path) -> None:
     )
 
     slept: list[float] = []
-    original_sleep = worker.time.sleep
-    worker.time.sleep = lambda seconds: slept.append(seconds)  # type: ignore[assignment]
+    args = argparse.Namespace(
+        cli_bin=str(fake_cli),
+        registry=str(registry),
+        runtime_root=None,
+        runtime_profile="generic_cli",
+        goal_id="g",
+        agent_id="a",
+        state_file=str(state_file),
+        wake_cmd=None,
+        once=False,
+        error_backoff_seconds=5.0,
+    )
+    # Stop after 4 real ticks by raising once sleep budget is exhausted.
+    def stop_after_four(seconds: float) -> None:
+        slept.append(seconds)
+        if len(slept) >= 4:
+            raise KeyboardInterrupt
     try:
-        args = argparse.Namespace(
-            cli_bin=str(fake_cli),
-            registry=str(registry),
-            runtime_root=None,
-            runtime_profile="generic_cli",
-            goal_id="g",
-            agent_id="a",
-            state_file=str(state_file),
-            wake_cmd=None,
-            once=False,
-            error_backoff_seconds=5.0,
-        )
-        # Stop after 4 real ticks by raising once sleep budget is exhausted.
-        def stop_after_four(seconds: float) -> None:
-            slept.append(seconds)
-            if len(slept) >= 4:
-                raise KeyboardInterrupt
-        worker.time.sleep = stop_after_four  # type: ignore[assignment]
-        try:
-            run_worker(args)
-        except KeyboardInterrupt:
-            pass
-    finally:
-        worker.time.sleep = original_sleep  # type: ignore[assignment]
+        run_worker(args, sleep=stop_after_four)
+    except KeyboardInterrupt:
+        pass
 
     # Tick1 marker a -> 10; tick2 marker b resets -> 10; later ticks -> 20.
     assert slept == [10 * 60, 10 * 60, 20 * 60, 20 * 60]
 
 
 def test_end_to_end_terminal_stops_immediately(tmp_path: Path) -> None:
-    terminal = _hint_payload(
-        action="stop_until_explicit_resume",
-        initial=0,
-        progression=[0],
-        limit=None,
-        cadence_class="terminal_no_followup",
-    )
-    registry = tmp_path / "terminal" / "registry"
-    state_file = tmp_path / "terminal" / "worker-state.json"
-    fake_cli = tmp_path / "terminal" / "fake-loopx"
-    _write_fake_cli(fake_cli, [terminal])
+    for action in (
+        "stop_until_explicit_resume",
+        "return_to_owner_until_material_change",
+    ):
+        terminal = _hint_payload(
+            action=action,
+            initial=0,
+            progression=[0],
+            limit=None,
+            cadence_class="terminal_no_followup",
+            local_scheduler_directive="stop",
+        )
+        del terminal["scheduler_hint"]["cold_path_detail"]
+        root = tmp_path / action
+        registry = root / "registry"
+        state_file = root / "worker-state.json"
+        fake_cli = root / "fake-loopx"
+        _write_fake_cli(fake_cli, [terminal])
 
-    slept: list[float] = []
-    original_sleep = worker.time.sleep
-    worker.time.sleep = lambda seconds: slept.append(seconds)  # type: ignore[assignment]
-    try:
+        slept: list[float] = []
         args = argparse.Namespace(
             cli_bin=str(fake_cli),
             registry=str(registry),
@@ -352,14 +362,12 @@ def test_end_to_end_terminal_stops_immediately(tmp_path: Path) -> None:
             once=False,
             error_backoff_seconds=5.0,
         )
-        rc = run_worker(args)
-    finally:
-        worker.time.sleep = original_sleep  # type: ignore[assignment]
+        rc = run_worker(args, sleep=slept.append)
 
-    assert rc == 0
-    assert slept == []
-    persisted = json.loads(state_file.read_text())
-    assert persisted["unchanged_count"] == 0
+        assert rc == 0
+        assert slept == []
+        persisted = json.loads(state_file.read_text())
+        assert persisted["unchanged_count"] == 0
 
 
 def test_end_to_end_should_run_invokes_wake_cmd(tmp_path: Path) -> None:
@@ -376,32 +384,27 @@ def test_end_to_end_should_run_invokes_wake_cmd(tmp_path: Path) -> None:
     state_file = tmp_path / "wake" / "worker-state.json"
     fake_cli = tmp_path / "wake" / "fake-loopx"
     marker = tmp_path / "wake" / "marker.txt"
-    _write_fake_cli(fake_cli, [active])
-
-    original_sleep = worker.time.sleep
-
-    def stop_after_one(seconds: float) -> None:
-        raise KeyboardInterrupt
-    worker.time.sleep = stop_after_one  # type: ignore[assignment]
-    try:
-        args = argparse.Namespace(
-            cli_bin=str(fake_cli),
-            registry=str(registry),
-            runtime_root=None,
-            runtime_profile="generic_cli",
-            goal_id="g",
-            agent_id="a",
-            state_file=str(state_file),
-            wake_cmd=f"echo woke > {shlex.quote(str(marker))}",
-            once=False,
-            error_backoff_seconds=5.0,
-        )
-        try:
-            run_worker(args)
-        except KeyboardInterrupt:
-            pass
-    finally:
-        worker.time.sleep = original_sleep  # type: ignore[assignment]
+    terminal = _hint_payload(
+        action="stop_until_explicit_resume",
+        initial=3, progression=[3], limit=None,
+        local_scheduler_directive="stop",
+    )
+    _write_fake_cli(fake_cli, [active, terminal])
+    slept: list[float] = []
+    args = argparse.Namespace(
+        cli_bin=str(fake_cli),
+        registry=str(registry),
+        runtime_root=None,
+        runtime_profile="generic_cli",
+        goal_id="g",
+        agent_id="a",
+        state_file=str(state_file),
+        wake_cmd=f"echo woke > {shlex.quote(str(marker))}",
+        once=False,
+        error_backoff_seconds=5.0,
+    )
+    assert run_worker(args, sleep=slept.append) == 0
+    assert slept == []
 
     assert marker.exists()
     assert marker.read_text().strip() == "woke"
@@ -425,25 +428,22 @@ def test_end_to_end_failed_wake_returns_nonzero_once(tmp_path: Path) -> None:
     fake_cli = tmp_path / "wakefail" / "fake-loopx"
     _write_fake_cli(fake_cli, [active])
 
-    original_sleep = worker.time.sleep
-    worker.time.sleep = lambda seconds: None  # type: ignore[assignment]
-    try:
-        args = argparse.Namespace(
-            cli_bin=str(fake_cli),
-            registry=str(registry),
-            runtime_root=None,
-            runtime_profile="generic_cli",
-            goal_id="g",
-            agent_id="a",
-            state_file=str(state_file),
-            wake_cmd="exit 17",
-            once=True,
-            error_backoff_seconds=5.0,
-        )
-        rc = run_worker(args)
-    finally:
-        worker.time.sleep = original_sleep  # type: ignore[assignment]
+    slept: list[float] = []
+    args = argparse.Namespace(
+        cli_bin=str(fake_cli),
+        registry=str(registry),
+        runtime_root=None,
+        runtime_profile="generic_cli",
+        goal_id="g",
+        agent_id="a",
+        state_file=str(state_file),
+        wake_cmd="exit 17",
+        once=True,
+        error_backoff_seconds=5.0,
+    )
+    rc = run_worker(args, sleep=slept.append)
 
+    assert slept == []
     assert rc == 17  # propagate the wake command's non-zero exit
     persisted = json.loads(state_file.read_text())
     # The failed wake must not be counted as successful progress.
@@ -454,7 +454,7 @@ def test_end_to_end_failed_wake_returns_nonzero_once(tmp_path: Path) -> None:
 
 def main() -> int:
     tests = [
-        test_active_work_uses_initial_interval,
+        test_active_observation_uses_initial_interval,
         test_unchanged_poll_advances_ladder_then_stops,
         test_new_reset_token_resets_progression,
         test_terminal_action_is_terminal,

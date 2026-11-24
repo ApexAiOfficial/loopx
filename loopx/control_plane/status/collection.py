@@ -2,17 +2,57 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from ..agents.execution_facts import collect_agent_execution_facts
+from ..coordination.local_authority import (
+    CanonicalTodoSnapshot,
+    LocalCoordinationAuthorityUnavailable,
+)
+from ..goals.acceptance_observation import attach_goal_acceptance_observations
+from ..goals.artifact_lifecycle import attach_goal_artifact_lifecycle_projections
 from ..goals.contract_health import project_contract_health_for_goal
+from ..goals.activation import (
+    GoalActivationState,
+    goal_activation_state,
+    normalize_goal_activation_state,
+)
 from ..runtime.runtime_projection_route import (
     collect_runtime_projection_route_diagnostics,
+    resolve_goal_source_runtime_route,
 )
+from ..projection_envelope_facts import seal_projection_envelope, source_fact
+from ..quota.blocked_retry import overlay_status_turn_retries
+from ..runtime.time import now_utc_iso, parse_timestamp, utc_isoformat
+from ..todos.todo_index import MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL
+from ...registry import registry_goals
+from ...rollout_event_log import RolloutEventSnapshot
 
 
 StatusCallback = Callable[..., Any]
+
+
+def registry_activation_revision(registry: dict[str, Any]) -> str:
+    """Stable fingerprint of the registry's goal activation partition.
+
+    Two scoped snapshots (active vs stopped) can be merged safely only when
+    this revision matches: it changes exactly when a goal is stopped or
+    resumed between the two requests. A mismatched revision means the merge
+    may duplicate or omit goals, so consumers should keep the projection
+    incomplete and resync instead of trusting the concatenated view.
+    """
+    entries = sorted(
+        (str(goal.get("id") or ""), goal_activation_state(goal).value)
+        for goal in registry_goals(registry)
+    )
+    digest = hashlib.sha256(
+        json.dumps(entries, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"registry_activation_v1:{digest[:16]}"
 
 
 @dataclass(frozen=True)
@@ -20,7 +60,7 @@ class StatusCollectionContext:
     load_registry: StatusCallback
     resolve_runtime_root: StatusCallback
     collect_global_registry_health: StatusCallback
-    collect_history: StatusCallback
+    collect_status_history: StatusCallback
     check_contract: StatusCallback
     build_attention_queue: StatusCallback
     build_runtime_summaries: StatusCallback
@@ -31,59 +71,133 @@ class StatusCollectionContext:
     build_goal_channel_notification_projection: StatusCallback
     status_control_plane_context_limit: int
     max_todo_index_items: int
+    tolerate_malformed_settlement_history: bool = False
 
 
 def collect_status(
     *,
     registry_path: Path,
     runtime_root_override: str | None,
-    scan_roots: list[Path],
     limit: int,
     context: StatusCollectionContext,
     include_task_graph: bool = False,
     goal_id: str | None = None,
     available_capabilities: Any = None,
-    include_public_boundary_scan: bool = True,
+    recent_run_limit: int | None = None,
+    include_goal_subagent_configuration: bool = False,
+    include_zcode_goal_eligibility: bool = False,
+    activation_state_filter: GoalActivationState | str | None = None,
+    agent_lane_id: str | None = None,
+    allow_missing_registry: bool = False,
+    include_presentation_projections: bool = True,
+    tolerate_malformed_settlement_history: bool = False,
 ) -> dict[str, Any]:
+    """Collect the status read model.
+
+    ``include_presentation_projections=False`` omits the runtime-wide
+    ``promotion_gate`` and per-item ``goal_channel_projection``, which only the
+    status/dashboard presentations read; decision callers such as quota use it.
+    """
     display_limit = max(0, limit)
-    control_plane_limit = max(display_limit, context.status_control_plane_context_limit)
+    control_plane_limit = max(
+        display_limit,
+        context.status_control_plane_context_limit,
+        max(0, recent_run_limit) if recent_run_limit is not None else 0,
+    )
     goal_filter = str(goal_id or "").strip() or None
+    activation_filter = (
+        normalize_goal_activation_state(activation_state_filter)
+        if activation_state_filter is not None
+        else None
+    )
     registry = context.load_registry(registry_path)
+    registry_read_at = now_utc_iso()
     runtime_root = context.resolve_runtime_root(
         registry,
         runtime_root_override,
         registry_path=registry_path,
+    )
+    rollout_events = RolloutEventSnapshot(
+        runtime_root,
+        limit=MAX_TODO_INDEX_ROLLOUT_EVENTS_PER_GOAL,
     )
     global_registry = context.collect_global_registry_health(
         registry_path=registry_path,
         runtime_root=runtime_root,
         current_registry=registry,
     )
+    global_registry_read_at = now_utc_iso()
     include_runtime_goals = bool(global_registry.get("current_registry_is_global"))
-    history = context.collect_history(
+    history_collection = context.collect_status_history(
         registry_path=registry_path,
         runtime_root=runtime_root,
         goal_id=goal_filter,
         limit=control_plane_limit,
-        include_runtime_goals=include_runtime_goals,
+        status_include_runtime_goals=include_runtime_goals,
+        activation_state_filter=activation_filter,
+        agent_lane_id=agent_lane_id,
+        registry=registry,
     )
+    history = history_collection.status_history
+    history_read_at = now_utc_iso()
+    source_snapshots: dict[Path, bytes | None] = {}
+
+    def canonical_runtime_for_goal(current_goal_id: str) -> Path:
+        try:
+            route = resolve_goal_source_runtime_route(
+                registry_path=registry_path, goal_id=current_goal_id,
+                runtime_root_override=runtime_root_override, registry=registry,
+                source_snapshots=source_snapshots,
+            )
+        except (OSError, ValueError) as error:
+            raise LocalCoordinationAuthorityUnavailable(
+                "Canonical Todo source route is unavailable",
+                code="canonical_todo_contract_diagnostics_unavailable",
+                payload={"goal_id": current_goal_id, "write_admitted": False,
+                         "legacy_fallback_used": False},
+            ) from error
+        return Path(route["source_runtime_root"])
+
+    todo_snapshot = CanonicalTodoSnapshot(runtime_root_for_goal=canonical_runtime_for_goal)
     contract = context.check_contract(
         registry_path=registry_path,
-        runtime_root_override=str(runtime_root),
-        scan_roots=scan_roots,
+        runtime_root_override=runtime_root_override,
+        scan_roots=[],
         limit=limit,
+        allow_missing_registry=allow_missing_registry,
         goal_id_filter=goal_filter,
-        include_public_boundary_scan=include_public_boundary_scan,
+        include_public_boundary_scan=False,
+        activation_state_filter=activation_filter,
+        history_audit=history_collection.contract_audit,
+        todo_snapshot=todo_snapshot,
+        registry=registry,
     )
+    contract_read_at = now_utc_iso()
     contract = project_contract_health_for_goal(contract, goal_id=goal_filter)
     queue = context.build_attention_queue(
+        todo_snapshot=todo_snapshot,
         contract=contract,
         history=history,
         global_registry=global_registry,
         runtime_root=runtime_root,
         include_task_graph=include_task_graph,
         goal_id_filter=goal_filter,
+        include_stopped_goal_context=(
+            activation_filter is GoalActivationState.STOPPED
+        ),
+        events_for_goal=rollout_events.events_for_goal,
+        current_registry=registry,
+        registry_path=registry_path,
+        include_goal_channel_projection=include_presentation_projections,
+        tolerate_malformed_settlement_history=(
+            tolerate_malformed_settlement_history
+            or context.tolerate_malformed_settlement_history
+        ),
+        agent_lane_id=agent_lane_id,
     )
+    # No later projection consumes the shared status snapshot.
+    del todo_snapshot
+    queue = overlay_status_turn_retries(history, queue, observed_at=now_utc_iso())
     runtime_summaries = context.build_runtime_summaries(
         history=history,
         queue=queue,
@@ -91,22 +205,55 @@ def collect_status(
         goal_id_filter=goal_filter,
         display_limit=display_limit,
         todo_index_limit=max(context.max_todo_index_items, display_limit),
+        recent_run_limit=recent_run_limit,
+        include_goal_subagent_configuration=(
+            include_goal_subagent_configuration
+        ),
+        events_for_goal=rollout_events.events_for_goal,
     )
-    promotion_gate = context.build_promotion_gate(
-        registry_path=registry_path,
-        runtime_root_override=str(runtime_root),
+    promotion_gate = (
+        context.build_promotion_gate(
+            registry_path=registry_path,
+            runtime_root_override=str(runtime_root),
+            registry=registry,
+        )
+        if include_presentation_projections
+        else None
     )
+    zcode_eligibility: dict[str, list[str]] = {}
+    source_goal_observer: Callable[[str, dict[str, Any] | None], None] | None = None
+    if include_zcode_goal_eligibility:
+        from ...zcode_goal_mode.bridge import zcode_goal_eligible_agent_ids
+
+        def observe_source_goal(current_goal_id: str, source_goal: dict[str, Any] | None) -> None:
+            zcode_eligibility[current_goal_id] = (
+                zcode_goal_eligible_agent_ids(source_goal) if source_goal is not None else []
+            )
+
+        source_goal_observer = observe_source_goal
     runtime_projection_routes = collect_runtime_projection_route_diagnostics(
         registry_path=registry_path,
         runtime_root=runtime_root,
         goal_id=goal_filter,
+        activation_state_filter=activation_filter,
+        registry=registry,
+        source_goal_observer=source_goal_observer,
     )
+    if include_zcode_goal_eligibility:
+        for row in runtime_summaries["run_history"]["goals"]:
+            row["zcode_goal_eligible_agent_ids"] = (
+                zcode_eligibility.get(str(row.get("id") or ""), [])
+                if row.get("registry_member") is True else []
+            )
+    routes_read_at = now_utc_iso()
     runtime_projection_route_health = {
         "healthy": (
             bool(runtime_projection_routes.get("healthy"))
             if runtime_projection_routes.get("available")
             else None
-        )
+        ),
+        # Registry, Goal and activation scope already live in the status envelope.
+        "goal_count": int(runtime_projection_routes.get("goal_count") or 0),
     }
     contract_projection = {
         "ok": contract.get("ok"),
@@ -135,12 +282,29 @@ def collect_status(
         "global_registry": global_registry,
         "attention_queue": queue,
         **runtime_summaries,
-        "promotion_gate": promotion_gate,
     }
+    if include_presentation_projections:
+        payload["promotion_gate"] = promotion_gate
+    if activation_filter is not None:
+        payload["goal_projection"] = {
+            "schema_version": "loopx_goal_projection_scope_v0",
+            "scope": activation_filter.value,
+            "complete": False,
+            "projected_goal_count": int(history.get("goal_count") or 0),
+            "registry_goal_count": len(registry_goals(registry)),
+            "registry_revision": registry_activation_revision(registry),
+        }
     payload["runtime_projection_routes"] = runtime_projection_route_health
+    # Lane liveness, delegation worker locks and leases are what make a worker
+    # `executing` or `unknown`. Each row carries its facts as `execution`, so a
+    # re-projection such as the peer directory reads them from there.
+    execution_facts = collect_agent_execution_facts(
+        runtime_root=runtime_root, status_payload=payload
+    )
     agent_management_projection = context.build_agent_management_projection(
         payload,
         available_capabilities=available_capabilities,
+        execution_facts=execution_facts,
     )
     if agent_management_projection.get("agents"):
         payload["agent_management_projection"] = agent_management_projection
@@ -152,6 +316,23 @@ def collect_status(
                 goal_id=goal_filter,
             )
         )
+        if activation_filter is not None and isinstance(
+            goal_channel_notification_projection, dict
+        ):
+            projected_goal_ids = {
+                str(goal.get("id") or "")
+                for goal in registry_goals(registry)
+                if goal_activation_state(goal) is activation_filter
+            }
+            goal_channel_notification_projection = {
+                **goal_channel_notification_projection,
+                "goals": [
+                    row
+                    for row in goal_channel_notification_projection.get("goals") or []
+                    if isinstance(row, dict)
+                    and str(row.get("goal_id") or "") in projected_goal_ids
+                ],
+            }
     except Exception:
         goal_channel_notification_projection = None
     notification_rows = (
@@ -166,4 +347,99 @@ def collect_status(
         payload["goal_channel_notification_projection"] = (
             goal_channel_notification_projection
         )
+    attach_goal_acceptance_observations(payload, history=history)
+    attach_goal_artifact_lifecycle_projections(payload, history=history)
+    payload["projection_envelope"] = seal_projection_envelope(
+        projection="status",
+        observed_at=now_utc_iso(),
+        sources=[
+            source_fact("registry", last_read_at=registry_read_at, item_count=len(registry_goals(registry))),
+            source_fact(
+                "global_registry",
+                read_status="read" if global_registry.get("available") else global_registry.get("read_status", "missing"),
+                last_read_at=global_registry_read_at if global_registry.get("available") else None,
+                required=False,
+                item_count=global_registry.get("global_goal_count"),
+            ),
+            _run_index_source(history, read_at=history_read_at),
+            source_fact("goal_state_contract", last_read_at=contract_read_at),
+            source_fact(
+                "runtime_projection_routes",
+                read_status="read" if runtime_projection_routes.get("available") else "missing",
+                last_read_at=routes_read_at if runtime_projection_routes.get("available") else None,
+                required=False,
+                item_count=runtime_projection_route_health["goal_count"],
+            ),
+        ],
+        coverage=_status_coverage(
+            registry,
+            history=history,
+            queue=queue,
+            goal_filter=goal_filter,
+            activation_filter=activation_filter,
+        ),
+    )
     return payload
+
+
+def _run_index_source(history: dict[str, Any], *, read_at: str) -> dict[str, Any]:
+    goals = [goal for goal in history.get("goals") or [] if isinstance(goal, dict)]
+    newest = None
+    for goal in goals:
+        for run in goal.get("latest_runs") or []:
+            generated = parse_timestamp(run.get("generated_at")) if isinstance(run, dict) else None
+            if generated is not None and generated.tzinfo is not None and (newest is None or generated > newest):
+                newest = generated
+    return source_fact(
+        "goal_run_indexes",
+        last_read_at=read_at,
+        source_updated_at=utc_isoformat(newest) if newest is not None else None,
+        item_count=len(goals),
+        missing_count=sum(1 for goal in goals if goal.get("index_exists") is False),
+    )
+
+
+def _status_coverage(
+    registry: dict[str, Any],
+    *,
+    history: dict[str, Any],
+    queue: dict[str, Any],
+    goal_filter: str | None,
+    activation_filter: GoalActivationState | None,
+) -> dict[str, Any]:
+    """Count registry members in the requested scope; legacy runtime goals are extra."""
+    members = registry_goals(registry)
+    if goal_filter is not None:
+        scope, expected = "goal", 1
+        expected_ids = {goal_filter}
+    elif activation_filter is not None:
+        scope = f"activation.{activation_filter.value}"
+        expected_ids = {
+            str(goal.get("id") or "") for goal in members if goal_activation_state(goal) is activation_filter
+        }
+        expected = len(expected_ids)
+    else:
+        scope = "registry"
+        expected_ids = {str(goal.get("id") or "") for goal in members}
+        expected = len(expected_ids)
+    projected = {
+        str(goal.get("id") or "")
+        for goal in history.get("goals") or []
+        if isinstance(goal, dict)
+        and (goal.get("registry_member") is True or (goal_filter is not None and goal.get("index_exists") is True))
+    }
+    missing = sorted(expected_ids - projected)
+    items = queue.get("items") if isinstance(queue.get("items"), list) else []
+    item_count = queue.get("item_count")
+    return {
+        "scope": scope,
+        "expected_count": expected,
+        "included_count": len(expected_ids & projected),
+        "omitted": (
+            [{"reason": "goal_not_found" if goal_filter else "not_projected", "count": len(missing), "refs": missing[:8]}]
+            if missing
+            else []
+        ),
+        "shown_count": len(items),
+        "available_count": item_count if isinstance(item_count, int) and item_count >= 0 else len(items),
+    }

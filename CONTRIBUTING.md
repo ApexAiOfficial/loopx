@@ -33,22 +33,58 @@ to understand the active programs and their maturity, then use
 [docs/development/contributor-tasks.md](docs/development/contributor-tasks.md) to find public work that is useful,
 claimable, and safe to discuss in the repository.
 
-If you do not see a matching task:
+Every claimable board row carries an anchor, a gap and an exit under the
+board's [Task Admission Rule](docs/development/contributor-tasks.md#task-admission-rule):
+a roadmap stream/milestone/card, an Accepted RFC section, or a
+reproduced adoption defect from a real install. For curated rows, a new catalog entry, a test that
+only pins current behavior, another fixture dimension, a rename or a docs
+restatement is not a task on its own; it is accepted as part of the anchored
+row that consumes it. Review credits the gap closed, not the PR count.
 
-1. open a GitHub issue with the contributor task template;
-2. explain the problem, proposed scope, touched files, and validation command;
-3. wait for maintainer feedback before starting large or behavior-changing
-   work.
+If you do not see a matching board task, a self-contained reproduced defect,
+accepted request or concrete maintenance outcome can go directly to a PR.
+Describe the gap, affected consumer, observable result and validation; a
+pre-existing issue, roadmap card or RFC is optional. Do not create a ceremonial
+issue only to qualify an ordinary repair. Open an issue for coordination before
+large or behavior-changing work whose outcome is not yet agreed.
 
-Small docs typo fixes and obviously safe cleanups can go straight to a pull
-request.
+| Contribution case | Route | Required basis |
+| --- | --- | --- |
+| Self-contained reproduced defect, accepted request or maintenance outcome | Direct PR | Concrete gap, consumer, result and validation; external anchor optional |
+| Catalog, test or fixture addition without a consumer or gap | Discussion until a useful outcome is established | Adding another entry or pinning current output is not an outcome |
+| Curated board row | Board claim or contributor-task issue | Valid canonical anchor, gap, exit and validation |
+
+Small docs typo fixes and obviously safe cleanups can go straight to a PR.
+
+### Check New Semantic Vocabulary While Developing
+
+If a change adds or extends an Enum, `Literal`, named closed set, TypeScript
+`as const` array, or another state/protocol vocabulary, run the diff-scoped
+advisory before the full-tree semantic check:
+
+```bash
+uv run python scripts/generate_semantic_inventory.py --changed-from HEAD
+```
+
+The command compares the named Git baseline with committed, staged, and working
+tree source changes, and reads the Git index and the working tree as separate
+snapshots so a staged addition survives a restored working file. It does not
+discover untracked files; include each intended
+new source explicitly, for example
+`--include-untracked loopx/control_plane/new_contract.ts`. It reports supported
+candidate carriers, registered-vocabulary reuse hints, and the disposition
+question to answer in review. Findings exit successfully because this is an
+advisory prompt, while invalid revisions, unreadable inputs, and tool failures
+exit non-zero. An empty report is not evidence that dynamic or unsupported
+semantic forms were analyzed.
+
 
 ## Public And Private Boundaries
 
 LoopX coordinates local agent state, so some files are runtime data and
 must stay out of public contributions:
 
-- do not commit `.loopx/`, `.codex/goals/`, or live
+- do not commit `.loopx/`, legacy `.codex/goals/`, or live
   `ACTIVE_GOAL_STATE.md` files;
 - do not publish private benchmark traces, verifier output, raw agent sessions,
   credentials, internal document links, or local machine paths;
@@ -69,6 +105,12 @@ loopx check \
   --scan-path examples/
 ```
 
+The credential rule also rejects unlabeled provider token shapes (GitHub, Slack,
+AWS, Google, Stripe, npm, PyPI, JWT) anywhere in a file. A fixture or example
+that must demonstrate a redaction keeps the value split, for example
+`"ghp_" + "<suffix>"` in Python or a `\u` escape in JSON, so the test still
+exercises the scan without a raw token entering the repository or the PR diff.
+
 ## Local Development
 
 Use the [developer guide](docs/development/README.md) as the stable entry point.
@@ -79,32 +121,103 @@ Before adding or consolidating a public smoke, use the bilingual
 [good smoke guide](docs/development/good-smokes.md) to define its durable
 invariant, independent oracle, cadence, and public-safe fixture boundary.
 
-Install and verify the checkout:
+### Prerequisites and one-time setup
+
+LoopX needs two runtimes:
+
+- **Python 3.11+.** `uv` installs a compatible one for you.
+- **Node.js 22.22.3 or newer**, with Node.js 24 LTS recommended. `pyproject.toml`
+  declares no cross-platform Python dependencies (only `tzdata; sys_platform == 'win32'`),
+  but the TypeScript control plane runs on the
+  system Node.js, both for `loopx` itself and for the test suite. `pip` and `uv`
+  cannot install Node.js for you.
+
+Run commands from the repository or dedicated worktree root with `uv`. It
+installs the current checkout in the project environment, which keeps your
+checks separate from any globally installed LoopX release. See the
+[local validation commands](docs/development/testing-and-quality.md#local-validation-environment--本地验证环境)
+for environment, lockfile, and CI boundaries.
 
 ```bash
-git clone https://github.com/huangruiteng/loopx ~/loopx
-~/loopx/scripts/install-local.sh
-export PATH="$HOME/.local/bin:$PATH"
-loopx doctor
-loopx demo
+uv sync --extra test
+npm ci --ignore-scripts   # TypeScript compiler and test dependencies
 ```
 
-Common focused checks:
+Run `npm ci` once per checkout or worktree. The Python architecture tests parse
+TypeScript with the repository's `typescript` package, so without it they fail.
+In that case pytest prints a single `loopx setup` line that names this command.
+
+### Fast loop and full check
+
+While iterating, run only what your change touches:
 
 ```bash
-python -m pip install -e ".[test]"
-python -m ruff check tests loopx/canary loopx/control_plane loopx/domain_packs loopx/presentation
-python -m mypy
-python examples/control_plane/cli-output-budget-regression-smoke.py
-python -m pytest -q
-loopx canary premerge --from-git-diff
-loopx check --scan-path loopx/ --scan-path tests/ --scan-path examples/ --scan-path docs/
+uv run --extra test python -m pytest -q <the test files for your change>
+npm run -s typecheck:control-plane && npm run -s test:control-plane   # when you changed *.ts
+uv run --extra test loopx canary premerge --from-git-diff             # selects smokes for your diff
+```
+
+Before pushing, run the full local equivalent of CI:
+
+```bash
+uv run --extra test python -m ruff check tests loopx/canary loopx/control_plane loopx/domain_packs loopx/presentation
+uv run --extra test python -m mypy
+uv run --extra test python examples/control_plane/cli-output-budget-regression-smoke.py
+uv run --extra test python -m pytest -q
+uv run --extra test loopx canary premerge --from-git-diff
+uv run --extra test loopx check --scan-path loopx/ --scan-path tests/ --scan-path examples/ --scan-path docs/
 git diff --check
 ```
 
 Choose focused smokes and broader canaries by change risk; do not run every
 public smoke or a live model call for every patch. The quality guide explains
 the CI, local/manual, and release-only boundaries.
+
+### What CI runs on a pull request
+
+Only two checks block a merge:
+
+- `Sign-off`, the DCO check;
+- `merge-gate`, which aggregates the Python Tests workflow.
+
+`merge-gate` stays green only when these Python Tests jobs succeed or were
+correctly skipped for your paths: `checks`, `pytest`,
+`node-minimum-compatibility`, `stage2c-correctness-e2e`, `windows-powershell`,
+and `presentation`. The other workflows are path-filtered, advisory, or do not
+run on pull requests. If an advisory workflow fails on a path you did not
+touch, mention it in the PR instead of fixing it there.
+
+| Workflow file | Runs on a PR | Blocks merge | What it checks |
+| --- | --- | --- | --- |
+| `python-tests.yml` | every PR | yes (`merge-gate`) | lint, mypy, sharded pytest, TypeScript core and coverage, minimum Node.js, Windows PowerShell, dashboard presentation |
+| `dco.yml` | every PR | yes (`Sign-off`) | `Signed-off-by` on contribution commits; verified GitHub-generated two-parent merges are exempt |
+| `ci-maintenance.yml` | opened, reopened, edited, updated or closed PR (`pull_request_target`, trusted base code only) | no | inspects potential stale PR comparisons without mutating the head or target; cancels obsolete Python qualification runs after rechecking the PR and source branch |
+| `dependency-review.yml` | every PR | no | dependency changes introduced by the PR |
+| `postgresql-integration.yml` | control-plane or npm lockfile paths | no | PostgreSQL authority store and service on a temporary instance |
+| `package-smoke.yml` | `loopx-core` and extension package paths | no | `loopx-core` and extension packages install, entrypoints, and example schemas |
+| `release-artifacts.yml` | `loopx/`, packaging, and lockfile paths | no | release identity and a release build from this source |
+| `runtime-snapshots.yml` | runtime artifact, installer, and updater paths | no | qualified, revision-addressed runtime archives and the main channel pointer |
+| `ark-turn.yml` | Turn driver and collaboration paths | no | optional Ark Turn package, stdio MCP, and DSH parity |
+| `memt-turn.yml` | optional MemT package, Turn driver, lock, and packaging paths | no | explicit optional dependency installation, complete adapter workflow, stdio MCP, and driver binding |
+| `dsh-plugin.yml` | DSH plugin and distribution workflow paths | no | Linux/Windows package install and uninstall, typed host contracts, and Linux real LoopX/web runtime admission |
+| `dsh-plugin-publish.yml` | no (manual, published plugin tag) | no | merged release identity, immutable npm package publication, and distribution readback |
+| `frontstage-pages.yml` | README, dashboard, and chat bundle paths | no | public Pages build |
+| `desktop-release-artifacts.yml` | desktop app and dashboard paths | no | macOS and Windows desktop builds |
+| `desktop-updater.yml` | desktop app paths | no | desktop app build and updater feed |
+| `full-public-smokes.yml` | no (manual, schedule) | no | every public smoke, in shards |
+| `sonarcloud.yml` | no (called by Python Tests) | no | SonarCloud analysis of that run's coverage |
+| `stale.yml` | no (schedule) | no | stale-issue reminders (never closes issues) |
+| `update-notes.yml` | no (schedule) | no | biweekly update notes |
+
+### Design notes and RFCs
+
+Most changes do not need an RFC. For example, adding a backward-compatible
+field to an existing projection or packet needs no RFC: update the owning
+reference contract or capability README, and put the design note in the PR
+description. See
+[when a change needs an RFC](docs/architecture/rfcs/README.md#when-a-change-needs-an-rfc).
+Before extending a capability, read the **Code map** in its README, where one
+exists, instead of reading the whole package.
 
 ## License And DCO Sign-Off
 
@@ -132,6 +245,11 @@ be information you are permitted to publish in the permanent Git history. If a
 commit is missing the trailer, amend it with `git commit --amend -s` or use an
 interactive rebase to sign the affected commits, then update the pull-request
 branch. The `DCO` pull-request check rejects unsigned commits.
+This includes manual merge commits and web edits. The check exempts only
+two-parent integration commits whose exact SHA, parents and `web-flow` identity
+have a valid signature verification in GitHub's commit record; it still checks
+the underlying contribution commits. A GitHub-looking name or email is not
+enough. If the provenance API is unavailable, the check fails with retry guidance.
 
 Releases through `v0.4.7` remain under their original MIT terms. See the
 [licensing and v0.4.8 transition policy](docs/project/licensing.md) for the
@@ -205,6 +323,10 @@ Repository roles and decision authority are defined in
 [Governance](.github/GOVERNANCE.md). Creator and contributor attribution is
 recorded in [docs/project/authors.md](docs/project/authors.md), while path-scoped maintenance and
 preferred review assignments are recorded in the same governance document.
+Its [Maintainer And Review Roster](.github/GOVERNANCE.md#maintainer-and-review-roster)
+lists who can approve which paths, and
+[Review Service Levels](.github/GOVERNANCE.md#review-service-levels) states how
+quickly a pull request should get a first response and a decision.
 The public Git history records individual contributions. Contribution does not
 automatically grant merge or release authority, and an agent or automation
 identity is not a human maintainer.
@@ -236,9 +358,89 @@ npm run smoke:demo-readiness
 Before opening a pull request:
 
 - link the issue or task ID when one exists;
-- describe the behavior change and the validation you ran;
+- state the requested outcome, current gap and observable before/after result;
+- distinguish completion of the scoped task from a justified increment; for an
+  increment, name the remaining gap, next owner/dependency and why the boundary
+  is independently testable and reversible;
+- link decisive validation to that outcome, including relevant user-entrypoint
+  readback and failure/recovery cases;
 - keep unrelated formatting or refactors out of the PR;
 - include docs or tests when changing user-visible behavior;
 - confirm that no private/local runtime state was committed.
 
-Maintainers may ask for a smaller PR if the change mixes unrelated concerns.
+Name the anchor the change closes: a card in the
+[overall roadmap](docs/architecture/rfcs/loopx-overall-roadmap-v0.md), an RFC
+section, or a reproduced public issue. Do not invent roadmap ids for ordinary
+fixes; an ordinary fix cites the issue it fixes. Existing
+issues and canonical Todos own execution; update them instead of duplicating
+follow-up work. A completed task needs no invented successor. Prerequisites,
+research, docs and maintenance can be useful delivered outcomes. A schema,
+message, mock or passing suite alone does not complete a promised user journey.
+
+Maintainers may request consolidation when a useful outcome was unnecessarily
+split, or a smaller PR when unrelated concerns were mixed. Review evaluates the
+verified goal delta and evidence, not minimum size, model identity or PR count.
+
+### Verify the published diff
+
+After opening or updating a PR, fetch its actual target branch and source head,
+then compare GitHub's changed-file inventory and line totals with
+`git diff --stat TARGET...HEAD` and `git diff --name-status TARGET...HEAD` at those
+exact revisions. Use the actual PR target, including a non-main target; a
+two-dot comparison with an advancing target also includes target-only changes.
+
+GitHub's [PR and compare views can use different merge bases](https://docs.github.com/en/pull-requests/reference/pull-requests#differences-between-commits-on-compare-and-pull-request-pages).
+The PR can retain an older base snapshot after the source branch incorporates
+target commits, inflating both files and line totals. CI Maintenance reports the pinned base and current target on PR lifecycle
+events, using trusted read-only inline code without checking out the contributor's
+branch. This is an advisory to compare inventories, not proof of an incorrect diff.
+It never updates the base: GitHub's REST base update has no conditional target
+write, so another GET cannot prevent overwriting a concurrent retarget.
+It does not repair unrelated code that is genuinely present in the Git diff.
+
+If published totals still disagree, inspect the PR's exact repository, head and
+base, and compare the pinned base with the current target. A maintainer can
+refresh the same base with the native API only while coordinating exclusive
+ownership of target edits for that operation:
+
+```bash
+gh api --method PATCH repos/OWNER/REPO/pulls/NUMBER -f base=VERIFIED_BASE_BRANCH
+```
+
+Do not use this unconditional PATCH in unattended automation. If target-edit
+ownership cannot be coordinated, leave the comparison unchanged and report the
+verified discrepancy. Read back the unchanged head, unchanged target branch and corrected file/line
+inventory before declaring the repair complete. Recheck moved revisions rather
+than reusing stale evidence. A refresh needs no empty commit, history rewrite,
+temporary retarget or close/reopen cycle. Ordinary target advancement alone is
+not evidence of an incorrect diff. If the Git diff itself contains unrelated
+work, isolate the intended changes on the verified target before publishing.
+
+### Validation disclosure
+
+Use the [PR template](.github/PULL_REQUEST_TEMPLATE.md) to report facts, not a
+self-assessed quality grade. The enum values are author declarations, not an
+automated proof or merge gate. `finished` means execution ended, not that all
+checks passed or that coverage is sufficient. Record the tested commit; after
+changes, rerun affected checks or identify the stale evidence and remaining gap.
+
+Use one row per relevant check, including failures, skips (`not_run`), blocked
+checks and work still running. Static checks do not prove runtime behavior;
+unit/mocked tests do not prove the public entrypoint or a real backend. State
+the behavior checked and why the set covers the changed paths. Refactors need
+the real-path and parity evidence required by the
+[testing guide](docs/development/testing-and-quality.md#refactor-real-path-gate--重构真实路径门).
+Small documentation changes can report a link/render/static check and explain
+why runtime testing is not applicable; do not launch unrelated suites to fill rows.
+
+Keep evidence public-safe at the point of entry, including hidden HTML comments
+and attachments. Report repository-relative test commands, public fixture names,
+aggregate outcomes, backend product/version and isolation mode, or public CI links.
+Do not copy commands containing private arguments, raw logs, snapshots, prompts,
+private screenshots, infrastructure addresses, connection strings, local paths or
+credentials. `authorized_private_read_only` discloses only a data category: it
+neither grants permission to access live state nor requires publishing its content,
+identifiers or fingerprints. When evidence cannot be shared, describe the tested
+behavior and verification limitation; public reproducibility remains an explicit
+gap until a safe reproducer or authorized review is available. Never upload private
+evidence to make a checkbox green.

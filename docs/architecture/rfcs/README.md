@@ -1,98 +1,587 @@
 # Architecture RFCs
 
 Architecture RFCs are public design proposals. Each RFC should name its
-status, decision boundary, non-goals, smallest useful implementation slice,
-and validation criteria. An RFC may describe future work; current behavior is
+decision boundary, non-goals, smallest useful implementation slice, and
+validation criteria. An RFC may describe future work; current behavior is
 defined by the implementation and stable reference contracts.
 
+Start new proposals from the [RFC template](TEMPLATE.md). Existing RFCs should
+adopt its maintenance contract when substantial revision would otherwise mix
+stable design, current progress, and historical evidence.
+
+### When a change needs an RFC
+
+Write an RFC, or amend the normative sections of an existing one, when a
+change does any of the following:
+
+- creates, moves, or removes an owner or source of authority;
+- changes default behavior;
+- makes a state or schema change that is not purely additive;
+- introduces an irreversible or multi-step migration;
+- defines a contract that several capabilities or hosts must follow.
+
+Most changes do not need an RFC. Examples are an additive, backward-compatible
+field on an existing projection or packet; a bug fix that restores documented
+behavior; and new tests, smokes, diagnostics, or documentation. For these,
+update the owning [reference contract](../../reference/contracts/README.md) or
+capability README, and put a short design note in the pull request. The note
+covers the problem, the field semantics, compatibility, and validation.
+
+An RFC is sized by its decision, not by the template. The template's twelve
+sections are a checklist. A section that cannot apply takes one line,
+`Not applicable: <reason>`, and an appendix is added only when it first has
+content. The Chinese mirror follows the same compact shape and stays
+synchronized for normative sections.
+
 The [Current Technical Directions](../../project/technical-directions.md) page
-maps these RFCs to strategic programs, contribution routes, and promotion
-gates. The groups below reflect the status written in each RFC; they do not
-promote a proposal beyond that status.
+maps RFCs to strategic programs, contribution routes, and promotion gates.
 
-## Accepted Architecture
+## How to read this index
 
+The sections below are technical ownership areas, not maturity levels. Each
+primary RFC appears once under its nearest architectural owner even when it
+also affects other areas.
+
+A merged active RFC is **Accepted**: it is a qualified design basis and its
+bounded implementation slices are available to claim. Draft and review describe
+an unmerged proposal, not a lifecycle state in this repository. Superseded,
+Retired and Rejected documents remain historical, not claimable active designs.
+
+Design acceptance and delivery maturity remain separate facts:
+
+- The generated [lifecycle index](STATUS.md) reads each RFC's canonical header.
+- **Delivery on `main`** records verified implementation maturity. Merge does not
+  prove implementation, live qualification, a new default, or promotion.
+- **Current boundary** names what is real now, remaining work and applicable
+  entry gates. Claiming a slice still respects its authorization and exit criteria.
+
+Within an RFC, keep the same separation:
+
+- normative sections define the current decision and acceptance contract;
+- a dated execution ledger records shipped slices and experiments without
+  silently changing that contract;
+- a decision log records explicit approval and the sections it changed;
+- an evidence registry maps claims to reproducible, public-safe proof.
+
+Do not append progress reports to a normative delivery plan. Dated checkpoint
+logs live in [`ledger/<rfc-slug>/`](ledger/README.md), one entry per date and
+slice, with the RFC body keeping only a pointer. The generator rejects dated
+execution headings above the first appendix, while permitting normative
+checkpoint contracts and historical appendix records. Schema
+reduction is never an incidental
+cleanup: the RFC or PR must name each removed field, document producer/reader/
+writer and compatibility research, define migration and rollback, prove the
+claimed semantic equivalence, and record explicit maintainer approval.
+
+This index was last audited against `main` on **2026-09-04**. Update an entry
+whenever its RFC status, promoted behavior, or meaningful delivery boundary
+changes.
+
+### Lifecycle index and supersession
+
+[`STATUS.md`](STATUS.md) ([中文版](STATUS.zh-CN.md)) is the generated
+lifecycle index. It groups every RFC into `Accepted`, `Superseded` and
+`Retired` (`Retired`, `Rejected`) from its own header. README entries retain
+hand-audited delivery facts and do not cache lifecycle states. Change the English
+header and its Chinese mirror, then run
+`python3 scripts/generate_rfc_status_index.py --write`; `--check` rejects stale
+indexes, invalid headers, lineage and dated execution entries in normative sections. Validation
+failure leaves the generated files untouched.
+
+- Use exactly `Accepted`, `Superseded`, `Retired` or `Rejected`, optionally followed
+  by punctuation and a note. New merged RFCs use `Accepted`.
+- Every header declares `**Supersedes / closes:**` as `none` or local RFC links.
+  Targets must exist, and English/Chinese declarations must identify the same RFCs.
+- A `Superseded` RFC names its successor in `**Superseded by:**`; the
+  successor reciprocally names that predecessor in `Supersedes / closes`.
+
+
+## Bilingual changes
+
+Existing English/Chinese RFC pairs and their ledger entries must both have a
+diff in the same PR. Before committing, run
+`python3 scripts/check_rfc_bilingual.py --base origin/main --staged` (including
+earlier branch commits). Before merge, run
+`python3 scripts/check_rfc_bilingual.py --base origin/main --head HEAD`, using
+the PR's actual target branch and reviewed head. Source-checkout
+`uv run --extra test loopx canary premerge --from-git-diff` includes this direct
+blocking check in every tier. CI waiting and admin bypass do not waive it.
+Only committed changes satisfy the merge check. It compares from the merge base,
+includes paired deletion/renaming, and leaves legacy single-language files alone.
+Paired diffs do not certify translation accuracy.
+
+## Overall Product and Delivery Roadmap
+
+- [LoopX Overall Roadmap v0](loopx-overall-roadmap-v0.md)
+  ([中文版](loopx-overall-roadmap-v0.zh-CN.md))
+  - **Delivery on `main`:** Planning and audit evidence, not runtime promotion.
+  - **Current boundary:** Maps every primary RFC and important
+    non-RFC domains into 13 streams, G0–G5 product milestones and R1–R7 core
+    execution cards. Covers product, multi-LoopX-Agent collaboration/handoff,
+    kernel, hosts, memory, cost, security, operations, research, releases,
+    community and adoption. Domain contracts retain their authority gates.
+
+- [App conversations and reusable asynchronous work delivery](app-conversation-and-async-inbox-v0.md)
+  ([中文版](app-conversation-and-async-inbox-v0.zh-CN.md))
+  - **Delivery on `main`:** Conversation-entry repair through existing Chat and explicit typed forms;
+    the full managed/attached App journey is not qualified.
+  - **Current boundary:** App-first conversation continuity, truthful activity,
+    public-safe golden queries and a replacement-first TS async inbox plan.
+
+## Control-Plane Kernel, State, And Migration
+
+- [Complete State Recovery and Controlled Reactivation v0](complete-state-recovery-v0.md)
+  ([中文版](complete-state-recovery-v0.zh-CN.md))
+  - **Delivery on `main`:** Bounded M1 archive verification and inert File/SQLite
+    inspection are implemented through `backup-state verify`, loopback HTTP and
+    the packaged Settings journey.
+  - **Current boundary:** Existing owners inspect a new inert copy; every v0
+    audit remains held for incomplete capture/owner metadata, with
+    `execution_authority_granted=false`. M2 capture consistency and M3 controlled
+    reactivation remain open; verification grants no activation or live-state mutation.
+
+- [Composable State Machines and Recovery Verification v0](composable-state-machines-recovery-verification-v0.md)
+  ([中文版](composable-state-machines-recovery-verification-v0.zh-CN.md))
+  - **Delivery on `main`:** Bounded Turn/provider/File-journal recovery is
+    implemented and exercised through the production Turn entrypoint with a
+    synthetic provider ledger; full M2 composition qualification remains open.
+  - **Current boundary:** Typed provider admission, exact retry and readback
+    retain prepared intent and prevent duplicate effects in that slice. Lease
+    transfer, stale-owner races, PostgreSQL authority, successor scheduling and
+    App/Lark delivery need separate qualification; no new runtime or state writer.
+
+- [Monorepo Distribution and Small-Kernel Runtime Composition v0](monorepo-distribution-split-v0.md)
+  ([中文版](monorepo-distribution-split-v0.zh-CN.md))
+  - **Delivery on `main`:** Proposal only; tracking [#5072](https://github.com/loopx-project/loopx/issues/5072).
+  - **Current boundary:** One design for directory ownership, `loopx-core` /
+    `loopx-workspace` / optional distributions, and minimal/standard runtime
+    composition over one governance implementation. Preserves import
+    compatibility and adds demand-loading, activation, context, managed-task
+    recovery and matched product/benchmark qualification. Original packaging
+    milestones and decisions remain; no runtime, default, licence or schema change.
+
+- [Automatic Execution Admission v0](automatic-execution-admission-v0.md)
+  ([中文版](automatic-execution-admission-v0.zh-CN.md))
+  - **Delivery on `main`:** M1 policy, managed Turn admission and M3
+    settings/readback companions are implemented; host promotion remains unqualified.
+  - **Current boundary:** The quota owner retains scoped interval policy and
+    durable start reservations; managed dispatch confirms starts through its
+    existing journal, while settlement replay skips admission. Settings, CLI,
+    Dashboard and selected-Agent Lark status consume owner-produced eligibility.
+    App timer-to-hook coverage and non-Turn launchers remain unqualified;
+    interval eligibility grants neither execution permission nor budget.
+
+- [Human-confirmed domain operations v0](human-confirmed-domain-operations-v0.md)
+  ([中文版](human-confirmed-domain-operations-v0.zh-CN.md))
+  - **Delivery on `main`:** Proposal only.
+  - **Current boundary:** Separates generic authenticated interaction, optional
+    financial execution and venue adapters. Defines shared frontend/Lark
+    confirmation and automatic outcomes; no runtime or trading permission added.
+- [Provider-side authorization at effect acceptance v0](provider-effect-acceptance-v0.md)
+  ([中文版](provider-effect-acceptance-v0.zh-CN.md))
+  - **Delivery on `main`:** Design only; no runtime integration or qualified provider.
+  - **Current boundary:** Defines an opt-in provider-owned transaction that
+    orders current policy and revocation with one-use authorization, effect
+    commit, and an immutable result. Strict operations also require a current
+    source-owned Goal admission witness and an independent LoopX qualification
+    receipt. Existing behavior is unchanged.
 - [Agent Loop Effect Interpreter v0](agent-loop-effect-interpreter-v0.md)
-  ([中文版](agent-loop-effect-interpreter-v0.zh-CN.md)): model LoopX as the
-  effect interpreter around an agent loop, with canonical
-  effect-request/interpretation/observation packets and a shared typed Effect
-  Program for qualified settlement paths. Replan planning and ACK remain
-  domain-local until a second real plan/receipt lifecycle justifies extraction.
+  ([中文版](agent-loop-effect-interpreter-v0.zh-CN.md))
+  - **Delivery on `main`:** Core implemented; bounded adoption continues.
+  - **Current boundary:** Effect request, interpretation, observation,
+    settlement, and typed Effect Program foundations are shipped. Replan
+    planning/ACK stays domain-local until a second real lifecycle justifies
+    extraction.
+- [Router–Controller–Worker Architecture and One Governed Work Contract v0](controller-executor-unified-contract-v0.md)
+  ([中文版](controller-executor-unified-contract-v0.zh-CN.md))
+  - **Delivery on `main`:** Design only; no unified schema or dual-session profile is implemented.
+  - **Current boundary:** Replaces permanent quota/Turn packet views with one
+    contract including differential context; a steward router coordinates Agent
+    units, each binding a controller and worker with asynchronous interaction.
+    Existing Core/request/session owners retain authority, identity and recovery.
+    C1–C9 connect concrete refactors, real host adoption and complete-cost
+    qualification without changing defaults or launching experiments.
+- [Recoverable History Working Sets and Context Policy Extensions v0](history-working-set-context-policy-v0.md)
+  ([中文版](history-working-set-context-policy-v0.zh-CN.md))
+  - **Delivery on `main`:** Proposal only; tracking [#8450](https://github.com/loopx-project/loopx/issues/8450).
+  - **Current boundary:** A bounded T02 continuation design informed by
+    billion-context. Reuses complete sources, shared TypeScript presentation
+    and exact delivery; first qualifies one real model-input consumer, then
+    source-bound historical views and optional provider extensions. Source
+    retention, original readback, actual adoption and complete-cost evidence
+    remain unqualified; no runtime, default or experiment change.
+- [Sparse Working Memory at Context Compaction v0](sparse-compaction-working-memory-v0.md)
+  ([中文版](sparse-compaction-working-memory-v0.zh-CN.md))
+  - **Retired:** Kernel execution and Workbench activation removed after the
+    requester withdrew the unqualified experiment. Strict saved-settings
+    compatibility and existing exact capture references remain; see the
+    [retirement ledger](ledger/sparse-compaction-working-memory-v0/2026-11-17-retirement.md).
 
-## Active Research Programs
-
-- [Long-Horizon Harness Benchmark and Research Program v0](long-horizon-harness-benchmark-research-program-v0.md)
-  ([中文版](long-horizon-harness-benchmark-research-program-v0.zh-CN.md)):
-  use ALE, LHTB, and DeepSWE as a complementary external-validity portfolio;
-  separate capability evidence from mechanism research and preserve
-  benchmark-native outcomes.
-- [Hierarchical Agent Stride Control v0](hierarchical-agent-stride-control-v0.md)
-  ([中文版](hierarchical-agent-stride-control-v0.zh-CN.md)): qualify effect
-  feedback, bounded delivery, and authority intervention as nested control
-  intervals before introducing adaptive stride selection.
-
-## Product Direction And Delivery Contracts
-
-- [Long-Running Agent Reliability Diagnostics and Governed Delivery v0](long-running-agent-reliability-diagnostics-governed-delivery-v0.md)
-  ([中文版](long-running-agent-reliability-diagnostics-governed-delivery-v0.zh-CN.md)):
-  define an observer-first entry between a native harness and full LoopX
-  adoption, qualify it with matched benchmark evidence, and add execution
-  authority only through accepted, reversible seams and reusable delivery
-  assets.
-
-## Drafts Under Review
-
-- [Research Exploration Control Plane v0](research-exploration-control-plane-v0.md)
-  ([中文版](research-exploration-control-plane-v0.zh-CN.md)): evolve a typed
-  research frontier across coverage, closure, and explicit composition while
-  keeping Explore, goal-frontier, and execution authority separate.
-- [Human Attention Wishlist v0](human-attention-wishlist-v0.md)
-  ([中文版](human-attention-wishlist-v0.zh-CN.md)): capture bounded,
-  evidence-backed requests for optional human leverage as a non-blocking
-  post-delivery sidecar without changing gates, selected work, quota, or
-  notification authority.
-- [Shared-goal online authority and pluggable coordination provider v0](shared-goal-authority-state-provider-v0.md)
-  ([中文版](shared-goal-authority-state-provider-v0.zh-CN.md),
-  [validation boundary](shared-goal-authority-state-provider-v0-evidence.zh-CN.md)):
-  prove a claim-only provider-neutral contract for target-scoped conflict and
-  original-receipt replay, with NoKV as an unpromoted provider candidate.
-- [Goal artifact lifecycle projection v0](goal-artifact-lifecycle-projection-v0.md)
-  ([中文版](goal-artifact-lifecycle-projection-v0.zh-CN.md)): derive
-  milestones, blocking guards, and legal next transitions as a read-only
-  operator projection.
-- [Post-Outcome Memory Utility Attribution v0](post-outcome-memory-utility-attribution-v0.md)
-  ([中文版](post-outcome-memory-utility-attribution-v0.zh-CN.md)): attribute
-  bounded, evidence-tiered utility to recalled memory after verified outcomes
-  without making retrieval, model judgment, or a global evaluator authoritative.
 - [TypeScript Control-Plane Migration v0](typescript-control-plane-migration-v0.md)
-  ([中文版](typescript-control-plane-migration-v0.zh-CN.md)): use a
-  contract-first, parity-gated Strangler Fig process; the shipped TypeScript
-  runtime owns migrated semantics, and the active phase cuts over complete
-  transactions while retiring Python facades and migration scaffolding;
-  delivery and vision ACK decisions remain domain-local reducers rather than
-  generic Effect Program steps.
+  ([中文版](typescript-control-plane-migration-v0.zh-CN.md))
+  - **Delivery on `main`:** Substantially implemented; active migration.
+  - **Current boundary:** Stage 1 and 2A are complete. Stage 2B is cutting over
+    whole semantic transactions and retiring Python facades under parity and
+    differential gates.
+- [Semantic Vocabulary Convergence and Commit-Time Drift Checks v0](semantic-vocabulary-convergence-v0.md)
+  ([中文版](semantic-vocabulary-convergence-v0.zh-CN.md))
+  - **Delivery on `main`:** M0/M0.5 checks, M1 typed action bindings and M2 Turn
+    contract generation are implemented; M3/M4 retirement remains incomplete.
+  - **Current boundary:** Repository-wide. A curated registry names kernel
+    and cross-runtime vocabularies with `module::Symbol` owners, relations,
+    the route-to-disposition projection, the Turn Envelope schema owner, and
+    ratchets for legacy should-run fields, py/ts twins, and constant forks; a
+    generated inventory maps every other closed-set carrier under `loopx/`; a
+    public smoke fails closed on drift in either runtime and on any narrowing
+    of the registry itself. Existing generators derive action bindings and Turn
+    vocabularies, route projections and controller rules from their declared
+    owners; they do not migrate every cross-runtime vocabulary or move value
+    authority. No enum merge, slot split or field removal is approved.
+- [Shared-goal Online Authority and Pluggable Coordination Provider v0](shared-goal-authority-state-provider-v0.md)
+  ([中文版](shared-goal-authority-state-provider-v0.zh-CN.md),
+  [validation boundary](shared-goal-authority-state-provider-v0-evidence.zh-CN.md))
+  - **Delivery on `main`:** Foundation, provider-contract, and local promotion
+    preparation slices implemented.
+  - **Current boundary:** Recoverable shared-authority foundations, the
+    file-backed reference path, NoKV shadow/recovery evidence, the TypeScript
+    store contract, PostgreSQL candidate/conformance coverage, and the
+    default-off local shadow/cutover foundations are on `main`
+    ([#3529](https://github.com/huangruiteng/loopx/pull/3529),
+    [#3669](https://github.com/huangruiteng/loopx/pull/3669),
+    [#3798](https://github.com/huangruiteng/loopx/pull/3798)). In-process PostgreSQL
+    service admission and identity rotation also exist;
+    deployed authenticated remote service and provider promotion remain distinct
+    qualification gates. [Cross-person shared access](shared-goal-authority-state-provider-v0.md#cross-person-shared-access)
+    defines the resource ACL and identity boundary. [R6 qualification](shared-goal-authority-state-provider-v0.md#cross-person-delivery-under-r6)
+    covers shared reading, collaborative research and the cloud worker.
+- [Shared Goal Alignment and Governed Amendment Protocol v0](shared-goal-alignment-and-governed-amendment-v0.md)
+  ([中文版](shared-goal-alignment-and-governed-amendment-v0.zh-CN.md))
+  - **Delivery on `main`:** Stage 1/2 read-only alignment and proposal-admission
+    foundations implemented; Stage 3+ remains unshipped.
+  - **Current boundary:** Current Todo/lease source-basis projection and retained
+    amendment admission have no canonical effect. Full Goal-intent versioning,
+    governed commit policy/verifier, lease-impact handling and Stage 3+
+    qualification remain unshipped. Manager handoff consumes these boundaries;
+    it does not provide another amendment writer.
+- [Goal contract evolution and bounded working context v0](goal-contract-evolution-v0.md)
+  ([中文版](goal-contract-evolution-v0.zh-CN.md))
+  - **Delivery on `main`:** Proposal only; existing objective revision and additive
+    outcome maintenance remain the implemented boundary.
+  - **Current boundary:** One authorized change set for objective and requirements,
+    retained version history, scoped peer adoption and bounded indexed context.
+    R4/R5 own migration; real model recognition, packaged recovery, shared-store
+    concurrency and outcome/cost qualification remain open.
+- [Persistent Goal outcome refinement v0](goal-outcome-refinement-v0.md)
+  ([中文版](goal-outcome-refinement-v0.zh-CN.md))
+  - **Current boundary:** Supporting outcomes preserve cumulative requirements
+    through the existing Goal authority. Installed/model adoption and comparative
+    benefit remain unqualified; declarations do not grant execution authority.
+- [Goal Direction Baseline v0](goal-direction-baseline-v0.md)
+  ([中文版](goal-direction-baseline-v0.zh-CN.md))
+  - **Delivery on `main`:** M1's provider-neutral, Agent-scoped read model and
+    explicit local M2 candidates exist; general activation and live model
+    consumption remain unqualified.
+  - **Current boundary:** The candidate path includes source-backed read offers,
+    same-Agent revision acknowledgement and cold readback. M1 capacity/receipt
+    decisions and M2 consumer/recovery UX approval remain pending. Observations
+    do not create work, rewrite Vision, change Goal routes or grant authority.
+- [Goal Continuity Across Restart and Replacement](goal-immutability-coherence-defense-v0.md)
+  ([中文版](goal-immutability-coherence-defense-v0.zh-CN.md))
+  - **Delivery on `main`:** Non-normative follow-up design record.
+  - **Current boundary:** Retains qualification scenarios under existing Goal
+    instance, direction, amendment and handoff owners; combined journeys remain
+    unqualified and no new runtime contract is introduced.
+- [Goal Artifact Lifecycle Projection v0](goal-artifact-lifecycle-projection-v0.md)
+  ([中文版](goal-artifact-lifecycle-projection-v0.zh-CN.md))
+  - **Delivery on `main`:** Proposal only.
+  - **Current boundary:** Milestones, blocking guards, and legal transitions are
+    specified as a read-only projection; no canonical lifecycle projection has
+    shipped.
+- [Goal Instance Identity and Orphan Recovery v0](goal-instance-identity-and-orphan-recovery-v0.md)
+  ([中文版](goal-instance-identity-and-orphan-recovery-v0.zh-CN.md))
+  - **Delivery on `main`:** The guided orphan fence and M0 codec are joined by
+    partial source-session lifetime and binding-owner implementation;
+    source-session quota settlement is qualified in #5389.
+  - **Current boundary:** Reuse those R5 owners for R2/R3. Complete the remaining
+    binding/effect fences and old-writer compatibility before activation;
+    orphan resolution and product acceptance remain held. A codec or partial
+    owner inventory grants no activation, and R6 and D1–D3 retain their own gates.
 
-## Draft Integration Proposals
+## Planning, Research, And Adaptive Intelligence
 
+- [Mechanism Convergence and the Experience Reuse Loop v0](mechanism-convergence-and-learning-loop-v0.md)
+  ([中文版](mechanism-convergence-and-learning-loop-v0.zh-CN.md))
+  - **Delivery on `main`:** Proposal only; budgeted method feedback and structural convergence, with no runtime change.
+  - **Current boundary:** Reuses Controller C1/C4/C9 and Target/Stride/Explore to
+    connect prior expectations, execution, feedback and the next real choice.
+    Defines caller migration and duplicate-producer retirement, then staged
+    forecast calibration and policy learning. Memory/Skills carry qualified
+    knowledge; application receipts are optional adoption evidence, not the
+    first-loop prerequisite. No default, training or experiment is activated.
+
+- [LoopX × LayerFS — Engineering Exploration and Evaluation v0](layerfs-engineering-exploration-evaluation-v0.md)
+  ([中文版](layerfs-engineering-exploration-evaluation-v0.zh-CN.md))
+  - **Delivery on `main`:** Proposal only; no provider integration or measured benefit.
+  - **Current boundary:** Optional execution-workspace provider under existing
+    Explore/Host owners; real-environment branch/handoff conformance, then warm
+    worktree comparisons and native/passive/governed outcome/cost attribution.
+    Filesystem checkpoints do not qualify complete research-state continuation.
+
+- [Goal-scoped Capability Portfolio and Connector Lifecycle v0](goal-scoped-capability-portfolio-v0.md)
+  ([中文版](goal-scoped-capability-portfolio-v0.zh-CN.md))
+  - **Delivery on `main`:** Proposal; catalog, Agent-context hooks and connector
+    inventory are prerequisites rather than a shipped portfolio.
+  - **Current boundary:** Existing Goal enablement activates supported capability
+    behavior without a second Portfolio opt-in. Direct work needs no DAG or
+    adoption record; material dependencies use bounded composition. Policy stays
+    capability-owned and existing config/effect/admission owners remain authoritative.
+    M0 includes affected product entry points; merged #4813 supplies evidence
+    infrastructure, not connector or Portfolio qualification. No new authority.
+
+- [Agent Judgment and Optional Independent Assessment v0](optional-semantic-assistance-jev-v0.md)
+  ([中文版](optional-semantic-assistance-jev-v0.zh-CN.md))
+  - **Delivery on `main`:** Proposal only; no Jev integration or qualification.
+  - **Current boundary:** Discusses eight Agent/assessment opportunities with a
+    provisional expected-value investigation order led by same-priority Todo
+    and Explore ranking; Jev is one comparator alongside existing models and workflow.
+    M0 accepts discussion intake only; research, data/spend, qualification,
+    product adoption and runtime authority remain pending and unapproved.
+
+- [Frontier Science Research Program v0](frontier-science-research-program-v0.md)
+  ([中文版](frontier-science-research-program-v0.zh-CN.md))
+  - **Delivery on `main`:** Proposal only.
+  - **Current boundary:** Ten cross-disciplinary research tracks, existing-owner
+    routing, evidence limits and staged experiment gates. Prioritizes sequential
+    evidence, decision-preserving continuation and stride shadow evaluation;
+    no runtime treatment, resource commitment or scientific uplift is promoted.
+- [Research Exploration Control Plane v0](research-exploration-control-plane-v0.md)
+  ([中文版](research-exploration-control-plane-v0.zh-CN.md))
+  - **Delivery on `main`:** Partially implemented.
+  - **Current boundary:** Ordinary result capture/readback and the explicit-only
+    M3 Goal/Todo/experiment write-time gate are implemented; the RFC's §5 retains
+    their local and remote qualification limits. The §11.5 single-experiment
+    result/adoption gate, model utility and inferred triggers remain unqualified.
+    Reuse existing capture and composition owners when connecting those gaps.
+- [Hierarchical Agent Stride Control v0](hierarchical-agent-stride-control-v0.md)
+  ([中文版](hierarchical-agent-stride-control-v0.zh-CN.md))
+  - **Delivery on `main`:** M1 observation and opt-in source-bound replan feedback
+    and structured proposals are implemented.
+  - **Current boundary:** Prior decisions and later recorded work reach the same
+    review owner; source/proposal validity does not prove model adoption or gain.
+    §11 targets one provider-result/adopted-work/next-review episode. Matched
+    research continuation and adaptive promotion retain separate gates; see the
+    [implementation comparison](../long-running-execution-exploration-and-correction.md).
+- [Joint Target, Yardstick and Stride Decisions v0](target-yardstick-stride-decisions-v0.md)
+  ([中文版](target-yardstick-stride-decisions-v0.zh-CN.md))
+  - **Delivery on `main`:** M1 optional decision/followthrough path exists;
+    budgeted planning is proposed, numerical fidelity and matched gain unqualified.
+  - **Current boundary:** Reuse Stride/Yardstick owners for multi-step decisions
+    under the remaining budget. The [EdgeBench pilot](long-horizon-harness-benchmark-research-program-v0.md#edgebench-budgeted-planning)
+    precedes full-budget benefit and later calibrated/learned allocation; no new
+    controller runtime is required. Scoped fidelity, actual adoption and complete
+    outcome/cost qualification remain separate from source delivery.
+- [Post-Outcome Memory Utility Attribution v0](post-outcome-memory-utility-attribution-v0.md)
+  ([中文版](post-outcome-memory-utility-attribution-v0.zh-CN.md))
+  - **Delivery on `main`:** Stage 1 implemented.
+  - **Current boundary:**
+    [#3280](https://github.com/huangruiteng/loopx/pull/3280) binds utility
+    observations to verified outcomes without changing retrieval ranking.
+    Reducer/read projection, provider readback, ranking influence, and pilot
+    promotion remain open.
+- [Obelisk Session Evidence Provider v0](obelisk-session-evidence-provider-v0.md)
+  ([中文版](obelisk-session-evidence-provider-v0.zh-CN.md))
+  - **Delivery on `main`:** Evaluation only.
+  - **Current boundary:** The default-off, read-only evidence-provider boundary
+    is documented. Obelisk is not installed, promoted, or authoritative for
+    Replan settlement, memory, or action selection.
+
+## Runtime, Capability, And Collaboration Integration
+
+- [Capable Agent Manager and Semantic Work Handoff v0](capable-manager-semantic-handoff-v0.md)
+  ([中文版](capable-manager-semantic-handoff-v0.zh-CN.md))
+  - **Delivery on `main`:** Partial; private runtime profile, executor settings,
+    team-plan confirmation and initial Todo materialization shipped.
+  - **Current boundary:** Proposes ordinary host-tool autonomy, persistent scoped
+    conversations, long-horizon semantic continuation and automatic result delivery.
+    Includes an official Grok Bot study distinguishing availability from goal
+    continuation; M0–M4 and A1–A20 define delivery and acceptance, with explicit
+    alignment, shared-authority and TS migration dependencies.
+    Cross-session restoration, execution takeover and automatic return are specified
+    separately, reusing #4094 with optional Obelisk gap recall under its own scope.
+    Full runtime-profile qualification and generic handoff migration remain open.
+- [Manager Runtime Profile v0](manager-runtime-profile-v0.md)
+  ([中文版](manager-runtime-profile-v0.zh-CN.md))
+  - **Delivery on `main`:** Partial; the explicit persistent `restricted` /
+    `trusted_owner` machine-level grant and its readback are the shipped slice
+    recorded by the parent RFC.
+  - **Current boundary:** Defines `manager_runtime_profile_v0` so that host
+    sandbox, prompt, managed workspace instructions, persistent configuration
+    and Session readback describe one effective mode. Qualification of the
+    profile as the default manager mode stays with the parent RFC.
+- [Explicit Todo Continuation — Stage A](cross-session-memory-substrate-v0.md)
+  ([中文版](cross-session-memory-substrate-v0.zh-CN.md))
+  - **Delivery on `main`:** #4094 shipped the explicit local CLI and rich/legacy
+    continuation note with revision-guarded ownership adoption.
+  - **Current boundary:** Registered agents, same host/Goal, lease-free promoted
+    local authority. No generic memory store, automatic host launch, cross-host
+    artifacts or automatic result return. Manager/handoff §5.13 integrates this
+    adapter into M2/M3; the shipped CLI contract remains until replacement qualifies.
+
+- [Single-Owner Local Daemon v0](single-owner-local-daemon-v0.md)
+  - **Delivery on `main`:** Proposal only; existing Desktop ownership repair is shipped.
+  - **Current boundary:** Service-profile identity, component readiness, supervised
+    composition, and recoverable migration are proposed for #3930. A unified
+    `loopxd` service has not shipped.
+- [Preserve the Selected Runtime During Rollback v0](self-update-explicit-runtime-route-v0.md)
+  ([中文版](self-update-explicit-runtime-route-v0.zh-CN.md))
+  - **Delivery on `main`:** Bounded rollback route repair implemented in
+    [#8470](https://github.com/loopx-project/loopx/pull/8470); installed
+    acceptance remains separate.
+  - **Current boundary:** Explicit registry/runtime routes stay bound across
+    `update --rollback` planning and child checks, with bounded CLI diagnostics
+    on failure. The read-only compatibility check can reject the target before
+    the switch. For a managed archive launcher, a nonzero core doctor result
+    restores the previous launcher. If only extension doctor returns nonzero,
+    the target runtime stays active and failing providers remain unavailable.
+- [Provider-Neutral Turn-Start Inbox Hook v0](provider-neutral-turn-start-inbox-hook-v0.md)
+  - **Delivery on `main`:** Implemented, opt-in.
+  - **Current boundary:** The provider-neutral turn-start read contract and
+    Lark ACK/replay path shipped in
+    [#3678](https://github.com/huangruiteng/loopx/pull/3678) and
+    [#3733](https://github.com/huangruiteng/loopx/pull/3733); no provider is
+    enabled implicitly.
+- [Provider-Neutral Post-Writeback Capability Hooks v0](provider-neutral-post-writeback-capability-hooks-v0.md)
+  ([中文版](provider-neutral-post-writeback-capability-hooks-v0.zh-CN.md))
+  - **Delivery on `main`:** First end-to-end vertical implemented.
+  - **Current boundary:** The periodic-report producer, durable intent
+    lifecycle, terminal closeout dispatch, consumer, and approved Goal Channel
+    delivery shipped through
+    [#3691](https://github.com/huangruiteng/loopx/pull/3691),
+    [#3748](https://github.com/huangruiteng/loopx/pull/3748),
+    [#3749](https://github.com/huangruiteng/loopx/pull/3749), and
+    [#3755](https://github.com/huangruiteng/loopx/pull/3755). General
+    multi-capability promotion remains under review.
 - [LoopX Desktop Execution Frontends v0](desktop-execution-frontends-v0.md)
-  ([中文版](desktop-execution-frontends-v0.zh-CN.md)): support both
-  attachment to an externally owned Codex App session and a LoopX-managed Pi or
-  DeepSeek Harness runtime driven by bounded Turns, with a provider-neutral
-  contract and Ark Agent Plan as the default product profile; converge Web and
-  Agent-scoped Lark Bot connections on the same ordered working session, and
-  route group messages or document comments through a provider-neutral external
-  Connector contract.
-- [Agent IM, LoopX, and OpenViking collaboration v0](agent-im-openviking-collaboration-v0.md):
-  separate runtime delivery, durable control state, and scoped context while
-  preserving direct agent-to-LoopX interaction.
-- [Goal Channel collaboration v0](goal-channel-collaboration-v0.md)
-  ([中文版](goal-channel-collaboration-v0.zh-CN.md)): bind external
-  collaboration surfaces to one LoopX goal while preserving LoopX as the
-  source of truth; interactive chat is refined by the Desktop Execution
-  Frontends RFC to route through an explicit Agent working session.
-- [Per-Goal Usage, Token, and Cost Surfacing v0](goal-usage-token-cost-v0.md):
-  capture per-goal token, cost, and duration in core `usage_summary` and surface
-  it in the existing dashboard behind a provider-neutral capture layer.
+  ([中文版](desktop-execution-frontends-v0.zh-CN.md))
+  - **Delivery on `main`:** Supporting foundations implemented.
+  - **Current boundary:** Attached and managed runtime, desktop, and connector
+    pieces exist, but the unified execution-frontend/session-ownership contract
+    and cross-transport convergence are not accepted as one shipped product
+    boundary.
+- [DSH / Pi: L1 Observation and Managed Runtime Selection](harness-selection-dsh-pi-v0.md)
+  ([中文版](harness-selection-dsh-pi-v0.zh-CN.md))
+  - **Delivery on `main`:** Partial; the combined reliability-diagnostics
+    readback and the bounded managed Turn host default-host resolution shipped,
+    the steward channel transport and intake sections record dated increments.
+  - **Current boundary:** Keeps DSH as the first L1 event source and Pi as a
+    managed-runtime candidate; no quantitative winner is claimed and the
+    session-owning runtime role stays opt-in pending the C0/C1, overhead,
+    retention and Mode B evidence rows.
+- [External Evidence Research Capability v0](external-evidence-research-capability-v0.md)
+  ([中文版](external-evidence-research-capability-v0.zh-CN.md))
+  - **Delivery on `main`:** Bounded slice; see the RFC acceptance section for
+    the audited state of the `external_evidence_research_v0` lifecycle.
+  - **Current boundary:** Provider-neutral research planning, provenance
+    admission, projection and retirement under one capability; a provider is
+    selectable only when readback says `declared`, `installed`, `enabled` and
+    `ready`. Product surfaces and TypeScript ownership are proposed, not promoted.
+- [Agent Session Execution Modes v0](agent-session-execution-modes-v0.md)
+  ([中文版](agent-session-execution-modes-v0.zh-CN.md))
+  - **Delivery on `main`:** Partial; the attached-host binding, broker, and
+    runtime fencing are implemented, while cross-host admission is proposed.
+  - **Current boundary:** Normalizes the attached/managed session-ownership
+    decision into one cross-host admission rule: an explicit persisted mode per
+    binding, one executor per Agent binding, capability-gated delivery that
+    fails closed, and no implicit mode change. Desktop product flows stay with
+    the Desktop frontends RFC, local service lifecycle with the daemon RFC, and
+    continuation with the manager RFC. Optional preview hosts, session
+    rotation, and host promotion remain unapproved.
+- [Goal Channel Collaboration v0](goal-channel-collaboration-v0.md)
+  ([中文版](goal-channel-collaboration-v0.zh-CN.md))
+  - **Delivery on `main`:** Lark vertical implemented.
+  - **Current boundary:** Goal-bound Lark groups, Kanban, gate notifications,
+    shared targets, and Bot runtime integration are shipped. The
+    provider-neutral multi-surface model remains draft, and interactive
+    transport is refined by the Desktop Frontends RFC.
+- [Agent IM, LoopX, and OpenViking Collaboration v0](agent-im-openviking-collaboration-v0.md)
+  - **Delivery on `main`:** Proposal only.
+  - **Current boundary:** LoopX, IM, and OpenViking have adjacent
+    implementations, but this three-owner collaboration contract has not
+    shipped as an integrated path.
+
+## Operator Experience And Observability
+
+- [Personal Follow-through historical proposal](personal-follow-through-v0.md)
+  ([中文版](personal-follow-through-v0.zh-CN.md))
+  - **Current boundary:** Design ownership and acceptance belong to the
+    [capable manager](capable-manager-semantic-handoff-v0.md). The
+    [Lark personal profile](../../product/use-cases/office-operations/personal-follow-through.md)
+    retains source interpretation and evaluation; the installed journey remains unqualified.
+
+- [Per-Goal Usage, Token, and Cost Surfacing v0](goal-usage-token-cost-v0.md)
+  - **Delivery on `main`:** Core slice implemented.
+  - **Current boundary:** Codex usage capture, normalized aggregation, and
+    dashboard surfacing shipped in
+    [#3117](https://github.com/huangruiteng/loopx/pull/3117); broader
+    runtime/provider coverage and cost semantics remain incomplete.
+- [Intelligent Review and Dynamic Presentation Surfaces v0](intelligent-review-presentation-surfaces-v0.md)
+  ([中文版](intelligent-review-presentation-surfaces-v0.zh-CN.md))
+  - **Delivery on `main`:** Bounded action-review, attention-detail and local
+    delivery-review verticals implemented.
+  - **Current boundary:** Typed action plans serve Dashboard and the existing
+    Lark operation cards. Direct Goal workspace navigation and Overview compose
+    bounded graph/acceptance readback, source navigation and snapshot export. General cross-channel disclosure,
+    living documents and governed amendment/settlement review remain open.
+- [Goal Workspace Surface v0](goal-workspace-surface-v0.md)
+  ([中文版](goal-workspace-surface-v0.zh-CN.md))
+  - **Delivery on `main`:** Proposal only; Overview, Tasks, Chat, Files, the W1
+    map, usage, acceptance readback and lifecycle stop ship as separate regions.
+  - **Current boundary:** Owns one Goal page's composition and the display
+    semantics of its vitals: persistent masthead with scoped Stop, window- and
+    coverage-labeled figures, work grouped by owner, all-work rail, shared
+    selection and since-last-look delta. M1 requires first-screen preview
+    approval. No new authority, Todo field, lifetime usage or Lark parity.
+- [Live Team Workspace v0](live-team-workspace-v0.md)
+  ([中文版](live-team-workspace-v0.zh-CN.md))
+  - **Delivery on `main`:** Partial: bounded team inspection and readable Goal Chat
+    results/comparison are shipped; live team streaming remains unqualified.
+  - **Current boundary:** A command surface plus spatial research studio, evidence
+    handoff motion, conclusion revision and replay. L1 requires one real
+    objection→revision→acceptance→adoption journey with evidence and intervention/stop
+    feedback in packaged UI; L2 requires original-coordinator two-cycle acceptance;
+    L3 qualifies semantic zoom and display scale. No new scheduler or authority.
+    The proposed [long-horizon product reading journey](../../product/use-cases/auto-research/long-horizon-progress-design.md)
+    ([中文版](../../product/use-cases/auto-research/long-horizon-progress-design.zh-CN.md))
+    adds a one-selection evidence-reading target under this presentation owner;
+    research calibration and packaged qualification remain open, without delaying L1/R2.
+- [Human Attention Wishlist v0](human-attention-wishlist-v0.md)
+  ([中文版](human-attention-wishlist-v0.zh-CN.md))
+  - **Delivery on `main`:** Intentionally deferred.
+  - **Current boundary:** The RFC remains a discussion contract. Runtime work is
+    held until repeated real usage demonstrates a second need without weakening
+    non-blocking authority boundaries.
+
+## Benchmark And Reliability Engineering
+
+- [Benchmark Study Upload and Dashboard Projection v0](benchmark-study-upload-dashboard-v0.md)
+  - **Delivery on `main`:** Proposal only.
+  - **Current boundary:** Experiment-board rows and benchmark-native scores
+    remain authoritative; the study manifest, upload/readback envelope, and
+    campaign-to-run dashboard projection are proposed but not implemented.
+- [Long-Horizon Harness Benchmark and Research Program v0](long-horizon-harness-benchmark-research-program-v0.md)
+  ([中文版](long-horizon-harness-benchmark-research-program-v0.zh-CN.md))
+  - **Delivery on `main`:** Active research and engineering program.
+  - **Current boundary:** ALE, LHTB, and DeepSWE form the external-validity
+    portfolio; benchmark infrastructure and evidence workflows are being built
+    without treating the research program as a runtime protocol.
+- [Long-Running Agent Reliability Diagnostics and Governed Delivery v0](long-running-agent-reliability-diagnostics-governed-delivery-v0.md)
+  ([中文版](long-running-agent-reliability-diagnostics-governed-delivery-v0.zh-CN.md))
+  - **Delivery on `main`:** Default-off L1 diagnostic prototype and first DSH
+    event-source adapter implemented.
+  - **Current boundary:** The capability-owned README records the prototype;
+    C0 adapter fidelity, C1 non-interference and measured overhead remain
+    required before P0 exit. Broader governed delivery and commercial adoption
+    remain proposals.
 
 RFCs must not contain internal conversations, private links, local filesystem
 paths, credentials, raw transcripts, or non-public organizational context.

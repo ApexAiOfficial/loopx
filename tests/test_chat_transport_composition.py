@@ -1,0 +1,431 @@
+"""Installed providers share native ownership; no HTTP registration or model."""
+from types import SimpleNamespace
+import threading
+import json
+from urllib.request import urlopen
+
+import pytest
+from test_chat_ordinary_project import ordinary  # noqa: F401
+
+from loopx.capabilities.native_chat.transports import ChatConversationTransports
+
+
+class Transport:
+    supports_result_files = False
+
+    def __init__(self, ref):
+        self.transport_ref = ref
+        self.calls = []
+        self.available = True
+        self.started = False
+
+    def observe(self):
+        self.calls.append("observe")
+        return {"transport_ref": self.transport_ref, "provider_ref": "a" * 24,
+                "operator_ref": "b" * 24, "verified": self.available}
+
+    def send_with_attempt(self, route, session, turn, text, record_attempt):
+        self.calls.append(("send", route, session, turn, text))
+        record_attempt({"message_ref": "frozen-provider-id"})
+        return {"reply_verified": False, "verification_performed": False}
+
+    def verify(self, route, session, turn, text, attempt):
+        self.calls.append(("verify", route, attempt))
+        return {"reply_verified": False, "verification_performed": True}
+
+    def start(self, server):
+        self.started = True
+        self.calls.append(("start", server))
+
+    def close(self):
+        self.calls.append("close")
+
+
+def composition():
+    default, external = Transport("lark-app"), Transport("external-owner")
+    composed = ChatConversationTransports(observe_default=lambda ref: default.observe(), transports=(external,))
+    composed.default_return = default
+    session = {"session_id": "original-session", "channel_id": "original-channel",
+               "steward_context": {"transport_ref": "external-owner"}}
+    selected = {"binding": {"transport_ref": "external-owner"}, "channel_id": "original-channel"}
+    composed.bindings = SimpleNamespace(session_context=lambda saved: selected)
+    route = {"session_id": session["session_id"], "channel_id": session["channel_id"]}
+    return composed, default, external, session, route
+
+
+def test_observation_and_return_follow_original_transport_even_after_new_session():
+    composed, default, external, session, route = composition()
+    assert composed.observe("external-owner")["verified"] is True
+    assert composed.observe("lark-app")["verified"] is True
+    attempts = []
+    composed.send_with_attempt(route, session, {}, "full late result", attempts.append)
+    composed.verify(route, session, {}, "full late result", attempts[0])
+    assert external.calls[-1] == ("verify", route, attempts[0])
+    assert not any(isinstance(c, tuple) and c[0] == "send" for c in default.calls)
+    web = {"session_id": "web", "channel_id": "legacy-group"}
+    composed.send_with_attempt({}, web, {}, "legacy result", attempts.append)
+    assert default.calls[-1][0] == "send"
+
+
+@pytest.mark.parametrize("field", ["channel_id", "session_id"])
+def test_changed_original_route_cannot_disclose_to_any_transport(field):
+    composed, default, external, session, route = composition()
+    route[field] = "other"
+    with pytest.raises(ValueError, match="audience changed"):
+        composed.send_with_attempt(route, session, {}, "private result", lambda value: None)
+    assert default.calls == external.calls == []
+
+
+def test_revocation_and_rotation_fence_send_and_readback():
+    composed, default, external, session, route = composition()
+    def revoked(saved):
+        raise ValueError("revoked exact binding")
+    composed.bindings.session_context = revoked
+    for operation in [lambda: composed.send_with_attempt(route, session, {}, "result", lambda value: None),
+                      lambda: composed.verify(route, session, {}, "result", {})]:
+        with pytest.raises(ValueError, match="revoked"):
+            operation()
+    external.available = False
+    with pytest.raises(ValueError, match="unverified"):
+        composed.observe("external-owner")
+    with pytest.raises(ValueError, match="unverified"):
+        composed.observe("unknown-transport")
+    assert default.calls == ["observe"]
+
+
+def test_file_support_and_stop_are_provider_specific():
+    composed, default, external, session, route = composition()
+    route["result_attachments"] = [{"name": "private.txt"}]
+    with pytest.raises(ValueError, match="does not support"):
+        composed.send_with_attempt(route, session, {}, "result", lambda value: None)
+    assert external.calls == []
+    default.supports_result_files = True
+    composed.bindings.session_context = lambda saved: {"binding": {"transport_ref": "lark-app"}, "channel_id": route["channel_id"]}
+    composed.send_with_attempt(route, session, {}, "file result", lambda value: None)
+    assert default.calls[-1][0] == "send"
+    stopped = threading.Event()
+    composed.cancelled = stopped.is_set
+    stopped.set()
+    assert external.cancelled() and default.cancelled()
+
+
+def test_duplicate_reference_and_lifecycle_failure_do_not_leave_consumers():
+    first, second = Transport("one"), Transport("two")
+    with pytest.raises(ValueError, match="duplicate"):
+        ChatConversationTransports(observe_default=lambda ref: {}, transports=(first, first))
+    composed = ChatConversationTransports(observe_default=lambda ref: {}, transports=(first, second))
+    def fail(server):
+        raise OSError("provider startup failed")
+    second.start = fail
+    with pytest.raises(OSError, match="startup failed"):
+        composed.start(object())
+    composed.start(object())
+    composed.close()
+    assert first.calls[-1] == second.calls[-1] == "close"
+    assert first.calls.count("close") == 1
+
+
+def test_provider_close_failure_still_closes_other_consumers_and_preserves_start_error(caplog):
+    first, second = Transport("one"), Transport("two")
+    def fail_start(server):
+        raise OSError("startup failure")
+    def fail_close():
+        second.calls.append("close")
+        raise ValueError("private provider detail")
+    second.start = fail_start
+    second.close = fail_close
+    composed = ChatConversationTransports(observe_default=lambda ref: {}, transports=(first, second))
+    with pytest.raises(OSError, match="startup failure"):
+        composed.start(object())
+    composed.close()
+    assert first.calls.count("close") == second.calls.count("close") == 1
+    assert "ValueError" in caplog.text
+    assert "private provider detail" not in caplog.text
+
+
+def test_return_rechecks_actual_typed_binding_after_owner_disconnect(ordinary):  # noqa: F811
+    from loopx.capabilities.native_chat.conversation_bindings import ChatConversationBindings
+    store, runtime, contexts, _, _, _, workspace = ordinary
+    external = Transport("external-owner")
+    composed = ChatConversationTransports(observe_default=lambda ref: {}, transports=(external,))
+    bindings = ChatConversationBindings(root=store.root, project_contexts=contexts, observe=composed.observe)
+    composed.bindings = bindings
+    contexts.conversation_bindings = bindings
+    row = bindings.configure(transport_ref=external.transport_ref, project_ref=contexts.available()[0]["project_ref"],
+        executor_endpoint_id="codex", context_kind="steward", goal_scope="selected")
+    source = {"source_ref": "c" * 24, "sender_ref": row["operator_ref"], "private_human_message": True}
+    selected = bindings.resolve(binding_id=row["binding_id"], **source)
+    session = {"session_id": "exact-original", "channel_id": selected["channel_id"],
+               "steward_context": selected["context"]}
+    route = {"session_id": session["session_id"], "channel_id": session["channel_id"]}
+    attempts = []
+    composed.send_with_attempt(route, session, {}, "full result", attempts.append)
+    assert attempts == [{"message_ref": "frozen-provider-id"}]
+    bindings.disconnect(row["binding_id"], expected_revision=bindings.read()["revision"])
+    before = len(external.calls)
+    with pytest.raises(ValueError):
+        composed.verify(route, session, {}, "full result", attempts[0])
+    assert len(external.calls) == before
+
+
+def test_http_queue_pins_source_revision_but_rechecks_inputs_and_authority(ordinary, monkeypatch):  # noqa: F811
+    import loopx.control_plane.effect_runtime as effect
+    from loopx.capabilities.native_chat.conversation_bindings import ChatConversationBindings
+
+    store, runtime, contexts, request, _, _, _ = ordinary
+    external = Transport("external-owner")
+    composed = ChatConversationTransports(observe_default=lambda ref: {}, transports=(external,))
+    bindings = ChatConversationBindings(root=store.root, project_contexts=contexts, observe=composed.observe)
+    composed.bindings = bindings
+    contexts.conversation_bindings = bindings
+    row = bindings.configure(transport_ref=external.transport_ref,
+        project_ref=contexts.available()[0]["project_ref"], executor_endpoint_id="codex",
+        context_kind="steward", goal_scope="selected")
+    selected = bindings.resolve(binding_id=row["binding_id"], source_ref="c" * 24,
+        sender_ref=row["operator_ref"], private_human_message=True)
+    session = store.create_session(goal_id="loopx-manager", agent_id="codex", adapter_kind="codex",
+        upstream_thread_id="synthetic-thread", channel_id=selected["channel_id"],
+        steward_context=selected["context"])
+    sid = session["session_id"]
+    first, _ = store.create_queued_turn(sid, client_turn_id="first", message="First original input")
+    fingerprint = effect._runtime_fingerprint
+    qualifications = []
+
+    def qualify():
+        revision = fingerprint()
+        qualifications.append(revision)
+        return revision
+
+    monkeypatch.setattr(effect, "_runtime_fingerprint", qualify)
+
+    def read_queue():
+        qualifications.clear()
+        return request(f"/api/chat/sessions/{sid}/queue")
+
+    try:
+        status, payload = read_queue()
+        assert status == 200 and [turn["turn_id"] for turn in payload["turns"]] == [first["turn_id"]]
+        assert len(qualifications) == 1
+        second, _ = store.create_queued_turn(sid, client_turn_id="second", message="New original input")
+        status, payload = read_queue()
+        assert status == 200 and {turn["turn_id"] for turn in payload["turns"]} == {first["turn_id"], second["turn_id"]}
+        assert len(qualifications) == 1
+        external.available = False
+        status, payload = read_queue()
+        assert status == 400 and "turns" not in payload
+        external.available = True
+        bindings.disconnect(row["binding_id"], expected_revision=bindings.read()["revision"])
+        status, payload = read_queue()
+        assert status == 400 and "turns" not in payload
+        qualifications.clear()
+        assert request("/healthz")[0] == 200
+        assert qualifications == []
+        assert {turn["turn_id"] for turn in store.queued_turns(sid)} == {first["turn_id"], second["turn_id"]}
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_real_chat_entrypoint_composes_one_store_controller_and_return_service(tmp_path, monkeypatch, installed):
+    import loopx.chat_server as chat
+    import loopx.chat.endpoint_catalog as endpoints
+    from loopx.cli import build_parser
+    from loopx.cli_commands.support_control_chat import chat_server_options
+    from loopx.extensions.lark.cli_resolution import LarkCliResolution
+    home = tmp_path / "home"
+    registry = home / ".loopx" / "registry.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({"goals": []}))
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "index.html").write_text("fixture")
+    monkeypatch.setattr(chat.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(chat, "build_lark_goal_topic_runtime_snapshot", lambda **kwargs: {})
+    monkeypatch.setattr(chat, "resolve_lark_cli_for_runtime", lambda **kwargs: LarkCliResolution(None, False, "missing", None, "lark_cli_not_installed"))
+    observations = []
+
+    def observe_endpoint():
+        available = len(observations) % 2 == 0
+        observations.append(available)
+        return {"available": available, "executable": "synthetic-endpoint"}
+
+    monkeypatch.setattr(endpoints, "_antigravity_readiness", observe_endpoint)
+    monkeypatch.setattr(endpoints, "_executable_readiness", lambda executable: {
+        "available": executable == "unavailable-fixture", "executable": executable,
+    })
+    entered = threading.Event()
+    captured = []
+    external = Transport("external-owner")
+    return_service_start_observations = []
+    if installed:
+        from loopx.capabilities.manager_context import roundtrip
+        original_return_service_start = roundtrip.ReturnService.start
+
+        def record_return_service_start(service):
+            return_service_start_observations.append(external.started)
+            original_return_service_start(service)
+
+        monkeypatch.setattr(roundtrip.ReturnService, "start", record_return_service_start)
+    class Server(chat.ChatHTTPServer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured.append(self)
+            entered.set()
+    monkeypatch.setattr(chat, "ChatHTTPServer", Server)
+    args = build_parser().parse_args(["--runtime-root", str(tmp_path / "runtime"),
+        "chat", "--port", "0", "--assets-dir", str(assets), "--no-open",
+        "--codex-bin", "unavailable-fixture"])
+    options = chat_server_options(args, registry_path=registry)
+    assert options["startup_timeout_sec"] is None
+    worker = threading.Thread(target=chat.serve_chat, kwargs={**options,
+        "external_conversation_factories": (lambda server: external,) if installed else ()}, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(8)
+        server = captured[0]
+        with urlopen(f"http://127.0.0.1:{server.server_port}/healthz", timeout=8) as response:
+            assert json.load(response)["ok"] is True
+        from loopx.capabilities.machine_configuration.builtins import build_builtin_machine_configuration_registry
+        from loopx.capabilities.machine_configuration.store import configure_machine_configuration
+
+        configuration = {"schema_version": "loopx_machine_configuration_v0", "namespaces": {
+            "steward_executor": {"schema_version": "steward_executor_machine_defaults_v1",
+                "selection_policy": "flexible", "eligible_endpoints": ["antigravity", "codex"],
+                "executor_endpoint": "antigravity", "executor_model": "gemini-4-argon-high",
+                "executor_reasoning_effort": "high"}}}
+        configuration_args = {"runtime_root": server.runtime_root, "configuration": configuration,
+            "registry": build_builtin_machine_configuration_registry()}
+        preview = configure_machine_configuration(**configuration_args, execute=False)
+        configure_machine_configuration(**configuration_args, execute=True,
+            expected_plan_revision=preview["plan_revision"])
+        observations.clear()
+        for expected in (True, False, True):
+            with urlopen(f"http://127.0.0.1:{server.server_port}/api/chat/capabilities", timeout=8) as response:
+                capabilities = json.load(response)
+            available = {item["agent_id"]: item["available"] for item in capabilities["adapters"]}
+            assert available["antigravity"] is expected
+            # The channel must choose from the same observation shown in Settings,
+            # including when the preferred endpoint disappears and later returns.
+            selected = capabilities["manager"]["channel_binding"]["executor_endpoint"]
+            assert selected == ("antigravity" if expected else "codex")
+            assert available[selected] is True
+        assert observations == [True, False, True]
+        assert server.chat_store.list_sessions() == []
+        assert server.runtime_controller.startup_timeout_sec == 30.0
+        assert server.runtime_controller.acp_startup_timeout_sec is None
+        if server.codex_account_service.provider is not None:
+            assert server.codex_account_service.provider.root == (
+                server.runtime_root / "extensions" / "codex-native-accounts"
+            )
+        assert server.manager_return_service.args[2] is server.chat_store
+        if installed:
+            assert server.manager_return_service.args[3] is server.conversation_transports
+            assert server.conversation_transports.bindings is server.runtime_controller.project_contexts.conversation_bindings
+            assert return_service_start_observations == [True]
+        else:
+            from loopx.extensions.lark.manager_returns import LarkManagerReturnTransport
+            assert not hasattr(server, "conversation_transports")
+            assert isinstance(server.manager_return_service.args[3], LarkManagerReturnTransport)
+        assert server.lark_private_conversations.core.controller is server.runtime_controller
+        assert server.lark_private_conversations.core.actions is server.action_service
+    finally:
+        if captured:
+            captured[0].shutdown()
+        worker.join(8)
+    assert not worker.is_alive()
+    assert external.calls == [("start", server), "close"] if installed else external.calls == []
+
+
+def test_account_settings_control_registry_owner_with_separate_conversation_storage(tmp_path, monkeypatch):
+    """The settings toggle must control the same policy the native CLI reads."""
+    import importlib
+    from pathlib import Path
+    from urllib.error import HTTPError
+    from urllib.request import Request
+
+    import loopx.chat_server as chat
+    from loopx.extensions.lark.cli_resolution import LarkCliResolution
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] /
+                                  "packages/loopx-codex-provider-routing/src"))
+    native = importlib.import_module("loopx_codex_provider_routing.native")
+    monkeypatch.setattr(native, "discover", lambda: {"synthetic": True})
+    effects = []
+
+    def transport(adapter, operation, **parameters):
+        effects.append(operation)
+        if operation == "status":
+            return {"slots": ["a", "b"], "active_slot": "a", "selection_revision": "fixture",
+                    "current_login_matches": True, "recovery_required": False}
+        if operation == "observe":
+            import time
+            return {"observations": [{"slot": slot, "status": "ok", "observed_at": time.time(),
+                    "usage": {"rate_limit": {"primary_window": {"used_percent": 0,
+                              "reset_at": time.time() + 3600}}, "credits": {"has_credits": False}}}
+                    for slot in parameters["slots"]]}
+        raise AssertionError("No account effect is authorized in this fixture: " + operation)
+
+    provider_type = native.NativeAccounts
+    monkeypatch.setattr(native, "NativeAccounts", lambda root: provider_type(root, transport=transport))
+    owner_root, conversation_root = tmp_path / "owner", tmp_path / "conversations"
+    owner = provider_type(owner_root, transport=transport)
+    owner.configure(expected_revision=0, enabled=True, slots=["a", "b"], restart_clients=True)
+    separate = provider_type(conversation_root, transport=transport)
+    separate.configure(expected_revision=0, enabled=False, slots=[])
+    separate_before = separate.path.read_bytes()
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"goals": [], "common_runtime_root": str(owner_root)}))
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "index.html").write_text("fixture")
+    monkeypatch.setattr(chat, "build_lark_goal_topic_runtime_snapshot", lambda **kwargs: {})
+    monkeypatch.setattr(chat, "resolve_lark_cli_for_runtime", lambda **kwargs:
+                        LarkCliResolution(None, False, "missing", None, "lark_cli_not_installed"))
+    servers, ready, failures = [], threading.Event(), []
+
+    class Server(chat.ChatHTTPServer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            servers.append(self)
+            ready.set()
+
+    monkeypatch.setattr(chat, "ChatHTTPServer", Server)
+
+    def serve():
+        try:
+            chat.serve_chat(registry_path=registry, runtime_root_override=conversation_root,
+                            port=0, assets_dir=assets, codex_bin="unavailable-fixture")
+        except BaseException as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        assert ready.wait(8)
+        server = servers[0]
+        url = f"http://127.0.0.1:{server.server_port}/api/chat/codex-accounts"
+        with urlopen(url, timeout=8) as response:
+            before = json.load(response)
+        assert before["policy"]["enabled"] is True
+        assert before["policy"]["slots"] == ["a", "b"]
+        assert server.chat_store.root == conversation_root / "chat"
+        request = {"operation": "configure", "parameters": {
+            "expected_revision": before["revision"], "enabled": False, "slots": ["a", "b"]}}
+        headers = {"Content-Type": "application/json"}
+        with urlopen(Request(url, data=json.dumps(request).encode(), headers=headers), timeout=8) as response:
+            disabled = json.load(response)
+        assert disabled["policy"]["enabled"] is False
+        assert owner.status()["policy"]["enabled"] is False
+        assert owner.status()["policy"]["restart_clients"] is True
+        with pytest.raises(HTTPError) as conflict:
+            urlopen(Request(url, data=json.dumps(request).encode(), headers=headers), timeout=8)
+        assert conflict.value.code == 409
+        assert json.load(conflict.value)["code"] == "configuration_changed"
+        assert separate.path.read_bytes() == separate_before
+        assert "switch" not in effects
+    finally:
+        if servers:
+            servers[0].shutdown()
+        worker.join(8)
+    assert not worker.is_alive() and not failures

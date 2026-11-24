@@ -1,28 +1,24 @@
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .control_plane.runtime.time import parse_timestamp as _parse_timestamp
 from .control_plane.todos.contract import normalize_required_write_scopes
+from .public_safe_text import (
+    PRIVATE_TEXT_PATTERNS as SHARED_PRIVATE_TEXT_PATTERNS,
+    TEXT_OWNER_CATEGORIES,
+    classify_private_text,
+)
 
 
 CHECKPOINTED_BOUNDARY_AUTHORITY_SCHEMA_VERSION = "checkpointed_boundary_authority_v0"
 ACTIVE_BOUNDARY_AUTHORITY_STATUSES = {"active", "approved"}
 BOUNDARY_AUTHORITY_DECISIONS = {"approve", "reject", "defer"}
-PRIVATE_TEXT_PATTERNS = (
-    re.compile(r"/" + r"Users/"),
-    re.compile(r"/" + r"ext_data/"),
-    re.compile("la" + "rk" + "office", re.I),
-    re.compile("docs" + r"\." + "internal", re.I),
-    re.compile(r"\bt-20\d{12}-[a-z0-9]+\b"),
-    re.compile(r"\b" + "Bear" + r"er\b", re.I),
-    re.compile(r"\b" + "Author" + r"ization\b", re.I),
-    re.compile(r"\b" + "tok" + r"en\s*=", re.I),
-    re.compile(r"\b" + "pass" + r"word\b", re.I),
-    re.compile(r"\b" + "sec" + r"ret\b", re.I),
-)
+# Owned by loopx.public_safe_text so every real validator owner shares one
+# contract; re-exported here because callers already import this name.
+PRIVATE_TEXT_PATTERNS = SHARED_PRIVATE_TEXT_PATTERNS
 
 
 def _now() -> datetime:
@@ -30,11 +26,11 @@ def _now() -> datetime:
 
 
 def _validate_public_safe_text(label: str, value: str | None) -> None:
-    if not value:
-        return
-    for pattern in PRIVATE_TEXT_PATTERNS:
-        if pattern.search(value):
-            raise ValueError(f"{label} contains a private-looking value; keep raw evidence in private payloads")
+    # Checkpointed lease text is LoopX's own state, so it uses the internal-state
+    # policy: the words bearer/password/secret are recognized, not rejected, while
+    # every shape that carries a value still fails (Refs #5136, direction 2).
+    if classify_private_text(value, categories=TEXT_OWNER_CATEGORIES) is not None:
+        raise ValueError(f"{label} contains a private-looking value; keep raw evidence in private payloads")
 
 
 def _clean_text(value: Any, *, limit: int = 180) -> str | None:
@@ -114,9 +110,21 @@ def normalize_checkpointed_boundary_authority_entries(
         source = _clean_text(raw.get("source") or raw.get("provenance") or raw.get("reason_summary"))
         decision_id = _clean_text(raw.get("decision_id") or raw.get("run_id") or raw.get("gate_id"), limit=120)
         recorded_at = str(raw.get("recorded_at") or raw.get("decision_at") or "").strip()
-        expires_at = str(raw.get("expires_at") or raw.get("fresh_until") or "").strip()
+        # Null/blank retains the optional no-expiry contract. A supplied invalid
+        # value (including a false-like non-string) must not become no expiry.
+        expires_at = ""
+        for field in ("expires_at", "fresh_until"):
+            raw_expiry = raw.get(field)
+            if raw_expiry is not None:
+                expires_at = str(raw_expiry).strip()
+                if expires_at:
+                    break
         recorded = _parse_timestamp(recorded_at)
-        expires = _parse_timestamp(expires_at)
+        try:
+            expires = _parse_timestamp(expires_at)
+        except OverflowError:
+            # An ISO offset can place an instant outside datetime's UTC range.
+            expires = None
         inactive_reasons: list[str] = []
         if not scopes:
             inactive_reasons.append("missing_write_scope")
@@ -128,7 +136,9 @@ def normalize_checkpointed_boundary_authority_entries(
             inactive_reasons.append("inactive_status")
         if decision != "approve":
             inactive_reasons.append("decision_not_approved")
-        if expires and expires < current_time:
+        if expires_at and (not isinstance(raw_expiry, str) or expires is None):
+            inactive_reasons.append("invalid_expires_at")
+        elif expires and expires < current_time:
             inactive_reasons.append("expired")
         entry: dict[str, Any] = {
             "schema_version": CHECKPOINTED_BOUNDARY_AUTHORITY_SCHEMA_VERSION,
@@ -138,7 +148,10 @@ def normalize_checkpointed_boundary_authority_entries(
             "source": source,
             "recorded_at": recorded_at or None,
             "expires_at": expires_at or None,
-            "freshness": "expired" if "expired" in inactive_reasons else "fresh",
+            "freshness": (
+                "invalid" if "invalid_expires_at" in inactive_reasons
+                else "expired" if "expired" in inactive_reasons else "fresh"
+            ),
             "active": not inactive_reasons,
         }
         if decision_id:
@@ -149,9 +162,15 @@ def normalize_checkpointed_boundary_authority_entries(
     return entries
 
 
-def _compact_checkpointed_boundary_authority_summary(value: Any) -> dict[str, Any] | None:
+def _compact_checkpointed_boundary_authority_summary(
+    value: Any,
+    *,
+    goal_repo: str | Path | None = None,
+) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
+
+    from .control_plane.coordination.configuration import fold_write_scope_subpaths
 
     def _count(raw: Any) -> int:
         try:
@@ -159,7 +178,10 @@ def _compact_checkpointed_boundary_authority_summary(value: Any) -> dict[str, An
         except (TypeError, ValueError):
             return 0
 
-    active_scopes = normalize_required_write_scopes(value.get("active_write_scope"))
+    active_scopes = fold_write_scope_subpaths(
+        normalize_required_write_scopes(value.get("active_write_scope")),
+        goal_repo=goal_repo,
+    )
     if not active_scopes and "active_count" not in value and "inactive_count" not in value:
         return None
     return {
@@ -170,12 +192,21 @@ def _compact_checkpointed_boundary_authority_summary(value: Any) -> dict[str, An
     }
 
 
-def checkpointed_boundary_authority_summary(coordination: dict[str, Any] | None) -> dict[str, Any] | None:
+def checkpointed_boundary_authority_summary(
+    coordination: dict[str, Any] | None,
+    *,
+    goal_repo: str | Path | None = None,
+) -> dict[str, Any] | None:
     if not isinstance(coordination, dict):
         return None
+    from .control_plane.coordination.configuration import fold_write_scope_subpaths
+
     checkpointed_authority = coordination.get("checkpointed_boundary_authority")
     if isinstance(checkpointed_authority, dict):
-        compact_summary = _compact_checkpointed_boundary_authority_summary(checkpointed_authority)
+        compact_summary = _compact_checkpointed_boundary_authority_summary(
+            checkpointed_authority,
+            goal_repo=goal_repo,
+        )
         if compact_summary is not None and "entries" not in checkpointed_authority:
             return compact_summary
         checkpointed_authority = checkpointed_authority.get("entries")
@@ -190,6 +221,7 @@ def checkpointed_boundary_authority_summary(coordination: dict[str, Any] | None)
         for scope in normalize_required_write_scopes(entry.get("write_scope")):
             if scope not in active_scopes:
                 active_scopes.append(scope)
+    active_scopes = fold_write_scope_subpaths(active_scopes, goal_repo=goal_repo)
     return {
         "schema_version": CHECKPOINTED_BOUNDARY_AUTHORITY_SCHEMA_VERSION,
         "active_count": len(active_entries),

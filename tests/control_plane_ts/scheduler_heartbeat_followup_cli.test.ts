@@ -1,0 +1,427 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { deflateSync } from "node:zlib";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+import { isSupportedNodeVersion } from "../../loopx/control_plane/runtime/node_version.ts";
+
+type CleanupContext = {
+  after(callback: () => void | Promise<void>): void;
+};
+
+const entrypoint = fileURLToPath(
+  new URL(
+    "../../loopx/control_plane/scheduler/heartbeat_followup_cli.ts",
+    import.meta.url,
+  ),
+);
+const goalId = "goal-followup-cli";
+const agentId = "agent-followup-cli";
+const turnId = "turn-followup-cli";
+
+test("heartbeat follow-up CLI applies minimum Node prerelease precedence", () => {
+  assert.equal(isSupportedNodeVersion("22.22.2"), false);
+  assert.equal(isSupportedNodeVersion("22.22.3-rc.1"), false);
+  assert.equal(isSupportedNodeVersion("22.22.3"), true);
+  assert.equal(isSupportedNodeVersion("22.22.4-rc.1"), true);
+  assert.equal(isSupportedNodeVersion("22.22.3+build.1"), true);
+});
+
+async function tempRuntime(t: CleanupContext): Promise<string> {
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "loopx-followup-cli-"));
+  t.after(() => rm(runtimeRoot, { recursive: true, force: true }));
+  return runtimeRoot;
+}
+
+async function writeReceipt(
+  runtimeRoot: string,
+  goalRef?: Record<string, string>,
+): Promise<void> {
+  const path = join(runtimeRoot, "goals", goalId, "rollout-event-log.jsonl");
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify({
+    schema_version: "loopx_rollout_event_v0",
+    event_kind: "quota_should_run",
+    goal_id: goalId,
+    agent_id: agentId,
+    run_id: turnId,
+    ...(goalRef === undefined ? {} : { goal_ref: goalRef }),
+  })}\n`, "utf8");
+}
+
+const goalRefA = {
+  goal_id: goalId,
+  goal_instance_id: `ginst_${"a".repeat(32)}`,
+};
+const goalRefB = {
+  goal_id: goalId,
+  goal_instance_id: `ginst_${"b".repeat(32)}`,
+};
+
+function hintPayload(
+  goalRef?: Record<string, string>,
+): Record<string, unknown> {
+  return {
+    schema_version: "loopx_scheduler_host_followup_hint_v0",
+    ...(goalRef === undefined ? {} : { goal_ref: goalRef }),
+    before: {
+      should_run: true,
+      normal_delivery_allowed: true,
+      recovery_delivery_allowed: false,
+      effective_action: "normal_run",
+      state: "eligible",
+    },
+    use_current_hint: true,
+    host_facts: {
+      schema_version: "loopx_scheduler_heartbeat_host_facts_v0",
+      operation: "ack",
+      goal_id: goalId,
+      agent_id: agentId,
+      surface: "codex_app",
+      state_key: "scheduler_hint.app_automation.stateful_backoff",
+      reset_token: "reset-cli-followup",
+      identity_signature: "identity-cli-followup",
+      progression_index: 0,
+      progression_minutes: [15, 30, 60],
+      expected_rrule: "FREQ=MINUTELY;INTERVAL=15",
+      applied_rrule: "FREQ=MINUTELY;INTERVAL=15",
+      cadence_class: "active_work",
+      generated_at: "2026-08-27T06:30:00Z",
+      ack_needed: true,
+      apply_needed: true,
+      source: "quota_scheduler_ack",
+      host_match_observed: true,
+    },
+  };
+}
+
+function chunks(value: unknown): string[] {
+  const encoded = deflateSync(Buffer.from(JSON.stringify(value), "utf8"))
+    .toString("base64")
+    .replace(/=+$/, "");
+  return encoded.match(/.{1,384}/g) ?? [];
+}
+
+function argv(runtimeRoot: string, format = "json", hint = hintPayload()): string[] {
+  const result = [
+    "--format",
+    format,
+    "--runtime-root",
+    runtimeRoot,
+    "quota",
+    "scheduler-ack-current",
+    "--goal-id",
+    goalId,
+    "--agent-id",
+    agentId,
+    "-A",
+    "--applied-rrule",
+    "FREQ=MINUTELY;INTERVAL=15",
+    "--app-automation-current-rrule",
+    "FREQ=MINUTELY;INTERVAL=15",
+    "--host-match-observed",
+  ];
+  for (const chunk of chunks(hint)) {
+    result.push("--scheduler-host-facts-chunk", chunk);
+  }
+  result.push("--turn-instance-id", turnId, "--execute");
+  return result;
+}
+
+function failureArgv(
+  runtimeRoot: string,
+  format = "json",
+  goalRef?: Record<string, string>,
+): string[] {
+  const payload = hintPayload(goalRef);
+  const facts = payload.host_facts as Record<string, unknown>;
+  payload.use_current_hint = false;
+  payload.host_facts = {
+    ...facts,
+    operation: "host_failure",
+    applied_rrule: "FREQ=MINUTELY;INTERVAL=3",
+    observed_host_rrule: "FREQ=MINUTELY;INTERVAL=3",
+    failure_kind: "timeout",
+    source: "quota_scheduler_host_update_failure",
+    host_match_observed: false,
+  };
+  const result = [
+    "--format",
+    format,
+    "--runtime-root",
+    runtimeRoot,
+    "quota",
+    "scheduler-fail-current",
+    "--goal-id",
+    goalId,
+    "--agent-id",
+    agentId,
+    "--failed-rrule",
+    "FREQ=MINUTELY;INTERVAL=15",
+    "--codex-app-current-rrule",
+    "FREQ=MINUTELY;INTERVAL=3",
+    "--failure-kind",
+    "timeout",
+  ];
+  for (const chunk of chunks(payload)) {
+    result.push("--scheduler-host-facts-chunk", chunk);
+  }
+  result.push("--turn-instance-id", turnId, "--execute");
+  return result;
+}
+
+function runCli(args: string[]) {
+  const child = spawnSync(
+    process.execPath,
+    ["--no-warnings", "--experimental-strip-types", entrypoint, ...args],
+    { encoding: "utf8" },
+  );
+  assert.equal(child.error, undefined, child.error?.message);
+  return child;
+}
+
+test("native scheduler CLI preserves receipt ownership with an explicit executable route", async (t) => {
+  const runtime = await tempRuntime(t);
+  await writeReceipt(runtime);
+  const child = runCli(["--cli-bin", "candidate's cli", ...argv(runtime)]);
+  assert.equal(child.status, 0, child.stdout + child.stderr);
+  const result = JSON.parse(child.stdout);
+  assert.equal(result.ok, true);
+  assert.equal(result.goal_id, goalId);
+  assert.equal(result.agent_id, agentId);
+});
+
+for (const program of ["", " ", "-invalid", "two\nlines"]) {
+  test(`native scheduler CLI rejects an invalid route ${JSON.stringify(program)} before effects`, async (t) => {
+    const runtime = await tempRuntime(t);
+    const child = runCli(["--cli-bin", program, ...argv(runtime)]);
+    assert.notEqual(child.status, 0);
+    assert.equal(JSON.parse(child.stdout).error.code, "invalid_scheduler_followup_argv");
+    assert.deepEqual(await readdir(runtime), []);
+  });
+}
+
+function invalidFactsArgv(parts: string[]): string[] {
+  const result = [
+    "--format",
+    "json",
+    "--runtime-root",
+    "/tmp/loopx-invalid-followup-facts",
+    "quota",
+    "scheduler-ack-current",
+    "--goal-id",
+    goalId,
+    "--agent-id",
+    agentId,
+  ];
+  for (const part of parts) {
+    result.push("--scheduler-host-facts-chunk", part);
+  }
+  result.push("--turn-instance-id", turnId, "--execute");
+  return result;
+}
+
+test("native host-followup CLI decodes bounded argv facts and writes JSON", async (t) => {
+  const runtimeRoot = await tempRuntime(t);
+  await writeReceipt(runtimeRoot);
+
+  const child = runCli(argv(runtimeRoot));
+
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout) as Record<string, unknown>;
+  assert.equal(result.schema_version, "loopx_scheduler_host_followup_result_v0");
+  assert.equal(result.ok, true);
+  assert.equal(result.mode, "scheduler-ack");
+  assert.equal(
+    (result.scheduler_commit as Record<string, unknown>).status,
+    "written",
+  );
+});
+
+test("native ACK cannot use its pre-update hint as fresh host readback", async (t) => {
+  const runtimeRoot = await tempRuntime(t);
+  await writeReceipt(runtimeRoot);
+  for (const observed of ["", "FREQ=MINUTELY;INTERVAL=3"]) {
+    const args = argv(runtimeRoot);
+    args[args.indexOf("--app-automation-current-rrule") + 1] = observed;
+    const child = runCli(args);
+    assert.equal(child.status, 1);
+    const result = JSON.parse(child.stdout) as Record<string, unknown>;
+    assert.equal(result.ok, false);
+    assert.equal(result.reason_code, "rrule_mismatch");
+    assert.equal((result.scheduler_commit as Record<string, unknown>).written, false);
+  }
+});
+
+test("dropping the bound host-match flag cannot bypass the launcher readback route", async (t) => {
+  const runtimeRoot = await tempRuntime(t);
+  await writeReceipt(runtimeRoot);
+  const args = argv(runtimeRoot);
+  args.splice(args.indexOf("--host-match-observed"), 1);
+  const child = runCli(args);
+  assert.equal(child.status, 1);
+  assert.equal(JSON.parse(child.stdout).error.code, "scheduler_host_facts_identity_mismatch");
+});
+
+test("neutral current readback updates a Trae ACK without reading Codex metadata", async (t) => {
+  for (const [before, observed] of [
+    ["FREQ=MINUTELY;INTERVAL=3", "FREQ=MINUTELY;INTERVAL=15"],
+    ["FREQ=MINUTELY;INTERVAL=15", "FREQ=MINUTELY;INTERVAL=3"],
+    ["FREQ=MINUTELY;INTERVAL=15", ""],
+  ]) {
+    await t.test(`${before} -> ${observed || "unavailable"}`, async (t) => {
+      const runtimeRoot = await tempRuntime(t);
+      await writeReceipt(runtimeRoot);
+      const hint = hintPayload();
+      const facts = hint.host_facts as Record<string, unknown>;
+      facts.surface = "trae_app";
+      facts.observed_host_rrule = before;
+      const args = argv(runtimeRoot, "json", hint);
+      args[args.indexOf("-A")] = "--trae_app";
+      args[args.indexOf("--app-automation-current-rrule") + 1] = observed;
+      const child = runCli(args);
+      const payload = JSON.parse(child.stdout) as Record<string, unknown>;
+      const matches = observed === "FREQ=MINUTELY;INTERVAL=15";
+      assert.equal(child.status, matches ? 0 : 1, child.stderr);
+      assert.equal(payload.ok, matches);
+      assert.equal((payload.scheduler_commit as Record<string, unknown>).written, matches);
+      if (!matches) assert.equal(payload.reason_code, "rrule_mismatch");
+    });
+  }
+});
+
+test("non-Codex ACK without a new observation preserves its bound facts", async (t) => {
+  const runtimeRoot = await tempRuntime(t);
+  await writeReceipt(runtimeRoot);
+  const hint = hintPayload();
+  const facts = hint.host_facts as Record<string, unknown>;
+  facts.surface = "trae_app";
+  facts.observed_host_rrule = "FREQ=MINUTELY;INTERVAL=15";
+  const args = argv(runtimeRoot, "json", hint);
+  args[args.indexOf("-A")] = "--trae_app";
+  args.splice(args.indexOf("--app-automation-current-rrule"), 2);
+  const child = runCli(args);
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(JSON.parse(child.stdout).scheduler_commit.status, "written");
+});
+
+test("native host-followup CLI preserves the scheduler Markdown surface", async (t) => {
+  const runtimeRoot = await tempRuntime(t);
+  await writeReceipt(runtimeRoot);
+
+  const child = runCli(argv(runtimeRoot, "markdown"));
+
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /^# LoopX Quota Scheduler Ack\n/);
+  assert.match(child.stdout, /- goal_id: `goal-followup-cli`/);
+  assert.match(child.stdout, /- should_run: `True`/);
+});
+
+test("native host-failure CLI preserves the legacy Markdown surface", async (t) => {
+  const runtimeRoot = await tempRuntime(t);
+  await writeReceipt(runtimeRoot);
+
+  const child = runCli(failureArgv(runtimeRoot, "markdown"));
+
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /^# LoopX Quota Scheduler Host Update Failure\n/);
+  assert.match(child.stdout, /- failed_rrule: `FREQ=MINUTELY;INTERVAL=15`/);
+  assert.match(child.stdout, /- observed_host_rrule: `FREQ=MINUTELY;INTERVAL=3`/);
+  assert.match(child.stdout, /- failure_kind: `timeout`/);
+  assert.match(child.stdout, /- failure_count: `1`/);
+});
+
+test("native scheduler CLI carries the hint Goal instance into ACK and failure writeback", async (t) => {
+  const runtimeRoot = await tempRuntime(t);
+  await writeReceipt(runtimeRoot, goalRefA);
+
+  const acknowledged = runCli(argv(runtimeRoot, "json", hintPayload(goalRefA)));
+  assert.equal(acknowledged.status, 0, acknowledged.stderr);
+  const ack = JSON.parse(acknowledged.stdout) as Record<string, unknown>;
+  assert.equal((ack.scheduler_commit as Record<string, unknown>).status, "written");
+
+  const failed = runCli(failureArgv(runtimeRoot, "json", goalRefA));
+  assert.equal(failed.status, 0, failed.stderr);
+  const failure = JSON.parse(failed.stdout) as Record<string, unknown>;
+  assert.equal(failure.ok, true);
+  assert.equal(failure.failure_count, 1);
+});
+
+test("native scheduler CLI rejects a receipt from another Goal instance without writing", async (t) => {
+  const runtimeRoot = await tempRuntime(t);
+  await writeReceipt(runtimeRoot, goalRefA);
+
+  const child = runCli(argv(runtimeRoot, "json", hintPayload(goalRefB)));
+
+  assert.notEqual(child.status, 0);
+  const result = JSON.parse(child.stdout) as Record<string, unknown>;
+  assert.equal(result.status, "heartbeat_receipt_missing");
+  assert.equal(
+    result.error_code,
+    "SCHEDULER_FOLLOWUP_HEARTBEAT_RECEIPT_MISSING",
+  );
+  assert.equal(result.scheduler_state_mutated, false);
+  assert.equal(result.write_performed, false);
+  assert.equal(result.appended, false);
+  assert.deepEqual(
+    await readdir(join(runtimeRoot, "goals", goalId)),
+    ["rollout-event-log.jsonl"],
+  );
+});
+
+test("native host-followup CLI returns the legacy receipt failure without writing", async (t) => {
+  const runtimeRoot = await tempRuntime(t);
+
+  const child = runCli(argv(runtimeRoot));
+
+  assert.notEqual(child.status, 0);
+  const result = JSON.parse(child.stdout) as Record<string, unknown>;
+  assert.equal(result.status, "heartbeat_receipt_missing");
+  assert.equal(
+    result.error_code,
+    "SCHEDULER_FOLLOWUP_HEARTBEAT_RECEIPT_MISSING",
+  );
+  assert.equal(result.scheduler_state_mutated, false);
+});
+
+test("native host-followup CLI rejects malformed compressed facts", () => {
+  const child = runCli(invalidFactsArgv(["not-valid-compressed-json"]));
+
+  assert.notEqual(child.status, 0);
+  const result = JSON.parse(child.stdout) as Record<string, unknown>;
+  assert.equal(result.status, "error");
+  assert.equal(
+    (result.error as Record<string, unknown>).code,
+    "invalid_scheduler_host_facts",
+  );
+});
+
+test("native host-followup transport rejects encoded facts beyond its bound", () => {
+  const child = runCli(invalidFactsArgv(["a".repeat(4_097)]));
+
+  assert.notEqual(child.status, 0);
+  const result = JSON.parse(child.stdout) as Record<string, unknown>;
+  assert.equal(
+    (result.error as Record<string, unknown>).code,
+    "invalid_scheduler_host_facts",
+  );
+});
+
+test("native host-followup transport rejects inflated facts beyond its bound", () => {
+  const encoded = deflateSync(
+    Buffer.from(JSON.stringify({ padding: "x".repeat(16_385) }), "utf8"),
+  ).toString("base64url");
+  assert.ok(encoded.length < 4_096);
+
+  const child = runCli(invalidFactsArgv([encoded]));
+
+  assert.notEqual(child.status, 0);
+  const result = JSON.parse(child.stdout) as Record<string, unknown>;
+  assert.equal(
+    (result.error as Record<string, unknown>).code,
+    "invalid_scheduler_host_facts",
+  );
+});

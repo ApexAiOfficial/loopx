@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from loopx.extensions.external_connector_provider import (
     build_document_comment_connector_registration,
     capture_document_comment_provider_page,
@@ -30,6 +32,7 @@ from loopx.extensions.lark.document_comment_provider import (
     LarkCliDocumentCommentProvider,
     LarkDocumentCommentProviderError,
     LarkDocumentCommentTarget,
+    _epoch_rfc3339,
 )
 
 
@@ -140,21 +143,52 @@ def _reply_page(text: str, *, extra: object | None = None) -> dict[str, Any]:
     }
 
 
-def test_lark_permission_probe_binds_exact_comment_scopes(tmp_path: Path) -> None:
+def _bot_identity(*, profile: str = "fixture-profile") -> dict[str, Any]:
+    return {
+        "identity": "bot",
+        "available": True,
+        "profile": profile,
+        "appId": "cli_fixture",
+    }
+
+
+def _app_version_page(*, scopes: list[str]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "identity": "bot",
+        "data": {
+            "items": [
+                {
+                    "status": 1,
+                    "publish_time": "1787377000",
+                    "scopes": [
+                        {"scope": scope, "token_types": ["tenant"]} for scope in scopes
+                    ],
+                }
+            ]
+        },
+    }
+
+
+def test_lark_bot_permission_probe_uses_published_app_scope_ledger(
+    tmp_path: Path,
+) -> None:
     calls: list[list[str]] = []
 
     def runner(args, _cwd, _timeout):
         calls.append(list(args))
         if args[-3:] == ["auth", "status", "--json"]:
             return _completed({"identity": "bot"})
+        if args[-2:] == ["whoami", "--json"]:
+            return _completed(_bot_identity())
+        assert "auth" not in args or "check" not in args
         return _completed(
-            {
-                "ok": False,
-                "missing": [
+            _app_version_page(
+                scopes=[
                     LARK_DOCUMENT_COMMENT_CREATE_SCOPE,
                     LARK_DOCUMENT_COMMENT_READ_SCOPE,
-                ],
-            }
+                ]
+            )
         )
 
     provider = LarkCliDocumentCommentProvider(
@@ -167,8 +201,8 @@ def test_lark_permission_probe_binds_exact_comment_scopes(tmp_path: Path) -> Non
         published=True,
     )
 
-    assert guidance["ready"] is False
-    assert guidance["missing_requirement_count"] == 3
+    assert guidance["ready"] is True
+    assert guidance["missing_requirement_count"] == 0
     assert calls == [
         [
             "lark-cli",
@@ -182,15 +216,211 @@ def test_lark_permission_probe_binds_exact_comment_scopes(tmp_path: Path) -> Non
             "lark-cli",
             "--profile",
             "fixture-profile",
-            "auth",
-            "check",
-            "--scope",
-            (
-                f"{LARK_DOCUMENT_COMMENT_CREATE_SCOPE} "
-                f"{LARK_DOCUMENT_COMMENT_READ_SCOPE}"
-            ),
+            "whoami",
             "--json",
         ],
+        [
+            "lark-cli",
+            "--profile",
+            "fixture-profile",
+            "api",
+            "GET",
+            "/open-apis/application/v6/applications/cli_fixture/app_versions",
+            "--as",
+            "bot",
+            "--params",
+            '{"lang":"zh_cn","page_size":"2"}',
+            "--json",
+        ],
+    ]
+
+
+def test_lark_bot_permission_probe_reports_missing_published_scope(
+    tmp_path: Path,
+) -> None:
+    def runner(args, _cwd, _timeout):
+        if args[-3:] == ["auth", "status", "--json"]:
+            return _completed({"identity": "bot"})
+        if args[-2:] == ["whoami", "--json"]:
+            return _completed(_bot_identity())
+        payload = _app_version_page(scopes=[LARK_DOCUMENT_COMMENT_READ_SCOPE])
+        payload["data"]["items"][0]["scopes"].append(
+            {
+                "scope": LARK_DOCUMENT_COMMENT_CREATE_SCOPE,
+                "token_types": ["user"],
+            }
+        )
+        return _completed(payload)
+
+    provider = LarkCliDocumentCommentProvider(
+        target=_target(),
+        reply_store=tmp_path / "reply-receipts.json",
+        runner=runner,
+    )
+    guidance = provider.permission_guidance(
+        response_enabled=True,
+        published=True,
+    )
+
+    assert guidance["ready"] is False
+    assert guidance["missing_requirement_count"] == 1
+    assert guidance["items"][1]["missing_scopes"] == [
+        LARK_DOCUMENT_COMMENT_CREATE_SCOPE
+    ]
+
+
+def test_lark_bot_permission_probe_unknown_fails_closed(tmp_path: Path) -> None:
+    def runner(args, _cwd, _timeout):
+        if args[-3:] == ["auth", "status", "--json"]:
+            return _completed({"identity": "bot"})
+        if args[-2:] == ["whoami", "--json"]:
+            return _completed(_bot_identity())
+        return _completed({"ok": True, "identity": "bot", "data": {"items": []}})
+
+    provider = LarkCliDocumentCommentProvider(
+        target=_target(),
+        reply_store=tmp_path / "reply-receipts.json",
+        runner=runner,
+    )
+
+    try:
+        provider.permission_guidance(response_enabled=True, published=True)
+    except LarkDocumentCommentProviderError as error:
+        assert error.code == "lark_document_comment_permission_probe_unknown"
+    else:
+        raise AssertionError("unknown Bot scope readiness must fail closed")
+
+
+def test_lark_bot_permission_probe_rejects_profile_mismatch(tmp_path: Path) -> None:
+    def runner(args, _cwd, _timeout):
+        if args[-3:] == ["auth", "status", "--json"]:
+            return _completed({"identity": "bot"})
+        return _completed(_bot_identity(profile="different-profile"))
+
+    provider = LarkCliDocumentCommentProvider(
+        target=_target(),
+        reply_store=tmp_path / "reply-receipts.json",
+        runner=runner,
+    )
+
+    try:
+        provider.permission_guidance(response_enabled=True, published=True)
+    except LarkDocumentCommentProviderError as error:
+        assert error.code == (
+            "lark_document_comment_permission_probe_identity_mismatch"
+        )
+    else:
+        raise AssertionError("Bot scope evidence must bind the configured profile")
+
+
+def test_lark_bot_permission_guidance_does_not_return_app_metadata(
+    tmp_path: Path,
+) -> None:
+    def runner(args, _cwd, _timeout):
+        if args[-3:] == ["auth", "status", "--json"]:
+            return _completed({"identity": "bot"})
+        if args[-2:] == ["whoami", "--json"]:
+            return _completed(_bot_identity())
+        payload = _app_version_page(
+            scopes=[
+                LARK_DOCUMENT_COMMENT_CREATE_SCOPE,
+                LARK_DOCUMENT_COMMENT_READ_SCOPE,
+            ]
+        )
+        payload["data"]["private_payload"] = "must-not-escape"
+        return _completed(payload)
+
+    provider = LarkCliDocumentCommentProvider(
+        target=_target(),
+        reply_store=tmp_path / "reply-receipts.json",
+        runner=runner,
+    )
+    serialized = json.dumps(
+        provider.permission_guidance(response_enabled=True, published=True)
+    )
+
+    assert "cli_fixture" not in serialized
+    assert "must-not-escape" not in serialized
+    assert "token" not in serialized.lower()
+
+
+def test_lark_user_permission_probe_still_uses_user_oauth_scopes(
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(args, _cwd, _timeout):
+        calls.append(list(args))
+        if args[-3:] == ["auth", "status", "--json"]:
+            return _completed({"identity": "user"})
+        return _completed(
+            {
+                "ok": True,
+                "granted": [
+                    LARK_DOCUMENT_COMMENT_CREATE_SCOPE,
+                    LARK_DOCUMENT_COMMENT_READ_SCOPE,
+                ],
+                "missing": [],
+            }
+        )
+
+    target = _target()
+    provider = LarkCliDocumentCommentProvider(
+        target=LarkDocumentCommentTarget(
+            source_ref=target.source_ref,
+            document_url=target.document_url,
+            provider_identity=target.provider_identity,
+            profile=target.profile,
+            identity="user",
+        ),
+        reply_store=tmp_path / "reply-receipts.json",
+        runner=runner,
+    )
+
+    guidance = provider.permission_guidance(response_enabled=True, published=True)
+
+    assert guidance["ready"] is True
+    assert any("auth" in call and "check" in call for call in calls)
+    assert not any("app_versions" in " ".join(call) for call in calls)
+
+
+def test_lark_user_permission_probe_preserves_missing_scope_predicate(
+    tmp_path: Path,
+) -> None:
+    def runner(args, _cwd, _timeout):
+        if args[-3:] == ["auth", "status", "--json"]:
+            return _completed({"identity": "user"})
+        return {
+            "returncode": 1,
+            "stdout": json.dumps(
+                {
+                    "ok": False,
+                    "granted": [LARK_DOCUMENT_COMMENT_READ_SCOPE],
+                    "missing": [LARK_DOCUMENT_COMMENT_CREATE_SCOPE],
+                }
+            ),
+            "stderr": "",
+        }
+
+    target = _target()
+    provider = LarkCliDocumentCommentProvider(
+        target=LarkDocumentCommentTarget(
+            source_ref=target.source_ref,
+            document_url=target.document_url,
+            provider_identity=target.provider_identity,
+            profile=target.profile,
+            identity="user",
+        ),
+        reply_store=tmp_path / "reply-receipts.json",
+        runner=runner,
+    )
+
+    guidance = provider.permission_guidance(response_enabled=True, published=True)
+
+    assert guidance["ready"] is False
+    assert guidance["missing_requirement_count"] == 1
+    assert guidance["items"][1]["missing_scopes"] == [
+        LARK_DOCUMENT_COMMENT_CREATE_SCOPE
     ]
 
 
@@ -242,6 +472,28 @@ def test_lark_provider_rejects_boolean_comment_timestamp(tmp_path: Path) -> None
         raise AssertionError("boolean timestamps must fail closed")
 
 
+def test_lark_document_comment_timestamp_accepts_microsecond_epoch():
+    assert _epoch_rfc3339("1700000000123456") == "2023-11-14T22:13:20.123456Z"
+
+
+@pytest.mark.parametrize("timestamp", ["²", "170000000²"])
+def test_lark_provider_rejects_non_ascii_comment_timestamp(
+    tmp_path: Path, timestamp: str
+) -> None:
+    payload = _comment_page()
+    payload["data"]["items"][0]["reply_list"]["replies"][0]["create_time"] = timestamp
+    provider = LarkCliDocumentCommentProvider(
+        target=_target(),
+        reply_store=tmp_path / "reply-receipts.json",
+        runner=lambda *_: _completed(payload),
+    )
+
+    with pytest.raises(
+        LarkDocumentCommentProviderError, match="comment_timestamp_invalid"
+    ):
+        provider.page_reader(_connector(), None, 100)
+
+
 def test_lark_document_comment_callsite_runs_read_effect_reply_readback_ack(
     tmp_path: Path,
 ) -> None:
@@ -253,24 +505,18 @@ def test_lark_document_comment_callsite_runs_read_effect_reply_readback_ack(
         if command[-3:] == ["auth", "status", "--json"]:
             call_order.append("identity_probe")
             return _completed({"identity": "bot"})
-        if command[-3:] == [
-            "--scope",
-            (
-                f"{LARK_DOCUMENT_COMMENT_CREATE_SCOPE} "
-                f"{LARK_DOCUMENT_COMMENT_READ_SCOPE}"
-            ),
-            "--json",
-        ]:
+        if command[-2:] == ["whoami", "--json"]:
+            call_order.append("identity_binding")
+            return _completed(_bot_identity())
+        if "app_versions" in " ".join(command):
             call_order.append("permission_probe")
             return _completed(
-                {
-                    "ok": True,
-                    "granted": [
+                _app_version_page(
+                    scopes=[
                         LARK_DOCUMENT_COMMENT_CREATE_SCOPE,
                         LARK_DOCUMENT_COMMENT_READ_SCOPE,
-                    ],
-                    "missing": [],
-                }
+                    ]
+                )
             )
         if "+list-comments" in command:
             call_order.append("provider_read")
@@ -360,6 +606,7 @@ def test_lark_document_comment_callsite_runs_read_effect_reply_readback_ack(
     assert settlement["response_readback_verified"] is True
     assert call_order == [
         "identity_probe",
+        "identity_binding",
         "permission_probe",
         "provider_read",
         "durable_effect",

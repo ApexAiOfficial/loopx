@@ -69,6 +69,25 @@ test("one routing transaction releases to fallback or no selection", () => {
   });
 });
 
+test("explicit closeout or replan releases continuity without completing the Todo", () => {
+  for (const facts of [
+    {previous_delivery_boundary: "semantic_closeout"},
+    {previous_path_delta: {schema_version: "goal_path_delta_v0", outcome: "replan",
+      prior_assumption: "The experiment might help", observed_reality: "Scoped experiment answered",
+      changed: ["Select remaining work"], evidence_refs: ["evidence:result"]}},
+  ]) {
+    assert.equal(route(facts).selection, "fallback");
+    // Fresh eligibility still rejects a blocked successor.
+    assert.equal(route({...facts, fallback_todo: null}).selection, "none");
+    const bound = route({...facts, preemptions: ["heartbeat_receipt"]});
+    assert.equal(bound.continuity?.reason, "heartbeat_receipt");
+  }
+  assert.equal(route({previous_path_delta: {outcome: "continue",
+    prior_assumption: "The implementation is unfinished", observed_reality: "Validated partial progress",
+    evidence_refs: ["evidence:progress"]}}).selection, "continuity");
+  assert.throws(() => route({previous_path_delta: {outcome: "finished"}}));
+});
+
 test("an initially selected open advancement Todo settles as in flight", () => {
   const result = route({
     previous_todo_id: null,
@@ -125,6 +144,50 @@ test("typed control obligations preempt sticky delivery", () => {
   assert.equal(result.continuity?.decision, "preempt");
   assert.equal(result.continuity?.reason, "autonomous_replan");
   assert.equal(result.continuity?.delivery_boundary, "semantic_closeout");
+});
+
+function replanFacts(overrides: Record<string, unknown> = {}) {
+  const obligation = "replan-0123456789abcdef";
+  return {
+    replan_todo: todo({todo_id: "todo_new_plan", replan_obligation_id: obligation}),
+    latest_replan_ack: {
+      schema_version: "autonomous_replan_ack_v0", recorded: true, agent_id: "codex-main",
+      semantic_delta: {schema_version: "replan_semantic_delta_v0", accepted: true,
+        outcomes: ["new_runnable_successor"], successor_todo_id: "todo_new_plan",
+        obligation_id: obligation, successor_origin_obligation_id: obligation},
+    },
+    ...overrides,
+  };
+}
+
+test("the accepted replan successor becomes the default ahead of the old route", () => {
+  const preferred = route(replanFacts());
+  assert.equal(preferred.selection, "replan");
+  assert.equal(preferred.boundary?.todo_id, "todo_new_plan");
+  assert.equal(preferred.continuity?.decision, "resume_in_flight");
+  // Recommendation cannot change an already committed identity or open a gate.
+  for (const preemption of ["heartbeat_receipt", "autonomous_replan", "blocking_work_lane", "delivery_not_allowed"]) {
+    assert.notEqual(route({...replanFacts(), preemptions: [preemption]}).selection, "replan");
+  }
+});
+
+test("replan preference rechecks current execution and exact causal ownership", () => {
+  for (const patch of [{status: "done"}, {status: "blocked"}, {actionable: false},
+    {capability_ready: false}, {claimed_by: "another-agent"}, {claimed_by: null},
+    {task_class: "continuous_monitor"}, {replan_obligation_id: "replan-fedcba9876543210"}]) {
+    assert.equal(route(replanFacts({replan_todo: todo({
+      todo_id: "todo_new_plan", replan_obligation_id: "replan-0123456789abcdef", ...patch,
+    })})).selection, "continuity");
+  }
+  const facts = replanFacts();
+  const ack = facts.latest_replan_ack;
+  for (const patch of [{recorded: false}, {agent_id: "another-agent"},
+    {semantic_delta: {...ack.semantic_delta, accepted: false}},
+    {semantic_delta: {...ack.semantic_delta, successor_todo_id: "todo_other_plan"}},
+    {semantic_delta: {...ack.semantic_delta, outcomes: ["fresh_vision_path_outcome"]}}]) {
+    assert.deepEqual(route({...facts, latest_replan_ack: {...ack, ...patch}}), route());
+  }
+  assert.deepEqual(route({latest_replan_ack: null, replan_todo: null}), route());
 });
 
 test("runtime decoder rejects malformed projection facts", () => {

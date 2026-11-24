@@ -1,11 +1,17 @@
 # Protocol Action Packet Codex CLI Wrapper v0
 
+> Historical synthetic experiment only. The production packet reader is retired;
+> see the [current format contract](protocol-action-packet-decision-v0.md).
+> These examples do not qualify current execution or quota-size reduction.
+
 This wrapper is the cold-path bridge between `protocol_action_packet_v0` and a
 future Codex CLI summarizer. It is intentionally outside `quota should-run` so
 the hot path keeps its interface budget.
 
-The wrapper consumes a synthetic `protocol_router_comparison_v0` report and
-builds a Codex CLI command envelope for an isolated project:
+The wrapper consumes a synthetic `protocol_router_comparison_v0` report, not a
+legacy field from fresh quota output. The [PR-05 migration](protocol-action-packet-decision-v0.md)
+keeps it outside the live execution contract. It builds a Codex CLI command
+envelope for an isolated project:
 
 ```text
 codex exec --skip-git-repo-check --ephemeral --ignore-user-config

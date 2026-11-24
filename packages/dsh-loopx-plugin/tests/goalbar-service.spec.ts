@@ -1,8 +1,9 @@
-import { mkdtemp, mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import {
   LoopXCliError,
@@ -16,15 +17,22 @@ import type {
 import {
   GoalBarCoordinator,
 } from '../src/goalbar/events.ts'
+import { computeGoalBarSourceRevision } from '../src/goalbar/read-model.ts'
 import {
   createGoalBarService,
   decodeGoalBarLifecycleExecutionV1,
 } from '../src/goalbar/service.ts'
-import type { GoalBarRequestV1 } from '../src/goalbar/protocol.ts'
+import type {
+  GoalBarContinuationAdmissionV1,
+  GoalBarRequestV1,
+} from '../src/goalbar/protocol.ts'
 
 const sessionId = 'session-fixture'
 const goalId = 'goal-fixture'
 const loopxAgentId = 'agent-fixture'
+const defaultCwd = resolve('fixture/project')
+const defaultSourceRevision = await computeGoalBarSourceRevision({ cwd: defaultCwd })
+const strictRegistryFixture = new URL('./fixtures/project-registry-strict-v1.json', import.meta.url)
 const command: LoopXCommand = {
   file: 'loopx',
   prefix: [],
@@ -35,7 +43,7 @@ const command: LoopXCommand = {
 function turnEnd(seq: number): SessionEvent<'turn/end'> {
   return {
     type: 'turn/end',
-    seq,
+    seq: SessionSeq(seq),
     time: 1,
     data: { turn: 0, reason: { kind: 'completed' } },
   }
@@ -55,21 +63,21 @@ function agentFixture(
   id = sessionId,
   initialStatus: 'idle' | 'running' = 'idle',
   eventSource?: (() => SessionEvent[]) | undefined,
-  cwd = '/fixture/project',
+  cwd = defaultCwd,
 ): AgentFixture {
   const events: SessionEvent[] = []
   let status = initialStatus
   const session = {
     id,
     header: { version: 0, id, createdAt: 1, cwd },
-    get events() { return eventSource?.() ?? events },
+    snapshotEvents: () => eventSource?.() ?? events,
     surface: { nodes: [] },
   }
   const agent = {
     id,
     options: {},
     session,
-    inbox: { nextTurn: [], nextStep: [], hasPending: false },
+    inbox: { nextTurn: [], nextStep: [] },
     ctx: {},
     get status() { return status },
     cancel() {},
@@ -144,6 +152,7 @@ function activationPayload(
     execute: false,
     goal_id: goalId,
     before_state: state,
+    observed_state_fingerprint: 'a'.repeat(64),
     after_state: 'stopped',
     changed: active,
     written: false,
@@ -228,6 +237,7 @@ interface Harness {
   bindingMode: 'bound' | 'missing' | 'ambiguous'
   activation: 'active' | 'stopped'
   currentAgent: Agent | undefined
+  driverAdmission: GoalBarContinuationAdmissionV1
   mutation?: ((args: readonly string[]) => Promise<FileResult>) | undefined
   onBinding?: (() => void) | undefined
   onActivation?: (() => Promise<void>) | undefined
@@ -240,6 +250,7 @@ type HarnessMutableState = Pick<
   | 'bindingMode'
   | 'activation'
   | 'currentAgent'
+  | 'driverAdmission'
   | 'mutation'
   | 'onBinding'
   | 'onActivation'
@@ -252,6 +263,7 @@ function harness(options: {
   readonly eventSource?: () => SessionEvent[]
   readonly driver?: 'applied' | 'unavailable' | 'none'
   readonly cwd?: string
+  readonly activationFingerprint?: unknown
 } = {}): Harness {
   const host = agentFixture(
     sessionId,
@@ -268,6 +280,7 @@ function harness(options: {
     bindingMode: 'bound',
     activation: 'stopped',
     currentAgent: host.agent as Agent | undefined,
+    driverAdmission: { state: 'clear' },
     mutation: undefined as Harness['mutation'],
     onBinding: undefined as Harness['onBinding'],
     onActivation: undefined as Harness['onActivation'],
@@ -298,9 +311,13 @@ function harness(options: {
     }
     if (args.includes('goal-lifecycle')) {
       await state.onActivation?.()
+      const payload = activationPayload(state.activation)
+      if (Object.hasOwn(options, 'activationFingerprint')) {
+        payload.observed_state_fingerprint = options.activationFingerprint
+      }
       return {
         exitCode: 0,
-        stdout: JSON.stringify(activationPayload(state.activation)),
+        stdout: JSON.stringify(payload),
         stderr: '',
       }
     }
@@ -324,6 +341,7 @@ function harness(options: {
         driverCalls.push('cancelQueued')
         return receipt
       },
+      readContinuationAdmission: () => state.driverAdmission,
     })
   }
   const service = createGoalBarService({
@@ -365,8 +383,7 @@ function watchRequest(
     op: 'watch',
     sessionId,
     afterSessionEventSeq,
-    sourceRevision: options.sourceRevision
-      ?? 'sha256:04284a0332528476ac54e743cb76d5c0731985225b77926e7f6a32941db96c42',
+    sourceRevision: options.sourceRevision ?? defaultSourceRevision,
     expected: options.expected ?? null,
     agentStatus: options.agentStatus ?? 'idle',
   }
@@ -403,6 +420,41 @@ async function eventually(predicate: () => boolean): Promise<void> {
 }
 
 describe('GoalBar Host read/watch', () => {
+  it('refreshes the bound snapshot after a recovery hold changes without a Session event', async () => {
+    const fixture = harness()
+    const signal = new AbortController().signal
+    const before = (await fixture.service.handle(readRequest(), signal)).result
+    if (before.kind !== 'present') throw new Error('fixture did not have a binding')
+    expect(before.snapshot).not.toHaveProperty('recoveryAttention')
+
+    let attention = true
+    const unregister = fixture.coordinator.registerDriverBridge({
+      evaluateActivatedSession: async () => ({ kind: 'applied' }),
+      cancelQueued: async () => ({ kind: 'applied' }),
+      readContinuationAdmission: () => ({ state: 'clear' }),
+      hasRecoveryAttention: (capture, expected) => attention
+        && capture.session === fixture.host.agent.session
+        && expected.goalId === goalId && expected.loopxAgentId === loopxAgentId,
+    })
+    try {
+      const watch = (sourceRevision: string) => fixture.service.handle(
+        watchRequest(null, { sourceRevision, expected: { goalId, loopxAgentId } }), signal,
+      )
+      expect((await watch(before.sourceRevision)).result.kind).toBe('source_changed')
+      const held = (await fixture.service.handle(readRequest(), signal)).result
+      if (held.kind !== 'present') throw new Error('expected the same binding on hold')
+      expect(held.snapshot.recoveryAttention).toBe(true)
+      expect((await watch(held.sourceRevision)).result.kind).toBe('timeout')
+
+      attention = false
+      expect((await watch(held.sourceRevision)).result.kind).toBe('source_changed')
+      expect((await fixture.service.handle(readRequest(), signal)).result).toEqual(before)
+    } finally {
+      unregister()
+      await fixture.service.dispose()
+    }
+  })
+
   it('captures the cursor before CLI, runs activation/Todo in parallel, and loses no wake', async () => {
     const fixture = harness()
     fixture.host.events.push(turnEnd(3))
@@ -458,6 +510,130 @@ describe('GoalBar Host read/watch', () => {
       baseSessionEventSeq: null,
       sourceRevision: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
     })
+    await fixture.service.dispose()
+  })
+
+  it('projects a latched driver admission failure into the read snapshot', async () => {
+    const fixture = harness()
+    fixture.driverAdmission = { state: 'failed', category: 'invalid_response' }
+    const response = await fixture.service.handle(
+      readRequest(),
+      new AbortController().signal,
+    )
+    expect(response.result).toMatchObject({
+      kind: 'present',
+      snapshot: {
+        goalActivation: 'stopped',
+        agentStatus: 'idle',
+        continuationAdmission: { state: 'failed', category: 'invalid_response' },
+      },
+    })
+    const serialized = JSON.stringify(response.result)
+    expect(serialized).not.toContain('/private')
+    expect(serialized).not.toContain('stderr')
+    await fixture.service.dispose()
+
+    const clean = harness()
+    const negative = await clean.service.handle(
+      readRequest(),
+      new AbortController().signal,
+    )
+    expect(negative.result).toMatchObject({
+      kind: 'present',
+      snapshot: { continuationAdmission: { state: 'clear' } },
+    })
+    await clean.service.dispose()
+  })
+
+  it('wakes a registered watcher when the driver admission state changes', async () => {
+    const fixture = harness({ watchTimeoutMs: 200 })
+    const anchor = await fixture.service.handle(
+      readRequest(),
+      new AbortController().signal,
+    )
+    if (anchor.result.kind !== 'present') throw new Error('expected present anchor')
+    const watching = fixture.service.handle(
+      watchRequest(anchor.result.baseSessionEventSeq, {
+        sourceRevision: anchor.result.sourceRevision,
+        expected: { goalId, loopxAgentId },
+        agentStatus: 'idle',
+      }),
+      new AbortController().signal,
+    )
+    await Promise.resolve()
+    fixture.driverAdmission = { state: 'failed', category: 'admission_rejected' }
+    fixture.coordinator.publishAdmissionChange(fixture.host.agent.session)
+
+    expect((await watching).result).toEqual({ kind: 'source_changed', sessionEventSeq: null })
+    const reread = await fixture.service.handle(
+      readRequest(),
+      new AbortController().signal,
+    )
+    expect(reread.result).toMatchObject({
+      kind: 'present',
+      snapshot: {
+        continuationAdmission: { state: 'failed', category: 'admission_rejected' },
+      },
+    })
+    await fixture.service.dispose()
+  })
+
+  it('detects an admission change that landed while no watcher was registered', async () => {
+    const fixture = harness({ watchTimeoutMs: 50 })
+    const anchor = await fixture.service.handle(
+      readRequest(),
+      new AbortController().signal,
+    )
+    if (anchor.result.kind !== 'present') throw new Error('expected present anchor')
+    const anchorRequest = watchRequest(anchor.result.baseSessionEventSeq, {
+      sourceRevision: anchor.result.sourceRevision,
+      expected: { goalId, loopxAgentId },
+      agentStatus: 'idle',
+    })
+
+    // The driver latched a failure after the read, but its notification found
+    // no in-flight watcher; the next watch must still force exactly one read.
+    fixture.driverAdmission = { state: 'failed', category: 'cli_unreachable' }
+    expect((await fixture.service.handle(
+      anchorRequest,
+      new AbortController().signal,
+    )).result).toEqual({ kind: 'source_changed', sessionEventSeq: null })
+    const served = await fixture.service.handle(
+      readRequest(),
+      new AbortController().signal,
+    )
+    expect(served.result).toMatchObject({
+      snapshot: {
+        continuationAdmission: { state: 'failed', category: 'cli_unreachable' },
+      },
+    })
+
+    // Another client's read cannot acknowledge this client's old anchor.
+    expect((await fixture.service.handle(anchorRequest, new AbortController().signal)).result.kind)
+      .toBe('source_changed')
+    if (served.result.kind !== 'present') throw new Error('expected a current snapshot')
+    // A watch anchored to the new snapshot settles into the normal lease.
+    expect((await fixture.service.handle(
+      { ...anchorRequest, sourceRevision: served.result.sourceRevision },
+      new AbortController().signal,
+    )).result).toEqual({ kind: 'timeout', sessionEventSeq: null })
+    await fixture.service.dispose()
+  })
+
+  it('keeps a hidden binding on a normal watch lease despite retained admission failure', async () => {
+    const fixture = harness({ watchTimeoutMs: 5 })
+    fixture.bindingMode = 'missing'
+    fixture.driverAdmission = { state: 'failed', category: 'cli_unreachable' }
+    const anchor = await fixture.service.handle(readRequest(), new AbortController().signal)
+    if (anchor.result.kind !== 'hidden') throw new Error('expected hidden anchor')
+    const callsAfterRead = fixture.calls.length
+    const watched = await fixture.service.handle(watchRequest(anchor.result.baseSessionEventSeq, {
+      sourceRevision: anchor.result.sourceRevision,
+      expected: null,
+      agentStatus: 'idle',
+    }), new AbortController().signal)
+    expect(watched.result).toEqual({ kind: 'timeout', sessionEventSeq: null })
+    expect(fixture.calls).toHaveLength(callsAfterRead)
     await fixture.service.dispose()
   })
 
@@ -654,7 +830,7 @@ describe('GoalBar Host read/watch', () => {
 
   it('retries a read when the active state is atomically replaced during CLI reads', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'loopx-goalbar-stable-read-'))
-    const stateDir = join(cwd, '.codex', 'goals', goalId)
+    const stateDir = join(cwd, '.loopx', 'goals', goalId)
     await mkdir(join(cwd, '.loopx'), { recursive: true })
     await mkdir(stateDir, { recursive: true })
     await writeFile(join(cwd, '.loopx', 'registry.json'), '{"goals":[]}', 'utf8')
@@ -690,6 +866,36 @@ describe('GoalBar Host read/watch', () => {
     }
   })
 
+  it('reads a strict registry with an unmigrated Goal through the stable service path', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'loopx-goalbar-strict-service-'))
+    const legacy = join(cwd, '.codex', 'goals', goalId, 'ACTIVE_GOAL_STATE.md')
+    const decoy = join(cwd, '.loopx', 'goals', goalId, 'ACTIVE_GOAL_STATE.md')
+    await mkdir(join(cwd, '.codex', 'goals', goalId), { recursive: true })
+    await mkdir(join(cwd, '.loopx', 'goals', goalId), { recursive: true })
+    await writeFile(join(cwd, '.loopx', 'registry.json'), await readFile(strictRegistryFixture))
+    await writeFile(legacy, 'legacy state', 'utf8')
+    await writeFile(decoy, 'decoy state', 'utf8')
+    const fixture = harness({ cwd })
+    try {
+      const first = await fixture.service.handle(readRequest(), new AbortController().signal)
+      expect(first.result.kind).toBe('present')
+      if (first.result.kind !== 'present') throw new Error('expected present fixture')
+      await writeFile(decoy, 'changed decoy', 'utf8')
+      const unchanged = await fixture.service.handle(readRequest(), new AbortController().signal)
+      expect(unchanged.result.kind).toBe('present')
+      if (unchanged.result.kind !== 'present') throw new Error('expected present fixture')
+      expect(unchanged.result.sourceRevision).toBe(first.result.sourceRevision)
+      await writeFile(legacy, 'changed legacy', 'utf8')
+      const changed = await fixture.service.handle(readRequest(), new AbortController().signal)
+      expect(changed.result.kind).toBe('present')
+      if (changed.result.kind !== 'present') throw new Error('expected present fixture')
+      expect(changed.result.sourceRevision).not.toBe(first.result.sourceRevision)
+    } finally {
+      await fixture.service.dispose()
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
   it('fails closed when a watch cursor is beyond the exact Session log', async () => {
     const fixture = harness()
     expect((await fixture.service.handle(
@@ -702,6 +908,23 @@ describe('GoalBar Host read/watch', () => {
 })
 
 describe('GoalBar Host lifecycle authority', () => {
+  it.each([undefined, null, 'invalid', 'A'.repeat(64)])(
+    'keeps reads available but rejects mutations without a valid Core fingerprint (%s)', async fingerprint => {
+      const fixture = harness({ activationFingerprint: fingerprint })
+      try {
+        expect((await fixture.service.handle(readRequest(), new AbortController().signal)).result.kind)
+          .toBe('present')
+        for (const op of ['start', 'pause'] as const) {
+          fixture.activation = op === 'start' ? 'stopped' : 'active'
+          expect((await fixture.service.handle(actionRequest(op), new AbortController().signal)).result)
+            .toEqual({ kind: 'rejected', code: 'binding_validation_failed' })
+        }
+        expect(fixture.calls.some(args => args.includes('--execute'))).toBe(false)
+        expect(fixture.driverCalls).toEqual([])
+      } finally { await fixture.service.dispose() }
+    },
+  )
+
   it('uses one immediate action lane and blocks later reads through child reap', async () => {
     const fixture = harness()
     const mutation = pending<FileResult>()
@@ -762,6 +985,8 @@ describe('GoalBar Host lifecycle authority', () => {
       'goal-lifecycle',
       '--goal-id', goalId,
       '--operation', 'resume',
+      '--actor-kind', 'owner',
+      '--expected-state-fingerprint', 'a'.repeat(64),
       '--execute',
     ])
     await fixture.service.dispose()
@@ -789,6 +1014,8 @@ describe('GoalBar Host lifecycle authority', () => {
       'goal-lifecycle',
       '--goal-id', goalId,
       '--operation', 'stop',
+      '--actor-kind', 'owner',
+      '--expected-state-fingerprint', 'a'.repeat(64),
       '--execute',
     ])
     expect(fixture.driverCalls).toEqual(['cancelQueued'])
@@ -866,6 +1093,7 @@ describe('GoalBar Host lifecycle authority', () => {
       cancelQueued: async () => ({
         kind: 'unavailable', reason: 'session_unavailable',
       }),
+      readContinuationAdmission: () => fixture.driverAdmission,
     })
     let mutationCalls = 0
     fixture.mutation = async () => {

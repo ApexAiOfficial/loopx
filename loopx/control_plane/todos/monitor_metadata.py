@@ -1,91 +1,53 @@
+"""Monitor wire adaptation. State rules live in the TS Todo field planner."""
 from __future__ import annotations
 
-import re
+from dataclasses import asdict, dataclass
 from typing import Any
 
-from ..runtime.time import parse_timestamp
-from .contract import (
-    TODO_MONITOR_METADATA_FIELDS,
-    TODO_TASK_CLASS_MONITOR,
-    normalize_todo_watch_only,
-)
+from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
 
 
-MONITOR_CADENCE_PATTERN = re.compile(
-    r"^\s*(?P<count>[1-9][0-9]{0,4})\s*"
-    r"(?P<unit>s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\s*$",
-    re.IGNORECASE,
-)
+@dataclass(frozen=True)
+class MonitorPollObservation:
+    """One observation, reduced against the Todo state under its writer lock."""
+
+    generated_at: str
+    result_hash: str
+    material_change: bool
+    monitor_effect_id: str | None = None
+    target_key: str | None = None
+    cadence: str | None = None
+    next_due_at: str | None = None
 
 
-def normalize_monitor_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
-    normalized: dict[str, Any] = {}
-    for key, value in (metadata or {}).items():
-        if key not in TODO_MONITOR_METADATA_FIELDS:
-            continue
-        if value is None:
-            normalized[key] = None
-            continue
-        candidate = str(value or "").strip()
-        if candidate:
-            normalized[key] = candidate
-    if normalized.get("cadence") is not None and not MONITOR_CADENCE_PATTERN.match(normalized["cadence"]):
-        raise ValueError("--cadence must look like 30m, 2h, or 1d")
-    if normalized.get("next_due_at") is not None and parse_timestamp(normalized["next_due_at"]) is None:
-        raise ValueError("--next-due-at must be an ISO timestamp")
-    if normalized.get("expires_at") is not None and parse_timestamp(normalized["expires_at"]) is None:
-        raise ValueError("--expires-at must be an ISO timestamp")
-    if normalized.get("last_checked_at") is not None and parse_timestamp(normalized["last_checked_at"]) is None:
-        raise ValueError("--last-checked-at must be an ISO timestamp")
-    if normalized.get("consecutive_no_change") is not None:
-        try:
-            int(normalized["consecutive_no_change"])
-        except ValueError as exc:
-            raise ValueError("--consecutive-no-change must be an integer") from exc
-    if normalized.get("material_change") is not None and normalized["material_change"] not in {"true", "false"}:
-        raise ValueError("--material-change metadata must be true or false")
-    if normalized.get("watch_only") is not None and normalize_todo_watch_only(
-        normalized["watch_only"]
-    ) is None:
-        raise ValueError("--watch-only metadata must be true or false")
-    return normalized
+MonitorMetadataInput = dict[str, Any] | MonitorPollObservation | None
 
 
-def require_continuous_monitor_boundedness(
-    *,
-    task_class: str | None,
-    resume_when: str | None,
-    monitor_metadata: dict[str, Any] | None,
-) -> None:
-    if task_class != TODO_TASK_CLASS_MONITOR:
-        return
-    metadata = monitor_metadata or {}
-    if (
-        str(metadata.get("expires_at") or "").strip()
-        or str(resume_when or "").strip()
-        or normalize_todo_watch_only(metadata.get("watch_only")) is True
-    ):
-        return
-    raise ValueError(
-        "continuous_monitor requires one of: --expires-at, --resume-when, "
-        "or --watch-only"
+def monitor_metadata_intent(value: MonitorMetadataInput) -> dict[str, Any]:
+    return (
+        {"observation": asdict(value), "metadata": None}
+        if isinstance(value, MonitorPollObservation)
+        else {"observation": None, "metadata": value}
     )
 
 
 def require_monitor_metadata_scope(
-    *,
-    monitor_metadata: dict[str, Any] | None,
-    role: str,
-    task_class: str | None,
+    *, monitor_metadata: dict[str, Any] | None, role: str,
+    task_class: str | None, generated_at: str | None = None,
+    resume_when: str | None = None, enforce_boundedness: bool = False,
 ) -> dict[str, Any]:
-    normalized = normalize_monitor_metadata(monitor_metadata)
-    if not normalized:
-        return {}
-    schedule_fields = {k for k, v in normalized.items() if v is not None and k != "target_key"}
-    if schedule_fields and (role != "agent" or task_class != "continuous_monitor"):
-        raise ValueError(
-            "monitor schedule metadata requires --role agent --task-class continuous_monitor"
-        )
-    if normalized.get("target_key") is not None and role != "agent":
-        raise ValueError("target_key requires --role agent")
-    return normalized
+    """Create/line-codec adapter; update composes this owner in its field plan."""
+    try:
+        result = effect_runtime_result("todo.monitor_metadata.plan", {
+            "schema_version": "loopx_todo_monitor_metadata_request_v0",
+            "existing": {}, "metadata": monitor_metadata, "role": role,
+            "task_class": task_class, "generated_at": generated_at,
+            "resume_when": resume_when, "enforce_boundedness": enforce_boundedness,
+        })
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None
+    if (not isinstance(result, dict)
+        or result.get("schema_version") != "loopx_todo_monitor_metadata_result_v0"
+        or not isinstance(result.get("metadata"), dict)):
+        raise RuntimeError("TypeScript monitor metadata result shape mismatch")
+    return result["metadata"]

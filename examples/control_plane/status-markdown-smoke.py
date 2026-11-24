@@ -18,12 +18,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from loopx.status import project_post_handoff_history  # noqa: E402
 from loopx.status import (  # noqa: E402
     build_status_runtime_summaries,
     build_contract_health_projection,
     collect_status,
-    delivery_batch_scale_for_run,
-    delivery_outcome_for_run,
     project_asset_summary_is_public_safe,
 )
 from loopx.presentation.renderers.status_markdown import render_status_markdown  # noqa: E402
@@ -54,7 +53,6 @@ from status_markdown_fixtures import (  # noqa: E402
     DEPENDENCY_MONITOR_TODO,
     DEPENDENCY_USER_TODO,
     EXPLICIT_REFRESH_CLASSIFICATION,
-    NEW_PLANNED_ACTION,
     OLD_PLANNED_ACTION,
     POST_HANDOFF_ACTION,
     POST_HANDOFF_CLASSIFICATION,
@@ -99,7 +97,6 @@ def collect_fixture_status(root: Path, registry_path: Path) -> tuple[dict, str]:
     payload = collect_status(
         registry_path=registry_path,
         runtime_root_override=str(root / "runtime"),
-        scan_roots=[root / "project"],
         limit=5,
     )
     return payload, render_status_markdown(payload)
@@ -788,7 +785,8 @@ def assert_dependency_blockers_stay_separate(payload: dict, markdown: str) -> No
     blocker_item = items_by_goal[DEPENDENCY_BLOCKER_GOAL_ID]
     assert current_item["waiting_on"] == "codex", current_item
     assert current_item["agent_todos"]["open_count"] == 2, current_item
-    assert "user_todos" not in current_item, current_item
+    assert current_item["user_todos"]["open_count"] == 0, current_item
+    assert current_item["user_todos"]["items"] == [], current_item
     blockers = current_item["dependency_blockers"]
     assert blockers["open_count"] == 1, blockers
     assert blockers["source"] == "attention_queue.user_todos", blockers
@@ -921,9 +919,12 @@ def assert_connected_delivery_surface_loop(payload: dict, markdown: str) -> None
     assert "outcome_gap_streak=3" in quota_markdown, quota_markdown
 
 
-def assert_delivery_batch_scale_prefers_test_named_runs() -> None:
+def assert_delivery_semantics_require_structured_fields() -> None:
+    def delivery_scale_signal(run: dict) -> str:
+        return project_post_handoff_history([run])["post_handoff_latest_run"]["delivery_batch_scale"]
+
     assert (
-        delivery_batch_scale_for_run(
+        delivery_scale_signal(
             {
                 "classification": "dashboard_home_browser_smoke_regression",
                 "delivery_batch_scale": "multi_surface",
@@ -932,22 +933,22 @@ def assert_delivery_batch_scale_prefers_test_named_runs() -> None:
         == "multi_surface"
     )
     assert (
-        delivery_batch_scale_for_run(
+        delivery_scale_signal(
             {"classification": "side_bypass_validation_plan_source_shape_consumer_test"}
         )
-        == "test_only"
+        == "unknown"
     )
     assert (
-        delivery_batch_scale_for_run({"classification": "owner_handoff_consumer_test"})
-        == "test_only"
+        delivery_scale_signal({"classification": "owner_handoff_consumer_test"})
+        == "unknown"
     )
     assert (
-        delivery_batch_scale_for_run({"classification": "delivery_ranker_readiness_batch"})
-        == "multi_surface"
+        delivery_scale_signal({"classification": "delivery_ranker_readiness_batch"})
+        == "unknown"
     )
     assert (
-        delivery_batch_scale_for_run({"classification": "feedback_reranker_adapter_slice"})
-        == "implementation"
+        delivery_scale_signal({"classification": "feedback_reranker_adapter_slice"})
+        == "unknown"
     )
     profile = {
         "outcome_floor": {
@@ -957,31 +958,19 @@ def assert_delivery_batch_scale_prefers_test_named_runs() -> None:
         }
     }
     assert (
-        delivery_outcome_for_run(
-            {"classification": "side_bypass_owner_drop_landing_forecast_implementation"},
-            profile,
-        )
-        == "surface_only"
+        project_post_handoff_history([{"classification": "side_bypass_owner_drop_landing_forecast_implementation"}], profile)["post_handoff_latest_run"]["delivery_outcome"]
+        == "unknown"
     )
     assert (
-        delivery_outcome_for_run(
-            {"classification": "side_bypass_ranker_fit_metric_implementation"},
-            profile,
-        )
-        == "outcome_progress"
+        project_post_handoff_history([{"classification": "side_bypass_ranker_fit_metric_implementation"}], profile)["post_handoff_latest_run"]["delivery_outcome"]
+        == "unknown"
     )
     assert (
-        delivery_outcome_for_run(
-            {"classification": "side_bypass_macro_evidence_segment_implementation"},
-            profile,
-        )
-        == "outcome_progress"
+        project_post_handoff_history([{"classification": "side_bypass_macro_evidence_segment_implementation"}], profile)["post_handoff_latest_run"]["delivery_outcome"]
+        == "unknown"
     )
     assert (
-        delivery_outcome_for_run(
-            {"classification": "status_refresh_without_marker", "delivery_outcome": "primary_goal_outcome"},
-            profile,
-        )
+        project_post_handoff_history([{"classification": "status_refresh_without_marker", "delivery_outcome": "primary_goal_outcome"}], profile)["post_handoff_latest_run"]["delivery_outcome"]
         == "primary_goal_outcome"
     )
 
@@ -1008,7 +997,10 @@ def assert_project_asset_secret_scanner_boundaries() -> None:
 def assert_explicit_delivery_refresh(payload: dict, markdown: str) -> None:
     item = payload["attention_queue"]["items"][0]
     assert item["goal_id"] == DELIVERY_GOAL_ID, item
-    assert item["status"] == EXPLICIT_REFRESH_CLASSIFICATION, item
+    # Current canonical work stays primary; progress classification remains in history.
+    assert item["source"] == "active_state", item
+    assert item["status"] == "active_state_agent_todo", item
+    assert item["agent_todos"]["items"][0]["text"] == DELIVERY_AGENT_TODO, item
     readiness = item["handoff_readiness"]
     assert readiness["post_handoff_latest_run"]["classification"] == EXPLICIT_REFRESH_CLASSIFICATION, readiness
     assert readiness["post_handoff_latest_run"]["delivery_batch_scale"] == "multi_surface", readiness
@@ -1027,31 +1019,26 @@ def assert_explicit_delivery_refresh(payload: dict, markdown: str) -> None:
     assert quota_payload["handoff_readiness"]["post_handoff_latest_run"]["delivery_outcome"] == "outcome_progress", quota_payload
 
 
-def assert_stale_latest_run_projection_warning(payload: dict, markdown: str) -> None:
-    items = payload["attention_queue"]["items"]
-    item = items[0]
-    warning = item["stale_latest_run_warning"]
-    assert warning["kind"] == "stale_latest_run_projection", warning
-    assert warning["requires_refresh_state"] is True, warning
-    assert warning["active_state_updated_at"] == "2026-01-01T00:03:00+00:00", warning
-    assert warning["latest_run_generated_at"] == "2026-01-01T00:02:00+00:00", warning
-    assert "active_state_updated_after_latest_run" in warning["reason"], warning
-    assert "active_state_digest_differs_from_latest_run_snapshot" in warning["reason"], warning
-    assert item["project_asset"]["stale_latest_run_warning"] == warning, item
-    assert "stale_latest_run_warning: requires_refresh_state=True" in markdown, markdown
-    assert "active_state_updated_at=2026-01-01T00:03:00+00:00" in markdown, markdown
+def assert_stale_latest_run_automatically_reconciled(payload: dict, markdown: str) -> None:
+    item = payload["attention_queue"]["items"][0]
+    assert item["source"] == "active_state", item
+    assert item["status"] == "active_state_user_gate", item
+    assert item["waiting_on"] == "controller", item
+    assert item["recommended_action"] == USER_TODO_TEXT, item
+    assert "stale_latest_run_warning" not in item, item
+    assert "stale_latest_run_warning" not in item["project_asset"], item
+    assert "stale_latest_run_warning:" not in markdown, markdown
+    historical = payload["run_history"]["goals"][0]["latest_status_run"]
+    assert historical["generated_at"] == "2026-01-01T00:02:00+00:00", historical
+    assert historical["classification"] == "state_refreshed", historical
 
     quota_payload = build_quota_should_run(payload, goal_id="planned-main-control")
-    quota_warning = quota_payload["stale_latest_run_warning"]
-    assert quota_warning["requires_refresh_state"] is True, quota_payload
+    assert not quota_payload.get("stale_latest_run_warning"), quota_payload
     quota_markdown = render_quota_should_run_markdown(quota_payload)
-    assert "stale_latest_run_warning: requires_refresh_state=True" in quota_markdown, quota_markdown
-    assert "stale_latest_run_action: run refresh-state before trusting latest_run-derived routing" in quota_markdown, quota_markdown
-
+    assert "stale_latest_run_action:" not in quota_markdown, quota_markdown
     packet = build_review_packet(payload, goal_id="planned-main-control", action_kind="codex")
-    assert packet["stale_latest_run_warning"]["requires_refresh_state"] is True, packet
-    assert "【状态投影警告】" in packet["packet"], packet
-    assert "先 refresh-state，再信任基于 latest_run 的路由/交接" in packet["packet"], packet
+    assert not packet.get("stale_latest_run_warning"), packet
+    assert "【状态投影警告】" not in packet["packet"], packet
 
 
 def assert_handoff_waiting_for_post_run(item: dict, markdown: str) -> None:
@@ -1228,11 +1215,13 @@ def main() -> int:
             root,
             generated_at="2026-01-01T00:05:00+00:00",
             classification="delivery_owner_drop_shape_test",
+            delivery_batch_scale="test_only",
         )
         append_connected_delivery_fixture(
             root,
             generated_at="2026-01-01T00:06:00+00:00",
             classification="delivery_active_blocker_snapshot_test",
+            delivery_batch_scale="test_only",
         )
         small_streak_payload, small_streak_markdown = collect_fixture_status(root, delivery_registry_path)
     with tempfile.TemporaryDirectory(prefix="loopx-status-connected-delivery-surface-loop-") as tmp:
@@ -1242,16 +1231,22 @@ def main() -> int:
             root,
             generated_at="2026-01-01T00:05:00+00:00",
             classification="delivery_owner_drop_landing_forecast_implementation",
+            delivery_batch_scale="implementation",
+            delivery_outcome="surface_only",
         )
         append_connected_delivery_fixture(
             root,
             generated_at="2026-01-01T00:06:00+00:00",
             classification="delivery_owner_drop_scenario_runbook_implementation",
+            delivery_batch_scale="implementation",
+            delivery_outcome="surface_only",
         )
         append_connected_delivery_fixture(
             root,
             generated_at="2026-01-01T00:07:00+00:00",
             classification="delivery_next_action_queue_owner_drop_fields_implementation",
+            delivery_batch_scale="implementation",
+            delivery_outcome="surface_only",
         )
         surface_loop_payload, surface_loop_markdown = collect_fixture_status(root, delivery_registry_path)
 
@@ -1330,16 +1325,17 @@ def main() -> int:
     assert_connected_delivery_custom_run_stays_runnable(delivery_payload, delivery_markdown)
     assert_source_registry_shadow_collapses_into_live_queue_item(shadow_payload)
     assert_explicit_delivery_refresh(explicit_payload, explicit_markdown)
-    assert_stale_latest_run_projection_warning(stale_projection_payload, stale_projection_markdown)
+    assert_stale_latest_run_automatically_reconciled(stale_projection_payload, stale_projection_markdown)
     assert_connected_readonly_progress_run_stays_runnable(readonly_payload, readonly_markdown)
     assert_dependency_blockers_stay_separate(dependency_payload, dependency_markdown)
     assert_connected_delivery_no_baseline_small_streak(small_streak_payload, small_streak_markdown)
     assert_connected_delivery_surface_loop(surface_loop_payload, surface_loop_markdown)
-    assert_delivery_batch_scale_prefers_test_named_runs()
+    assert_delivery_semantics_require_structured_fields()
     assert_project_asset_secret_scanner_boundaries()
     assert_promotion_readiness_full_scan_fallback()
     assert_promotion_readiness_warning_in_quota_guard()
-    assert_status_agent_lane_next_action_projection()
+    with tempfile.TemporaryDirectory(prefix="loopx-status-agent-lane-") as tmp:
+        assert_status_agent_lane_next_action_projection(Path(tmp))
     assert_status_agent_lane_todo_summary_display_compaction()
     assert_status_agent_member_selected_lane_claim_survives_truncated_claim_list()
     assert_status_agent_lane_vision_lookback_survives_display_trim()

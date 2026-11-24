@@ -1,0 +1,670 @@
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+
+import type { JsonObject } from "../effect_program.ts";
+import { EffectRuntimeLockTimeoutError } from "../effect_runtime_errors.ts";
+import { withFileMutationLock } from "../effect_runtime_io.ts";
+import type {
+  AuthorityStore,
+  AuthorityStoreCommit,
+  AuthorityStoreCommitResult,
+  AuthorityStoreCommittedTransaction,
+  AuthorityStoreIdentityResult,
+  AuthorityStoreLoadResult,
+  AuthorityStoreHead,
+  AuthorityStoreReadFailure,
+  AuthorityStoreReceiptResult,
+  AuthorityStoreReceiptBatchResult,
+  AuthorityStoreScanResult,
+} from "./authority_store.ts";
+import {
+  AuthorityStoreProtocolError,
+  canonicalAuthorityBytes,
+  normalizeAuthorityStoreCommit,
+  requireAuthorityStoreId,
+} from "./authority_store_codec.ts";
+import {transactionForRevision} from "./authority_store_transactions.ts";
+import {FileAuthorityJournal} from "./file_authority_journal.ts";
+import {AuthorityJournalScan} from "./authority_journal_scan.ts";
+
+const STORE_IDENTITY_PATTERN = /^file:[0-9a-f]{32}$/;
+// File retains a checkpoint/delta journal in one durable envelope. A managed Effect server
+// opens a new store handle for each request. Retain a bounded working set across
+// handles so alternating Goals do not evict each other on every observation.
+// Every lookup still reads and hashes the full file and checks store identity. Large journals retain only
+// the head and receipt index in memory; commits and scans still load and verify
+// the complete history. This is a bounded read optimization, not a new source
+// of authority or a substitute for the SQLite long-goal profile.
+const MAX_CACHED_DOCUMENT_BYTES = 128 * 1024 * 1024;
+const MAX_CACHED_READ_VIEW_BYTES = 16 * 1024 * 1024;
+const MAX_CACHED_STORES = 4;
+interface VerifiedDocument {
+  path: string;
+  identity: string;
+  digest: string;
+  head: JsonObject;
+  providerRevision: string;
+  cursor: string;
+  receipts: ReadonlyMap<string, {
+    cursor: string;
+    providerRevision: string;
+    receipts: readonly JsonObject[];
+  }>;
+  document?: FileAuthorityJournal;
+}
+const verifiedDocuments = new Map<string, {view: VerifiedDocument; bytes: number}>();
+// Only identical immutable input bytes share in-flight verification. Failed
+// proofs are removed too.
+const pendingVerification = new Map<string, Promise<FileAuthorityJournal>>();
+
+function documentDigest(raw: Uint8Array): string {
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+function rememberVerifiedDocument(path: string, identity: string, raw: Uint8Array,
+  digest: string, document: FileAuthorityJournal,
+  maxDocumentBytes: number): VerifiedDocument {
+  const receipts = new Map<string, {
+    cursor: string;
+    providerRevision: string;
+    receipts: readonly JsonObject[];
+  }>();
+  let viewBytes = Buffer.byteLength(JSON.stringify(document.head));
+  for (const entry of document.receiptEntries()) {
+    receipts.set(entry.operation_id, {cursor: entry.cursor,
+      providerRevision: entry.provider_revision, receipts: entry.receipts});
+    viewBytes += Buffer.byteLength(entry.operation_id) + Buffer.byteLength(entry.cursor) +
+      Buffer.byteLength(entry.provider_revision) + Buffer.byteLength(JSON.stringify(entry.receipts));
+  }
+  const view: VerifiedDocument = {path, identity, digest, head: document.head,
+    providerRevision: document.provider_revision, cursor: document.cursor,
+    receipts, document};
+  // Account for serialized history and the separate head/receipt index. This
+  // is a retained-byte bound, not a claim about the JS heap or process RSS.
+  const fullBytes = raw.byteLength + viewBytes;
+  const retainHistory = raw.byteLength <= maxDocumentBytes && fullBytes <= MAX_CACHED_DOCUMENT_BYTES;
+  const retained = retainHistory ? view : {...view, document: undefined};
+  const bytes = retainHistory ? fullBytes : viewBytes;
+  verifiedDocuments.delete(path);
+  if (retainHistory || viewBytes <= MAX_CACHED_READ_VIEW_BYTES) {
+    verifiedDocuments.set(path, {view: retained, bytes});
+    let total = [...verifiedDocuments.values()].reduce((sum, entry) => sum + entry.bytes, 0);
+    while (verifiedDocuments.size > MAX_CACHED_STORES || total > MAX_CACHED_DOCUMENT_BYTES) {
+      const oldest = verifiedDocuments.keys().next().value!;
+      total -= verifiedDocuments.get(oldest)!.bytes;
+      verifiedDocuments.delete(oldest);
+    }
+  }
+  return view;
+}
+
+class FileStoreUnavailableError extends Error {}
+
+export type FileAuthorityArchiveResult =
+  | {
+    status: "applied";
+    archived_provider_revision: string;
+    archived_cursor: string;
+    archive_id: string;
+  }
+  | {
+    status: "replayed";
+    archived_provider_revision: string;
+    archived_cursor: string;
+    archive_id: string;
+  }
+  | { status: "missing" }
+  | {
+    status: "conflict";
+    conflict_kind: string;
+    current_provider_revision?: string;
+    current_cursor?: string;
+    archived_provider_revision?: string;
+    archive_id?: string;
+  }
+  | {
+    status: "ambiguous";
+    reason_code: string;
+    reason: string;
+  }
+  | {
+    status: "failed";
+    reason_code: string;
+    reason: string;
+  };
+
+export function fileAuthorityRevision(goalId: string, storeIdentity: string, previousRevision: string | null, transaction: ReturnType<typeof transactionForRevision>): string {
+  const digest = createHash("sha256").update(canonicalAuthorityBytes({ goal_id: goalId, store_identity: storeIdentity, previous_provider_revision: previousRevision, transaction })).digest("hex").slice(0, 24);
+  return `file:${transaction.cursor}:${digest}`;
+}
+
+export async function syncAuthorityDirectory(directory: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const handle = await open(directory, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function replaceFileAuthorityDurably(path: string, payload: Uint8Array): Promise<void> {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
+  const handle = await open(temporary, "wx", 0o600);
+  try {
+    try {
+      await handle.writeFile(payload);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporary, path);
+    await syncAuthorityDirectory(directory);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+function decodeDocument(
+  value: unknown,
+  goalId: string,
+  storeIdentity: string,
+): Promise<FileAuthorityJournal> {
+  return FileAuthorityJournal.decode(value, goalId, storeIdentity, (previous, transaction) =>
+    fileAuthorityRevision(goalId, storeIdentity, previous, transaction));
+}
+
+function readFailure(error: unknown): AuthorityStoreReadFailure {
+  if (error instanceof AuthorityStoreProtocolError || error instanceof SyntaxError) {
+    return { status: "failed", reason_code: "provider_protocol_violation", reason: error.message };
+  }
+  return {
+    status: "unavailable",
+    reason_code: "provider_read_unavailable",
+    reason: error instanceof Error ? error.message : "provider read unavailable",
+  };
+}
+
+/** File-backed Stage 1 conformance provider; LoopX owns all domain decisions. */
+export class FileAuthorityStore implements AuthorityStore {
+  readonly providerKind = "file" as const;
+  readonly goalId: string;
+  readonly directory: string;
+  readonly path: string;
+  readonly identityPath: string;
+  private readonly existingOnly: boolean;
+  private readonly expectedIdentity: string | undefined;
+
+  constructor(directory: string, goalId: string, options: { existingOnly?: boolean; expectedIdentity?: string } = {}) {
+    this.goalId = requireAuthorityStoreId(goalId, "goal id");
+    if (typeof directory !== "string" || directory.length === 0) {
+      throw new AuthorityStoreProtocolError("store directory is required");
+    }
+    this.directory = resolve(directory);
+    const digest = createHash("sha256").update(goalId, "utf8").digest("hex").slice(0, 16);
+    this.path = join(this.directory, `authority-store-${digest}.json`);
+    this.identityPath = join(this.directory, "store-identity");
+    this.existingOnly = options.existingOnly === true;
+    this.expectedIdentity = options.expectedIdentity;
+  }
+
+  /** Narrow effect seam for crash-window qualification; not a semantic hook. */
+  protected async replaceDurably(path: string, payload: Uint8Array): Promise<void> {
+    await replaceFileAuthorityDurably(path, payload);
+  }
+
+  /** Filesystem-only crash seam; the archive owner must still fsync both parents. */
+  protected async archiveRenamed(): Promise<void> {}
+
+  /** Full-history verification seam; unchanged byte-identical reads may reuse it. */
+  protected decodeStoredDocument(value: unknown, identity: string): Promise<FileAuthorityJournal> {
+    return decodeDocument(value, this.goalId, identity);
+  }
+
+  /** Test seam for the compact-view path; production keeps the fixed memory cap. */
+  protected fullDocumentCacheLimitBytes(): number {
+    return MAX_CACHED_DOCUMENT_BYTES;
+  }
+
+  private async readStoreIdentity(createIfMissing = !this.existingOnly): Promise<string> {
+    try {
+      const identity = await readFile(this.identityPath, "utf8");
+      if (!STORE_IDENTITY_PATTERN.test(identity) ||
+          (this.expectedIdentity !== undefined && identity !== this.expectedIdentity)) {
+        throw new AuthorityStoreProtocolError("store identity is invalid or differs from the expected File lineage");
+      }
+      if (createIfMissing) await syncAuthorityDirectory(this.directory);
+      return identity;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (!createIfMissing || this.expectedIdentity !== undefined) throw new FileStoreUnavailableError("existing store identity is missing");
+    return await withFileMutationLock(this.identityPath, async () => {
+      try {
+        const identity = await readFile(this.identityPath, "utf8");
+        if (!STORE_IDENTITY_PATTERN.test(identity) ||
+          (this.expectedIdentity !== undefined && identity !== this.expectedIdentity)) {
+          throw new AuthorityStoreProtocolError("store identity is invalid or differs from the expected File lineage");
+        }
+        await syncAuthorityDirectory(this.directory);
+        return identity;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      const identity = `file:${randomUUID().replaceAll("-", "")}`;
+      await this.replaceDurably(this.identityPath, Buffer.from(identity, "ascii"));
+      return identity;
+    });
+  }
+
+  async storeIdentity(): Promise<AuthorityStoreIdentityResult> {
+    try {
+      return { status: "available", store_identity: await this.readStoreIdentity() };
+    } catch (error) {
+      if (error instanceof AuthorityStoreProtocolError) {
+        return { status: "failed", reason_code: "store_identity_invalid", reason: error.message };
+      }
+      return {
+        status: "unavailable",
+        reason_code: error instanceof EffectRuntimeLockTimeoutError
+          ? "store_identity_lock_timeout"
+          : "store_identity_unavailable",
+        reason: error instanceof Error ? error.message : "store identity unavailable",
+      };
+    }
+  }
+
+  private async readVerified(knownIdentity?: string, requireHistory = false): Promise<VerifiedDocument | null> {
+    let raw: Buffer;
+    try {
+      raw = await readFile(this.path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw new FileStoreUnavailableError(
+        error instanceof Error ? error.message : "authority document unavailable",
+      );
+    }
+    const identity = knownIdentity ?? await this.readStoreIdentity();
+    try {
+      const digest = documentDigest(raw);
+      const cached = verifiedDocuments.get(this.path);
+      if (cached?.view.identity === identity && cached.view.digest === digest &&
+          (!requireHistory || cached.view.document !== undefined)) {
+        verifiedDocuments.delete(this.path);
+        verifiedDocuments.set(this.path, cached);
+        return cached.view;
+      }
+      const key = JSON.stringify([this.path, identity, digest]);
+      let proof = pendingVerification.get(key);
+      if (!proof) {
+        proof = this.decodeStoredDocument(JSON.parse(raw.toString("utf8")), identity);
+        pendingVerification.set(key, proof);
+      }
+      let document: FileAuthorityJournal;
+      try { document = await proof; }
+      finally {
+        if (pendingVerification.get(key) === proof) pendingVerification.delete(key);
+      }
+      return rememberVerifiedDocument(this.path, identity, raw, digest, document,
+        this.fullDocumentCacheLimitBytes());
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new AuthorityStoreProtocolError(`file authority store JSON is invalid: ${error.message}`);
+      }
+      throw error;
+    }
+  }
+
+  private async readDocument(knownIdentity?: string): Promise<FileAuthorityJournal | null> {
+    return (await this.readVerified(knownIdentity, true))?.document ?? null;
+  }
+
+  async loadAuthority(): Promise<AuthorityStoreLoadResult> {
+    try {
+      const verified = await this.readVerified();
+      return verified
+        ? {
+          status: "loaded",
+          head: structuredClone(verified.head),
+          provider_revision: verified.providerRevision,
+          cursor: verified.cursor,
+        }
+        : { status: "missing" };
+    } catch (error) {
+      return readFailure(error);
+    }
+  }
+
+  /** Checkpoint-only external append: retain the real writer lock through the
+   * synchronous callback. This neither commits nor advances authority revision. */
+  async withCheckpointHead(save: (head: AuthorityStoreHead, identity: string) => JsonObject): Promise<JsonObject> {
+    return await withFileMutationLock(this.path, async () => {
+      const identity = await this.readStoreIdentity(false);
+      const current = await this.readDocument();
+      if (!current) throw new FileStoreUnavailableError("checkpoint authority is missing");
+      const result = save({head: structuredClone(current.head),
+        provider_revision: current.provider_revision, cursor: current.cursor}, identity);
+      if (result instanceof Promise) throw new Error("checkpoint save must be synchronous");
+      return result;
+    });
+  }
+
+  async commitAuthority(commit: AuthorityStoreCommit): Promise<AuthorityStoreCommitResult> {
+    let normalized: AuthorityStoreCommit;
+    try {
+      normalized = normalizeAuthorityStoreCommit(commit);
+    } catch (error) {
+      return {
+        status: "failed",
+        reason_code: "invalid_commit_request",
+        reason: error instanceof Error ? error.message : "invalid commit request",
+      };
+    }
+    try {
+      return await withFileMutationLock(this.path, async () => {
+        let identity: string;
+        let current: FileAuthorityJournal | null;
+        try {
+          // Read the identity under the same document lock used by the commit.
+          // A restored directory must not race a missing-head bootstrap and
+          // bind new authority bytes to an identity observed before the lock.
+          identity = await this.readStoreIdentity();
+          current = await this.readDocument(identity);
+        } catch (error) {
+          return {
+            status: "failed",
+            reason_code: error instanceof AuthorityStoreProtocolError
+              ? "provider_protocol_violation"
+              : "provider_read_unavailable",
+            reason: error instanceof Error ? error.message : "provider read unavailable",
+          };
+        }
+        if (this.existingOnly && current === null) {
+          return { status: "failed", reason_code: "existing_authority_missing", reason: "existing-only store cannot bootstrap a missing authority" };
+        }
+        // Content-aware idempotency: same operation_id with matching full body
+        // ({events, receipts, projection}) returns the original receipt
+        // (retry-after-crash); the check must precede the revision gate so a
+        // stuck writer can't block the already-committed replay. A different
+        // body (including a projection-only drift) remains a conflict.
+        if (current !== null) {
+          const existing = current.receipt(normalized.operation_id);
+          if (existing) {
+            const cursorIndex = Number(existing.cursor) - 1;
+            const [historical] = current.scan(cursorIndex, 1);
+            if (!historical) {
+              return {status: "failed", reason_code: "provider_protocol_violation",
+                reason: `receipt entry cursor ${existing.cursor} missing from journal scan`};
+            }
+            const intendedBody = {events: normalized.events, receipts: normalized.receipts,
+              projection: normalized.next_projection};
+            const existingBody = {events: existing.events, receipts: existing.receipts,
+              projection: historical.projection};
+            if (canonicalAuthorityBytes(intendedBody).equals(canonicalAuthorityBytes(existingBody))) {
+              return {
+                status: "applied",
+                provider_revision: existing.provider_revision,
+                cursor: existing.cursor,
+              };
+            }
+            return {
+              status: "conflict",
+              conflict_kind: "operation_id_exists",
+              current_provider_revision: current.provider_revision,
+              current_cursor: current.cursor,
+            };
+          }
+        }
+        if ((current?.provider_revision ?? null) !== normalized.expected_provider_revision) {
+          return {
+            status: "conflict",
+            conflict_kind: "provider_revision_mismatch",
+            current_provider_revision: current?.provider_revision ?? null,
+            current_cursor: current?.cursor ?? null,
+          };
+        }
+        const document = FileAuthorityJournal.append(current, this.goalId, identity, normalized, (previous, transaction) =>
+          fileAuthorityRevision(this.goalId, identity, previous, transaction));
+        return await this.publishDocument(identity, document);
+      });
+    } catch (error) {
+      return {
+        status: "failed",
+        reason_code: error instanceof EffectRuntimeLockTimeoutError
+          ? "provider_lock_timeout"
+          : "provider_write_unavailable",
+        reason: error instanceof Error ? error.message : "provider write unavailable",
+      };
+    }
+  }
+
+  /** File-only archive IO seam, called after verified-input and prefix audit.
+   * The existing lock/CAS protects one bounded page. Every original transaction
+   * gets its own revision, cursor and receipt; only envelope publication is
+   * coalesced. No selector, admission or execution authority changes here. */
+  async appendArchivePage(expectedRevision: string | null, expectedIdentity: string,
+    rows: readonly AuthorityStoreCommittedTransaction[]): Promise<AuthorityStoreCommitResult> {
+    try {
+      if (rows.length < 1 || rows.length > 16) throw new AuthorityStoreProtocolError("archive page requires 1..16 rows");
+      const page = rows.map(row => {
+        if (row.projection.goal_id !== this.goalId) throw new AuthorityStoreProtocolError("archive page goal mismatch");
+        return {cursor: row.cursor, commit: normalizeAuthorityStoreCommit({expected_provider_revision: null,
+          operation_id: row.operation_id, events: row.events,
+          next_projection: row.projection, receipts: row.receipts})};
+      });
+      return await withFileMutationLock(this.path, async () => {
+        const identity = await this.readStoreIdentity(false);
+        if (identity !== expectedIdentity) throw new AuthorityStoreProtocolError("archive target lineage changed");
+        const current = await this.readDocument(identity);
+        if (this.existingOnly && current === null) {
+          return {status: "failed", reason_code: "existing_authority_missing",
+            reason: "existing-only store cannot bootstrap a missing authority"};
+        }
+        if ((current?.provider_revision ?? null) !== expectedRevision) {
+          return {status: "conflict", conflict_kind: "provider_revision_mismatch",
+            current_provider_revision: current?.provider_revision ?? null, current_cursor: current?.cursor ?? null};
+        }
+        const operations = new Set<string>();
+        for (const [index, {cursor, commit}] of page.entries()) {
+          if (cursor !== (BigInt(current?.cursor ?? "0") + BigInt(index + 1)).toString()) {
+            throw new AuthorityStoreProtocolError("archive page cursor gap");
+          }
+          if (current?.receipt(commit.operation_id) || operations.has(commit.operation_id)) {
+            throw new AuthorityStoreProtocolError("archive page operation identity is duplicated");
+          }
+          operations.add(commit.operation_id);
+        }
+        const document = FileAuthorityJournal.appendCommits(current, this.goalId, identity, page.map(row => row.commit),
+          (previous, transaction) => fileAuthorityRevision(this.goalId, identity, previous, transaction));
+        return await this.publishDocument(identity, document);
+      });
+    } catch (error) {
+      return {status: "failed", reason_code: error instanceof AuthorityStoreProtocolError
+        ? "provider_protocol_violation" : error instanceof EffectRuntimeLockTimeoutError
+        ? "provider_lock_timeout" : "provider_write_unavailable",
+        reason: error instanceof Error ? error.message : "archive page unavailable"};
+    }
+  }
+
+  private async publishDocument(identity: string, document: FileAuthorityJournal): Promise<AuthorityStoreCommitResult> {
+    try {
+      const bytes = canonicalAuthorityBytes(document.toDocument());
+      await this.replaceDurably(this.path, bytes);
+      rememberVerifiedDocument(this.path, identity, bytes, documentDigest(bytes), document,
+        this.fullDocumentCacheLimitBytes());
+    } catch (error) {
+      // Rename may already have published the page. Neither cached version
+      // proves the outcome; the archive owner reads journal and original receipts.
+      verifiedDocuments.delete(this.path);
+      return {status: "ambiguous", reason_code: "commit_outcome_unknown",
+        reason: error instanceof Error ? error.message : "commit outcome unknown"};
+    }
+    return {status: "applied", provider_revision: document.provider_revision, cursor: document.cursor};
+  }
+
+  async readReceipt(operationId: string): Promise<AuthorityStoreReceiptResult> {
+    let normalized: string;
+    try {
+      normalized = requireAuthorityStoreId(operationId, "operation id");
+    } catch (error) {
+      return {
+        status: "failed",
+        reason_code: "invalid_operation_id",
+        reason: error instanceof Error ? error.message : "invalid operation id",
+      };
+    }
+    const batch = await this.readReceipts([normalized]);
+    return batch.status === "receipts" ? batch.results[0]! : batch;
+  }
+
+  /** One exact-byte/identity proof per bounded batch. Look up every requested
+   * operation in that verified index; do not replace receipt proof with a scan.
+   * Returned items own their bodies, including duplicate operation IDs. */
+  async readReceipts(operationIds: readonly string[]): Promise<AuthorityStoreReceiptBatchResult> {
+    try {
+      if (!Array.isArray(operationIds) || operationIds.length < 1 || operationIds.length > 64) {
+        throw new AuthorityStoreProtocolError("receipt batch requires 1..64 operations");
+      }
+      const normalized = Array.from({length: operationIds.length}, (_, i) =>
+        requireAuthorityStoreId(operationIds[i], "operation id"));
+      const verified = await this.readVerified();
+      return {status: "receipts", results: normalized.map((id): AuthorityStoreReceiptResult => {
+        const transaction = verified?.receipts.get(id);
+        return transaction ? {status: "found", cursor: transaction.cursor,
+          provider_revision: transaction.providerRevision,
+          receipts: structuredClone([...transaction.receipts])} : {status: "missing"};
+      })};
+    } catch (error) { return readFailure(error); }
+  }
+
+  async scanCommitted(afterCursor: string | null, limit: number): Promise<AuthorityStoreScanResult> {
+    const scan = AuthorityJournalScan.prepare(afterCursor, limit);
+    if (!(scan instanceof AuthorityJournalScan)) return scan;
+    try {
+      const document = await this.readDocument();
+      if (!document) return scan.page([], null);
+      const range = scan.rangeFailure(document.cursor);
+      if (range) return range;
+      const start = Number(scan.offset);
+      return scan.page(document.scan(start, limit + 1), document);
+    } catch (error) { return readFailure(error); }
+  }
+
+  /**
+   * Quarantine one exact pre-promotion shadow lineage without deleting it.
+   *
+   * This is intentionally file-provider-specific administrative behavior, not
+   * part of the provider-neutral AuthorityStore contract. The caller must
+   * fence the exact observed revision; an exact retry replays from the durable
+   * archive while a re-used operation id cannot retire a later lineage.
+   */
+  async archiveAuthorityDocument(
+    expectedProviderRevision: string,
+    operationId: string,
+  ): Promise<FileAuthorityArchiveResult> {
+    let expectedRevision: string;
+    let normalizedOperationId: string;
+    try {
+      expectedRevision = requireAuthorityStoreId(
+        expectedProviderRevision,
+        "expected provider revision",
+      );
+      normalizedOperationId = requireAuthorityStoreId(operationId, "operation id");
+    } catch (error) {
+      return {
+        status: "failed",
+        reason_code: "invalid_archive_request",
+        reason: error instanceof Error ? error.message : "invalid archive request",
+      };
+    }
+    const archiveId = this.authorityArchiveId(normalizedOperationId);
+    const archiveDirectory = join(this.directory, "rollback");
+    const archivePath = this.authorityArchivePath(normalizedOperationId);
+    let renameStarted = false;
+    try {
+      return await withFileMutationLock(this.path, async () => {
+        const identity = await this.readStoreIdentity(false);
+        let archived: FileAuthorityJournal | null = null;
+        try {
+          archived = await decodeDocument(
+            JSON.parse(await readFile(archivePath, "utf8")),
+            this.goalId,
+            identity,
+          );
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        const current = await this.readDocument();
+        if (archived) {
+          if (archived.provider_revision !== expectedRevision) {
+            return {
+              status: "conflict",
+              conflict_kind: "archive_operation_identity_mismatch",
+              archived_provider_revision: archived.provider_revision,
+              archive_id: archiveId,
+            };
+          }
+          if (current) {
+            return {
+              status: "conflict",
+              conflict_kind: "archive_operation_reused_after_rebootstrap",
+              current_provider_revision: current.provider_revision,
+              archive_id: archiveId,
+            };
+          }
+          return {
+            status: "replayed",
+            archived_provider_revision: archived.provider_revision,
+            archived_cursor: archived.cursor,
+            archive_id: archiveId,
+          };
+        }
+        if (!current) return { status: "missing" };
+        if (current.provider_revision !== expectedRevision) {
+          return {
+            status: "conflict",
+            conflict_kind: "provider_revision_mismatch",
+            current_provider_revision: current.provider_revision,
+            current_cursor: current.cursor,
+          };
+        }
+        await mkdir(archiveDirectory, { recursive: true, mode: 0o700 });
+        renameStarted = true;
+        await rename(this.path, archivePath);
+        await this.archiveRenamed();
+        await syncAuthorityDirectory(this.directory);
+        await syncAuthorityDirectory(archiveDirectory);
+        return {
+          status: "applied",
+          archived_provider_revision: current.provider_revision,
+          archived_cursor: current.cursor,
+          archive_id: archiveId,
+        };
+      });
+    } catch (error) {
+      return {
+        status: renameStarted ? "ambiguous" : "failed",
+        reason_code: renameStarted
+          ? "archive_outcome_unknown"
+          : error instanceof EffectRuntimeLockTimeoutError
+            ? "provider_lock_timeout"
+            : "provider_archive_unavailable",
+        reason: error instanceof Error ? error.message : "provider archive unavailable",
+      };
+    }
+  }
+
+  /** Stable provider-owned destination; callers cannot supply an archive path. */
+  authorityArchiveId(operationId: string): string {
+    requireAuthorityStoreId(operationId, "operation id");
+    return createHash("sha256").update(this.goalId, "utf8").update("\0", "utf8")
+      .update(operationId, "utf8").digest("hex").slice(0, 24);
+  }
+
+  authorityArchivePath(operationId: string): string {
+    return join(this.directory, "rollback", `authority-store-${this.authorityArchiveId(operationId)}.json`);
+  }
+}

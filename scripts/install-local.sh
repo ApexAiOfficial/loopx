@@ -12,14 +12,12 @@ Options:
   -h, --help  Show this help and exit.
 
 Common environment variables:
-  LOOPX_PYTHON=/path/to/python3.11  Use this supported Python for the release.
+  LOOPX_PYTHON=/path/to/python    Use a Python 3.11+ executable for the release.
   LOOPX_PROMOTE_DEFAULT=1          Promote this checkout as the default loopx.
   LOOPX_INSTALL_CANARY=0           Skip the loopx-canary executable.
   LOOPX_INSTALL_SKILL=0            Skip packaged workflow skills.
   LOOPX_SKILLS_DIR=/path           Install workflow skills into this host-native root.
   LOOPX_SKILL_DEDUPE_OTHER_ROOT=1  Retire managed LoopX skill copies from the alternate well-known root.
-  LOOPX_SKILL_BACKUP_DIR=/path     Keep replaced or retired skill copies that were edited or unrecorded here
-                                   (default: .loopx-skill-backups beside the skills root).
   LOOPX_ENTRY_HOST_SURFACE=...     Bind generated $loopx to an exact host (ark-managed-agent).
   LOOPX_INSTALL_SLASH_COMMANDS=0   Skip Codex and Claude command skills.
   LOOPX_INSTALL_OPENCODE=0         Install the OpenCode goal bridge surface.
@@ -62,7 +60,6 @@ if [[ "${LOOPX_SKILLS_DIR+x}" == "x" ]]; then
 fi
 skills_dir="${LOOPX_SKILLS_DIR:-$codex_home/skills}"
 entry_host_surface="${LOOPX_ENTRY_HOST_SURFACE:-}"
-workflow_skill_ids=()
 if [[ -n "$entry_host_surface" && "$entry_host_surface" != "ark-managed-agent" ]]; then
   echo "loopx installer error: unsupported LOOPX_ENTRY_HOST_SURFACE: $entry_host_surface" >&2
   exit 2
@@ -79,6 +76,10 @@ release_dir=""
 release_tmp=""
 install_lock=""
 install_lock_owned=0
+previous_loopx=""
+previous_rrule=""
+activation_started=0
+activation_verified=0
 skill_install_lock=""
 skill_install_lock_owned=0
 legacy_line=""
@@ -112,6 +113,18 @@ PY
 }
 
 cleanup_install_lock() {
+  local result=$?
+  if [[ "$result" != "0" && "$activation_started" == "1" && "$activation_verified" != "1" ]]; then
+    # Restore executable links owned by this activation only. Data migration
+    # receipts/backups are independent and are deliberately never rolled back.
+    if [[ -n "$previous_loopx" && "$(readlink "$bin_dir/loopx" 2>/dev/null || true)" == "$release_dir/scripts/loopx" ]]; then
+      install_symlink "$previous_loopx" "$bin_dir/loopx" || true
+      echo "loopx installer: restored the previous executable after activation failure; migration backups retained" >&2
+    fi
+    if [[ -n "$previous_rrule" && "$(readlink "$bin_dir/loopx-apply-rrule" 2>/dev/null || true)" == "$release_dir/scripts/loopx-apply-rrule" ]]; then
+      install_symlink "$previous_rrule" "$bin_dir/loopx-apply-rrule" || true
+    fi
+  fi
   if [[ -n "$release_tmp" && -d "$release_tmp" ]]; then
     rm -rf "$release_tmp"
   fi
@@ -120,6 +133,12 @@ cleanup_install_lock() {
   fi
   if [[ "$skill_install_lock_owned" == "1" && -n "$skill_install_lock" && -d "$skill_install_lock" ]]; then
     rm -rf "$skill_install_lock"
+  fi
+}
+
+update_stage() {
+  if [[ "${LOOPX_UPDATE_EVENTS:-0}" == "1" ]]; then
+    printf 'LOOPX_UPDATE_EVENT {"stage":"%s"}\n' "$1" >&2
   fi
 }
 
@@ -220,38 +239,78 @@ acquire_install_lock() {
 
 warn_stale_promotion_readiness() {
   local python_bin="${LOOPX_PYTHON:-python3}"
-  local runtime_root="${LOOPX_RUNTIME_ROOT:-$codex_home/loopx}"
-  local gate_json
-  gate_json="$(PYTHONSAFEPATH=1 PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" -m loopx.cli --runtime-root "$runtime_root" --format json promotion-gate 2>/dev/null || true)"
-  if [[ -z "$gate_json" ]]; then
-    return 0
-  fi
-  LOOPX_PROMOTION_GATE_JSON="$gate_json" "$python_bin" - <<'PY' || true
-import json
+  # Reuse the same collector and registry resolution without importing every CLI.
+  PYTHONSAFEPATH=1 PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" \
+    "$python_bin" - <<'PY_WARNING' || true
+import argparse
 import os
 import sys
 
+from loopx.cli_runtime import resolve_cli_registry
+from loopx.paths import default_registry_path
+from loopx.promotion_gate import build_promotion_gate
+
+runtime_root = os.environ.get("LOOPX_RUNTIME_ROOT") or None
+args = argparse.Namespace(command="promotion-gate", registry=str(default_registry_path()), runtime_root=runtime_root)
+registry_path, _ = resolve_cli_registry(args, [])
 try:
-    payload = json.loads(os.environ.get("LOOPX_PROMOTION_GATE_JSON") or "{}")
-except json.JSONDecodeError:
-    sys.exit(0)
-
-if not payload.get("should_warn"):
-    sys.exit(0)
-
-message = payload.get("warning_message")
-if not message:
-    message = "promotion-readiness evidence requires a canary readiness run before promotion."
-print(f"loopx install warning: {message}", file=sys.stderr)
-PY
+    payload = build_promotion_gate(registry_path=registry_path, runtime_root_override=runtime_root)
+except Exception:
+    print("loopx install warning: promotion readiness could not be checked", file=sys.stderr)
+else:
+    if payload.get("should_warn"):
+        message = payload.get("warning_message") or "promotion-readiness evidence requires a canary readiness run before promotion."
+        print(f"loopx install warning: {message}", file=sys.stderr)
+PY_WARNING
 }
 
+copy_platform="$(uname -s)"
 copy_path() {
   local src="$1"
   local dst="$2"
   if [[ -e "$src" ]]; then
+    # A release owns independent files. APFS clones avoid recopying their data;
+    # copy-on-write keeps later cleanup or edits separate from the checkout.
+    if [[ "$copy_platform" == "Darwin" ]]; then
+      if cp -cR "$src" "$dst" 2>/dev/null; then
+        return 0
+      fi
+      # Cloning may be unsupported across filesystems. Discard only this fresh
+      # staging target before ordinary copy, so a partial directory cannot nest.
+      rm -rf "$dst"
+    fi
     cp -R "$src" "$dst"
   fi
+}
+
+copy_apps() {
+  local src="$1"
+  local dst="$2"
+  if [[ ! -d "$src" || -L "$src" ]]; then
+    copy_path "$src" "$dst"
+    return
+  fi
+  # Application dependencies and build outputs never belong to a release.
+  # Exclude them before copying so staging does not pay to copy and delete them.
+  "${LOOPX_PYTHON:-python3}" - "$src" "$dst" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+
+excluded = {"node_modules", ".next", "dist", "build", "coverage"}
+
+def ignore(directory, names):
+    root = Path(directory)
+    # Cargo's default output directory belongs to its manifest, not every
+    # source/asset directory named target. It can also be a cache symlink.
+    ignored = excluded | ({"target"} if (root / "Cargo.toml").is_file() else set())
+    return [
+        name for name in names
+        if name in ignored and ((root / name).is_dir() or (root / name).is_symlink())
+    ]
+
+shutil.copytree(sys.argv[1], sys.argv[2], symlinks=True, ignore=ignore)
+PY
 }
 
 append_legacy_line() {
@@ -285,15 +344,21 @@ disable_legacy_shim() {
   append_legacy_line "legacy command disabled: $disabled"
 }
 
-install_symlink() {
-  local target="$1"
-  local link="$2"
-  local tmp="$link.tmp.$$"
-  rm -f "$tmp"
+check_symlink_destination() {
+  local link="$1"
   if [[ ! -L "$link" && -d "$link" ]]; then
     echo "loopx installer error: $link is a directory; remove it before installing" >&2
     return 1
   fi
+}
+
+install_symlink() {
+  local target="$1"
+  local link="$2"
+  local tmp="$link.tmp.$$"
+  # Repeat the check at replacement time in case a caller changed the path.
+  check_symlink_destination "$link" || return 1
+  rm -f "$tmp"
   ln -s "$target" "$tmp"
   LOOPX_LINK_TMP="$tmp" LOOPX_LINK_TARGET="$link" "${LOOPX_PYTHON:-python3}" - <<'PY'
 import os
@@ -306,11 +371,40 @@ install_workflow_skills() {
   local skills_source="$1"
   local source_root="$2"
   local entry_cli_bin="$3"
-  local skill_source skill_name skill_scope_file skill_target skill_tmp retired_to
+  local skill_source skill_name skill_scope skill_target skill_tmp entry_status skill_plan
+  local installed_skill_ids_text=""
   local -a installed_skill_ids=()
   skill_line="- skill: skipped"
   if [[ "$install_skill" == "0" || ! -d "$skills_source" ]]; then
     return 0
+  fi
+
+  # Delivery scope is a product rule, not an installer convention: ask the
+  # owning capability which sources this host install may materialize instead
+  # of re-reading the scope marker here. ``repo_only`` sources have no marker
+  # on purpose and must never be copied onto a host.
+  skill_plan="$(mktemp "${TMPDIR:-/tmp}/loopx-skill-plan.XXXXXX")" || return 1
+  if ! LOOPX_SKILL_SCOPE_ROOT="$skills_source" \
+      PYTHONSAFEPATH=1 \
+      PYTHONPATH="$source_root${PYTHONPATH:+:$PYTHONPATH}" \
+      "${LOOPX_PYTHON:-python3}" - >"$skill_plan" <<'PY'
+import os
+from pathlib import Path
+
+from loopx.capabilities.project_skill_delivery import classify_host_skill_sources
+
+projection = classify_host_skill_sources(Path(os.environ["LOOPX_SKILL_SCOPE_ROOT"]))
+for skill_id, scope in (
+    [(skill_id, "deliverable") for skill_id in projection["deliverable_skill_ids"]]
+    + [(skill_id, "project") for skill_id in projection["project_skill_ids"]]
+    + [(skill_id, "repo_only") for skill_id in projection["repo_only_skill_ids"]]
+):
+    print(f"{skill_id}\t{scope}")
+PY
+  then
+    rm -f "$skill_plan"
+    echo "loopx installer error: cannot classify workflow skill sources under $skills_source" >&2
+    return 1
   fi
 
   mkdir -p "$skills_dir"
@@ -339,74 +433,50 @@ install_workflow_skills() {
   printf '%s\n' "$$" >"$skill_install_lock/pid"
 
   skill_line=""
-  while IFS= read -r skill_source; do
-    skill_name="$(basename "$skill_source")"
-    skill_scope_file="$skill_source/.loopx-skill-scope"
-    if [[ -f "$skill_scope_file" ]] && [[ "$(tr -d '[:space:]' <"$skill_scope_file")" == "project" ]]; then
+  while IFS=$'\t' read -r skill_name skill_scope; do
+    [[ -n "$skill_name" ]] || continue
+    skill_source="$skills_source/$skill_name"
+    if [[ "$skill_scope" == "project" ]]; then
       skill_line="${skill_line}- project skill source: $skill_source (install explicitly per project)"$'\n'
+      continue
+    fi
+    if [[ "$skill_scope" == "repo_only" ]]; then
+      skill_line="${skill_line}- repo-only skill source: $skill_source (kept in the checkout; never delivered by an install)"$'\n'
       continue
     fi
     skill_target="$skills_dir/$skill_name"
     skill_tmp="$(mktemp -d "$skills_dir/.${skill_name}.tmp.XXXXXX")"
-    if ! cp -R "$skill_source"/. "$skill_tmp"/; then
+    if ! PYTHONSAFEPATH=1 PYTHONPATH="$source_root${PYTHONPATH:+:$PYTHONPATH}" \
+      "${LOOPX_PYTHON:-python3}" - "$skill_source" "$skill_tmp" <<'PY'
+import sys
+from pathlib import Path
+
+from loopx.workflow_skill_install import _install_one_skill
+
+_install_one_skill(Path(sys.argv[1]), Path(sys.argv[2]))
+PY
+    then
       rm -rf "$skill_tmp"
       return 1
     fi
-    if [[ -e "$skill_target" || -L "$skill_target" ]]; then
-      # Delete the previous copy only if it is unchanged install output;
-      # anything edited or unrecorded is moved to the skill backup root.
-      if ! retired_to="$(
-        LOOPX_RETIRE_TARGET="$skill_target" \
-          LOOPX_RETIRE_SKILLS_DIR="$skills_dir" \
-          PYTHONSAFEPATH=1 \
-          PYTHONPATH="$source_root${PYTHONPATH:+:$PYTHONPATH}" \
-          "${LOOPX_PYTHON:-python3}" - <<'PY'
-import os
-from pathlib import Path
-
-from loopx.skill_install_readback import recorded_skill_hashes, retire_skill_dir
-
-target = Path(os.environ["LOOPX_RETIRE_TARGET"])
-skills_dir = Path(os.environ["LOOPX_RETIRE_SKILLS_DIR"])
-outcome = retire_skill_dir(
-    target,
-    skills_dir=skills_dir,
-    recorded_hash=recorded_skill_hashes(skills_dir).get(target.name),
-    reason="replaced by scripts/install-local.sh",
-)
-if outcome["action"] == "backed_up":
-    print(outcome["backup"])
-PY
-      )"; then
-        rm -rf "$skill_tmp"
-        return 1
-      fi
-      if [[ -n "$retired_to" ]]; then
-        skill_line="${skill_line}- previous $skill_name kept (modified or unrecorded): $retired_to"$'\n'
-      fi
-    fi
+    rm -rf "$skill_target"
     mv "$skill_tmp" "$skill_target"
     installed_skill_ids+=("$skill_name")
     skill_line="${skill_line}- skill: $skill_target"$'\n'
-  done < <(find "$skills_source" -mindepth 1 -maxdepth 1 -type d -print | sort)
+  done <"$skill_plan"
+  rm -f "$skill_plan"
 
-  # The skills root stays locked until finalize_workflow_skills records the readback.
-  workflow_skill_ids=("${installed_skill_ids[@]}")
-}
-
-# Second half of the workflow-skill install. It runs after every other step that writes
-# into the skills root (in the Codex root the slash-command step also writes loopx/), so
-# the loopx entry skill materialized here -- exact CLI path and host surface -- is the
-# authoritative final writer, and the integrity readback describes the installed tree.
-finalize_workflow_skills() {
-  local source_root="$1"
-  local entry_cli_bin="$2"
-  local entry_status
-  if [[ "${#workflow_skill_ids[@]}" -gt 0 ]]; then
-    if ! entry_status="$(
+  # The generated `$loopx` entry is the core LoopX route and must be
+  # materialized independently of the rich workflow selection.
+  # Keep its installation/readback independent from the optional global
+  # workflow copies so project-scope filtering cannot hide the main entry.
+  if [[ "${#installed_skill_ids[@]}" -gt 0 ]]; then
+    installed_skill_ids_text="$(printf '%s\n' "${installed_skill_ids[@]}")"
+  fi
+  if ! entry_status="$(
       LOOPX_SKILL_INSTALL_DIR="$skills_dir" \
         LOOPX_SKILL_INSTALL_SOURCE_ROOT="$source_root" \
-        LOOPX_SKILL_INSTALL_IDS="$(printf '%s\n' "${workflow_skill_ids[@]}")" \
+        LOOPX_SKILL_INSTALL_IDS="$installed_skill_ids_text" \
         LOOPX_SKILL_INSTALLED_AT="$installed_at" \
         LOOPX_SKILL_ENTRY_CLI_BIN="$entry_cli_bin" \
         LOOPX_SKILL_ENTRY_HOST_SURFACE="$entry_host_surface" \
@@ -423,6 +493,7 @@ from loopx.skill_install_readback import (
     write_skill_install_readback,
 )
 from loopx.slash_command_install import materialize_loopx_entry_skill
+from loopx.workflow_skills.ego_delivery import reconcile_ego_browser_skill
 
 result = materialize_loopx_entry_skill(
     skills_dir=Path(os.environ["LOOPX_SKILL_INSTALL_DIR"]),
@@ -452,17 +523,18 @@ write_skill_install_readback(
     source_root=Path(os.environ["LOOPX_SKILL_INSTALL_SOURCE_ROOT"]),
     installed_at=os.environ["LOOPX_SKILL_INSTALLED_AT"],
 )
-if os.environ.get("LOOPX_SKILL_DEDUPE_OTHER_ROOT") == "1":
+ego = reconcile_ego_browser_skill(
+    skills_dir=Path(os.environ["LOOPX_SKILL_INSTALL_DIR"]), execute=True,
+)
+print(f"Ego skill: {ego['status']}: {ego['reason']}", file=sys.stderr)
+if not ego["ok"]:
+    raise SystemExit(1)
+if os.environ.get("LOOPX_SKILL_DEDUPE_OTHER_ROOT") != "0":
     dedupe = retire_duplicate_managed_skills(
         skills_dir=Path(os.environ["LOOPX_SKILL_INSTALL_DIR"]),
         execute=True,
     )
-    # stdout carries only the entry status the caller compares; report on stderr.
-    print(
-        f"skill dedupe: {dedupe['reason']} (retired={len(dedupe['retired'])}, "
-        f"kept={len(dedupe['backed_up'])}, skipped={len(dedupe['skipped'])})",
-        file=sys.stderr,
-    )
+    print(f"skill dedupe: {dedupe['reason']}", file=sys.stderr)
 print(status)
 PY
     )"; then
@@ -475,14 +547,10 @@ PY
       skill_line="${skill_line}- generated skill: not materialized ($entry_status)"$'\n'
     fi
     skill_line="${skill_line}- skill readback: $skills_dir/.loopx-skill-install.json"$'\n'
-  fi
-  if [[ "$skill_install_lock_owned" == "1" ]]; then
-    skill_line="${skill_line%$'\n'}"
-    rm -rf "$skill_install_lock"
-    skill_install_lock_owned=0
-    skill_install_lock=""
-  fi
-  workflow_skill_ids=()
+  skill_line="${skill_line%$'\n'}"
+  rm -rf "$skill_install_lock"
+  skill_install_lock_owned=0
+  skill_install_lock=""
 }
 
 preflight_workflow_skills() {
@@ -505,6 +573,12 @@ from pathlib import Path
 
 from loopx.skill_install_readback import SKILL_INSTALL_READBACK_FILENAME
 from loopx.slash_command_install import materialize_loopx_entry_skill
+from loopx.workflow_skills.ego_delivery import reconcile_ego_browser_skill
+
+ego = reconcile_ego_browser_skill(skills_dir=Path(os.environ["LOOPX_SKILL_INSTALL_DIR"]))
+if not ego["ok"]:
+    print(f"loopx installer error: {ego['reason']}", file=sys.stderr)
+    raise SystemExit(1)
 
 result = materialize_loopx_entry_skill(
     skills_dir=Path(os.environ["LOOPX_SKILL_INSTALL_DIR"]),
@@ -526,10 +600,22 @@ if os.environ.get("LOOPX_SKILL_ENTRY_HOST_SURFACE") and result["status"] in {
 PY
 }
 
+read_source_git_commit() {
+  PYTHONSAFEPATH=1 PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" \
+    "$LOOPX_PYTHON" - "$repo_root" <<'PY_SOURCE'
+from pathlib import Path
+import sys
+
+from loopx.doctor_git import git_metadata_for_root
+
+print(git_metadata_for_root(Path(sys.argv[1]))["git_commit"] or "")
+PY_SOURCE
+}
+
 verify_default_promotion() {
   LOOPX_VERIFY_LINK="$bin_dir/loopx" \
     LOOPX_VERIFY_RELEASE_DIR="$release_dir" \
-    LOOPX_VERIFY_SOURCE_COMMIT="${LOOPX_RESOLVED_SOURCE_GIT_COMMIT:-$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)}" \
+    LOOPX_VERIFY_SOURCE_COMMIT="${LOOPX_RESOLVED_SOURCE_GIT_COMMIT:-$source_git_commit}" \
     "${LOOPX_PYTHON:-python3}" - <<'PY'
 from pathlib import Path
 import json
@@ -583,7 +669,7 @@ validate_release_candidate() {
   fi
 
   local doctor_json
-  if ! doctor_json="$(PATH="$candidate/scripts:$PATH" "$candidate_wrapper" --format json doctor --deep)"; then
+  if ! doctor_json="$(PATH="$candidate/scripts:$PATH" "$candidate_wrapper" --format json doctor --deep --installation-only)"; then
     echo "loopx installer error: release candidate doctor validation failed" >&2
     return 1
   fi
@@ -643,13 +729,14 @@ resolve_default_promotion() {
       ;;
   esac
 
-  if ! git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  source_git_commit="$(read_source_git_commit)"
+  if [[ -z "$source_git_commit" ]]; then
     promotion_mode="canary_only_unverified_source"
     return 1
   fi
 
   local source_commit approved_commit source_status approved_ref
-  source_commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)"
+  source_commit="$source_git_commit"
   source_status="$(git -C "$repo_root" status --porcelain 2>/dev/null || true)"
   approved_ref="${LOOPX_APPROVED_DEFAULT_REF:-refs/remotes/origin/main}"
   approved_commit="$(git -C "$repo_root" rev-parse "$approved_ref" 2>/dev/null || true)"
@@ -674,18 +761,56 @@ if [[ -z "$shell_profile" ]]; then
 fi
 
 configure_python_runtime
-
+# Git hooks can pass selectors for their own repository into this installer.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+source_git_commit=""
 promote_default=0
 if resolve_default_promotion; then
   promote_default=1
 fi
+# Reject unusable entry targets before building candidates or upgrading data.
+# Canary-only installs must leave the default entry alone, even if it is a directory.
+if [[ "$promote_default" == "1" ]]; then
+  check_symlink_destination "$bin_dir/loopx"
+  check_symlink_destination "$bin_dir/loopx-apply-rrule"
+elif [[ "$install_canary" == "0" ]]; then
+  echo "loopx installer error: default promotion is guarded and LOOPX_INSTALL_CANARY=0 leaves no install target" >&2
+  echo "Set LOOPX_PROMOTE_DEFAULT=1 only after explicitly approving this checkout." >&2
+  exit 2
+fi
+if [[ "$install_canary" != "0" ]]; then
+  check_symlink_destination "$bin_dir/loopx-canary"
+fi
+if [[ "$promote_default" == "1" ]]; then
+  # Use the same source-root identity as the manifest and doctor, after rejecting
+  # unusable entry targets. A nested archive must not borrow its container's Git.
+  if [[ -z "$source_git_commit" ]]; then
+    source_git_commit="$(read_source_git_commit)"
+  fi
+  # Preparing shared Chat assets is part of the guarded installation.
+  mkdir -p "$releases_dir"
+  run_under_install_guard "$@"
+fi
+update_stage frontend
+if [[ "${LOOPX_PREBUILT_RUNTIME:-0}" == "1" ]]; then
+  # A release may not silently turn a missing/corrupt bundle into a local build.
+  "${LOOPX_PYTHON:-python3}" "$repo_root/scripts/chat_bundle.py" verify --source
+fi
+chat_bundle_args=(ensure)
+if [[ -L "$bin_dir/loopx" ]]; then
+  previous_chat_assets="$("${LOOPX_PYTHON:-python3}" - "$bin_dir/loopx" <<'PYTHON'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).resolve().parents[1] / "loopx/web/chat")
+PYTHON
+)"
+  if [[ -f "$previous_chat_assets/index.html" ]]; then
+    chat_bundle_args+=(--previous "$previous_chat_assets")
+  fi
+fi
+"${LOOPX_PYTHON:-python3}" "$repo_root/scripts/chat_bundle.py" "${chat_bundle_args[@]}"
 
 if [[ "$promote_default" == "0" ]]; then
-  if [[ "$install_canary" == "0" ]]; then
-    echo "loopx installer error: default promotion is guarded and LOOPX_INSTALL_CANARY=0 leaves no install target" >&2
-    echo "Set LOOPX_PROMOTE_DEFAULT=1 only after explicitly approving this checkout." >&2
-    exit 2
-  fi
   mkdir -p "$bin_dir"
   chmod +x "$repo_root/scripts/loopx"
   install_symlink "$repo_root/scripts/loopx" "$bin_dir/loopx-canary"
@@ -694,7 +819,6 @@ if [[ "$promote_default" == "0" ]]; then
   skill_line="- skill: unchanged (set LOOPX_SKILLS_DIR to install canary workflow skills)"
   if [[ "$skills_dir_explicit" == "1" ]]; then
     install_workflow_skills "$repo_root/skills" "$repo_root" "$bin_dir/loopx-canary"
-    finalize_workflow_skills "$repo_root" "$bin_dir/loopx-canary"
   fi
   cat <<EOF
 loopx checkout installed as canary only
@@ -713,8 +837,6 @@ fi
 
 export LOOPX_PROMOTION_MODE="$promotion_mode"
 
-mkdir -p "$releases_dir"
-run_under_install_guard "$@"
 warn_stale_promotion_readiness
 acquire_install_lock
 mkdir -p "$bin_dir"
@@ -724,25 +846,25 @@ if [[ -z "$legacy_line" ]]; then
   legacy_line="- legacy command disabled: not present"
 fi
 reserve_release_id
+update_stage copy
 copy_path "$repo_root/loopx" "$release_tmp/loopx"
 copy_path "$repo_root/scripts" "$release_tmp/scripts"
 copy_path "$repo_root/skills" "$release_tmp/skills"
 copy_path "$repo_root/docs" "$release_tmp/docs"
 copy_path "$repo_root/man" "$release_tmp/man"
 copy_path "$repo_root/examples" "$release_tmp/examples"
-copy_path "$repo_root/apps" "$release_tmp/apps"
+copy_apps "$repo_root/apps" "$release_tmp/apps"
 copy_path "$repo_root/.github" "$release_tmp/.github"
 copy_path "$repo_root/README.md" "$release_tmp/README.md"
 copy_path "$repo_root/LICENSE" "$release_tmp/LICENSE"
+copy_path "$repo_root/NOTICE" "$release_tmp/NOTICE"
+copy_path "$repo_root/LICENSE-MIT" "$release_tmp/LICENSE-MIT"
 copy_path "$repo_root/pyproject.toml" "$release_tmp/pyproject.toml"
+copy_path "$repo_root/setup.py" "$release_tmp/setup.py"
+copy_path "$repo_root/MANIFEST.in" "$release_tmp/MANIFEST.in"
 printf '%s\n' "$LOOPX_PYTHON" >"$release_tmp/.loopx-python"
 find "$release_tmp" -name __pycache__ -type d -prune -exec rm -rf {} +
 find "$release_tmp" -name '*.pyc' -type f -delete
-if [[ -d "$release_tmp/apps" ]]; then
-  find "$release_tmp/apps" \
-    \( -name node_modules -o -name .next -o -name dist -o -name build -o -name coverage \) \
-    -type d -prune -exec rm -rf {} +
-fi
 PYTHONPATH="$release_tmp" "${LOOPX_PYTHON:-python3}" \
   "$release_tmp/scripts/render-manpage.py" \
   --output "$release_tmp/man/loopx.1"
@@ -757,6 +879,7 @@ PYTHONPATH="$release_tmp" "${LOOPX_PYTHON:-python3}" \
 chmod +x "$release_tmp/scripts/loopx" "$release_tmp/scripts/loopx-apply-rrule"
 mv "$release_tmp" "$release_dir"
 release_tmp=""
+update_stage validate
 if ! validate_release_candidate "$release_dir"; then
   rm -rf "$release_dir"
   exit 1
@@ -765,6 +888,17 @@ if ! preflight_workflow_skills "$release_dir/skills" "$release_dir" "$bin_dir/lo
   rm -rf "$release_dir"
   exit 1
 fi
+# Data upgrade is a separate, resumable operation. Never delete its backups or
+# roll migrated stores back merely because a later launcher/skill step fails.
+update_stage migrate
+if ! "$release_dir/scripts/loopx" --format json authority-archive upgrade --all-known --execute; then
+  echo "loopx installer error: authority format upgrade failed; backups are retained. Retry with this candidate before activation." >&2
+  exit 1
+fi
+update_stage activate
+previous_loopx="$(readlink "$bin_dir/loopx" 2>/dev/null || true)"
+previous_rrule="$(readlink "$bin_dir/loopx-apply-rrule" 2>/dev/null || true)"
+activation_started=1
 install_symlink "$release_dir/scripts/loopx" "$bin_dir/loopx"
 install_symlink "$release_dir/scripts/loopx-apply-rrule" "$bin_dir/loopx-apply-rrule"
 verify_default_promotion
@@ -824,11 +958,17 @@ PY
 fi
 
 export PATH="$bin_dir:$PATH"
-"$bin_dir/loopx" doctor >/dev/null
+"$bin_dir/loopx" doctor --installation-only >/dev/null
+activation_verified=1
+if [[ "${LOOPX_INSTALL_REVALIDATE_EXTENSIONS:-1}" != "0" ]] && ! "$bin_dir/loopx" --format json extension doctor --all-enabled --execute >/dev/null; then
+  echo "loopx installer warning: one or more enabled extensions failed post-install doctor revalidation" >&2
+  echo "Run 'loopx extension doctor --all-enabled --execute' after repairing the provider." >&2
+fi
 if [[ "$install_canary" != "0" ]]; then
-  "$bin_dir/loopx-canary" doctor >/dev/null
+  "$bin_dir/loopx-canary" doctor --installation-only >/dev/null
 fi
 
+update_stage skills
 install_workflow_skills "$release_dir/skills" "$release_dir" "$bin_dir/loopx"
 
 slash_line="- slash commands: skipped"
@@ -867,8 +1007,6 @@ PY
     slash_line="- slash commands: install attempted; run manually: loopx slash-commands --install"
   fi
 fi
-
-finalize_workflow_skills "$release_dir" "$bin_dir/loopx"
 
 # loopx Claude Code adapter: OPT-IN, OFF by default — the normal loopx install
 # does not install MCP, hooks, or settings. The lightweight slash-command
@@ -927,7 +1065,8 @@ $skill_line
 $slash_line
 $claude_line
 $opencode_line
-- first-run feedback (optional): https://github.com/huangruiteng/loopx/issues/new?template=first_run.yml
+- first-run feedback (optional): https://github.com/loopx-project/loopx/issues/new?template=first_run.yml
+- basic usage statistics (after first-use notice): loopx usage-ping status; disable: loopx usage-ping disable
 
 Current shell can use it with:
   export PATH="$bin_dir:\$PATH"

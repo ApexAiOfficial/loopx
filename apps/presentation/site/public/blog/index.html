@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fafafa">
+  <title>LoopX Blog · LoopX</title>
+  <meta name="description" content="Design, engineering, and field notes on long-horizon agents.">
+  <link rel="canonical" href="https://loopx-project.github.io/loopx/blog/">
+  <link rel="alternate" hreflang="en" href="https://loopx-project.github.io/loopx/blog/">
+  <link rel="alternate" hreflang="zh-CN" href="https://loopx-project.github.io/loopx/blog/zh/">
+  <link rel="alternate" hreflang="x-default" href="https://loopx-project.github.io/loopx/blog/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="LoopX">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:title" content="LoopX Blog">
+  <meta property="og:description" content="Design, engineering, and field notes on long-horizon agents.">
+  <meta property="og:url" content="https://loopx-project.github.io/loopx/blog/">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../blog/blog.css">
+  <script type="module" src="../blog/blog-index.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <a class="brand" href="../" aria-label="LoopX home"><span class="product-mark" aria-hidden="true"><i></i><i></i></span>LoopX</a>
+  <nav aria-label="Primary navigation">
+    <a href="../blog/" aria-current="page">Blog</a>
+    <a href="../docs/book/en/">Docs</a>
+  </nav>
+  <div class="header-actions"><a class="language" href="../blog/zh/" lang="zh-CN" hreflang="zh-CN" aria-label="阅读中文版">中文</a><a class="github" href="https://github.com/loopx-project/loopx">GitHub <span aria-hidden="true">↗</span></a></div>
+</header>
+<main id="main" class="blog-index">
+  <div class="index-heading"><p class="eyebrow">LoopX · Blog</p><h1>Engineering the long run.</h1><p class="lead">Design, engineering, and field notes on long-horizon agents.</p></div>
+  <nav class="reading-routes" aria-labelledby="reading-routes"><h2 id="reading-routes">Read by question</h2><ul><li><b>Understand LoopX</b><span>Which decisions and responsibilities must long-running work retain?</span><p><a href="from-one-shot-agents-to-long-horizon-control/">Architecture</a> <span aria-hidden="true">→</span> <a href="application-scenarios/">Scenarios</a></p></li><li><b>Repair the control rules</b><span>Start with retries, transactions, authority and recovery counterexamples.</span><p><a href="typescript-control-plane-refactor/">TypeScript and semantics</a></p></li><li><b>Choose what to read next</b><span>Follow one task through progressive reads and cycle deltas.</span><p><a href="context-delivery/">Context delivery</a></p></li><li><b>Check whether it helped</b><span>Separate the starting point, later gains, best retention and complete cost.</span><p><a href="edgebench-feedback-and-memory/">EdgeBench study</a> <span aria-hidden="true">→</span> <a href="five-freshness-incidents/">Postmortem</a></p></li></ul></nav>
+  <article class="post-listing">
+    <div><p class="eyebrow">Context delivery · Mechanisms and examples</p><p class="listing-date"><time datetime="2026-11-01">November 1, 2026</time> · <span>Updated November 14</span></p></div>
+    <div><h2><a href="context-delivery/">An Agent needs a way to look things up, too</a></h2><p>Ten reported EdgeBench score pairs include four with runtimes close to 18 hours, plus historical and incomplete runs. The article also traces the separate baselines for the 32.5% progressive view, the 74.25% in-cycle ANN reduction and the 3.0% / 5.0% first read.</p><a class="read-post" href="context-delivery/">Read article <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">Research notes · EdgeBench and LHTB</p><p class="listing-date"><time datetime="2026-10-16">October 16, 2026</time></p></div>
+    <div><h2><a href="edgebench-long-horizon-repairs/">EdgeBench / LHTB: notes from historical runs</a></h2><p>Exploratory notes by songoow on historical, partly interrupted EdgeBench/LHTB runs. The feedback-first option is withdrawn; these are not official LoopX results or current capability claims.</p><a class="read-post" href="edgebench-long-horizon-repairs/">Read the article <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">LoopX 2.0 · Engineering</p><p class="listing-date"><time datetime="2026-10-16">October 16, 2026</time></p></div>
+    <div><h2><a href="typescript-control-plane-refactor/">LoopX 2.0: Two Months of TypeScript Control-Plane Engineering</a></h2><p>From an incremental migration proposal to complete transactions, shared authority, semantic checks, and retirement of old paths. How real callers and counterexamples changed the design.</p><a class="read-post" href="typescript-control-plane-refactor/">Read article <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">Agentic Software · Development</p><p class="listing-date"><time datetime="2026-10-14">October 14, 2026</time></p></div>
+    <div><h2><a href="semantic-software-development/">Agentic Software: Infrastructure for Long-Horizon Development</a></h2><p>Using LoopX to explore infrastructure for agentic software: preserve goals, evidence, and human feedback across sessions, and carry exploration into verifiable delivery.</p><a class="read-post" href="semantic-software-development/">Read article <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">Research notes · EdgeBench</p><p class="listing-date"><time datetime="2026-10-05">First published October 5, 2026</time> · <span>Updated November 10</span></p></div>
+    <div><h2><a href="edgebench-feedback-and-memory/">What does an agent achieve with ten more hours?</a></h2><p>From trustworthy feedback to long-horizon research: separate Stride actions from scored transitions, preserve unreconciled outcomes and the 25-review/17-transition boundary, and retain Yardstick counterexamples.</p><a class="read-post" href="edgebench-feedback-and-memory/">Read article <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">Design perspective · Self-improvement</p><p class="listing-date"><time datetime="2026-10-02">October 2, 2026</time></p></div>
+    <div><h2><a href="long-horizon-rsi/">General long-horizon capability is a prerequisite for RSI</a></h2><p>From its first Meta Goal to Personal Workspace: four months of bootstrapping, 6,848 non-merge commits, and a case for making improvements compound across rounds.</p><a class="read-post" href="long-horizon-rsi/">Read the article <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">Postmortem · Field notes</p><p class="listing-date"><time datetime="2026-09-26">September 26, 2026</time></p></div>
+    <div><h2><a href="five-freshness-incidents/">Five freshness incidents in 47 days: a LoopX postmortem</a></h2><p>Our own advisory agent answered from stale, partial, or unread sources five times while every health signal stayed green. What failed, why local fixes were not enough, and the contract that makes the gap visible.</p><a class="read-post" href="five-freshness-incidents/">Read the article <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">Scenarios · Practice and research</p><p class="listing-date"><time datetime="2026-09-18">September 18, 2026</time></p></div>
+    <div><h2><a href="application-scenarios/">Where LoopX fits: complex tasks, open-ended exploration, and continuous delivery</a></h2><p>See how goals, evidence, and delivery responsibility work across three scenarios, alongside signals from SWE-Marathon, DeepSWE × Sol, and V4 Flash max.</p><a class="read-post" href="application-scenarios/">Read the article <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">Agent-native Kanban · Long-running collaboration</p><p class="listing-date"><time datetime="2026-09-15">September 15, 2026</time></p></div>
+    <div><h2><a href="agent-facing-kanban/">LoopX: Native Kanban for long-running agents</a></h2><p>Four diagrams explain Goals, Todos, claims, leases, gates, evidence, and shared authority state—and how they support long-running collaboration.</p><a class="read-post" href="agent-facing-kanban/">Read the article <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">Architecture · Design notes</p><p class="listing-date"><time datetime="2026-09">September 2026</time></p></div>
+    <div><h2><a href="from-one-shot-agents-to-long-horizon-control/">From one-shot agents to long-horizon control</a></h2><p>How LoopX uses goals, a state kernel, and Effect Programs to carry work across sessions, preserve human judgment, and recover from interruptions.</p><a class="read-post" href="from-one-shot-agents-to-long-horizon-control/">Read the article <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <section class="prose" aria-labelledby="community-reading">
+    <h2 id="community-reading">Community reading</h2>
+    <h3><a href="https://blog.csdn.net/xiaofeng10330111/article/details/163927600" lang="zh-CN">从上下文窗口到控制平面：长周期 AI Agent 如何实现可持续、可治理与可恢复运行</a></h3>
+    <p>By <strong>张彦峰ZYF</strong> · Original Chinese article on CSDN · CC BY-SA 4.0.</p>
+    <p>A community perspective on coordinating long-running agents through goals, evidence, human decisions, and recovery. Its bounded verified transitions (BVT) and proposed metrics are the author's design suggestions; assess current LoopX behavior against the <a href="../docs/book/en/">Developer Book</a> and implementation evidence.</p>
+    <p>The article cites <a href="https://dev.to/arshtechpro/loopx-a-control-plane-for-ai-agents-that-have-to-keep-working-for-days-47n">ArshTechPro's introduction to LoopX</a> among its sources. This reading entry links to the author's original text.</p>
+    <a class="read-post" href="https://blog.csdn.net/xiaofeng10330111/article/details/163927600">Read the original on CSDN <span aria-hidden="true">↗</span></a>
+  </section>
+  <div class="index-note"><span>Start using LoopX</span><a href="../docs/book/en/">Open the Developer Book →</a></div>
+</main>
+<footer class="site-footer"><a class="brand" href="../">LoopX</a><p>Keep the loop moving. Keep the judgment human.</p><a href="../blog/">All posts ↑</a></footer>
+</body>
+</html>

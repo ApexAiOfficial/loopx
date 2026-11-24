@@ -6,15 +6,16 @@ import json
 import shlex
 import subprocess
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
 
+import loopx.bootstrap_command_pack as command_pack_module
 from loopx.bootstrap_command_pack import (
     GUIDED_COMMAND_PACK_PROJECTION_SCHEMA_VERSION,
     build_loopx_bootstrap_command_pack,
     build_start_goal_guided_packet,
-    render_start_goal_guided_markdown,
 )
 from loopx.capabilities.issue_fix.candidate_preflight import (
     build_issue_fix_candidate_preflight_packet,
@@ -25,23 +26,34 @@ from loopx.cli_commands.todo_argument_validation import (
     validate_shared_todo_options,
     validate_todo_add_options,
 )
+from loopx.control_plane import effect_program, effect_runtime
+from loopx.slash_commands import build_slash_command_catalog
 
 GOAL_ID = "guided-projection-goal"
 AGENT_ID = "codex-guided-projection"
 GOAL_TEXT = "Ship a bounded public issue triage workflow."
 
 
-def _write_connected_project(root: Path) -> Path:
+@pytest.fixture(autouse=True)
+def _isolate_ambient_ssh_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SSH_CONNECTION", raising=False)
+    monkeypatch.delenv("SSH_CLIENT", raising=False)
+
+
+def _write_connected_project(root: Path, *, todos_body: str | None = None) -> Path:
     project = root / "project"
     state_file = project / ".codex" / "goals" / GOAL_ID / "ACTIVE_GOAL_STATE.md"
     state_file.parent.mkdir(parents=True)
-    state_file.write_text("# Active Goal State\n", encoding="utf-8")
+    state_file.write_text("# Active Goal State\n" + (
+        f"## Objective\n{GOAL_TEXT}\n## Agent Todo\n{todos_body}\n"
+        if todos_body is not None else ""), encoding="utf-8")
     registry = project / ".loopx" / "registry.json"
     registry.parent.mkdir(parents=True)
     registry.write_text(
         json.dumps(
             {
                 "schema_version": "0.1",
+                "common_runtime_root": str(root / "runtime"),
                 "goals": [
                     {
                         "id": GOAL_ID,
@@ -60,6 +72,17 @@ def _write_connected_project(root: Path) -> Path:
         + "\n",
         encoding="utf-8",
     )
+    from canonical_authority_fixture import initialize_canonical_authority
+    from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
+    from loopx.control_plane.todos.active_state_todo_parser import parse_todo_source
+    from loopx.control_plane.todos.todo_summary import canonical_todo_read_record, structured_todo_item
+
+    active, _, _ = parse_todo_source(state_file.read_text())
+    records = [canonical_todo_read_record(structured_todo_item(
+        item, role="agent", source_section="Agent Todo", text_limit=None,
+    )) for item in active["agent"]]
+    initialize_canonical_authority(root / "runtime", GOAL_ID,
+        build_todo_runtime_shadow_projection(goal_id=GOAL_ID, todos=records), state_path=state_file)
     return project
 
 
@@ -79,6 +102,10 @@ def _build(project: Path, *, include_detail: bool) -> dict[str, Any]:
 def _host_shadow_document(payload: dict[str, Any]) -> dict[str, Any]:
     command_pack = payload["command_pack"]
     transaction = payload["guided_transaction"]
+    recommendation = dict(payload["recommended_next_step"])
+    if "plan_prompt_ref" in recommendation:
+        assert "plan_prompt" not in recommendation
+        recommendation["plan_prompt"] = _resolve_pointer(payload, recommendation.pop("plan_prompt_ref"))
     return {
         "schema_version": payload["schema_version"],
         "project": payload["project"],
@@ -87,7 +114,7 @@ def _host_shadow_document(payload: dict[str, Any]) -> dict[str, Any]:
         "agent_id": payload["agent_id"],
         "host_surface": payload["host_surface"],
         "goal_text": payload["goal_text"],
-        "recommended_next_step": payload["recommended_next_step"],
+        "recommended_next_step": recommendation,
         "ordered_steps": transaction["ordered_steps"],
         "idempotency_policy": transaction["idempotency_policy"],
         "preserve_todos_policy": transaction["preserve_todos_policy"],
@@ -119,6 +146,38 @@ def _invoke_detail_command(command: str) -> dict[str, Any]:
     return payload
 
 
+def _invoke_start_goal_for_host(
+    project: Path,
+    host_surface: str,
+    *,
+    include_detail: bool = False,
+) -> tuple[int, dict[str, Any]]:
+    args = [
+        "--format",
+        "json",
+        "start-goal",
+        "--guided",
+        "--project",
+        str(project),
+        "--goal-id",
+        GOAL_ID,
+        "--agent-id",
+        AGENT_ID,
+        "--host-surface",
+        host_surface,
+        "--goal-text",
+        GOAL_TEXT,
+    ]
+    if include_detail:
+        args.append("--include-command-pack-detail")
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(args)
+    payload = json.loads(output.getvalue())
+    assert isinstance(payload, dict)
+    return exit_code, payload
+
+
 def _invoke_ark_start_goal_cli(
     project: Path,
     *goal_input_args: str,
@@ -147,15 +206,373 @@ def _invoke_ark_start_goal_cli(
     return exit_code, payload
 
 
-def test_default_projection_preserves_host_actions_and_json_anchors(
+def _invoke_start_goal_with_slash_arguments(
+    project: Path,
+    raw_arguments: str,
+    *,
+    extra_arguments: tuple[str, ...] = (),
+) -> tuple[int, dict[str, Any]]:
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(
+            [
+                "--format",
+                "json",
+                "start-goal",
+                "--guided",
+                "--project",
+                str(project),
+                "--goal-id",
+                GOAL_ID,
+                "--host-surface",
+                "codex-app",
+                *extra_arguments,
+                f"--slash-command-arguments={raw_arguments}",
+            ]
+        )
+    payload = json.loads(output.getvalue())
+    assert isinstance(payload, dict)
+    return exit_code, payload
+
+
+def _block_effect_runtime_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    diagnostic_code: str = "node_unavailable",
+    message: str = "TypeScript Effect runtime could not serve the request",
+) -> None:
+    request = effect_program.effect_runtime_result
+
+    def unavailable(method, params, **kwargs):
+        if method == "effect.program_from_ordered_steps":
+            raise effect_runtime.EffectRuntimeStartupError(
+                message,
+                diagnostic_code=diagnostic_code,
+            )
+        return request(method, params, **kwargs)
+
+    monkeypatch.setattr(effect_program, "effect_runtime_result", unavailable)
+
+
+@pytest.mark.parametrize(
+    (
+        "diagnostic_code",
+        "expected_action_fragment",
+        "mentions_node_installation",
+        "mentions_generic_runtime_recovery",
+    ),
+    [
+        ("node_unavailable", "Install or activate Node.js", True, True),
+        (
+            "startup_lock_timeout",
+            "wait for the active startup to settle",
+            False,
+            True,
+        ),
+        ("runtime_launch_failed", "runtime still cannot start", False, True),
+        ("runtime_exited_before_ready", "runtime exits again", False, True),
+        ("runtime_startup_timeout", "startup continues to time out", False, True),
+        ("runtime_request_failed", "requests continue to fail", False, True),
+        ("invalid_idle_timeout", "could not serve the request", False, False),
+        ("future_runtime_diagnostic", "runtime remains unavailable", False, True),
+    ],
+)
+def test_cli_reports_effect_runtime_startup_failure_without_traceback(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic_code: str,
+    expected_action_fragment: str,
+    mentions_node_installation: bool,
+    mentions_generic_runtime_recovery: bool,
 ) -> None:
     project = _write_connected_project(tmp_path)
-    compact = _build(project, include_detail=False)
-    detailed = _build(project, include_detail=True)
+    _block_effect_runtime_startup(monkeypatch, diagnostic_code=diagnostic_code)
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(
+            [
+                "--format",
+                "json",
+                "start-goal",
+                "--guided",
+                "--project",
+                str(project),
+                "--goal-id",
+                GOAL_ID,
+                "--agent-id",
+                AGENT_ID,
+                "--host-surface",
+                "shell",
+                "--goal-text",
+                GOAL_TEXT,
+            ]
+        )
+
+    raw_output = output.getvalue()
+    payload = json.loads(raw_output)
+    assert exit_code == 1
+    assert payload["ok"] is False
+    assert payload["schema_version"] == "loopx_start_goal_guided_v0"
+    assert payload["error"] == "LoopX TypeScript control-plane runtime is unavailable"
+    assert payload["diagnostic_code"] == diagnostic_code
+    assert payload["runtime_requirement"]["minimum_node_version"] == "22.22.3"
+    action = payload["recommended_action"]
+    assert expected_action_fragment in action
+    assert ("Node.js" in action) is mentions_node_installation
+    if not mentions_node_installation:
+        assert "Install or activate Node.js" not in action
+    if mentions_generic_runtime_recovery:
+        assert "loopx doctor --deep" in action
+    else:
+        assert "loopx doctor --deep" not in action
+        assert "reinstall" not in action
+    assert "Traceback" not in raw_output
+
+
+@pytest.mark.parametrize(
+    "host_args",
+    [
+        ("--host-surface", "codex-app"),
+        (),
+        ("--host-surface", "codex-app", "--fine-grained", "--capability-route", "issue-fix"),
+    ],
+    ids=["guided_start", "host_selection_gate", "fine_issue_fix"],
+)
+def test_start_goal_markdown_reuses_the_rendered_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    host_args: tuple[str, ...],
+) -> None:
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+    args = [
+        "--runtime-root", str(tmp_path / "runtime"),
+        "start-goal", "--guided", "--project", str(project),
+        "--goal-text", GOAL_TEXT, *host_args,
+    ]
+    render_requests: list[dict[str, Any]] = []
+    request = effect_program.effect_runtime_result
+
+    def count_render(method, params, **kwargs):
+        if method == "effect.program_from_ordered_steps":
+            render_requests.append(params)
+        return request(method, params, **kwargs)
+
+    monkeypatch.setattr(effect_program, "effect_runtime_result", count_render)
+
+    assert cli_main(["--format", "markdown", *args]) == 0
+    markdown = capsys.readouterr().out
+    assert len(render_requests) == 1
+
+    assert cli_main(["--format", "json", *args]) == 0
+    packet = json.loads(capsys.readouterr().out)
+    assert len(render_requests) == 2
+    assert markdown == packet["message"] + "\n"
+    assert render_requests[0] == render_requests[1]
+    assert render_requests[0]["include_raw"] is False
+    transaction = packet["guided_transaction"]
+    rpc_steps = render_requests[1]["ordered_steps"]
+    assert [step["id"] for step in rpc_steps] == [step["id"] for step in transaction["ordered_steps"]]
+    if not host_args:
+        gate = transaction["host_surface_selection_gate"]
+        assert gate["choices"][0]["rerun_command"] in markdown
+        assert all("choices" not in step for step in rpc_steps)
+        return
+
+    sources = {step["id"]: step for step in transaction["ordered_steps"]}
+    projected = {step["id"]: step for step in rpc_steps}
+    connect = sources["connect_if_needed"]["command"]
+    assert len(connect.splitlines()) > 1
+    assert projected["connect_if_needed"]["command"] == connect
+    planning = sources["plan_ranked_todos"]
+    assert "Goal requirements and Todos:" in planning["prompt"]
+    assert planning["goal_requirements"]["inspect_command"]
+    assert "goal_requirements" not in projected["plan_ranked_todos"]
+    assert projected["plan_ranked_todos"]["prompt"] == planning["prompt"].splitlines()[0]
+    assert "overall requirements: reuse existing or declare missing requirements" in markdown
+    if "--capability-route" in host_args:
+        assert "candidate_preflight" in sources["qualify_selected_capability"]
+        assert "candidate_preflight" not in projected["qualify_selected_capability"]
+        assert "preflight: refresh" in markdown
+
+
+def test_guided_markdown_keeps_a_present_command_with_an_empty_first_line() -> None:
+    step = MappingProxyType({
+        "id": "preview",
+        "kind": "read_only",
+        "purpose": "Read a saved preview",
+        "command": "\nRead only the original evidence.",
+        "command_template": "fallback must stay unused",
+    })
+    rendered = command_pack_module.render_start_goal_guided_markdown({
+        "guided_transaction": {"ordered_steps": [step]},
+    })
+    assert "1. `preview` (read_only): Read a saved preview\n   - ``\n" in rendered
+    assert "fallback must stay unused" not in rendered
+
+
+def test_cli_reports_effect_runtime_startup_failure_in_default_markdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _write_connected_project(tmp_path)
+    _block_effect_runtime_startup(monkeypatch)
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(
+            [
+                "start-goal",
+                "--guided",
+                "--project",
+                str(project),
+                "--goal-id",
+                GOAL_ID,
+                "--agent-id",
+                AGENT_ID,
+                "--host-surface",
+                "shell",
+                "--goal-text",
+                GOAL_TEXT,
+            ]
+        )
+
+    raw_output = output.getvalue()
+    assert exit_code == 1
+    assert "# Guided Start Goal" in raw_output
+    assert "LoopX TypeScript control-plane runtime is unavailable" in raw_output
+    assert "diagnostic_code: `node_unavailable`" in raw_output
+    assert "loopx doctor --deep" in raw_output
+    assert "Traceback" not in raw_output
+
+
+def test_guided_cli_keeps_actionable_invalid_idle_timeout_remediation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real guided entrypoint must keep the actionable configuration fix.
+
+    This drives the real managed Node runtime instead of stubbing the startup
+    failure, so it also proves the typed stderr diagnostic survives the public
+    projection end to end.
+    """
+
+    project = _write_connected_project(tmp_path)
+    monkeypatch.setattr(effect_runtime, "_runtime_dir", lambda: tmp_path / "runtime")
+    monkeypatch.setenv("LOOPX_EFFECT_RUNTIME_IDLE_MS", "0")
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(
+            [
+                "--format",
+                "json",
+                "start-goal",
+                "--guided",
+                "--project",
+                str(project),
+                "--goal-id",
+                GOAL_ID,
+                "--agent-id",
+                AGENT_ID,
+                "--host-surface",
+                "shell",
+                "--goal-text",
+                GOAL_TEXT,
+            ]
+        )
+
+    payload = json.loads(output.getvalue())
+    assert exit_code == 1
+    assert payload["ok"] is False
+    assert payload["diagnostic_code"] == "invalid_idle_timeout"
+
+    action = payload["recommended_action"]
+    assert "LOOPX_EFFECT_RUNTIME_IDLE_MS" in action
+    assert "between 1 and 2147483647 milliseconds" in action
+    assert '(received "0")' in action
+    assert "unset" in action.lower()
+    assert "Then retry `loopx start-goal --guided`." in action
+    assert "doctor" not in action
+    assert "reinstall" not in action
+
+
+def test_invalid_idle_timeout_remediation_reuses_typed_runtime_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The projection reuses the runtime-owned guidance instead of restating it.
+
+    The TypeScript parser owns the accepted range and publishes it as the
+    typed startup message, so the guided CLI must surface whatever bounded
+    message the runtime produced and append only its own retry text. A varied
+    message proves no range is re-hardcoded on the Python side.
+    """
+
+    varied_message = (
+        "LOOPX_EFFECT_RUNTIME_IDLE_MS must be a base-10 integer between "
+        '7 and 9001 milliseconds (received "nope")'
+    )
+    project = _write_connected_project(tmp_path)
+    _block_effect_runtime_startup(
+        monkeypatch,
+        diagnostic_code="invalid_idle_timeout",
+        message=varied_message,
+    )
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(
+            [
+                "--format",
+                "json",
+                "start-goal",
+                "--guided",
+                "--project",
+                str(project),
+                "--goal-id",
+                GOAL_ID,
+                "--agent-id",
+                AGENT_ID,
+                "--host-surface",
+                "shell",
+                "--goal-text",
+                GOAL_TEXT,
+            ]
+        )
+
+    payload = json.loads(output.getvalue())
+    assert exit_code == 1
+    assert payload["diagnostic_code"] == "invalid_idle_timeout"
+    action = payload["recommended_action"]
+    assert action == f"{varied_message} Then retry `loopx start-goal --guided`."
+    assert "2147483647" not in action
+    assert "doctor" not in action
+    assert "reinstall" not in action
+
+
+def test_default_projection_preserves_host_actions_and_json_anchors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    project = _write_connected_project(tmp_path)
+    code, compact = _invoke_start_goal_for_host(project, "codex-app")
+    detail_code, detailed = _invoke_start_goal_for_host(project, "codex-app", include_detail=True)
+    assert code == detail_code == 0
 
     assert set(compact) == set(detailed)
     assert _host_shadow_document(compact) == _host_shadow_document(detailed)
+    recommendation = compact["recommended_next_step"]
+    assert "plan_prompt" not in recommendation
+    assert recommendation["plan_prompt_ref"] == "#/command_pack/commands/goal_start_plan_prompt"
+    assert _resolve_pointer(compact, recommendation["plan_prompt_ref"]) == (
+        detailed["recommended_next_step"]["plan_prompt"]
+    )
+    assert "plan_prompt_ref" not in detailed["recommended_next_step"]
+    assert compact["message"] == detailed["message"]
     assert compact["command_pack_detail_included"] is False
     assert detailed["command_pack_detail_included"] is True
     assert compact["guided_transaction"]["ordered_steps"][-1]["id"] == (
@@ -203,6 +620,18 @@ def test_goal_start_packet_is_parity_complete_behavior_authority(
     contract = payload["command_pack"]["goal_start_contract"]
     assert "ordered_steps + goal_start_contract" in contract["behavior_authority"]
     assert "passes raw arguments" in contract["behavior_authority"]
+    assert contract["activation"]["host_surfaces"]["trae_app"] == (
+        "Trae App heartbeat automation"
+    )
+    slash_catalog = build_slash_command_catalog()
+    goal_start = next(
+        command
+        for command in slash_catalog["commands"]
+        if command["command"] == "/loopx <goal text>"
+    )
+    assert goal_start["agent_contract"]["host_loop_activation_by_agent_type"][
+        "trae_app"
+    ].startswith("create/update Trae App heartbeat automation")
 
     invariants = contract["execution_invariants"]
     for marker in (
@@ -330,7 +759,7 @@ def test_issue_fix_goal_projects_capability_guard_without_todo_fields(
     assert commands[route["admission_command_key"]].startswith(
         "loopx issue-fix feasibility "
     )
-    rendered = render_start_goal_guided_markdown(payload)
+    rendered = command_pack_module.render_start_goal_guided_markdown(payload)
     assert "authority: open public issue; source clues are evidence only" in rendered
     assert "discover: `gh issue list " in rendered
     assert (
@@ -341,7 +770,8 @@ def test_issue_fix_goal_projects_capability_guard_without_todo_fields(
     assert "loopx issue-fix workflow-plan " in rendered
     assert "loopx issue-fix feasibility " in rendered
     assert "proceed: `loopx issue-fix feasibility " in rendered
-    assert len(rendered.replace(str(project), "<project>")) <= 3_600
+    # Full-body readback adds a routed command and authority/completeness guidance.
+    assert len(rendered.replace(str(project), "<project>")) <= 4_100
     todo_command = next(
         step["command_template"]
         for step in transaction["ordered_steps"]
@@ -622,7 +1052,10 @@ def test_projection_materially_reduces_repetition_without_hiding_measurement(
     compact_json = json.dumps(compact, ensure_ascii=False, sort_keys=True)
     detailed_json = json.dumps(detailed, ensure_ascii=False, sort_keys=True)
 
-    assert len(compact_json) <= int(len(detailed_json) * 0.65)
+    # Both views carry one copy of the declaration/link recipe. Its roughly
+    # 700 common characters contribute about 240 characters to the ratio
+    # difference (34% of the added content). Keep the duplicate limits below.
+    assert len(compact_json) <= int(len(detailed_json) * 0.66) + 240
     compact_duplication = compact["packet_summary"]["duplication_measurement"]
     detailed_duplication = detailed["packet_summary"]["duplication_measurement"]
     assert compact_duplication["objective_content"]["duplicate_occurrences"] <= 11
@@ -766,14 +1199,132 @@ def test_cli_codex_app_reuses_ambient_thread_binding(
     assert payload["guided_transaction"].get("blocked_by") is None
 
 
+@pytest.mark.parametrize(
+    ("host_surface", "prompt_flag"),
+    (("trae_app", "--trae_app"), ("traex-cli", "--runtime-profile generic_cli")),
+)
+def test_cli_trae_hosts_reuse_ambient_thread_binding(
+    tmp_path: Path, monkeypatch, host_surface: str, prompt_flag: str
+) -> None:
+    project = _write_connected_project(tmp_path)
+    registry_path = project / ".loopx" / "registry.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["goals"][0]["coordination"]["thread_agent_bindings"] = [
+        {"thread_id": "trae-thread", "host_surface": host_surface, "agent_id": AGENT_ID}
+    ]
+    registry_path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+    monkeypatch.setenv("TRAECLI_THREAD_ID", "trae-thread")
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(
+            [
+                "--format",
+                "json",
+                "start-goal",
+                "--guided",
+                "--project",
+                str(project),
+                "--goal-id",
+                GOAL_ID,
+                "--host-surface",
+                host_surface,
+                "--goal-text",
+                GOAL_TEXT,
+            ]
+        )
+
+    assert exit_code == 0
+    payload = json.loads(output.getvalue())
+    assert payload["thread_id"] == "trae-thread"
+    assert payload["agent_id"] == AGENT_ID
+    assert payload["thread_agent_binding"]["status"] == "bound"
+    assert payload["goal_text"] == GOAL_TEXT
+    assert prompt_flag in payload["command_pack"]["commands"][
+        "heartbeat_prompt"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("ambient", "bound_host", "explicit", "conflict", "expected_gate"),
+    (
+        ("bound-thread", "traex-cli", None, False, None),
+        ("other-thread", "traex-cli", "bound-thread", False, None),
+        ("new-thread", "traex-cli", None, False, "fresh_agent_registration_required"),
+        (None, "traex-cli", None, False, "thread_binding_selection_required"),
+        ("bound-thread", "trae_app", None, False, "fresh_agent_registration_required"),
+        ("bound-thread", "traex-cli", None, True, "thread_binding_conflict"),
+    ),
+)
+def test_cli_traex_thread_continuity_preserves_identity_fences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ambient: str | None,
+    bound_host: str,
+    explicit: str | None,
+    conflict: bool,
+    expected_gate: str | None,
+) -> None:
+    project = _write_connected_project(tmp_path)
+    registry_path = project / ".loopx" / "registry.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    coordination = registry["goals"][0]["coordination"]
+    bindings = [
+        {"thread_id": "bound-thread", "host_surface": bound_host, "agent_id": AGENT_ID}
+    ]
+    if conflict:
+        coordination["registered_agents"].append("conflicting-agent")
+        bindings.append(
+            {"thread_id": "bound-thread", "host_surface": bound_host,
+             "agent_id": "conflicting-agent"}
+        )
+    coordination["thread_agent_bindings"] = bindings
+    registry_path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+    before = registry_path.read_bytes()
+    # Another host's ambient id cannot fill a missing TraeX id.
+    monkeypatch.setenv("CODEX_THREAD_ID", "bound-thread")
+    if ambient is None:
+        monkeypatch.delenv("TRAECLI_THREAD_ID", raising=False)
+    else:
+        monkeypatch.setenv("TRAECLI_THREAD_ID", ambient)
+    argv = [
+        "--format", "json", "start-goal", "--guided", "--project", str(project),
+        "--goal-id", GOAL_ID, "--host-surface", "traex-cli", "--goal-text", GOAL_TEXT,
+    ]
+    if explicit is not None:
+        argv += ["--thread-id", explicit]
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(argv)
+    assert exit_code == 0
+    payload = json.loads(output.getvalue())
+    assert payload["goal_text"] == GOAL_TEXT
+    assert payload.get("thread_id") == (explicit or ambient)
+    assert registry_path.read_bytes() == before
+    gate = payload["guided_transaction"].get("identity_selection_gate")
+    if expected_gate is None:
+        assert gate is None
+        assert payload["agent_id"] == AGENT_ID
+        assert payload["thread_agent_binding"]["status"] == "bound"
+    else:
+        assert gate["state"] == expected_gate
+        assert payload["agent_id"] is None
+        assert payload["guided_transaction"]["blocked_by"] == "agent_identity_selection"
+
+
 def test_start_goal_binds_selected_lane_before_todo_writeback(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path,
 ) -> None:
     project = _write_connected_project(tmp_path)
     source_registry = project / ".loopx" / "registry.json"
     runtime = tmp_path / "runtime"
-    runtime.mkdir()
+    runtime.mkdir(exist_ok=True)
     source_payload = json.loads(source_registry.read_text(encoding="utf-8"))
+    source_payload["common_runtime_root"] = str(runtime)
+    source_registry.write_text(
+        json.dumps(source_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
     global_payload = {
         **source_payload,
         "registry_role": "global-local",
@@ -783,8 +1334,6 @@ def test_start_goal_binds_selected_lane_before_todo_writeback(
         json.dumps(global_payload, indent=2) + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("LOOPX_RUNTIME_ROOT", str(runtime))
-
     first = build_start_goal_guided_packet(
         project=project,
         goal_id=GOAL_ID,
@@ -813,8 +1362,9 @@ def test_start_goal_binds_selected_lane_before_todo_writeback(
 
     output = io.StringIO()
     bind_argv = shlex.split(bind_step["command"])
+    assert bind_argv[bind_argv.index("--runtime-root") + 1] == str(runtime)
     with contextlib.redirect_stdout(output):
-        exit_code = cli_main(["--runtime-root", str(runtime), *bind_argv[1:]])
+        exit_code = cli_main(bind_argv[1:])
     assert exit_code == 0, output.getvalue()
 
     second = build_start_goal_guided_packet(
@@ -833,6 +1383,198 @@ def test_start_goal_binds_selected_lane_before_todo_writeback(
     assert "bind_thread_identity" not in {
         step["id"] for step in second["guided_transaction"]["ordered_steps"]
     }
+
+
+def test_fresh_agent_registration_preserves_guided_runtime_root(
+    tmp_path: Path,
+) -> None:
+    project = _write_connected_project(tmp_path)
+    source_registry = project / ".loopx" / "registry.json"
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(exist_ok=True)
+    source_payload = json.loads(source_registry.read_text(encoding="utf-8"))
+    source_payload["common_runtime_root"] = str(runtime)
+    source_payload["goals"][0]["coordination"]["registered_agents"] = []
+    source_registry.write_text(
+        json.dumps(source_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    global_payload = {
+        **source_payload,
+        "registry_role": "global-local",
+    }
+    global_payload["goals"][0]["source_registry"] = str(source_registry)
+    global_registry = runtime / "registry.global.json"
+    global_registry.write_text(
+        json.dumps(global_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    payload = build_start_goal_guided_packet(
+        project=project,
+        goal_id=GOAL_ID,
+        agent_id="fresh-agent",
+        thread_id="thread-fresh-agent",
+        cli_bin="loopx",
+        host_surface="codex-app",
+        goal_text=GOAL_TEXT,
+        available_capabilities=["network"],
+    )
+
+    gate = payload["guided_transaction"]["identity_selection_gate"]
+    fresh_registration = gate["fresh_agent_registration"]
+    execute_command = fresh_registration["execute_command"]
+    rerun_command = fresh_registration["rerun_start_goal_command"]
+    execute_args = shlex.split(execute_command)
+    rerun_args = shlex.split(rerun_command)
+    assert execute_args[execute_args.index("--runtime-root") + 1] == str(runtime)
+    assert "--runtime-root" not in rerun_args
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(execute_args[1:])
+    assert exit_code == 0, output.getvalue()
+
+    registered_source = json.loads(source_registry.read_text(encoding="utf-8"))
+    registered_global = json.loads(global_registry.read_text(encoding="utf-8"))
+    assert registered_source["goals"][0]["coordination"]["registered_agents"] == [
+        "fresh-agent"
+    ]
+    assert registered_global["goals"][0]["coordination"]["registered_agents"] == [
+        "fresh-agent"
+    ]
+
+
+def test_start_goal_cli_preserves_explicit_runtime_root_in_registration_command(
+    tmp_path: Path,
+) -> None:
+    project = _write_connected_project(tmp_path)
+    source_registry = project / ".loopx" / "registry.json"
+    runtime = project / "explicit-runtime"
+    runtime.mkdir()
+    source_payload = json.loads(source_registry.read_text(encoding="utf-8"))
+    source_payload["goals"][0]["coordination"]["registered_agents"] = []
+    source_registry.write_text(
+        json.dumps(source_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    global_payload = {
+        **source_payload,
+        "registry_role": "global-local",
+        "common_runtime_root": str(runtime),
+    }
+    global_payload["goals"][0]["source_registry"] = str(source_registry)
+    global_registry = runtime / "registry.global.json"
+    global_registry.write_text(
+        json.dumps(global_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(
+            [
+                "--runtime-root",
+                "explicit-runtime",
+                "--format",
+                "json",
+                "start-goal",
+                "--guided",
+                "--project",
+                str(project),
+                "--goal-id",
+                GOAL_ID,
+                "--agent-id",
+                "explicit-runtime-agent",
+                "--thread-id",
+                "thread-explicit-runtime",
+                "--host-surface",
+                "codex-app",
+                "--goal-text",
+                GOAL_TEXT,
+            ]
+        )
+    assert exit_code == 0, output.getvalue()
+
+    payload = json.loads(output.getvalue())
+    registration = payload["guided_transaction"]["identity_selection_gate"][
+        "fresh_agent_registration"
+    ]
+    execute_args = shlex.split(registration["execute_command"])
+    assert execute_args[execute_args.index("--runtime-root") + 1] == str(runtime)
+
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main(execute_args[1:])
+    assert exit_code == 0, output.getvalue()
+
+    registered_source = json.loads(source_registry.read_text(encoding="utf-8"))
+    registered_global = json.loads(global_registry.read_text(encoding="utf-8"))
+    assert registered_source["goals"][0]["coordination"]["registered_agents"] == [
+        "explicit-runtime-agent"
+    ]
+    assert registered_global["goals"][0]["coordination"]["registered_agents"] == [
+        "explicit-runtime-agent"
+    ]
+
+
+def test_guided_state_commands_share_explicit_runtime_root(
+    tmp_path: Path,
+) -> None:
+    project = _write_connected_project(tmp_path)
+    runtime = project / "explicit-runtime"
+    runtime.mkdir()
+    from canonical_authority_fixture import initialize_canonical_authority
+    from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
+
+    initialize_canonical_authority(runtime, GOAL_ID,
+        build_todo_runtime_shadow_projection(goal_id=GOAL_ID, todos=[]),
+        state_path=project / ".codex" / "goals" / GOAL_ID / "ACTIVE_GOAL_STATE.md")
+
+    payload = build_start_goal_guided_packet(
+        project=project,
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+        thread_id="thread-runtime-consistency",
+        cli_bin="loopx",
+        host_surface="codex-app",
+        goal_text=GOAL_TEXT,
+        available_capabilities=["network"],
+        runtime_root_arg="explicit-runtime",
+        include_command_pack_detail=True,
+    )
+
+    expected_runtime = str(runtime)
+    command_pack = payload["command_pack"]
+    commands = command_pack["commands"]
+
+    def assert_runtime(command: str) -> None:
+        tokens = shlex.split(command)
+        runtime_index = tokens.index("--runtime-root")
+        assert tokens[runtime_index + 1] == expected_runtime
+
+    assert_runtime(command_pack["canonical_cli_command"])
+    for command_key in (
+        "goal_start_connect_if_needed",
+        "goal_start_bind_thread",
+        "goal_start_refresh_state",
+        "goal_start_host_loop_activation",
+        "goal_start_agent_onboard_recheck",
+        "goal_start_quota_should_run",
+    ):
+        command = commands[command_key]
+        assert command is not None
+        assert_runtime(command)
+
+    ordered_steps = payload["guided_transaction"]["ordered_steps"]
+    for step_id, command_key in (
+        ("write_ordered_todos", "command_template"),
+        ("refresh_state", "command"),
+        ("quota_guard", "command"),
+    ):
+        step = next(step for step in ordered_steps if step["id"] == step_id)
+        command = step[command_key]
+        assert command is not None
+        assert_runtime(command)
 
 
 def test_dsh_native_start_goal_binds_the_exact_same_session_lane(
@@ -864,7 +1606,7 @@ def test_dsh_native_start_goal_binds_the_exact_same_session_lane(
     )
 
 
-def test_start_goal_with_unbound_thread_requires_existing_lane_selection(
+def test_start_goal_with_unbound_thread_defaults_to_fresh_agent_registration(
     tmp_path: Path,
 ) -> None:
     project = _write_connected_project(tmp_path)
@@ -886,16 +1628,16 @@ def test_start_goal_with_unbound_thread_requires_existing_lane_selection(
 
     gate = payload["guided_transaction"]["identity_selection_gate"]
     assert payload["guided_transaction"]["blocked_by"] == "agent_identity_selection"
-    assert gate["state"] == "thread_binding_selection_required"
-    assert gate["default_action"] == "select_agent_identity"
-    assert gate["fresh_agent_registration"] is None
+    assert gate["state"] == "fresh_agent_registration_required"
+    assert gate["default_action"] == "register_fresh_agent"
+    assert gate["fresh_agent_registration"]["recommended"] is True
     assert all(
         choice["requires_explicit_takeover_intent"] is True
         for choice in gate["choices"]
     )
 
 
-def test_start_goal_unbound_thread_requires_lane_selection_even_for_single_registered_agent(
+def test_start_goal_unbound_thread_defaults_to_fresh_for_single_registered_agent(
     tmp_path: Path,
 ) -> None:
     project = _write_connected_project(tmp_path)
@@ -914,10 +1656,31 @@ def test_start_goal_unbound_thread_requires_lane_selection_even_for_single_regis
     assert payload["agent_id"] is None
     assert payload["guided_transaction"]["blocked_by"] == "agent_identity_selection"
     gate = payload["guided_transaction"]["identity_selection_gate"]
-    assert gate["state"] == "thread_binding_selection_required"
-    assert gate["default_action"] == "select_agent_identity"
-    assert gate["fresh_agent_registration"] is None
+    assert gate["state"] == "fresh_agent_registration_required"
+    assert gate["default_action"] == "register_fresh_agent"
+    assert gate["fresh_agent_registration"]["recommended"] is True
     assert gate["choices"][0]["agent_id"] == AGENT_ID
+
+
+def test_start_goal_unbound_thread_preserves_explicit_existing_agent(
+    tmp_path: Path,
+) -> None:
+    project = _write_connected_project(tmp_path)
+
+    payload = build_start_goal_guided_packet(
+        project=project,
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+        thread_id="thread-explicit-existing",
+        cli_bin="loopx",
+        host_surface="codex-app",
+        goal_text=GOAL_TEXT,
+        available_capabilities=["network"],
+    )
+
+    assert payload["agent_id"] == AGENT_ID
+    assert payload["command_pack"]["host_loop_activation"]["activation_allowed"] is True
+    assert payload["guided_transaction"].get("identity_selection_gate") is None
 
 
 def test_start_goal_without_thread_id_requires_explicit_lane_selection(tmp_path: Path) -> None:
@@ -942,7 +1705,7 @@ def test_start_goal_without_thread_id_requires_explicit_lane_selection(tmp_path:
     assert gate["choices"][0]["requires_explicit_takeover_intent"] is True
 
 
-def test_cli_codex_app_unbound_ambient_thread_requires_lane_selection(
+def test_cli_codex_app_unbound_ambient_thread_defaults_to_fresh_agent(
     tmp_path: Path, monkeypatch
 ) -> None:
     project = _write_connected_project(tmp_path)
@@ -972,9 +1735,9 @@ def test_cli_codex_app_unbound_ambient_thread_requires_lane_selection(
     assert payload["thread_id"] == "thread-new-session"
     assert payload["agent_id"] is None
     gate = payload["guided_transaction"]["identity_selection_gate"]
-    assert gate["state"] == "thread_binding_selection_required"
-    assert gate["default_action"] == "select_agent_identity"
-    assert gate["fresh_agent_registration"] is None
+    assert gate["state"] == "fresh_agent_registration_required"
+    assert gate["default_action"] == "register_fresh_agent"
+    assert gate["fresh_agent_registration"]["recommended"] is True
     assert gate["choices"][0]["agent_id"] == AGENT_ID
 
 
@@ -1021,7 +1784,47 @@ def test_cli_codex_app_ssh_reuses_ambient_thread_binding(
     assert payload["guided_transaction"].get("blocked_by") is None
 
 
-def test_cli_codex_app_ssh_unbound_ambient_thread_requires_lane_selection(
+def test_cli_codex_app_fails_closed_when_codex_thread_runs_over_ssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _write_connected_project(tmp_path)
+    monkeypatch.setenv("CODEX_THREAD_ID", "thread-ssh-runtime")
+    monkeypatch.setenv("SSH_CONNECTION", "client 1000 server 22")
+    monkeypatch.setenv("SSH_CLIENT", "client 1000 22")
+
+    wrong_exit_code, rejected = _invoke_start_goal_for_host(project, "codex-app")
+    assert wrong_exit_code == 2
+    assert rejected["ok"] is False
+    assert rejected["error_code"] == "host_surface_environment_mismatch"
+    assert rejected["blocked_by"] == "host_surface_environment_mismatch"
+    assert rejected["safety_contract"] == {
+        "writes_registry": False,
+        "activates_host_loop": False,
+    }
+    assert rejected["host_surface_environment_gate"] == {
+        "schema_version": "loopx_host_surface_environment_gate_v0",
+        "state": "blocked",
+        "requested_host_surface": "codex-app",
+        "detected_runtime": "codex-app-over-ssh",
+        "required_host_surface": "codex-app-ssh",
+        "evidence_env_vars": ["CODEX_THREAD_ID", "SSH_CONNECTION", "SSH_CLIENT"],
+    }
+
+    correct_exit_code, accepted = _invoke_start_goal_for_host(
+        project,
+        "codex-app-ssh",
+        include_detail=True,
+    )
+    assert correct_exit_code == 0
+    activation = accepted["command_pack"]["host_loop_activation"]
+    assert activation["activation_method"] == "set_visible_goal"
+    thin_prompt_command = activation["commands"]["heartbeat_prompt"]
+    assert "--thin" in thin_prompt_command
+    assert "--runtime-profile codex_app_ssh_goal" in thin_prompt_command
+    assert "--codex-app" not in thin_prompt_command
+
+
+def test_cli_codex_app_ssh_unbound_ambient_thread_defaults_to_fresh_agent(
     tmp_path: Path, monkeypatch
 ) -> None:
     project = _write_connected_project(tmp_path)
@@ -1051,9 +1854,9 @@ def test_cli_codex_app_ssh_unbound_ambient_thread_requires_lane_selection(
     assert payload["thread_id"] == "thread-ssh-new"
     assert payload["agent_id"] is None
     gate = payload["guided_transaction"]["identity_selection_gate"]
-    assert gate["state"] == "thread_binding_selection_required"
-    assert gate["default_action"] == "select_agent_identity"
-    assert gate["fresh_agent_registration"] is None
+    assert gate["state"] == "fresh_agent_registration_required"
+    assert gate["default_action"] == "register_fresh_agent"
+    assert gate["fresh_agent_registration"]["recommended"] is True
     assert gate["choices"][0]["agent_id"] == AGENT_ID
 
 
@@ -1124,6 +1927,98 @@ def test_start_goal_new_peer_explicitly_allows_fresh_registration(tmp_path: Path
     assert gate["fresh_agent_registration"]["recommended"] is True
 
 
+@pytest.mark.parametrize(
+    "raw_arguments",
+    [
+        f"--new-peer {GOAL_TEXT}",
+        f"--fine-grained --new-peer {GOAL_TEXT}",
+        f"--new-peer --capability-route issue-fix {GOAL_TEXT}",
+    ],
+)
+def test_cli_parses_new_peer_from_complete_slash_arguments(
+    tmp_path: Path,
+    raw_arguments: str,
+) -> None:
+    project = _write_connected_project(tmp_path)
+
+    exit_code, payload = _invoke_start_goal_with_slash_arguments(
+        project,
+        raw_arguments,
+    )
+
+    assert exit_code == 0
+    assert payload["goal_text"] == GOAL_TEXT
+    assert payload["new_peer"] is True
+    gate = payload["guided_transaction"]["identity_selection_gate"]
+    assert gate["default_action"] == "register_fresh_agent"
+    assert gate["fresh_agent_registration"]["recommended"] is True
+
+
+def test_cli_accepts_generated_independent_new_peer_with_raw_arguments(
+    tmp_path: Path,
+) -> None:
+    project = _write_connected_project(tmp_path)
+    registry_before = (project / ".loopx" / "registry.json").read_bytes()
+
+    exit_code, payload = _invoke_start_goal_with_slash_arguments(
+        project,
+        GOAL_TEXT,
+        extra_arguments=("--new-peer",),
+    )
+
+    assert exit_code == 0
+    assert payload["goal_text"] == GOAL_TEXT
+    assert payload["new_peer"] is True
+    gate = payload["guided_transaction"]["identity_selection_gate"]
+    assert gate["default_action"] == "register_fresh_agent"
+    assert gate["fresh_agent_registration"]["recommended"] is True
+    assert (project / ".loopx" / "registry.json").read_bytes() == registry_before
+
+
+def test_cli_rejects_duplicate_independent_and_raw_new_peer(
+    tmp_path: Path,
+) -> None:
+    project = _write_connected_project(tmp_path)
+
+    exit_code, payload = _invoke_start_goal_with_slash_arguments(
+        project,
+        f"--new-peer {GOAL_TEXT}",
+        extra_arguments=("--new-peer",),
+    )
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert "duplicate leading --new-peer switch" in payload["error"]
+
+
+@pytest.mark.parametrize(
+    ("raw_arguments", "expected_error"),
+    [
+        ("--new-peer", "must contain goal text after --new-peer"),
+        (
+            f"--new-peer --new-peer {GOAL_TEXT}",
+            "duplicate leading --new-peer switch",
+        ),
+        ("--new-peer-extra " + GOAL_TEXT, "malformed leading --new-peer"),
+    ],
+)
+def test_cli_rejects_ambiguous_new_peer_slash_arguments(
+    tmp_path: Path,
+    raw_arguments: str,
+    expected_error: str,
+) -> None:
+    project = _write_connected_project(tmp_path)
+
+    exit_code, payload = _invoke_start_goal_with_slash_arguments(
+        project,
+        raw_arguments,
+    )
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert expected_error in payload["error"]
+
+
 def test_projection_preserves_multi_goal_selection_actions(tmp_path: Path) -> None:
     project = _write_connected_project(tmp_path)
     registry_path = project / ".loopx" / "registry.json"
@@ -1172,12 +2067,60 @@ def test_projection_preserves_multi_goal_selection_actions(tmp_path: Path) -> No
         "inspect_connection",
         "select_goal",
     ]
+    assert compact["command_pack"]["host_loop_activation"] == {
+        "activation_state": "goal_selection_required",
+        "activation_allowed": False,
+        "activation_required_after_todo_write": False,
+        "host_surface": None,
+        "activation_method": None,
+    }
     assert _host_shadow_document(compact) == _host_shadow_document(detailed)
     for choice in compact["goal_selection_gate"]["choices"]:
         assert "--capability-route issue-fix" in choice["rerun_command"]
     assert "--capability-route issue-fix" in compact["command_pack"][
         "detail_command"
     ]
+
+
+def test_guided_start_uses_one_registry_version_for_goal_selection(tmp_path: Path, monkeypatch) -> None:
+    project = _write_connected_project(tmp_path)
+    registry_path = project / ".loopx" / "registry.json"
+    single_goal = registry_path.read_bytes()
+    initial = json.loads(single_goal)
+    second_goal_id = "guided-projection-second-goal"
+    initial["goals"].append({**initial["goals"][0], "id": second_goal_id})
+    registry_path.write_text(json.dumps(initial), encoding="utf-8")
+    replacement = registry_path.with_name("registry.next")
+    replacement.write_bytes(single_goal)
+    load_registry = command_pack_module.load_registry
+
+    def replace_after_first_read(path, **kwargs):
+        document = load_registry(path, **kwargs)
+        if path == registry_path and replacement.exists():
+            replacement.replace(registry_path)
+        return document
+
+    monkeypatch.setattr(command_pack_module, "load_registry", replace_after_first_read)
+
+    def preview():
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            assert cli_main([
+                "--registry", str(registry_path), "--runtime-root", str(tmp_path / "runtime"),
+                "--format", "json", "start-goal", "--guided", "--project", str(project),
+                "--host-surface", "codex-app", "--thread-id", "snapshot-thread", "--goal-text", GOAL_TEXT,
+            ]) == 0
+        return json.loads(stdout.getvalue())
+
+    first = preview()
+    assert first["guided_transaction"]["blocked_by"] == "goal_selection"
+    assert [choice["goal_id"] for choice in first["goal_selection_gate"]["choices"]] == [GOAL_ID, second_goal_id]
+    assert first["agent_id"] is None
+    assert registry_path.read_bytes() == single_goal
+
+    next_preview = preview()
+    assert next_preview["goal_id"] == GOAL_ID
+    assert "goal_selection_gate" not in next_preview["guided_transaction"]
 
 
 def test_start_goal_keeps_the_requested_linked_worktree(
@@ -1277,34 +2220,60 @@ def test_cli_without_host_returns_read_only_host_selection_gate(
     tmp_path: Path,
 ) -> None:
     project = _write_connected_project(tmp_path)
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output):
+    base_args = [
+        "--format",
+        "json",
+        "start-goal",
+        "--guided",
+        "--project",
+        str(project),
+        "--goal-id",
+        GOAL_ID,
+        "--agent-id",
+        AGENT_ID,
+        "--goal-text",
+        GOAL_TEXT,
+        "--capability-route",
+        "issue-fix",
+    ]
+
+    compact_output = io.StringIO()
+    with contextlib.redirect_stdout(compact_output):
         exit_code = cli_main(
-            [
-                "--format",
-                "json",
-                "start-goal",
-                "--guided",
-                "--project",
-                str(project),
-                "--goal-id",
-                GOAL_ID,
-                "--agent-id",
-                AGENT_ID,
-                "--goal-text",
-                GOAL_TEXT,
-                "--capability-route",
-                "issue-fix",
-            ]
+            base_args
         )
 
     assert exit_code == 0
-    payload = json.loads(output.getvalue())
+    payload = json.loads(compact_output.getvalue())
     assert payload["guided_transaction"]["blocked_by"] == "host_surface_selection"
     assert payload["safety_contract"]["writes_registry"] is False
     choices = payload["host_surface_selection_gate"]["choices"]
     assert [choice["host_surface"] for choice in choices] == [
         "codex-app",
+        "trae_app",
+        "codex-app-ssh",
+        "codex-cli-tui",
+        "claude-code",
+        "shell",
+        "other-agent",
+    ]
+    gate = payload["host_surface_selection_gate"]
+    assert gate["choice_projection"] == "compact"
+    assert gate["omitted_choice_count"] == 14
+    assert "--include-command-pack-detail" in gate["full_choices_detail_command"]
+    assert payload["packet_summary"]["compatibility"]["compact_projection_default"] is True
+    assert "Choose Where This Agent Runs" in payload["message"]
+    assert "Need another host (14 more)?" in payload["message"]
+
+    detailed_output = io.StringIO()
+    with contextlib.redirect_stdout(detailed_output):
+        detailed_exit = cli_main([*base_args, "--include-command-pack-detail"])
+    assert detailed_exit == 0
+    detailed = json.loads(detailed_output.getvalue())
+    full_choices = detailed["host_surface_selection_gate"]["choices"]
+    assert [choice["host_surface"] for choice in full_choices] == [
+        "codex-app",
+        "trae_app",
         "codex-app-ssh",
         "codex-ide-plugin",
         "codex-cli-tui",
@@ -1315,13 +2284,23 @@ def test_cli_without_host_returns_read_only_host_selection_gate(
         "pi",
         "gemini-cli",
         "cursor-agent",
+        "zcode",
+        "agy",
+        "antigravity-app",
+        "kiro-cli",
         "deepseek-harness",
         "deepseek-harness-native",
         "ark-managed-agent",
         "shell",
         "other-agent",
     ]
-    ide = next(choice for choice in choices if choice["host_surface"] == "codex-ide-plugin")
+    assert detailed["host_surface_selection_gate"]["choice_projection"] == "complete"
+    assert detailed["host_surface_selection_gate"]["omitted_choice_count"] == 0
+    ide = next(
+        choice
+        for choice in full_choices
+        if choice["host_surface"] == "codex-ide-plugin"
+    )
     assert "--host-surface codex-ide-plugin" in ide["rerun_command"]
     assert "--capability-route issue-fix" in ide["rerun_command"]
 
@@ -1448,8 +2427,6 @@ def test_ark_managed_agent_plans_todos_before_one_shot_goal_activation(
         f" --objective {shlex.quote(GOAL_TEXT)}"
         " --adapter-kind read_only_project_map_v0"
         " --adapter-status connected-read-only"
-        " --no-onboarding-scan"
-        " --codex-app-heartbeat ask"
     )
     assert actionable_connect_command in payload["message"]
     assert "preview the issue-fix route before todo writeback" not in payload["message"]
@@ -1542,3 +2519,258 @@ def test_guided_write_ordered_todos_template_is_accepted_by_todo_add(
     args = build_parser().parse_args(_runnable_todo_add_argv(template))
     validate_shared_todo_options(args)
     validate_todo_add_options(args)
+
+
+def _write_connected_project_with_todos(
+    root: Path,
+    *,
+    todos_body: str,
+) -> Path:
+    return _write_connected_project(root, todos_body=todos_body)
+
+
+def _write_connected_project_with_runnable_agent_todo(root: Path) -> Path:
+    return _write_connected_project_with_todos(
+        root,
+        todos_body=(
+            "- [ ] [P1] continue the scheduler coverage fix\n"
+            "  <!-- loopx:todo status=open task_class=advancement_task "
+            f"claimed_by={AGENT_ID} todo_id=todo_3586abcd0001 -->"
+        ),
+    )
+
+
+def test_guided_takeover_with_runnable_frontier_projects_todo_delta(
+    tmp_path: Path,
+) -> None:
+    project = _write_connected_project_with_runnable_agent_todo(tmp_path)
+    payload = _build(project, include_detail=False)
+    steps = payload["guided_transaction"]["ordered_steps"]
+    step_ids = [step["id"] for step in steps]
+    assert "write_ordered_todos" not in step_ids
+    assert "plan_ranked_todos" not in step_ids
+    assert "compare_planned_todos_with_frontier" in step_ids
+    delta = next(step for step in steps if step["id"] == "apply_todo_delta")
+    assert delta["kind"] == "operator_or_agent_actions"
+    assert "reuse" in delta["todo_delta"]["rule"]
+    todo_delta = delta["todo_delta"]
+    assert "reuse" in todo_delta["rule"]
+    assert any("scheduler coverage fix" in str(item) for item in todo_delta["frontier"])
+    # add_new remains available as an explicit, template-backed escape hatch.
+    add_args = build_parser().parse_args(
+        _runnable_todo_add_argv(delta["add_new_command_template"])
+    )
+    validate_shared_todo_options(add_args)
+    validate_todo_add_options(add_args)
+    # The takeover continues through the normal refresh/host-loop/quota tail.
+    assert step_ids.index("apply_todo_delta") < step_ids.index("read_back_authored_todos") < step_ids.index("refresh_state")
+    assert "quota_guard" in step_ids
+    rendered = command_pack_module.render_start_goal_guided_markdown(payload)
+    assert "apply_todo_delta" in rendered
+    assert "reuse" in rendered
+    assert "todo_delta:" in rendered
+    readback = next(step for step in steps if step["id"] == "read_back_authored_todos")
+    assert readback["command_template"] in rendered
+    assert "todo_detail_projection.source_complete=true" in rendered
+
+
+def test_guided_takeover_without_runnable_frontier_keeps_unconditional_authoring(
+    tmp_path: Path,
+) -> None:
+    project = _write_connected_project(tmp_path)
+    payload = _build(project, include_detail=False)
+    step_ids = [step["id"] for step in payload["guided_transaction"]["ordered_steps"]]
+    assert "write_ordered_todos" in step_ids
+    assert "apply_todo_delta" not in step_ids
+    assert step_ids.index("write_ordered_todos") < step_ids.index("read_back_authored_todos") < step_ids.index("refresh_state")
+
+
+def _write_connected_project_with_blocked_agent_todo(root: Path) -> Path:
+    return _write_connected_project_with_todos(
+        root,
+        todos_body=(
+            "- [ ] [P1] continue the scheduler coverage fix\n"
+            "  <!-- loopx:todo status=blocked task_class=advancement_task "
+            f"claimed_by={AGENT_ID} todo_id=todo_3586bbbb0001 -->"
+        ),
+    )
+
+
+def test_guided_takeover_with_only_blocked_todo_keeps_unconditional_authoring(
+    tmp_path: Path,
+) -> None:
+    # A blocked Todo claimed by the agent is not a runnable frontier: the
+    # packet must fail closed to unconditional planning instead of projecting
+    # a takeover delta onto work that cannot proceed.
+    project = _write_connected_project_with_blocked_agent_todo(tmp_path)
+    payload = _build(project, include_detail=False)
+    steps = payload["guided_transaction"]["ordered_steps"]
+    step_ids = [step["id"] for step in steps]
+    assert "write_ordered_todos" in step_ids
+    assert "plan_ranked_todos" in step_ids
+    assert "apply_todo_delta" not in step_ids
+
+
+def _write_connected_project_with_peer_claimed_agent_todo(root: Path) -> Path:
+    return _write_connected_project_with_todos(
+        root,
+        todos_body=(
+            "- [ ] [P1] peer agent release work\n"
+            "  <!-- loopx:todo status=open task_class=advancement_task "
+            "claimed_by=peer-agent-3586 todo_id=todo_3586cccc0001 -->"
+        ),
+    )
+
+
+def test_guided_takeover_with_only_peer_claimed_todo_keeps_unconditional_authoring(
+    tmp_path: Path,
+) -> None:
+    # A runnable Todo claimed by another agent is not a runnable frontier for
+    # the current agent: the packet must fail closed to unconditional planning
+    # rather than exposing peer-owned work under a writable delta contract.
+    project = _write_connected_project_with_peer_claimed_agent_todo(tmp_path)
+    payload = _build(project, include_detail=False)
+    steps = payload["guided_transaction"]["ordered_steps"]
+    step_ids = [step["id"] for step in steps]
+    assert "write_ordered_todos" in step_ids
+    assert "plan_ranked_todos" in step_ids
+    assert "apply_todo_delta" not in step_ids
+
+
+def test_guided_takeover_filters_out_peer_claimed_todos_from_frontier(
+    tmp_path: Path,
+) -> None:
+    project = _write_connected_project_with_todos(
+        tmp_path,
+        todos_body=(
+            "- [ ] [P1] own advancement task\n"
+            "  <!-- loopx:todo status=open task_class=advancement_task "
+            f"claimed_by={AGENT_ID} todo_id=todo_3586own0001 -->\n"
+            "- [ ] [P1] peer advancement task\n"
+            "  <!-- loopx:todo status=open task_class=advancement_task "
+            "claimed_by=peer-agent-3586 todo_id=todo_3586peer0001 -->"
+        ),
+    )
+    payload = _build(project, include_detail=False)
+    steps = payload["guided_transaction"]["ordered_steps"]
+    delta = next(step for step in steps if step["id"] == "apply_todo_delta")
+    todo_delta = delta["todo_delta"]
+    assert todo_delta["runnable_frontier_count"] == 1
+    assert any("own advancement task" in str(item) for item in todo_delta["frontier"])
+    assert not any("peer advancement task" in str(item) for item in todo_delta["frontier"])
+
+
+def _write_connected_project_with_open_blocker_agent_todo(root: Path) -> Path:
+    return _write_connected_project_with_todos(
+        root,
+        todos_body=(
+            "- [ ] [P0] investigate rate limit blocker\n"
+            "  <!-- loopx:todo status=open task_class=blocker "
+            f"claimed_by={AGENT_ID} todo_id=todo_3586blk0001 -->"
+        ),
+    )
+
+
+def test_guided_takeover_with_only_open_blocker_todo_keeps_unconditional_authoring(
+    tmp_path: Path,
+) -> None:
+    # An open blocker is a non-executable lane and not a runnable advancement
+    # frontier: the packet must fail closed to unconditional planning rather
+    # than projecting a takeover delta onto a blocker.
+    project = _write_connected_project_with_open_blocker_agent_todo(tmp_path)
+    payload = _build(project, include_detail=False)
+    step_ids = [step["id"] for step in payload["guided_transaction"]["ordered_steps"]]
+    assert "write_ordered_todos" in step_ids
+    assert "plan_ranked_todos" in step_ids
+    assert "apply_todo_delta" not in step_ids
+
+
+def test_guided_takeover_with_only_open_monitor_todo_keeps_unconditional_authoring(
+    tmp_path: Path,
+) -> None:
+    project = _write_connected_project_with_todos(
+        tmp_path,
+        todos_body=(
+            "- [ ] [P1] observe the upstream release window\n"
+            "  <!-- loopx:todo status=open task_class=continuous_monitor "
+            f"claimed_by={AGENT_ID} todo_id=todo_3586mon0001 -->"
+        ),
+    )
+    payload = _build(project, include_detail=False)
+    step_ids = [
+        step["id"] for step in payload["guided_transaction"]["ordered_steps"]
+    ]
+    assert "write_ordered_todos" in step_ids
+    assert "plan_ranked_todos" in step_ids
+    assert "apply_todo_delta" not in step_ids
+
+
+def test_guided_takeover_with_only_deferred_advancement_todo_keeps_unconditional_authoring(
+    tmp_path: Path,
+) -> None:
+    # A deferred advancement Todo is not open: the takeover must fail closed
+    # to unconditional Todo planning.
+    project = _write_connected_project_with_todos(
+        tmp_path,
+        todos_body=(
+            "- [-] [P1] deferred advancement task\n"
+            "  <!-- loopx:todo status=deferred task_class=advancement_task "
+            f"claimed_by={AGENT_ID} todo_id=todo_3586def0001 -->"
+        ),
+    )
+    payload = _build(project, include_detail=False)
+    step_ids = [step["id"] for step in payload["guided_transaction"]["ordered_steps"]]
+    assert "write_ordered_todos" in step_ids
+    assert "plan_ranked_todos" in step_ids
+    assert "apply_todo_delta" not in step_ids
+
+
+def test_guided_takeover_with_resume_blocked_advancement_todo_keeps_unconditional_authoring(
+    tmp_path: Path,
+) -> None:
+    # An open advancement Todo whose resume_when dependency is not satisfied
+    # is not yet runnable (resume_ready=false): takeover must fail closed to
+    # unconditional planning rather than projecting a premature delta.
+    project = _write_connected_project_with_todos(
+        tmp_path,
+        todos_body=(
+            "- [ ] [P1] resume-blocked advancement task\n"
+            "  <!-- loopx:todo status=open task_class=advancement_task "
+            f"claimed_by={AGENT_ID} resume_when=todo_done:todo_missing "
+            "todo_id=todo_3586res0001 -->"
+        ),
+    )
+    payload = _build(project, include_detail=False)
+    step_ids = [step["id"] for step in payload["guided_transaction"]["ordered_steps"]]
+    assert "write_ordered_todos" in step_ids
+    assert "plan_ranked_todos" in step_ids
+    assert "apply_todo_delta" not in step_ids
+
+
+def test_guided_takeover_with_resume_ready_advancement_todo_projects_todo_delta(
+    tmp_path: Path,
+) -> None:
+    # Once the resume_when prerequisite is completed (resume_ready=true), the
+    # advancement Todo is actionable-open and enters the runnable frontier.
+    project = _write_connected_project_with_todos(
+        tmp_path,
+        todos_body=(
+            "- [x] [P1] prerequisite task\n"
+            "  <!-- loopx:todo status=done task_class=advancement_task "
+            f"claimed_by={AGENT_ID} todo_id=todo_3586prereq0001 -->\n"
+            "- [ ] [P1] resume-ready advancement task\n"
+            "  <!-- loopx:todo status=open task_class=advancement_task "
+            f"claimed_by={AGENT_ID} resume_when=todo_done:todo_3586prereq0001 "
+            "todo_id=todo_3586res0002 -->"
+        ),
+    )
+    payload = _build(project, include_detail=False)
+    steps = payload["guided_transaction"]["ordered_steps"]
+    step_ids = [step["id"] for step in steps]
+    assert "write_ordered_todos" not in step_ids
+    assert "plan_ranked_todos" not in step_ids
+    assert "compare_planned_todos_with_frontier" in step_ids
+    delta = next(step for step in steps if step["id"] == "apply_todo_delta")
+    todo_delta = delta["todo_delta"]
+    assert todo_delta["runnable_frontier_count"] == 1
+    assert any("resume-ready advancement task" in str(item) for item in todo_delta["frontier"])

@@ -4,12 +4,17 @@ import test from "node:test";
 
 import {
   buildTodoCompletionMetadataUpdates,
-  normalizeTodoCompletionValue,
-  requireTodoCompletionMetadataValue,
-  selectTodoCompletionContinuation,
+  normalizeTodoNoFollowup,
+  normalizeTodoCompletionContinuation,
+  normalizeTodoCompletionRecovery,
+  requireTodoCompletionMetadata,
   selectTodoCompletionState,
   TODO_COMPLETION_STATE_REQUEST_SCHEMA,
 } from "../../loopx/control_plane/todos/completion_state.ts";
+import {
+  createEffectRuntimeHandlers,
+  dispatchEffectRuntimeMethod,
+} from "../../loopx/control_plane/effect_runtime_handlers.ts";
 
 const fixture = JSON.parse(
   readFileSync(
@@ -24,7 +29,7 @@ const fixture = JSON.parse(
   source_baseline: string;
   cases: Array<{
     name: string;
-    method: "normalize" | "require_metadata" | "continuation_for_write" |
+    method: "normalize" | "require_metadata" |
       "evaluate" | "metadata_updates";
     request: Record<string, unknown>;
     expected_result?: Record<string, unknown>;
@@ -32,21 +37,28 @@ const fixture = JSON.parse(
   }>;
 };
 
+function normalizeValue(request: Record<string, unknown>) {
+  const value = request.kind === "no_followup" ? normalizeTodoNoFollowup(request.value) :
+    request.kind === "continuation" ? normalizeTodoCompletionContinuation(request.value) : normalizeTodoCompletionRecovery(request.value);
+  return {schema_version: "loopx_todo_completion_state_result_v0", kind: request.kind, value};
+}
+function requireValue(request: Record<string, unknown>) {
+  return {schema_version: "loopx_todo_completion_state_result_v0", value: requireTodoCompletionMetadata(String(request.key), request.value)};
+}
 const methods = {
-  normalize: normalizeTodoCompletionValue,
-  require_metadata: requireTodoCompletionMetadataValue,
-  continuation_for_write: selectTodoCompletionContinuation,
+  normalize: normalizeValue,
+  require_metadata: requireValue,
   evaluate: selectTodoCompletionState,
   metadata_updates: buildTodoCompletionMetadataUpdates,
 } as const;
 
-test("pinned Python completion-state characterization remains exact", () => {
+test("persisted completion spellings and lifecycle compatibility remain exact", () => {
   assert.equal(
     fixture.schema_version,
     "loopx_todo_completion_state_characterization_v0",
   );
   assert.equal(fixture.source_baseline, "0c59d47f6");
-  assert.equal(fixture.cases.length, 11);
+  assert.equal(fixture.cases.length, 10);
   for (const item of fixture.cases) {
     const evaluate = methods[item.method];
     if (item.expected_error) {
@@ -59,6 +71,36 @@ test("pinned Python completion-state characterization remains exact", () => {
     } else {
       assert.deepEqual(evaluate(item.request), item.expected_result, item.name);
     }
+  }
+});
+
+test("whole completion owner selects continuation and rejects contradictory intent", () => {
+  const request = {
+    schema_version: TODO_COMPLETION_STATE_REQUEST_SCHEMA,
+    todo: { status: "open", no_followup: false },
+  };
+  for (const [noFollowup, hasSuccessor, continuation] of [
+    [false, false, "active_goal"],
+    [false, true, "successor"],
+    [true, false, "no_followup"],
+  ] as const) {
+    assert.deepEqual(selectTodoCompletionState({
+      ...request, requested_no_followup: noFollowup, has_successor: hasSuccessor,
+    }), {
+      schema_version: "loopx_todo_completion_state_result_v0",
+      continuation, recovery: null,
+    });
+  }
+  assert.throws(() => selectTodoCompletionState({
+    ...request, requested_no_followup: true, has_successor: true,
+  }), /cannot record both no_followup and a successor/);
+});
+
+test("retired scalar and summary RPCs fail closed", async () => {
+  const handlers = createEffectRuntimeHandlers({fingerprint: "completion-retirement-test", requestShutdown: () => undefined});
+  for (const method of ["todo.completion_state.continuation_for_write", "todo.completion_state.normalize",
+    "todo.completion_state.require_metadata", "todo.summary.project"]) {
+    await assert.rejects(dispatchEffectRuntimeMethod(handlers, method, {}), /unsupported Effect runtime method/);
   }
 });
 

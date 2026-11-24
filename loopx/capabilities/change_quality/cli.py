@@ -4,14 +4,13 @@ import argparse
 from collections.abc import Callable
 from pathlib import Path
 
+from ...history import load_registry
 from ...paths import resolve_runtime_root
-from ...registry import read_json
 from .receipt import (
     build_change_quality_prepare_packet,
     record_change_quality_receipt,
     verify_change_quality_receipt,
 )
-
 
 PrintPayload = Callable[
     [dict[str, object], str, Callable[[dict[str, object]], str]],
@@ -117,6 +116,8 @@ def render_change_quality_markdown(payload: dict[str, object]) -> str:
             )
     if payload.get("required_action"):
         lines.append(f"- required_action: {payload.get('required_action')}")
+    if payload.get("error"):
+        lines.append(f"- error: {payload.get('error')}")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -130,7 +131,7 @@ def handle_change_quality_command(
 ) -> int | None:
     if args.command != "change-quality":
         return None
-    registry = read_json(registry_path)
+    registry = load_registry(registry_path)
     runtime_root = resolve_runtime_root(
         registry,
         runtime_root_arg,
@@ -144,7 +145,10 @@ def handle_change_quality_command(
     }
     try:
         if args.change_quality_command == "prepare":
-            payload = build_change_quality_prepare_packet(**common)
+            payload = build_change_quality_prepare_packet(
+                **common,
+                runtime_root=runtime_root,
+            )
         elif args.change_quality_command == "record":
             payload = record_change_quality_receipt(
                 **common,

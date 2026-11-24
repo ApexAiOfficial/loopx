@@ -131,12 +131,14 @@ QUALITY_SURFACE_CATALOG: tuple[dict[str, Any], ...] = (
     },
     {
         "surface_id": "scheduler-ack-route",
-        "title": "Scheduler ACK state and route binding",
+        "title": "Scheduler ACK/failure state and native route binding",
         "risk": "high",
         "canary_profile_id": "scheduler-ack-route",
         "owner_paths": [
             "loopx/control_plane/quota/live_decision.py",
-            "loopx/control_plane/scheduler/ack.py",
+            "loopx/control_plane/scheduler/heartbeat_commit.ts",
+            "loopx/control_plane/scheduler/heartbeat_followup.ts",
+            "loopx/control_plane/scheduler/heartbeat_followup_cli.ts",
             "loopx/control_plane/scheduler/monitor_wait.py",
             "loopx/control_plane/scheduler/scheduler_hint.py",
             "loopx/control_plane/scheduler/state.py",
@@ -157,7 +159,10 @@ QUALITY_SURFACE_CATALOG: tuple[dict[str, Any], ...] = (
                 "tests/control_plane/test_scheduler_ack_decision_table.py",
                 "tests/control_plane/test_scheduler_backoff_convergence.py",
                 "tests/control_plane/test_scheduler_host_failure_cache.py",
+                "tests/control_plane/test_scheduler_host_followup_hint_transport.py",
                 "tests/control_plane/test_scheduler_state_transition_rules.py",
+                "tests/control_plane_ts/scheduler_heartbeat_followup.test.ts",
+                "tests/control_plane_ts/scheduler_heartbeat_followup_cli.test.ts",
             ),
             "durable_smoke": _covered(
                 "examples/control_plane/quota-scheduler-state-ack-smoke.py",
@@ -165,8 +170,9 @@ QUALITY_SURFACE_CATALOG: tuple[dict[str, Any], ...] = (
                 "examples/control_plane/monitor-scheduler-contract-smoke.py",
             ),
             "catalog_canary": _covered("scheduler-ack-route"),
-            "host_upgrade": _not_applicable(
-                "The host executes bound CLI arguments but does not choose or rewrite their registry route."
+            "host_upgrade": _covered(
+                "tests/test_scheduler_native_launcher.py",
+                "tests/test_windows_install.py",
             ),
             "model_behavior": _not_applicable(
                 "Route binding and ACK state progression are deterministic safety invariants."
@@ -415,10 +421,10 @@ QUALITY_SURFACE_CATALOG: tuple[dict[str, Any], ...] = (
         },
     },
     {
-        "surface_id": "new-user-onboarding",
-        "title": "New-user goal start and host activation",
+        "surface_id": "first-connect",
+        "title": "First-connect state and host activation",
         "risk": "high",
-        "canary_profile_id": "new-user-onboarding-lifecycle",
+        "canary_profile_id": "first-connect-contract",
         "owner_paths": [
             "loopx/agent_onboarding.py",
             "loopx/bootstrap_command_pack.py",
@@ -440,9 +446,9 @@ QUALITY_SURFACE_CATALOG: tuple[dict[str, Any], ...] = (
                 "tests/control_plane/test_onboarding_model_behavior_qualification.py",
             ),
             "durable_smoke": _covered(
-                "examples/project/onboarding-no-scan-projection-smoke.py"
+                "examples/project/first-connect-contract-smoke.py"
             ),
-            "catalog_canary": _covered("new-user-onboarding-lifecycle"),
+            "catalog_canary": _covered("first-connect-contract"),
             "host_upgrade": _covered(
                 "examples/control_plane/agent-onboard-host-loop-activation-smoke.py"
             ),
@@ -451,7 +457,7 @@ QUALITY_SURFACE_CATALOG: tuple[dict[str, Any], ...] = (
                 "onboarding_actual_behavior_qualification_v0"
             ),
             "release_gate": _covered(
-                "loopx canary premerge --profile new-user-onboarding-lifecycle"
+                "loopx canary premerge --profile first-connect-contract"
             ),
         },
     },

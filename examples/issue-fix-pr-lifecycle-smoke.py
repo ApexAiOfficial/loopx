@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 import re
 import subprocess
 import sys
@@ -21,6 +22,8 @@ from loopx.capabilities.issue_fix.pr_lifecycle import (  # noqa: E402
     ISSUE_FIX_PR_LIFECYCLE_MONITOR_SCHEMA_VERSION,
     build_issue_fix_pr_lifecycle_monitor_packet,
 )
+from loopx.control_plane.testing.canary_harness import import_fixture_authority  # noqa: E402
+from loopx.todos import list_goal_todos  # noqa: E402
 from loopx.domain_packs.issue_fix import (  # noqa: E402
     default_issue_fix_domain_state_ledger_path,
     issue_fix_pr_lifecycle_ledger_key,
@@ -68,14 +71,12 @@ def assert_public_safe(payload: dict[str, Any] | str) -> None:
 def run_cli(
     args: list[str],
     *,
+    runtime_root: Path,
     registry_path: Path | None = None,
-    runtime_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    control_plane_args: list[str] = []
+    control_plane_args = ["--runtime-root", str(runtime_root)]
     if registry_path is not None:
         control_plane_args.extend(["--registry", str(registry_path)])
-    if runtime_root is not None:
-        control_plane_args.extend(["--runtime-root", str(runtime_root)])
     return subprocess.run(
         [
             sys.executable,
@@ -87,6 +88,7 @@ def run_cli(
             *args,
         ],
         cwd=ROOT,
+        env={**os.environ, "LOOPX_USAGE_PING": "0"},
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -122,7 +124,7 @@ def assert_packet_shape(packet: dict[str, Any]) -> None:
     assert_public_safe(packet)
 
 
-def main() -> int:
+def check_lifecycle(provider: str) -> None:
     merged = build_issue_fix_pr_lifecycle_monitor_packet(
         url="https://github.com/huangruiteng/loopx/pull/1715",
         provider_payload={
@@ -350,6 +352,8 @@ def main() -> int:
             "## Agent Todo\n\n",
             encoding="utf-8",
         )
+        import_fixture_authority(registry_path, "example-goal", provider=provider)
+
         ledger = default_issue_fix_domain_state_ledger_path(
             project=project,
             goal_id="example-goal",
@@ -404,7 +408,8 @@ def main() -> int:
                 "example-goal",
                 "--project",
                 str(project),
-            ]
+            ],
+            runtime_root=runtime_root,
         )
         cli_packet = json.loads(cli_result.stdout)
         completed_before = datetime.now(timezone.utc).replace(microsecond=0)
@@ -441,7 +446,8 @@ def main() -> int:
                 "--generated-at",
                 explicit_time,
                 "--no-write-domain-state",
-            ]
+            ],
+            runtime_root=runtime_root,
         )
         explicit_packet = json.loads(explicit_result.stdout)
         assert explicit_packet["generated_at"] == explicit_time, explicit_packet
@@ -552,8 +558,7 @@ def main() -> int:
         mutation_authority = reconciled_gate["todo_completion"][
             "mutation_authority"
         ]
-        assert mutation_authority["mode"] == "registered_peer_actor", reconciled_gate
-        assert mutation_authority["actor_agent_id"] == "codex-test", reconciled_gate
+        assert mutation_authority["authority_mode"] == "registered_peer_actor", reconciled_gate
         assert reconciled_gate["rollout_event"]["appended"] is True, reconciled_gate
         assert "status=done" in state_file.read_text(encoding="utf-8")
         gate_projection = parse_active_state_todos(
@@ -565,7 +570,6 @@ def main() -> int:
             if item["todo_id"] == "todo_merge_gate_1716"
         )
         assert gate_item["status"] == "done", gate_item
-        assert "state=MERGED" in gate_item["evidence"], gate_item
         assert_public_safe(reconciled_gate)
 
         repeated_gate = json.loads(
@@ -693,7 +697,6 @@ def main() -> int:
         )
         assert review_item["status"] == "done", review_item
         assert review_item["no_followup"] is True, review_item
-        assert "state=MERGED" in review_item["evidence"], review_item
         assert_public_safe(reconciled_review)
 
         repeated_review = json.loads(
@@ -786,6 +789,19 @@ def main() -> int:
             material_rows
         )
 
+        native = list_goal_todos(registry_path=registry_path, goal_id="example-goal")
+        assert native["authority_read"]["decision_read_from_provider"] is True, native
+        assert native["authority_read"]["legacy_fallback_used"] is False, native
+        rows = {item["todo_id"]: item for item in native["todos"]}
+        for todo_id in ("todo_merge_gate_1716", "todo_review_action_1716"):
+            assert rows[todo_id]["status"] == "done", rows[todo_id]
+            assert rows[todo_id]["last_actor_agent_id"] == "codex-test", rows[todo_id]
+            assert "state=MERGED" in rows[todo_id]["evidence"], rows[todo_id]
+
+
+def main() -> int:
+    for provider in ("file", "sqlite"):
+        check_lifecycle(provider)
     print("issue-fix-pr-lifecycle-smoke: ok")
     return 0
 

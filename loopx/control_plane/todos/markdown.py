@@ -1,12 +1,220 @@
 from __future__ import annotations
 
+import json
+import shlex
 from typing import Any
 
+from ...project_prompt import host_command, shell_arg_for_host
+from ..quota.settlement import render_settlement_progress_markdown
 from .contract import TODO_STATUS_OPEN, todo_marker_for_status
 
 
+def _render_lease_recovery(payload: dict[str, Any]) -> list[str]:
+    """Render the typed rejection's guidance without deciding lease eligibility."""
+    recovery = payload.get("recovery")
+    if not isinstance(recovery, dict) or not recovery.get("reason") or not payload.get("handoff_mode"):
+        return []
+    retry = recovery.get("retry")
+    retry_args = retry.get("cli_args", []) if isinstance(retry, dict) else []
+    complete_claim_recovery = (recovery.get("action") == "claim_task"
+        and isinstance(retry_args, list)
+        and any(retry_args[i:i + 2] == ["todo", "complete"] for i in range(len(retry_args) - 1)))
+    lines = ([] if complete_claim_recovery
+        else [f"- handoff_mode: `{payload['handoff_mode']}`"])
+    lines.append(f"- recovery: {recovery['reason']}")
+    for step in ("claim", "inspect", "acquire", "retry", "release"):
+        instruction = recovery.get(step)
+        if isinstance(instruction, dict) and instruction.get("command"):
+            arguments = instruction.get("cli_args")
+            command = instruction["command"]
+            if isinstance(arguments, list):
+                try:
+                    program = shlex.split(command)[0]
+                except (ValueError, IndexError):
+                    pass  # Keep the original diagnostic when guidance is malformed.
+                else:
+                    command = shlex.join([program, *arguments])
+            lines.append(f"- {step}: `{command}`")
+            if instruction.get("requires_flags"):
+                lines.append(f"  - supply: `{', '.join(instruction['requires_flags'])}`")
+            if instruction.get("remove_flags"):
+                lines.append(f"  - remove if supplied: `{', '.join(instruction['remove_flags'])}`")
+    return lines
+
+
+def _render_settlement_plan(plan: object) -> list[str]:
+    """Project the TS-owned recovery plan without adding admission decisions."""
+    if not isinstance(plan, dict) or plan.get("schema_version") not in {
+        "quota_settlement_plan_v1", "quota_settlement_plan_v2",
+    }:
+        return []
+    lines = ["", "## Same-Turn settlement plan", ""]
+    for step in plan.get("ordered_steps", []):
+        if not isinstance(step, dict):
+            continue
+        condition = step.get("command_condition") or ("conditional" if step.get("conditional") else "")
+        lines.append(f"- {step.get('kind')}: {step.get('precondition')}")
+        if step.get("command_template"):
+            lines.append(f"  - command{f' ({condition})' if condition else ''}: `{step['command_template']}`")
+        if step.get("semantic_closeout_command_template"):
+            lines.append(f"  - semantic closeout: `{step['semantic_closeout_command_template']}`")
+    return lines
+
+
+def _render_todo_detail(payload: dict[str, Any]) -> str:
+    """Render the same lossless read lens, including missing/source metadata."""
+    metadata = {key: value for key, value in payload.items() if key != "todo"}
+    lines = ["# LoopX Todo Detail", "", "## Read metadata", "", "```json",
+             json.dumps(metadata, ensure_ascii=False, indent=2), "```"]
+    todo = payload.get("todo")
+    if isinstance(todo, dict):
+        lines.extend(["", "## Original Todo", "", todo["text"], "",
+                      "## Todo metadata", "", "```json",
+                      json.dumps({key: value for key, value in todo.items() if key != "text"},
+                                 ensure_ascii=False, indent=2), "```"])
+    return "\n".join(lines)
+
+
+def _render_todo_projection(payload: dict[str, Any]) -> str:
+    """Keep the existing provider-projection receipt presentation separate."""
+    return "\n".join(
+        [
+            "# LoopX Todo Markdown Projection",
+            "",
+            f"- ok: `{payload.get('ok')}`",
+            f"- goal_id: `{payload.get('goal_id')}`",
+            f"- dry_run: `{payload.get('dry_run')}`",
+            f"- executed: `{payload.get('executed')}`",
+            f"- changed: `{payload.get('changed')}`",
+            f"- source_authority: `{payload.get('source_authority')}`",
+            f"- provider_revision: `{payload.get('provider_revision')}`",
+            f"- todo_count: `{payload.get('todo_count')}`",
+            f"- parse_render_parity: `{payload.get('parse_render_parity')}`",
+            f"- narrative_preserved: `{payload.get('narrative_preserved')}`",
+            f"- error: `{payload.get('error')}`" if payload.get("error") else "",
+        ]
+    ).rstrip()
+
+
+def _render_thin_todo_list(payload: dict[str, Any]) -> str:
+    """Render the existing bounded list without altering its projection."""
+    field_projection = payload.get("todo_list_field_projection")
+    field_projection = (
+        field_projection if isinstance(field_projection, dict) else {}
+    )
+    cold_paths = field_projection.get("full_detail_cold_paths") or []
+    lines = [
+        "# LoopX Todo List",
+        "",
+        f"- goal_id: `{payload.get('goal_id')}`",
+        f"- role: `{payload.get('role')}`",
+        f"- status_filter: `{payload.get('status_filter')}`",
+        f"- todo_count: `{payload.get('todo_count')}`",
+        f"- matched_todo_count: `{payload.get('matched_todo_count')}`",
+        f"- returned_todo_count: `{payload.get('returned_todo_count')}`",
+        f"- omitted_todo_count: `{payload.get('omitted_todo_count')}`",
+        (
+            "- item_limit_per_role: `"
+            f"{field_projection.get('item_limit_per_role')}`"
+        ),
+        f"- view: `{field_projection.get('view')}`",
+        (
+            "- full_detail_cold_path: `"
+            f"{cold_paths[0] if cold_paths else 'todo list without --thin'}`"
+        ),
+    ]
+    for key, heading in (
+        ("user_todos", "User Todo"),
+        ("agent_todos", "Agent Todo"),
+    ):
+        summary = payload.get(key)
+        if not isinstance(summary, dict):
+            continue
+        lines.extend(["", f"## {heading}", ""])
+        expected_role = key.removesuffix("_todos")
+        items = [
+            item
+            for item in payload.get("todos") or []
+            if isinstance(item, dict)
+            and item.get("role") == expected_role
+        ]
+        if not items:
+            lines.append("- none")
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            marker = todo_marker_for_status(
+                item.get("status") or TODO_STATUS_OPEN
+            )
+            text = item.get("text") or item.get("title") or ""
+            metadata = [
+                f"{metadata_key}={item.get(metadata_key)}"
+                for metadata_key in (
+                    "todo_id",
+                    "status",
+                    "claimed_by",
+                    "blocks_agent",
+                    "next_due_at",
+                )
+                if item.get(metadata_key)
+            ]
+            suffix = f" <!-- {' '.join(metadata)} -->" if metadata else ""
+            lines.append(f"- [{marker}] {text}{suffix}")
+    return "\n".join(lines)
+
+
+def _render_queue_summary(payload: dict[str, Any]) -> str:
+    projection = payload["todo_list_summary_projection"]
+    authority = payload.get("authority_read") or {}
+    lines = ["# LoopX Todo List Summary", "",
+             f"- goal_id: `{payload.get('goal_id')}`",
+             f"- shown: `{payload.get('returned_todo_count')}` / `{payload.get('matched_todo_count')}`; omitted: `{payload.get('omitted_todo_count')}`",
+             f"- item_limit_per_role: `{projection['item_limit_per_role']}`", ""]
+
+    def cell(value: Any) -> str:
+        return " ".join(str(value if value is not None else "—").split()).replace("|", "\\|")
+
+    if payload["todos"]:
+        lines.extend(["| Role | Priority | Status | Claimed by | Todo | ID |",
+                      "| --- | --- | --- | --- | --- | --- |"])
+        for item in payload["todos"]:
+            cells = [cell(item.get(key)) for key in (
+                "role", "priority", "status", "claimed_by", "title", "todo_id")]
+            if item.get("title_truncated"):
+                cells[4] += " *"
+            lines.append("| " + " | ".join(cells) + " |")
+    else:
+        lines.append("No matching Todos.")
+    if any(item.get("title_truncated") for item in payload["todos"]):
+        lines.extend(["", r"\* Title truncated; the exact read retains the full requirement."])
+    lines.extend(["", f"- source: `{authority.get('source_authority')}` @ `{authority.get('provider_revision')}`",
+                  f"- full_detail: `{projection['full_detail_cold_paths'][0]}`",
+                  f"- readback: {projection['readback']}"])
+    return "\n".join(lines)
+
+
+def _render_execution_managed_claim_lines(payload: dict[str, Any]) -> list[str]:
+    """Render compact managed-claim lease metadata alongside claim identity."""
+    lines = ["", f"- claim_operation_id: `{payload['claim_operation_id']}`"]
+    if payload.get("lease_expires_at"):
+        lines.append(f"- lease_expires_at: `{payload['lease_expires_at']}`")
+    if payload.get("lease_ttl_seconds") is not None:
+        lines.append(f"- lease_ttl_seconds: `{payload['lease_ttl_seconds']}`")
+    return lines
+
+
 def render_todo_markdown(payload: dict[str, Any]) -> str:
+    if payload.get("todo_detail_projection"):
+        return _render_todo_detail(payload)
+    if payload.get("command") == "project-markdown":
+        return _render_todo_projection(payload)
     if payload.get("command") == "list":
+        if payload.get("summary"):
+            return _render_queue_summary(payload)
+        if payload.get("thin"):
+            return _render_thin_todo_list(payload)
+
         lines = [
             "# LoopX Todo List",
             "",
@@ -34,18 +242,6 @@ def render_todo_markdown(payload: dict[str, Any]) -> str:
         if isinstance(projection, dict):
             lines.append(
                 f"- returned_todo_count: `{payload.get('returned_todo_count')}`"
-            )
-        state_event_projection = payload.get("state_event_projection")
-        if isinstance(state_event_projection, dict):
-            lines.extend(
-                [
-                    f"- event_log: `{state_event_projection.get('event_log')}`",
-                    (
-                        "- source_event_count: `"
-                        f"{state_event_projection.get('source_event_count')}`"
-                    ),
-                    f"- last_event_id: `{state_event_projection.get('last_event_id')}`",
-                ]
             )
         for key, heading in (
             ("user_todos", "User Todo"),
@@ -147,6 +343,24 @@ def render_todo_markdown(payload: dict[str, Any]) -> str:
         )
     if payload.get("error"):
         lines.append(f"- error: {payload.get('error')}")
+        if recovery_command := payload.get("recovery_command"):
+            command = " ".join([host_command(recovery_command[0]),
+                                *(shell_arg_for_host(arg) for arg in recovery_command[1:])])
+            lines.extend([
+                "", "Read the original operation receipt:",
+                "```sh", command, "```",
+            ])
+        if payload.get("error_code") == "todo_claim_invalid_arguments":
+            recovery = payload["recovery"]
+            lines.extend([
+                f"- recovery: {recovery['reason']}",
+                f"- requires_flags: `{', '.join(recovery['requires_flags']) or 'none'}`",
+                f"- remove_flags: `{', '.join(recovery['remove_flags']) or 'none'}`",
+                "- cli_args (append required values before running):",
+                "```json", json.dumps(recovery["cli_args"]), "```",
+            ])
+        lines.extend(_render_lease_recovery(payload))
+        lines.extend(_render_settlement_plan(payload.get("settlement_plan")))
         if payload.get("operator_action"):
             action = payload["operator_action"]
             lines.append(f"- error_code: `{payload.get('error_code')}`")
@@ -159,14 +373,25 @@ def render_todo_markdown(payload: dict[str, Any]) -> str:
     elif "todo" in payload:
         marker = todo_marker_for_status(payload.get("status") or TODO_STATUS_OPEN)
         lines.extend(["", "## Todo", "", f"- [{marker}] {payload.get('todo')}"])
+    if (not payload.get("error") and payload.get("settlement_plan")
+            and ((payload.get("replan_transition") or {}).get("turn_boundary") == "settle_original_turn_before_end"
+                 or (payload.get("settlement_progress") or {}).get("next_step") == "durable_writeback")):
+        if payload.get("instruction"):
+            lines.extend(["", str(payload["instruction"])])
+        lines.extend(_render_settlement_plan(payload["settlement_plan"]))
+    if not payload.get("error") and payload.get("execution_managed"):
+        lines.extend(_render_execution_managed_claim_lines(payload))
+    if not payload.get("error"):
+        lines.extend(render_settlement_progress_markdown(payload))
+    if not payload.get("error") and (payload.get("execution_managed") or payload.get("settlement_progress")):
+        for command in payload.get("next_cli_actions", []):
+            lines.extend(["", "```sh", command, "```"])
     correctness = payload.get("local_state_write_correctness")
     if isinstance(correctness, dict):
-        intent = correctness.get("write_intent") if isinstance(correctness.get("write_intent"), dict) else {}
-        apply_result = (
-            correctness.get("apply_result")
-            if isinstance(correctness.get("apply_result"), dict)
-            else {}
-        )
+        intent_value = correctness.get("write_intent")
+        intent = intent_value if isinstance(intent_value, dict) else {}
+        apply_result_value = correctness.get("apply_result")
+        apply_result = apply_result_value if isinstance(apply_result_value, dict) else {}
         lines.extend(
             [
                 "",

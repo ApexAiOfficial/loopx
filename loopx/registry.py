@@ -1,21 +1,23 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import json
 import os
 import re
+import shutil
 import subprocess
-import tempfile
 from pathlib import Path
-from typing import Any
 
 from .authority import authority_registry_summary
 from .control_plane import compact_control_plane_policy, control_plane_policy_summary
 from .control_plane.goals.contract_health import contract_error_diagnostic
+from .control_plane.projects.registry_codec import load_registry
 from .execution_profile import compact_execution_profile, execution_profile_summary
+from .file_lock import write_json_atomic
 from .explore_graph import compact_explore_graph_policy
 from .orchestration import compact_orchestration_policy, orchestration_policy_summary
 from .presentation.markdown import markdown_code, markdown_table_row, markdown_table_separator
-from .quota import goal_quota_config
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -46,26 +48,18 @@ def atomic_write_json(
     *,
     preserve_mode: bool = False,
 ) -> None:
-    path = path.expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = path.stat().st_mode & 0o777 if preserve_mode and path.exists() else None
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=str(path.parent),
+    """Goal-registry JSON writer; delegates the rename dance to the kernel owner.
+
+    A new registry file keeps the umask-narrowed `mkstemp` mode rather than a
+    forced chmod, matching the writer this delegation replaced.
+    """
+    write_json_atomic(
+        path,
+        payload,
+        mode=None,
+        preserve_mode=preserve_mode,
+        indent=2,
     )
-    temporary_path = Path(temporary)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        if mode is not None:
-            os.chmod(temporary_path, mode)
-        os.replace(temporary_path, path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
 
 
 def stable_path_key(path: Path) -> str:
@@ -101,6 +95,41 @@ PRIVATE_REGISTRY_TEXT_RE = re.compile(
 )
 
 
+_GIT_PROBE_TIMEOUT_SECONDS = 1.5
+_GIT_PROBE_DRAIN_SECONDS = 1.0
+
+
+def _definitely_outside_git_worktree(probe_dir: Path) -> bool:
+    if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"):
+        return False
+    try:
+        current = probe_dir.resolve(strict=True)
+    except OSError:
+        return False
+    return not any(os.path.lexists(parent / ".git") for parent in (current, *current.parents))
+
+
+def _release_probe_pipes(process: subprocess.Popen[str]) -> None:
+    """Drop a timed-out probe's pipes instead of draining them.
+
+    A descendant that opened its own session keeps the inherited write end, so
+    reading to EOF waits for a process this probe no longer owns. The deadline
+    already discards the output, so close the parent's ends and let the one
+    reaped leader decide how long the release may take.
+    """
+
+    for stream in (process.stdout, process.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except (OSError, ValueError):  # pragma: no cover - already closed.
+            pass
+    try:
+        process.wait(timeout=_GIT_PROBE_DRAIN_SECONDS)
+    except subprocess.TimeoutExpired:  # pragma: no cover - the group kill already landed.
+        process.kill()
+
+
 def _registry_git_probe(path: Path) -> dict[str, Any]:
     probe_dir = path if path.is_dir() else path.parent
 
@@ -115,8 +144,11 @@ def _registry_git_probe(path: Path) -> dict[str, Any]:
         }
 
     def run_git(*args: str, cwd: Path = probe_dir) -> subprocess.CompletedProcess[str] | None:
+        # A probe that times out must retire everything it started. `run` kills
+        # only the leader, so a Git that fanned out into a helper, a hook or a
+        # remote would outlive the deadline on every later status read.
         try:
-            return subprocess.run(
+            process = subprocess.Popen(
                 ["git", *args],
                 cwd=cwd,
                 text=True,
@@ -124,34 +156,62 @@ def _registry_git_probe(path: Path) -> dict[str, Any]:
                 errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                check=False,
-                timeout=1.5,
+                start_new_session=os.name == "posix",
+                creationflags=(
+                    int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP"))
+                    if os.name == "nt" else 0
+                ),
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError:
             return None
+        try:
+            stdout, stderr = process.communicate(timeout=_GIT_PROBE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            from .extensions.process_runtime import terminate_process_tree
+
+            try:
+                terminate_process_tree(process, 0)
+            except (OSError, RuntimeError, ValueError):
+                process.kill()
+            _release_probe_pipes(process)
+            return None
+        return subprocess.CompletedProcess(["git", *args], process.returncode, stdout, stderr)
+
+    # Git discovers a normal repository only through an ancestor `.git`
+    # marker. Non-Git LoopX projects are common, and status can inspect the
+    # same registry more than once per command, so avoid a guaranteed-failing
+    # subprocess while retaining the Git path for worktrees, submodules, and
+    # explicit environment overrides.
+    if _definitely_outside_git_worktree(probe_dir):
+        if shutil.which("git") is None:
+            return unavailable()
+        return {
+            "available": True,
+            "probe_status": "ok",
+            "inside_worktree": False,
+            "tracked": False,
+            "ignored": False,
+            "worktree_root_recorded": False,
+        }
 
     root = run_git("rev-parse", "--show-toplevel")
-    if root is None:
-        return unavailable()
-    inside = root.returncode == 0
-    tracked = False
-    ignored = False
-    if inside:
-        root_path = Path(root.stdout.strip())
-        try:
-            rel_path = os.path.relpath(path.resolve(), root_path)
-        except (OSError, ValueError):
-            rel_path = path.name
-        tracked_result = run_git("ls-files", "--error-unmatch", "--", rel_path, cwd=root_path)
-        ignored_result = run_git("check-ignore", "-q", "--", rel_path, cwd=root_path)
-        tracked = tracked_result is not None and tracked_result.returncode == 0
-        ignored = ignored_result is not None and ignored_result.returncode == 0
+    if root is None or root.returncode != 0:
+        return {**unavailable(), "worktree_discovery_unknown": True}
+
+    root_path = Path(root.stdout.strip())
+    try:
+        rel_path = os.path.relpath(path.resolve(), root_path)
+    except (OSError, ValueError):
+        rel_path = path.name
+    tracked_result = run_git("ls-files", "--error-unmatch", "--", rel_path, cwd=root_path)
+    ignored_result = run_git("check-ignore", "-q", "--", rel_path, cwd=root_path)
+    tracking_available = tracked_result is not None and tracked_result.returncode in (0, 1)
     return {
-        "available": True,
-        "probe_status": "ok",
-        "inside_worktree": inside,
-        "tracked": tracked,
-        "ignored": ignored,
+        "available": tracking_available,
+        "probe_status": "ok" if tracking_available else "git_unavailable",
+        "inside_worktree": True,
+        "tracked": tracked_result is not None and tracked_result.returncode == 0,
+        "ignored": ignored_result is not None and ignored_result.returncode == 0,
         "worktree_root_recorded": False,
     }
 
@@ -243,7 +303,7 @@ def inspect_registry_boundary(path: Path) -> dict[str, Any]:
             "exists": False,
             "error": "registry file does not exist",
         }
-    payload = read_json(expanded)
+    payload = load_registry(expanded)
     markers = registry_private_markers(payload)
     classification = classify_registry_boundary(expanded, payload, markers)
     git = _registry_git_probe(expanded)
@@ -308,6 +368,8 @@ def inspect_registry_boundary(path: Path) -> dict[str, Any]:
 
 
 def inspect_registry(path: Path) -> dict[str, Any]:
+    from .quota import goal_quota_config
+
     if not path.exists():
         return {
             "ok": False,
@@ -315,7 +377,7 @@ def inspect_registry(path: Path) -> dict[str, Any]:
             "error": "registry file does not exist",
         }
 
-    payload = read_json(path)
+    payload = load_registry(path)
     goals = payload.get("goals") or []
     if not isinstance(goals, list):
         raise ValueError("goals must be a list")
@@ -327,6 +389,14 @@ def inspect_registry(path: Path) -> dict[str, Any]:
     seen_ids: set[str] = set()
     repo_goal_ids: dict[str, list[str]] = {}
     state_goal_ids: dict[str, list[str]] = {}
+    path_keys: dict[str, str] = {}
+
+    def inspection_path_key(path: Path) -> str:
+        # Group and report from the same resolution within this registry read.
+        spelling = os.fspath(path)
+        if spelling not in path_keys:
+            path_keys[spelling] = stable_path_key(path)
+        return path_keys[spelling]
 
     def add_problem(
         code: str,
@@ -354,10 +424,10 @@ def inspect_registry(path: Path) -> dict[str, Any]:
         repo_text = str(raw_goal.get("repo") or "")
         repo = Path(repo_text).expanduser() if repo_text else None
         if repo:
-            repo_goal_ids.setdefault(stable_path_key(repo), []).append(goal_id)
+            repo_goal_ids.setdefault(inspection_path_key(repo), []).append(goal_id)
             state_file = resolve_state_file(repo, raw_goal.get("state_file"))
             if state_file:
-                state_goal_ids.setdefault(stable_path_key(state_file), []).append(goal_id)
+                state_goal_ids.setdefault(inspection_path_key(state_file), []).append(goal_id)
 
     for raw_goal in goals:
         if not isinstance(raw_goal, dict):
@@ -369,9 +439,10 @@ def inspect_registry(path: Path) -> dict[str, Any]:
         repo_text = str(raw_goal.get("repo") or "")
         repo = Path(repo_text).expanduser() if repo_text else None
         state_file = resolve_state_file(repo, raw_goal.get("state_file")) if repo else None
-        repo_ids = repo_goal_ids.get(stable_path_key(repo), []) if repo else []
-        adapter = raw_goal.get("adapter") if isinstance(raw_goal.get("adapter"), dict) else {}
-        spawn_policy = raw_goal.get("spawn_policy") if isinstance(raw_goal.get("spawn_policy"), dict) else {}
+        state_file_abs = inspection_path_key(state_file) if state_file else None
+        repo_ids = repo_goal_ids.get(inspection_path_key(repo), []) if repo else []
+        adapter = cast(dict[str, Any], raw_goal.get("adapter")) if isinstance(raw_goal.get("adapter"), dict) else {}
+        spawn_policy = cast(dict[str, Any], raw_goal.get("spawn_policy")) if isinstance(raw_goal.get("spawn_policy"), dict) else {}
         orchestration = compact_orchestration_policy(spawn_policy)
         execution_profile = compact_execution_profile(raw_goal.get("execution_profile"))
         control_plane = compact_control_plane_policy(raw_goal.get("control_plane"))
@@ -428,8 +499,8 @@ def inspect_registry(path: Path) -> dict[str, Any]:
                 "repo_goal_count": len(repo_ids),
                 "repo_goal_ids": repo_ids,
                 "state_file": raw_goal.get("state_file"),
-                "state_file_abs": stable_path_key(state_file) if state_file else None,
-                "state_file_exists": bool(state_file and state_file.exists()),
+                "state_file_abs": state_file_abs,
+                "state_file_exists": bool(state_file_abs and Path(state_file_abs).exists()),
                 "adapter_kind": adapter.get("kind"),
                 "adapter_status": adapter.get("status"),
                 "authority_sources": authority_sources,
@@ -442,11 +513,7 @@ def inspect_registry(path: Path) -> dict[str, Any]:
                 "operator_question": raw_goal.get("operator_question"),
                 "recommended_action": raw_goal.get("recommended_action"),
                 "next_handoff_condition": raw_goal.get("next_handoff_condition"),
-                "explore_graph": compact_explore_graph_policy(
-                    raw_goal.get("explore_graph")
-                )
-                if isinstance(raw_goal.get("explore_graph"), dict)
-                else None,
+                "explore_graph": compact_explore_graph_policy(raw_goal.get("explore_graph"), spawn_policy.get("explore_harness")) if raw_goal.get("explore_graph") is not None or (raw_goal.get("spawn_policy") or {}).get("explore_harness") else None,
                 "orchestration": orchestration,
                 "orchestration_mode": orchestration.get("mode"),
                 "spawn_allowed": spawn_policy.get("allowed"),
@@ -457,13 +524,13 @@ def inspect_registry(path: Path) -> dict[str, Any]:
             }
         )
 
-    for state_file, goal_ids in sorted(state_goal_ids.items()):
+    for shared_state_file, goal_ids in sorted(state_goal_ids.items()):
         unique_goal_ids = sorted(set(goal_ids))
         if len(unique_goal_ids) > 1:
             add_problem(
                 "registry_state_file_shared",
                 "state_file shared by multiple goals: "
-                f"{', '.join(unique_goal_ids)} -> {state_file}",
+                f"{', '.join(unique_goal_ids)} -> {shared_state_file}",
                 goal_ids=unique_goal_ids,
             )
 
@@ -520,20 +587,20 @@ def render_registry_markdown(payload: dict[str, Any]) -> str:
     for goal in payload.get("goals") or []:
         adapter = f"{goal.get('adapter_kind')}:{goal.get('adapter_status')}"
         spawn = orchestration_policy_summary(
-            goal.get("orchestration") if isinstance(goal.get("orchestration"), dict) else None
+            cast(dict[str, Any], goal.get("orchestration")) if isinstance(goal.get("orchestration"), dict) else None
         )
         authority_suffix = ""
         if goal.get("authority_source_count"):
             authority_suffix = f" authorities={goal.get('authority_source_count')}"
-        authority_registry = goal.get("authority_registry") if isinstance(goal.get("authority_registry"), dict) else {}
+        authority_registry = cast(dict[str, Any], goal.get("authority_registry")) if isinstance(goal.get("authority_registry"), dict) else {}
         if authority_registry.get("declared"):
             default_count = authority_registry.get("default_entry_count")
             topic_count = authority_registry.get("topic_authority_count")
             authority_suffix += f" authority_registry=defaults:{default_count},topics:{topic_count}"
-        quota = goal.get("quota") if isinstance(goal.get("quota"), dict) else {}
+        quota = cast(dict[str, Any], goal.get("quota")) if isinstance(goal.get("quota"), dict) else {}
         quota_suffix = f" quota={quota.get('compute')}" if quota else ""
         execution_profile = (
-            goal.get("execution_profile")
+            cast(dict[str, Any], goal.get("execution_profile"))
             if isinstance(goal.get("execution_profile"), dict)
             else None
         )
@@ -543,7 +610,7 @@ def render_registry_markdown(payload: dict[str, Any]) -> str:
             else ""
         )
         control_plane = (
-            goal.get("control_plane")
+            cast(dict[str, Any], goal.get("control_plane"))
             if isinstance(goal.get("control_plane"), dict)
             else None
         )
@@ -590,7 +657,7 @@ def render_registry_boundary_markdown(payload: dict[str, Any]) -> str:
     if payload.get("error"):
         lines.append(f"- error: {payload.get('error')}")
         return "\n".join(lines)
-    git = payload.get("git") if isinstance(payload.get("git"), dict) else {}
+    git = cast(dict[str, Any], payload.get("git")) if isinstance(payload.get("git"), dict) else {}
     lines.extend(
         [
             f"- boundary_kind: `{payload.get('boundary_kind')}`",
@@ -607,11 +674,11 @@ def render_registry_boundary_markdown(payload: dict[str, Any]) -> str:
             f"- worktree_root_recorded: `{git.get('worktree_root_recorded')}`",
         ]
     )
-    risks = payload.get("risks") if isinstance(payload.get("risks"), list) else []
+    risks = cast(list[Any], payload.get("risks")) if isinstance(payload.get("risks"), list) else []
     if risks:
         lines.extend(["", "## Risks"])
         lines.extend(f"- `{risk}`" for risk in risks)
-    markers = payload.get("private_markers") if isinstance(payload.get("private_markers"), list) else []
+    markers = cast(list[Any], payload.get("private_markers")) if isinstance(payload.get("private_markers"), list) else []
     if markers:
         lines.extend(["", "## Private Markers"])
         for marker in markers:

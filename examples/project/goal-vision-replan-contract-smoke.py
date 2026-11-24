@@ -12,7 +12,6 @@ PROTOCOL_INDEX = ROOT / "docs" / "reference" / "protocols" / "README.md"
 DOCS_INDEX = ROOT / "docs" / "README.md"
 STATE_MACHINE = ROOT / "docs" / "product" / "core-control-plane" / "state-machine.md"
 RULE_SEAM = ROOT / "docs" / "product" / "core-control-plane" / "rule-seam-map.md"
-THREE_LAYER = ROOT / "docs" / "reference" / "protocols" / "multi-agent-three-layer-minimality-v0.md"
 SELF_REPAIR_SKILL = ROOT / "skills" / "loopx-self-repair" / "SKILL.md"
 REPAIR_PATTERNS = ROOT / "skills" / "loopx-self-repair" / "references" / "repair-patterns.md"
 
@@ -56,7 +55,6 @@ def main() -> int:
     docs_index = read(DOCS_INDEX)
     state_machine = read(STATE_MACHINE)
     rule_seam = read(RULE_SEAM)
-    three_layer = read(THREE_LAYER)
     self_repair_skill = read(SELF_REPAIR_SKILL)
     repair_patterns = read(REPAIR_PATTERNS)
 
@@ -68,7 +66,6 @@ def main() -> int:
                 docs_index,
                 state_machine,
                 rule_seam,
-                three_layer,
                 self_repair_skill,
                 repair_patterns,
             ]
@@ -83,7 +80,7 @@ def main() -> int:
             "CLI Budget",
             "`vision_summary` | 420",
             "`advancement_policy` | 32",
-            "`total_agent_vision` | 1200",
+            "`total_agent_vision` | 1800",
             "Reject over-budget writes with `vision_budget_exceeded`",
             "Do not silently truncate fields",
             "Long reasoning belongs in evidence artifacts or design docs",
@@ -102,7 +99,7 @@ def main() -> int:
             "`continue`, `replan`, `wait`, `no_change`, `ask_human`, or",
             "`prior_assumption` and `observed_reality` are required",
             "at least one `retained`, `changed`, or `stopped`",
-            "shares the existing 1,200-character `total_agent_vision` budget",
+            "shares the 1,800-character `total_agent_vision` budget",
             "compact audit/read model, not a second planner or a new state machine",
             "Every vision packet and checkpoint is scoped by `agent_id`",
             "Vision Checkpoint",
@@ -133,12 +130,12 @@ def main() -> int:
             "`vision_gap_judge_v0` instruction packet",
             "the agent is told to compare the active vision",
             "projected required reads",
-            "`loopx evidence-log",
+            "`replan_context` supplies",
             "bounded public web research",
             "`done=true` is only valid",
             "explicit completion with authoritative evidence",
             "a completed todo is only evidence input",
-            "15 or more advancement todos",
+            "owns at least 15 open advancement Todos",
             "Write / Correction Mechanism",
             "Vision correction is a normal state-machine transition",
             "material `refresh-state` closeouts emit a per-agent `vision_checkpoint_v0`",
@@ -159,7 +156,7 @@ def main() -> int:
             "required replan is evaluated before",
             "An acknowledgement without a vision, todo, acceptance, or no-follow-up",
             "`vision_checkpoint_missing`",
-            "about 15 advancement todos",
+            "at least 15 open advancement todos",
             "bounded public research when local evidence is insufficient",
             "goal-vision-replan-contract-v0.md",
         ],
@@ -176,16 +173,6 @@ def main() -> int:
             "Per-agent vision is a bounded goal-routing contract",
         ],
         source=RULE_SEAM,
-    )
-    require(
-        three_layer,
-        [
-            "per-agent vision/replan state",
-            "per-agent vision budgets",
-            "vision/replan state transitions",
-            "product-specific fork of per-agent vision/replan mechanics",
-        ],
-        source=THREE_LAYER,
     )
     require(
         self_repair_skill,
@@ -206,10 +193,10 @@ def main() -> int:
         repair_patterns,
         [
             "vision_replan_writeback_gap",
-            "no `goal_frontier_projection.acceptance_gaps[]`",
-            "--agent-id <agent-id>",
-            "--vision-unchanged-reason",
-            "vision_checkpoint_missing",
+            "refine the matching outcome",
+            "Retain unaffected requirements",
+            "fresh guard required by changed acceptance",
+            "without replacing the admitted Turn or replaying effects",
         ],
         source=REPAIR_PATTERNS,
     )

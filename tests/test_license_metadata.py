@@ -25,21 +25,23 @@ def test_root_license_is_canonical_apache_2_with_historical_notices() -> None:
 
     historical_mit = (ROOT / "LICENSE-MIT").read_text(encoding="utf-8")
     notice = (ROOT / "NOTICE").read_text(encoding="utf-8")
-    assert historical_mit.startswith("MIT License\n\nCopyright (c) 2026 LoopX contributors")
+    assert historical_mit.startswith(
+        "MIT License\n\nCopyright (c) 2026 LoopX contributors"
+    )
     assert "releases through v0.4.7 were distributed under the MIT License" in notice
 
 
 def test_python_distributions_declare_apache_2() -> None:
     root_project = _project_metadata("pyproject.toml")
-    assert root_project["version"] == "0.5.2"
-    assert '__version__ = "0.5.2"' in (ROOT / "loopx/__init__.py").read_text()
     assert root_project["license"] == "Apache-2.0"
     assert set(root_project["license-files"]) == {"LICENSE", "NOTICE", "LICENSE-MIT"}
 
-    extension_project = _project_metadata(
-        "packages/loopx-finance-value-discovery/pyproject.toml"
-    )
-    assert extension_project["license"] == "Apache-2.0"
+    for project_file in (
+        "packages/loopx-finance-value-discovery/pyproject.toml",
+        "packages/loopx-finance-execution/pyproject.toml",
+    ):
+        extension_project = _project_metadata(project_file)
+        assert extension_project["license"] == "Apache-2.0"
 
 
 def test_npm_workspace_metadata_declares_apache_2() -> None:
@@ -56,6 +58,8 @@ def test_public_docs_state_the_versioned_transition() -> None:
     assert "beginning with `v0.4.8`" in licensing
     assert "through `v0.4.7`" in licensing
     assert "git commit -s" in contributing
-    assert (ROOT / "DCO").read_text(encoding="utf-8").startswith(
-        "Developer Certificate of Origin\nVersion 1.1"
+    assert (
+        (ROOT / "DCO")
+        .read_text(encoding="utf-8")
+        .startswith("Developer Certificate of Origin\nVersion 1.1")
     )

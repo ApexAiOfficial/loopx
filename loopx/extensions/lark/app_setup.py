@@ -20,6 +20,7 @@ from .goal_channel_transport import SAFE_PROFILE_PATTERN
 
 _OFFICIAL_SETUP_HOSTS = (
     "open.feishu.cn",
+    "open.larksuite.com",
     "open." + "la" + "rk" + "office.com",
 )
 OFFICIAL_SETUP_URL_PATTERN = re.compile(
@@ -50,7 +51,7 @@ def _default_process_factory(args: list[str], env: dict[str, str]) -> SetupProce
         env=env,
         stderr=subprocess.STDOUT,
         stdout=subprocess.PIPE,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
 
 

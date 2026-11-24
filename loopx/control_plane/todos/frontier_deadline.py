@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from datetime import datetime
 from typing import Any
 
@@ -93,40 +92,4 @@ def todo_summary_frontier_deadline(
         "schema_version": TODO_FRONTIER_DEADLINE_SCHEMA_VERSION,
         **selected,
         "candidate_count": len(candidates),
-    }
-
-
-def build_frontier_recheck_plan(
-    payload: dict[str, Any],
-    *,
-    current_time: datetime,
-) -> dict[str, Any] | None:
-    deadlines = [
-        deadline
-        for summary_key in ("agent_todo_summary", "user_todo_summary")
-        if (
-            deadline := todo_summary_frontier_deadline(
-                payload.get(summary_key),
-                current_time=current_time,
-            )
-        )
-        is not None
-    ]
-    if not deadlines:
-        return None
-
-    selected = min(deadlines, key=lambda item: item["next_due_at"])
-    next_due_at = parse_timestamp(selected["next_due_at"])
-    if next_due_at is None:
-        return None
-    return {
-        "frontier_recheck_after_seconds": max(
-            1,
-            math.ceil((next_due_at - current_time).total_seconds()),
-        ),
-        "frontier_recheck_source": selected["source"],
-        "frontier_recheck_identity": selected["identity"],
-        "frontier_recheck_candidate_count": sum(
-            int(item.get("candidate_count") or 0) for item in deadlines
-        ),
     }

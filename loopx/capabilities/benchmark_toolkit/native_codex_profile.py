@@ -32,7 +32,10 @@ NATIVE_CODEX_PROFILE_REQUIRED_SKILL_IDS = (
     "loopx",
     *PACKAGED_HOST_SKILL_IDS,
 )
-_DEFAULT_GLOBAL_REGISTRY_TOKEN = "$HOME/.codex/loopx/registry.global.json"
+_DEFAULT_GLOBAL_REGISTRY_TOKENS = (
+    "$HOME/.loopx/registry.global.json",
+    "$HOME/.codex/loopx/registry.global.json",  # Explicit legacy route before migration.
+)
 _SAFE_RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SAFE_ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _INSTALL_ENV_PASSTHROUGH = (
@@ -44,6 +47,21 @@ _INSTALL_ENV_PASSTHROUGH = (
     "SSL_CERT_FILE",
     "TERM",
     "TZ",
+)
+_AGENT_SHELL_ENV_INCLUDE_ONLY = (
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+    "USER",
 )
 
 
@@ -123,7 +141,7 @@ def _source_clean_preflight(source_root: Path) -> bool | None:
             ["git", "-C", str(source_root), "rev-parse", "--show-toplevel"],
             check=False,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
     except OSError:
         top_level = None
@@ -138,7 +156,7 @@ def _source_clean_preflight(source_root: Path) -> bool | None:
             ["git", "-C", str(source_root), "status", "--porcelain"],
             check=False,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
         if status.returncode != 0:
             return None
@@ -187,11 +205,17 @@ def _formal_install_environment(
     env.update(
         {
             "HOME": str(paths["home"]),
+            "TMPDIR": str(paths["home"]),
+            "TMP": str(paths["home"]),
+            "TEMP": str(paths["home"]),
             "SHELL": "/bin/sh",
             "CODEX_HOME": str(paths["codex_home"]),
             "LOOPX_PYTHON": python_executable,
             "LOOPX_PROMOTE_DEFAULT": "1",
             "LOOPX_INSTALL_CANARY": "0",
+            # Synthetic profiles must not become adoption samples, even when
+            # rebuilding the environment drops the supervisor's CI/opt-out flags.
+            "LOOPX_USAGE_PING": "0",
             "LOOPX_BIN_DIR": str(paths["bin_dir"]),
             "LOOPX_RELEASES_DIR": str(paths["release_root"].parent),
             "LOOPX_RELEASE_ID": release_id,
@@ -225,37 +249,51 @@ def native_codex_profile_environment(
     env.update(
         {
             "HOME": str(profile.home),
+            # The Effect runtime locator is temp-scoped and content-addressed.
+            # Equal-source profiles must not share its writer or stop owner.
+            "TMPDIR": str(profile.home),
+            "TMP": str(profile.home),
+            "TEMP": str(profile.home),
             "CODEX_HOME": str(profile.codex_home),
+            "LOOPX_USAGE_PING": "0",
             "PATH": f"{profile.bin_dir}{os.pathsep}{inherited_path}",
         }
     )
     return env
 
 
-def native_codex_app_server_environment(
-    profile: NativeCodexProfile,
+def native_codex_app_server_shell_policy_args(
     *,
-    provider_env_key: str,
-    base_env: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    """Admit one runner-owned provider value into the formal profile environment.
+    excluded_env_keys: Sequence[str],
+) -> tuple[str, ...]:
+    """Build a minimal Codex shell environment as defense in depth.
 
-    The underlying profile environment remains credential-free by default. The
-    runner must name the provider key explicitly and separately deny that key to
-    agent shell or tool processes.
+    Credential isolation must come from a separate OS authority boundary. This
+    helper only prevents ordinary inheritance of explicitly named non-secret
+    runtime values such as a runner-gateway sentinel.
     """
 
-    if not _SAFE_ENV_KEY.fullmatch(provider_env_key):
-        raise ValueError("provider_env_key must be a safe environment variable name")
-    source = os.environ if base_env is None else base_env
-    provider_value = source.get(provider_env_key)
-    if not isinstance(provider_value, str) or not provider_value.strip():
-        raise NativeCodexProfileError(
-            f"provider_environment_value_missing:{provider_env_key}"
+    normalized = _normalized_ids(
+        excluded_env_keys,
+        field="excluded_env_keys",
+    )
+    invalid = [key for key in normalized if not _SAFE_ENV_KEY.fullmatch(key)]
+    if invalid:
+        raise ValueError(
+            "excluded_env_keys must contain safe environment variable names"
         )
-    env = native_codex_profile_environment(profile, base_env=base_env)
-    env[provider_env_key] = provider_value
-    return env
+    return (
+        "-c",
+        'shell_environment_policy.inherit="core"',
+        "-c",
+        "shell_environment_policy.ignore_default_excludes=false",
+        "-c",
+        f"shell_environment_policy.include_only={json.dumps(_AGENT_SHELL_ENV_INCLUDE_ONLY)}",
+        "-c",
+        f"shell_environment_policy.exclude={json.dumps(normalized)}",
+        "-c",
+        'shell_environment_policy.set.LOOPX_USAGE_PING="0"',
+    )
 
 
 def render_native_codex_goal_prompt(
@@ -326,7 +364,7 @@ def render_native_codex_goal_prompt(
             env=native_codex_profile_environment(profile, base_env=base_env),
             check=False,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=timeout_sec,
         )
     except subprocess.TimeoutExpired as exc:
@@ -361,13 +399,14 @@ def render_native_codex_goal_prompt(
     runtime_registry_bound = runtime_registry_path is None
     if runtime_registry_path is not None:
         runtime_registry = str(Path(runtime_registry_path).expanduser().resolve())
-        if _DEFAULT_GLOBAL_REGISTRY_TOKEN not in task_body:
-            raise NativeCodexProfileError("goal_prompt_default_registry_token_missing")
-        task_body = task_body.replace(_DEFAULT_GLOBAL_REGISTRY_TOKEN, runtime_registry)
-        runtime_registry_bound = (
-            runtime_registry in task_body
-            and _DEFAULT_GLOBAL_REGISTRY_TOKEN not in task_body
-        )
+        if any(token in task_body for token in _DEFAULT_GLOBAL_REGISTRY_TOKENS):
+            for token in _DEFAULT_GLOBAL_REGISTRY_TOKENS:
+                task_body = task_body.replace(token, runtime_registry)
+            runtime_registry_bound = runtime_registry in task_body
+        else:
+            # Explicit runtime-root commands resolve their own global registry;
+            # no separate --registry token is emitted or needs rewriting.
+            runtime_registry_bound = str(runtime) in task_body
         if not runtime_registry_bound:
             raise NativeCodexProfileError("goal_prompt_runtime_registry_not_bound")
 
@@ -393,7 +432,7 @@ def _doctor_payload(
         env=doctor_env,
         check=False,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     if completed.returncode:
         raise NativeCodexProfileError(
@@ -440,11 +479,32 @@ def inspect_native_codex_profile(
     if resolved_release not in resolved_cli.parents:
         raise NativeCodexProfileError("profile_cli_not_release_snapshot")
 
+    env = _formal_install_environment(
+        paths=paths,
+        python_executable=_resolved_executable(None),
+        release_id=release_id,
+        base_env=base_env,
+    )
+    # The profile's CLI owns the loaded skills; the inspecting supervisor may
+    # run a different LoopX version.
+    try:
+        version_readback = subprocess.run(
+            [str(cli_bin), "--version"],
+            cwd=paths["root"], env=env, check=False, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise NativeCodexProfileError("profile_cli_version_unavailable") from exc
+    version_parts = version_readback.stdout.split()
+    if version_readback.returncode or len(version_parts) != 2 or version_parts[0] != "loopx":
+        raise NativeCodexProfileError("profile_cli_version_invalid")
+
     expected_source = Path(source_root).expanduser().resolve() if source_root else None
     skill_readback = inspect_skill_install_readback(
         skills_dir=paths["skills_dir"],
         required_skill_ids=required,
         source_root=expected_source,
+        expected_loopx_version_override=version_parts[1],
     )
     if skill_readback.get("ready") is not True:
         status = re.sub(r"[^A-Za-z0-9_.:-]", "_", str(skill_readback.get("status")))
@@ -461,12 +521,6 @@ def inspect_native_codex_profile(
     if not isinstance(skills_digest, str) or not isinstance(source_revision, str):
         raise NativeCodexProfileError("profile_identity_missing")
 
-    env = _formal_install_environment(
-        paths=paths,
-        python_executable=_resolved_executable(None),
-        release_id=release_id,
-        base_env=base_env,
-    )
     doctor = _doctor_payload(cli_bin=cli_bin, paths=paths, env=env)
     release_manifest = (doctor.get("release_manifest") or {}).get("manifest") or {}
     release_source = release_manifest.get("source") or {}
@@ -549,7 +603,7 @@ def install_native_codex_profile(
         env=env,
         check=False,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     if completed.returncode:
         raise NativeCodexProfileError(
@@ -614,7 +668,7 @@ __all__ = [
     "compact_native_codex_profile_receipt",
     "inspect_native_codex_profile",
     "install_native_codex_profile",
-    "native_codex_app_server_environment",
+    "native_codex_app_server_shell_policy_args",
     "native_codex_profile_environment",
     "render_native_codex_goal_prompt",
 ]

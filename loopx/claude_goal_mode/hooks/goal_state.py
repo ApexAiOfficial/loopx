@@ -32,8 +32,6 @@ from loopx.goal_mode_context import (  # noqa: E402
     resolve_goal_context,
 )
 
-REGISTRY_DIRS = (".loopx", ".goal-harness")  # prefer loopx; fall back to legacy
-
 _ARMED_RE = re.compile(r"<!--\s*loopx:armed\s*(\{.*?\})\s*-->")
 
 
