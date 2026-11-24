@@ -1,0 +1,47 @@
+{
+  "note": "Non-official DRAFT case-insight records for the codex×LoopX SWE-Marathon study. Two tiers: per-case `records` (child of a single terminal run) and `study_observations` (cross-task aggregate on how LoopX continuation changes behavior). Field shapes track benchmark_case_insight_projection_v0 (upstream #3878 / RFC #3812) so records can be promoted, but schema_version is a draft: these are NOT attachable via the official benchmark provider until matching benchmark_experiment_board_row_v0 rows exist (see README lineage). Identity note: data.json is latest-attempt-per-(task,arm) after _common.collect() folding; run_id hashes the surviving attempt's run_dir.",
+  "schema_version": "swe_marathon_case_insight_draft_v0",
+  "promotion_target": "benchmark_case_insight_projection_v0",
+  "study_observations": [],
+  "count": 2,
+  "records": [
+    {
+      "schema_version": "swe_marathon_case_insight_draft_v0",
+      "benchmark_id": "swe-marathon",
+      "study_id": "codex-loopx-access-modes",
+      "case_id": "excel-clone",
+      "run_id": "excel-clone__heartbeat__8b86bd1f",
+      "outcome_status": "incomplete",
+      "failure_class": "unattended_continuation_idle_churn",
+      "causal_summary": "heartbeat 在 excel-clone 的多轮续跑出现重复解锁：unblock=8、cont=9、终态未 complete（partial=0.5）。这些计数是描述性观察，尚不能确定失败原因或据此比较其他接入模式。",
+      "expectedness": "unexpected",
+      "implication": "额外续跑未保证完成；需要区分有效工作与重复解锁，并保留此负例。",
+      "next_probe": "核查每次解锁后的实际工作与回合边界，再做匹配重复实验。",
+      "confidence": "medium",
+      "evidence_refs": [
+        "run:excel-clone__heartbeat__8b86bd1f"
+      ],
+      "privacy_classification": "public_safe",
+      "producer_redaction_attested": true
+    },
+    {
+      "schema_version": "swe_marathon_case_insight_draft_v0",
+      "benchmark_id": "swe-marathon",
+      "study_id": "codex-loopx-access-modes",
+      "case_id": "zstd-decoder",
+      "run_id": "zstd-decoder__heartbeat__2fefe10b",
+      "outcome_status": "completed",
+      "failure_class": "automation_recovers_over_baseline",
+      "causal_summary": "heartbeat（automation/续跑模式）在 zstd-decoder 达终态 partial=1，而同任务的 plain 基线（有效运行）停在 partial=0.721。gap≈0.279。这是同模型配置和时限预算下的单次观察，不能排除采样差异；轨迹与继续验证补齐边界的机制假设一致。 轨迹对照：plain 在 6 个可见 fixture 通过后即于第 52 step 宣布“Implemented the complete RFC 8878 decoder”收工（hidden 25/37）——典型的“可见信号变绿即停”。heartbeat 在同一可见-通过点没有停：LoopX 续跑循环反复注入 goal、驳回其 update_goal=complete，把运行推到 453 step。这段续跑里 agent 自建了一套 RFC-derived 验收程序（156 项检查，远超 6 个 fixture）、转入内存安全审计，并定位/修复了具体边界缺陷——包括 offset-table 越界，以及 four-stream Huffman 在极小 regenerated size 下第四段计算下溢、令前序段越过 literal buffer 的内存安全漏洞（并补了 sanitizer 回归）。这些正是 hidden 套件考察的长尾，最终 hidden 37/37。",
+      "expectedness": "expected",
+      "implication": "这条正面回答“automation 如何帮基线做出题”：其价值在于**抵消模型的早停**——当基线在public/可见信号变绿后就宣布完成时，续跑循环继续驱动它覆盖 hidden 边界。注意这只在**基线尚有未覆盖长尾**时有增益；在 plain 已达上限的任务上（本套多数任务）automation 与基线打平，不产生此类 gap。",
+      "next_probe": "在更多任务和重复运行上量化‘早停’的普遍度（如对比各模式 agent step 数与最终 hidden 覆盖），并确认基线低分是能力所限还是早停所致；对早停敏感的任务优先用续跑模式。",
+      "confidence": "medium",
+      "evidence_refs": [
+        "run:zstd-decoder__heartbeat__2fefe10b"
+      ],
+      "privacy_classification": "public_safe",
+      "producer_redaction_attested": true
+    }
+  ]
+}

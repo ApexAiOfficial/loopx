@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -103,6 +104,17 @@ with tempfile.TemporaryDirectory(prefix="loopx-lark-extension-") as raw_temp:
         ),
         encoding="utf-8",
     )
+    # Capability availability is tested on a valid canonical Goal, independently
+    # of the explicit unmigrated-Goal refusal covered by authority smokes.
+    state = project / "STATE.md"
+    state.write_text("# Extension fixture\n\n## Objective\nObserve local extension availability.\n\n## Next Action\nInspect installed extension availability.\n\n## User Todo / Owner Review Reading Queue\n\n## Agent Todo\n")
+    data = json.loads(registry.read_text())
+    data["common_runtime_root"] = str(runtime_root)
+    data["goals"][0]["state_file"] = state.name
+    registry.write_text(json.dumps(data))
+    from loopx.control_plane.testing.canary_harness import import_fixture_authority
+    import_fixture_authority(registry, "lark-extension-fixture", provider="sqlite")
+
     drain_args = (
         "lark-inbox",
         "drain",
@@ -173,7 +185,7 @@ with tempfile.TemporaryDirectory(prefix="loopx-lark-extension-") as raw_temp:
     assert active["extension_activation"] == {
         "schema_version": "loopx_extension_activation_v0",
         "extension_id": "loopx-lark",
-        "provider_version": "1.5.0",
+        "provider_version": installed["version"],
         "revision": installed["revision"],
         "enabled": True,
         "doctor_verified": True,
@@ -264,11 +276,15 @@ with tempfile.TemporaryDirectory(prefix="loopx-lark-extension-") as raw_temp:
     assert enabled["doctor"]["verified"] is True, enabled
 
     bundled_manifest = ROOT / "loopx" / "extensions" / "lark" / "extension.toml"
-    upgraded_manifest = temp / "loopx-lark-v1.6.toml"
+    bundled_text = bundled_manifest.read_text(encoding="utf-8")
+    bundled_version = str(tomllib.loads(bundled_text)["version"])
+    major, minor, patch = (int(part) for part in bundled_version.split("."))
+    upgraded_version = f"{major}.{minor}.{patch + 1}"
+    upgraded_manifest = temp / f"loopx-lark-v{upgraded_version}.toml"
     upgraded_manifest.write_text(
-        bundled_manifest.read_text(encoding="utf-8").replace(
-            'version = "1.5.0"',
-            'version = "1.6.0"',
+        bundled_text.replace(
+            f'version = "{bundled_version}"',
+            f'version = "{upgraded_version}"',
             1,
         ),
         encoding="utf-8",

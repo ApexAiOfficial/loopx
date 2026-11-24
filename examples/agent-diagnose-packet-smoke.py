@@ -13,7 +13,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from loopx.diagnose import _first_agent_todo_text, render_diagnosis_markdown  # noqa: E402
+from loopx.diagnose import (  # noqa: E402
+    _compact_scheduler_hint,
+    _first_agent_todo_text,
+    _scheduler_hint_line,
+    render_diagnosis_markdown,
+)
 
 GOAL_ID = "diagnose-smoke-goal"
 SCOPED_GOAL_ID = "diagnose-smoke-agent-scoped"
@@ -63,6 +68,26 @@ def assert_selected_agent_todo_preferred() -> None:
         )
         == selected
     )
+
+
+def assert_diagnose_preserves_app_scheduler_identity() -> None:
+    legacy = {
+        "codex_app": {"apply": "none"},
+        "reset_policy": {"codex_app_initial_rrule": "FREQ=MINUTELY;INTERVAL=3"},
+    }
+    trae = {
+        "app_automation": {"apply": "none", "host_surface": "trae_app"},
+        "reset_policy": {
+            "app_automation_initial_rrule": "FREQ=MINUTELY;INTERVAL=3"
+        },
+    }
+
+    legacy_compact = _compact_scheduler_hint(legacy)
+    trae_compact = _compact_scheduler_hint(trae)
+    assert "codex_app" in legacy_compact and "app_automation" not in legacy_compact
+    assert "app_automation" in trae_compact and "codex_app" not in trae_compact
+    assert "codex_app_apply=none" in (_scheduler_hint_line(legacy) or "")
+    assert "app_automation_apply=none" in (_scheduler_hint_line(trae) or "")
 
 
 def assert_diagnose_markdown_separates_status_and_packet_goal_counts() -> None:
@@ -122,7 +147,7 @@ def assert_diagnose_markdown_separates_status_and_packet_goal_counts() -> None:
     assert "contract_warnings_truncated: total=4" in markdown, markdown
 
 
-def bootstrap_project(project: Path, runtime: Path, goal_id: str, *, onboarding: bool) -> dict:
+def bootstrap_project(project: Path, runtime: Path, goal_id: str) -> dict:
     args = [
         "--runtime-root",
         str(runtime),
@@ -139,8 +164,6 @@ def bootstrap_project(project: Path, runtime: Path, goal_id: str, *, onboarding:
         "diagnose_fixture_v0",
         "--no-global-sync",
     ]
-    if not onboarding:
-        args.append("--no-onboarding-scan")
     return run_cli(*args)
 
 
@@ -216,6 +239,8 @@ def write_agent_scoped_registry(root: Path, runtime: Path) -> Path:
         + "\n",
         encoding="utf-8",
     )
+    from loopx.control_plane.testing.canary_harness import import_fixture_authority
+    import_fixture_authority(registry, SCOPED_GOAL_ID, provider="sqlite")
     return registry
 
 
@@ -279,18 +304,21 @@ def write_capability_scoped_registry(root: Path, runtime: Path) -> Path:
         + "\n",
         encoding="utf-8",
     )
+    from loopx.control_plane.testing.canary_harness import import_fixture_authority
+    import_fixture_authority(registry, CAPABILITY_GOAL_ID, provider="sqlite")
     return registry
 
 
 def main() -> int:
     assert_selected_agent_todo_preferred()
+    assert_diagnose_preserves_app_scheduler_identity()
     assert_diagnose_markdown_separates_status_and_packet_goal_counts()
     with tempfile.TemporaryDirectory(prefix="loopx-agent-diagnose-smoke-") as tmp:
         root = Path(tmp)
         runtime = root / "runtime"
 
         ready_project = write_project(root, "ready-project")
-        bootstrap_project(ready_project, runtime, GOAL_ID, onboarding=False)
+        bootstrap_project(ready_project, runtime, GOAL_ID)
         registry = ready_project / ".loopx" / "registry.json"
         added = run_cli(
             "--registry",
@@ -329,7 +357,7 @@ def main() -> int:
         scheduler_hint = selected["quota_signals"]["scheduler_hint"]
         assert scheduler_hint["schema_version"] == "diagnose_scheduler_hint_summary_v0", selected
         assert "local_scheduler" not in str(scheduler_hint), scheduler_hint
-        assert scheduler_hint["codex_app"]["no_spend_for_cadence_change"] is True, scheduler_hint
+        assert scheduler_hint["app_automation"]["no_spend_for_cadence_change"] is True, scheduler_hint
         assert selected["agent_reasoning_checklist"], selected
         assert any(
             " diagnose " in command and f"--goal-id {GOAL_ID}" in command
@@ -354,15 +382,37 @@ def main() -> int:
 
         gated_project = write_project(root, "gated-project")
         gated_goal_id = "diagnose-smoke-gated"
-        bootstrap_project(gated_project, runtime, gated_goal_id, onboarding=True)
+        bootstrap_project(gated_project, runtime, gated_goal_id)
         gated_registry = gated_project / ".loopx" / "registry.json"
+        # ``connect`` no longer seeds an owner gate, so the fixture writes the
+        # user gate it wants to diagnose by itself.
+        user_gate_text = "[P1] Confirm the release window before autonomous delivery."
+        run_cli(
+            "--registry",
+            str(gated_registry),
+            "todo",
+            "add",
+            "--goal-id",
+            gated_goal_id,
+            "--role",
+            "user",
+            "--text",
+            user_gate_text,
+            "--task-class",
+            "user_gate",
+            "--action-kind",
+            "owner_decision",
+            "--global-gate",
+            "--execute",
+        )
         gated_packet = run_cli("--registry", str(gated_registry), "diagnose", "--goal-id", gated_goal_id)
         gated_selected = gated_packet["selected"]
         assert gated_selected["machine_signal"] == "user_or_controller_attention", gated_selected
         assert gated_selected["todo_evidence"]["user_open_count"] == 1, gated_selected
         assert gated_selected["quota_signals"]["action_required"] is True, gated_selected
         assert gated_selected["quota_signals"]["open_count"] == 1, gated_selected
-        assert "autonomous=yes/no" in str(gated_selected["user_question"]), gated_selected
+        assert user_gate_text in str(gated_selected["user_question"]), gated_selected
+        assert gated_selected["recommended_action"] == user_gate_text, gated_selected
         assert "can_self_drive" not in gated_selected, gated_selected
 
         scoped_registry = write_agent_scoped_registry(root, runtime)

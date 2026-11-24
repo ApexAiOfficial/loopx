@@ -25,6 +25,9 @@ _RETRIEVAL_RECEIPT_FIELDS = {
     "provider",
     "namespace",
     "visibility",
+    "target_scope_kind",
+    "actor_binding_verified",
+    "provider_preflight_performed",
     "status",
     "reason_code",
     "provider_version",
@@ -118,7 +121,7 @@ def _retrieval_counts(
     rejected_record_count: int,
 ) -> tuple[int, int, str]:
     if packet is None:
-        result_count = promoted_count + rejected_record_count
+        result_count: Any = promoted_count + rejected_record_count
         return result_count, rejected_record_count, "evidence_records"
     if not isinstance(packet, Mapping):
         raise TypeError("retrieval_receipt must be an object")
@@ -159,8 +162,7 @@ def _retrieval_counts(
     if requested_limit and result_count > requested_limit:
         raise ValueError("retrieval_receipt exceeds its requested result limit")
     if any(
-        not isinstance(result, Mapping)
-        or set(result) != _RETRIEVAL_RESULT_FIELDS
+        not isinstance(result, Mapping) or set(result) != _RETRIEVAL_RESULT_FIELDS
         for result in results
     ):
         raise ValueError("retrieval_receipt results must use the canonical projection")
@@ -168,7 +170,9 @@ def _retrieval_counts(
     if not isinstance(telemetry, Mapping) or set(telemetry) != (
         _RETRIEVAL_TELEMETRY_FIELDS
     ):
-        raise ValueError("retrieval_receipt telemetry must use the canonical projection")
+        raise ValueError(
+            "retrieval_receipt telemetry must use the canonical projection"
+        )
     if result_count and (
         packet.get("search_performed") is not True
         or packet.get("read_performed") is not True
@@ -219,8 +223,7 @@ def build_decision_outcome_feedback(
         and item["evidence_ref"] == evidence["packet_ref"]
     ]
     current_source_revisions = sum(
-        revision["freshness"] == "current"
-        for revision in evidence["source_revisions"]
+        revision["freshness"] == "current" for revision in evidence["source_revisions"]
     )
     (
         discovered_result_count,
@@ -257,6 +260,41 @@ def build_decision_outcome_feedback(
                     f"Decision: {accepted['summary']} "
                     f"Verified outcome: {verified_outcome['summary']}"
                 ),
+                "experience": {
+                    "schema_version": "procedural_experience_contract_v0",
+                    "applicability": [
+                        f"A future decision matches: {accepted['summary']}"
+                    ],
+                    "observed_outcome": verified_outcome["summary"],
+                    "attribution": (
+                        "The accepted decision and verified outcome are linked to "
+                        "the same exact-read evidence packet; rejected or stale "
+                        "claims were excluded from the attribution."
+                    ),
+                    "future_behavior": {
+                        "trigger": (
+                            "The same decision pattern recurs with a current source "
+                            "revision and no unresolved authority conflict."
+                        ),
+                        "action": (
+                            f"Re-evaluate the evidence before applying this decision: "
+                            f"{accepted['summary']}"
+                        ),
+                        "validation": (
+                            "Require an exact-read promoted claim and a verified outcome "
+                            "linked to the same evidence packet."
+                        ),
+                        "stop_condition": (
+                            "Do not reuse the experience when the source revision is "
+                            "stale, the outcome is unverified, or a conflict is unresolved."
+                        ),
+                    },
+                    "limitations": [
+                        "One verified outcome does not establish universal causality.",
+                        "Reuse requires current evidence and the original scope boundaries.",
+                    ],
+                    "evidence_refs": [evidence["packet_ref"], outcome["packet_ref"]],
+                },
                 "source": {
                     "source_kind": "verified_decision_outcome",
                     "source_ref": outcome["packet_ref"],
@@ -321,9 +359,7 @@ def build_decision_outcome_feedback(
         "outcome_telemetry": {
             "verification_status": outcome["verification_status"],
             "linked_verified_outcome_count": len(linked_verified_outcomes),
-            "invalidated_assumption_count": len(
-                outcome["invalidated_assumptions"]
-            ),
+            "invalidated_assumption_count": len(outcome["invalidated_assumptions"]),
             "resulting_transition_count": len(outcome["resulting_transitions"]),
         },
         "reward_memory": {

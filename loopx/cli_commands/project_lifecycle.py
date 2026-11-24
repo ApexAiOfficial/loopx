@@ -1,68 +1,37 @@
 from __future__ import annotations
 
 import argparse
-import json
-from collections.abc import Callable, Mapping
-from importlib import import_module
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from ..capabilities.explore.activation import (
-    sync_explore_graph_after_material_refresh,
+from ..cli_runtime import PROJECT_LIFECYCLE_COMMANDS as PROJECT_LIFECYCLE_COMMANDS
+from ..control_plane.capability_hooks import (
+    PostWritebackHookRegistration,
 )
-from ..control_plane.agents.capability_gate import (
-    runtime_capabilities_for_cli_projection,
-)
-from ..control_plane.goals.goal_vision_policy import (
-    GOAL_VISION_ADVANCEMENT_POLICY_CHOICES,
-)
-from ..control_plane.quota.settlement import (
-    require_settlement_writeback,
-    resolve_heartbeat_settlement_identity,
-    settlement_result_payload,
-)
-from ..control_plane.work_items.delivery_batch_scale import (
-    DELIVERY_BATCH_SCALE_INPUT_CHOICES,
-)
-from ..control_plane.work_items.delivery_outcome import DELIVERY_OUTCOME_CHOICES
-from ..control_plane.work_items.progress_observation import ProgressResultClass
-from ..control_plane.work_items.semantic_replan_writeback import (
-    ReplanWritebackRejected,
-    project_replan_writeback_rejection,
-)
-from ..extensions.lark.goal_channel_lifecycle import (
-    goal_channel_gate_sync_failure,
-    sync_human_gate_after_refresh,
-)
-from ..extensions.runtime import (
-    default_extension_state_file,
-    resolve_extension_activation,
-)
+from ..control_plane.actor_identity import OWNER_CONTROLLER_ACTOR_CHOICES
 from ..feedback import (
     LESSON_KINDS,
     append_human_reward,
     compact_reward,
     render_reward_markdown,
 )
-from ..history import load_registry
 from ..operator_gate import (
     DEFAULT_OPERATOR_GATE,
     OPERATOR_GATE_DECISIONS,
     record_operator_gate,
     render_operator_gate_markdown,
 )
-from ..paths import resolve_runtime_root
 from ..project_map import (
     DEFAULT_PROJECT_MAP_CLASSIFICATION,
     read_only_project_map_run,
     render_read_only_project_map_markdown,
 )
-from ..state_refresh import (
-    DEFAULT_REFRESH_ACTION,
-    DEFAULT_REFRESH_CLASSIFICATION,
-    PROGRESS_SCOPE_CHOICES,
-    REPAIR_DELTA_KIND_CHOICES,
-    refresh_state_run,
-    render_state_refresh_markdown,
+from .post_writeback import (
+    PostWritebackProjectionBuilder,
+)
+from .project_lifecycle_refresh_state import (
+    handle_refresh_state_command,
+    register_refresh_state_command,
 )
 
 PrintPayload = Callable[
@@ -72,405 +41,11 @@ PrintPayload = Callable[
 OutputFormat = Callable[[argparse.Namespace], str]
 AppendCliRolloutEvent = Callable[..., dict[str, object]]
 
-PROJECT_LIFECYCLE_COMMANDS = {
-    "refresh-state",
-    "read-only-map",
-    "reward",
-    "operator-gate",
-}
-
-INLINE_VISION_FIELDS = {
-    "vision_summary": "vision_summary",
-    "vision_role_scope": "role_scope",
-    "vision_acceptance": "acceptance_summary",
-    "vision_advancement_policy": "advancement_policy",
-    "vision_replan_trigger": "replan_trigger_summary",
-    "vision_dreaming_policy": "dreaming_policy",
-    "vision_last_patch": "last_patch_summary",
-}
-
-
-def _lark_explore_graph_syncer(
-    runtime_root_arg: str | None,
-    *,
-    registry_path: Path,
-) -> Callable[..., Mapping[str, object]]:
-    extension_runtime_root = resolve_runtime_root(
-        load_registry(registry_path), runtime_root_arg
-    )
-
-    def sync(**kwargs: object) -> Mapping[str, object]:
-        implementation = import_module(
-            "loopx.extensions.lark.presentation.explore_results"
-        )
-        preview_kwargs = dict(kwargs)
-        preview_kwargs["execute"] = False
-        preview = dict(
-            implementation.sync_issue_fix_explore_on_material_change(
-                **preview_kwargs
-            )
-        )
-        if preview.get("status") in {"not_applicable", "not_configured"}:
-            return preview
-
-        provider = import_module("loopx.extensions.lark")
-        activation = resolve_extension_activation(
-            str(provider.LARK_EXTENSION_ID),
-            state_file=default_extension_state_file(extension_runtime_root),
-            required_permissions=(str(provider.LARK_PROJECTION_SINK_PERMISSION),),
-        )
-        result = (
-            dict(implementation.sync_issue_fix_explore_on_material_change(**kwargs))
-            if kwargs.get("execute")
-            else preview
-        )
-        result["extension_activation"] = activation
-        return result
-
-    return sync
-
-
-def _apply_external_sink_postcondition(
-    payload: dict[str, object],
-    *,
-    sink_result: Mapping[str, object],
-    warning: str,
-    error: str,
-) -> None:
-    postcondition = (
-        sink_result.get("delivery_postcondition")
-        if isinstance(sink_result.get("delivery_postcondition"), Mapping)
-        else {}
-    )
-    if not sink_result.get("enabled") or postcondition.get("satisfied"):
-        return
-    payload.setdefault("warnings", []).append(warning)
-    if postcondition.get("blocks_delivery"):
-        payload["ok"] = False
-        payload["error"] = error
-
-
-def _inline_agent_vision_packet(args: argparse.Namespace) -> dict[str, object] | None:
-    patch = {
-        field: str(value).strip()
-        for attr, field in INLINE_VISION_FIELDS.items()
-        for value in [getattr(args, attr, None)]
-        if str(value or "").strip()
-    }
-    todo_delta = [
-        str(item or "").strip()
-        for item in (getattr(args, "vision_todo_delta", None) or [])
-        if str(item or "").strip()
-    ]
-    state = str(getattr(args, "vision_state", None) or "").strip()
-    if not patch and not todo_delta and not state:
-        return None
-    if not str(getattr(args, "agent_id", None) or "").strip():
-        raise ValueError("inline agent vision requires --agent-id")
-    if not patch:
-        raise ValueError("inline agent vision requires at least one --vision-* patch field")
-    packet: dict[str, object] = {
-        "schema_version": "goal_vision_replan_contract_v0",
-        "vision_patch": patch,
-        "todo_delta": todo_delta,
-    }
-    if state:
-        packet["state"] = state
-    return packet
-
-
-def _inline_progress_observation(
-    args: argparse.Namespace,
-) -> dict[str, object] | None:
-    fields = {
-        "surface_id": getattr(args, "progress_surface_id", None),
-        "hypothesis_id": getattr(args, "progress_hypothesis_id", None),
-        "probe_kind": getattr(args, "progress_probe_kind", None),
-        "result_class": getattr(args, "progress_result_class", None),
-        "blocker_id": getattr(args, "progress_blocker_id", None),
-        "coverage_scope_id": getattr(args, "progress_coverage_scope_id", None),
-        "coverage_complete": getattr(args, "progress_coverage_complete", None),
-    }
-    evidence_ids = list(getattr(args, "progress_evidence_ids", None) or [])
-    if not any(value is not None for value in fields.values()) and not evidence_ids:
-        return None
-    if not fields["result_class"]:
-        raise ValueError("typed progress observation requires --progress-result-class")
-    if fields["result_class"] in {
-        ProgressResultClass.EXPLORATION_EXHAUSTED.value,
-        ProgressResultClass.NO_FOLLOWUP.value,
-    } and not fields["coverage_scope_id"]:
-        raise ValueError(
-            f"--progress-result-class {fields['result_class']} requires "
-            "--progress-coverage-scope-id"
-        )
-    if (
-        fields["result_class"] == ProgressResultClass.EXPLORATION_EXHAUSTED.value
-        and fields["coverage_complete"] is not True
-    ):
-        raise ValueError(
-            "--progress-result-class exploration_exhausted requires "
-            "--progress-coverage-complete"
-        )
-    return {
-        "schema_version": "typed_progress_observation_v0",
-        **{key: value for key, value in fields.items() if value is not None},
-        "evidence_ids": evidence_ids,
-    }
-
-
 def register_project_lifecycle_commands(
     subparsers: argparse._SubParsersAction,
     add_subcommand_format: Callable[[argparse.ArgumentParser], None],
 ) -> None:
-    refresh_state_parser = subparsers.add_parser(
-        "refresh-state",
-        help="Append a read-only run from active goal state after state-only updates.",
-    )
-    add_subcommand_format(refresh_state_parser)
-    refresh_state_parser.add_argument(
-        "--goal-id",
-        required=True,
-        help="Goal id whose active state should be refreshed.",
-    )
-    refresh_state_parser.add_argument("--project", help="Project root. Defaults to the registry goal repo.")
-    refresh_state_parser.add_argument(
-        "--state-file",
-        help="Active goal state path. Defaults to the registry goal state_file.",
-    )
-    refresh_state_parser.add_argument(
-        "--classification",
-        default=DEFAULT_REFRESH_CLASSIFICATION,
-        help=f"Refresh run classification. Defaults to {DEFAULT_REFRESH_CLASSIFICATION}.",
-    )
-    refresh_state_parser.add_argument(
-        "--recommended-action",
-        help=(
-            "Local-control next action. Private project refs are allowed; "
-            f"inline secrets are rejected. Defaults to: {DEFAULT_REFRESH_ACTION}"
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--next-action",
-        help=(
-            "Explicitly update the active state's durable ## Next Action before "
-            "appending the refresh run. Without this flag, --recommended-action "
-            "only describes the run record."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--delivery-batch-scale",
-        choices=DELIVERY_BATCH_SCALE_INPUT_CHOICES,
-        help=(
-            "Optional explicit delivery scale for this refresh run, overriding "
-            "classification-name inference. Accepts canonical scales plus "
-            "single_segment/bounded_segment aliases for single_surface."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--delivery-outcome",
-        choices=DELIVERY_OUTCOME_CHOICES,
-        help="Optional explicit outcome-floor signal for this refresh run.",
-    )
-    refresh_state_parser.add_argument(
-        "--delivery-boundary",
-        choices=("in_flight_continuation", "semantic_closeout"),
-        help=(
-            "Typed semantic boundary for vision checkpointing. Defaults to "
-            "semantic_closeout; in_flight_continuation is valid only for an "
-            "open agent-bound Todo reporting outcome_progress."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--delivery-workspace-path",
-        help=(
-            "Local git worktree that produced this accountable delivery. Use when "
-            "refresh-state must run from a separate registry checkout; the local "
-            "path is validated but is not persisted."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--todo-id",
-        help=(
-            "Selected Todo from the original turn-scoped quota guard. Requires "
-            "--turn-instance-id and an accountable delivery outcome."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--replan-obligation-id",
-        help=(
-            "Autonomous replan obligation from the original turn-scoped quota "
-            "guard. Requires --turn-instance-id and an accountable delivery "
-            "outcome; cannot be combined with --todo-id."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--turn-instance-id",
-        help=(
-            "Stable quota guard turn id for settlement writeback. Reuse the same "
-            "value on retries."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--completion-todo-id",
-        help=argparse.SUPPRESS,
-    )
-    refresh_state_parser.add_argument(
-        "--completion-turn-key",
-        help=argparse.SUPPRESS,
-    )
-    refresh_state_parser.add_argument(
-        "--autonomous-replan-recorded",
-        action="store_true",
-        help=(
-            "Mark this refresh as the explicit autonomous replan ACK. "
-            "Use only after the agent has performed and written back the bounded replan slice."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--progress-result-class",
-        choices=[item.value for item in ProgressResultClass],
-        help=(
-            "Typed result for this bounded work slice. Semantics come only from "
-            "this enum and stable identifiers, never from classification prose."
-        ),
-    )
-    refresh_state_parser.add_argument("--progress-surface-id")
-    refresh_state_parser.add_argument("--progress-hypothesis-id")
-    refresh_state_parser.add_argument("--progress-probe-kind")
-    refresh_state_parser.add_argument("--progress-blocker-id")
-    refresh_state_parser.add_argument("--progress-coverage-scope-id")
-    refresh_state_parser.add_argument(
-        "--progress-evidence-id",
-        dest="progress_evidence_ids",
-        action="append",
-    )
-    refresh_state_parser.add_argument(
-        "--progress-coverage-complete",
-        action="store_true",
-        default=None,
-    )
-    refresh_state_parser.add_argument(
-        "--repair-delta-kind",
-        dest="repair_delta_kinds",
-        choices=REPAIR_DELTA_KIND_CHOICES,
-        action="append",
-        help=(
-            "Machine-visible frontier changed by this repair/replan ACK. Repeat for "
-            "multiple deltas. Without a delta, --autonomous-replan-recorded is stored "
-            "as replan_noop/repair_noop and does not clear the obligation."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--agent-vision-json",
-        help=(
-            "Path to a complete generated goal_vision_replan_contract_v0 update. "
-            "The CLI enforces budgets; any autonomous replan that changes durable "
-            "mainline fields requires goal_path_delta_v0."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--vision-state",
-        help=(
-            "Optional lower snake_case lifecycle state for an inline "
-            "goal_vision_replan_contract_v0 patch. Closure aliases such as "
-            "satisfied and vision_satisfied normalize to vision_closed; "
-            "custom states remain open until explicitly closed."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--vision-summary",
-        help=(
-            "Inline bounded vision_summary for a field-level patch merged into the "
-            "current agent's latest active vision."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--vision-role-scope",
-        help="Inline bounded role_scope for the current agent's vision patch.",
-    )
-    refresh_state_parser.add_argument(
-        "--vision-acceptance",
-        help="Inline bounded acceptance_summary for the current agent's vision patch.",
-    )
-    refresh_state_parser.add_argument(
-        "--vision-advancement-policy",
-        choices=GOAL_VISION_ADVANCEMENT_POLICY_CHOICES,
-        help=(
-            "Whether open acceptance needs advancement only as needed or must "
-            "keep a runnable advancement frontier until the vision closes."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--vision-replan-trigger",
-        help="Inline bounded replan_trigger_summary that quota can project as an acceptance gap.",
-    )
-    refresh_state_parser.add_argument(
-        "--vision-dreaming-policy",
-        help="Inline bounded dreaming_policy for the current agent's vision patch.",
-    )
-    refresh_state_parser.add_argument(
-        "--vision-last-patch",
-        help="Inline bounded last_patch_summary for the current agent's vision patch.",
-    )
-    refresh_state_parser.add_argument(
-        "--vision-todo-delta",
-        action="append",
-        help="Compact todo delta for an inline vision patch. Repeat for multiple deltas.",
-    )
-    refresh_state_parser.add_argument(
-        "--vision-unchanged-reason",
-        help=(
-            "Compact reason why a required vision checkpoint is intentionally unchanged."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--agent-id",
-        help=(
-            "Registered agent id for agent-lane state refreshes. When set, the "
-            "refresh is visible in run history but does not replace goal-level status."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--available-capability",
-        dest="available_capabilities",
-        action="append",
-        help=(
-            "Preserve one observed public-safe runtime capability from the scoped "
-            "quota decision. Repeatable; this context does not grant authority or "
-            "change refresh-state write scope."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--agent-lane",
-        help="Public-safe lane label for --agent-id scoped refreshes, such as productization_frontstage.",
-    )
-    refresh_state_parser.add_argument(
-        "--progress-scope",
-        choices=PROGRESS_SCOPE_CHOICES,
-        help=(
-            "Refresh scope. In multi-agent goals, use agent_lane for per-agent runnable "
-            "status, or goal with any registered peer for durable goal-level status/Next Action."
-        ),
-    )
-    refresh_state_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print the refresh payload without appending.",
-    )
-    refresh_state_parser.add_argument(
-        "--no-global-sync",
-        action="store_true",
-        help="Do not refresh the shared global registry after writing the state run.",
-    )
-    refresh_state_parser.add_argument(
-        "--suppress-external-sinks",
-        action="store_true",
-        help=(
-            "Keep enabled local projections active but suppress configured external "
-            "sink writes for this refresh. Pending sink digests remain retryable."
-        ),
-    )
+    register_refresh_state_command(subparsers, add_subcommand_format)
 
     read_only_map_parser = subparsers.add_parser(
         "read-only-map",
@@ -522,6 +97,14 @@ def register_project_lifecycle_commands(
         help="Exact run generated_at timestamp. Defaults to the latest compact run for the goal.",
     )
     reward_parser.add_argument("--recorded-at", help="Reward timestamp. Defaults to current UTC time.")
+    reward_parser.add_argument(
+        "--actor-kind",
+        choices=OWNER_CONTROLLER_ACTOR_CHOICES,
+        help=(
+            "Explicit non-Agent actor for the durable append. Anonymous dry-run "
+            "remains available when this option is omitted."
+        ),
+    )
     reward_parser.add_argument("--decision", required=True, help="Operator decision label, such as continue_route.")
     reward_parser.add_argument(
         "--reward",
@@ -614,273 +197,24 @@ def handle_project_lifecycle_command(
     print_payload: PrintPayload,
     output_format: OutputFormat,
     append_cli_rollout_event: AppendCliRolloutEvent,
+    post_writeback_hooks: Sequence[PostWritebackHookRegistration] | None = None,
+    post_writeback_projection_builder: PostWritebackProjectionBuilder | None = None,
 ) -> int | None:
     if args.command not in PROJECT_LIFECYCLE_COMMANDS:
         return None
 
     fmt = output_format(args)
-    if args.command == "refresh-state":
-        agent_vision_packet: dict[str, object] | None = None
-        progress_observation: dict[str, object] | None = None
-        merge_agent_vision_patch = False
-        try:
-            inline_agent_vision_packet = _inline_agent_vision_packet(args)
-            if args.agent_vision_json and inline_agent_vision_packet:
-                raise ValueError(
-                    "--agent-vision-json cannot be combined with inline --vision-* fields"
-                )
-            if args.agent_vision_json:
-                agent_vision_packet = json.loads(
-                    Path(args.agent_vision_json).expanduser().read_text(encoding="utf-8")
-                )
-            elif inline_agent_vision_packet:
-                agent_vision_packet = inline_agent_vision_packet
-                merge_agent_vision_patch = True
-            progress_observation = _inline_progress_observation(args)
-        except Exception as exc:
-            payload = {
-                "ok": False,
-                "registry": str(registry_path),
-                "runtime_root": args.runtime_root,
-                "goal_id": args.goal_id,
-                "classification": args.classification,
-                "appended": False,
-                "dry_run": bool(args.dry_run),
-                "error": str(exc),
-            }
-            print_payload(payload, fmt, render_state_refresh_markdown)
-            return 1
-        try:
-            payload = refresh_state_run(
-                registry_path=registry_path,
-                runtime_root_override=args.runtime_root,
-                goal_id=args.goal_id,
-                project=Path(args.project).expanduser() if args.project else None,
-                state_file=Path(args.state_file).expanduser() if args.state_file else None,
-                classification=args.classification,
-                recommended_action=args.recommended_action,
-                next_action=args.next_action,
-                delivery_batch_scale=args.delivery_batch_scale,
-                delivery_outcome=args.delivery_outcome,
-                delivery_boundary=getattr(args, "delivery_boundary", None),
-                delivery_workspace_path=(
-                    Path(args.delivery_workspace_path).expanduser()
-                    if args.delivery_workspace_path
-                    else None
-                ),
-                todo_id=getattr(args, "todo_id", None),
-                turn_instance_id=getattr(args, "turn_instance_id", None),
-                replan_obligation_id=getattr(
-                    args, "replan_obligation_id", None
-                ),
-                completion_todo_id=getattr(args, "completion_todo_id", None),
-                completion_turn_key=getattr(args, "completion_turn_key", None),
-                agent_id=args.agent_id,
-                agent_lane=args.agent_lane,
-                progress_scope=args.progress_scope,
-                autonomous_replan_recorded=bool(args.autonomous_replan_recorded),
-                repair_delta_kinds=args.repair_delta_kinds,
-                agent_vision_packet=agent_vision_packet,
-                merge_agent_vision_patch=merge_agent_vision_patch,
-                vision_unchanged_reason=args.vision_unchanged_reason,
-                progress_observation=progress_observation,
-                dry_run=bool(args.dry_run),
-                sync_global=not bool(args.no_global_sync),
-            )
-        except Exception as exc:
-            payload = {
-                "ok": False,
-                "registry": str(registry_path),
-                "runtime_root": args.runtime_root,
-                "goal_id": args.goal_id,
-                "classification": args.classification,
-                "appended": False,
-                "dry_run": bool(args.dry_run),
-                "error": str(exc),
-            }
-            if isinstance(exc, ReplanWritebackRejected):
-                transition = project_replan_writeback_rejection(
-                    exc,
-                    goal_id=args.goal_id,
-                    agent_id=args.agent_id,
-                )
-                payload["replan_transition"] = transition
-                payload["error"] += " Required transition: " + "; ".join(
-                    transition["next_cli_actions"]
-                )
-        projected_capabilities = runtime_capabilities_for_cli_projection(
-            args.available_capabilities
-        )
-        if projected_capabilities:
-            payload["available_capabilities"] = projected_capabilities
-        payload["external_sink_delivery_authorized"] = not bool(
-            args.suppress_external_sinks
-        )
-        material_refresh_ready = bool(
-            payload.get("ok")
-            and (
-                payload.get("appended")
-                or payload.get("idempotent_replay")
-            )
-            and not payload.get("dry_run")
-        )
-        settlement_receipt_repair = bool(
-            payload.get("ok")
-            and payload.get("receipt_repair_required")
-            and getattr(args, "turn_instance_id", None)
-            and (
-                getattr(args, "todo_id", None)
-                or getattr(args, "replan_obligation_id", None)
-            )
-        )
-        if material_refresh_ready or settlement_receipt_repair:
-            append_cli_rollout_event(
-                payload,
-                registry_path=registry_path,
-                runtime_root_arg=args.runtime_root,
-                event_kind="refresh_state",
-                agent_id=args.agent_id,
-                todo_id=getattr(args, "todo_id", None),
-                run_id=getattr(args, "turn_instance_id", None),
-                status=(
-                    "receipt_repaired"
-                    if settlement_receipt_repair
-                    else "appended"
-                ),
-                summary=(
-                    "refresh-state appended compact control-plane state with "
-                    f"classification={payload.get('classification')}"
-                ),
-                details={
-                    "command": "refresh-state",
-                    "progress_scope": payload.get("progress_scope") or "",
-                    "agent_lane": payload.get("agent_lane") or "",
-                    "autonomous_replan_recorded": bool(
-                        payload.get("autonomous_replan_recorded")
-                    ),
-                    "global_sync_wrote": bool(
-                        isinstance(payload.get("global_sync"), dict)
-                        and payload["global_sync"].get("wrote")
-                    ),
-                    "settlement_effect_id": (
-                        payload.get("settlement_identity", {}).get("effect_id")
-                        if isinstance(payload.get("settlement_identity"), dict)
-                        else None
-                    ),
-                    "replan_obligation_id": getattr(
-                        args, "replan_obligation_id", None
-                    )
-                    or "",
-                },
-                idempotency_fields=(
-                    [
-                        "goal_id",
-                        "event_kind",
-                        "agent_id",
-                        *(
-                            ["todo_id"]
-                            if getattr(args, "todo_id", None)
-                            else []
-                        ),
-                        "run_id",
-                    ]
-                    if getattr(args, "turn_instance_id", None)
-                    else None
-                ),
-            )
-            if getattr(args, "turn_instance_id", None) and (
-                getattr(args, "todo_id", None)
-                or getattr(args, "replan_obligation_id", None)
-            ):
-                runtime_root = resolve_runtime_root(
-                    load_registry(registry_path),
-                    args.runtime_root,
-                )
-                settlement_result = resolve_heartbeat_settlement_identity(
-                    runtime_root,
-                    goal_id=args.goal_id,
-                    agent_id=args.agent_id,
-                    todo_id=getattr(args, "todo_id", None),
-                    turn_instance_id=getattr(args, "turn_instance_id", None),
-                    replan_obligation_id=getattr(
-                        args, "replan_obligation_id", None
-                    ),
-                ).bind(
-                    lambda identity: require_settlement_writeback(
-                        runtime_root,
-                        identity,
-                    )
-                )
-                payload["settlement_result"] = settlement_result_payload(
-                    settlement_result
-                )
-                if settlement_result.failure is not None:
-                    payload["ok"] = False
-                    payload["receipt_repair_required"] = True
-                    payload["error"] = settlement_result.failure.reason
-                elif settlement_receipt_repair:
-                    payload["receipt_repair_required"] = False
-                    payload["receipt_repaired"] = True
-            if not material_refresh_ready:
-                print_payload(payload, fmt, render_state_refresh_markdown)
-                return 0 if payload.get("ok") else 1
-            graph_sync = sync_explore_graph_after_material_refresh(
-                registry_path=registry_path,
-                goal_id=args.goal_id,
-                agent_id=args.agent_id,
-                project=Path(args.project).expanduser() if args.project else None,
-                state_file=Path(args.state_file).expanduser() if args.state_file else None,
-                external_sink_delivery_authorized=not bool(
-                    args.suppress_external_sinks
-                ),
-                syncer=_lark_explore_graph_syncer(
-                    args.runtime_root,
-                    registry_path=registry_path,
-                ),
-            )
-            payload["explore_graph_sync"] = graph_sync
-            _apply_external_sink_postcondition(
-                payload,
-                sink_result=graph_sync,
-                warning=(
-                    "enabled Explore Graph delivery postcondition is unsatisfied; "
-                    "the unchanged sink digest keeps it retryable"
-                ),
-                error=(
-                    "enabled Explore Graph sync/readback failed after the material "
-                    "refresh; retry it before delivery"
-                ),
-            )
-            try:
-                gate_sync = sync_human_gate_after_refresh(
-                    registry_path=registry_path,
-                    runtime_root_override=args.runtime_root,
-                    goal_id=args.goal_id,
-                    agent_id=args.agent_id,
-                    external_sink_delivery_authorized=not bool(
-                        args.suppress_external_sinks
-                    ),
-                )
-            except Exception:
-                gate_sync = goal_channel_gate_sync_failure(
-                    registry_path=registry_path,
-                    goal_id=args.goal_id,
-                )
-            payload["goal_channel_gate_sync"] = gate_sync
-            _apply_external_sink_postcondition(
-                payload,
-                sink_result=gate_sync,
-                warning=(
-                    "enabled Goal Channel human-gate delivery postcondition is "
-                    "unsatisfied; the notification remains retryable"
-                ),
-                error=(
-                    "enabled Goal Channel human-gate notification/readback failed "
-                    "after the refresh; retry it before delivery"
-                ),
-            )
-        print_payload(payload, fmt, render_state_refresh_markdown)
-        return 0 if payload.get("ok") else 1
+    refresh_state_result = handle_refresh_state_command(
+        args,
+        registry_path=registry_path,
+        print_payload=print_payload,
+        output_format=output_format,
+        append_cli_rollout_event=append_cli_rollout_event,
+        post_writeback_hooks=post_writeback_hooks,
+        post_writeback_projection_builder=post_writeback_projection_builder,
+    )
+    if refresh_state_result is not None:
+        return refresh_state_result
 
     if args.command == "read-only-map":
         try:
@@ -905,6 +239,7 @@ def handle_project_lifecycle_command(
                 "appended": False,
                 "dry_run": bool(args.dry_run),
                 "error": str(exc),
+                **({"error_code": exc.code, **getattr(exc, "payload", {})} if isinstance(getattr(exc, "code", None), str) else {}),
             }
         print_payload(payload, fmt, render_read_only_project_map_markdown)
         return 0 if payload.get("ok") else 1
@@ -932,6 +267,7 @@ def handle_project_lifecycle_command(
                 goal_id=args.goal_id,
                 run_generated_at=args.run_generated_at,
                 reward=reward,
+                actor_kind=args.actor_kind,
                 dry_run=bool(args.dry_run),
                 state_file_override=Path(args.state_file).expanduser() if args.state_file else None,
                 write_active_state_summary=bool(args.write_active_state_summary),
@@ -945,6 +281,7 @@ def handle_project_lifecycle_command(
                 "appended": False,
                 "dry_run": bool(args.dry_run),
                 "error": str(exc),
+                **({"error_code": exc.code, **getattr(exc, "payload", {})} if isinstance(getattr(exc, "code", None), str) else {}),
             }
         print_payload(payload, fmt, render_reward_markdown)
         return 0 if payload.get("ok") else 1
@@ -974,6 +311,7 @@ def handle_project_lifecycle_command(
             "appended": False,
             "dry_run": bool(args.dry_run),
             "error": str(exc),
+                **({"error_code": exc.code, **getattr(exc, "payload", {})} if isinstance(getattr(exc, "code", None), str) else {}),
         }
     print_payload(payload, fmt, render_operator_gate_markdown)
     return 0 if payload.get("ok") else 1

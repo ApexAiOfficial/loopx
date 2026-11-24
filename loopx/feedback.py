@@ -1,14 +1,55 @@
 from __future__ import annotations
 
-import json
+from typing import Any, cast
+
+from contextlib import nullcontext
+from importlib import import_module as _import_module
+
+from .file_lock import exclusive_cross_runtime_file_lock
+
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-from .history import load_index, load_registry
+from .control_plane.runtime.time import chronology_key
 from .paths import resolve_runtime_root
+from .public_safe_text import (
+    PRIVATE_TEXT_PATTERNS as SHARED_PRIVATE_TEXT_PATTERNS,
+    TEXT_OWNER_CATEGORIES,
+    classify_private_text,
+)
 from .registry import registry_goals, resolve_state_file
+from .control_plane.actor_identity import normalize_owner_controller_actor
+
+
+_MUTATION_ADAPTERS = {
+    "require_prose_state_write_allowed": "loopx.control_plane.coordination.legacy_writer_fence",
+    "atomic_write_state_text": "loopx.control_plane.runtime.document_io",
+}
+_LAZY_IMPORTS = {
+    **_MUTATION_ADAPTERS,
+    "append_run_index_record": "loopx.history",
+    "load_index": "loopx.history",
+    "load_registry": "loopx.history",
+}
+
+
+def __getattr__(name: str) -> Any:
+    owner = _LAZY_IMPORTS.get(name)
+    if owner is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(_import_module(owner), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_IMPORTS))
+
+
+def _mutation_adapter(name: str) -> Any:
+    # Preserve the released module-level patch points and original objects.
+    return globals()[name] if name in globals() else __getattr__(name)
 
 
 GOAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -36,18 +77,9 @@ LESSON_KINDS = {
     "safety_boundary",
     "operating_rule",
 }
-PRIVATE_TEXT_PATTERNS = (
-    re.compile(r"/" + r"Users/"),
-    re.compile(r"/" + r"ext_data/"),
-    re.compile("la" + "rk" + "office", re.I),
-    re.compile("docs" + r"\." + "internal", re.I),
-    re.compile(r"\bt-20\d{12}-[a-z0-9]+\b"),
-    re.compile(r"\b" + "Bear" + r"er\b", re.I),
-    re.compile(r"\b" + "Author" + r"ization\b", re.I),
-    re.compile(r"\b" + "tok" + r"en\s*=", re.I),
-    re.compile(r"\b" + "pass" + r"word\b", re.I),
-    re.compile(r"\b" + "sec" + r"ret\b", re.I),
-)
+# Owned by loopx.public_safe_text so every real validator owner shares one
+# contract; re-exported here because callers already import this name.
+PRIVATE_TEXT_PATTERNS = SHARED_PRIVATE_TEXT_PATTERNS
 LOCAL_CONTROL_TEXT_PATTERNS = (
     re.compile(r"\b" + "Bear" + r"er\s+[A-Za-z0-9._~+/=-]+\b", re.I),
     re.compile(r"\b" + "Author" + r"ization\s*:", re.I),
@@ -120,14 +152,14 @@ def now_local() -> str:
 
 
 def validate_public_safe_text(label: str, value: str | None) -> None:
-    if not value:
-        return
-    for pattern in PRIVATE_TEXT_PATTERNS:
-        if pattern.search(value):
-            raise ValueError(
-                f"{label} contains a private-looking value; "
-                + public_safe_text_guidance(label)
-            )
+    # The named policy, not a bare pattern sweep: this is LoopX's own state, so a
+    # mention of "Bearer"/"password"/"secret" is a fact about a credential, not
+    # one. Value and assignment shapes stay rejected (Refs #5136, direction 2).
+    if classify_private_text(value, categories=TEXT_OWNER_CATEGORIES) is not None:
+        raise ValueError(
+            f"{label} contains a private-looking value; "
+            + public_safe_text_guidance(label)
+        )
 
 
 def validate_local_control_text(label: str, value: str | None) -> None:
@@ -162,7 +194,7 @@ def compact_reward(
     validate_public_safe_text("decision", decision)
     validate_public_safe_text("reason_summary", reason_summary)
     validate_public_safe_text("follow_up", follow_up)
-    payload = {
+    payload: dict[str, Any] = {
         "recorded_at": recorded_at or now_utc(),
         "decision": decision,
         "reward": reward,
@@ -213,7 +245,13 @@ def select_run(runs: list[dict[str, Any]], run_generated_at: str | None) -> dict
             if str(run.get("generated_at") or "") == run_generated_at:
                 return run
         raise ValueError(f"run not found for generated_at={run_generated_at}")
-    return sorted(runs, key=lambda item: str(item.get("generated_at") or ""), reverse=True)[0]
+    return max(
+        enumerate(runs),
+        key=lambda item: (
+            *chronology_key(item[1].get("generated_at")),
+            item[0],
+        ),
+    )[1]
 
 
 def find_registry_goal(registry: dict[str, Any], goal_id: str) -> dict[str, Any] | None:
@@ -264,7 +302,7 @@ def build_reward_coordination(
     follow_up = reward.get("follow_up")
     if follow_up:
         summary = f"{summary} follow_up：{follow_up}"
-    lesson = reward.get("lesson") if isinstance(reward.get("lesson"), dict) else {}
+    lesson = cast(dict[str, Any], reward.get("lesson")) if isinstance(reward.get("lesson"), dict) else {}
     if lesson:
         summary = (
             f"{summary} lesson[{lesson.get('kind')}]: "
@@ -384,6 +422,13 @@ def plan_active_state_update(
     return update, state_file, updated_text if changed and not dry_run else None
 
 
+class HumanRewardSummaryWriteError(RuntimeError):
+    """The reward overlay committed, but its optional summary did not settle."""
+
+    code = "active_state_summary_write_failed"
+    payload = {"appended": True, "active_state_summary_written": False}
+
+
 def append_human_reward(
     *,
     registry_path: Path,
@@ -391,15 +436,21 @@ def append_human_reward(
     goal_id: str,
     run_generated_at: str | None,
     reward: dict[str, Any],
+    actor_kind: str | None = None,
     dry_run: bool = False,
     state_file_override: Path | None = None,
     write_active_state_summary: bool = False,
 ) -> dict[str, Any]:
+    # Resolve before registry reads or any append. An unavailable adapter must
+    # fail before the reward index can commit; TS still owns the write check.
+    _mutation_adapter("require_prose_state_write_allowed")
+    _mutation_adapter("atomic_write_state_text")
+    actor = normalize_owner_controller_actor(actor_kind, required=not dry_run)
     validate_goal_id(goal_id)
-    registry = load_registry(registry_path)
-    runtime_root = resolve_runtime_root(registry, runtime_root_override)
+    registry = _mutation_adapter("load_registry")(registry_path)
+    runtime_root = resolve_runtime_root(registry, runtime_root_override, registry_path=registry_path)
     index_path = runtime_root / "goals" / goal_id / "runs" / "index.jsonl"
-    runs, raw_count = load_index(index_path)
+    runs, raw_count = _mutation_adapter("load_index")(index_path)
     selected = select_run(runs, run_generated_at)
 
     missing_paths = [
@@ -421,6 +472,8 @@ def append_human_reward(
         for field in HUMAN_REWARD_FIELDS
         if field in reward
     }
+    if actor is not None:
+        index_record["human_reward"]["actor_kind"] = actor.value
 
     selected_run = {
         "generated_at": selected.get("generated_at"),
@@ -436,7 +489,7 @@ def append_human_reward(
         dry_run=dry_run,
     )
     project_agent_visibility = (
-        coordination.get("project_agent_visibility")
+        cast(dict[str, Any], coordination.get("project_agent_visibility"))
         if isinstance(coordination.get("project_agent_visibility"), dict)
         else {}
     )
@@ -452,13 +505,33 @@ def append_human_reward(
     )
 
     if not dry_run:
-        index_path.parent.mkdir(parents=True, exist_ok=True)
-        with index_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(index_record, ensure_ascii=False) + "\n")
-        if state_file_to_write and state_text_to_write is not None:
-            state_file_to_write.write_text(state_text_to_write, encoding="utf-8")
-            active_state_update["written"] = True
-            active_state_update["would_write"] = False
+        state_lock = (
+            exclusive_cross_runtime_file_lock(state_file_to_write, operation="reward_summary")
+            if state_file_to_write is not None else nullcontext()
+        )
+        # Match refresh/history: index first, then the source state lock.
+        from .file_lock import exclusive_run_index_lock
+        with exclusive_run_index_lock(index_path, operation="reward_append"), state_lock:
+            if state_file_to_write is not None:
+                original = state_file_to_write.read_text(encoding="utf-8")
+                planned, changed = insert_progress_ledger_entry(
+                    original, str(active_state_update["entry"]),
+                    updated_at=str(reward.get("recorded_at") or now_local()),
+                )
+                _mutation_adapter("require_prose_state_write_allowed")(
+                    registry_path=registry_path, runtime_root=runtime_root, goal_id=goal_id,
+                    state_path=state_file_to_write, original_text=original, planned_text=planned,
+                )
+                state_text_to_write = planned if changed else None
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            _mutation_adapter("append_run_index_record")(index_path, index_record)
+            if state_file_to_write and state_text_to_write is not None:
+                try:
+                    _mutation_adapter("atomic_write_state_text")(state_file_to_write, state_text_to_write)
+                except OSError as error:
+                    raise HumanRewardSummaryWriteError(str(error)) from error
+                active_state_update["written"] = True
+                active_state_update["would_write"] = False
 
     return {
         "ok": True,
@@ -470,6 +543,7 @@ def append_human_reward(
         "dry_run": dry_run,
         "selected_run": selected_run,
         "human_reward": index_record["human_reward"],
+        "actor_kind": actor.value if actor is not None else None,
         **coordination,
         "active_state_update": active_state_update,
         "index_record": index_record,
@@ -513,10 +587,10 @@ def render_reward_markdown(payload: dict[str, Any]) -> str:
         lines.append(f"- error: {payload.get('error')}")
         return "\n".join(lines)
 
-    selected = payload.get("selected_run") if isinstance(payload.get("selected_run"), dict) else {}
-    reward = payload.get("human_reward") if isinstance(payload.get("human_reward"), dict) else {}
-    state_update = payload.get("active_state_update") if isinstance(payload.get("active_state_update"), dict) else {}
-    visibility = payload.get("project_agent_visibility") if isinstance(payload.get("project_agent_visibility"), dict) else {}
+    selected = cast(dict[str, Any], payload.get("selected_run")) if isinstance(payload.get("selected_run"), dict) else {}
+    reward = cast(dict[str, Any], payload.get("human_reward")) if isinstance(payload.get("human_reward"), dict) else {}
+    state_update = cast(dict[str, Any], payload.get("active_state_update")) if isinstance(payload.get("active_state_update"), dict) else {}
+    visibility = cast(dict[str, Any], payload.get("project_agent_visibility")) if isinstance(payload.get("project_agent_visibility"), dict) else {}
     lines.extend(
         [
             "",
@@ -538,6 +612,7 @@ def render_reward_markdown(payload: dict[str, Any]) -> str:
             "",
             "## Reward",
             f"- recorded_at: `{reward.get('recorded_at')}`",
+            f"- actor_kind: `{reward.get('actor_kind')}`",
             f"- decision: `{reward.get('decision')}`",
             f"- reward: `{reward.get('reward')}`",
             f"- reason_summary: {reward.get('reason_summary')}",
@@ -545,12 +620,12 @@ def render_reward_markdown(payload: dict[str, Any]) -> str:
     )
     if reward.get("follow_up"):
         lines.append(f"- follow_up: {reward.get('follow_up')}")
-    lesson = reward.get("lesson") if isinstance(reward.get("lesson"), dict) else {}
+    lesson = cast(dict[str, Any], reward.get("lesson")) if isinstance(reward.get("lesson"), dict) else {}
     if lesson:
         lines.append(f"- lesson_kind: `{lesson.get('kind')}`")
         lines.append(f"- lesson_summary: {lesson.get('summary')}")
         for field in ("avoid", "prefer"):
-            values = lesson.get(field) if isinstance(lesson.get(field), list) else []
+            values = cast(list[Any], lesson.get(field)) if isinstance(lesson.get(field), list) else []
             if values:
                 lines.append(f"- lesson_{field}: {', '.join(str(value) for value in values[:5])}")
     if payload.get("active_state_summary"):
@@ -579,3 +654,7 @@ def render_reward_markdown(payload: dict[str, Any]) -> str:
             ]
         )
     return "\n".join(lines)
+
+
+# Keep the historical star-import surface, including the deferred adapters.
+__all__ = [name for name in globals() if not name.startswith("_")] + list(_LAZY_IMPORTS)

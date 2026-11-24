@@ -1,0 +1,713 @@
+"""Public evidence must not acquire account, local-network or file authority."""
+import asyncio
+import io
+import ipaddress
+import json
+import socket
+import ssl
+import threading
+import time
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
+from loopx.extensions import public_source_reader as reader
+from loopx.capabilities.native_chat import codex_context
+
+
+@pytest.fixture
+def github_diff_transport(monkeypatch):
+    state = {"clock": 100.0, "attempts": [], "closed": [], "dns": [], "cost": 1.0,
+             "failure": TimeoutError("TCP stalled"), "private_host": None, "fail_canonical": False}
+    monkeypatch.setattr(reader.time, "monotonic", lambda: state["clock"])
+    def resolve(host, *args, **kwargs):
+        state["dns"].append(host)
+        addresses = ["8.8.8.8", "1.1.1.1"] if host == "github.com" else ["9.9.9.9"]
+        if host == state["private_host"]:
+            addresses.append("127.0.0.1")
+        return [(0, 0, 0, "", (address, 443)) for address in addresses]
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    class Sock:
+        def settimeout(self, value): pass
+        def makefile(self, *args):
+            return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                             b"Content-Length: 8\r\nConnection: close\r\n\r\ncomplete")
+    class Connection:
+        def __init__(self, host, address, timeout):
+            self.host, self.address, self.timeout = host, address, timeout
+            self.sock = Sock()
+        def request(self, method, path, *, headers):
+            state["attempts"].append((self.host, self.address, path, self.timeout, headers))
+            if self.host != "patch-diff.githubusercontent.com" or state["fail_canonical"]:
+                state["clock"] += min(self.timeout, state["cost"])
+                raise state["failure"]
+        def getresponse(self):
+            response = reader.http.client.HTTPResponse(self.sock)
+            response.begin()
+            self.sock = None
+            return response
+        def close(self): state["closed"].append(self.address)
+    monkeypatch.setattr(reader, "_PinnedHTTPS", Connection)
+    return state
+
+
+def test_github_diff_transport_failure_recovers_canonical_source_in_same_budget(github_diff_transport):
+    state = github_diff_transport
+    original = "https://github.com/example/project/pull/42.diff"
+    result = reader.article(original, deadline=110.0)
+    assert result["requested_url"] == original
+    assert result["observed_url"] == "https://patch-diff.githubusercontent.com/raw/example/project/pull/42.diff"
+    assert result["text"] == "complete" and result["truncated"] is False
+    assert state["dns"] == ["github.com", "patch-diff.githubusercontent.com"]
+    assert [(host, address, path) for host, address, path, _, _ in state["attempts"]] == [
+        ("github.com", "8.8.8.8", "/example/project/pull/42.diff"),
+        ("github.com", "1.1.1.1", "/example/project/pull/42.diff"),
+        ("patch-diff.githubusercontent.com", "9.9.9.9", "/raw/example/project/pull/42.diff")]
+    assert [budget for _, _, _, budget, _ in state["attempts"]] == [5.0, 9.0, 8.0]
+    assert state["closed"] == ["8.8.8.8", "1.1.1.1", "9.9.9.9"]
+    assert all(set(headers) == {"Accept-Encoding", "User-Agent"}
+               for _, _, _, _, headers in state["attempts"])
+
+
+def test_github_diff_recovery_honors_exact_source_scope_before_dns(github_diff_transport):
+    state = github_diff_transport
+    original = "https://github.com/example/project/pull/42.diff"
+    with pytest.raises(ValueError, match="public source URL not authorized"):
+        reader.fetch(original, deadline=110.0, allowed_urls={original})
+    assert state["dns"] == ["github.com"]
+    assert [attempt[0] for attempt in state["attempts"]] == ["github.com", "github.com"]
+    assert len(state["closed"]) == 2
+
+
+def test_public_url_scope_rejects_initial_destination_before_dns(monkeypatch):
+    def resolve(host):
+        pytest.fail(f"unapproved destination resolved: {host}")
+
+    monkeypatch.setattr(reader, "public_addresses", resolve)
+    with pytest.raises(ValueError, match="public source URL not authorized"):
+        reader.fetch("https://source.example/unlisted.png", deadline=time.monotonic() + 10,
+                     allowed_urls={"https://source.example/listed.png"})
+
+
+@pytest.mark.parametrize("host", ["github.com", "patch-diff.githubusercontent.com"])
+def test_github_diff_recovery_rejects_mixed_dns_before_connection(github_diff_transport, host):
+    state = github_diff_transport
+    state["private_host"] = host
+    with pytest.raises(ValueError, match="non-public source address"):
+        reader.fetch("https://github.com/example/project/pull/42.diff", deadline=110.0)
+    assert all(attempt[0] != host for attempt in state["attempts"])
+
+
+@pytest.mark.parametrize("failure", [ssl.SSLCertVerificationError("untrusted certificate"),
+                                    ValueError("public source unavailable")])
+def test_github_diff_recovery_does_not_bypass_policy_rejection(github_diff_transport, failure):
+    state = github_diff_transport
+    state["failure"] = failure
+    with pytest.raises(type(failure)):
+        reader.fetch("https://github.com/example/project/pull/42.diff", deadline=110.0)
+    assert state["dns"] == ["github.com"] and len(state["attempts"]) == 1
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/example/project/pull/42.diff?private=1",
+    "https://github.com/example/project/pull/42.patch",
+    "https://github.com/example/project/blob/main/file.diff",
+    "https://github.com/example/project/pull/42.diff/extra",
+    "https://github.com/example/project/pull/42%2ediff",
+    "https://github.com.evil.example/example/project/pull/42.diff",
+    "https://github.com/example/../pull/42.diff"])
+def test_github_diff_recovery_is_limited_to_exact_public_diff_paths(github_diff_transport, url):
+    state = github_diff_transport
+    with pytest.raises(TimeoutError):
+        reader.fetch(url, deadline=110.0)
+    assert "patch-diff.githubusercontent.com" not in state["dns"]
+
+
+def test_github_diff_recovery_cannot_extend_exhausted_deadline(github_diff_transport):
+    state = github_diff_transport
+    state["cost"] = 10.0
+    with pytest.raises(TimeoutError):
+        reader.fetch("https://github.com/example/project/pull/42.diff", deadline=110.0)
+    assert state["clock"] == 110.0 and state["dns"] == ["github.com"]
+
+
+def test_github_diff_canonical_failure_does_not_loop(github_diff_transport):
+    state = github_diff_transport
+    state["fail_canonical"] = True
+    with pytest.raises(TimeoutError):
+        reader.fetch("https://github.com/example/project/pull/42.diff", deadline=110.0)
+    assert state["dns"] == ["github.com", "patch-diff.githubusercontent.com"]
+    assert len(state["attempts"]) == len(state["closed"]) == 3
+
+
+def test_github_diff_recovery_consumes_existing_redirect_hop_limit(monkeypatch):
+    attempts = []
+    monkeypatch.setattr(reader, "public_addresses", lambda host: ["8.8.8.8"])
+    class Response:
+        status = 302
+        def getheader(self, name):
+            return ("/example/project/pull/42.diff" if len(attempts) == 5
+                    else f"/hop{len(attempts)}")
+        def close(self): pass
+    class Connection:
+        sock = None
+        def __init__(self, host, address, timeout): self.host = host
+        def request(self, method, path, **kwargs):
+            attempts.append((self.host, path))
+            if path.endswith(".diff"):
+                raise TimeoutError("TCP stalled")
+        def getresponse(self): return Response()
+        def close(self): pass
+    monkeypatch.setattr(reader, "_PinnedHTTPS", Connection)
+    with pytest.raises(ValueError, match="too many source redirects"):
+        reader.fetch("https://github.com/start", deadline=time.monotonic() + 10)
+    assert len(attempts) == 6 and attempts[-1] == ("github.com", "/example/project/pull/42.diff")
+
+
+@pytest.mark.parametrize("framing", ["headers", "chunk"])
+def test_trickled_framing_cannot_consume_the_next_address_budget(monkeypatch, framing):
+    attempts, peers, servers = [], [], []
+    monkeypatch.setattr(reader, "public_addresses", lambda host: ["8.8.8.8", "1.1.1.1"])
+    class Connection:
+        def __init__(self, host, address, timeout):
+            attempts.append(address)
+            self.sock, peer = socket.socketpair()
+            self.transport = self.sock
+            self.sock.settimeout(timeout)
+            peers.append(peer)
+            def serve():
+                try:
+                    with peer:
+                        peer.sendall(b"HTTP/1.1 200 OK\r\n")
+                        if address == "8.8.8.8":
+                            if framing == "chunk":
+                                peer.sendall(b"Content-Type: text/plain\r\nTransfer-Encoding: chunked\r\n"
+                                             b"Connection: close\r\n\r\n8;progress=")
+                            for _ in range(18):
+                                time.sleep(.1)
+                                peer.sendall(b"X-Progress: tick\r\n" if framing == "headers" else b"x")
+                            if framing == "chunk":
+                                peer.sendall(b"\r\ncomplete\r\n0\r\n\r\n")
+                                return
+                        peer.sendall(b"Content-Type: text/plain\r\nContent-Length: 8\r\n"
+                                     b"Connection: close\r\n\r\ncomplete")
+                except OSError:
+                    pass  # The timed-out address is deliberately interrupted.
+            server = threading.Thread(target=serve)
+            servers.append(server)
+            server.start()
+        def request(self, *args, **kwargs): pass
+        def getresponse(self):
+            response = reader.http.client.HTTPResponse(self.sock)
+            try:
+                response.begin()
+            except Exception:
+                response.close()
+                raise
+            self.sock = None  # Exercise the detached Connection: close body too.
+            return response
+        def close(self): self.transport.close()
+    monkeypatch.setattr(reader, "_PinnedHTTPS", Connection)
+    started = time.monotonic()
+    try:
+        assert reader.fetch("https://example.org/source", deadline=started + 1) == (
+            "https://example.org/source", "text/plain", b"complete")
+        assert attempts == ["8.8.8.8", "1.1.1.1"]
+        assert time.monotonic() - started < .9
+    finally:
+        for peer in peers:
+            peer.close()
+        for server in servers:
+            server.join(2)
+
+
+@pytest.mark.parametrize("failure", ["headers", "body", "incomplete"])
+def test_failed_response_retries_checked_address_without_partial_content(monkeypatch, failure):
+    addresses = ["8.8.8.8", "1.1.1.1"]
+    resolutions, connections = [], []
+    def resolve(host):
+        resolutions.append(host)
+        return addresses
+    monkeypatch.setattr(reader, "public_addresses", resolve)
+    class Sock:
+        def settimeout(self, value): pass
+        def makefile(self, *args):
+            return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                             b"Content-Length: 8\r\nConnection: close\r\n\r\ncomplete")
+    class Connection:
+        def __init__(self, host, address, timeout):
+            # Also reproduces the previous connection's first-address choice.
+            self.address = address[0] if isinstance(address, list) else address
+            self.sock = Sock()
+            self.closed = False
+            connections.append(self)
+        def request(self, *args, **kwargs): pass
+        def getresponse(self):
+            if self.address == addresses[0] and failure == "headers":
+                raise TimeoutError("response headers stalled")
+            response = reader.http.client.HTTPResponse(self.sock)
+            response.begin()
+            self.sock = None  # HTTPConnection detaches Connection: close responses.
+            if self.address == addresses[0]:
+                if failure == "body":
+                    chunks = iter([b"part"])
+                    def stalled(*args):
+                        chunk = next(chunks, None)
+                        if chunk is None:
+                            raise TimeoutError("body stalled after partial response")
+                        return chunk
+                    response.read1 = stalled
+                else:
+                    response.fp = io.BytesIO(b"short")
+            return response
+        def close(self): self.closed = True
+    monkeypatch.setattr(reader, "_PinnedHTTPS", Connection)
+    assert reader.fetch("https://example.org/source", deadline=time.monotonic() + 10) == (
+        "https://example.org/source", "text/plain", b"complete")
+    assert resolutions == ["example.org"]
+    assert [c.address for c in connections] == addresses
+    assert all(c.closed for c in connections)
+
+
+def test_address_attempts_share_deadline_and_reserve_time_for_remaining_addresses(monkeypatch):
+    clock = [100.0]
+    attempts = []
+    monkeypatch.setattr(reader.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(reader, "public_addresses", lambda host: ["8.8.8.8", "1.1.1.1"])
+    class Connection:
+        def __init__(self, host, address, timeout):
+            attempts.append(timeout)
+        def request(self, *args, **kwargs):
+            clock[0] += attempts[-1]
+            raise TimeoutError("attempt exhausted its budget")
+        def close(self): pass
+    monkeypatch.setattr(reader, "_PinnedHTTPS", Connection)
+    with pytest.raises(TimeoutError):
+        reader.fetch("https://example.org/", deadline=110.0)
+    assert attempts == [5.0, 5.0] and clock[0] == 110.0
+
+
+@pytest.mark.parametrize("failure", [ssl.SSLCertVerificationError("untrusted certificate"),
+                                    ValueError("public source unavailable")])
+def test_address_recovery_does_not_retry_security_or_http_policy_rejection(monkeypatch, failure):
+    attempts, closed = [], []
+    monkeypatch.setattr(reader, "public_addresses", lambda host: ["8.8.8.8", "1.1.1.1"])
+    class Connection:
+        def __init__(self, host, address, timeout): attempts.append(address)
+        def request(self, *args, **kwargs): raise failure
+        def close(self): closed.append(True)
+    monkeypatch.setattr(reader, "_PinnedHTTPS", Connection)
+    with pytest.raises(type(failure)):
+        reader.fetch("https://example.org/", deadline=time.monotonic() + 10)
+    assert len(attempts) == len(closed) == 1
+
+
+# Synthetic RFC1918 range fixtures are expressed as integers; these are not operator addresses.
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "http://example.org/", "https://user:pass@example.org/",
+    "https://127.0.0.1/", "https://[::1]/", "https://169.254.169.254/",
+    f"https://{ipaddress.IPv4Address(0x0A000001)}/",
+    "https://example.org:8443/", "https://example.org/\nheader", "https://example.org\\@127.0.0.1/",
+    "https://224.0.0.1/", "https://[2002:7f00:1::]/"])
+def test_nonpublic_or_authenticated_urls_rejected_before_network(monkeypatch, url):
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: pytest.fail("DNS must not be called"))
+    with pytest.raises(ValueError):
+        reader.public_url(url)
+
+
+@pytest.mark.parametrize("values", [["127.0.0.1"], ["8.8.8.8", str(ipaddress.IPv4Address(0xC0A80102))], ["::ffff:127.0.0.1"], ["100.64.0.1"]])
+def test_dns_private_and_mixed_results_rejected(monkeypatch, values):
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(0, 0, 0, "", (v, 443)) for v in values])
+    with pytest.raises(ValueError):
+        reader.public_addresses("public-name.example")
+
+
+def test_checked_address_is_the_connected_address_and_tls_hostname_stays_original(monkeypatch):
+    class Raw:
+        def settimeout(self, value): assert 0 < value <= 2
+    raw = Raw()
+    observed = []
+    monkeypatch.setattr(socket, "create_connection", lambda target, timeout: observed.append(target) or raw)
+    connection = reader._PinnedHTTPS("example.org", "8.8.8.8", 2)
+    class TLS:
+        def wrap_socket(self, sock, *, server_hostname):
+            assert sock is raw and server_hostname == "example.org"
+            return raw
+    connection._context = TLS()
+    connection.connect()
+    assert observed == [("8.8.8.8", 443)] and connection.sock is raw
+
+
+def test_connect_time_consumes_tls_budget_and_expired_socket_is_closed(monkeypatch):
+    clock, timeouts, closed = [100.0], [], []
+    monkeypatch.setattr(reader.time, "monotonic", lambda: clock[0])
+    class Raw:
+        def settimeout(self, value): timeouts.append(value)
+        def close(self): closed.append(True)
+    def connect(target, timeout):
+        assert target == ("8.8.8.8", 443) and timeout == 2.0
+        clock[0] += 2.0
+        return Raw()
+    monkeypatch.setattr(socket, "create_connection", connect)
+    connection = reader._PinnedHTTPS("example.org", "8.8.8.8", 2.0)
+    class TLS:
+        def wrap_socket(self, *args, **kwargs): pytest.fail("expired attempt must not start TLS")
+    connection._context = TLS()
+    with pytest.raises(TimeoutError):
+        connection.connect()
+    assert timeouts == [] and closed == [True]
+
+
+@pytest.mark.parametrize("status", [200, 403])
+def test_public_redirect_rechecks_destination_and_http_rejection_stops(monkeypatch, status):
+    resolutions, requests, closed = [], [], []
+    def resolve(host):
+        resolutions.append(host)
+        return ["8.8.8.8", "1.1.1.1"]
+    monkeypatch.setattr(reader, "public_addresses", resolve)
+    class Response:
+        length = 0
+        def __init__(self, host):
+            self.status = 302 if host == "example.org" else status
+        def getheader(self, name, default=None):
+            return {"Location": "https://other.example/final", "Content-Type": "text/plain"}.get(name, default)
+        def isclosed(self): return True
+        def close(self): closed.append("response")
+    class Connection:
+        sock = None
+        def __init__(self, host, address, timeout): self.host = host
+        def request(self, method, path, *, headers): requests.append((self.host, path, headers))
+        def getresponse(self): return Response(self.host)
+        def close(self): closed.append("connection")
+    monkeypatch.setattr(reader, "_PinnedHTTPS", Connection)
+    if status == 200:
+        assert reader.fetch("https://example.org/start", deadline=time.monotonic() + 10) == (
+            "https://other.example/final", "text/plain", b"")
+    else:
+        with pytest.raises(ValueError, match="public source unavailable"):
+            reader.fetch("https://example.org/start", deadline=time.monotonic() + 10)
+    assert resolutions == ["example.org", "other.example"]
+    assert [(host, path) for host, path, _ in requests] == [
+        ("example.org", "/start"), ("other.example", "/final")]
+    assert all(set(headers) == {"Accept-Encoding", "User-Agent"} for _, _, headers in requests)
+    assert closed == ["response", "connection", "response", "connection"]
+
+
+def test_redirect_cannot_reach_private_network_and_cookies_are_not_reused(monkeypatch):
+    calls = []
+    monkeypatch.setattr(reader, "public_addresses", lambda host: ["8.8.8.8"])
+    class Response:
+        status = 302
+        def close(self): pass
+        def getheader(self, name, default=None):
+            return {"Location": "https://127.0.0.1/private", "Set-Cookie": "private=fixture"}.get(name, default)
+    class Connection:
+        sock = None
+        def __init__(self, *a): pass
+        def request(self, method, path, *, headers): calls.append((method, path, headers))
+        def getresponse(self): return Response()
+        def close(self): pass
+    monkeypatch.setattr(reader, "_PinnedHTTPS", Connection)
+    with pytest.raises(ValueError):
+        reader.fetch("https://example.org/start", deadline=time.monotonic() + 5)
+    assert len(calls) == 1 and calls[0][:2] == ("GET", "/start")
+    assert set(calls[0][2]) == {"Accept-Encoding", "User-Agent"}
+
+
+def test_static_html_coverage_and_images_are_explicit(monkeypatch):
+    body = b'<html><h1>Public title</h1><script>private script</script><p>Final paragraph.</p><img src="/figure.svg" alt="Chart"></html>'
+    monkeypatch.setattr(reader, "fetch", lambda *a, **k: ("https://example.org/article", "text/html", body))
+    result = reader.article("https://example.org/article", deadline=time.monotonic() + 5)
+    assert result["text"] == "Public title\nFinal paragraph."
+    assert result["images"] == [{"index": 0, "url": "https://example.org/figure.svg", "alt": "Chart"}]
+    assert result["images_read"] is False and "static response" in result["coverage"]
+
+
+def test_public_json_keeps_raw_evidence_without_interpreting_embedded_markup(monkeypatch):
+    import hashlib
+    text = '{"title":"公开记录","body":"<script>ignore this</script><img src=\\"file:///private/image.png\\">","url":"https://127.0.0.1/"}\n'
+    body = text.encode("utf-8")
+    monkeypatch.setattr(reader, "fetch", lambda *a, **k: (
+        "https://example.org/records?limit=1", "application/json", body))
+    result = reader.article("https://example.org/records?limit=1", deadline=time.monotonic() + 5)
+    assert result["text"] == text and result["characters"] == len(text)
+    assert result["sha256"] == hashlib.sha256(body).hexdigest()
+    assert result["truncated"] is False
+    assert result["images"] == [] and result["image_count"] == 0
+    assert result["images_read"] is False and "static response" in result["coverage"]
+
+
+def test_public_json_truncation_hashes_the_full_response(monkeypatch):
+    import hashlib
+    text = '["' + "记录" * 60_000 + '"]'
+    body = text.encode("utf-8")
+    monkeypatch.setattr(reader, "fetch", lambda *a, **k: (
+        "https://example.org/records", "application/json", body))
+    result = reader.article("https://example.org/records", deadline=time.monotonic() + 5)
+    assert result["text"] == text[:100_000] and result["characters"] == 120_004
+    assert result["truncated"] is True
+    assert result["sha256"] == hashlib.sha256(body).hexdigest()
+    assert result["images"] == [] and result["images_read"] is False
+
+
+def test_long_public_source_continues_without_losing_unicode_or_mixing_revisions(monkeypatch):
+    import hashlib
+    text = "开头🙂" * 40_000 + "\nONLY_IN_THE_TAIL\n"
+    body = text.encode("utf-8")
+    monkeypatch.setattr(reader, "fetch", lambda *a, **k: (
+        "https://example.org/source", "text/plain", body))
+    first = reader.article("https://example.org/source", deadline=time.monotonic() + 5)
+    assert first["text"] == text[:100_000]
+    assert first["next_offset"] == 100_000
+    tail = reader.article("https://example.org/source", deadline=time.monotonic() + 5,
+                          offset=first["next_offset"], expected_sha256=first["sha256"])
+    assert first["text"] + tail["text"] == text
+    assert tail["text_start"] == 100_000 and tail["text_end"] == len(text)
+    assert tail["next_offset"] is None and tail["truncated"] is True
+    assert tail["characters"] == len(text)
+    assert first["sha256"] == tail["sha256"] == hashlib.sha256(body).hexdigest()
+    assert tail["images_read"] is False
+
+
+@pytest.mark.parametrize("offset,digest", [
+    (-1, None), (True, None), ("1", None), (None, None),
+    (4_000_001, "a" * 64), (1, None), (1, ""), (1, "not-a-digest"),
+    (1, "A" * 64), (0, False), (0, "a" * 63),
+])
+def test_invalid_public_text_page_never_starts_observation(monkeypatch, offset, digest):
+    def forbidden(*a, **k):
+        pytest.fail("invalid page must be rejected before network or worker IO")
+    monkeypatch.setattr(reader, "_observation", forbidden)
+    result = reader.read_public_url("https://example.org/source", offset=offset, expected_sha256=digest)
+    assert result == {"ok": False, "error": "public_source_unavailable_or_rejected"}
+
+
+@pytest.fixture
+def public_source_mcp(monkeypatch):
+    from mcp.server.fastmcp import FastMCP
+    servers = []
+    monkeypatch.setattr(FastMCP, "run", lambda server: servers.append(server))
+    reader.main()  # Exercise the production registration, not a separate test server.
+    assert len(servers) == 1
+    return servers[0]
+
+
+@pytest.mark.parametrize("tool,arguments,error", [
+    *(("read_public_url", {"offset": offset, "expected_sha256": "a" * 64},
+        "public_source_unavailable_or_rejected")
+       for offset in (False, True, "1", 1.0, None, -1, reader.MAX_BYTES + 1)),
+    *(("read_public_url", {"expected_sha256": digest}, "public_source_unavailable_or_rejected")
+       for digest in ("null", "false", "[]", False, "a" * 63, "A" * 64)),
+    ("read_public_url", {"offset": 1}, "public_source_unavailable_or_rejected"),
+    *(("read_public_image", {"index": index}, "public_image_unavailable_or_rejected")
+       for index in (False, True, "0", 0.0, None, -1, reader.MAX_IMAGES)),
+])
+def test_mcp_rejects_raw_invalid_parameters_before_sdk_coercion(
+        public_source_mcp, monkeypatch, tool, arguments, error):
+    from mcp.shared.memory import create_connected_server_and_client_session
+    calls = []
+    monkeypatch.setattr(reader, "_observation", lambda *a, **k: calls.append((a, k)) or {
+        "ok": True, "metadata": {"ok": True}, "pixels": "cGl4ZWxz"})
+
+    async def request():
+        async with create_connected_server_and_client_session(public_source_mcp) as client:
+            return await client.call_tool(tool, {"url": "https://example.org/source", **arguments})
+    result = asyncio.run(request())
+    assert calls == []  # A sanitized error after IO would not protect this boundary.
+    assert len(result.content) == 1 and result.content[0].type == "text"
+    assert json.loads(result.content[0].text) == {"ok": False, "error": error}
+
+
+def test_mcp_valid_pages_images_and_private_url_rejection(public_source_mcp, monkeypatch):
+    import base64
+    import hashlib
+    from mcp.shared.memory import create_connected_server_and_client_session
+    body = ("公共🙂" * 40_000).encode()
+    png = io.BytesIO()
+    Image.new("RGB", (2, 1), "red").save(png, format="PNG")
+    pixels = png.getvalue()
+    calls = []
+    monkeypatch.setattr(reader, "fetch", lambda *a, **k: (
+        "https://example.org/source", "text/plain", body))
+    def observe(kind, url, index=None, **kwargs):
+        calls.append((kind, index, kwargs))
+        if kind == "text":
+            return reader.article(url, deadline=time.monotonic() + 5, **kwargs)
+        return {"metadata": {"ok": True, "index": index, "sha256": hashlib.sha256(pixels).hexdigest()},
+                "pixels": base64.b64encode(pixels).decode()}
+    monkeypatch.setattr(reader, "_observation", observe)
+
+    async def request():
+        async with create_connected_server_and_client_session(public_source_mcp) as client:
+            tools = {t.name: t.inputSchema for t in (await client.list_tools()).tools}
+            assert set(tools) == {"read_public_url", "read_public_image"}
+            assert tools["read_public_url"]["properties"]["offset"]["type"] == "integer"
+            assert tools["read_public_image"]["properties"]["index"]["type"] == "integer"
+            first = (await client.call_tool("read_public_url", {"url": "https://example.org/source"})).structuredContent
+            explicit_initial = await client.call_tool("read_public_url", {
+                "url": "https://example.org/source", "offset": 0, "expected_sha256": None})
+            assert explicit_initial.structuredContent == first
+            tail = (await client.call_tool("read_public_url", {"url": "https://example.org/source",
+                "offset": first["next_offset"], "expected_sha256": first["sha256"]})).structuredContent
+            assert first["text"] + tail["text"] == body.decode()
+            assert tail["next_offset"] is None and tail["sha256"] == first["sha256"]
+            changed = await client.call_tool("read_public_url", {"url": "https://example.org/source",
+                "offset": 1, "expected_sha256": "b" * 64})
+            assert changed.structuredContent == {"ok": False, "error": "public_source_changed"}
+            image = await client.call_tool("read_public_image", {"url": "https://example.org/source", "index": 0})
+            assert json.loads(image.content[0].text)["index"] == 0
+            assert image.content[1].type == "image" and base64.b64decode(image.content[1].data) == pixels
+            before = len(calls)
+            for tool, extra, error in (("read_public_url", {}, "public_source_unavailable_or_rejected"),
+                    ("read_public_image", {"index": 0}, "public_image_unavailable_or_rejected")):
+                rejected = await client.call_tool(tool, {"url": "https://127.0.0.1/private", **extra})
+                assert json.loads(rejected.content[0].text) == {"ok": False, "error": error}
+            assert len(calls) == before
+    asyncio.run(request())
+
+
+def test_public_text_page_rejects_changed_source_and_out_of_range(monkeypatch):
+    import hashlib
+    original = b"a" * 100_000 + b"original tail"
+    changed = b"a" * 100_000 + b"changed tail"
+    monkeypatch.setattr(reader, "fetch", lambda *a, **k: (
+        "https://example.org/source", "text/plain", changed))
+    result = reader.article("https://example.org/source", deadline=time.monotonic() + 5,
+                            offset=100_000, expected_sha256=hashlib.sha256(original).hexdigest())
+    assert result == {"ok": False, "error": "public_source_changed"}
+    with pytest.raises(ValueError, match="offset"):
+        reader.article("https://example.org/source", deadline=time.monotonic() + 5,
+                       offset=len(changed) + 1, expected_sha256=hashlib.sha256(changed).hexdigest())
+
+
+def test_public_text_page_keeps_html_image_inventory_without_reading_pixels(monkeypatch):
+    body = ("<p>" + "public " * 20_000 + '</p><img src="/figure.png" alt="chart">').encode()
+    monkeypatch.setattr(reader, "fetch", lambda *a, **k: (
+        "https://example.org/article", "text/html", body))
+    first = reader.article("https://example.org/article", deadline=time.monotonic() + 5)
+    tail = reader.article("https://example.org/article", deadline=time.monotonic() + 5,
+                          offset=first["next_offset"], expected_sha256=first["sha256"])
+    assert first["text"] + tail["text"] == "public " * 19_999 + "public"
+    assert tail["images"] == first["images"] == [{"index": 0, "url": "https://example.org/figure.png", "alt": "chart"}]
+    assert tail["images_read"] is False
+
+
+@pytest.mark.parametrize("mime", ["application/octet-stream", "image/png", "application/javascript", "application/jsonp"])
+def test_json_support_does_not_admit_other_response_types(monkeypatch, mime):
+    monkeypatch.setattr(reader, "fetch", lambda *a, **k: (
+        "https://example.org/records", mime, b'{"body":"public"}'))
+    with pytest.raises(ValueError, match="unsupported public text format"):
+        reader.article("https://example.org/records", deadline=time.monotonic() + 5)
+
+
+@pytest.mark.parametrize("element", [
+    '<image href="file:///etc/passwd"/>', '<use href="https://example.org/a.svg#shape"/>',
+    '<rect fill="url(file:///private/secret)"/>', '<style>@import "https://example.org/private";</style>',
+    '<rect style="fill:u\\72l(file:///private/secret)"/>', '<foreignObject/>', '<script/>',
+    '<use href="#shape" xml:base="file:///private/secret"/>',
+])
+def test_svg_cannot_fetch_external_or_local_resources(element):
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40">{element}</svg>'.encode()
+    with pytest.raises(ValueError):
+        reader.image_png(svg, "image/svg+xml")
+
+
+def test_actual_svg_pixels_preserve_geometry_and_arrow_direction():
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><rect width="80" height="40" fill="white"/><path d="M10 20H60L50 10M60 20L50 30" fill="none" stroke="black" stroke-width="4"/></svg>'
+    png = reader.image_png(svg, "image/svg+xml")
+    image = Image.open(io.BytesIO(png))
+    assert image.size == (80, 40)
+    assert image.getpixel((60, 20)) == (0, 0, 0, 255)
+    assert image.getpixel((70, 20)) == (255, 255, 255, 255)
+
+
+def test_transparent_pixels_are_preserved_instead_of_becoming_black():
+    source = Image.new("RGBA", (4, 4), (0, 0, 0, 0))
+    buffer = io.BytesIO()
+    source.save(buffer, format="PNG")
+    result = Image.open(io.BytesIO(reader.image_png(buffer.getvalue(), "image/png")))
+    assert result.getpixel((0, 0)) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("size", [(5000, 10), (10, 5000)])
+def test_oversized_svg_rejected_before_render(size):
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{size[0]}" height="{size[1]}"/>'.encode()
+    with pytest.raises(ValueError):
+        reader.image_png(svg, "image/svg+xml")
+
+
+def test_public_provider_disabled_by_default_and_operator_only(monkeypatch):
+    effective = {"mcp_servers": {"personal": {"command": "private", "env": {"SECRET": "fixture"}}}}
+    disabled = codex_context.disable_mcp_servers(effective, {})
+    monkeypatch.delenv("LOOPX_CHAT_PUBLIC_SOURCE_READ", raising=False)
+    assert codex_context.public_source_reader(effective, disabled) == disabled
+    monkeypatch.setenv("LOOPX_CHAT_PUBLIC_SOURCE_READ", "on")
+    enabled = codex_context.public_source_reader(effective, disabled)
+    assert enabled["mcp_servers"]["personal"] == {"enabled": False}
+    public = enabled["mcp_servers"]["loopx_public_source_read"]
+    assert public["env_vars"] == [] and list(public["env"]) == ["PATH"]
+    assert public["args"] == ["-I", str(Path(reader.__file__).resolve())]
+    assert effective["mcp_servers"]["personal"]["command"] == "private"
+    with pytest.raises(ValueError):
+        codex_context.public_source_reader({"mcp_servers": {"loopx_public_source_read": {"env": {"SECRET": "fixture"}}}}, {})
+    monkeypatch.setenv("LOOPX_CHAT_PUBLIC_SOURCE_READ", "yes")
+    with pytest.raises(ValueError):
+        codex_context.public_source_reader({}, {})
+
+
+def test_dependency_failure_prevents_provider_admission(monkeypatch):
+    monkeypatch.setenv("LOOPX_CHAT_PUBLIC_SOURCE_READ", "on")
+    monkeypatch.setattr(codex_context.importlib.util, "find_spec", lambda name: None)
+    with pytest.raises(ValueError, match=r"Install loopx\[public-source-reader\]"):
+        codex_context.public_source_reader({}, {})
+
+
+def test_worker_deadline_and_environment_are_not_account_owned(monkeypatch):
+    import subprocess
+    def blocked(command, **kwargs):
+        assert command[1:] == ["-I", str(Path(reader.__file__).resolve()), "--observe"]
+        assert kwargs["timeout"] == 30 and list(kwargs["env"]) == ["PATH"]
+        raise subprocess.TimeoutExpired(command, 30)
+    monkeypatch.setattr(reader.subprocess, "run", blocked)
+    assert reader.read_public_url("https://example.org/")["ok"] is False
+
+
+def test_writable_workspace_and_pythonpath_cannot_replace_trusted_provider(tmp_path):
+    import json
+    import os
+    import subprocess
+    import sys
+    package = tmp_path / "loopx" / "extensions"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("")
+    (package / "__init__.py").write_text("")
+    marker = tmp_path / "workspace-code-ran"
+    (package / "public_source_reader.py").write_text(
+        "from pathlib import Path; Path('workspace-code-ran').write_text('untrusted')")
+    result = subprocess.run([sys.executable, "-I", str(Path(reader.__file__).resolve()), "--observe"],
+        cwd=tmp_path, env={"PATH": os.defpath, "PYTHONPATH": str(tmp_path)},
+        input=json.dumps({"kind": "text", "url": "file:///etc/passwd"}).encode(),
+        capture_output=True, timeout=5)
+    assert result.returncode != 0 and b"invalid observation" not in result.stderr
+    assert b"anonymous HTTPS source required" in result.stderr
+    assert not marker.exists()
+
+
+def test_source_only_host_worker_needs_no_site_installed_loopx(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    import venv
+    host = tmp_path / "source-only-host"
+    venv.EnvBuilder(with_pip=False).create(host)
+    interpreter = host / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    absent = subprocess.run([str(interpreter), "-I", "-c",
+        "import importlib.util; assert importlib.util.find_spec('loopx') is None"],
+        capture_output=True, check=True)
+    assert absent.stdout == b""
+    # The worker must reach its URL boundary through the host release, instead
+    # of failing to import LoopX or needing another installed package revision.
+    monkeypatch.setattr(reader.sys, "executable", str(interpreter))
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        reader._observation("text", "file:///etc/passwd")
+    assert b"anonymous HTTPS source required" in error.value.stderr
+    assert b"No module named" not in error.value.stderr

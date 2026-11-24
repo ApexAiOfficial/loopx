@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ...control_plane.digest_envelope import sha256_envelope
 from ...control_plane.runtime.public_safety import public_safe_compact_text
 from ..context_providers.base import ContextProvider
-from ..reward_memory.runtime_hooks import run_reward_memory_automatic_recall_hook
 
 
 AGENT_TURN_SITUATION_SCHEMA_VERSION = "agent_turn_situation_v0"
@@ -32,7 +31,7 @@ def _canonical_hash(value: object) -> str:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return sha256_envelope(encoded)
 
 
 def _recent_outcomes(quota_decision: Mapping[str, Any]) -> list[str]:
@@ -45,7 +44,9 @@ def _recent_outcomes(quota_decision: Mapping[str, Any]) -> list[str]:
         ]
     )
     handoff = _mapping(quota_decision.get("handoff_readiness"))
-    candidates.append(_mapping(handoff.get("post_handoff_latest_run")).get("classification"))
+    candidates.append(
+        _mapping(handoff.get("post_handoff_latest_run")).get("classification")
+    )
     result: list[str] = []
     for value in candidates:
         text = _compact(value, limit=180)
@@ -121,9 +122,7 @@ def build_agent_turn_situation(
         "decision": _compact(quota_decision.get("decision"), limit=80),
         "selected_todo": selected,
         "recent_outcomes": _recent_outcomes(quota_decision),
-        "next_intent": _compact(
-            quota_decision.get("recommended_action"), limit=320
-        ),
+        "next_intent": _compact(quota_decision.get("recommended_action"), limit=320),
         "conflict_state": conflict_state,
         "status_health_ok": status_health_ok,
         "user_prompt_included": False,
@@ -215,6 +214,8 @@ def run_agent_turn_recall(
 ) -> dict[str, Any]:
     """Recall guidance and inject it into this turn's private reasoning context."""
 
+    from ..reward_memory.runtime_hooks import run_reward_memory_automatic_recall_hook
+
     query = _turn_query(situation)
     context = {
         "schema_version": AGENT_TURN_RECALL_CONTEXT_SCHEMA_VERSION,
@@ -231,6 +232,9 @@ def run_agent_turn_recall(
                 "candidate_ref": item.candidate_ref,
                 "target_class": item.target_class,
                 "content_summary": item.content_summary,
+                "experience": (
+                    dict(item.experience) if item.experience is not None else None
+                ),
             }
             for item in items
         ]
@@ -277,6 +281,7 @@ def run_agent_turn_recall(
         "ok": result.get("ok") is True,
         "schema_version": AGENT_TURN_RECALL_SCHEMA_VERSION,
         "status": result.get("status"),
+        "reason_code": result.get("reason_code"),
         "surface_id": AGENT_TURN_RECALL_SURFACE_ID,
         "turn_recall_id": situation.get("turn_recall_id"),
         "situation_fingerprint": situation.get("situation_fingerprint"),

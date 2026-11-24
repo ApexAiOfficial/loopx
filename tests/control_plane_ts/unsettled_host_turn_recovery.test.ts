@@ -1,0 +1,1228 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { performance } from "node:perf_hooks";
+import test from "node:test";
+
+import {
+  settlementIdentity,
+  type JsonObject,
+} from "../../loopx/control_plane/effect_program.ts";
+import {
+  acquireFileMutationLock,
+  releaseFileMutationLock,
+} from "../../loopx/control_plane/effect_runtime_io.ts";
+import {
+  ACCEPTED_CLOSEOUTS,
+  RECOVERY_ADMISSION_LIMIT,
+  PRIOR_HOST_TURN_CLOSEOUT_PREFLIGHT_REQUEST_SCHEMA,
+  UNSETTLED_HOST_TURN_RECOVERY_REQUEST_SCHEMA,
+  preflightPriorHostTurnCloseout,
+  reduceUnsettledHostTurnRecovery,
+} from "../../loopx/control_plane/quota/unsettled_host_turn_recovery.ts";
+
+const GOAL = "goal-a";
+const AGENT = "agent-a";
+
+interface Runtime {
+  root: string;
+  close(): Promise<void>;
+}
+
+/** A disposable runtime whose only persisted state is the receipts under test. */
+async function runtimeWith(events: JsonObject[]): Promise<Runtime> {
+  const root = await mkdtemp(join(tmpdir(), "loopx-closeout-"));
+  const goalRoot = join(root, "goals", GOAL);
+  await mkdir(goalRoot, {recursive: true});
+  await writeFile(
+    join(goalRoot, "rollout-event-log.jsonl"),
+    events.map((event) => JSON.stringify(event)).join("\n") + "\n",
+    "utf8",
+  );
+  return {root, close: () => rm(root, {recursive: true, force: true})};
+}
+
+async function runtimeWithSettledTurns(count: number): Promise<Runtime> {
+  const root = await mkdtemp(join(tmpdir(), "loopx-closeout-scale-"));
+  const goalRoot = join(root, "goals", GOAL);
+  const runsRoot = join(goalRoot, "runs");
+  await mkdir(runsRoot, {recursive: true});
+  const events: JsonObject[] = [];
+  const runs: JsonObject[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const suffix = String(index).padStart(4, "0");
+    const turn = `turn-${suffix}`;
+    const todoId = `todo_${suffix}`;
+    const identity = settlementIdentity({
+      goal_id: GOAL,
+      agent_id: AGENT,
+      todo_id: todoId,
+      turn_instance_id: turn,
+    });
+    events.push(
+      receipt(turn, {
+        todo_id: todoId,
+        settlement_effect_id: identity.effect_id,
+        closeout_required: true,
+      }, {event_id: `guard-${suffix}`}),
+      {
+        schema_version: "loopx_rollout_event_v0",
+        event_id: `writeback-${suffix}`,
+        event_kind: "refresh_state",
+        goal_id: GOAL,
+        agent_id: AGENT,
+        run_id: turn,
+        details: {settlement_effect_id: identity.effect_id},
+      },
+      {
+        schema_version: "loopx_rollout_event_v0",
+        event_id: `spend-${suffix}`,
+        event_kind: "quota_spend",
+        goal_id: GOAL,
+        agent_id: AGENT,
+        run_id: turn,
+        details: {settlement_effect_id: identity.effect_id},
+      },
+    );
+    runs.push(
+      {
+        classification: "state_refreshed",
+        delivery_outcome: "outcome_progress",
+        goal_id: GOAL,
+        agent_id: AGENT,
+        todo_id: todoId,
+        turn_instance_id: turn,
+        settlement_identity: identity,
+      },
+      {
+        classification: "quota_slot_spent",
+        goal_id: GOAL,
+        agent_id: AGENT,
+        todo_id: todoId,
+        turn_instance_id: turn,
+        settlement_identity: identity,
+      },
+    );
+  }
+  await writeFile(
+    join(goalRoot, "rollout-event-log.jsonl"),
+    `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    "utf8",
+  );
+  await writeFile(
+    join(runsRoot, "index.jsonl"),
+    `${runs.map((run) => JSON.stringify(run)).join("\n")}\n`,
+    "utf8",
+  );
+  return {root, close: () => rm(root, {recursive: true, force: true})};
+}
+
+function receipt(
+  turn: string,
+  details: JsonObject,
+  overrides: JsonObject = {},
+): JsonObject {
+  return {
+    schema_version: "loopx_rollout_event_v0",
+    event_id: `event-${turn}`,
+    event_kind: "quota_should_run",
+    goal_id: GOAL,
+    agent_id: AGENT,
+    run_id: turn,
+    details,
+    ...overrides,
+  };
+}
+
+function closeoutRequired(
+  turn: string,
+  todoId: string | null,
+  replanId: string | null = null,
+): JsonObject {
+  return {
+    ...(todoId ? {todo_id: todoId} : {}),
+    ...(replanId ? {replan_obligation_id: replanId} : {}),
+    ...(todoId ? {settlement_effect_id: `${GOAL}:${AGENT}:${todoId}:${turn}`} : {}),
+    closeout_required: true,
+  };
+}
+
+function preflight(runtimeRoot: string, exclude: string | null = "current-turn") {
+  return preflightPriorHostTurnCloseout({
+    schema_version: PRIOR_HOST_TURN_CLOSEOUT_PREFLIGHT_REQUEST_SCHEMA,
+    runtime_root: runtimeRoot,
+    goal_id: GOAL,
+    agent_id: AGENT,
+    exclude_turn_instance_id: exclude,
+  });
+}
+
+async function withSourceAdmission<T>(
+  runtimeRoot: string,
+  instanceId: string,
+  run: (binding: JsonObject) => Promise<T>,
+): Promise<T> {
+  const indexPath = join(runtimeRoot, "goals", GOAL, "runs", "index.jsonl");
+  const registryPath = join(runtimeRoot, "project", ".loopx", "registry.json");
+  const guardPath = join(
+    dirname(registryPath),
+    ".loopx",
+    "lifecycle",
+    "goal-instance",
+    "guards",
+    `${createHash("sha256").update(GOAL, "utf8").digest("hex")}.guard`,
+  );
+  const indexLock = await acquireFileMutationLock(indexPath);
+  const guardLock = await acquireFileMutationLock(guardPath);
+  try {
+    const goalRef = {
+      goal_id: GOAL,
+      goal_instance_id: instanceId,
+    };
+    return await run({
+      goal_ref: goalRef,
+      source_admission: {
+        schema_version: "loopx_quota_source_admission_v0",
+        profile_id: "source_session_v1",
+        registry_path: registryPath,
+        planned_goal_ref: goalRef,
+        authority: {kind: "present", goal_ref: goalRef},
+        locks: [
+          {
+            role: "run_index",
+            target: indexPath,
+            pid: process.pid,
+            token: indexLock.token,
+          },
+          {
+            role: "source_guard",
+            target: guardPath,
+            pid: process.pid,
+            token: guardLock.token,
+          },
+        ],
+      },
+    });
+  } finally {
+    await releaseFileMutationLock(guardPath, guardLock.token, null, true);
+    await releaseFileMutationLock(indexPath, indexLock.token, null, true);
+  }
+}
+
+function candidateFrom(result: JsonObject): JsonObject {
+  assert.equal(result.status, "candidate");
+  return result.candidate as JsonObject;
+}
+
+function reduce(
+  candidate: JsonObject,
+  missingReceipts: string[] = [
+    "durable_writeback_receipt",
+    "quota_spend_receipt",
+  ],
+  bindingFacts: JsonObject = {status: "not_read"},
+) {
+  return reduceUnsettledHostTurnRecovery({
+    schema_version: UNSETTLED_HOST_TURN_RECOVERY_REQUEST_SCHEMA,
+    goal_id: GOAL,
+    agent_id: AGENT,
+    candidate,
+    missing_receipts: missingReceipts,
+    binding_facts: bindingFacts,
+  });
+}
+
+const READ_TODO = (todo: JsonObject | null, committed: JsonObject | null = null) => ({
+  status: "read",
+  todo,
+  committed_monitor_poll: committed,
+});
+
+const ADVANCEMENT_OPEN = {
+  task_class: "advancement_task",
+  status: "open",
+  has_resume_when: false,
+  has_successor_todo_ids: false,
+  target_key: null,
+  cadence: null,
+};
+
+test("the admission bound keeps debt identity, deduplicates replays, and accepts owner resume and legal closeout", async () => {
+  const original = receipt("owed", closeoutRequired("owed", "todo_alpha"));
+  const runtime = await runtimeWith([original]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    const initial = reduce(candidate, undefined, READ_TODO(ADVANCEMENT_OPEN));
+    const checkpoint = (initial.recovery as JsonObject).admission_checkpoint as JsonObject;
+    const admitted = (id: string, patch: JsonObject = {}) => receipt(id,
+      {...checkpoint, should_run: true, ...patch});
+    const history = [original,
+      admitted("recovery-a"), admitted("recovery-a"),
+      admitted("other-debt", {recovery_owed_turn_id: "different"}),
+      admitted("recovery-b"), admitted("recovery-c")];
+    const log = join(runtime.root, "goals", GOAL, "rollout-event-log.jsonl");
+    await writeFile(log, history.map(event => JSON.stringify(event)).join("\n") + "\n");
+    const observed = await preflight(runtime.root);
+    assert.deepEqual(observed.recovery_admissions,
+      {count: RECOVERY_ADMISSION_LIMIT, owner_action_id: null, checkpoint});
+    const observedNull = await preflight(runtime.root, null);
+    assert.deepEqual(observedNull.recovery_admissions,
+      {count: RECOVERY_ADMISSION_LIMIT, owner_action_id: null, checkpoint});
+    const decide = (facts: JsonObject, missing = observed.missing_receipts) => reduceUnsettledHostTurnRecovery({
+      schema_version: UNSETTLED_HOST_TURN_RECOVERY_REQUEST_SCHEMA,
+      goal_id: GOAL, agent_id: AGENT, candidate, missing_receipts: missing,
+      recovery_admissions: observed.recovery_admissions, binding_facts: facts,
+    });
+    const attention = decide(READ_TODO(ADVANCEMENT_OPEN));
+    assert.equal(attention.status, "attention_required");
+    assert.equal((attention.obligation as JsonObject).must_attempt_work, false);
+    const attentionNull = reduceUnsettledHostTurnRecovery({
+      schema_version: UNSETTLED_HOST_TURN_RECOVERY_REQUEST_SCHEMA,
+      goal_id: GOAL, agent_id: AGENT, candidate: candidateFrom(observedNull),
+      missing_receipts: observedNull.missing_receipts,
+      recovery_admissions: observedNull.recovery_admissions, binding_facts: READ_TODO(ADVANCEMENT_OPEN),
+    });
+    assert.equal(attentionNull.status, "attention_required");
+    assert.equal((attentionNull.obligation as JsonObject).must_attempt_work, false);
+    assert.equal((attention.recovery as JsonObject).settlement_effect_id, candidate.settlement_effect_id);
+    assert.equal(decide(READ_TODO({...ADVANCEMENT_OPEN, status: "blocked"})).status, "none");
+    const owner = await preflightPriorHostTurnCloseout({
+      schema_version: PRIOR_HOST_TURN_CLOSEOUT_PREFLIGHT_REQUEST_SCHEMA,
+      runtime_root: runtime.root, goal_id: GOAL, agent_id: AGENT,
+      exclude_turn_instance_id: "current", owner_action_id: "explicit-owner-resume",
+    });
+    assert.deepEqual(owner.recovery_admissions, {
+      count: 0, owner_action_id: "explicit-owner-resume",
+      checkpoint: {...checkpoint, recovery_owner_action_id: "explicit-owner-resume"},
+    });
+    const replay = await preflight(runtime.root, "recovery-c");
+    assert.equal((replay.recovery_admissions as JsonObject).count, 2);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("losing an owner activation projection cannot renew its exhausted allowance", async () => {
+  const original = receipt("owed", closeoutRequired("owed", "todo_alpha"));
+  const runtime = await runtimeWith([original]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    const recovery = reduce(candidate, undefined, READ_TODO(ADVANCEMENT_OPEN)).recovery as JsonObject;
+    const checkpoint = recovery.admission_checkpoint as JsonObject;
+    const history = [original, ...["old-owner", "current-owner", "current-owner", "current-owner"].map(
+      (owner, index) => receipt(`admission-${index}`, {...checkpoint,
+        should_run: true, recovery_owner_action_id: owner}),
+    )];
+    await writeFile(join(runtime.root, "goals", GOAL, "rollout-event-log.jsonl"),
+      history.map(event => JSON.stringify(event)).join("\n") + "\n");
+    // Controller activation has no owner id. Keep the latest recorded owner
+    // epoch, without counting admissions before that owner's explicit reset.
+    assert.deepEqual((await preflight(runtime.root)).recovery_admissions, {
+      count: 3, owner_action_id: "current-owner",
+      checkpoint: {...checkpoint, recovery_owner_action_id: "current-owner"},
+    });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("the preflight reads the persisted receipts and names the newest required closeout", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-old", closeoutRequired("turn-old", "todo_older")),
+    receipt("turn-new", closeoutRequired("turn-new", "todo_newer")),
+    // A Turn that repeats later is the more recent one, exactly as the
+    // persisted log's append order defines "newest".
+    receipt("turn-old", closeoutRequired("turn-old", "todo_older")),
+  ]);
+  try {
+    const result = await preflight(runtime.root);
+    assert.equal(result.schema_version, "loopx_prior_host_turn_closeout_preflight_result_v0");
+    assert.equal(result.turns_validated, 2);
+    const candidate = candidateFrom(result);
+    assert.equal(candidate.prior_turn_instance_id, "turn-old");
+    assert.equal(candidate.binding_kind, "todo");
+    assert.equal(candidate.binding_id, "todo_older");
+    assert.equal(candidate.event_id, "event-turn-old");
+    // The receipt exists but its writeback and spend receipts do not.
+    assert.deepEqual(result.missing_receipts, [
+      "durable_writeback_receipt",
+      "quota_spend_receipt",
+    ]);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("recovering an earlier Turn cannot depend on a later Turn", async () => {
+  // Turn ids are opaque. Deliberately reverse their lexical order; clocks and
+  // last replay order must not reverse the persisted causal relationship.
+  const earlier = "z-original";
+  const later = "a-followup";
+  const runtime = await runtimeWith([
+    receipt(earlier, closeoutRequired(earlier, "todo_original")),
+    receipt(later, closeoutRequired(later, "todo_followup")),
+    receipt(earlier, closeoutRequired(earlier, "todo_original")),
+  ]);
+  try {
+    assert.equal((await preflight(runtime.root, earlier)).status, "none");
+    const result = await preflight(runtime.root, later);
+    assert.equal(candidateFrom(result).prior_turn_instance_id, earlier);
+    assert.deepEqual(result.missing_receipts, [
+      "durable_writeback_receipt", "quota_spend_receipt",
+    ]);
+    // A genuinely fresh Turn still owes both outstanding closeouts.
+    assert.equal(candidateFrom(await preflight(runtime.root)).prior_turn_instance_id, earlier);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("an unbound first receipt fixes causality before its late binding upgrade", async () => {
+  const runtime = await runtimeWith([
+    receipt("original", {}),
+    receipt("followup", closeoutRequired("followup", "todo_followup")),
+    receipt("original", closeoutRequired("original", "todo_original")),
+  ]);
+  try {
+    assert.equal((await preflight(runtime.root, "original")).status, "none");
+    assert.equal(candidateFrom(await preflight(runtime.root, "followup")).binding_id, "todo_original");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("a late replay of a causal predecessor remains owed by the original Turn", async () => {
+  const runtime = await runtimeWith([
+    receipt("predecessor", closeoutRequired("predecessor", "todo_predecessor")),
+    receipt("original", closeoutRequired("original", "todo_original")),
+    receipt("followup", closeoutRequired("followup", "todo_followup")),
+    receipt("predecessor", closeoutRequired("predecessor", "todo_predecessor")),
+  ]);
+  try {
+    assert.equal(candidateFrom(await preflight(runtime.root, "original")).binding_id, "todo_predecessor");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("causal filtering does not hide conflicting later receipt identities", async () => {
+  const runtime = await runtimeWith([
+    receipt("original", closeoutRequired("original", "todo_original")),
+    receipt("followup", closeoutRequired("followup", "todo_alpha")),
+    receipt("followup", closeoutRequired("followup", "todo_beta")),
+  ]);
+  try {
+    await assert.rejects(() => preflight(runtime.root, "original"), /conflicting settlement identities/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("exact preflight filters stale owners before selecting the newest Turn", async () => {
+  const instanceA = "ginst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const instanceB = "ginst_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const runtime = await runtimeWith([
+    receipt("turn-b", closeoutRequired("turn-b", "todo_current"), {
+      goal_ref: {goal_id: GOAL, goal_instance_id: instanceB},
+    }),
+    receipt("turn-delayed-a", closeoutRequired("turn-delayed-a", "todo_stale"), {
+      goal_ref: {goal_id: GOAL, goal_instance_id: instanceA},
+    }),
+  ]);
+  try {
+    const result = await withSourceAdmission(
+      runtime.root,
+      instanceB,
+      async (binding) => {
+        const request = {
+          schema_version: PRIOR_HOST_TURN_CLOSEOUT_PREFLIGHT_REQUEST_SCHEMA,
+          runtime_root: runtime.root,
+          goal_id: GOAL,
+          agent_id: AGENT,
+          exclude_turn_instance_id: "current-turn",
+          ...binding,
+        };
+        const borrowed = await preflightPriorHostTurnCloseout({...request, borrow_source_admission: true});
+        assert.equal(candidateFrom(borrowed).prior_turn_instance_id, "turn-b");
+        return await preflightPriorHostTurnCloseout(request);
+      },
+    );
+    assert.equal(candidateFrom(result).prior_turn_instance_id, "turn-b");
+
+    const onlyStale = await runtimeWith([
+      receipt("turn-a", closeoutRequired("turn-a", "todo_stale"), {
+        goal_ref: {goal_id: GOAL, goal_instance_id: instanceA},
+      }),
+    ]);
+    try {
+      const none = await withSourceAdmission(
+        onlyStale.root,
+        instanceB,
+        async (binding) => await preflightPriorHostTurnCloseout({
+          schema_version: PRIOR_HOST_TURN_CLOSEOUT_PREFLIGHT_REQUEST_SCHEMA,
+          runtime_root: onlyStale.root,
+          goal_id: GOAL,
+          agent_id: AGENT,
+          exclude_turn_instance_id: "current-turn",
+          ...binding,
+        }),
+      );
+      assert.equal(none.status, "none");
+      assert.equal(none.reason, "no_prior_turn_requires_closeout");
+    } finally {
+      await onlyStale.close();
+    }
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("a receipt that does not opt in never becomes a recovery obligation", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", {todo_id: "todo_alpha", settlement_effect_id: "e"}),
+    receipt("turn-b", {
+      todo_id: "todo_beta",
+      settlement_effect_id: `${GOAL}:${AGENT}:todo_beta:turn-b`,
+      closeout_required: false,
+    }),
+  ]);
+  try {
+    const result = await preflight(runtime.root);
+    assert.equal(result.status, "none");
+    assert.equal(result.reason, "no_prior_turn_requires_closeout");
+    assert.equal(result.turns_validated, 2);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("an admitted Todo-bound replan without verified writeback does not hold a later guard", async () => {
+  const admitted = {
+    ...closeoutRequired("turn-replan", "todo_alpha"), closeout_required: false,
+    semantic_replan_obligation_id: `replan-${"b".repeat(16)}`,
+    ok: true, should_run: true, interaction_mode: "autonomous_replan",
+    must_attempt_work: true, delivery_allowed: false, quiet_noop_allowed: false,
+  };
+  const runtime = await runtimeWith([
+    receipt("turn-normal", closeoutRequired("turn-normal", "todo_beta")),
+    receipt("turn-replan", admitted),
+  ]);
+  const replanOnly = await runtimeWith([receipt("turn-replan", admitted)]);
+  try {
+    assert.equal(candidateFrom(await preflight(runtime.root)).prior_turn_instance_id, "turn-normal");
+    assert.equal((await preflight(replanOnly.root)).reason, "no_prior_turn_requires_closeout");
+  } finally {
+    await runtime.close();
+    await replanOnly.close();
+  }
+});
+
+test("an admitted obligation-bound replan without verified writeback does not hold a later guard", async () => {
+  const turn = "turn-replan";
+  const replanId = `replan-${"c".repeat(16)}`;
+  const identity = settlementIdentity({
+    goal_id: GOAL,
+    agent_id: AGENT,
+    replan_obligation_id: replanId,
+    turn_instance_id: turn,
+  });
+  const runtime = await runtimeWith([
+    receipt(turn, {
+      replan_obligation_id: replanId,
+      semantic_replan_obligation_id: replanId,
+      settlement_effect_id: identity.effect_id,
+      closeout_required: false,
+      ok: true,
+      should_run: true,
+      interaction_mode: "autonomous_replan",
+      must_attempt_work: true,
+      delivery_allowed: false,
+      quiet_noop_allowed: false,
+    }),
+  ]);
+  try {
+    const result = await preflight(runtime.root);
+    assert.equal(result.status, "none");
+    assert.equal(result.reason, "no_prior_turn_requires_closeout");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("the current Turn, other goals, other agents, and other event kinds are ignored", async () => {
+  const runtime = await runtimeWith([
+    receipt("current-turn", closeoutRequired("current-turn", "todo_current")),
+    receipt("turn-other-goal", closeoutRequired("turn-other-goal", "todo_other"), {
+      goal_id: "goal-b",
+    }),
+    receipt("turn-other-agent", closeoutRequired("turn-other-agent", "todo_other"), {
+      agent_id: "agent-b",
+    }),
+    receipt("turn-other-kind", closeoutRequired("turn-other-kind", "todo_other"), {
+      event_kind: "quota_settled",
+    }),
+    receipt("", closeoutRequired("", "todo_unbound_turn")),
+  ]);
+  try {
+    const result = await preflight(runtime.root);
+    assert.equal(result.status, "none");
+    assert.equal(result.turns_validated, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("one receipt may bind only one settlement identity", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-conflict", {
+      todo_id: "todo_alpha",
+      replan_obligation_id: `replan-${"a".repeat(16)}`,
+      closeout_required: true,
+    }),
+  ]);
+  try {
+    await assert.rejects(
+      () => preflight(runtime.root),
+      /conflicting Todo and autonomous replan bindings/,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("a receipt cannot claim an effect identity it does not bind", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", {
+      settlement_effect_id: "effect-without-binding",
+      closeout_required: true,
+    }),
+  ]);
+  try {
+    await assert.rejects(
+      () => preflight(runtime.root),
+      /refuse to infer or upgrade it/,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("a Todo binding the settlement authority cannot address fails the read", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", {
+      todo_id: "TODO_ALPHA",
+      closeout_required: true,
+    }),
+  ]);
+  try {
+    await assert.rejects(
+      () => preflight(runtime.root),
+      /not a legal Todo id/,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("receipts of one Turn that disagree on the binding are a conflict, not a preference", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", "todo_alpha")),
+    receipt("turn-a", closeoutRequired("turn-a", "todo_beta")),
+  ]);
+  try {
+    await assert.rejects(
+      () => preflight(runtime.root),
+      /conflicting settlement identities/,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("a Turn with many receipts resolves the one that binds its settlement", async () => {
+  const crowded: JsonObject[] = [];
+  for (let index = 0; index < 40; index += 1) {
+    crowded.push(
+      receipt(`turn-crowded`, {
+        stall_observation: "not_applicable",
+        revision: index,
+      }),
+    );
+  }
+  crowded.push(receipt("turn-crowded", closeoutRequired("turn-crowded", "todo_crowded")));
+  crowded.push(receipt("turn-newer", closeoutRequired("turn-newer", "todo_newer")));
+  const runtime = await runtimeWith(crowded);
+  try {
+    const result = await preflight(runtime.root);
+    assert.equal(result.turns_validated, 2);
+    assert.equal(candidateFrom(result).binding_id, "todo_newer");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("a prior Turn that already validates its settlement needs no bound facts", async () => {
+  // The receipt alone is not a settlement: the readback resolves the identity
+  // and reports the missing writeback and spend receipts instead...
+  const unsettled = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", "todo_alpha")),
+  ]);
+  try {
+    assert.equal((await preflight(unsettled.root)).status, "candidate");
+  } finally {
+    await unsettled.close();
+  }
+  // ...so a caller can never observe "validated" without the persisted
+  // writeback and spend receipts, which the Python CLI fixtures cover
+  // end-to-end through the real entrypoint.
+});
+
+test("a prior typed blocked writeback closes without a quota debit", async () => {
+  const turn = "turn-blocked";
+  const todoId = "todo_blocked";
+  const identity = settlementIdentity({
+    goal_id: GOAL, agent_id: AGENT, todo_id: todoId, turn_instance_id: turn,
+  });
+  const runtime = await runtimeWith([
+    receipt(turn, {
+      todo_id: todoId,
+      settlement_effect_id: identity.effect_id,
+      closeout_required: true,
+    }),
+    {
+      schema_version: "loopx_rollout_event_v0",
+      event_id: "event-blocked-writeback",
+      event_kind: "refresh_state",
+      goal_id: GOAL,
+      agent_id: AGENT,
+      run_id: turn,
+      details: {settlement_effect_id: identity.effect_id},
+    },
+  ]);
+  try {
+    const runsRoot = join(runtime.root, "goals", GOAL, "runs");
+    await mkdir(runsRoot, {recursive: true});
+    await writeFile(join(runsRoot, "index.jsonl"), `${JSON.stringify({
+      classification: "state_refreshed",
+      delivery_outcome: "outcome_gap",
+      goal_id: GOAL,
+      agent_id: AGENT,
+      todo_id: todoId,
+      turn_instance_id: turn,
+      settlement_identity: identity,
+      blocked_retry: {
+        schema_version: "quota_blocked_retry_v0",
+        source: "turn_settlement",
+        todo_id: todoId,
+        resume_when: "resume_at:2026-09-24T10:05:00Z",
+        observed_at: "2026-09-24T10:00:00Z",
+        due_at: "2026-09-24T10:05:00Z",
+      },
+      progress_observation: {
+        schema_version: "typed_progress_observation_v0",
+        result_class: "blocked",
+        work_item_id: todoId,
+        blocker_id: "blocker-lease",
+        evidence_ids: ["evidence-lease"],
+      },
+    })}\n`);
+    const result = await preflight(runtime.root);
+    assert.equal(result.status, "none");
+    assert.equal(result.accepted_closeout, "typed_blocked_writeback_no_spend");
+    assert.equal(result.prior_turn_instance_id, turn);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("a malformed or foreign log line fails the read instead of erasing a closeout", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", "todo_alpha")),
+  ]);
+  try {
+    await writeFile(
+      join(runtime.root, "goals", GOAL, "rollout-event-log.jsonl"),
+      `${JSON.stringify(receipt("turn-a", closeoutRequired("turn-a", "todo_alpha")))}\nnot json\n`,
+      "utf8",
+    );
+    await assert.rejects(
+      () => preflight(runtime.root),
+      /malformed/,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("an unrelated malformed line remains non-strict when no closeout exists", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", {closeout_required: false}),
+  ]);
+  try {
+    await writeFile(
+      join(runtime.root, "goals", GOAL, "rollout-event-log.jsonl"),
+      `${JSON.stringify(receipt("turn-a", {closeout_required: false}))}\nnot json\n`,
+      "utf8",
+    );
+    const result = await preflight(runtime.root);
+    assert.equal(result.status, "none");
+    assert.equal(result.reason, "no_prior_turn_requires_closeout");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("settled history is read and indexed once instead of rescanned per Turn", async () => {
+  const runtime = await runtimeWithSettledTurns(1000);
+  try {
+    const started = performance.now();
+    const result = await preflight(runtime.root);
+    const elapsedMs = performance.now() - started;
+    assert.equal(result.status, "none");
+    assert.equal(result.reason, "prior_turn_settlement_validated");
+    assert.equal(result.turns_validated, 1000);
+    assert.ok(
+      elapsedMs < 1500,
+      `indexed closeout preflight took ${elapsedMs.toFixed(1)}ms`,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("warm history still discovers an appended older identity conflict and repaired rewrite", async () => {
+  const runtime = await runtimeWithSettledTurns(1000);
+  const path = join(runtime.root, "goals", GOAL, "rollout-event-log.jsonl");
+  try {
+    assert.equal((await preflight(runtime.root)).status, "none");
+    await appendFile(path, JSON.stringify(
+      receipt("turn-0000", closeoutRequired("turn-0000", "todo_changed")),
+    ) + "\n");
+    await assert.rejects(() => preflight(runtime.root), /conflicting settlement identities/);
+    // An authoritative repair/rewrite must also retire the cached conflict.
+    await writeFile(path, JSON.stringify(receipt("repaired-turn", {closeout_required: false})) + "\n");
+    const repaired = await preflight(runtime.root);
+    assert.equal(repaired.status, "none");
+    assert.equal(repaired.turns_validated, 1);
+  } finally { await runtime.close(); }
+});
+
+test("monitor closeout comes from exact committed history, not a second Python scan", async () => {
+  const todo = "todo_monitor";
+  const runtime = await runtimeWith([receipt("turn-a", closeoutRequired("turn-a", todo))]);
+  const runs = join(runtime.root, "goals", GOAL, "runs");
+  const effectId = `quota-monitor-poll:${GOAL}:${AGENT}:turn-a:todo:${todo}`;
+  const poll = {
+    classification: "quota_monitor_poll", goal_id: GOAL, agent_id: AGENT,
+    turn_instance_id: "turn-a", todo_id: todo,
+    quota_monitor_poll_commit: {effect_id: effectId},
+  };
+  try {
+    await mkdir(runs);
+    assert.equal((await preflight(runtime.root)).committed_monitor_poll, null);
+    for (const override of [
+      {goal_id: "other-goal"}, {agent_id: "other-agent"},
+      {turn_instance_id: "other-turn"}, {todo_id: "todo_other"},
+      {quota_monitor_poll_commit: {effect_id: "uncommitted"}},
+    ]) {
+      await writeFile(join(runs, "index.jsonl"), JSON.stringify({...poll, ...override}) + "\n");
+      assert.equal((await preflight(runtime.root)).committed_monitor_poll, null);
+    }
+    await writeFile(join(runs, "index.jsonl"), JSON.stringify(poll) + "\n");
+    // A later observation without a commit cannot revoke a durable exact poll.
+    await appendFile(join(runs, "index.jsonl"), JSON.stringify({...poll, quota_monitor_poll_commit: {}}) + "\n");
+    const result = await preflight(runtime.root);
+    assert.deepEqual(result.committed_monitor_poll, {effect_id: effectId});
+    const verdict = reduce(candidateFrom(result), result.missing_receipts as string[], READ_TODO(
+      {...ADVANCEMENT_OPEN, task_class: "continuous_monitor"},
+      result.committed_monitor_poll as JsonObject,
+    ));
+    assert.equal(verdict.accepted_closeout, "exact_committed_quota_monitor_poll");
+    await appendFile(join(runs, "index.jsonl"), "malformed\n");
+    await assert.rejects(() => preflight(runtime.root), /malformed/);
+  } finally { await runtime.close(); }
+});
+
+test("an unsettled Turn cannot be decided without its bound Todo facts", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", "todo_alpha")),
+  ]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    assert.throws(
+      () => reduce(candidate),
+      /requires its bound Todo facts/,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("the missing-receipt checkpoint is the closeout policy's own vocabulary", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", "todo_alpha")),
+  ]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    assert.throws(
+      () => reduce(
+        candidate,
+        ["quota_spend_receipt", "durable_writeback_receipt"],
+        READ_TODO(ADVANCEMENT_OPEN),
+      ),
+      /must be the closeout receipts/,
+    );
+    assert.throws(
+      () => reduce(candidate, ["unknown_receipt"], READ_TODO(ADVANCEMENT_OPEN)),
+      /must be the closeout receipts/,
+    );
+    assert.throws(
+      () => reduce(candidate, [], READ_TODO(ADVANCEMENT_OPEN)),
+      /must be the closeout receipts/,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("an exactly committed monitor-poll closeout is accepted", async () => {
+  const todoId = "todo_monitor";
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", todoId)),
+  ]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    const verdict = reduce(
+      candidate,
+      ["durable_writeback_receipt", "quota_spend_receipt"],
+      READ_TODO(
+        {task_class: "continuous_monitor", status: "open", has_resume_when: false,
+          has_successor_todo_ids: false, target_key: "target", cadence: "1h"},
+        {effect_id: `quota-monitor-poll:${GOAL}:${AGENT}:turn-a:todo:${todoId}`},
+      ),
+    );
+    assert.equal(verdict.status, "none");
+    assert.equal(verdict.accepted_closeout, "exact_committed_quota_monitor_poll");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("a monitor-poll receipt for another Turn or effect is not an accepted closeout", async () => {
+  const todoId = "todo_monitor";
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", todoId)),
+  ]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    for (const effectId of [
+      `quota-monitor-poll:${GOAL}:${AGENT}:turn-other:todo:${todoId}`,
+      `quota-monitor-poll:${GOAL}:${AGENT}:turn-a:todo:todo_other`,
+      "",
+    ]) {
+      const verdict = reduce(
+        candidate,
+        ["durable_writeback_receipt", "quota_spend_receipt"],
+        READ_TODO(
+          {task_class: "continuous_monitor", status: "open", has_resume_when: false,
+            has_successor_todo_ids: false, target_key: null, cadence: null},
+          {effect_id: effectId},
+        ),
+      );
+      assert.equal(verdict.status, "recovery_required");
+    }
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("a committed monitor-poll closeout is not accepted for a non-monitor Turn", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", "todo_alpha")),
+  ]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    const verdict = reduce(
+      candidate,
+      ["durable_writeback_receipt", "quota_spend_receipt"],
+      READ_TODO(
+        {...ADVANCEMENT_OPEN, target_key: null, cadence: null},
+        {effect_id: `quota-monitor-poll:${GOAL}:${AGENT}:turn-a:todo:todo_alpha`},
+      ),
+    );
+    assert.equal(verdict.status, "recovery_required");
+    assert.equal((verdict.obligation as JsonObject).repair, "resume_prior_turn");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("typed lifecycle closeouts are accepted and other open Todos are not", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", "todo_alpha")),
+  ]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    for (const [todo, accepted] of [
+      [{...ADVANCEMENT_OPEN, has_resume_when: true, has_successor_todo_ids: true},
+        "typed_external_wait_with_runnable_successor"],
+      [{...ADVANCEMENT_OPEN, status: "done"},
+        "typed_blocker_or_lifecycle_transition"],
+      [{...ADVANCEMENT_OPEN, status: "blocked"},
+        "typed_blocker_or_lifecycle_transition"],
+      [{...ADVANCEMENT_OPEN, status: "deferred"},
+        "typed_blocker_or_lifecycle_transition"],
+      // A retained wait without a runnable successor is not a closeout.
+      [{...ADVANCEMENT_OPEN, has_resume_when: true, has_successor_todo_ids: false}, null],
+      // The persisted status is read verbatim; padding is not a transition.
+      [{...ADVANCEMENT_OPEN, status: "done "}, null],
+    ] as const) {
+      const verdict = reduce(
+        candidate,
+        ["durable_writeback_receipt", "quota_spend_receipt"],
+        READ_TODO(todo),
+      );
+      if (accepted === null) {
+        assert.equal(verdict.status, "recovery_required");
+      } else {
+        assert.equal(verdict.status, "none");
+        assert.equal(verdict.accepted_closeout, accepted);
+      }
+      const ordinaryPending = reduce(candidate, ["quota_spend_receipt"], READ_TODO(todo));
+      assert.equal(ordinaryPending.status, verdict.status);
+      assert.equal(ordinaryPending.accepted_closeout, verdict.accepted_closeout);
+
+      const replanPending = reduce(
+        {...candidate, admitted_todo_replan: true},
+        ["quota_spend_receipt"],
+        READ_TODO(todo),
+      );
+      assert.equal(replanPending.status, "recovery_required");
+      assert.equal((replanPending.recovery as JsonObject).repair, "resume_prior_turn");
+    }
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("an unsettled Turn keeps the exact public recovery payload", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", "todo_alpha")),
+  ]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    const verdict = reduce(
+      candidate,
+      ["durable_writeback_receipt", "quota_spend_receipt"],
+      READ_TODO({...ADVANCEMENT_OPEN, target_key: "key-1", cadence: "1h"}),
+    );
+    assert.equal(verdict.status, "recovery_required");
+    assert.deepEqual(verdict.recovery, {
+      schema_version: "unsettled_host_turn_recovery_v0",
+      state: "recovery_required",
+      reason_code: "required_closeout_receipt_missing",
+      prior_turn_instance_id: "turn-a",
+      prior_event_id: "event-turn-a",
+      binding_kind: "todo",
+      binding_id: "todo_alpha",
+      settlement_effect_id: `${GOAL}:${AGENT}:todo_alpha:turn-a`,
+      missing_receipts: ["durable_writeback_receipt", "quota_spend_receipt"],
+      accepted_closeouts: [...ACCEPTED_CLOSEOUTS],
+      external_state_policy: "typed_host_observation_only",
+      quota_policy: "no_spend_for_recovery_transition",
+      binding_task_class: "advancement_task",
+      binding_target_key: "key-1",
+      binding_cadence: "1h",
+      repair: "resume_prior_turn",
+      admissions_without_progress: 0,
+      admission_limit: 3,
+      admission_checkpoint: {
+        recovery_checkpoint_schema: "unsettled_recovery_admission_v0",
+        recovery_owed_turn_id: "turn-a",
+        recovery_binding_kind: "todo",
+        recovery_binding_id: "todo_alpha",
+        recovery_effect_id: `${GOAL}:${AGENT}:todo_alpha:turn-a`,
+        recovery_missing_writeback: true,
+        recovery_missing_spend: true,
+        recovery_owner_action_id: null,
+      },
+    });
+    const obligation = verdict.obligation as JsonObject;
+    assert.equal(obligation.lane, "control_plane_recovery");
+    assert.equal(obligation.must_attempt_work, true);
+    assert.equal(obligation.delivery_allowed, false);
+    assert.equal(obligation.notify, "DONT_NOTIFY");
+    assert.equal(obligation.repair, "resume_prior_turn");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("continuation is a guarded route, not a closeout or an inferred wait", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", "todo_alpha")),
+  ]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    for (const missing of [
+      ["durable_writeback_receipt", "quota_spend_receipt"],
+      ["quota_spend_receipt"],
+    ]) {
+      for (const [todo, repair] of [
+        [ADVANCEMENT_OPEN, "resume_prior_turn"],
+        [{...ADVANCEMENT_OPEN, has_successor_todo_ids: true}, "resume_prior_turn"],
+        [{...ADVANCEMENT_OPEN, has_resume_when: true}, "lifecycle"],
+        [{...ADVANCEMENT_OPEN, task_class: "user_gate"}, "lifecycle"],
+        [{...ADVANCEMENT_OPEN, status: "open "}, "lifecycle"],
+        [null, "lifecycle"],
+      ] as const) {
+        const verdict = reduce(candidate, missing, READ_TODO(todo));
+        assert.equal(verdict.status, "recovery_required");
+        assert.equal((verdict.recovery as JsonObject).repair, repair);
+        assert.equal((verdict.obligation as JsonObject).delivery_allowed, false);
+        assert.equal(verdict.accepted_closeout, undefined);
+        assert.deepEqual((verdict.recovery as JsonObject).missing_receipts, missing);
+      }
+    }
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("a monitor-bound recovery names only the receipts that are actually missing", async () => {
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", "todo_monitor")),
+  ]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    const verdict = reduce(
+      candidate,
+      ["quota_spend_receipt"],
+      READ_TODO({
+        task_class: "continuous_monitor", status: "open", has_resume_when: false,
+        has_successor_todo_ids: false, target_key: "target", cadence: "30m",
+      }),
+    );
+    const recovery = verdict.recovery as JsonObject;
+    assert.equal(verdict.status, "recovery_required");
+    assert.equal(recovery.repair, "monitor_poll");
+    assert.equal(recovery.binding_target_key, "target");
+    assert.deepEqual(recovery.missing_receipts, ["quota_spend_receipt"]);
+    assert.equal((verdict.obligation as JsonObject).repair, "monitor_poll");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("an autonomous replan binding recovers without a Todo binding", async () => {
+  const replanId = `replan-${"b".repeat(16)}`;
+  const runtime = await runtimeWith([
+    receipt("turn-a", closeoutRequired("turn-a", null, replanId)),
+  ]);
+  try {
+    const candidate = candidateFrom(await preflight(runtime.root));
+    assert.equal(candidate.binding_kind, "autonomous_replan");
+    const verdict = reduce(
+      candidate,
+      ["durable_writeback_receipt", "quota_spend_receipt"],
+      READ_TODO(null),
+    );
+    const recovery = verdict.recovery as JsonObject;
+    assert.equal(recovery.binding_kind, "autonomous_replan");
+    assert.equal(recovery.binding_id, replanId);
+    assert.equal((verdict.obligation as JsonObject).repair, "lifecycle");
+    assert.equal("binding_task_class" in recovery, false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("an admitted obligation-bound replan with writeback resumes its original debit", async () => {
+  const turn = "turn-replan-writeback";
+  const replanId = `replan-${"d".repeat(16)}`;
+  const identity = settlementIdentity({
+    goal_id: GOAL,
+    agent_id: AGENT,
+    replan_obligation_id: replanId,
+    turn_instance_id: turn,
+  });
+  const runtime = await runtimeWith([
+    receipt(turn, {
+      replan_obligation_id: replanId,
+      semantic_replan_obligation_id: replanId,
+      settlement_effect_id: identity.effect_id,
+      closeout_required: false,
+      ok: true,
+      should_run: true,
+      interaction_mode: "autonomous_replan",
+      must_attempt_work: true,
+      delivery_allowed: false,
+      quiet_noop_allowed: false,
+    }),
+    {
+      schema_version: "loopx_rollout_event_v0",
+      event_id: "event-replan-writeback",
+      event_kind: "refresh_state",
+      goal_id: GOAL,
+      agent_id: AGENT,
+      run_id: turn,
+      details: {settlement_effect_id: identity.effect_id},
+    },
+  ]);
+  try {
+    const runsRoot = join(runtime.root, "goals", GOAL, "runs");
+    await mkdir(runsRoot, {recursive: true});
+    await writeFile(join(runsRoot, "index.jsonl"), `${JSON.stringify({
+      classification: "state_refreshed",
+      delivery_outcome: "outcome_progress",
+      goal_id: GOAL,
+      agent_id: AGENT,
+      replan_obligation_id: replanId,
+      turn_instance_id: turn,
+      settlement_identity: identity,
+    })}\n`);
+
+    const result = await preflight(runtime.root);
+    const candidate = candidateFrom(result);
+    assert.equal(candidate.binding_kind, "autonomous_replan");
+    assert.equal(candidate.binding_id, replanId);
+    assert.equal(candidate.admitted_replan, true);
+    assert.deepEqual(result.missing_receipts, ["quota_spend_receipt"]);
+
+    const verdict = reduce(
+      candidate,
+      result.missing_receipts as string[],
+      READ_TODO(null),
+    );
+    assert.equal(verdict.status, "recovery_required");
+    assert.equal((verdict.recovery as JsonObject).repair, "resume_prior_turn");
+    assert.equal((verdict.obligation as JsonObject).repair, "resume_prior_turn");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("candidate bindings are revalidated before any verdict", async () => {
+  assert.throws(
+    () => reduce({
+      prior_turn_instance_id: "turn-a",
+      event_id: "event-turn-a",
+      binding_kind: "todo",
+      binding_id: "TODO_ALPHA",
+      settlement_effect_id: null,
+    }, ["durable_writeback_receipt", "quota_spend_receipt"], READ_TODO(null)),
+    /not a legal Todo id/,
+  );
+  assert.throws(
+    () => reduce({
+      prior_turn_instance_id: "turn-a",
+      event_id: null,
+      binding_kind: "autonomous_replan",
+      binding_id: "replan-not-an-obligation",
+      settlement_effect_id: null,
+    }, ["durable_writeback_receipt", "quota_spend_receipt"], READ_TODO(null)),
+    /autonomous replan binding is malformed/,
+  );
+});

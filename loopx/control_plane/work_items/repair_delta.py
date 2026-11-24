@@ -19,7 +19,7 @@ from ..todos.contract import (
     normalize_todo_resume_when,
     normalize_todo_status,
 )
-from ..todos.projection import (
+from ..todos.todo_semantics import (
     todo_item_claimed_by_agent_or_unclaimed,
     todo_item_expires_at,
     todo_item_is_actionable_open,
@@ -630,7 +630,7 @@ def build_repair_delta_contract(
     update = active_state_next_action_update or {}
     effective_vision = agent_vision or existing_agent_vision or {}
     vision_patch = (
-        effective_vision.get("vision_patch")
+        cast(dict[str, Any], effective_vision.get("vision_patch"))
         if isinstance(effective_vision.get("vision_patch"), dict)
         else {}
     )

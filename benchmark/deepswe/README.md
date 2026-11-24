@@ -140,15 +140,33 @@ The treatment also needs three independent product-path proofs:
 Prepare the latter two with
 `benchmark_toolkit.native_codex_profile.install_native_codex_profile`. Do not copy
 `SKILL.md` files into a runner image. Generate the first input with
-`render_native_codex_goal_prompt`, build app-server's environment with
-`native_codex_app_server_environment(profile, provider_env_key=..., base_env=...)`,
-then separately exclude that key from agent shell and tool processes. The
-credential-free `native_codex_profile_environment` remains the default for CLI
-and preflight work. Set
+`render_native_codex_goal_prompt`, keep app-server on the credential-free
+`native_codex_profile_environment`, and route its provider through
+`serve_runner_owned_provider_gateway`. The app-server receives only the gateway
+URL and a fixed non-secret env sentinel. A Linux host-side worker must also run
+inside `native_codex_isolation`; filtering child env alone does not prevent a
+danger-full-access agent from reading parent process environments or ambient
+HOME files. `native_codex_app_server_shell_policy_args` remains defense in depth
+for model-created shells, not the credential boundary. Set
 `NativeGoalConfig.required_skill_ids=profile.required_skill_ids`. The runtime then
 uses `skills/list` before thread creation and fails before model work unless Codex
 actually discovers the installed skill set. A filesystem check alone is not
 treatment-fidelity evidence.
+
+### One read-only Turn with a retained decision
+
+Use the native runner with both `--decision-capture` and `--decision-sha256`
+to test a single ephemeral Codex Turn against an existing LoopX capture. Supply
+the absolute path to the original private `decision.json` and its digest. The
+runner verifies the UTF-8 bytes before sending them as standalone tool data
+with explicit Codex retention. This mode uses a read-only sandbox and ends
+with the first Turn. It does not attach a persistent native Goal.
+
+Use a Codex build that supports wrapped `thread/inject_items` retention, such
+as 0.171.0. Captures above 48,000 bytes and digest mismatches fail before
+`turn/start`. The receipt records the source digest and native Turn status.
+To qualify Compaction, inspect the provider request immediately after a
+mid-Turn window change and compare its tool data to the original bytes.
 
 ## Authority and anti-cheating
 
@@ -205,6 +223,11 @@ storage. Promote concrete result tables only after the matched study is solid
 enough to support the stated claim level.
 
 ### Public trajectory lifecycle summary
+
+For exploratory observations rather than a complete score release, see
+[DeepSWE behavior discoveries](behavior-discovery/README.md): a standalone article
+and bounded `behavior_finding` records. The note describes selected cases and
+explicitly scoped duration comparisons, not a benchmark-wide outcome conclusion.
 
 The runnable native Goal adapter now emits a nested
 `public_trajectory_summary_v0` beside its existing compact receipt. The summary

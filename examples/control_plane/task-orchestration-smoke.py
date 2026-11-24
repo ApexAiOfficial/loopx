@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from loopx.control_plane.quota.turn_envelope import build_turn_envelope  # noqa: E402
+from loopx.control_plane.quota.turn_envelope import compose_turn_decision  # noqa: E402
 from loopx.control_plane.scheduler.execution_context import (  # noqa: E402
     SchedulerRuntimeProfile,
     scheduler_execution_context_for_runtime_profile,
@@ -134,7 +134,9 @@ def payload(
     }
 
 
-def adaptive_payload() -> dict:
+def adaptive_payload(
+    *, allowed_domains: tuple[str, ...] = ("code", "validation")
+) -> dict:
     coordinator = "codex-alpha"
     coordination = {
         "agent_model": "peer_v1",
@@ -183,7 +185,7 @@ def adaptive_payload() -> dict:
             "mode": "multi_subagent",
             "allowed": True,
             "max_children": 2,
-            "allowed_domains": ["code", "validation"],
+            "allowed_domains": list(allowed_domains),
         },
     }
     attention = {
@@ -284,15 +286,30 @@ def main() -> int:
         assert blocked_turn["interaction_contract"]["mode"] == (
             "peer_coordination_blocked"
         ), blocked_turn
+        assert blocked_turn["automation_liveness"]["keep_active"] is True, (
+            blocked_turn
+        )
+        assert blocked_turn["automation_liveness"]["pause_allowed"] is False, (
+            blocked_turn
+        )
+        assert blocked_turn["automation_liveness"]["automation_action"] == (
+            "keep_active_peer_coordination_backoff"
+        ), blocked_turn
         assert blocked_turn["scheduler_hint"]["action"] == (
-            "return_to_owner_until_material_change"
+            "backoff_until_reassigned"
         ), blocked_turn
-        assert blocked_turn["scheduler_hint"]["codex_app"]["host_action"] == (
-            "pause_or_delete_current_heartbeat"
+        assert blocked_turn["scheduler_hint"]["cadence_class"] == (
+            "peer_coordination_wait"
         ), blocked_turn
-        assert blocked_turn["scheduler_hint"]["unchanged_poll"][
+        assert blocked_turn["scheduler_hint"]["app_automation"][
+            "recommended_interval_minutes"
+        ] == 10, blocked_turn
+        assert blocked_turn["scheduler_hint"]["app_automation"][
+            "example_progression_minutes"
+        ] == [10, 20, 30, 60], blocked_turn
+        assert blocked_turn["scheduler_hint"]["unchanged_poll"]["limits"][
             "local_scheduler"
-        ] == "stop", blocked_turn
+        ] == 3, blocked_turn
         assert blocked_turn["interaction_contract"]["cli_channel"][
             "spend_after_validation"
         ] is False, blocked_turn
@@ -340,14 +357,15 @@ def main() -> int:
         "coordinator_agent_id"
     ] == coordinator, reversed_decision
 
+    codex_context = scheduler_execution_context_for_runtime_profile(
+        SchedulerRuntimeProfile.CODEX_CLI_VISIBLE
+    )
     adaptive_decision = build_quota_should_run(
         adaptive_payload(),
         goal_id=GOAL_ID,
         agent_id="codex-alpha",
         available_capabilities=["subagent_spawn", "subagent_resume"],
-        scheduler_execution_context=scheduler_execution_context_for_runtime_profile(
-            SchedulerRuntimeProfile.CODEX_CLI_VISIBLE
-        ),
+        scheduler_execution_context=codex_context,
     )
     adaptive_contract = adaptive_decision["task_orchestration_contract"]
     assert adaptive_contract["schema_version"] == "task_orchestration_contract_v2"
@@ -361,40 +379,74 @@ def main() -> int:
         "resume",
     ]
 
-    turn_envelope = build_turn_envelope(adaptive_decision)
-    assert turn_envelope["action_signature"]["matches"] is True
+    unrestricted_state = adaptive_payload(allowed_domains=())
+    unrestricted_state["attention_queue"]["items"][0]["agent_todos"]["items"][
+        1
+    ].pop("task_domain")
+    unrestricted_decision = build_quota_should_run(
+        unrestricted_state,
+        goal_id=GOAL_ID,
+        agent_id="codex-alpha",
+        available_capabilities=["subagent_spawn", "subagent_resume"],
+        scheduler_execution_context=codex_context,
+    )
+    unrestricted_contract = unrestricted_decision["task_orchestration_contract"]
+    assert unrestricted_contract["mode"] == "adaptive"
+    assert unrestricted_contract["eligible_child_lanes"][0]["todo_id"] == (
+        "todo_validation"
+    )
+
+    codex_contract = compose_turn_decision(
+        adaptive_decision, scheduler_execution_context=codex_context, composed_settlement=True
+    )
     codex_plan = build_loopx_turn_plan(
-        turn_envelope,
+        codex_contract,
         host="codex-cli",
         execution_mode="interactive-visible",
     )
     codex_request = build_loopx_turn_host_request(codex_plan)
+    assert codex_plan["route"]["selected_todo"]["todo_id"] == "todo_primary"
+    assert codex_request["work_contract"] == codex_contract
+    assert "turn_envelope" not in codex_plan and "turn_envelope" not in codex_request
     assert [
-        item["context"]
-        for item in codex_request["child_operations"][0]["available_contexts"]
-    ] == ["fresh", "resume"]
+        item for item in codex_request["child_operations"][0]["available_contexts"]
+    ] == ["fresh"]
+    assert codex_request["child_operations"][0]["host_adapter"] == {
+        "host": "codex-cli",
+        "native_operation": "spawn_agent",
+        "arguments": {"fork_turns": "none"},
+        "requires_session": False,
+    }
 
+    claude_context = scheduler_execution_context_for_runtime_profile(
+        SchedulerRuntimeProfile.CLAUDE_CODE_VISIBLE
+    )
     claude_decision = build_quota_should_run(
         adaptive_payload(),
         goal_id=GOAL_ID,
         agent_id="codex-alpha",
         available_capabilities=["subagent_spawn"],
-        scheduler_execution_context=scheduler_execution_context_for_runtime_profile(
-            SchedulerRuntimeProfile.CLAUDE_CODE_VISIBLE
-        ),
+        scheduler_execution_context=claude_context,
+    )
+    claude_contract = compose_turn_decision(
+        claude_decision, scheduler_execution_context=claude_context, composed_settlement=True
     )
     claude_plan = build_loopx_turn_plan(
-        build_turn_envelope(claude_decision),
+        claude_contract,
         host="claude-code",
         execution_mode="interactive-visible",
     )
-    assert claude_plan["child_operations"][0]["available_contexts"] == [
-        {
-            "context": "fresh",
-            "native_operation": "Task",
-            "requires_session": False,
-        }
-    ]
+    claude_request = build_loopx_turn_host_request(claude_plan)
+    assert claude_plan["route"]["selected_todo"]["todo_id"] == "todo_primary"
+    assert claude_request["work_contract"] == claude_contract
+    assert "turn_envelope" not in claude_plan and "turn_envelope" not in claude_request
+    assert claude_request["child_operations"][0]["available_contexts"] == ["fresh"]
+    assert claude_request["child_operations"][0]["host_adapter"] == {
+        "host": "claude-code",
+        "native_operation": "Task",
+        "arguments": {},
+        "requires_session": False,
+    }
     print("task-orchestration-smoke ok")
     return 0
 

@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 import loopx.extensions.governed_capability_execution as governed_execution
+from loopx import paths
+from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
 from loopx.control_plane.effect_program import SettlementIdentity
 from loopx.control_plane.effect_runtime import EffectRuntimeRejected
 from loopx.extensions.capability_admission import (
@@ -18,9 +20,33 @@ from loopx.extensions.capability_admission import (
 from loopx.extensions.governed_capability_execution import (
     reconcile_governed_external_capability,
     start_governed_external_capability,
+    validate_governed_capability_result,
 )
 from loopx.extensions.runtime import install_extension
 from loopx.todos import list_goal_todos
+from tests.control_plane.canonical_authority_fixture import initialize_canonical_authority
+
+
+def test_default_governed_run_dir_follows_single_runtime_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_root = tmp_path / ".loopx"
+    legacy_root = tmp_path / ".codex" / "loopx"
+    monkeypatch.setattr(paths, "DEFAULT_RUNTIME_ROOT", current_root)
+    monkeypatch.setattr(paths, "LEGACY_RUNTIME_ROOT", legacy_root)
+    suffix = Path("extensions") / "governed-capability-runs"
+
+    assert governed_execution.default_governed_capability_run_dir() == current_root / suffix
+    legacy_root.mkdir(parents=True)
+    (legacy_root / paths.GLOBAL_REGISTRY_FILENAME).write_text("{}", encoding="utf-8")
+    assert governed_execution.default_governed_capability_run_dir() == legacy_root / suffix
+
+    current_root.mkdir()
+    (current_root / paths.GLOBAL_REGISTRY_FILENAME).write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="Both default LoopX registries exist"):
+        governed_execution.default_governed_capability_run_dir()
+    assert governed_execution.default_governed_capability_run_dir(current_root) == current_root / suffix
 
 
 def _provider(path: Path, *, call_log: Path) -> Path:
@@ -41,7 +67,12 @@ result = {{
     "schema_version": "fixture_material_capability_result_v0",
     "invocation_id": request["invocation_id"],
     "status": "running" if phase == "start" else "succeeded",
-    "observations": [{{"kind": "synthetic-progress", "phase": phase}}],
+    "observations": [{{
+        "kind": "synthetic-progress",
+        "phase": phase,
+        "confidence": 1.0,
+        "label": "材料",
+    }}],
     "domain_state_mutations": [],
     "domain_transition_receipts": [],
     "transition_proposals": [{{
@@ -86,7 +117,12 @@ json.dump(result, sys.stdout)
     return path
 
 
-def _installed_material_extension(tmp_path: Path) -> tuple[Path, Path, Path]:
+_MONITOR_PROPOSAL_KINDS = ("continuous_monitor_upsert", "continuous_monitor_complete")
+
+
+def _installed_material_extension(
+    tmp_path: Path, *, proposal_kinds: tuple[str, ...] = _MONITOR_PROPOSAL_KINDS
+) -> tuple[Path, Path, Path]:
     call_log = tmp_path / "provider-calls.txt"
     provider = _provider(tmp_path / "provider", call_log=call_log)
     (tmp_path / "profile.json").write_text(
@@ -104,10 +140,7 @@ def _installed_material_extension(tmp_path: Path) -> tuple[Path, Path, Path]:
                             "target_key_prefixes": ["fixture-material:"],
                         },
                         "transition_contract": {
-                            "proposal_kinds": [
-                                "continuous_monitor_upsert",
-                                "continuous_monitor_complete",
-                            ],
+                            "proposal_kinds": list(proposal_kinds),
                             "monitor_key_prefixes": ["fixture:"],
                             "monitor_action_kinds": ["poll_material_delivery"],
                             "monitor_target_key_prefixes": ["fixture-run:"],
@@ -188,6 +221,16 @@ integration_profile = "profile.json"
         operations=["publish"],
         execute=True,
     )
+    initialize_canonical_authority(
+        tmp_path / "runtime",
+        "fixture-goal",
+        build_todo_runtime_shadow_projection(
+            goal_id="fixture-goal",
+            todos=[],
+            handoff_mode="soft_claim",
+        ),
+        state_path=active_state,
+    )
     return state_file, registry, call_log
 
 
@@ -217,8 +260,12 @@ def _admission(identity: SettlementIdentity) -> dict[str, object]:
     }
 
 
-def _start_arguments(tmp_path: Path) -> dict[str, object]:
-    state_file, registry, _call_log = _installed_material_extension(tmp_path)
+def _start_arguments(
+    tmp_path: Path, *, proposal_kinds: tuple[str, ...] = _MONITOR_PROPOSAL_KINDS
+) -> dict[str, object]:
+    state_file, registry, _call_log = _installed_material_extension(
+        tmp_path, proposal_kinds=proposal_kinds
+    )
     identity = _identity()
     return {
         "state_file": state_file,
@@ -238,19 +285,50 @@ def _start_arguments(tmp_path: Path) -> dict[str, object]:
                     "digest": "sha256:synthetic-context",
                 }
             ],
-            "input": {"requirement_key": "REQ-1"},
+            "input": {
+                "requirement_key": "REQ-1",
+                "confidence": 1.0,
+                "label": "材料",
+            },
         },
         "admission": _admission(identity),
     }
 
 
-def test_material_start_is_previewable_and_provider_idempotent(tmp_path: Path) -> None:
+def _record_runtime_operations(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    operations: list[str] = []
+    runtime_result = governed_execution.effect_runtime_result
+
+    def record(
+        operation: str,
+        payload: Mapping[str, object],
+    ) -> object:
+        operations.append(operation)
+        return runtime_result(operation, payload)
+
+    monkeypatch.setattr(governed_execution, "effect_runtime_result", record)
+    return operations
+
+
+def test_material_start_is_previewable_and_provider_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     arguments = _start_arguments(tmp_path)
     call_log = tmp_path / "provider-calls.txt"
+    runtime_operations = _record_runtime_operations(monkeypatch)
 
     preview = start_governed_external_capability(**arguments)
+    assert runtime_operations == ["governed_capability.validate_result"]
+    runtime_operations.clear()
     started = start_governed_external_capability(**arguments, execute=True)
+    assert runtime_operations == [
+        "governed_capability.validate_result",
+        "governed_capability.validate_result",
+    ]
+    runtime_operations.clear()
     replay = start_governed_external_capability(**arguments, execute=True)
+    assert runtime_operations == ["governed_capability.validate_result"]
 
     assert preview["status"] == "ready"
     assert preview["executed"] is False
@@ -270,6 +348,44 @@ def test_material_start_is_previewable_and_provider_idempotent(tmp_path: Path) -
     assert monitors[0]["status"] == "open"
     journal = Path(arguments["run_dir"]) / f"{started['invocation_id']}.json"
     assert stat.S_IMODE(journal.stat().st_mode) == 0o600
+    journal_value = json.loads(journal.read_text(encoding="utf-8"))
+    assert started["provider_result_digest"] == governed_execution._canonical_digest(
+        journal_value["provider_result"]
+    )
+
+
+def test_legacy_provider_result_adapter_remains_available() -> None:
+    result = {
+        "schema_version": "fixture_material_capability_result_v0",
+        "invocation_id": "capability-legacy",
+        "status": "no_change",
+        "observations": [],
+        "domain_state_mutations": [],
+        "domain_transition_receipts": [],
+        "transition_proposals": [],
+        "effect_receipt": {
+            "schema_version": "loopx_external_effect_receipt_v0",
+            "invocation_id": "capability-legacy",
+            "idempotency_key": "legacy-effect",
+            "status": "no_change",
+            "external_ref": "legacy-ref",
+            "evidence_digest": "sha256:legacy-evidence",
+        },
+        "follow_up": {},
+    }
+
+    assert (
+        validate_governed_capability_result(
+            result,
+            invocation_id="capability-legacy",
+            effect_id="legacy-effect",
+            operation={
+                "result_schema": "fixture_material_capability_result_v0",
+                "effect_class": "external_write",
+            },
+        )
+        == result
+    )
 
 
 def test_material_start_recovers_monitor_after_pre_receipt_crash(
@@ -340,11 +456,13 @@ def test_material_operation_remains_unavailable_through_direct_invoke(
 
 def test_material_reconcile_writes_receipt_before_spending_and_replays(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     arguments = _start_arguments(tmp_path)
     started = start_governed_external_capability(**arguments, execute=True)
     identity = _identity()
     calls: list[str] = []
+    runtime_operations = _record_runtime_operations(monkeypatch)
 
     def writeback(context: Mapping[str, object]) -> dict[str, object]:
         calls.append("writeback")
@@ -369,12 +487,20 @@ def test_material_reconcile_writes_receipt_before_spending_and_replays(
         writeback=writeback,
         spend=spend,
     )
+    assert runtime_operations == [
+        "governed_capability.validate_result",
+        "governed_capability.validate_result",
+        "governed_capability.validate_settlement_callback",
+        "governed_capability.validate_settlement_callback",
+    ]
+    runtime_operations.clear()
     replay = reconcile_governed_external_capability(
         run_dir=arguments["run_dir"],
         invocation_id=str(started["invocation_id"]),
         writeback=writeback,
         spend=spend,
     )
+    assert runtime_operations == ["governed_capability.validate_result"]
 
     assert committed["status"] == "committed"
     assert committed["effect_id"] == identity.effect_id
@@ -460,6 +586,72 @@ def test_material_start_recovers_an_existing_journal_without_new_run_authority(
     replay = start_governed_external_capability(**arguments, execute=True)
 
     assert replay["invocation_id"] == started["invocation_id"]
+    assert (tmp_path / "provider-calls.txt").read_text(
+        encoding="utf-8"
+    ).splitlines() == ["start"]
+
+
+@pytest.mark.parametrize(
+    "admission_update, error",
+    [
+        ({"should_run": False}, "requires should_run=true"),
+        ({"selected_todo": None}, "selected_todo must be an object"),
+        (
+            {
+                "selected_todo": {
+                    "todo_id": "todo_fixturematerial1",
+                    "role": "agent",
+                    "status": "open",
+                    "action_kind": "different_material_action",
+                    "target_key": "fixture-material:delivery-1",
+                }
+            },
+            "not authorized by selected_todo action_kind",
+        ),
+    ],
+)
+def test_material_start_requires_current_authority_before_recovering_transitions(
+    tmp_path: Path,
+    admission_update: dict[str, object],
+    error: str,
+) -> None:
+    arguments = _start_arguments(tmp_path)
+    started = start_governed_external_capability(**arguments, execute=True)
+    journal_path = tmp_path / "runs" / f"{started['invocation_id']}.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["transition_receipts"] = []
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    arguments["admission"] = {
+        **arguments["admission"],
+        **admission_update,
+    }
+    before = journal_path.read_bytes()
+
+    with pytest.raises((ValueError, EffectRuntimeRejected), match=error):
+        start_governed_external_capability(**arguments, execute=True)
+
+    assert journal_path.read_bytes() == before
+    assert (tmp_path / "provider-calls.txt").read_text(
+        encoding="utf-8"
+    ).splitlines() == ["start"]
+
+
+def test_material_start_recovers_unsettled_transitions_with_current_authority(
+    tmp_path: Path,
+) -> None:
+    arguments = _start_arguments(tmp_path)
+    started = start_governed_external_capability(**arguments, execute=True)
+    journal_path = tmp_path / "runs" / f"{started['invocation_id']}.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["transition_receipts"] = []
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    replay = start_governed_external_capability(**arguments, execute=True)
+
+    assert len(replay["transition_receipts"]) == 1
+    assert replay["transition_receipts"][0]["proposal_id"] == (
+        "fixture_monitor_upsert_1"
+    )
     assert (tmp_path / "provider-calls.txt").read_text(
         encoding="utf-8"
     ).splitlines() == ["start"]
@@ -721,3 +913,98 @@ def test_material_reconcile_recovers_completion_after_pre_receipt_crash(
     )["todos"]
     assert len(monitors) == 1
     assert monitors[0]["status"] == "done"
+
+
+def _journal(tmp_path: Path, invocation_id: str) -> dict:
+    return json.loads(
+        (tmp_path / "runs" / f"{invocation_id}.json").read_text(encoding="utf-8")
+    )
+
+
+def test_an_operation_that_cannot_propose_a_team_plan_reads_no_plan_basis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A monitor-only operation starts exactly as before.
+
+    Its provider cannot return a team plan, so the start neither reads a plan
+    basis nor stores one: no extra runtime read, no new way to fail before the
+    provider runs.
+    """
+
+    reads: list[dict] = []
+    monkeypatch.setattr(
+        governed_execution,
+        "team_plan_state_fingerprint",
+        lambda **kwargs: reads.append(kwargs) or "sha256:unexpected",
+    )
+
+    started = start_governed_external_capability(
+        **_start_arguments(tmp_path), execute=True
+    )
+
+    assert reads == []
+    assert "team_plan_state_basis" not in _journal(tmp_path, started["invocation_id"])
+    assert [item["status"] for item in started["transition_receipts"]] == ["committed"]
+
+
+def test_an_operation_that_may_propose_a_team_plan_binds_the_basis_before_its_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stored basis is the state the agent saw before its provider ran.
+
+    No shipped contract admits a team plan yet, so this widens the manifest's
+    admitted kinds in-test to stand in for that future contract. State moves
+    while the provider runs; the journal keeps the earlier basis, and a replay
+    never re-binds it from the current state.
+    """
+
+    from loopx.control_plane.work_items.team_plan_adapter import (
+        team_plan_state_fingerprint,
+    )
+    from loopx.extensions import manifest
+
+    team_plan_kind = "steward_team_plan_preview"
+    monkeypatch.setattr(
+        manifest,
+        "_EXTERNAL_CAPABILITY_TRANSITION_PROPOSAL_KINDS",
+        {*manifest._EXTERNAL_CAPABILITY_TRANSITION_PROPOSAL_KINDS, team_plan_kind},
+    )
+    arguments = _start_arguments(
+        tmp_path, proposal_kinds=(*_MONITOR_PROPOSAL_KINDS, team_plan_kind)
+    )
+
+    def basis() -> str:
+        return team_plan_state_fingerprint(
+            registry_path=Path(str(arguments["registry_path"])),
+            goal_id="fixture-goal",
+            basis_agent_id="fixture-agent",
+        )
+
+    before = basis()
+    active_state = tmp_path / "ACTIVE_GOAL_STATE.md"
+    run_provider = governed_execution.execute_extension_runtime_binding
+
+    def provider_while_state_moves(*args, **kwargs):
+        active_state.write_text(
+            active_state.read_text(encoding="utf-8").replace(
+                "# Active Goal State", "# Active Goal State, revised"
+            ),
+            encoding="utf-8",
+        )
+        return run_provider(*args, **kwargs)
+
+    monkeypatch.setattr(
+        governed_execution,
+        "execute_extension_runtime_binding",
+        provider_while_state_moves,
+    )
+
+    started = start_governed_external_capability(**arguments, execute=True)
+
+    assert _journal(tmp_path, started["invocation_id"])["team_plan_state_basis"] == before
+    assert basis() != before
+    replay = start_governed_external_capability(**arguments, execute=True)
+    assert replay["transition_receipts"] == started["transition_receipts"]
+    assert _journal(tmp_path, started["invocation_id"])["team_plan_state_basis"] == before

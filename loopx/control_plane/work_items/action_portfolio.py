@@ -4,155 +4,233 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
-from ..todos.contract import (
-    TODO_TASK_CLASS_ADVANCEMENT,
-    TODO_TASK_CLASS_MONITOR,
-    normalize_todo_claimed_by,
-    normalize_todo_id,
+from ..goals.goal_vision_policy import DEFAULT_PLANNING_HORIZON_GOAL
+from ..coordination.coordination_state_contract_generated import (
+    ACTION_PORTFOLIO_PLANNING_PACKET_REQUEST_SCHEMA,
+    ACTION_PORTFOLIO_PLANNING_PACKET_RESULT_SCHEMA,
+    ACTION_PORTFOLIO_SELECTION_REQUEST_SCHEMA,
+    ACTION_PORTFOLIO_SELECTION_RESULT_SCHEMA,
 )
-from ..todos.projection import (
-    todo_item_is_actionable_open,
-    todo_item_task_class,
+from ..todos.contract import normalize_todo_id, normalize_todo_task_class
+from .planning_inventory import (
+    build_quota_planning_inventory_request,
+    compact_planning_candidate,
 )
-from ..todos.summary_item import compact_todo_summary_item
-from .primary_action import protocol_action_text
 
-
-ACTION_PORTFOLIO_REQUEST_SCHEMA_VERSION = "quota_action_portfolio_request_v0"
-ACTION_PORTFOLIO_SCHEMA_VERSION = "quota_action_portfolio_v0"
+ACTION_SELECTION_QUALIFICATION_REQUEST_SCHEMA_VERSION = ACTION_PORTFOLIO_SELECTION_REQUEST_SCHEMA
+ACTION_SELECTION_QUALIFICATION_SCHEMA_VERSION = ACTION_PORTFOLIO_SELECTION_RESULT_SCHEMA
+QUOTA_PLANNING_PACKET_REQUEST_SCHEMA_VERSION = ACTION_PORTFOLIO_PLANNING_PACKET_REQUEST_SCHEMA
+QUOTA_PLANNING_PACKET_SCHEMA_VERSION = ACTION_PORTFOLIO_PLANNING_PACKET_RESULT_SCHEMA
+RETAINED_ACTION_SELECTION_REENTRY_REQUEST_SCHEMA_VERSION = (
+    "retained_action_selection_reentry_request_v0"
+)
+RETAINED_ACTION_SELECTION_REENTRY_SCHEMA_VERSION = (
+    "retained_action_selection_reentry_v0"
+)
 
 
 def _compact_candidate(value: Mapping[str, Any]) -> dict[str, Any] | None:
-    todo_id = normalize_todo_id(value.get("todo_id"))
-    text = protocol_action_text(value.get("text"), limit=500)
-    if not todo_id or not text:
-        return None
-    compact = compact_todo_summary_item(dict(value), text=text)
-    for field in (
-        "source",
-        "selected_by",
-        "claim_required_before_work",
-        "availability_reason",
-    ):
-        if value.get(field) is not None:
-            compact[field] = value[field]
-    return compact
+    return compact_planning_candidate(value)
 
 
-def _runnable_candidates(
-    *,
-    agent_id: str,
-    agent_todo_summary: Mapping[str, Any] | None,
-    capability_gate: Mapping[str, Any] | None,
-) -> list[dict[str, Any]]:
-    if not isinstance(agent_todo_summary, Mapping):
+def _frontier_acceptance_gaps(
+    projection: Mapping[str, Any] | None,
+) -> list[Any]:
+    if not isinstance(projection, Mapping):
         return []
-    capability_candidates = (
-        capability_gate.get("runnable_candidates")
-        if isinstance(capability_gate, Mapping)
-        else None
-    )
-    if isinstance(capability_candidates, list):
-        sources: list[list[Any]] = [capability_candidates]
-    else:
-        sources = []
-        for field in (
-            "active_next_action_executable_items",
-            "first_executable_items",
-            "executable_backlog_items",
-        ):
-            items = agent_todo_summary.get(field)
-            if isinstance(items, list):
-                sources.append(items)
-
-    candidates: list[dict[str, Any]] = []
-    for items in sources:
-        for item in items:
-            if not isinstance(item, Mapping):
-                continue
-            candidate = dict(item)
-            claimed_by = normalize_todo_claimed_by(candidate.get("claimed_by"))
-            if (
-                not todo_item_is_actionable_open(candidate)
-                or todo_item_task_class(candidate) != TODO_TASK_CLASS_ADVANCEMENT
-                or (claimed_by is not None and claimed_by != agent_id)
-            ):
-                continue
-            compact = _compact_candidate(candidate)
-            if compact is None:
-                continue
-            if claimed_by is None:
-                compact["claim_required_before_work"] = True
-            candidates.append(compact)
-    return candidates
+    acceptance_gaps = projection.get("acceptance_gaps")
+    return acceptance_gaps if isinstance(acceptance_gaps, list) else []
 
 
-def _unavailable_higher_priority_candidates(
-    blocked_priority_fallback: Mapping[str, Any] | None,
-) -> list[dict[str, Any]]:
-    if not isinstance(blocked_priority_fallback, Mapping):
-        return []
-    items = blocked_priority_fallback.get("blocked_items")
-    unavailable: list[dict[str, Any]] = []
-    for item in items if isinstance(items, list) else []:
-        if not isinstance(item, Mapping):
-            continue
-        candidate = dict(item)
-        task_class = todo_item_task_class(candidate)
-        if task_class == TODO_TASK_CLASS_MONITOR and candidate.get("next_due_at"):
-            candidate["availability_reason"] = "scheduled_for_future"
-        elif candidate.get("status"):
-            candidate["availability_reason"] = (
-                f"status_{str(candidate['status']).strip().lower()}"
-            )
-        else:
-            candidate["availability_reason"] = "not_currently_executable"
-        compact = _compact_candidate(candidate)
-        if compact is not None:
-            unavailable.append(compact)
-    return unavailable
-
-
-def build_quota_action_portfolio(
+def build_quota_planning_packet(
     *,
-    primary: Mapping[str, Any] | None,
+    projection_enabled: bool,
+    include_detail: bool,
+    goal_id: str,
+    selected: Mapping[str, Any] | None,
     agent_id: str | None,
     agent_todo_summary: Mapping[str, Any] | None,
+    agent_todo_source_items: list[dict[str, Any]],
     capability_gate: Mapping[str, Any] | None,
     blocked_priority_fallback: Mapping[str, Any] | None,
-    max_fallback_actions: int = 2,
-) -> dict[str, Any] | None:
-    """Adapt gated Python projections into the TypeScript-owned portfolio."""
+    goal_frontier_projection: Mapping[str, Any] | None,
+    replan_selection_context: Mapping[str, Any] | None = None,
+    source_status: Mapping[str, Any] | None = None,
+    planning_horizon_goal: bool = DEFAULT_PLANNING_HORIZON_GOAL,
+) -> dict[str, Any]:
+    """Project every requested planning lens through one TypeScript request."""
 
-    safe_agent_id = normalize_todo_claimed_by(agent_id)
-    compact_primary = _compact_candidate(primary) if primary is not None else None
-    if not safe_agent_id or compact_primary is None:
-        return None
+    if not isinstance(planning_horizon_goal, bool):
+        raise ValueError("planning_horizon_goal must be a boolean")
+    if not projection_enabled and not include_detail and replan_selection_context is None:
+        return {}
+    inventory_request = build_quota_planning_inventory_request(
+        goal_id=goal_id,
+        selected=selected,
+        agent_id=agent_id,
+        agent_todo_summary=agent_todo_summary,
+        agent_todo_source_items=agent_todo_source_items,
+        capability_gate=capability_gate,
+        blocked_priority_fallback=blocked_priority_fallback,
+    )
+    if inventory_request is None:
+        return {}
+    from .replan_context_codec import goal_context_facts
+
+    goal_facts = (
+        goal_context_facts(source_status, goal_id, (agent_todo_summary or {}).get("goal_acceptance_contract"))
+        if planning_horizon_goal and source_status and source_status.get("registry") else None
+    )
     try:
         projected = effect_runtime_result(
             "work_item.action_portfolio.project",
             {
-                "schema_version": ACTION_PORTFOLIO_REQUEST_SCHEMA_VERSION,
-                "primary": compact_primary,
-                "candidates": _runnable_candidates(
-                    agent_id=safe_agent_id,
-                    agent_todo_summary=agent_todo_summary,
-                    capability_gate=capability_gate,
+                "schema_version": QUOTA_PLANNING_PACKET_REQUEST_SCHEMA_VERSION,
+                "planning_inventory_request": inventory_request,
+                "projection_enabled": projection_enabled,
+                "include_detail": include_detail,
+                "acceptance_gaps": _frontier_acceptance_gaps(
+                    goal_frontier_projection
                 ),
-                "unavailable_higher_priority": (
-                    _unavailable_higher_priority_candidates(
-                        blocked_priority_fallback
-                    )
-                ),
-                "max_fallback_actions": max_fallback_actions,
+                **({"goal_facts": goal_facts} if goal_facts is not None else {}),
+                **({"replan_selection_context": dict(replan_selection_context)}
+                   if replan_selection_context is not None else {}),
             },
         )
     except EffectRuntimeRejected as exc:
         raise ValueError(str(exc)) from None
-    if projected is None:
-        return None
     if not isinstance(projected, Mapping) or (
-        projected.get("schema_version") != ACTION_PORTFOLIO_SCHEMA_VERSION
+        projected.get("schema_version") != QUOTA_PLANNING_PACKET_SCHEMA_VERSION
     ):
-        raise RuntimeError("TypeScript quota action portfolio shape mismatch")
-    return dict(projected)
+        raise RuntimeError("TypeScript quota planning packet shape mismatch")
+    result: dict[str, Any] = {}
+    for field in (
+        "action_portfolio",
+        "planning_horizon",
+        "agent_todo_planning_inventory",
+    ):
+        value = projected.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, Mapping):
+            raise TypeError(f"TypeScript quota planning packet {field} mismatch")
+        result[field] = dict(value)
+    return result
+
+
+def qualify_action_selection(
+    *,
+    requested_todo_id: str,
+    candidate: Mapping[str, Any] | None,
+    requested_task_class: str | None,
+    should_run: bool,
+    normal_delivery_allowed: bool,
+    delivery_preemptions: list[str],
+    scoped_fallback_todo_id: str | None = None,
+    quota_state: str | None = None,
+    goal_health_ok: bool = False,
+) -> dict[str, Any]:
+    """Adapt current Python projections into the TS-owned selection reducer."""
+
+    compact_candidate = _compact_candidate(candidate) if candidate is not None else None
+    try:
+        result = effect_runtime_result(
+            "work_item.action_selection.qualify",
+            {
+                "schema_version": ACTION_SELECTION_QUALIFICATION_REQUEST_SCHEMA_VERSION,
+                "requested_todo_id": requested_todo_id,
+                "candidate": compact_candidate,
+                "requested_task_class": requested_task_class,
+                "should_run": should_run,
+                "normal_delivery_allowed": normal_delivery_allowed,
+                "delivery_preemptions": delivery_preemptions,
+                "scoped_fallback_todo_id": scoped_fallback_todo_id,
+                "quota_state": quota_state,
+                "goal_health_ok": goal_health_ok,
+            },
+        )
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None
+    if not isinstance(result, Mapping) or (
+        result.get("schema_version") != ACTION_SELECTION_QUALIFICATION_SCHEMA_VERSION
+    ):
+        raise RuntimeError("TypeScript action-selection qualification shape mismatch")
+    return dict(result)
+
+
+def qualify_action_selection_from_inventory(
+    *,
+    requested_todo_id: str,
+    candidate: Mapping[str, Any] | None,
+    source_items: list[dict[str, Any]],
+    should_run: bool,
+    normal_delivery_allowed: bool,
+    delivery_preemptions: list[str],
+    scoped_fallback_todo_id: str | None = None,
+    quota_state: str | None = None,
+    goal_health_ok: bool = False,
+) -> dict[str, Any]:
+    """Resolve the requested task class before invoking the typed reducer."""
+
+    requested_item = next(
+        (
+            item
+            for item in source_items
+            if normalize_todo_id(item.get("todo_id")) == requested_todo_id
+        ),
+        None,
+    )
+    requested_task_class = (
+        normalize_todo_task_class(
+            requested_item.get("task_class"),
+            text=str(requested_item.get("text") or ""),
+            action_kind=requested_item.get("action_kind"),
+        )
+        if requested_item is not None
+        else None
+    )
+    return qualify_action_selection(
+        requested_todo_id=requested_todo_id,
+        candidate=candidate,
+        requested_task_class=requested_task_class,
+        should_run=should_run,
+        normal_delivery_allowed=normal_delivery_allowed,
+        delivery_preemptions=delivery_preemptions,
+        scoped_fallback_todo_id=scoped_fallback_todo_id,
+        quota_state=quota_state,
+        goal_health_ok=goal_health_ok,
+    )
+
+
+def reconcile_retained_action_selection(
+    *,
+    retained_todo_id: str,
+    projected_todo_id: str | None,
+    effective_action: str,
+    replan_obligation_id: str | None,
+) -> dict[str, Any]:
+    """Ask the typed owner whether a reentry may bind its new projection."""
+
+    try:
+        result = effect_runtime_result(
+            "work_item.action_selection.reconcile_retained",
+            {
+                "schema_version": (
+                    RETAINED_ACTION_SELECTION_REENTRY_REQUEST_SCHEMA_VERSION
+                ),
+                "retained_todo_id": retained_todo_id,
+                "projected_todo_id": projected_todo_id,
+                "effective_action": effective_action,
+                "replan_obligation_id": replan_obligation_id,
+            },
+        )
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None
+    if not isinstance(result, Mapping) or (
+        result.get("schema_version")
+        != RETAINED_ACTION_SELECTION_REENTRY_SCHEMA_VERSION
+    ):
+        raise RuntimeError(
+            "TypeScript retained action-selection reentry shape mismatch"
+        )
+    return dict(result)

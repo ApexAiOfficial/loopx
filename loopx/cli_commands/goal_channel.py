@@ -23,7 +23,12 @@ from ..extensions.lark.goal_channel import (
     setup_lark_goal_channel,
     sync_lark_goal_channel,
 )
-from ..extensions.lark.goal_channel_contracts import binding_for_goal, operation_packet
+from ..extensions.lark.goal_channel_contracts import (
+    binding_for_goal,
+    notification_request_snapshot,
+    operation_packet,
+)
+from ..extensions.lark.goal_topic_batch import upgrade_lark_goal_topics
 from ..extensions.runtime import (
     default_extension_state_file,
     resolve_extension_activation,
@@ -31,18 +36,17 @@ from ..extensions.runtime import (
 from ..control_plane.runtime.runtime_projection_route import (
     resolve_goal_source_runtime_route,
 )
-from ..control_plane.goals.botmux_runtime import (
-    BOTMUX_DEFAULT_ENDPOINT,
-    BOTMUX_DEFAULT_TOKEN_ENV,
-    default_botmux_runtime_binding_path,
-    disable_botmux_runtime,
-    doctor_botmux_runtime,
-    setup_botmux_runtime,
-    status_botmux_runtime,
-    trigger_botmux_runtime,
+from .goal_channel_runtime import (
+    register_goal_channel_runtime_commands,
+    run_goal_channel_runtime,
+)
+from .goal_channel_operation import (
+    GoalChannelOperationContext,
+    register_goal_channel_operation_commands,
+    run_goal_channel_operation,
 )
 from ..history import load_registry
-from ..paths import registry_project_root, resolve_runtime_root
+from ..paths import resolve_runtime_root
 from ..quota import build_quota_should_run
 from ..status import collect_status
 
@@ -55,7 +59,7 @@ OutputFormat = Callable[[argparse.Namespace], str]
 
 
 def register_goal_channel_commands(
-    subparsers: argparse._SubParsersAction,
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
     add_subcommand_format: Callable[[argparse.ArgumentParser], None],
 ) -> None:
     parser = subparsers.add_parser(
@@ -63,6 +67,18 @@ def register_goal_channel_commands(
         help="Project one LoopX goal into a provider-backed collaboration channel.",
     )
     sub = parser.add_subparsers(dest="goal_channel_command", required=True)
+
+    upgrade = sub.add_parser(
+        "upgrade",
+        help="Upgrade old connections to Agent inboxes in place. Dry-run unless --execute.",
+    )
+    add_subcommand_format(upgrade)
+    _add_common_args(upgrade)
+    upgrade.add_argument("--connection-id", help="Select one existing connection.")
+    upgrade.add_argument(
+        "--agent-id", help="Recipient for an exact unassigned connection."
+    )
+    upgrade.add_argument("--execute", action="store_true")
 
     setup = sub.add_parser(
         "setup",
@@ -158,6 +174,21 @@ def register_goal_channel_commands(
         action="store_false",
         help="Disable automatic human gate notifications.",
     )
+    automation.add_argument(
+        "--auto-notify-blocked-notices",
+        dest="auto_notify_blocked_notices",
+        action="store_true",
+        help="Send new or materially changed blocked Todo notices to the Goal Channel.",
+    )
+    automation.add_argument(
+        "--no-auto-notify-blocked-notices",
+        dest="auto_notify_blocked_notices",
+        action="store_false",
+        help="Disable automatic blocked Todo notices.",
+    )
+    configure.set_defaults(
+        auto_notify_human_gates=None, auto_notify_blocked_notices=None
+    )
     configure.add_argument("--execute", action="store_true")
 
     doctor = sub.add_parser(
@@ -183,68 +214,24 @@ def register_goal_channel_commands(
     add_subcommand_format(notify)
     _add_common_args(notify)
     notify.add_argument("--agent-id")
-    notify.add_argument("--cooldown-seconds", type=int, default=3600)
+    notify.add_argument(
+        "--cooldown-seconds",
+        type=int,
+        default=None,
+        help=(
+            "Accepted for compatibility; delivery repeats only for a material "
+            "gate-state generation or an explicit quota reminder window."
+        ),
+    )
     notify.add_argument("--execute", action="store_true")
 
-    runtime = sub.add_parser(
-        "runtime",
-        help="Bind and drive an optional IM/runtime provider for a Goal Channel.",
-    )
-    runtime_sub = runtime.add_subparsers(
-        dest="goal_channel_runtime_command",
-        required=True,
-    )
-    runtime_setup = runtime_sub.add_parser(
-        "setup",
-        help="Verify and bind one botmux runtime. Dry-run unless --execute.",
-    )
-    add_subcommand_format(runtime_setup)
-    _add_runtime_common_args(runtime_setup)
-    runtime_setup.add_argument("--endpoint", default=BOTMUX_DEFAULT_ENDPOINT)
-    runtime_setup.add_argument("--bot-id", required=True)
-    runtime_setup.add_argument("--chat-id", required=True)
-    runtime_setup.add_argument("--token-env", default=BOTMUX_DEFAULT_TOKEN_ENV)
-    runtime_setup.add_argument("--execute", action="store_true")
-
-    runtime_doctor = runtime_sub.add_parser(
-        "doctor",
-        help="Verify the configured botmux daemon, bot, project, and chat route.",
-    )
-    add_subcommand_format(runtime_doctor)
-    _add_runtime_common_args(runtime_doctor)
-
-    runtime_trigger = runtime_sub.add_parser(
-        "trigger",
-        help="Queue one bounded LoopX turn through the configured botmux runtime.",
-    )
-    add_subcommand_format(runtime_trigger)
-    _add_runtime_common_args(runtime_trigger)
-    runtime_trigger.add_argument("--instruction")
-    runtime_trigger.add_argument(
-        "--turn-key",
-        help="Explicit semantic revision key for a deliberate new runtime turn.",
-    )
-    runtime_trigger.add_argument("--execute", action="store_true")
-
-    runtime_status = runtime_sub.add_parser(
-        "status",
-        help="Read the typed lifecycle result of the current botmux runtime turn.",
-    )
-    add_subcommand_format(runtime_status)
-    _add_runtime_common_args(runtime_status)
-    runtime_status.add_argument(
-        "--execute",
-        action="store_true",
-        help="Persist the observed runtime state into the local-private receipt.",
+    register_goal_channel_operation_commands(
+        sub,
+        add_subcommand_format,
+        _add_common_args,
     )
 
-    runtime_disable = runtime_sub.add_parser(
-        "disable",
-        help="Disable this goal's botmux runtime binding. Dry-run unless --execute.",
-    )
-    add_subcommand_format(runtime_disable)
-    _add_runtime_common_args(runtime_disable)
-    runtime_disable.add_argument("--execute", action="store_true")
+    register_goal_channel_runtime_commands(sub, add_subcommand_format)
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -256,14 +243,6 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target-path", help=argparse.SUPPRESS)
 
 
-def _add_runtime_common_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--goal-id", required=True)
-    parser.add_argument(
-        "--runtime-binding-path",
-        help="Local-private botmux runtime binding path beside the project registry.",
-    )
-
-
 def _error_packet(
     *,
     goal_id: str | None,
@@ -271,8 +250,11 @@ def _error_packet(
     execute: bool,
     blocker: str,
     summary: str,
+    external_write_performed: bool = False,
+    failure_stage: str | None = None,
+    details: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    packet: dict[str, object] = {
         "schema_version": "loopx_goal_channel_operation_v0",
         "ok": False,
         "goal_id": goal_id,
@@ -280,7 +262,7 @@ def _error_packet(
         "operation": operation,
         "execute": execute,
         "status": "blocked",
-        "external_write_performed": False,
+        "external_write_performed": external_write_performed,
         "readback_verified": False,
         "idempotency_key": None,
         "receipt_id": None,
@@ -288,6 +270,11 @@ def _error_packet(
         "private_provider_payload_captured": False,
         "blocker": blocker,
     }
+    if failure_stage:
+        packet["failure_stage"] = failure_stage
+    if details:
+        packet["details"] = dict(details)
+    return packet
 
 
 def _target_path(args: argparse.Namespace, runtime_root: Path) -> Path:
@@ -321,7 +308,7 @@ def _source_context(
     registry_path: Path,
     goal_id: str,
     binding_path_arg: str | None = None,
-) -> tuple[dict[str, Any], Path, Path]:
+) -> tuple[dict[str, Any], Path, Path, Path]:
     source_route = resolve_goal_source_runtime_route(
         registry_path=registry_path,
         goal_id=goal_id,
@@ -339,7 +326,8 @@ def _source_context(
         if binding_path_arg
         else default_goal_channel_binding_path(source_registry_path)
     )
-    return source_registry, source_registry_path, binding_path
+    source_runtime_root = Path(str(source_route["source_runtime_root"]))
+    return source_registry, source_registry_path, binding_path, source_runtime_root
 
 
 def _attach_goals(
@@ -378,7 +366,7 @@ def _attach_goals(
     external_write_performed = False
     readback_verified = True
     for goal_id in unique_goal_ids:
-        source_registry, source_registry_path, binding_path = _source_context(
+        source_registry, source_registry_path, binding_path, _ = _source_context(
             registry=registry,
             registry_path=registry_path,
             goal_id=goal_id,
@@ -443,19 +431,22 @@ def _quota_packet(
     goal_id: str,
     agent_id: str | None,
 ) -> dict[str, Any]:
-    project_root = registry_project_root(registry_path)
     status = collect_status(
         registry_path=registry_path,
         runtime_root_override=runtime_root_arg,
-        scan_roots=[project_root],
         limit=20,
         goal_id=goal_id,
     )
-    return build_quota_should_run(
+    packet = build_quota_should_run(
         status,
         goal_id=goal_id,
         agent_id=agent_id,
     )
+    # Transport adapter: retain the complete same-read Todo projection only
+    # for this notification. Quota's 180-character hot path stays unchanged;
+    # the shared TS presentation owner checks identity/version/lifecycle.
+    packet["request_snapshot"] = notification_request_snapshot(status, goal_id)
+    return packet
 
 
 def handle_goal_channel_command(
@@ -479,97 +470,58 @@ def handle_goal_channel_command(
     )
     if command == "runtime":
         assert goal_id is not None
-        source_registry, source_registry_path, _ = _source_context(
+        source_registry, source_registry_path, _, _ = _source_context(
             registry=registry,
             registry_path=registry_path,
             goal_id=goal_id,
         )
-        runtime_binding_path = (
-            Path(str(args.runtime_binding_path)).expanduser()
-            if getattr(args, "runtime_binding_path", None)
-            else default_botmux_runtime_binding_path(source_registry_path)
+        payload = run_goal_channel_runtime(
+            args, registry=source_registry, registry_path=source_registry_path
         )
-        runtime_command = str(args.goal_channel_runtime_command)
-        try:
-            if runtime_command == "setup":
-                payload = setup_botmux_runtime(
-                    registry=source_registry,
-                    registry_path=source_registry_path,
-                    goal_id=goal_id,
-                    binding_path=runtime_binding_path,
-                    endpoint=args.endpoint,
-                    bot_id=args.bot_id,
-                    chat_id=args.chat_id,
-                    token_env=args.token_env,
-                    execute=execute,
-                )
-            elif runtime_command == "doctor":
-                payload = doctor_botmux_runtime(
-                    goal_id=goal_id,
-                    binding_path=runtime_binding_path,
-                )
-            elif runtime_command == "trigger":
-                payload = trigger_botmux_runtime(
-                    registry=source_registry,
-                    registry_path=source_registry_path,
-                    goal_id=goal_id,
-                    binding_path=runtime_binding_path,
-                    instruction=args.instruction,
-                    turn_key=args.turn_key,
-                    execute=execute,
-                )
-            elif runtime_command == "status":
-                payload = status_botmux_runtime(
-                    goal_id=goal_id,
-                    binding_path=runtime_binding_path,
-                    execute=execute,
-                )
-            elif runtime_command == "disable":
-                payload = disable_botmux_runtime(
-                    goal_id=goal_id,
-                    binding_path=runtime_binding_path,
-                    execute=execute,
-                )
-            else:
-                raise ValueError(
-                    f"unknown goal-channel runtime command: {runtime_command}"
-                )
-        except ValueError:
-            payload = {
-                "schema_version": "loopx_goal_channel_runtime_operation_v0",
-                "ok": False,
-                "goal_id": goal_id,
-                "provider": "botmux",
-                "operation": f"runtime_{runtime_command}",
-                "execute": execute,
-                "status": "blocked",
-                "external_write_performed": False,
-                "readback_verified": False,
-                "idempotency_key": None,
-                "receipt_id": None,
-                "public_summary": "the botmux runtime configuration is invalid",
-                "private_provider_payload_captured": False,
-                "blocker": "invalid_configuration",
-            }
         print_payload(payload, output_format(args), render_goal_channel_markdown)
         return 0 if payload.get("ok") else 1
-    if command == "configure" and bool(args.auto_notify_human_gates):
+    if command in {"inspect-operation", "consume-operation", "report-operation"}:
+        # Original-Agent continuations do not call Lark. They must remain
+        # readable/settleable even if that transport extension is unavailable.
         assert goal_id is not None
-        _, source_registry_path, binding_path = _source_context(
+        _, source_path, source_binding, source_root = _source_context(
+            registry=registry,
+            registry_path=registry_path,
+            goal_id=goal_id,
+        )
+        payload = run_goal_channel_operation(
+            args,
+            context=GoalChannelOperationContext(
+                invoked_runtime_root=runtime_root,
+                source_registry_path=source_path,
+                source_runtime_root=source_root,
+                binding_path=source_binding,
+            ),
+        )
+        assert payload is not None
+        print_payload(payload, output_format(args), render_goal_channel_markdown)
+        return 0 if payload.get("ok") else 1
+    if command == "configure" and (
+        args.auto_notify_human_gates is True
+        or getattr(args, "auto_notify_blocked_notices", None) is True
+    ):
+        assert goal_id is not None
+        _, source_registry_path, binding_path, _ = _source_context(
             registry=registry,
             registry_path=registry_path,
             goal_id=goal_id,
             binding_path_arg=getattr(args, "binding_path", None),
         )
-        default_binding_path = default_goal_channel_binding_path(
-            source_registry_path
-        )
+        default_binding_path = default_goal_channel_binding_path(source_registry_path)
     else:
         binding_path = None
         default_binding_path = None
     if (
         command == "configure"
-        and bool(args.auto_notify_human_gates)
+        and (
+            args.auto_notify_human_gates is True
+            or getattr(args, "auto_notify_blocked_notices", None) is True
+        )
         and binding_path is not None
         and default_binding_path is not None
         and binding_path.resolve() != default_binding_path.resolve()
@@ -580,15 +532,18 @@ def handle_goal_channel_command(
             execute=execute,
             blocker="noncanonical_binding_path",
             summary=(
-                "automatic human gate delivery requires the project-local "
+                "automatic Goal Channel delivery requires the project-local "
                 "default Goal Channel binding"
             ),
         )
         print_payload(payload, output_format(args), render_goal_channel_markdown)
         return 1
-    if command == "configure" and not bool(args.auto_notify_human_gates):
+    if command == "configure" and (
+        args.auto_notify_human_gates is False
+        or getattr(args, "auto_notify_blocked_notices", None) is False
+    ):
         assert goal_id is not None
-        source_registry, _, binding_path = _source_context(
+        source_registry, _, binding_path, _ = _source_context(
             registry=registry,
             registry_path=registry_path,
             goal_id=goal_id,
@@ -599,7 +554,10 @@ def handle_goal_channel_command(
                 registry=source_registry,
                 goal_id=goal_id,
                 binding_path=binding_path,
-                human_gate_auto_notify=False,
+                human_gate_auto_notify=args.auto_notify_human_gates,
+                blocked_notice_auto_notify=getattr(
+                    args, "auto_notify_blocked_notices", None
+                ),
                 execute=execute,
             )
         except Exception:
@@ -676,95 +634,127 @@ def handle_goal_channel_command(
                     )
             else:
                 assert goal_id is not None
-                source_registry, source_registry_path, binding_path = _source_context(
+                (
+                    source_registry,
+                    source_registry_path,
+                    binding_path,
+                    source_runtime_root,
+                ) = _source_context(
                     registry=registry,
                     registry_path=registry_path,
                     goal_id=goal_id,
                     binding_path_arg=getattr(args, "binding_path", None),
                 )
-                target_name = str(getattr(args, "target", None) or "")
-                if not target_name:
-                    target_name = _binding_target_name(binding_path, goal_id)
-                provider_target = (
-                    _provider_target(
-                        target_path=target_path,
-                        target_name=target_name,
-                    )
-                    if target_name
-                    else None
+                operation_payload = run_goal_channel_operation(
+                    args,
+                    context=GoalChannelOperationContext(
+                        invoked_runtime_root=runtime_root,
+                        source_registry_path=source_registry_path,
+                        source_runtime_root=source_runtime_root,
+                        binding_path=binding_path,
+                    ),
                 )
-                if target_name and provider_target is None:
-                    payload = _error_packet(
-                        goal_id=goal_id,
-                        operation=command.replace("-", "_"),
-                        execute=execute,
-                        blocker="provider_target_missing",
-                        summary="configure the named shared provider target first",
-                    )
-                elif command == "setup":
-                    payload = setup_lark_goal_channel(
-                        registry=source_registry,
-                        registry_path=source_registry_path,
-                        goal_id=goal_id,
-                        binding_path=binding_path,
-                        target_name=target_name or None,
-                        provider_target=provider_target,
-                        chat_id=args.chat_id,
-                        chat_name=args.chat_name,
-                        base_url=args.base_url,
-                        base_token=args.base_token,
-                        table_id=args.table_id,
-                        identity_mode=args.identity_mode,
-                        sender_profile=args.sender_profile,
-                        sender_identity=args.sender_identity,
-                        bot_app_id=getattr(args, "bot_app_id", None),
-                        bot_display_name=args.bot_display_name,
-                        cli_bin=args.cli_bin,
-                        execute=execute,
-                    )
-                elif command == "configure":
-                    payload = configure_lark_goal_channel_automation(
-                        registry=source_registry,
-                        goal_id=goal_id,
-                        binding_path=binding_path,
-                        human_gate_auto_notify=bool(args.auto_notify_human_gates),
-                        execute=execute,
-                    )
-                elif command == "doctor":
-                    payload = doctor_lark_goal_channel(
-                        registry=source_registry,
-                        registry_path=source_registry_path,
-                        goal_id=goal_id,
-                        binding_path=binding_path,
-                        provider_target=provider_target,
-                    )
-                elif command == "sync":
-                    payload = sync_lark_goal_channel(
-                        registry=source_registry,
-                        registry_path=source_registry_path,
-                        goal_id=goal_id,
-                        binding_path=binding_path,
-                        provider_target=provider_target,
-                        agent_id=args.agent_id,
-                        execute=execute,
-                    )
-                elif command == "notify-gate":
-                    payload = notify_lark_goal_channel_gate(
-                        registry=source_registry,
-                        goal_id=goal_id,
-                        binding_path=binding_path,
-                        provider_target=provider_target,
-                        quota_packet=_quota_packet(
-                            registry_path=registry_path,
-                            runtime_root_arg=runtime_root_arg,
-                            goal_id=goal_id,
-                            agent_id=args.agent_id,
-                        ),
-                        cooldown_seconds=max(0, args.cooldown_seconds),
-                        execute=execute,
-                    )
+                if operation_payload is not None:
+                    payload = operation_payload
                 else:
-                    raise ValueError(f"unknown goal-channel command: {command}")
+                    target_name = str(getattr(args, "target", None) or "")
+                    if not target_name:
+                        target_name = _binding_target_name(binding_path, goal_id)
+                    provider_target = (
+                        _provider_target(
+                            target_path=target_path,
+                            target_name=target_name,
+                        )
+                        if target_name
+                        else None
+                    )
+                    if command == "upgrade":
+                        payload = upgrade_lark_goal_topics(
+                            registry=source_registry,
+                            registry_path=source_registry_path,
+                            goal_id=goal_id,
+                            binding_path=binding_path,
+                            target_path=target_path,
+                            connection_id=args.connection_id,
+                            agent_id=args.agent_id,
+                            execute=execute,
+                        )
+                    elif target_name and provider_target is None:
+                        payload = _error_packet(
+                            goal_id=goal_id,
+                            operation=command.replace("-", "_"),
+                            execute=execute,
+                            blocker="provider_target_missing",
+                            summary="configure the named shared provider target first",
+                        )
+                    elif command == "setup":
+                        payload = setup_lark_goal_channel(
+                            registry=source_registry,
+                            registry_path=source_registry_path,
+                            goal_id=goal_id,
+                            binding_path=binding_path,
+                            target_name=target_name or None,
+                            provider_target=provider_target,
+                            chat_id=args.chat_id,
+                            chat_name=args.chat_name,
+                            base_url=args.base_url,
+                            base_token=args.base_token,
+                            table_id=args.table_id,
+                            identity_mode=args.identity_mode,
+                            sender_profile=args.sender_profile,
+                            sender_identity=args.sender_identity,
+                            bot_app_id=getattr(args, "bot_app_id", None),
+                            bot_display_name=args.bot_display_name,
+                            cli_bin=args.cli_bin,
+                            execute=execute,
+                        )
+                    elif command == "configure":
+                        payload = configure_lark_goal_channel_automation(
+                            registry=source_registry,
+                            goal_id=goal_id,
+                            binding_path=binding_path,
+                            human_gate_auto_notify=args.auto_notify_human_gates,
+                            blocked_notice_auto_notify=getattr(
+                                args, "auto_notify_blocked_notices", None
+                            ),
+                            execute=execute,
+                        )
+                    elif command == "doctor":
+                        payload = doctor_lark_goal_channel(
+                            registry=source_registry,
+                            registry_path=source_registry_path,
+                            goal_id=goal_id,
+                            binding_path=binding_path,
+                            provider_target=provider_target,
+                        )
+                    elif command == "sync":
+                        payload = sync_lark_goal_channel(
+                            registry=source_registry,
+                            registry_path=source_registry_path,
+                            goal_id=goal_id,
+                            binding_path=binding_path,
+                            provider_target=provider_target,
+                            agent_id=args.agent_id,
+                            execute=execute,
+                        )
+                    elif command == "notify-gate":
+                        payload = notify_lark_goal_channel_gate(
+                            registry=source_registry,
+                            goal_id=goal_id,
+                            binding_path=binding_path,
+                            provider_target=provider_target,
+                            quota_packet=_quota_packet(
+                                registry_path=registry_path,
+                                runtime_root_arg=runtime_root_arg,
+                                goal_id=goal_id,
+                                agent_id=args.agent_id,
+                            ),
+                            execute=execute,
+                            registry_path=source_registry_path,
+                            runtime_root=runtime_root,
+                        )
+                    else:
+                        raise ValueError(f"unknown goal-channel command: {command}")
             if payload.get("ok"):
                 payload["extension_activation"] = activation
         except ValueError:

@@ -100,15 +100,18 @@ CONTROL_PLANE_QUALIFICATION_PROFILES: tuple[dict[str, Any], ...] = (
             "loopx/control_plane/quota/stall_repair.py",
             "loopx/control_plane/scheduler/arbitration.py",
             "loopx/control_plane/scheduler/monitor_poll_writeback.py",
-            "loopx/control_plane/scheduler/monitor_target.py",
+            "loopx/control_plane/quota/monitor_poll_commit.ts",
+            "loopx/control_plane/quota/monitor_poll_codec.ts",
+            "loopx/control_plane/quota/monitor_poll_admission.ts",
+            "loopx/control_plane/quota/monitor_poll_provider.ts",
             "loopx/control_plane/todos/decision_scope.py",
             "loopx/control_plane/testing/decision_replay.py",
             "loopx/control_plane/work_items/interaction_contract.py",
             "loopx/control_plane/work_items/execution_obligation.py",
             "loopx/control_plane/work_items/goal_route_hint.py",
-            "loopx/control_plane/work_items/outcome_followthrough.py",
+            "loopx/control_plane/work_items/delivery_history.py",
+            "loopx/control_plane/work_items/delivery_history.ts",
             "loopx/control_plane/work_items/work_lane.py",
-            "loopx/control_plane/runtime/event_store_migration_bridge.py",
             "control-plane-integrated-canary-smoke.py",
             "interaction-contract-state-machine-smoke.py",
             "interaction-scheduler-authority-smoke.py",
@@ -119,7 +122,7 @@ CONTROL_PLANE_QUALIFICATION_PROFILES: tuple[dict[str, Any], ...] = (
                 "command": "python3 examples/control_plane/control-plane-integrated-canary-smoke.py",
                 "tier": "deep",
                 "reason": (
-                    "samples the full event-sourced todo projection, status, quota interaction contract, "
+                    "samples the Markdown Todo projection, status, quota interaction contract, "
                     "work-lane contract, scheduler ack, refresh-state, spend-slot, and review-packet handoff path; "
                     "kept deep because it is a slow end-to-end fixture"
                 ),
@@ -225,6 +228,8 @@ CONTROL_PLANE_QUALIFICATION_PROFILES: tuple[dict[str, Any], ...] = (
             "loopx/control_plane/scheduler/monitor_wait.py",
             "loopx/control_plane/scheduler/state.py",
             "loopx/control_plane/scheduler/state_transition_rules.py",
+            "loopx/cli_commands/context_machine.py",
+            "loopx/capabilities/machine_configuration/context_delivery.py",
             "loopx/cli_commands/quota",
             "quota-scheduler-state-ack-smoke.py",
             "quota-scheduler-registry-route-smoke.py",

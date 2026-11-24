@@ -67,6 +67,7 @@ def quota_todo_summary(
     claim_scope_agent_id: str | None = None,
     item_limit: int | None = None,
     include_task_orchestration_authority: bool = False,
+    evaluated_at: str | None = None,
 ) -> dict[str, Any]:
     source_section = "Agent Todo" if role == "agent" else "User Todo"
     summary = compact_todo_group(
@@ -75,6 +76,7 @@ def quota_todo_summary(
         role=role,
         item_limit=item_limit,
         include_task_orchestration_authority=include_task_orchestration_authority,
+        evaluated_at=evaluated_at,
     )
     if summary is None:
         summary = {
@@ -91,6 +93,15 @@ def quota_todo_summary(
             "monitor_due_count": 0,
         }
     if claim_scope_agent_id:
+        from ..todos.quota_summary import summarize_project_asset_todos_for_quota
+
+        scoped = summarize_project_asset_todos_for_quota(
+            summary,
+            agent_identity={"agent_id": claim_scope_agent_id},
+        )
+        if scoped is None:
+            raise RuntimeError("agent-scoped Todo fixture projection is unavailable")
+        summary["work_counts"] = scoped["work_counts"]
         summary["claim_scope"] = {"agent_id": claim_scope_agent_id}
     return summary
 
@@ -196,8 +207,7 @@ def quota_status_payload(
     }
     if coordination:
         goal["coordination"] = coordination
-    if latest_runs is not None:
-        goal["latest_runs"] = latest_runs
+    goal["latest_runs"] = latest_runs if latest_runs is not None else []
     if goal_extra:
         goal.update(goal_extra)
 

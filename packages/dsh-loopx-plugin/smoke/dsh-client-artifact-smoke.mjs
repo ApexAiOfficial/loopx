@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { reconcileClientPackage } from './dsh-sdk-client-registry.mjs'
 import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
@@ -16,12 +17,13 @@ const rows = [
   ['loopx-goalbar', packageId],
   ['loopx-init-command', `${packageId}/init-command`],
   ['loopx-driver', `${packageId}/driver`],
+  ['loopx-shadow-observer', `${packageId}/observer`],
 ]
 const clientInject = [
   '@deepseek-ai/dsh-client-connection',
   '@deepseek-ai/dsh-client-locale',
-  '@deepseek-ai/dsh-client-runtime',
   '@deepseek-ai/dsh-client-ui-conversation',
+  '@deepseek-ai/dsh-client-ui-renderer',
 ]
 const approvedRequires = new Set([
   'react',
@@ -29,8 +31,8 @@ const approvedRequires = new Set([
   'react-dom',
   'react-dom/client',
   '@deepseek-ai/cordis',
-  '@deepseek-ai/dsh-client-runtime/client',
   '@deepseek-ai/dsh-client-ui-primitives',
+  '@deepseek-ai/dsh-client-ui-renderer/client',
   '@deepseek-ai/dsh-client-ui-slots',
 ])
 const packedStaticEntries = new Set([
@@ -42,8 +44,12 @@ const packedStaticEntries = new Set([
   'package/lib/driver.js',
   'package/lib/index.js',
   'package/lib/init-command.js',
+  'package/lib/native-operation-context.js',
+  'package/lib/native-operation.js',
+  'package/lib/observer.js',
   'package/lib/types/cli.d.ts',
   'package/lib/types/client/LoopXGoalBar.d.ts',
+  'package/lib/types/client/dashboard.d.ts',
   'package/lib/types/client/index.d.ts',
   'package/lib/types/client/locale.d.ts',
   'package/lib/types/client/rpc.d.ts',
@@ -51,15 +57,20 @@ const packedStaticEntries = new Set([
   'package/lib/types/driver.d.ts',
   'package/lib/types/goalbar/connection-rpc.d.ts',
   'package/lib/types/goalbar/events.d.ts',
+  'package/lib/types/goalbar/project-registry-wire.d.ts',
   'package/lib/types/goalbar/protocol.d.ts',
   'package/lib/types/goalbar/read-model.d.ts',
   'package/lib/types/goalbar/service.d.ts',
   'package/lib/types/index.d.ts',
   'package/lib/types/init-command.d.ts',
+  'package/lib/types/managed-runtime.d.ts',
+  'package/lib/types/native-operation-context.d.ts',
+  'package/lib/types/native-operation.d.ts',
+  'package/lib/types/observer.d.ts',
   'package/package.json',
 ])
 const packedHashedEntries = [
-  ['CLI chunk', /^package\/lib\/cli-[A-Za-z0-9_-]{8}\.js$/u],
+  ['managed runtime chunk', /^package\/lib\/managed-runtime-[A-Za-z0-9_-]{8}\.js$/u],
   ['Driver chunk', /^package\/lib\/driver-[A-Za-z0-9_-]{8}\.js$/u],
 ]
 
@@ -134,6 +145,18 @@ async function assertManifest(root) {
     types: './lib/types/client/index.d.ts',
     default: './lib/client.js',
   })
+  assert.deepEqual(manifest.exports?.['./observer'], {
+    types: './lib/types/observer.d.ts',
+    default: './lib/observer.js',
+  })
+  assert.deepEqual(manifest.exports?.['./native-operation-context'], {
+    types: './lib/types/native-operation-context.d.ts',
+    default: './lib/native-operation-context.js',
+  })
+  assert.deepEqual(manifest.exports?.['./native-operation'], {
+    types: './lib/types/native-operation.d.ts',
+    default: './lib/native-operation.js',
+  })
   assert.deepEqual(manifest.dsh?.client, {
     inject: clientInject,
     platform: 'web',
@@ -204,17 +227,47 @@ async function createRealClientModuleSystem(context, staticModules) {
   const sourcePath = appRequire.resolve('@deepseek-ai/dsh-client-modules/client')
   const source = await readFile(sourcePath, 'utf8')
   let handoff
-  context.__ModuleLoader__ = {
+  const registrationTarget = {
+    mode: 'queue',
+    pendingQueue: [],
     load(value) {
       assert.equal(handoff, undefined, 'client-modules registered more than one factory')
       handoff = value
     },
   }
+  context.__ModuleLoader__ = registrationTarget
   vm.runInContext(source, context, { filename: sourcePath })
   assert.equal(handoff?.id, '@deepseek-ai/dsh-client-modules')
   const clientModules = handoff.factory(() => {
     throw new Error('client-modules unexpectedly required a platform module')
   })
+  if (typeof clientModules.createClientModuleSystem === 'function') {
+    return clientModules.createClientModuleSystem(
+      registrationTarget,
+      { id: handoff.id, exports: clientModules },
+      {
+        boot: {
+          rev: 'dsh-loopx-plugin-artifact-smoke',
+          entries: [{
+            id: packageId,
+            url: `/plugins/${packageId}/client.js`,
+            rev: 'dsh-loopx-plugin-artifact-smoke',
+            external: [],
+          }],
+          // 0.1.5 requires every entry to belong to exactly one initial-load
+          // batch, so the synthetic manifest carries the application batch the
+          // real host composes around this single row.
+          batches: [{
+            phase: 'application',
+            url: `/plugins/${packageId}/client.js`,
+            rev: 'dsh-loopx-plugin-artifact-smoke',
+            entries: [packageId],
+          }],
+        },
+        staticModules,
+      },
+    )
+  }
   delete context.__ModuleLoader__
   return new clientModules.ClientModuleSystem({
     modules: [],
@@ -249,11 +302,32 @@ function createClientApplyHarness() {
     },
     slots: {
       inject(name, install) {
-        assert.equal(name, 'conversation.input.dock')
+        assert(
+          ['sidebar.panellist', 'main', 'conversation.input.dock'].includes(name),
+          `unexpected slot injection ${name}`,
+        )
         const dispose = install()
         if (typeof dispose === 'function') effects.push(dispose)
       },
       register(config, component) {
+        if (config.name === 'sidebar.panellist') {
+          assert.equal(config.id, 'loopx-dashboard')
+          assert.equal(config.order, 7)
+          assert.equal(typeof config.label, 'function')
+          assert.equal(config.label(), 'LoopX')
+          assert.equal(typeof component, 'function')
+          assert.equal(slots.has('sidebar:loopx-dashboard'), false)
+          slots.add('sidebar:loopx-dashboard')
+          return () => slots.delete('sidebar:loopx-dashboard')
+        }
+        if (config.name === 'main') {
+          assert.equal(config.key, 'loopx-dashboard')
+          assert.equal(config.locale, 'loopx.dashboard')
+          assert.equal(typeof component, 'function')
+          assert.equal(slots.has('main:loopx-dashboard'), false)
+          slots.add('main:loopx-dashboard')
+          return () => slots.delete('main:loopx-dashboard')
+        }
         assert.equal(config.name, 'conversation.input.dock')
         assert.equal(config.id, 'loopx-goal')
         assert.equal(config.order, 15)
@@ -288,6 +362,7 @@ async function assertClientArtifact(root) {
   assert(!/sourceMappingURL|\.(?:ts|tsx)\.map/iu.test(source), 'client artifact contains a source map')
   assert(!/(?:^|["'])node:/mu.test(source), 'client artifact contains a Node builtin')
   assert(!/(?:typert|remote|EventSource)/u.test(source), 'client artifact contains a forbidden transport')
+  assert(source.includes('http://127.0.0.1:8767/chat/'), 'client artifact lacks the loopback workspace address')
   assert(!/\/(?:Users|home|private|workspace)\//u.test(source), 'client artifact contains an absolute path')
   assert(!/[A-Za-z]:\\(?:Users|home|workspace)\\/u.test(source), 'client artifact contains a Windows absolute path')
 
@@ -322,9 +397,14 @@ async function assertClientArtifact(root) {
   assert.deepEqual(first.labels, [
     'dsh-loopx-plugin CSS ownership',
     'dsh-loopx-plugin GoalBar locale',
+    'dsh-loopx-plugin dashboard locale',
   ])
-  assert.equal(first.locales.size, 1)
-  assert.deepEqual([...first.slots], ['loopx-goal'])
+  assert.equal(first.locales.size, 2)
+  assert.deepEqual([...first.slots], [
+    'sidebar:loopx-dashboard',
+    'main:loopx-dashboard',
+    'loopx-goal',
+  ])
   assert.equal(styles.length, 1)
   assert.equal(styles[0].dataset.plugin, packageId)
   assert.equal(styles[0].dataset.pluginCss, `${packageId}/goalbar.module.css`)
@@ -348,7 +428,11 @@ async function assertClientArtifact(root) {
   const reapplied = createClientApplyHarness()
   assert.equal(cachedExports.apply(reapplied.ctx), undefined)
   assert.equal(styles.length, 1, 'cached-export reapply did not restore CSS')
-  assert.deepEqual([...reapplied.slots], ['loopx-goal'])
+  assert.deepEqual([...reapplied.slots], [
+    'sidebar:loopx-dashboard',
+    'main:loopx-dashboard',
+    'loopx-goal',
+  ])
   reapplied.dispose()
   assert.equal(styles.length, 0, 'cached-export unload retained CSS')
   removeOwnedStylesForHmr()
@@ -369,26 +453,47 @@ async function assertDshDiscovery(root) {
   const registry = Object.create(ClientModuleRegistry.prototype)
   registry.pkgMeta = new Map()
   registry.table = new Map()
-  registry.resolvePkgJson = specifier => installedRequire.resolve(`${specifier}/package.json`)
+  registry.sources = new Map()
+  registry.dirty = new Set()
+  registry.initialRevisionNonce = 'artifact-smoke-nonce'
+  registry.nextInitialRevision = 0
+  const baseUrl = pathToFileURL(join(root, 'package.json')).href
+  // 0.1.5 resolves the mounted row through the Loader's own `internal`
+  // resolver, so the probe supplies that face instead of the retired
+  // `resolvePkgJson` stub, and `resolveSource` reads the base URL from the
+  // entry's tree context rather than from the call site.
   registry.ctx = {
+    logger: { warn() {} },
     loader: {
+      internal: {
+        version: 'v1',
+        resolveSync: specifier => ({
+          url: pathToFileURL(installedRequire.resolve(`${specifier}/package.json`)).href,
+        }),
+      },
       entries: () => [{
         options: { name: packageId },
+        parent: { tree: { ctx: { baseUrl } } },
         fiber: {},
         disabled: false,
       }],
     },
   }
-  const meta = registry.resolveMeta(packageId)
-  assert.equal(meta.clientPath, join(root, 'lib', 'client.js'))
-  assert.deepEqual(meta.inject, clientInject)
-  assert.equal(meta.immediately, false)
-  assert.equal(registry.processOne(packageId), true)
+  // 0.1.5 returns the located manifest beside the parsed client declaration.
+  const resolved = registry.resolveMeta(packageId, baseUrl)
+  assert.equal(resolved.meta.clientPath, join(root, 'lib', 'client.js'))
+  assert.deepEqual(resolved.meta.inject, clientInject)
+  assert.equal(resolved.meta.immediately, false)
+  assert.equal(reconcileClientPackage(registry, packageId, error => { throw error }), true)
   const record = registry.table.get(packageId)
-  assert.equal(record.clientPath, join(root, 'lib', 'client.js'))
+  assert.equal(record.clientPath ?? record.meta?.clientPath, join(root, 'lib', 'client.js'))
   assert.equal(record.entry.id, packageId)
   assert.deepEqual(record.entry.inject, clientInject)
-  assert.match(record.entry.rev, /^[0-9a-f]{12}$/u)
+  // The initial row revision is an opaque allocation, and the composed combo
+  // URL is what carries it as the HMR cache-buster.
+  assert.equal(typeof record.entry.rev, 'string')
+  assert(record.entry.rev.length > 0, 'DSH omitted the client revision')
+  assert.equal(new URL(record.entry.url, 'http://localhost').searchParams.get('rev'), record.entry.rev)
 }
 
 async function assertHostExports(root) {
@@ -397,27 +502,33 @@ async function assertHostExports(root) {
     root: requireFromPlugin.resolve(packageId),
     init: requireFromPlugin.resolve(`${packageId}/init-command`),
     driver: requireFromPlugin.resolve(`${packageId}/driver`),
+    observer: requireFromPlugin.resolve(`${packageId}/observer`),
+    nativeContext: requireFromPlugin.resolve(`${packageId}/native-operation-context`),
+    nativeOperation: requireFromPlugin.resolve(`${packageId}/native-operation`),
     client: requireFromPlugin.resolve(`${packageId}/client`),
   }
   assert.equal(resolutions.client, join(root, 'lib', 'client.js'))
-  const [host, init, driver] = await Promise.all([
+  const [host, init, driver, observer, nativeContext, nativeOperation] = await Promise.all([
     import(pathToFileURL(resolutions.root).href),
     import(pathToFileURL(resolutions.init).href),
     import(pathToFileURL(resolutions.driver).href),
+    import(pathToFileURL(resolutions.observer).href),
+    import(pathToFileURL(resolutions.nativeContext).href),
+    import(pathToFileURL(resolutions.nativeOperation).href),
   ])
   assert.equal(typeof host.apply, 'function')
   assert.equal(host.name, packageId)
-  assert.deepEqual(host.inject, ['agents', 'connection'])
+  assert.deepEqual(host.inject, ['agents', 'connection', 'loopxBootstrap'])
   let handler
   let disposeHost
   let rpcDisposals = 0
   const hostContext = {
     agents: { get: () => undefined },
     connection: {
-      rpc: {
-        handle(channel, candidate, options) {
-          assert.equal(channel, '/loopx')
-          assert.deepEqual(options, { authority: 'loopback' })
+      fetch: {
+        register(route) {
+          assert.equal(route.path, '/api/loopx.goalbar')
+          const candidate = route.fetch
           assert.equal(handler, undefined, 'Host registered duplicate RPC handlers')
           handler = candidate
           return async () => { rpcDisposals += 1 }
@@ -438,11 +549,15 @@ async function assertHostExports(root) {
   assert.equal(host.apply(hostContext), undefined)
   assert.equal(typeof handler, 'function')
   assert.equal(typeof disposeHost, 'function')
-  const malformed = await handler(
-    'goalbar/read',
-    { unexpected: true },
-    new AbortController().signal,
-  )
+  const response = await handler(new Request('http://fixture/api/loopx.goalbar', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      type: 'client-request', rpcId: 'malformed', method: 'loopx.goalbar',
+      payload: { unexpected: true },
+    }),
+  }))
+  const { result: malformed } = await response.json()
   assert.equal(malformed.ok, false)
   assert.equal(malformed.error.code, 'bad-request')
   await disposeHost()
@@ -452,6 +567,32 @@ async function assertHostExports(root) {
   assert.equal(typeof host.initializeLoopX, 'function')
   assert.equal(typeof init.apply, 'function')
   assert.equal(typeof driver.apply, 'function')
+  assert.equal(observer.name, 'dsh-loopx-shadow-observer')
+  assert.deepEqual(observer.inject, [])
+  assert.equal(typeof observer.apply, 'function')
+  assert.equal(host.ShadowObserver, undefined)
+  assert.equal(nativeContext.name, 'loopx-native-operation-context')
+  assert.deepEqual(nativeContext.inject, ['agents', 'tools', 'sessionProjections'])
+  assert.equal(typeof nativeContext.apply, 'function')
+  assert.equal(host.createNativeContextTool, undefined)
+  assert.equal(nativeOperation.name, 'loopx-native-operation')
+  assert.deepEqual(nativeOperation.inject, ['agents', 'tools', 'sessionProjections'])
+  assert.equal(typeof nativeOperation.createNativeOperationTool, 'function')
+  assert.equal(host.createNativeOperationTool, undefined)
+
+  const [rootSource, driverSource, observerSource] = await Promise.all([
+    readFile(resolutions.root, 'utf8'),
+    readFile(resolutions.driver, 'utf8'),
+    readFile(resolutions.observer, 'utf8'),
+  ])
+  for (const source of [rootSource, driverSource]) {
+    assert(!source.includes('LOOPX_DSH_SHADOW_OBSERVER_GOAL_ID'))
+    assert(!source.includes('reliability_observer_envelope_v0'))
+    assert(!source.includes('loopx_operation_context'))
+  }
+  assert(observerSource.includes('LOOPX_DSH_SHADOW_OBSERVER_GOAL_ID'))
+  assert(!observerSource.includes('.send('))
+  assert(!observerSource.includes('agent/pre-step'))
 }
 
 async function exerciseInstalled(installed) {

@@ -1,0 +1,105 @@
+import type {DelegationPreflight} from "../../data/delegation-preflight.js";
+
+const labels: Record<DelegationPreflight["state"], {en: string; zh: string}> = {
+  workspace_unavailable: {en: "Bound workspace unavailable", zh: "绑定工作目录不可用"},
+  authority_unavailable: {en: "Canonical authority unavailable", zh: "缺少规范权限状态"},
+  turn_blocked: {en: "Task admission blocked", zh: "当前任务未获准执行"},
+  acceptance_unavailable: {en: "Task validation unavailable", zh: "任务验收不可用"},
+  runtime_unavailable: {en: "Runtime unavailable", zh: "运行时不可用"},
+  runtime_unverified: {en: "Runtime availability unverified", zh: "运行时可用性尚未验证"},
+  launchable: {en: "Local launch prerequisites met", zh: "本机启动条件已满足"},
+};
+
+const workspaceDetails = {
+  missing: {en: "Directory missing", zh: "目录不存在"},
+  not_directory: {en: "Bound location is not a directory", zh: "绑定位置不是目录"},
+  unavailable: {en: "Directory could not be read", zh: "目录无法读取"},
+};
+
+const acceptanceDetails: Record<NonNullable<DelegationPreflight["acceptance_reason_code"]>, {en: string; zh: string}> = {
+  independent_delegation_validation_required: {en: "Independent Todo validation is required", zh: "原任务缺少独立验收声明"},
+  completion_validation_declaration_unavailable: {en: "Declared Todo validation is unavailable", zh: "原任务验收声明不可读取"},
+  completion_validation_declaration_mismatch: {en: "Todo validation declaration does not match", zh: "原任务验收声明与当前指纹不符"},
+  validation_files_unavailable: {en: "Pinned validation files are unavailable", zh: "固定验收文件不可用"},
+  acceptance_binding_unavailable: {en: "Current task acceptance could not be established", zh: "当前任务验收依据不可确认"},
+};
+
+const acceptanceActions: Record<Exclude<NonNullable<DelegationPreflight["acceptance_next_action"]>, "none">, {en: string; zh: string}> = {
+  review_original_request_validation: {
+    en: "Next: ask the original configuration owner to review the independent request validation declaration, then recheck",
+    zh: "下一步：请原配置责任人核对请求独立验收声明，再重新检查",
+  },
+  review_original_todo_validation: {
+    en: "Next: ask the original configuration owner to review the Todo validation declaration, then recheck",
+    zh: "下一步：请原配置责任人核对任务验收声明，再重新检查",
+  },
+  restore_original_validation_files: {
+    en: "Next: ask the original configuration owner to restore the pinned validation files, then recheck",
+    zh: "下一步：请原配置责任人恢复固定验收文件，再重新检查",
+  },
+  review_original_task_acceptance: {
+    en: "Next: ask the original configuration owner to review the current task and applicable acceptance contract, then recheck",
+    zh: "下一步：请原配置责任人核对当前任务与适用验收契约，再重新检查",
+  },
+};
+
+export function DelegationPreflightStatus({check, zh}: {check: DelegationPreflight; zh: boolean}) {
+  const request = check.binding?.todo_id === null;
+  const label = request && check.state === "turn_blocked" && check.request_required === true
+    ? {en: "Awaiting original request", zh: "等待原请求"}
+    : request && check.state === "acceptance_unavailable"
+    ? {en: "Request validation unavailable", zh: "请求验收不可用"}
+    : request && check.state === "turn_blocked"
+      ? {en: "Request admission blocked", zh: "当前请求未获准执行"} : labels[check.state];
+  const lane = check.state === "turn_blocked" && check.turn_eligible === false
+    && check.turn_lane?.scope === "native_turn_lane" ? check.turn_lane.state : null;
+  const busy = lane === "live";
+  const unknown = lane === "foreign_host" || lane === "unreadable";
+  const laneLabel = busy ? (zh ? "执行通道正在处理工作" : "Execution lane is busy")
+    : unknown ? (zh ? "执行通道状态无法确认" : "Execution lane state is unknown") : null;
+  const workspaceDetail = check.workspace_state ? workspaceDetails[check.workspace_state] : null;
+  const acceptanceDetail = request && check.state === "acceptance_unavailable"
+    && check.acceptance_reason_code === "independent_delegation_validation_required"
+    ? {en: "Independent request validation is required", zh: "原请求缺少独立验收声明"}
+    : check.state === "acceptance_unavailable" && check.acceptance_reason_code
+    && Object.hasOwn(acceptanceDetails, check.acceptance_reason_code) ? acceptanceDetails[check.acceptance_reason_code] : null;
+  const acceptanceAction = check.state === "acceptance_unavailable" && check.acceptance_next_action
+    && check.acceptance_next_action !== "none" && Object.hasOwn(acceptanceActions, check.acceptance_next_action)
+    ? acceptanceActions[check.acceptance_next_action] : null;
+  const executorDetail = check.executor
+    ? [check.executor.host, check.executor.reason].filter(Boolean).join(" · ") : check.authority_reason;
+  const operationTransport = check.executor?.operation_transport;
+  const operationDetail = !busy && !unknown && operationTransport?.schema_version === "loopx_operation_transport_v0"
+    ? operationTransport.configuration_valid === true && operationTransport.runtime_qualified === false
+      ? (zh ? "自有原生工具传输已配置，运行未核验；执行仍需精确批准与首次消费"
+        : "Owned native tool transport configured, runtime unqualified; exact approval and first consumption still required")
+      : (zh ? "操作传输配置未获准；请原配置责任人核对宿主、固定模型/思考深度和 sandbox"
+        : "Operation transport configuration not admitted; ask its original owner to review host, pinned model/effort and sandbox")
+    : null;
+  const detail = busy || unknown ? null : check.state === "workspace_unavailable"
+    ? (workspaceDetail ? (zh ? workspaceDetail.zh : workspaceDetail.en) : null)
+    : [acceptanceDetail ? (zh ? acceptanceDetail.zh : acceptanceDetail.en) : null, executorDetail].filter(Boolean).join(" · ");
+  const disclaimer = busy || unknown
+    ? (zh ? "检查不启动新的执行" : "Inspection starts no new execution")
+    : check.state === "workspace_unavailable"
+    ? (zh ? "权限、验收与运行时尚未检查；未启动成员" : "Authority, acceptance and runtime uninspected; no member launched")
+    : check.state === "authority_unavailable"
+      ? (zh ? "未检查或启动执行器" : "No executor was inspected or launched")
+      : (zh ? "不代表正在执行" : "Does not mean executing");
+  const nextAction = busy ? (zh ? "当前执行结束后重新检查" : "Recheck after the current execution ends")
+    : unknown ? (zh ? "恢复执行状态读回后重新检查" : "Restore execution-state observation, then recheck")
+    : check.workspace_next_action === "review_operator_workspace_binding"
+    ? (zh ? "下一步：核对原执行配置的工作目录，再重新检查" : "Next: review the workspace in the original execution configuration, then recheck")
+    : check.authority_next_action === "preview_reviewed_goal_authority_promotion"
+    ? (zh ? "下一步：预览整 Goal 协调 Authority 晋级" : "Next: preview whole-Goal coordination-authority promotion")
+    : check.authority_next_action === "repair_canonical_authority"
+      ? (zh ? "下一步：修复规范 Authority 读回" : "Next: repair canonical authority readback")
+      : acceptanceAction ? (zh ? acceptanceAction.zh : acceptanceAction.en) : null;
+  return <p role="status">
+    {laneLabel ?? (zh ? label.zh : label.en)}
+    {detail ? ` · ${detail}` : ""}
+    {operationDetail ? ` · ${operationDetail}` : ""}
+    {nextAction ? ` · ${nextAction}` : ""}
+    {` · ${disclaimer}`}
+  </p>;
+}

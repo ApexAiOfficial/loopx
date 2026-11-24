@@ -348,6 +348,28 @@ def test_fresh_evidence_linked_continue_checkpoint_preserves_frontier() -> None:
     assert acceptance_gaps_from_outcome_checkpoint(active_vision, checkpoint) == []
 
 
+def test_fresh_path_without_final_outcome_claim_names_the_missing_component() -> None:
+    active_vision = _outcome_vision(evidence_refs=["result:milestone-receipt"])
+    active_vision["vision_patch"].pop("acceptance_summary")
+
+    gaps = acceptance_gaps_from_outcome_checkpoint(active_vision, _material_checkpoint())
+
+    assert len(gaps) == 1
+    gap = gaps[0]
+    assert gap["kind"] == "vision_outcome_checkpoint_required"
+    assert gap["reason_code"] == "final_outcome_claim_missing"
+    assert gap["component_checks"] == {
+        "checkpoint_satisfied": True,
+        "checkpoint_fresh": True,
+        "path_outcome_valid": True,
+        "evidence_refs_present": True,
+        "final_outcome_claim_present": False,
+        "no_reported_outcome_gap": True,
+    }
+    assert "acceptance_summary" in gap["resolution_hint"]
+    assert "without a fresh" not in gap["replan_trigger_summary"]
+
+
 def test_unsatisfied_material_checkpoint_cannot_preserve_frontier() -> None:
     active_vision = _outcome_vision(evidence_refs=["result:final-outcome-receipt"])
     checkpoint = {**_material_checkpoint(), "satisfied": False}

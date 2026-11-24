@@ -158,7 +158,7 @@ def run_turn_journal_probe_command(
         check=False,
         capture_output=True,
         input=json.dumps(request, sort_keys=True),
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         timeout=30,
     )
     if completed.returncode != 0:

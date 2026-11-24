@@ -1,0 +1,530 @@
+"""Reduce terminal EdgeBench receipts to a portable, settings-bound report.
+
+This adapter reads an explicit run selection, never traverses trajectories, and
+reuses benchmark-toolkit run rows. It neither qualifies integrity nor launches
+jobs. Source inputs stay private; the export is an allowlisted projection.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import hashlib
+import json
+import math
+import re
+from pathlib import Path
+
+from loopx.capabilities.benchmark_toolkit.experiment_board import (
+    normalize_benchmark_experiment_board_row,
+)
+from .causal_attribution import validate_historical_stride_strategy
+from .feedback_hook import FEEDBACK_PAYLOAD
+from .result_publication import native_grading_complete
+
+
+def _validate_feedback_payload(runner, profile):
+    payload = runner.get("feedback_payload")
+    if payload != profile.get("feedback_payload"):
+        raise ValueError("Settings profile disagrees with feedback payload")
+    if payload is not None and (payload != FEEDBACK_PAYLOAD or runner["feedback"] != "best-only"):
+        raise ValueError("Unsupported feedback payload for this mode")
+
+
+def _validate_turn_validator(runner, profile):
+    key = "validation_argv_sha256"
+    if runner["worker"] == "turn-resume":
+        digest = runner.get(key)
+        if not isinstance(digest, str) or not re.fullmatch("[0-9a-f]{64}", digest) or profile.get(key) != digest:
+            raise ValueError("Turn validator argv digest missing or mismatched")
+    elif key in runner or key in profile:
+        raise ValueError("Unexpected Turn validator on another worker")
+
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def read(path: Path):
+    return json.loads(path.read_text())
+
+
+def write(path: Path, value):
+    path.write_text(
+        json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        newline="\n",
+    )
+
+
+def number(value):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ValueError("Expected a finite numeric observation")
+    return value
+
+
+def _higher_is_better(config, row):
+    """Validate explicit provider vocabulary; never infer policy from a task id."""
+    higher = True  # Historical reports use the original maximizing contract.
+    if "native_ranking" in config:
+        ranking = config["native_ranking"]
+        if (
+            not isinstance(ranking, dict)
+            or set(ranking) != {"selection", "score_direction"}
+            or ranking["selection"] not in ("score_first", "valid_then_score", "pass_rate_first")
+            or ranking["score_direction"] not in ("maximize", "minimize")
+        ):
+            raise ValueError("Invalid native ranking: supply selection and score_direction")
+        higher = ranking["score_direction"] == "maximize"
+    metric = row["metrics"].get("best_score", {})
+    if "higher_is_better" in metric and metric["higher_is_better"] is not higher:
+        raise ValueError("Score direction disagrees with report ranking metadata")
+    return higher
+
+
+def _pass_rate(value):
+    value = number(value)
+    if not 0 <= value <= 1:
+        raise ValueError("Expected a native pass rate between zero and one")
+    return value
+
+
+def csv_write(path, records):
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(
+            stream, fieldnames=list(dict.fromkeys(k for r in records for k in r)),
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def _csv_summary(record):
+    summary = dict(record)
+    for key in (
+        "best_score",
+        "last_observed_score",
+        "runtime_seconds",
+        "budget_seconds",
+    ):
+        summary[key] = number(float(record[key]))
+    for key in (
+        "total_rounds",
+        "agent_submissions",
+        "auto_submissions",
+        "resume_count",
+    ):
+        summary[key] = int(record[key])
+    for key in ("timed_out", "score_countable"):
+        if record[key] not in {"True", "False"}:
+            raise ValueError(f"Invalid summary boolean: {key}")
+        summary[key] = record[key] == "True"
+    return summary
+
+
+def _validate_run_data(row, config, summary, points):
+    """Check known same-run projections; do not certify private source truth."""
+    if row["metrics"]["best_score"].get("higher_is_better") is not _higher_is_better(config, row):
+        raise ValueError("Missing score direction in canonical row")
+    for key, row_key in (
+        ("run_id", "run_id"),
+        ("case_id", "case_id"),
+        ("arm_id", "arm_id"),
+        ("attempt", "attempt"),
+        ("source_study_id", "study_id"),
+        ("source_benchmark_id", "benchmark_id"),
+    ):
+        if config[key] != row[row_key]:
+            raise ValueError(f"Settings identity mismatch: {key}")
+    runner, profile = config["runner"], config["worker_profile"]
+    _validate_feedback_payload(runner, profile)
+    _validate_turn_validator(runner, profile)
+    if (
+        runner["runner_commit"] != row["runner_revision"]
+        or runner["model"] != row["model_id"]
+    ):
+        raise ValueError("Settings source/model mismatch")
+    for key, profile_key in (
+        ("worker", "profile"),
+        ("model", "model"),
+        ("effort", "reasoning_effort"),
+        ("timeout_seconds", "timeout_seconds"),
+        ("feedback", "feedback"),
+    ):
+        if runner[key] != profile[profile_key]:
+            raise ValueError(f"Settings profile disagrees with runtime: {key}")
+    for key in ("run_id", "arm_id", "benchmark_id"):
+        if summary[key] != row[key]:
+            raise ValueError(f"Score summary identity mismatch: {key}")
+    if (
+        type(summary["score_countable"]) is not bool
+        or summary["score_countable"] != row["countability"]["score_countable"]
+    ):
+        raise ValueError("Score summary countability mismatch")
+    if (
+        number(summary["budget_seconds"]) <= 0
+        or summary["budget_seconds"] != runner["timeout_seconds"]
+    ):
+        raise ValueError("Score summary budget disagrees with settings")
+    duration = number(summary["runtime_seconds"])
+    if duration < 0 or round(duration * 1000) != row["effort"]["duration_ms"]:
+        raise ValueError("Score summary duration disagrees with canonical row")
+    for key in (
+        "total_rounds",
+        "agent_submissions",
+        "auto_submissions",
+        "resume_count",
+    ):
+        if type(summary[key]) is not int or summary[key] < 0:
+            raise ValueError(f"Invalid summary count: {key}")
+    if not points or len(points) != summary["total_rounds"]:
+        raise ValueError("Sample count disagrees with summary")
+    if summary["agent_submissions"] + summary["auto_submissions"] != len(points):
+        raise ValueError("Submission counts disagree with sample count")
+    if summary["best_score"] != row["metrics"]["best_score"]["value"]:
+        raise ValueError("Score summary disagrees with canonical row")
+    values = [number(float(p["score"])) for p in points]
+    if (
+        ("native_ranking" not in config and max(values) != summary["best_score"])
+        or values[-1] != summary["last_observed_score"]
+    ):
+        raise ValueError("Sample scores disagree with summary")
+    if len({p["round"] for p in points}) != len(points):
+        raise ValueError("Duplicate sample identities")
+    if [int(p["sequence"]) for p in points] != list(range(1, len(points) + 1)):
+        raise ValueError("Sample order is incomplete")
+    best = [p for p in points if p["round"] == summary["best_round"]]
+    if len(best) != 1 or number(float(best[0]["score"])) != summary["best_score"]:
+        raise ValueError("Best round does not substantiate best score")
+    if "native_ranking" in config:
+        metric = row["metrics"].get("best_pass_rate", {})
+        if (
+            metric.get("higher_is_better") is not True
+            or _pass_rate(metric.get("value")) != _pass_rate(float(best[0]["pass_rate"]))
+        ):
+            raise ValueError("Best round does not substantiate native pass rate")
+    for p in points:
+        if "native_ranking" in config:
+            _pass_rate(float(p["pass_rate"]))
+        if (
+            p["elapsed_seconds"] not in (None, "")
+            and number(float(p["elapsed_seconds"])) < 0
+        ):
+            raise ValueError("Sample predates run")
+
+
+def export(runs_root: Path, selection: list, output: Path, *, observed_at: str):
+    """Selection is operator-reviewed public settings, not raw launch commands."""
+    if output.exists():
+        raise ValueError(
+            "Use a new output directory; published snapshots are immutable"
+        )
+    projected, samples, summaries, configs, bindings = [], [], [], {}, []
+    seen = set()
+    for selected in selection:
+        row = normalize_benchmark_experiment_board_row(selected["row"])
+        run, case = row["run_id"], row["case_id"]
+        if run in seen or any(
+            "/" in s or "\\" in s or s in {".", ".."} for s in (run, case)
+        ):
+            raise ValueError("Unique safe run/case identities required")
+        seen.add(run)
+        trial = runs_root / run / case
+        receipt, profile, final, history = [
+            read(trial / name)
+            for name in (
+                "runtime-receipt.json",
+                "worker-profile.json",
+                "final_result.json",
+                "run_history.json",
+            )
+        ]
+        if receipt["status"] != "terminal" or row["status"] not in {
+            "running",
+            "completed",
+        }:
+            raise ValueError("Only terminal, scored runs can be exported")
+        if not native_grading_complete(final):
+            raise ValueError("Native grading is not complete; terminal execution alone cannot be exported")
+        for source in (receipt, final):
+            if (
+                source["run_id"] != run
+                or source["task"] != case
+                or source["model"] != row["model_id"]
+            ):
+                raise ValueError("Run identity/model mismatch")
+        if history["run_id"] != run or profile["profile"] != receipt["worker"]:
+            raise ValueError("History/profile identity mismatch")
+        for key, other in (
+            ("model", "model"),
+            ("effort", "reasoning_effort"),
+            ("timeout_seconds", "timeout_seconds"),
+            ("feedback", "feedback"),
+        ):
+            if receipt[key] != profile[other]:
+                raise ValueError(f"Profile disagrees with runtime: {key}")
+        if row.get("runner_revision") != receipt["runner_commit"]:
+            raise ValueError("Board and runner revision disagree")
+        _validate_feedback_payload(receipt, profile)
+        _validate_turn_validator(receipt, profile)
+        if receipt.get("planning_horizon_goal") != profile.get("planning_horizon_goal"):
+            raise ValueError("Profile disagrees with runtime: planning_horizon_goal")
+        for source in (receipt, profile):
+            if "planning_horizon_goal" in source and not isinstance(source["planning_horizon_goal"], bool):
+                raise ValueError("planning_horizon_goal must be a boolean")
+        if receipt.get("stride_strategy") != profile.get("stride_strategy"):
+            raise ValueError("Profile disagrees with runtime: stride_strategy")
+        if "stride_strategy" in receipt:
+            # Read-only history: absent, "off" or evidence_conditioned_v1.
+            if receipt["stride_strategy"] is None:
+                raise ValueError("stride_strategy must be omitted rather than null")
+            validate_historical_stride_strategy(receipt["stride_strategy"])
+        if number(final["best_score"]) != number(receipt["best_score"]):
+            raise ValueError("Final and runtime scores disagree")
+        score_entries = [
+            e
+            for e in history["entries"]
+            if e.get("type") == "submission"
+            and e.get("status") == "completed"
+            and e.get("score") is not None
+        ]
+        if not score_entries:
+            raise ValueError("History does not substantiate best score")
+        config = copy.deepcopy(selected["settings"])
+        higher = _higher_is_better(config, row)
+        if "native_ranking" in config:
+            # Bind the native result, without recomputing its ranking or score.
+            number(history.get("best_score"))
+            _pass_rate(history.get("best_pass_rate"))
+            for key in ("best_round", "best_score", "best_pass_rate"):
+                if key not in history or key not in final or history[key] != final[key]:
+                    raise ValueError(f"Native history disagrees with final result: {key}")
+            row["metrics"]["best_pass_rate"] = {
+                "value": _pass_rate(final["best_pass_rate"]),
+                "unit": "ratio", "higher_is_better": True,
+            }
+        # Settings are supplied separately only for facts absent from receipts.
+        config.update(
+            run_id=run,
+            case_id=case,
+            arm_id=row["arm_id"],
+            attempt=row["attempt"],
+            source_study_id=row["study_id"],
+            source_benchmark_id=row["benchmark_id"],
+            runner={
+                key: receipt[key]
+                for key in (
+                    "worker",
+                    "model",
+                    "effort",
+                    "timeout_seconds",
+                    "feedback",
+                    "internet",
+                    "eval_interval",
+                    "submission_cooldown",
+                    "loopx_commit",
+                    "runner_commit",
+                    "task_sha256",
+                )
+            },
+            worker_profile=profile,
+        )
+        # Do not copy arbitrary profile additions (e.g. future private paths).
+        config["worker_profile"] = {
+            key: profile[key]
+            for key in (
+                "profile",
+                "model",
+                "reasoning_effort",
+                "timeout_seconds",
+                "stop_hook",
+                "outer_resume",
+                "explore_graph",
+                "explore_harness",
+                "feedback",
+            )
+        }
+        # Old notification-only attempts retain absent/unknown payload metadata;
+        # never relabel them using today's default or operator-supplied settings.
+        if "validation_argv_sha256" in receipt:
+            for target in ("runner", "worker_profile"):
+                config[target]["validation_argv_sha256"] = receipt["validation_argv_sha256"]
+        if "feedback_payload" in receipt:
+            config["runner"]["feedback_payload"] = receipt["feedback_payload"]
+            config["worker_profile"]["feedback_payload"] = profile["feedback_payload"]
+        if "planning_horizon_goal" in receipt:
+            config["runner"]["planning_horizon_goal"] = receipt["planning_horizon_goal"]
+            config["worker_profile"]["planning_horizon_goal"] = profile["planning_horizon_goal"]
+        if "stride_strategy" in receipt:
+            config["runner"]["stride_strategy"] = receipt["stride_strategy"]
+            config["worker_profile"]["stride_strategy"] = profile["stride_strategy"]
+        row["status"], row["observed_at"] = "completed", observed_at
+        row["metrics"]["best_score"] = {
+            "value": final["best_score"],
+            "unit": "raw_score",
+            "higher_is_better": higher,
+        }
+        row["countability"]["official_result_present"] = True
+        # Preserve integrity, countability, and insight decisions; never promote.
+        row["effort"]["duration_ms"] = round(number(final["runtime_seconds"]) * 1000)
+        row = normalize_benchmark_experiment_board_row(row)
+        projected.append(row)
+        configs[run] = config
+        source_hashes = {
+            name: digest(trial / name)
+            for name in (
+                "runtime-receipt.json",
+                "worker-profile.json",
+                "final_result.json",
+                "run_history.json",
+            )
+        }
+        bindings.append({"run_id": run, "source_sha256": source_hashes})
+        start = float((trial / "started_at").read_text().splitlines()[1])
+        run_samples = []
+        for index, entry in enumerate(score_entries):
+            label = entry["round"]
+            if (
+                not isinstance(label, str)
+                or "/" in label
+                or "\\" in label
+                or label in {".", ".."}
+            ):
+                raise ValueError("Unsafe sample identity")
+            report = trial / "submissions" / label / "report.json"
+            elapsed = None
+            if report.exists():
+                submitted = read(report).get("submitted_at")
+                if submitted is not None:
+                    elapsed = round(number(submitted) - start, 6)
+                    if elapsed < 0:
+                        raise ValueError("Sample predates run")
+            run_samples.append(
+                {
+                    "run_id": run,
+                    "sequence": index + 1,
+                    "round": label,
+                    "elapsed_seconds": elapsed,
+                    "score": number(entry["score"]),
+                    "valid": entry.get("valid"),
+                    **({"pass_rate": _pass_rate(entry.get("pass_rate"))}
+                       if "native_ranking" in config else {}),
+                }
+            )
+        summary = {
+            "run_id": run,
+            "arm_id": row["arm_id"],
+            "benchmark_id": row["benchmark_id"],
+            "best_score": final["best_score"],
+            "best_round": final["best_round"],
+            "runtime_seconds": final["runtime_seconds"],
+            "budget_seconds": receipt["timeout_seconds"],
+            "total_rounds": final["total_rounds"],
+            "agent_submissions": final["agent_submissions"],
+            "auto_submissions": final["auto_submissions"],
+            "resume_count": final.get("resume_count", 0),
+            "timed_out": final["timed_out"],
+            "last_observed_score": score_entries[-1]["score"],
+            "score_countable": row["countability"]["score_countable"],
+        }
+        _validate_run_data(row, config, summary, run_samples)
+        samples.extend(run_samples)
+        summaries.append(summary)
+    if not seen:
+        raise ValueError("Empty selection")
+    output.mkdir(parents=True)
+    (output / "settings").mkdir()
+    write(output / "run-rows.json", projected)
+    csv_write(output / "scores.csv", summaries)
+    csv_write(output / "samples.csv", samples)
+    for binding in bindings:
+        run = binding["run_id"]
+        name = f"settings/{run}.json"
+        write(output / name, configs[run])
+        binding.update(settings_file=name, settings_sha256=digest(output / name))
+    files = sorted(p for p in output.rglob("*") if p.is_file())
+    write(
+        output / "index.json",
+        {
+            "observed_at": observed_at,
+            "runs": bindings,
+            "files_sha256": {
+                p.relative_to(output).as_posix(): digest(p) for p in files
+            },
+        },
+    )
+    verify(output)
+
+
+def verify(directory: Path):
+    """Read-only binding validation; hashes do not certify evidence truth/privacy."""
+    index = read(directory / "index.json")
+    if not {"run-rows.json", "scores.csv", "samples.csv"} <= set(index["files_sha256"]):
+        raise ValueError("Missing required data-file binding")
+    for name, expected in index["files_sha256"].items():
+        path = (directory / name).resolve()
+        if not path.is_relative_to(directory.resolve()) or digest(path) != expected:
+            raise ValueError(f"File binding failed: {name}")
+    rows = [
+        normalize_benchmark_experiment_board_row(r)
+        for r in read(directory / "run-rows.json")
+    ]
+    by_run = {r["run_id"]: r for r in rows}
+    bindings = index["runs"]
+    if (
+        len(by_run) != len(rows)
+        or len(bindings) != len(rows)
+        or {b["run_id"] for b in bindings} != set(by_run)
+    ):
+        raise ValueError("Every run needs exactly one settings binding")
+    configs = {}
+    for b in bindings:
+        if index["files_sha256"].get(b["settings_file"]) != b["settings_sha256"]:
+            raise ValueError("Settings digest not bound to file inventory")
+        configs[b["run_id"]] = read(directory / b["settings_file"])
+    with (directory / "scores.csv").open() as stream:
+        scores = [_csv_summary(s) for s in csv.DictReader(stream)]
+    if len(scores) != len(rows) or {s["run_id"] for s in scores} != set(by_run):
+        raise ValueError("Score rows differ from run selection")
+    with (directory / "samples.csv").open() as stream:
+        samples = list(csv.DictReader(stream))
+    if {s["run_id"] for s in samples} != set(by_run):
+        raise ValueError("Sample rows differ from run selection")
+    for score in scores:
+        points = [s for s in samples if s["run_id"] == score["run_id"]]
+        _validate_run_data(
+            by_run[score["run_id"]], configs[score["run_id"]], score, points
+        )
+    return {"runs": len(rows), "files": len(index["files_sha256"]), "verified": True}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verify", type=Path)
+    parser.add_argument("--runs-root", type=Path)
+    parser.add_argument("--selection", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--observed-at")
+    args = parser.parse_args()
+    if args.verify:
+        print(json.dumps(verify(args.verify)))
+    else:
+        if not all((args.runs_root, args.selection, args.output, args.observed_at)):
+            parser.error(
+                "Export needs --runs-root, --selection, --output, --observed-at"
+            )
+        export(
+            args.runs_root,
+            read(args.selection),
+            args.output,
+            observed_at=args.observed_at,
+        )
+        print(json.dumps(verify(args.output)))
+
+
+if __name__ == "__main__":
+    main()

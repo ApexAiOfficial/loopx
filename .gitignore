@@ -2,7 +2,6 @@
 .venv/
 .idea
 node_modules/
-apps/dashboard/public/*.local.json
 apps/presentation/dashboard/public/*.local.json
 __pycache__/
 *.pyc
@@ -11,13 +10,19 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+.hypothesis/
 .ruff_cache/
 .mypy_cache/
 .coverage
 coverage.xml
+coverage/
 htmlcov/
 .playwright-cli/
 output/playwright/
+# Historical browser captures belong in ignored output or PR attachments.
+/examples/personal-workspace-browser/evidence/
+/examples/personal-workspace-browser/screenshots/
+apps/desktop/loopx-control-plane/runtime/
 
 # Local/private operator skills. Generic, reusable contracts belong in docs or
 # product code; account-specific creator/operator skills stay outside git.
@@ -35,3 +40,11 @@ goals/**/ACTIVE_GOAL_STATE.md
 goals/**/ACTIVE_GOAL_STATE.md.lock
 /runtime/
 logs/
+
+# Legacy semantic census reports are derived locally, never repository authority.
+/loopx/semantics/inventory_v0.json
+/loopx/semantics/project_registry_io_manifest_v1.json
+
+# Frontend delivery artifacts are built and qualified from source.
+/loopx/web/chat/
+/loopx/web/.chat-build-*/

@@ -33,8 +33,8 @@ const approvedRequires = new Set([
   'react-dom',
   'react-dom/client',
   '@deepseek-ai/cordis',
-  '@deepseek-ai/dsh-client-runtime/client',
   '@deepseek-ai/dsh-client-ui-primitives',
+  '@deepseek-ai/dsh-client-ui-renderer/client',
   '@deepseek-ai/dsh-client-ui-slots',
 ])
 const packedStaticEntries = new Set([
@@ -46,8 +46,12 @@ const packedStaticEntries = new Set([
   'package/lib/driver.js',
   'package/lib/index.js',
   'package/lib/init-command.js',
+  'package/lib/native-operation-context.js',
+  'package/lib/native-operation.js',
+  'package/lib/observer.js',
   'package/lib/types/cli.d.ts',
   'package/lib/types/client/LoopXGoalBar.d.ts',
+  'package/lib/types/client/dashboard.d.ts',
   'package/lib/types/client/index.d.ts',
   'package/lib/types/client/locale.d.ts',
   'package/lib/types/client/rpc.d.ts',
@@ -55,15 +59,20 @@ const packedStaticEntries = new Set([
   'package/lib/types/driver.d.ts',
   'package/lib/types/goalbar/connection-rpc.d.ts',
   'package/lib/types/goalbar/events.d.ts',
+  'package/lib/types/goalbar/project-registry-wire.d.ts',
   'package/lib/types/goalbar/protocol.d.ts',
   'package/lib/types/goalbar/read-model.d.ts',
   'package/lib/types/goalbar/service.d.ts',
   'package/lib/types/index.d.ts',
   'package/lib/types/init-command.d.ts',
+  'package/lib/types/managed-runtime.d.ts',
+  'package/lib/types/native-operation-context.d.ts',
+  'package/lib/types/native-operation.d.ts',
+  'package/lib/types/observer.d.ts',
   'package/package.json',
 ])
 const packedHashedEntries = [
-  ['CLI chunk', /^package\/lib\/cli-[A-Za-z0-9_-]{8}\.js$/u],
+  ['managed runtime chunk', /^package\/lib\/managed-runtime-[A-Za-z0-9_-]{8}\.js$/u],
   ['Driver chunk', /^package\/lib\/driver-[A-Za-z0-9_-]{8}\.js$/u],
 ]
 
@@ -161,6 +170,7 @@ function activationPayload(state) {
     execute: false,
     goal_id: goalId,
     before_state: state,
+    observed_state_fingerprint: 'a'.repeat(64),
     after_state: 'stopped',
     changed: active,
     written: false,
@@ -242,7 +252,17 @@ function coordinatorHarness() {
   let activateCalls = 0
   let cancelCalls = 0
   let abortedWaits = 0
+  let admission = { state: 'clear' }
   return {
+    setAdmission(change) {
+      admission = change.value
+      for (const waiter of [...waiters]) {
+        if (waiter.session !== change.session) continue
+        waiter.finish(waiter.options.isSessionCurrent()
+          ? { kind: 'admission_changed', sessionId: String(change.session.id) }
+          : { kind: 'session_unavailable' })
+      }
+    },
     openWatchService() {
       let disposed = false
       return {
@@ -330,26 +350,43 @@ function coordinatorHarness() {
       cancelCalls += 1
       return { kind: 'applied' }
     },
+    readContinuationAdmission() {
+      return admission
+    },
     counts: () => ({ activateCalls, cancelCalls, waiters: waiters.size }),
     abortedWaits: () => abortedWaits,
   }
 }
 
-async function openPackedConnection(installed, host, service) {
-  const installedRequire = createRequire(join(installed, 'package.json'))
-  const dshRequire = createRequire(installedRequire.resolve('@deepseek-ai/dsh/package.json'))
+async function openPackedConnection(host, service) {
+  const harnessRequire = createRequire(join(packageRoot, 'package.json'))
+  const dshRequire = createRequire(harnessRequire.resolve('@deepseek-ai/dsh/package.json'))
   const appRequire = createRequire(dshRequire.resolve('@deepseek-ai/dsh-web-app/package.json'))
   const [{ Context }, { HostConnectionService }, { WebServer }] = await Promise.all([
-    import(pathToFileURL(installedRequire.resolve('@deepseek-ai/cordis')).href),
-    import(pathToFileURL(installedRequire.resolve('@deepseek-ai/dsh-client-connection')).href),
+    import(pathToFileURL(harnessRequire.resolve('@deepseek-ai/cordis')).href),
+    import(pathToFileURL(harnessRequire.resolve('@deepseek-ai/dsh-client-connection')).href),
     import(pathToFileURL(appRequire.resolve('@deepseek-ai/dsh-host-webserver')).href),
   ])
   const ctx = new Context()
   await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 })
-  await ctx.plugin(HostConnectionService, [])
-  const disposeRpc = host.registerGoalBarConnectionRpc(ctx.connection, service)
+  // 0.1.5 constructs the service as `(ctx, trustedHosts, browserAuth)`. The
+  // deployment's Connection plugin owns the concrete browser-auth face and is
+  // gated on a `credentials` service, so this carrier probe supplies its own
+  // permissive face to isolate the host-half state machine; the real fence is
+  // asserted by the real-profile phase against the installed application.
+  const connection = new HostConnectionService(ctx, [], {
+    isAuthenticated: () => true,
+    authorizeIndex: () => true,
+    authenticatedUrl: url => url,
+  })
+  const disposeRpc = host.registerGoalBarConnectionRpc(connection, service)
   return {
     baseUrl: `http://127.0.0.1:${String(ctx.webServer.port)}`,
+    // This phase registers the standalone authenticated `/loopx` channel
+    // explicitly, so its client must address that channel. The shared
+    // `/api/loopx.goalbar` route is owned by the real-profile phase, which goes
+    // through the installed `registerGoalBarConnectionTransport` dispatcher.
+    sharedApi: false,
     disposeRpc,
     close: () => ctx.fiber.dispose(),
   }
@@ -371,7 +408,10 @@ async function exercisePackedService(installed) {
   const session = {
     id: sessionId,
     header: { version: 0, id: sessionId, createdAt: 1, cwd: installed },
+    // The fixture owns the log: `events` stays its mutable store for the
+    // harness, and `snapshotEvents()` is the installed-generation reader.
     events,
+    snapshotEvents: () => events,
     surface: { nodes: [] },
   }
   const agent = {
@@ -409,14 +449,21 @@ async function exercisePackedService(installed) {
   const service = host.createGoalBarService({
     getAgent: id => id === sessionId ? currentAgent : undefined,
     coordinator,
-    command: { file: 'loopx', prefix: [], skillCommand: 'loopx', version: 'loopx smoke' },
+    command: { file: 'loopx', prefix: [], skillCommand: 'loopx', version: 'loopx 1.2.4' },
     runner,
     retryDelaysMs: [0, 0],
     watchTimeoutMs: 50,
   })
-  const connection = await openPackedConnection(installed, host, service)
+  const connection = await openPackedConnection(host, service)
   const call = async (endpoint, payload, signal) => {
-    const result = await rpc(connection.baseUrl, endpoint, payload, {}, signal)
+    const result = await rpc(
+      connection.baseUrl,
+      endpoint,
+      payload,
+      {},
+      signal,
+      connection.sharedApi,
+    )
     assert.equal(result.response.status, 200)
     assert.equal(result.body.rpcId, result.rpcId)
     return result.body.result
@@ -512,9 +559,9 @@ async function exercisePackedService(installed) {
     expected: { goalId, loopxAgentId },
     agentStatus: 'running',
   })
-  await mkdir(join(installed, '.codex', 'goals', goalId), { recursive: true })
+  await mkdir(join(installed, '.loopx', 'goals', goalId), { recursive: true })
   await writeFile(
-    join(installed, '.codex', 'goals', goalId, 'ACTIVE_GOAL_STATE.md'),
+    join(installed, '.loopx', 'goals', goalId, 'ACTIVE_GOAL_STATE.md'),
     'runtime smoke state revision\n',
   )
   assert.deepEqual((await externalWatch).value.result, {
@@ -529,6 +576,50 @@ async function exercisePackedService(installed) {
   binding = 'bound'
   const current = await read()
   assert.deepEqual(current.snapshot.progress, progress)
+
+  // A driver admission failure is projected into the snapshot with a safe
+  // category, wakes an exact-Session watcher without new events, and is
+  // cleared by the next admitted evaluation.
+  assert.deepEqual(
+    current.snapshot.continuationAdmission,
+    { state: 'clear' },
+    'clean admission state crossed the wire',
+  )
+  const admissionWatch = call('goalbar/watch', {
+    v: requestVersion,
+    op: 'watch',
+    sessionId,
+    afterSessionEventSeq: current.baseSessionEventSeq,
+    sourceRevision: current.sourceRevision,
+    expected: { goalId, loopxAgentId },
+    agentStatus: 'running',
+  })
+  await waitUntil(
+    () => coordinator.counts().waiters === 1,
+    'admission watch never became pending',
+  )
+  coordinator.setAdmission({
+    session,
+    value: { state: 'failed', category: 'invalid_response' },
+  })
+  assert.deepEqual((await admissionWatch).value.result, {
+    kind: 'source_changed', sessionEventSeq: current.baseSessionEventSeq,
+  })
+  const failed = await read()
+  assert.equal(failed.kind, 'present')
+  assert.deepEqual(
+    failed.snapshot.continuationAdmission,
+    { state: 'failed', category: 'invalid_response' },
+  )
+  const failedWire = JSON.stringify(failed)
+  assert(!failedWire.includes('transient diagnostic'))
+  assert(!failedWire.includes(installed))
+  coordinator.setAdmission({ session, value: { state: 'clear' } })
+  assert.deepEqual(
+    (await read()).snapshot.continuationAdmission,
+    { state: 'clear' },
+    'admitted evaluation cleared the projected failure',
+  )
 
   const abortedBefore = coordinator.abortedWaits()
   const cancelledWatch = disconnectableRpc(
@@ -651,9 +742,41 @@ async function createClientModuleSystem(context, staticModules) {
   const appRequire = createRequire(dshRequire.resolve('@deepseek-ai/dsh-web-app/package.json'))
   const sourcePath = appRequire.resolve('@deepseek-ai/dsh-client-modules/client')
   let loader
-  context.__ModuleLoader__ = { load: value => { loader = value } }
+  const registrationTarget = {
+    mode: 'queue',
+    pendingQueue: [],
+    load: value => { loader = value },
+  }
+  context.__ModuleLoader__ = registrationTarget
   vm.runInContext(await readFile(sourcePath, 'utf8'), context, { filename: sourcePath })
   const exports = loader.factory(() => { throw new Error('unexpected module-system dependency') })
+  if (typeof exports.createClientModuleSystem === 'function') {
+    return exports.createClientModuleSystem(
+      registrationTarget,
+      { id: loader.id, exports },
+      {
+        boot: {
+          rev: 'dsh-loopx-plugin-runtime-smoke',
+          entries: [{
+            id: packageId,
+            url: `/plugins/${packageId}/client.js`,
+            rev: 'dsh-loopx-plugin-runtime-smoke',
+            external: [],
+          }],
+          // 0.1.5 requires every entry to belong to exactly one initial-load
+          // batch, so the synthetic manifest carries the application batch the
+          // real host composes around this single row.
+          batches: [{
+            phase: 'application',
+            url: `/plugins/${packageId}/client.js`,
+            rev: 'dsh-loopx-plugin-runtime-smoke',
+            entries: [packageId],
+          }],
+        },
+        staticModules,
+      },
+    )
+  }
   delete context.__ModuleLoader__
   return new exports.ClientModuleSystem({ modules: [], staticModules })
 }
@@ -684,14 +807,19 @@ async function materializeServedClient(source) {
       locale: { register: () => () => undefined },
       slots: {
         inject(name, install) {
-          assert.equal(name, 'conversation.input.dock')
+          assert(
+            ['sidebar.panellist', 'main', 'conversation.input.dock'].includes(name),
+            `unexpected slot injection ${name}`,
+          )
           const dispose = install()
           if (typeof dispose === 'function') effects.push(dispose)
         },
         register(config, component) {
           assert.equal(typeof component, 'function')
-          slots.set(config.id, config)
-          return () => slots.delete(config.id)
+          const key = config.id ?? `main:${config.key}`
+          assert.equal(slots.has(key), false, `duplicate slot ${key}`)
+          slots.set(key, config)
+          return () => slots.delete(key)
         },
       },
       on: () => () => undefined,
@@ -699,9 +827,14 @@ async function materializeServedClient(source) {
     client.apply(ctx)
     const config = slots.get('loopx-goal')
     assert.equal(config.order, 15)
-    assert.deepEqual([...slots].sort((a, b) => a[1].order - b[1].order).map(([id]) => id), [
-      'goal', 'loopx-goal', 'queue',
-    ])
+    const sidebar = slots.get('loopx-dashboard')
+    assert.equal(sidebar.order, 7)
+    assert.equal(slots.get('main:loopx-dashboard').key, 'loopx-dashboard')
+    const dockOrder = [...slots.entries()]
+      .filter(([id]) => ['goal', 'loopx-goal', 'queue'].includes(id))
+      .sort((a, b) => a[1].order - b[1].order)
+      .map(([id]) => id)
+    assert.deepEqual(dockOrder, ['goal', 'loopx-goal', 'queue'])
     assert.equal(config.inject('session-one').rpcSessionId, 'session-one')
     assert.equal(config.inject('session-two').rpcSessionId, 'session-two')
     return {
@@ -724,10 +857,14 @@ async function materializeServedClient(source) {
 
 async function waitForWebUrl(child, output) {
   return await new Promise((resolveUrl, reject) => {
-    const timeout = setTimeout(() => reject(new Error(`DSH URL timeout\n${output.text}`)), 20_000)
+    const timeout = setTimeout(() => reject(new Error(
+      `DSH URL timeout\n${redactWebOutput(output.text)}`,
+    )), 20_000)
     const inspect = chunk => {
       output.text += chunk.toString()
-      const match = output.text.match(/dsh web: (http:\/\/127\.0\.0\.1:\d+)/u)
+      const match = output.text.match(
+        /dsh web: (http:\/\/127\.0\.0\.1:\d+(?:\/\?[A-Za-z0-9_-]+=[A-Za-z0-9_-]+)?)/u,
+      )
       if (match) {
         clearTimeout(timeout)
         resolveUrl(match[1])
@@ -737,9 +874,43 @@ async function waitForWebUrl(child, output) {
     child.stderr.on('data', inspect)
     child.once('exit', (code, signal) => {
       clearTimeout(timeout)
-      reject(new Error(`DSH exited before URL (code=${code}, signal=${signal})\n${output.text}`))
+      reject(new Error(
+        `DSH exited before URL (code=${code}, signal=${signal})\n${redactWebOutput(output.text)}`,
+      ))
     })
   })
+}
+
+function redactWebOutput(value) {
+  return value.replace(/([?&][A-Za-z0-9_-]+=)[A-Za-z0-9_-]+/gu, '$1<redacted>')
+}
+
+async function openAuthenticatedWeb(launchUrl) {
+  const url = new URL(launchUrl)
+  if (!url.searchParams.has('token')) {
+    return {
+      baseUrl: url.origin,
+      headers: {},
+      index: await fetch(url, { signal: AbortSignal.timeout(5_000) }),
+    }
+  }
+  const exchange = await fetch(url, {
+    redirect: 'manual',
+    signal: AbortSignal.timeout(5_000),
+  })
+  assert.equal(exchange.status, 303)
+  const cookie = exchange.headers.get('set-cookie')?.split(';', 1)[0]
+  assert(cookie, 'DSH launch-token exchange omitted its browser session cookie')
+  const cleanUrl = new URL(exchange.headers.get('location') ?? '/', url)
+  const headers = { cookie }
+  return {
+    baseUrl: cleanUrl.origin,
+    headers,
+    index: await fetch(cleanUrl, {
+      headers,
+      signal: AbortSignal.timeout(5_000),
+    }),
+  }
 }
 
 async function stopChild(child) {
@@ -760,19 +931,45 @@ async function stopChild(child) {
   await closed
 }
 
-async function rpc(baseUrl, endpoint, payload, extraHeaders = {}, signal) {
+async function rpc(
+  baseUrl,
+  endpoint,
+  payload,
+  extraHeaders = {},
+  signal,
+  sharedApi = false,
+) {
   const rpcId = randomUUID()
   const requestSignal = signal ?? AbortSignal.timeout(5_000)
-  const response = await fetch(`${baseUrl}/loopx/${endpoint}`, {
+  const wireEndpoint = sharedApi ? 'loopx.goalbar' : endpoint
+  const channel = sharedApi ? 'api' : 'loopx'
+  const response = await fetch(`${baseUrl}/${channel}/${wireEndpoint}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...extraHeaders },
-    body: JSON.stringify({ type: 'client-request', rpcId, method: endpoint, payload }),
+    body: JSON.stringify({ type: 'client-request', rpcId, method: wireEndpoint, payload }),
     signal: requestSignal,
   })
   const body = response.headers.get('content-type')?.includes('json')
     ? await response.json()
     : await response.text()
   return { response, body, rpcId }
+}
+
+async function hostRpc(baseUrl, method, args, extraHeaders = {}) {
+  const rpcId = randomUUID()
+  const response = await fetch(`${baseUrl}/api/${method}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...extraHeaders },
+    // The 0.1.5 gateway accepts exactly one plain-object `args` field as the
+    // Remote-method payload instead of the bare request object.
+    body: JSON.stringify({ type: 'client-request', rpcId, method, payload: { args } }),
+    signal: AbortSignal.timeout(5_000),
+  })
+  assert.equal(response.status, 200)
+  const body = await response.json()
+  assert.equal(body.rpcId, rpcId)
+  assert.equal(body.result.ok, true, JSON.stringify(body.result.error))
+  return body.result.value
 }
 
 function disconnectableRpc(baseUrl, endpoint, payload) {
@@ -810,20 +1007,30 @@ function disconnectableRpc(baseUrl, endpoint, payload) {
   }
 }
 
-async function exerciseRealDshWeb(home, env, cliLog) {
+async function exerciseRealDshWeb(
+  home,
+  env,
+  cliLog,
+  skipSessionFixture,
+  sharedApi,
+) {
   const output = { text: '' }
-  const child = spawn(dshBin, ['--profile', 'web', '--port', '0'], {
+  const child = spawn(dshBin, ['--profile', 'web', '--port', '0', '--no-open'], {
     cwd: packageRoot,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let baseUrl
   try {
-    baseUrl = await waitForWebUrl(child, output)
-    const index = await fetch(baseUrl, { signal: AbortSignal.timeout(5_000) })
+    const launchUrl = await waitForWebUrl(child, output)
+    const authenticated = await openAuthenticatedWeb(launchUrl)
+    baseUrl = authenticated.baseUrl
+    const index = authenticated.index
+    const authHeaders = authenticated.headers
     assert.equal(index.status, 200)
     const html = await index.text()
-    const bootText = html.match(/window\.__DSH_BOOT__ = (\{.*?\})<\/script>/su)?.[1]
+    const bootText = /(?:window\.__DSH_BOOT__|globalThis\["__DSH_BOOT__"\])\s*=\s*(\{.*?\})<\/script>/su
+      .exec(html)?.[1]
     assert(bootText, 'real DSH index omitted the boot manifest')
     const boot = JSON.parse(bootText)
     const row = boot.entries.find(entry => entry.id === packageId)
@@ -831,10 +1038,11 @@ async function exerciseRealDshWeb(home, env, cliLog) {
     assert.deepEqual(row.inject, [
       '@deepseek-ai/dsh-client-connection',
       '@deepseek-ai/dsh-client-locale',
-      '@deepseek-ai/dsh-client-runtime',
       '@deepseek-ai/dsh-client-ui-conversation',
+      '@deepseek-ai/dsh-client-ui-renderer',
     ])
     const bundle = await fetch(new URL(row.url, baseUrl), {
+      headers: authHeaders,
       signal: AbortSignal.timeout(5_000),
     })
     assert.equal(bundle.status, 200)
@@ -842,8 +1050,49 @@ async function exerciseRealDshWeb(home, env, cliLog) {
     assert(clientSource.includes('id: "dsh-loopx-plugin"'))
     await materializeServedClient(clientSource)
 
-    const malformed = await rpc(baseUrl, 'goalbar/read', { reflected: 'must-not-return' })
-    assert.equal(malformed.response.status, 200)
+    const sessionId = 'loopx-bootstrap-readback'
+    const initializationLog = await readFile(cliLog, 'utf8').catch(() => '(no LoopX calls)')
+    assert(
+      await stat(join(env.DSH_AGENTS_HOME, 'skills', 'loopx', 'SKILL.md'))
+        .then(() => true, () => false),
+      `automatic initialization did not create the isolated loopx skill: ${initializationLog}\n${redactWebOutput(output.text)}`,
+    )
+    if (!skipSessionFixture) {
+      // 0.1.5 namespaces Remote endpoints as `<namespace>/<method>` and names
+      // the wire arguments after the Host method's own parameter, so the
+      // session and skill hosts are addressed by namespace and `request`.
+      await hostRpc(baseUrl, 'session/create', {
+        request: { sessionId, cwd: packageRoot },
+      }, authHeaders)
+      const skillCatalog = await hostRpc(baseUrl, 'skills/list', {
+        request: { sessionId },
+      }, authHeaders)
+      assert(
+        skillCatalog.skills.some(skill => skill.name === 'loopx'),
+        `automatic initialization did not expose the loopx skill before DSH readiness: ${JSON.stringify(skillCatalog)}\n${redactWebOutput(output.text)}`,
+      )
+    }
+
+    const startupCalls = (await readFile(cliLog, 'utf8')).trim().split('\n')
+    assert.equal(startupCalls.length, 4, `unexpected automatic initialization calls: ${startupCalls.join(' | ')}`)
+    assert(startupCalls[0].endsWith('--version'))
+    assert(startupCalls[1].includes('workflow-skills'))
+    assert(startupCalls[2].includes('--install'))
+    assert(startupCalls[3].includes('workflow-skills'))
+
+    const malformed = await rpc(
+      baseUrl,
+      'goalbar/read',
+      { reflected: 'must-not-return' },
+      authHeaders,
+      undefined,
+      sharedApi,
+    )
+    assert.equal(
+      malformed.response.status,
+      200,
+      `GoalBar route unavailable: ${JSON.stringify(malformed.body)}\n${redactWebOutput(output.text)}`,
+    )
     assert.equal(malformed.body.rpcId, malformed.rpcId)
     assert.equal(malformed.body.result.ok, false)
     assert.equal(malformed.body.result.error.code, 'bad-request')
@@ -851,7 +1100,7 @@ async function exerciseRealDshWeb(home, env, cliLog) {
 
     const read = await rpc(baseUrl, 'goalbar/read', {
       v: requestVersion, op: 'read', sessionId: 'runtime-no-agent',
-    })
+    }, authHeaders, undefined, sharedApi)
     const unavailable = read.body.result.value.result
     assert.equal(unavailable.kind, 'fault')
     assert.equal(unavailable.code, 'session_unavailable')
@@ -860,12 +1109,34 @@ async function exerciseRealDshWeb(home, env, cliLog) {
 
     const rejected = await rpc(baseUrl, 'goalbar/read', {
       v: requestVersion, op: 'read', sessionId: 'runtime-no-agent',
-    }, { origin: 'http://non-loopback.invalid' })
+    }, { ...authHeaders, origin: 'http://non-loopback.invalid' }, undefined, sharedApi)
     assert.equal(rejected.response.status, 403)
     assert.equal(rejected.body, 'forbidden')
     await new Promise(resolveWait => setTimeout(resolveWait, 150))
-    const logExists = await stat(cliLog).then(() => true, () => false)
-    assert.equal(logExists, false, 'idle real DSH runtime invoked LoopX')
+    const idleCalls = (await readFile(cliLog, 'utf8')).trim().split('\n')
+    assert.deepEqual(idleCalls, startupCalls, 'idle real DSH runtime invoked LoopX after bootstrap')
+
+    // Use the same Entry.update live-disable operation as Plugin Hub. Losing
+    // LoopX's bootstrap provider must remove only its own dependent services.
+    const disabled = await fetch(new URL('/qualification/disable-loopx', baseUrl), {
+      method: 'POST', headers: authHeaders, signal: AbortSignal.timeout(5_000),
+    })
+    assert.equal(disabled.status, 200, 'LoopX disposal stopped the shared Web server')
+    assert.deepEqual(await disabled.json(), { bootstrapRemoved: true, webAlive: true })
+    const afterDisable = await fetch(baseUrl, {
+      headers: authHeaders, signal: AbortSignal.timeout(5_000),
+    })
+    assert.equal(afterDisable.status, 200, 'DSH became unavailable after LoopX live-disable')
+    assert(!(await afterDisable.text()).includes(`"id":"${packageId}"`),
+      'live-disable retained the LoopX Client boot entry')
+    const retired = await rpc(baseUrl, 'goalbar/read', {
+      v: requestVersion, op: 'read', sessionId: 'runtime-no-agent',
+    }, authHeaders, undefined, sharedApi)
+    assert.equal(retired.response.status, 404, 'live-disable retained the LoopX route')
+    assert.deepEqual((await readFile(cliLog, 'utf8')).trim().split('\n'), startupCalls,
+      'LoopX disposal invoked a business command')
+  } catch (error) {
+    throw new Error(`real DSH web qualification failed: ${error.message}\n${redactWebOutput(output.text)}`, { cause: error })
   } finally {
     await stopChild(child)
   }
@@ -876,11 +1147,15 @@ async function exerciseRealDshWeb(home, env, cliLog) {
 
 async function main() {
   const suppliedTarball = parseArgs(process.argv.slice(2))
+  const dshVersion = run(dshBin, ['--version']).trim()
+  const expectedDshVersion = process.env.DSH_EXPECTED_VERSION
+  if (expectedDshVersion) assert.equal(dshVersion, expectedDshVersion)
+  const skipSessionFixture = process.env.DSH_RUNTIME_SKIP_SESSION_FIXTURE === '1'
   const temp = await mkdtemp(join(tmpdir(), 'dsh-loopx-goalbar-runtime-'))
   const home = join(temp, 'dsh-home')
   const tarball = suppliedTarball ?? join(temp, 'dsh-loopx-plugin.tgz')
   const cliLog = join(temp, 'loopx-invocations.log')
-  const fakeLoopX = join(temp, 'loopx-idle-probe')
+  const fakeLoopX = join(temp, 'loopx-bootstrap-probe')
   let installed
   try {
     if (suppliedTarball === undefined) {
@@ -888,19 +1163,104 @@ async function main() {
     }
     assert((await stat(tarball)).isFile(), 'packed artifact is unavailable')
     assertPackedArtifact(tarball)
-    await writeFile(fakeLoopX, `#!/usr/bin/env sh\nprintf '%s\\n' "$*" >> "${cliLog}"\nprintf '%s\\n' 'loopx smoke'\n`)
+    await writeFile(fakeLoopX, String.raw`#!/usr/bin/env sh
+set -eu
+printf '%s\n' "$*" >> "${cliLog}"
+case " $* " in
+  *" --version "*)
+    printf '%s\n' 'loopx 2.4.0'
+    exit 0
+    ;;
+esac
+skills_dir=''
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = '--skills-dir' ]; then skills_dir="$argument"; fi
+  previous="$argument"
+done
+case " $* " in
+  *" workflow-skills "*)
+    case " $* " in
+      *" --install "*)
+        # Make initialization observably asynchronous: the printed URL must
+        # still wait for native Loader readiness without a Web-row dependency.
+        sleep 1
+        for skill in loopx loopx-benchmark loopx-doc-registry loopx-pr-program loopx-pr-review loopx-project loopx-self-repair; do
+          mkdir -p "$skills_dir/$skill"
+          printf '%s\n' '---' "name: \"$skill\"" "description: \"LoopX runtime smoke skill.\"" '---' '' '# LoopX smoke' > "$skills_dir/$skill/SKILL.md"
+        done
+        printf '%s\n' '{"ok":true,"schema_version":"loopx_workflow_skill_install_v0","operation":"install","host_surface":"deepseek-harness-native","installed":{"loopx-benchmark":"created","loopx-doc-registry":"created","loopx-pr-program":"created","loopx-pr-review":"created","loopx-project":"created","loopx-self-repair":"created"},"entry":{"status":"created"}}'
+        ;;
+      *)
+        if [ -f "$skills_dir/loopx/SKILL.md" ]; then required=false; else required=true; fi
+        printf '%s\n' "{\"ok\":true,\"schema_version\":\"loopx_workflow_skill_install_v0\",\"operation\":\"inspect\",\"host_surface\":\"deepseek-harness-native\",\"install_required\":$required}"
+        ;;
+    esac
+    ;;
+  *)
+    printf '%s\n' '{"ok":false,"error":"unexpected smoke command"}'
+    exit 1
+    ;;
+esac
+`)
     await chmod(fakeLoopX, 0o755)
-    const env = { ...process.env, DSH_HOME: home, LOOPX_BIN: fakeLoopX }
+    const env = {
+      ...process.env,
+      DSH_HOME: home,
+      DSH_AGENTS_HOME: join(temp, 'agents'),
+      LOOPX_BIN: fakeLoopX,
+    }
     run(dshBin, [
       'plugin', '--profile', 'web', 'add', tarball,
       '--prefer-offline', '--ignore-scripts',
     ], env)
+    const probe = join(temp, 'lifecycle-probe.mjs')
+    await writeFile(probe, `
+export const inject = ['loader', 'webServer']
+export function apply(ctx) {
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact', path: '/qualification/disable-loopx',
+    async handler(request, response) {
+      if (request.method !== 'POST') { response.writeHead(405).end(); return }
+      for (const id of ['loopx-init-command', 'loopx-goalbar', 'loopx-driver', 'loopx-shadow-observer']) {
+        const entry = [...ctx.loader.entries()].find(candidate => candidate.options.id === id)
+        if (!entry) throw new Error('missing qualification row: ' + id)
+        await entry.update({ disabled: true }, false, true)
+      }
+      response.setHeader('content-type', 'application/json')
+      response.end(JSON.stringify({
+        bootstrapRemoved: ctx.get('loopxBootstrap') === undefined,
+        // DSH 0.2.1 renamed the Web runtime service from webRuntime to webApp.
+        // The listener plus either owning runtime service proves Web stayed up.
+        webAlive: ctx.get('webServer') !== undefined
+          && (ctx.get('webApp') !== undefined || ctx.get('webRuntime') !== undefined),
+      }))
+    },
+  }))
+}
+`)
+    const profilePatch = join(home, 'profiles', 'web', 'cordis.patch.yml')
+    await writeFile(profilePatch, `- insert:\n    - id: loopx-lifecycle-qualification\n      name: ${JSON.stringify(probe)}\n`)
+    installed = await realpath(join(home, 'profiles', 'web', 'node_modules', packageId))
+    const dshInstallRequire = createRequire(
+      join(dirname(dirname(dshBin)), '..', 'package.json'),
+    )
+    const installedDshRequire = createRequire(
+      dshInstallRequire.resolve('@deepseek-ai/dsh/package.json'),
+    )
+    const installedConnection = await import(pathToFileURL(
+      installedDshRequire.resolve('@deepseek-ai/dsh-client-connection'),
+    ).href)
+    const sharedApi = Reflect.has(installedConnection.HostConnectionService.prototype, 'fetch')
+    await exerciseRealDshWeb(home, env, cliLog, skipSessionFixture, sharedApi)
+    await exercisePackedService(installed)
     const installedDump = run(dshBin, ['--profile', 'web', '--dump-config'], env)
     let previousRow = -1
     for (const [id, name] of [
       ['loopx-goalbar', packageId],
       ['loopx-init-command', `${packageId}/init-command`],
       ['loopx-driver', `${packageId}/driver`],
+      ['loopx-shadow-observer', `${packageId}/observer`],
     ]) {
       const row = installedDump.indexOf(`id: ${id}`)
       assert(
@@ -909,10 +1269,28 @@ async function main() {
       )
       previousRow = row
     }
-    installed = await realpath(join(home, 'profiles', 'web', 'node_modules', packageId))
-    await exercisePackedService(installed)
-    await exerciseRealDshWeb(home, env, cliLog)
+    assert(!installedDump.includes('loopxBootstrap'),
+      'optional LoopX bootstrap leaked into shared profile dependencies')
+
+    await writeFile(profilePatch, [
+      'loopx-init-command', 'loopx-goalbar', 'loopx-driver', 'loopx-shadow-observer',
+    ].map(id => `- id: ${id}\n  disabled: true\n`).join(''))
+    const disabledOutput = { text: '' }
+    const disabledChild = spawn(dshBin, ['--profile', 'web', '--port', '0', '--no-open'], {
+      cwd: packageRoot, env, stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    try {
+      const disabledWeb = await openAuthenticatedWeb(await waitForWebUrl(disabledChild, disabledOutput))
+      assert.equal(disabledWeb.index.status, 200, 'disabled LoopX package prevented DSH boot')
+      const retired = await rpc(disabledWeb.baseUrl, 'goalbar/read', {
+        v: requestVersion, op: 'read', sessionId: 'runtime-no-agent',
+      }, disabledWeb.headers, undefined, sharedApi)
+      assert.equal(retired.response.status, 404, 'disabled LoopX package activated the Host')
+    } finally {
+      await stopChild(disabledChild)
+    }
     run(dshBin, ['plugin', '--profile', 'web', 'remove', packageId], env)
+    await rm(profilePatch)
     const dump = run(dshBin, ['--profile', 'web', '--dump-config'], env)
     assert(!dump.includes(packageId), 'profile removal retained a LoopX Loader row')
   } finally {
@@ -920,8 +1298,8 @@ async function main() {
   }
   process.stdout.write([
     'dsh-loopx GoalBar runtime smoke passed',
-    '  real-profile: packed install, boot graph, served/materialized Client, /loopx registration, loopback fence, process teardown, idle no-CLI',
-    '  packed-rc7-connection: live mid-turn binding, lease revision reconciliation, runtime-only update, pending-watch abort, successful Start/Pause, handler disposal',
+    `  real-profile: DSH ${dshVersion}, packed install, delayed automatic initialization before readiness, immediate /loopx skill readback, boot graph, served/materialized Client, loopback fence, live-disable preserves DSH and retires LoopX, disabled-package boot, process teardown, idle no-extra-CLI`,
+    '  packed-connection: live mid-turn binding, lease revision reconciliation, runtime-only update, pending-watch abort, successful Start/Pause, handler disposal',
     '  client-lifecycle: slot coexistence/session injection plus ordinary-unload and cached-reapply CSS cleanup',
     '  manual-evidence: mounted Client-to-carrier Start/Pause stays in the owner-reviewed packed-browser gate',
   ].join('\n') + '\n')

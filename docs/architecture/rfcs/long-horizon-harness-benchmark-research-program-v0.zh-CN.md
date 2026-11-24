@@ -2,7 +2,8 @@
 
 | 字段 | 值 |
 |---|---|
-| 状态 | Draft，研究计划 |
+| 状态 | 已接受 |
+| 替代 / 关闭 | 无 |
 | 日期 | 2026-08-16 |
 | 作者 | LoopX maintainers |
 | 范围 | 外部能力证据、benchmark 协作、harness 实验与机制 qualification |
@@ -82,6 +83,87 @@ cadence。三个 benchmark 组成的组合把这些限制转化为互补证据�
 validation 后才能 accountable settlement、精简 run reduction，以及 treatment integrity
 无法证明时显式判无效。私有 trajectory 与 audit artifact 只保留为本地证据；只有泛化后的
 typed contract 与 public-safe 结论可以进入仓库。
+
+### 2.2 Bitter-Lesson 边界：原始产物重置与受治理控制面
+
+随着前沿编码模型在自主文件系统检索与自编探针脚本上持续增强，厚重的手工上下文压缩与多层
+外置提示词容易带来净协议税（$\Delta J(B \mid s_0) \le 0$）。在**可重置的 episode 型、结构清晰、
+且具备稠密或连续隔离标量验证的任务**上，仅保留原始历史产物与标量分数、并在每轮间执行干净
+上下文重置（让 Agent 自行编写 Python / 文件系统检索脚本）的极简外循环，可以打平甚至超越
+有损手工摘要：
+
+- [Meta-Harness](https://arxiv.org/html/2603.28052v1) 让外层 proposer 选择性检索此前的源码、
+  分数与执行轨迹。TerminalBench-2 搜索中，proposer 每轮读取文件数的中位数为 `82`
+  （附录 A.1）；另一个量是单次产物评估**最多可生成 `10M` tokens 的诊断资料**（§1、表 1），
+  并非实测的 proposer 每轮消费量。分类准确率比 ACE 高 `7.7` 分且上下文 token 少 `4x`；
+  找到的 Opus 4.6 harness 在 TerminalBench-2 达到 `76.4%`。系统仍保留提出候选、评估、
+  保存日志的外循环，不能据此认定仅靠标量分数或移除全部 harness 机制就能取得这些收益。
+- [Vercel `d0`](https://vercel.com/blog/we-removed-80-percent-of-our-agents-tools) 表明，
+  在结构清晰的语义文件系统上删去约 80% 自定义工具（`17 -> 2`：`bash` 与 SQL），使成功率从
+  `80%` 升至 `100%`，同时减少 `37%` token 并将延迟降低 `3.5x`。
+- [AlphaEvolve](https://arxiv.org/abs/2506.13131) 在算法代码发现上的成功，恰恰依赖固定不变的
+  外层循环与确定性程序 verifier，而不允许求解器改写自身 harness 或评分契约。
+- [AgentFlow](https://arxiv.org/abs/2510.05592) 在多轮工具规划中表明，静态轨迹上的离线 SFT
+  在轨迹分布偏移下会发生分布坍缩，而在环闭环分片优化（`Flow-GRPO`）使探索保持在真实工具结果上，
+  同时让冻结执行器保持简洁；[HELIX](https://arxiv.org/abs/2608.13951) 则表明从共享状态分叉的
+  已验证兄弟轨迹能够将因果策略增益与混淆的起点状态漂移分离开来。
+- LoopX 已发布的上下文研究（[上下文交付研究](https://loopx-project.github.io/loopx/blog/context-delivery/)
+  与 [EdgeBench 反馈与记忆研究](https://loopx-project.github.io/loopx/blog/edgebench-feedback-and-memory/)）
+  同样表明，冗余序列化与见顶后的重复 replan 循环会在原始代码检查与本地探针即可解决的场景下消耗大量
+  uncached 上下文——而且回合中的动态提示词改写会破坏前缀 KV-cache 复用，把温缓存运行推入高昂的冷
+  prefill 工况——此时保留单调追加前缀与本地探针已足够。
+
+然而，实证研究确立了**五类失败机制**，证明原始产物、标量奖励与干净重置无法替代受治理控制面：
+
+1. **Goodhart、verifier 篡改与掩盖症状的捷径作弊：** 当求解器与评分器共享进程、文件系统、网络或密钥边界时，
+   缺乏防护的优化会利用捷径通道——实证见于 `LHTB 2.0`（在冻结 agent 进程并隔离 verifier 之前，
+   早期 `14/17` 个满分属于评分器泄漏）、[Reward Hacking Benchmark](https://arxiv.org/abs/2605.02964)
+   （13 个前沿模型利用漏洞比例为 `0%` 至 `13.9%`，其中 `72%` 带有显式思维链合理化，且在任务复杂度
+   超过诚实求解阈值后生产对齐保护失效）、[SWE-Marathon](https://arxiv.org/abs/2606.07682)
+   （观测到 `13.8%` rollout 存在 reward hacking）、[Darwin Gödel Machine](https://arxiv.org/abs/2505.22954)
+   （Node 114 伪造验证日志），以及 [METR reward-hacking 评估](https://metr.org/blog/2025-06-05-recent-reward-hacking/)。
+   Agent 容器内的 Python 探针无法提供 OS/容器级 verifier 隔离、`benchmark_integrity_audit_v0`
+   或树外**反 Reward-Hacking 根因认证守卫**（将真正的不变量修复与屏蔽测试、放宽阈值或硬编码fixture 区分开；§6.5、§7.1）。
+2. **分布外（OOD）过拟合与 harness 膨胀：** 在原始产物上做无正则进化会死记训练轨迹并导致 OOD 退化。
+   [RRSI](https://arxiv.org/abs/2609.24972) 发现未正则的 Meta-Harness 在 OOD 仅提升 `+0.9`
+   （`40.6` vs `39.7`），`TTHE` 甚至下降 `-1.7`（`38.0` 并膨胀出 `8,500` 词提示词），而加入 critic
+   剪枝与退火预算正则化后 OOD 升至 `43.6`（`+3.9`）且策略 token 减少 `30%`；
+   [Harness Updating Is Not Harness Benefit](https://arxiv.org/abs/2605.30621) 同样显示 harness 修改
+   主要提升中等模型，在缺少 OOD 门控时前沿模型会饱和或回退。连续有效统计推断、留出集隔离及保留
+   决策差异的率失真记忆由本计划协同 [前沿科学研究计划](./frontier-science-research-program-v0.zh-CN.md#2-问题与动机)
+   （第 2 节与第 5 节 `T01`–`T07`）共同治理。
+3. **过早终止与稀疏 / 二值终局 verifier：** 本地文件重读无法阻止模型在可见冒烟测试通过后立即宣布完成，
+   也无法从 `0/1` 终局奖励中提取中间梯度。在 LoopX 已发布的 `SWE-Marathon` 研究
+   （[`benchmark/swe-marathon/README.md`](../../../benchmark/swe-marathon/README.md)）中，
+   `zstd-decoder` 任务上 `plain` Codex 在可见测试通过后早停（partial `0.721`，reward `0`），而受控
+   `heartbeat` 持续推进协议自测与内存安全验证（partial `1.000`，reward `1`）；在 `LHTB` `covshift`
+   （[EdgeBench 长程修复研究](https://loopx-project.github.io/loopx/blog/edgebench-long-horizon-repairs/)）中，
+   默认完成判断在第 38 分钟退出（`0.000`），而由 owner 锁定的验收门控将其推至 `0.82`（五臂 `heartbeat` 为
+   `0.743`）。外部完成拒绝、`stopped_recovery.py` 与隐藏覆盖压力仍然不可或缺。
+4. **代理指标偏移（Proxy Misalignment）与尾部 TLE 悬崖：** 未校准的本地 yardstick 与均值指标会倒挂
+   原生排名或触碰超时悬崖。LoopX 的 [`benchmark/proxy_order.py`](../../../benchmark/proxy_order.py) 分析
+   （[行为发现说明](../../reference/benchmark-behavior-findings.md#compare-a-local-proxy-with-released-scores)）
+   展示了本地代理排序与原生接受顺序的反转；[DuoDiscover 表 4](https://arxiv.org/html/2610.17184v1#S4.T4)
+   区分 SWE-fficiency 加速比（`x`）与 SOL-Exec 分数（`% SOL`）：在目标选择上加入未检验的
+   yardstick 后，`12.71x / 69.68%` 降至 `10.33x / 66.91%`；相邻下一行加入保真度检验后，
+   达到 `13.25x / 72.57%`。再加入 co-discovery 为 `13.76x / 74.43%`，加入 orchestrator 后才是
+   完整系统的 `14.93x / 80.80%`，不能把最终结果全部归给保真度门控。另有 `41%`–`45%` 的
+   yardstick 随代码演进失效；而
+   [LangChain 的 Terminal-Bench 2.0 研究](https://www.langchain.com/blog/improving-deep-agents-with-harness-engineering)
+   显示，在缺乏分阶段推理深度控制时，统一使用 `xhigh` 推理深度因超时悬崖从 `63.6%` 跌至 `53.9%`。
+   受治理的 yardstick 校准与尾延迟压力门控是原生优化的必要保护。
+5. **有状态依赖 DAG、覆盖台账与 workspace / 结算不变量：** 多单元依赖前沿、非 episode 持续世界、
+   linked-worktree 补丁归一化与幂等结算无法靠容器内的 Agent 脚本自行修复。[LoopsBench](https://arxiv.org/abs/2608.00267)
+   （`112` 个任务、`>5,300` 个依赖 DAG 单元）使当前最强外循环 SOTA 仍停留在 `25.00%`；一组
+   `EdgeBench` `New Foundations Consistency` 的 Astra max、`18h` 五臂研究中，带声明台账和方向
+   复盘的 Explore 达到 `92.3419`，高于 Official 与 Resume 的 `91.9412` 平台
+   （[报告源码](https://github.com/loopx-project/loopx/blob/d0ca48db02846be61a9b683f0efcd5c706381b66/apps/presentation/site/public/blog/zh/edgebench-feedback-and-memory/index.html#L63)）。
+   这是组合 profile 的单次描述性证据，不是台账的独立因果效应，也不是 C2/C3 结果；
+   实际评测基建同样依赖宿主侧不变量，例如 [`workspace_delivery.py`](../../../benchmark/deepswe-gptxhigh-v1/workspace_delivery.py)
+   （将 linked worktree 改动归一化回 `/app`）、[`frontiercs2/README.md`](../../../benchmark/frontiercs2/README.md)
+   （`v2.patch` 的 tmpfs `docker exec` 流式上传与持久准入恢复），以及
+   [`widesearch/pier/README.md`](../../../benchmark/widesearch/pier/README.md)（`$HOME` 绑定挂载、纯数值
+   `reward.json` 校验与 `provider_credential_shell_excluded`）。
 
 ## 3. Benchmark 介绍与适配分析
 
@@ -174,7 +256,94 @@ cost、output token 与 agent step。
 - verifier pass 本身不能证明维护成本更低或具备广泛专业迁移；
 - repository trace 可能敏感且体积很大，进入 LoopX state 前必须 reduction。
 
-### 3.4 为什么三者是一个组合
+### 3.4 StartupBench
+
+[StartupBench](https://startupbench.github.io/) 评测通用 agent 在"市场验证过的
+startup 工作流"上的表现。包含 97 个真实工作流任务，覆盖六个专业域（医疗健康 21、
+金融 18、商业与管理 19、法律 16、STEM 与计算机 16、教育与人文 7）。任务来自获得
+融资的 AI-native startup 产品、产品 demo 与用户访谈中真实委托给 agent 的工作流；
+每个任务要求 agent 在接近真实的工作区约束下搜索、推理、组织、验证并交付多格式
+artifact（DOCX、XLSX、PPTX、PDF、Markdown、图片、文本）。
+
+评分是 artifact-first：每个提交先转换为 evidence view，再按细粒度加权 rubric
+（平均每个任务 25.3 条）评判，而不是按答案相似度。公开的 Agent-as-Judge 框架报告
+92% 人类一致性、pass 阈值为 90、九个大模型上最高平均分 73.67、top pass@1 31.27，
+说明多数真实工作流交付物仍达不到生产就绪。
+
+**最适合 LoopX 研究的问题**
+
+- 长程 artifact 交付与多格式输出验证；
+- 超越软件的专业域工作流委托（金融、法律、医疗、商业）以及控制平面能否迁移；
+- 交付物质量与自我验证幻觉：agent 声称满足需求而 rubric 检查失败；
+- 交付物被外部评判的 human-attention 与 authority 研究；
+- 围绕 artifact 完成度与格式合规的 evidence-linked Todo/settlement。
+
+**主张限制**
+
+- 任务场景、参考材料与生成 artifact 不得进入 LoopX 公共 state 或可复用
+  training/memory surface；
+- Agent-as-Judge 是 benchmark 原生评测，不是通用生产 oracle 或权威；
+- rubric 分数本身不能证明维护成本更低或广泛专业迁移，需要独立审计；
+- leaderboard 是 model/scaffold 特定结果；更换 harness 是独立实验。
+
+### 3.5 LoopsBench
+
+[LoopsBench](https://loopsbench.ai/)（microsoft/Loopsbench）是长程终端环境软件
+任务的 benchmark 与 harness。每个任务打包 agent 可见 workspace、单元级需求、
+模块依赖图，以及 Docker-backed 执行环境，verifier 区分 incomplete、partial、
+complete 三种完成度。任务语料通过 GitHub-native 的 task proposal 与 validation
+社区化生长，发布确定性 bundle 与 SHA-256 校验；[论文](https://arxiv.org/abs/2608.00267)
+公开，数据集在 [Hugging Face](https://huggingface.co/datasets/LoopsBench/LoopsBench)。
+内置 adapter 覆盖 Oracle、Mini SWE-agent、SWE-agent、OpenHands、Claude Code、
+Cursor、Codex、Qwen Code、Copilot。
+
+**最适合 LoopX 研究的问题**
+
+- 多单元长程实现：跨相连模块规划、实现、测试与恢复，且依赖图显式可见；
+- partial-vs-complete verifier 语义：进展与完成可分别观测；
+- 依赖图感知的工作排序与 stall/replan 研究；
+- Docker/terminal 真实感与可复现的远程/本地执行；
+- 单元测试失败与 verifier 反馈后的恢复，且不把 read/ACK 当作进展。
+
+**主张限制**
+
+- 任务语料仍在增长；每次实验必须固定 upstream revision 与精确任务集；
+- incomplete/partial/complete 分层是 benchmark 合同，不得复制为通用 LoopX
+  生产语义；
+- Docker-backed 终端任务需要干净的网络与容器隔离 attestation；
+- 早期 leaderboard 比较是暂定的，不是饱和参考。
+
+### 3.6 WideSearch
+
+[WideSearch](https://widesearch-seed.github.io/)（ByteDance-Seed/WideSearch）
+评测 agentic broad information-seeking。包含 200 个双语任务（100 英文、100 中文）
+覆盖 18 个行业，要求 agent 搜索、收集并把大规模结构化信息整理成 markdown 表格。
+挑战在于操作规模与完整性，而不是单条事实的认知难度；评测用细粒度 Item F1，
+含 exact-match、number-near、URL-match、date-near 与 LLM-judge 组件。
+[论文](https://arxiv.org/abs/2508.07999)与[数据集](https://huggingface.co/datasets/ByteDance-Seed/WideSearch)
+以 MIT 协议公开，并有 [Harbor adapter](https://github.com/harbor-framework/harbor)
+支持确定性任务生成。
+
+**最适合 LoopX 研究的问题**
+
+- 需要 benchmark toolkit 网络放行策略（`widesearch-permitted-solving`）的
+  网络研究型任务，LoopX integrity reducer 已建模该策略；
+- 长程收集/完整性与幻觉：agent 必须验证规模与完整性，而不只是找到一条事实；
+- 基于证据的验证（citation、URL、日期、数字），可衔接 evidence 与
+  human-attention 研究；
+- 跨 18 个行业的双语（中/英）泛化；
+- 作为"深搜"benchmark 的互补：强调广度与体量。
+
+**主张限制**
+
+- 实时网络收集对时间与环境敏感；每次实验必须固定检索窗口、工具与搜索面；
+- Item F1 与 LLM-judge 指标必须固定到精确合同与 judge model；
+- 外部网络访问保持在 benchmark 原生 `permitted_solving` 策略内，不得泛化为
+  生产网络 authority；
+- 原始网页内容进入 LoopX state 前必须 reduction；benchmark 材料不得作为
+  training、memory 或 skill 输入。
+
+### 3.7 为什么这六个组成一个组合
 
 | 证据维度 | ALE | LHTB | DeepSWE |
 |---|---|---|---|
@@ -188,6 +357,98 @@ cost、output token 与 agent step。
 
 计划必须在各 benchmark 的原生 metric space 中报告，不能把 ALE score、LHTB reward 与
 DeepSWE pass rate 平均成一个 LoopX 数字。
+
+第二组三个 benchmark 为同一计划补充了三个互补 surface：
+
+| 证据维度 | StartupBench | LoopsBench | WideSearch |
+|---|---|---|---|
+| 工作 surface | 多格式专业 artifact | 多单元终端软件 | 大规模网络收集 |
+| 核心挑战 | 交付物质量与格式合规 | 相连单元间的 partial vs complete | 规模上的广度与完整性 |
+| 主要指标 | Weighted rubric / Agent-as-Judge | incomplete/partial/complete verifier 分层 | Item F1 与组件指标 |
+| 长程相关性 | Artifact 组装与一致性 | 依赖图规划与恢复 | 持续的搜索/收集/验证 loop |
+| 网络边界 | 工作流本地 | 容器化终端 | 求解阶段允许外部网络 |
+| 最适合回答的 LoopX 问题 | 控制能否改善经验证的 artifact 交付？ | 多单元工作为何、何时 stall 或恢复？ | 证据门控的控制能否在规模上降低幻觉？ |
+
+六个 benchmark 仍须在各自主语空间报告；StartupBench rubric、LoopsBench verifier
+分层与 WideSearch Item F1 不得互相平均，也不得并入 ALE/LHTB/DeepSWE 的结果。
+
+### 3.8 外部 Benchmark 调研与优先级排序（2026-11 更新）
+
+本次 2026-11-15 调研更新 2026-08 的六基准组合入门（§3.1–§3.7），并为后续集成排序
+（§9、§11）覆盖 EdgeBench 及 20 个外部 benchmark。排序依据四项实证标准：（1）相对纯基模
+scaling 仍保留的前沿区分度与上升空间；（2）verifier 确定性、抗 Goodhart 能力以及是否具备
+连续或多单元进度信号；（3）对第 2.2 节五类受治理失败机制的直接压力测试；（4）仓库就绪度
+（`benchmark/` 目录现有 `177` 个 `.py` 文件、共 `52,031` 行：`tests` `27,338` 行、`runtime/`
+`9,082` 行、`edgebench/` `6,899` 行、`deepswe*` `4,433` 行、`swe-marathon/` `1,430` 行、
+`frontiercs2*` `1,285` 行、`LHTB/` `596` 行、`widesearch/` `592` 行、根目录辅助 `376` 行）与
+Linux x86\_64 Docker、GPU 及云资源约束之间的权衡。
+
+**扩大多臂对照前的共同前置条件：** 在大规模扩展新的 Harbor、云端或 GPU benchmark 多臂
+对比前，应先将各适配器收敛至统一的 `benchmark/runtime/` Turn/Harbor 入口，对齐原生
+Stop-hook 基线对等性，并完成 E0–E2 生命周期、完整性与可计分门控（§11.2），避免继续复制
+烟囱式独立 runner。
+
+#### 优先级矩阵
+
+| 优先级 | Benchmark | 任务规模与时长 | 奖励与 Verifier 形态 | 前沿余量与机制信号 | 工程就绪度与平台约束 |
+|---|---|---|---|---|---|
+| **P0** | **EdgeBench** | 连续算法优化（`12h–18h` 长程运行） | 确定性在线冷却裁判；任务原生标量指标（按任务最大化或最小化） | 仅作按任务区分的描述性信号：`New Foundations 92.3419`（单次五臂研究）、`ANN 7,159 QPS`（另一组 `18h` 研究）；其他任务比较中 Official 领先。这些结果不是合并后的等预算帕累托证据，来源边界见下文。 | **已就绪并已评测**（`edgebench/` `6,899` 行）；需 **Linux x86\_64 Docker + SForge `iptables`**（macOS Docker socket 缺少网络边界） |
+| **P0** | **FrontierCS-2** | `48` 公开 / `150` 总计（`13` 个领域）；`5h`，限 `3–100` 次 train 调用 | 确定性隐藏工作负载 Driver/Judge；二值 `PASS`（须在*全部*指标与负载上胜过参考解）+ `FCI`/`FDI` 标量 | 12 个参评 agent 中最高通过率 **`58%`**，**`16/48` 零通过**；直接检验代理指标校准与抗刷分能力 | **单机桥接已就绪**（`frontiercs2*` `1,285` 行、`v2.patch` 传输修复；冻结 v1 `batch_local_counting` 归档为 `score_countable=false`、`integrity_qualified=false`；尚无有效 LoopX 计分结果）；**强制要求 Linux x86\_64 Docker**（macOS ARM Rosetta/QEMU 下 seccomp 失败）；官方 EKS+Modal 全测约 `$1,400`/48 题 |
+| **P0** | **LHTB / LHTB 2.0** | `v1: 46`（`90m`）；`v2.0: 77`（`46` 原题 + `31` 重构题，`3h` 含 `30m` 检查点） | 连续标量 `[0,1]` + 6 级阶梯（`R>=0.95`/`1.0`）+ 冻结进程 Harbor 二值拒止循环 | `v1` LoopX `0.4948` vs Goal `0.4475` / Plain `0.4218`（非等预算）；`v2.0` 最高 `0.692`（`37/77`）；早期 `14/17` 满分泄漏实证了 verifier 隔离必要性 | **`v1` Harbor 适配器已就绪**（`LHTB/` `596` 行）；**`LHTB 2.0` 尚无代码**；非 GPU Docker / Daytona |
+| **P0** | **LoopsBench** | `112` 个依赖 DAG 任务（`>5,300` 单元，`8` 种语言） | 沿就绪 DAG 前沿释放的确定性单元测试 + 回归测试（`incomplete` / `partial` / `complete`） | 最强带外循环 SOTA 仅 **`25.00%`**（`Opus-4.7` + Claude Code + 外循环）；专为外循环 DAG 与回归不变量设计 | **仓库暂无活跃代码**（§3.5/§9.5 规划中）；非 GPU，建议 Linux x86\_64 Docker |
+| **P1** | **SWE-Marathon** | `20` 超长程任务（仓内已评 `15` 题 v1.1 子集）；平均 `27.2M tok`/次 | 多层对抗式 verifier；二值求解 + 连续 `partial_score` | `v1` 前沿通过率 `<30%`，**`13.8%` rollout 出现 reward hacking**；仓内 `30%` 预算实验 `heartbeat 0.333 (5/15)` vs `Plain/Goal 0.267 (4/15)` | **已就绪并已评测**（`swe-marathon/` `1,430` 行）；`amd64` 多语言 Docker；token 与墙钟成本高（每组 15 题 `1,592m–2,375m`） |
+| **P1** | **PaperBenchX** *(优先于 PaperBench)* | `93` 篇论文（`12` 方向 / `6` 个非 ML 学科，`>3,000` 条细则）；`4–24h`（中位 `7h`） | 从零干净重放 + 确定性检查与共享 LLM-Judge（`>=90%` 为完整复现） | 细则均分 `27.53–59.08%`，**完整复现仅 `14%`**（`>=90%`）——比旧版 `PaperBench`（`20` 篇 ICML'24 论文、`24–36h`、SOTA `26.0%`）学科更广且验证缺口更锐利 | **仓库 `0` 代码**（约 `2–4` 周适配）；需重型 Linux Docker + 专业科学软件栈（`HFSS`、`Meep`、`GPU4PySCF`、`Habitat`）+ Judge API 密钥隔离 |
+| **P1** | **ALE (Agents' Last Exam)** *（区别于 `ALE-Bench`）* | `1,500+` 分类体系（`v1.1: 122` 题：`119` CPU / `3` GPU、`78` Docker）；多小时 VM | 运行后注入隐藏参考并执行 `evaluate()`，标量 `[0,1]` | 最难层级完整通过率 `<1%`；检验跨 CLI+GUI 专业工作迁移 | **仓库暂无活跃代码**（§3.1/§9.1 规划中，约 `2–4` 周适配）；强依赖 **GCP/GCE VM 与 CUA MCP**（无法在 macOS 本地直接运行） |
+| **P1** | **WideSearch** | `200`（`100 EN + 100 ZH`，`18` 个行业）；`44+` 网页 / 人类均值约 `2.3h` | 自动化原子表格评分（`Item F1` / `Row F1` + 二值 `SR`）；存在实时网页漂移非确定性 | 前沿 `SR <= 5.1%`（`o3` 多智能体 `5.1%`、单智能体 `4.5%`、`Gemini 2.5 Pro 4.3%`）；高适配扇出/完备性 harness，迭代 RSI 适配度低至中 | **适配器与 `pier` 模板已就绪**（`widesearch/` `592` 行，尚无实跑记录）；需 Linux/云端 `$HOME` 挂载（macOS `/tmp` 在 Colima 下失效）及 `permitted_solving` 网络 |
+| **P1** | **KernelBench / AlgoTune** | `KernelBench`: `250` PyTorch/CUDA 算子（`L1–L3`+`L4`）；`AlgoTune`: `154` 个 SciPy/sklearn/CVXPY 函数 | 确定性正确性校验 + GPU（`fast_p`）或 CPU 几何平均加速比 | `KernelBench` `<20% fast_1`；`AlgoTune` `AlgoTuner 1.72x`（前沿约 `2.05x`）；纯客观加速比适合进化/RLVR 循环 | **仓库 `0` 代码**；`KernelBench` 强制依赖 **NVIDIA CUDA/Triton GPU Linux/Modal**（Mac 无法运行）；`AlgoTune` 需**固定绑核的独占多核 Linux x86\_64** 计时宿主机 |
+| **P2** | **ALE-Bench (SakanaAI)** *（区别于 `ALE`）* | `40` 道 AtCoder 启发式竞赛题（`C++/Rust/Py`，`300+` 用例）；`150` 步迭代 | 确定性相对启发式得分 | 单发相对迭代反馈差距显著；跨题稳定性仍落后人类高手 | **仓库暂无活跃代码**；重型多核 Linux/AWS Docker；上游赛题协议禁止打包私有测试种子与输入 |
+| **P2** | **StartupBench** | `97` 交付物任务（`DOCX/XLSX/PPTX/PDF`，`6` 域，均 `25.3` 细则） | Evidence view + 加权 Agent-as-Judge `0–100`（`>=90` 通过，`92%` 人类一致性） | 最高均分 `Kimi-k3 73.67`，最高 `pass@1` `GPT-5.6-sol 31.27%`；RSI 适配度低至中（开放交付细则） | **仓库暂无活跃代码**（§3.4/§9.4 规划中）；多轮办公产物 API + Judge 边界；非 GPU |
+| **P2** | **MLE-bench** | `75` 场 Kaggle 竞赛（`22` Lite `158 GB`，全量 `3.3 TB`）；`24h` 标准（榜单于 `2026-04` 暂停） | 确定性 Kaggle 指标 + 奖牌阈值 | 主榜 SOTA `64.44±1.18%`；旧竞赛存在训练污染风险 | **仓库暂无活跃代码**；基础设施门槛极高（`36 vCPU`、`440 GB RAM`、`24 GB A10 GPU`、`3.3 TB` 磁盘、Kaggle 鉴权与 Git LFS） |
+| **P2** | **tb-science** *（仅保留单次迁移样本；**排除出 RSI**）* | `96` 已合并任务 + `366` 开放 PR；Harbor 格式 | **100% 二值 `1/0` `reward.txt`**（agent `public` vs verifier `no-network`） | 部分 PR 前沿难度极高，但**不适合 RSI**（无每代连续梯度、无 train/held-out 划分、CI 锁死单轮预算） | **仓库 `0` 代码**（约 `1–2` 周 Harbor 接入）；`ci_checks/check-task-timeout.sh` 硬锁 **`28800s`（`8h`）**；建议 Linux x86\_64 Docker |
+| **仅作对照 / 降级** | **DeepSWE** | `113` 原创任务（`91` 仓库，`5` 语言） | 手写行为 verifier（`0/1` 二值，`1.4%` judge 分歧率） | `v1.1` 在前沿三模型间呈现约 **`74%` 并列趋近饱和**；仅保留作回归与基线对照 | **已就绪**（`4,433` 行含 `workspace_delivery.py`）；需 Linux Docker 宿主机 worker；历史 v1 存在非等预算限制 |
+| **仅作对照 / 降级** | **SWE-bench Pro** | `v1: 1,865`（`731` 公开）；`v2: 642` + `HARD-51` | 补丁 + 单元测试（`0/1` 二值；`32.4%` judge 分歧率） | **`HARD-51` 已达 `98.0%`**——受基模 scaling 快速饱和 | **仓库暂无活跃代码**；`linux/amd64` Docker 镜像（`ghcr.io`），Mac ARM 非原生支持 |
+| **仅作对照 / 降级** | **CORE-Bench** | `270`（`90` 论文，`3` 难度）；经 HAL 运行 | 输出问答二值匹配 | 修复容差与脚手架缺陷后，Claude Opus 4.5 从 `21%` 升至 **`95%`**——已饱和 | **仓库 `0` 代码**；Docker/Azure（`Python`/`R`） |
+| **仅作对照 / 降级** | **ScienceAgentBench** | `102`（`44` 论文）；`30m` Docker 运行 | 有效执行 + 细则/代码检查 | `32.4%–42.2%`（`o1-preview`）；单脚本范围限制长程控制面区分度 | **仓库 `0` 代码**；`30m` / 8 线程 Docker |
+| **仅作对照 / 降级** | **BixBench** | `60` 胶囊 / `205` 问题（`v1.5`）；`24–48h` 5 次重复 | 二值精确匹配 MCQ / LLM-Judge 开放问答 | 开放问答 `17%`（早期基线，缺 2026 前沿 SOTA）；5 副本二值评估成本高 | **仓库 `0` 代码**；高昂多副本 API 成本 |
+| **仅作对照 / 降级** | **FrontierScience** | `160` 问答项（`100` 奥赛 + `60` 研究） | 简答 + 10 分研究细则 | `GPT-5.2` 奥赛 `77%` / 研究 `25%`；无交互仓库与沙箱闭环 | **仓库 `0` 代码**；纯 API 推理 |
+| **仅作对照 / 降级** | **RE-Bench** *（已废弃）* | `7` ML 研发任务（`2h–32h`） | 确定性 ML 评测（含历史时钟/内存作弊案例） | **上游已标废弃**（`METR/RE-Bench`）；由 `FrontierCS-2`、`PaperBenchX` 与 `KernelBench` 替代 | **仓库 `0` 代码**；需 Linux x86\_64 + NVIDIA CUDA GPU |
+
+EdgeBench 数字来自[不同的已报告研究](https://github.com/loopx-project/loopx/blob/d0ca48db02846be61a9b683f0efcd5c706381b66/apps/presentation/site/public/blog/zh/edgebench-feedback-and-memory/index.html#L43)。
+New Foundations 观察使用 Astra max；ANN `18h` 研究使用 Sol/xhigh，约束为
+`Recall@10 >= 0.95`。报告中的反例包括 Portfolio（`Official 53.87` 对 Explore `31.19`，越高越好）
+及 Historical Grid（`Official 1,967` 对 Context on + Stride `2,088`，越低越好）
+（[ANN 与反例来源](https://github.com/loopx-project/loopx/blob/d0ca48db02846be61a9b683f0efcd5c706381b66/apps/presentation/site/public/blog/zh/edgebench-feedback-and-memory/index.html#L131)）。
+各任务保留自己的模型、起点、反馈权限、观察窗口和完整成本覆盖。这些观察支持选题；
+C2/C3 或等预算帕累托主张仍须满足 §5.1/§5.3 的匹配比较与 §6.2 的完整成本记账。
+
+#### 关键口径辨析与排除说明
+
+1. **`ALE` 与 `SakanaAI/ALE-Bench` 区分（及不存在公开的 `"ALE Science"`）：**
+   公开文献与仓库中不存在名为 `"ALE Science"` 的独立 benchmark 或赛道。`ALE`
+   （[`rdi-berkeley/agents-last-exam`](https://github.com/rdi-berkeley/agents-last-exam)）
+   是包含科学子域的广谱 CLI+GUI 专业工作集，而 `ALE-Bench`
+   （[`SakanaAI/ALE-Bench`](https://github.com/SakanaAI/ALE-Bench)）面向 AtCoder
+   启发式算法竞赛优化。两者在上表分别归入 `P1` 与 `P2`。
+2. **`tb-science` 排除出 RSI、仅留单次迁移样本的原因：**
+   随着 `laude-institute` 迁移至 `harbor-framework`，
+   [`harbor-framework/terminal-bench-science`](https://github.com/harbor-framework/terminal-bench-science)
+   成为独立于 `terminal-bench-2`（`89` 个通用任务，默认 `900s` 超时）的科学领域套件。尽管已有 `96` 个
+   已合并任务和 `366` 个开放 PR，**`tb-science` 不适合迭代式 RSI 循环**：CI
+   （`ci_checks/check-task-timeout.sh`）硬性锁定 `[agent] timeout_sec == 28800.0`（`8h`），
+   终局 `reward.txt` 为 **100% 二值 `1/0`**（即使任务内部计算连续分），缺少 train/held-out 划分，
+   `[agent] network_mode` 为 `public`，且 `rubrics/task-implementation.toml` 明确拒绝开放式假说任务。
+   本计划仅保留高难度单次迁移样本（如 Lean 形式化 `#2530`、`#2197`、`#2653`、`#2629`，生物
+   `#1518`，物理 `#2804` 或托管 GPU 控制 `#2531`）。
+3. **`PaperBenchX` 优先于旧版 `PaperBench`，及 `DeepSWE` 术语边界：**
+   `PaperBenchX`（`93` 篇跨学科非 ML 科学论文、从零干净重放）替代旧版 `PaperBench`（`20` 篇
+   ICML'24 论文）成为 `P1` 主复现目标。本文中的 `DeepSWE` 指 Datacurve 的 `113` 题 benchmark
+   （[`datacurve-ai/deep-swe`](https://deepswe.datacurve.ai/)），不同于 Agentica 的
+   `DeepSWE-Preview` 模型；其在 `74%` 附近的饱和趋势使新的 `C2`/`C3` 因果投入转向 `P0`/`P1`。
+4. **平台执行约束：** 勿在 macOS ARM64 Rosetta/QEMU 模拟下对依赖 Linux seccomp、`iptables`、
+   CUDA 或多核稳定计时的套件（`EdgeBench`、`FrontierCS-2`、`KernelBench`、`AlgoTune`、
+   `SWE-bench Pro`、`tb-science`）运行可计分对比；统一在固定配置的 Linux x86\_64（及所需专用
+   CUDA/云主机）上执行，并避免在 Colima 上使用 macOS `/tmp` 绑定挂载（见
+   `widesearch/pier/README.md`）。
 
 ## 4. 主张阶梯
 
@@ -241,13 +502,30 @@ overhead 与 authority budget，并通过非 benchmark product canary。只有�
 计划区分四种 arm：
 
 1. **Native baseline**：benchmark 支持的 reference scaffold，或声明过的、没有 LoopX
-   控制的 CLI harness。
+   控制的 CLI harness。在 **episode 型 RSI 与标量优化赛道**上，Governed LoopX 的 C2/C3 主张
+   必须包含一个匹配的 **Raw-Artifact Reset Baseline（原始产物重置基线）**，可以为本研究实跑，
+   或按下述资格复用历史运行。它在每代干净重置上下文，保留此前求解器可见的全部产物与标量分数，
+   由模型使用原生文件系统/Python 检索，不注入 LoopX packet 或治理台账（§2.2）。
+   这定义的是 treatment，不意味着执行成本为零。
 2. **Passive LoopX**：worker decision 和 benchmark 合同完全相同，只增加只读 LoopX
    observation 与精简 settlement。
 3. **Governed LoopX**：声明过的 LoopX profile 可以影响 continuation、checkpoint、
    replan、recovery 或允许的控制动作。
 4. **Mechanism ablation**：只让一个具名机制与 governed parent profile 不同，其他所有
    可控字段保持一致。
+
+Raw-Artifact Reset Baseline 的资格要求：
+
+- 固定 §5.1 的比较 identity，并满足 §5.3，包括相同任务、模型 revision/effort、起点、环境与
+  verifier、预算，以及反馈/工具/网络/权限范围。在观察结果前声明重置频率、停止规则和有意改变的
+  treatment 条件。
+- “历史产物”仅指求解器在该次运行相应时点有权读取的材料。隐藏 reference、答案、verifier
+  内部、仅操作者可见的诊断与事后评分材料继续不可读；文件被保留不产生访问权。
+- 只有固定输入、treatment、获准产物、完整性、成果和完整成本可独立读回，且足以证明同一匹配
+  比较时，才复用历史 arm。只有标量分数或 model family 标签不够；复用历史也不会让原成本归零。
+- 按 §6.2 计入检索/探针生成、上下文重置、归档/编排、模型使用、评测/确认、冷却、失败/重试及
+  人工介入。覆盖缺失保留 unknown。缺少合格基线、匹配或成本证据不完整时，保留描述性观察与
+  另有独立证据的 C0/C1 结果，不声称 C2/C3 增益或完整成本下的帕累托优势。
 
 assisted human 或 simulator intervention 是独立 study family，绝不能呈现为 autonomous
 leaderboard arm。
@@ -290,6 +568,21 @@ goal-mode baseline。benchmark-reference scaffold reproduction 是额外 fidelit
 
 内部 control score 可以诊断行为，但不得加到原生 task score 上，也不能把失败任务变成成功。
 
+### 5.5 四层漏斗验证协议
+
+完整原生全预算长跑（例如 EdgeBench 等长程标量研究的 `18h–20h` 单元）的时钟与算力成本过高，不应作为排查基础设施缺陷、未命中 KV-cache 开销或局部代理指标反序的第一道过滤器。每项新控制机制、运行时优化及 benchmark 实验均按研究适用的匹配预算，顺序通过闭环阻塞**四层漏斗验证协议**的**适用阶段**推进。对官方 benchmark 或 leaderboard 可比较单元（cell），基准声明的原生时长仍是强制可比性合同；它不是内部 promotion probe 的研究时长上限。
+
+研究可以预先声明**扩展预算晋升探针（extended-budget promotion probe）**——例如让 `LHTB 2.0` 或 `FrontierCS-2` 运行超过 `10h`——以检验 LoopX 机制是否产生长程优势。这仅在以下条件同时满足时成立：除已注册的 treatment 差异外，每个 arm 使用相同的固定任务、benchmark 环境与 verifier、模型、反馈机会、控制权限上限、停止规则、run profile 和扩展预算；且 runner 能延长执行而不改变 benchmark 的任务或 outcome 语义。若 runner 硬锁时长，必须提供显式、带版本的 run-profile 扩展及其资格验证；不得把较短运行改名成扩展预算证据。
+
+报告必须把 `native-budget` 与 `extended-budget` cell 分开。两者都须在适用时包含匹配的 `Raw-Artifact Reset Baseline`（§5.2）、完整 token、时间、provider、控制与评测成本（§6.2）、完整性审计（§6.5）及不确定性。扩展预算结果可以支撑限定在该预算下的 C2 主张；它既不是官方原生预算结果，也不是 leaderboard-eligible 结果，不能证明原生时长下的等预算帕累托占优，也不得与原生预算 cell 汇总。`N >= 5` 按实际 promotion-condition cell 计算。当任务族或分支具备已证明的 checkpoint 恢复接缝（§8.7）时，在 Tier 3 之前执行有界 Tier 2 checkpoint 分叉；当**不存在已证明的 checkpoint 恢复接缝**时，Tier 2 属于不适用而非伪造分叉——研究保留 Tier 0 与 Tier 1 门禁，改走 **§8.7 从起点匹配（`from-scratch matched-budget`）对照路线**直达 Tier 3，如实报告实际消耗预算，且不得将全新注册运行记为 checkpoint fork 或同状态反事实（$\tau_B(s; a, a_0, \pi)$）：
+
+| 层级 | 典型范围与时长 | 必需证据与核心指标 | 门禁与不可替代边界 |
+|---|---|---|---|
+| **Tier 0 · 离线不变量与标尺校准** | 零在线模型开销：单测与回归套件、确定性重放与 checkpoint 恢复夹具、`WarmStart` 与评测器 `/context` 预检、容器/认证/网络隔离审计，以及 [`benchmark/proxy_order.py`](../../../benchmark/proxy_order.py) 离线共同面板诊断 | 确定性通过/失败契约、精确产物与源码 digest 绑定、零隐藏评测泄漏，以及共同面板 Kendall $\tau_b$ 与尾部断崖刻画 | 任一项失败即阻止实跑消耗 token；静态与重放验证仅证明 E0 基础就绪度（E1 与 E2 仍须按 §11.2 给出实 runner 实跑回执与重复转换恢复证据） |
+| **Tier 1 · 快速效率对齐门** | 低于研究适用预算（原生或预声明扩展预算）的短周期匹配实验（如 `12h–20h` 长程赛道上采用 `--timeout 18000` 的 `5h` 对照，或 `3h–5h` 与 `10h+` 赛道上的等比例更短窗口），按 §5.1–§5.3 对比 `Raw-Artifact Reset Baseline`、静默单会话执行与 `Controller–Worker` + `EpochReset` 相对于锚定基线的表现 | 原生 `score` 对齐度、`time-to-threshold`、轮间协议延迟缺口压缩（如训练结束至下次提交的等待窗口）、`cached_prefix_tokens` 与 `uncached_input_tokens` 稳定性，以及总 token/耗时比上限 | 尽早拦截协议税膨胀或执行退化；短周期效率对齐不能替代完整预算净收益或证明长程无熵增漂移 |
+| **Tier 2 · 有界反事实标定（仅在已证明恢复接缝可用时适用）** | 仅当研究已证明所需 checkpoint 恢复接缝（§8.7）时适用：处于研究预算内的短窗口匹配分叉（如剩余上限 `~1h–3h`），从同一静止封存的 `research-checkpoint`（$s_0$）发起，严格固定源码、评测条件（`/context`）与提交冷却；**当没有已证明的恢复接缝时**，不启用 Tier 2、不伪造分叉，直接按 §8.7 从起点匹配比较进入 Tier 3 | 决策邻域 Kendall $\tau_b(s; a, a_0, \pi)$、相对原生 incumbent 的代理假提升率、前沿断崖（`Yardstick`）检出，以及计入完整边际控制/评测成本后的条件净收益 $\Delta J(B \mid s_0)$（checkpoint 研究在准入配对前仍须完成恢复接缝验证） | 在启动全周期多臂组前隔离后期决策与局部标尺保真度；结果以起点 $s_0$ 为条件，不替代从冷启动到终局的全周期对照，且从起点比较不得记为同状态反事实 |
+| **Tier 3 · 全周期复现与晋升实验** | 在基准声明的原生时长，或预声明的扩展预算晋升探针下做复现实验（如 `LHTB 2.0` 原生 `3h`、`FrontierCS-2` 原生 `5h`，也可将任一者作为独立的 `10h+` 内部探针；EdgeBench `18h–20h`；`N >= 5` 按实际 promotion-condition cell 计算），既可承接自 Tier 2，也可在缺乏已证明恢复接缝时直接承接 §8.7 从起点匹配路线；含 episode 型 RSI / 标量赛道必配的 `Raw-Artifact Reset Baseline`（§5.2）、完整成本核算（§6.2）及独立完整性审计（§6.5） | 在锚定研究上于所选原生或扩展预算与匹配对照下达成含不确定性界限的 benchmark 原生收益提升或成本归一化帕累托占优（若主张 C3 则还需跨族复现） | Tier 3 单研究在原生或扩展预算下的复现支撑限定于该预算的 C2，跨族复现支撑 C3，C4 产品晋升仍按 §4 单独把关。原生预算 cell 仍是官方可比性路径；扩展预算证据不得报告为原生预算或 leaderboard 结果，也不得与原生 cell 汇总。缺乏恢复接缝而走 §8.7 从起点比较时，上述证据判据均不放松，checkpoint 分叉研究本身的恢复门槛亦保持严格；Tier 0–2 出现退化时须停止归因与重设计，严禁靠堆砌全矩阵掩盖 |
+
 ## 6. 测量模型
 
 ### 6.1 原生结果
@@ -308,6 +601,42 @@ goal-mode baseline。benchmark-reference scaffold reproduction 是额外 fidelit
 - 到首个 material delta 和各 score threshold 的时间与成本；
 - honest success、exhaustion、blocker 或 no-follow-up 后未使用的 budget。
 
+#### 先核覆盖，再比较成本
+
+复用既有 usage/trajectory owner，每项比较保留来源 revision、单位、范围、观测窗口
+和完整性。CLI packet 序列化字节衡量传输量，不能衡量实际消费的上下文、provider
+token、缓存处理、金额或验收价值。[#7050](https://github.com/loopx-project/loopx/pull/7050)
+的同响应验收共享验证了传输变化，不代表研究总成本按同一百分比下降。
+
+| 观测 | 必须保留的解释 |
+| --- | --- |
+| Packet 字节与交付上下文 | 分别测序列化、来源读取及实际消费者输入。引用仍须能解析完整适用指令；省略义务得到的小输出不是效率收益。 |
+| 模型用量 | 将真实 request 身份及保留的 counter 归属到覆盖的 session/Turn 窗口。核对压缩、重试、镜像记录与累计快照，避免重复计数；显式区分 `cached_prefix_tokens`（温 KV-cache 命中）与 `uncached_input_tokens`（冷 prefill / `EpochReset` 后前缀重建）及输出 token，并分别报告**冷 vs. 温 KV-cache 工况**。请求或尾段覆盖缺失保持未知。 |
+| 完整边际成本 | 纳入已测任务工作、控制、评估、恢复及人工注意力，也报告采集／验证开销。未知项阻止完整金额主张；保留取消和失败尝试，不只用成功工作作分母。 |
+| 有效成果 | 分别报告保留的最佳有效 native 产物／结果、终态完成与新增已验证提升。原生排名仍由任务拥有；部分分数、Todo 完成或最终文件单独不代表整题成功。 |
+
+[#7054](https://github.com/loopx-project/loopx/pull/7054) 已集成显式观测的未完成 Turn
+counter；严格完整会话行为仍是默认。在 main `5550e91bab` 检查点，请求／压缩对账
+[#7087](https://github.com/loopx-project/loopx/pull/7087) 仍是提案。两者都不能证明
+provider 计费完整或匹配研究收益。通过既有 Research 阅读入口呈现这些边界，不另建
+成本账本，也不把字节变化换算成已测节省。
+
+**面向 Agent 的 harness 与规划改动决策准则。** 评估任何候选 harness、上下文策略或
+规划机制时，统一以**完整预算记账**下的净终局原生验收成果
+$\Delta J(B \mid s_0) = \mathbb{E}[Y_B^\pi - Y_B^{\pi_0} \mid s_0]$ 为准：模型／上下文处理
+（显式区分冷/温 KV-cache 工况下的 `cached_prefix_tokens` 与 `uncached_input_tokens`，防止回合中
+破坏缓存的改写伪装成序列化字节节省）、控制面与协议税（RPC 往返、必填表单仪式、治理提示词）、
+checkpoint 构建、yardstick 造尺／修尺，以及评测／确认计算和冷却等待均计入成本；将负结果、
+无差异结果和信息不足实验原样保留在分母中；优先构建可恢复的静默同状态 checkpoint 反事实接续
+（$\tau_B(s; a, a_0, \pi)$），而非根据混淆起点状态的观察动作日志做无归因微调。
+
+**跨策略变体的反事实 arm 归因。** 当自适应元策略（例如[联合决策 §5.9](target-yardstick-stride-decisions-v0.zh-CN.md#policy-evolution)
+中的 Phase 1 `KL-UCB` arm 选择）在候选 `(target–yardstick, stride, context-stack)` arm
+间探索时，单纯统计被选中 arm 的胜率会混淆状态难度与处理效应。应在决策时记录每个 arm 的精确分配倾向度
+$p(a \mid s)$，并采用逆倾向度加权 / Horvitz-Thompson 风格的匹配 arm 归因（$\hat{\Delta}_{\text{HT}}(B \mid s)$
+或基于共享 checkpoint 兄弟轨迹组的双稳健残差，见 [HELIX](https://arxiv.org/abs/2608.13951)）评估策略对比，
+同时核验正概率条件（$p(a \mid s) > 0$）、重叠度诊断与有效样本量（$N_{\text{eff}}$），避免把选择偏差当成因果收益。
+
 ### 6.3 长程控制质量
 
 - 物质等价 work-slice 的重复次数；
@@ -322,6 +651,85 @@ goal-mode baseline。benchmark-reference scaffold reproduction 是额外 fidelit
 这些 measurement 必须来自 typed observation、receipt、runner event 或 verifier checkpoint。
 prose similarity 与 keyword matching 不能成为 semantic truth source。
 
+#### 基于证据的研究片段评估（拟议细化）
+
+可选的[轨迹分析 producer](../../reference/trajectory-assessment.md)将指标向量、固定分母的侧车与 Codex 执行边界具体化。本切片不代表打包产品旅程或独立科学校准已经完成。
+
+原生分数不变时，可能已有有用信息、实际方法变化，也可能只是昂贵活动。分别呈现这些观察；
+轨迹评估器或研究图不能替代原生结果、完整性、机制保真或比较资格。
+
+分析单位是**研究片段（research episode）**：有范围的问题或竞争解释、判别实验、实际产物与
+观察、后续决定。一段可跨多个模型 Turn；一批输入是一个实验，不按输入数计“成功探索”。
+问题、干预或决定变化时切分，不能每次工具返回都切一段。保留未完成、合理重复、恢复及
+未分配工作。先固定切分规则，再看实验组标签及最终收益。
+
+呈现指标向量，不给未校准总分：
+
+| 维度 | 分子 / 分母或观察 | 必要限定 |
+| --- | --- | --- |
+| 原生结果 | 最佳与最终原生结果，有效/无效/缺失提交，到事先声明阈值的时间 | 固定反馈可用时间、来源和评测机会预算，迟到结果不能回写早窗 |
+| 信息 | 经独立复核、有效实验改变决定相关不确定性的片段 / 全部符合口径的片段 | 相关性、新颖性、有效性和窄范围反证分开；噪声结果可保留未决 |
+| 判别力 | 能区分所声明竞争解释的已完成有效实验 / 符合口径的已完成实验 | 正向代理指标或工作时钟下状态相同，不证明原生迁移或真实墙钟透明 |
+| 实际采用 | 有后续机会、且可追踪到产物或行为后果的适用证据 / 有这种机会的适用证据 | 引用、自评、Todo 完成或图边本身不证明采用；尚无后续机会不等于忽视证据 |
+| 重复 | 经复核无新信息的同问题/干预/输入片段 / 可评片段 | 合理复现、噪声控制和恢复与冗余工作分开 |
+| 成本与覆盖 | 片段及可评数量，墙钟区间、活跃模型/工具工作、控制、评测等待、恢复、缓存/未缓存输入及输出 Token | 未测成本保留未知；祖先 response 去重，但新处理的上下文仍计成本 |
+
+总体片段数 N 已知时，显示核实 n/N、未知 u/N 及覆盖；[n/N, (n+u)/N] 是缺失数据界，
+不是统计置信区间。N 未知则不给总体比例。数量比例与资源加权比例是不同估计目标。
+并发墙钟取区间并集，资源/等待可保留重叠标签与未分配成本，不重复计时或强造互斥归属。
+前缀/seed、接续边际、重复设置及全研究成本分列。
+
+后半程按预先声明的总预算或成熟 checkpoint 规则定义，不能按最后涨分时间倒切。
+接续另列源年龄、接续经过时间、剩余预算及评测机会状态。共同窗冻结，未完工作可见，
+但不使用未来反馈。信息进展不能抵销未披露的原生退化或更高全成本。
+
+共同证据准则用于基线和处理；缺 LoopX 元数据是可观测性未知，不是零进展。
+Todo/replan/Explore 只有连接实际执行和外部产物后才用于机制解释。
+关闭 stride 的 LoopX 组不是原生 harness 基线。目的抽样例子不能估计全程有价值探索比例
+或因果处理效应。
+
+资格先从可独立复算的源码/输入/提交/反馈、时间与成本绑定开始，再用至少两名独立人工
+标注者，报告片段边界、分项一致率、未知覆盖与裁决。冻结准则后，在未参与设计的片段上
+测试模型评估器。先遮住实验组与最终分数评设计和决定相关性，再展开执行、采用、结果。
+误判集覆盖同代码分差、旧源码、迟到反馈、失效对照、有用负证据/未决实验、合理重复、
+基线缺元数据及未完工作；分别测无依据正判与漏掉有用证据。小规模手工试评不是可靠性
+估计或合格模型评估器。产品/UX 或代码评审不能替代独立科学标注；按维度报告模型评估器
+精确率、召回率与弃权，不靠精选例子的一致性晋升。
+
+初始标注留在 benchmark owner 的只读分析侧车，复用原生结果/board 权威及 Explore
+证据和合法关系；不造第二事实图，不从分析文字推闭合，不回灌冻结 solver。
+研究侧可按自身契约使用获准私有证据，但产品只接收受众有权读取、安全且带版本和覆盖度
+的投影。隐藏 evaluator 材料须同时满足 solver 已终止且评分已完成，绝不回流 solver
+上下文或运行反馈。产品把现有分数/时间视图关联到片段、证据及后续采用，在原处展示观察、
+推断、未知与版本范围。最小旅程包含证据缺失/拒绝及键盘返回原窗口。合成图和规范证明
+设计边界，不证明打包交互、已安装评估器或能力收益；未来运行效果仍须独立已接受契约与资格。
+
+[产品阅读旅程](../../product/use-cases/auto-research/long-horizon-progress-design.zh-CN.md)
+给出合成示例、一次选择的详情与独立理解验收。这些是拟议分析和展示要求，不是新的运行
+协议、指标晋升或扩展实验的授权。
+
+#### 新实验前的关系采集
+
+[采集与阅读切片](../../product/use-cases/auto-research/long-horizon-progress-design.zh-CN.md#record-relationships-before-the-next-study)
+基于 #6648 的全历史提案，不是已经完成资格验证的评估服务。复用普通 Explore
+结果回写及其可选关系，保留路线变化背后的证据。区分显式关系、parent 分组与推断
+分析；保留有意义的假设、实验及产物身份，不能只统计问题和 finding 数量。
+现有 edge writer 缺少直接的证据引用和端点版本绑定。只读分析 sidecar 应保留
+可复现的关联并暴露来源缺失；文字摘要不能关闭这一缺口。
+
+若实验要论证关系信息改善了决策质量，启动前须用一个获准真实案例完成结果回写、
+replan 前 checkpoint、恢复、接收者读回及下一次可观察动作的资格验证。
+单独检查源自 #6648 的打包阅读路径，覆盖正确项目选择、缺失或无效关系、重复回放、
+迟到观察及输入变化。产品缺陷尚未关闭不等于科学验证通过。可观测性较弱的原生
+结果研究保留较窄的主张范围；不把全部 V12 分析设为其他有效研究的前置条件。
+
+对比各臂须冻结相同的采集指导和成本口径：要求 Agent 组织关系本身可能构成实验
+干预，不能等同于被动采集。Checkpoint 捕获不得隐式选择 TurnEnvelope 或其他
+输入模式。保留旧冻结运行与未知的基线覆盖。判断记录是否解释了一项决策、能否
+独立复核，不能用更多图边替代。研究侧负责来源与主张校准及实际采用；Explore
+负责持久化与合法关系；产品侧负责如实阅读。本次文档切片不引入新关系词汇、
+运行时强制、付费运行授权或因果效应结论。
+
 ### 6.4 人类注意力
 
 仅适用于 assisted study：
@@ -332,6 +740,16 @@ prose similarity 与 keyword matching 不能成为 semantic truth source。
 - intervention 避免的浪费工作；
 - false escalation 与 unnecessary gate rate；
 - 固定 intervention budget 下的 value of information。
+
+[研究页人工注意力 observer](../../reference/trajectory-assessment.md#human-attention-in-research-optional)
+现在通过既有 pack 与引用 owner 读取有来源的人工介入、分别取并集的主动／等待时间
+及标记可避免的介入候选。记录方分类、部分时间覆盖和历史来源保持明确。
+合成打包阅读检查验收此读取路径。真实 producer 当前仅验收经过认证、由目标 Goal
+pack 与 UTC 时间窗显式绑定的 LoopX Lark `operation.execute` 与 `team.plan` 卡片决定。
+该边界保留部分覆盖，把投递到确认记为等待，主动投入和必要性保持未知；为保留单人
+记录契约，它拒绝包含多个 principal 的窗口，并将 marker 引入前的保守回填标为 legacy。
+未认证、pending/expired、runtime-native approval 的采集，必要性校准及同等验收质量下
+的注意力降低仍未验收。
 
 ### 6.5 Benchmark integrity 与反作弊
 
@@ -354,6 +772,46 @@ answer 相似这一事实来推断作弊。
 私有 audit 可以保留 protected evidence pointer 与精确 access event。公开 receipt 只包含稳定
 run identity、固定 policy/environment digest、parity status、disposition、reason code 与
 redacted evidence reference。公开 receipt 不能把未知的 private audit 升级为 `eligible`。
+
+**反 Reward-Hacking 根因认证守卫。** 除挂载、网络与隐藏 verifier 隔离之外，完整性与验收资格还必须
+执行树外确定性的根因认证守卫：核验候选修复是否保持冻结测试框架、未篡改断言与跨留出/对抗性检查的
+差分不变量，而非通过跳过测试、放宽容差、硬编码 fixture 输出或评分通道捷径过关。结构化守卫失败结果
+（缺少失败到通过证据、未授权测试改动或差分回归）直接记入 `benchmark_integrity_audit_v0` 处置
+（`quarantined` / `invalid`），而不依赖求解器文本子串推断作弊。
+
+#### 声明反馈权限与评测时机
+
+完整性资格必须比较实际访问与预注册实验协议。协议包含两个独立选择：solver 能否请求并
+收到原生评测反馈，以及独立 evaluator 仅在求解结束后运行，还是也在求解期间采样交付物。
+后台采样本身不授权向 solver 返回分数、诊断、日志或评测产物。Solver 自编的本地验证与
+访问独立 evaluator 分开处理。
+
+当前 `benchmark_integrity_policy_v0` 实现支持区分网络权限，却无条件要求
+`official_feedback_blinded` 与 `verifier_started_after_agent`。它不能为上述全部协议提供
+资格判定。这是尚未闭合的 toolkit/runner 契约缺口，不是原生允许反馈构成作弊的证据。
+契约及证据交付前，相关 receipt 继续保持未合格；实际为 false 的 boolean 不得填成 true。
+
+下一份有界实现归既有 `benchmark-toolkit` owner：共享 policy 决策进入其类型化 TypeScript
+边界，provider 专属观测留在原生 runner。扩展既有 policy 和 receipt，不在 runner 再建
+一套 eligibility 判断。保留当前盲反馈、求解后评测的默认行为与负例。显式协议必须在准入
+前固定，并与 runner 的实际观测绑定；看到结果后修改协议不能让旧运行获得资格。
+
+验收需要通过真实 runner 和 qualification 入口覆盖反馈/时机的全部四种组合，并包括：
+
+- 允许的反馈只携带 benchmark 声明的响应。隐藏测试、参考答案及 evaluator 实现仍不可
+  访问；分数响应不授权读取它们的底层文件或其他 trial。
+- 盲反馈后台评测使用 controller 持有的交付物快照与 evaluator。分数存储、提交端点、
+  凭证、日志及网络路由均不能形成面向 solver 的反馈通路，resume 后也必须成立。
+- Runner 证据把实际身份、挂载、环境和网络规则绑定到本次运行。证据缺失或矛盾仍未合格；
+  命令扫描无命中、声明了某个模式，都不能单独证明隔离。
+- Provider 凭证排除是独立边界。由 solver 的 OS 用户持有的凭证文件即使权限为 `0600`，
+  shell 仍可读取。不能据此声明排除成立，也不能为了准入某种反馈模式而豁免它。
+- 反馈消融只改变反馈可用性：任务要求、迭代引导、交付物选择、预算、评测频率及源码固定
+  保持一致。获准的 harness 自修复与实际 evaluator 访问分别记录。
+
+此 checkpoint 定义验收，不代表已安装支持，也不新增访问权限。Runner 隔离与协议支持
+均仍是结果可计入的前置条件。诊断观察保留原资格状态；后续集成不得改写历史 receipt 或
+运行中的实验。
 
 ## 7. 架构与 ownership
 
@@ -450,6 +908,14 @@ non-material event mix；它不能证明 benchmark integrity，也不能复用�
 研究应估计 model/work-class-specific response curve，而不是一个全局 tool-call 或 Todo-count
 threshold。更宽并不天然更好。
 
+拟议[长作业修订](hierarchical-agent-stride-control-v0.zh-CN.md#75-长作业与决策-checkpoint修订提案)
+测试**决策时机**，不延后 Turn 记账。先 shadow capture 一个 provider 的 validated
+result/checkpoint 和绑定 monitor；只有通过资格验证的 opt-in arm 才能抑制
+unchanged model admission。原生评测、job 资源、deadline 与所有欠付 Turn
+settlement 保持一致。测量 observer CPU/IO、模型 token/call、result-to-decision
+latency、漏结果、重复执行/debit 与总预算下原生结果。Callback 丢失必须按已声明
+observation deadline 恢复。训练更久或 bookkeeping call 更少，单独都不够资格。
+
 ### 8.2 Evidence、空转检测与 semantic replan
 
 核心假设是 durable coverage ledger 与 semantic progress observation 能阻止重复 maintenance
@@ -460,6 +926,21 @@ successor、coverage-backed exhaustion、blocker 或 no-follow-up。
 LHTB 是首要动态实验场，因为 partial reward 与 checkpoint 可以显示方向变化是否产生进展。
 DeepSWE 验证相同机制能否改善 repository outcome，且不依赖 reward-specific shortcut。
 ALE 验证它能否迁移到异构专业工作流。
+
+拟议[实验决策路径](research-exploration-control-plane-v0.zh-CN.md#115-由证据驱动的实验决策修订提案)
+把 result adoption 与 cadence 分别验证。固定 session continuity、planning、model
+和总预算，对比仅交付 evidence 与 evidence-linked continuation/successor adoption，
+独立比较成立后再组合机制。包含有效负证据、inconclusive/conflicting measurement、
+失败前置条件、有依据复验、未覆盖的同 family probe 与 input 改变后重开 scope。
+除原生结果和成本外，判断实际执行的 next action 是否遵循 scoped result。
+Citation/schema compliance 单独不够；压制有用实验的强制 pivot 算失败。
+这些是拟议 study，不是当前 C2/C4 evidence，也不授予 job launch 权限。
+
+晚期已验证提升是既有路线在观测条件下仍有有效收益空间的积极信号。单独一段较长
+平台期不能证明穷尽，也不足以终止运行。从同一已资格化 checkpoint 出发，在相同
+剩余预算、反馈机会和有效性规则下，比较继续当前路线、改变机制及有理由的复验；
+无提升和失败接续也纳入分母。这验证的是接续决策；一次晚期突破不能证明由 LoopX
+导致，也不授权延长冻结实验。
 
 ### 8.3 研究探索与组合
 
@@ -515,8 +996,133 @@ capability approval。capability candidate 必须按 caller outcome 命名，不
 
 [结果后记忆效用归因 RFC](./post-outcome-memory-utility-attribution-v0.zh-CN.md)可以把经过验证的
 benchmark outcome 作为一种 evidence source。trajectory-level reward 不能建立 per-memory
-causal credit。给出强 utility 前必须做 holdout replay 或 bounded ablation。benchmark 内容
-绝不能以污染后续 task 的方式被保留。
+causal credit。给出强 utility 前必须做 holdout replay、记录倾向度的反事实 arm 归因（§6.2），
+或针对受 Semantic Duplicate Gate 去重保护的批屏障 `add / revise / retire` 记忆迁移开展有界消融。
+benchmark 内容绝不能以污染后续 task 的方式被保留。
+
+<a id="edgebench-budgeted-planning"></a>
+
+### 8.7 EdgeBench 预算内研究规划
+
+**假设。** 按剩余预算结束时的预期验收结果比较有界多步接续，可能比当前 LoopX
+策略获得更好的 native 结果。比较包含前置工作、有信息价值的测量和确认时间，
+不只看下一步的即时涨分。
+[联合决策 §5.8](target-yardstick-stride-decisions-v0.zh-CN.md#budgeted-planning)
+定义决策语义，§5.9 定义后续校准/学习路径。这是拟议实验，尚未执行或证明收益。
+
+[目标与理论说明](../../research/budgeted-research-planning.zh-CN.md)解释预算目标、依赖进展、
+测量价值与因果比较，其中的[完整闭环案例](../../research/budgeted-research-planning.zh-CN.md#worked-loop)
+把决策时证据连到实际采用的工作与终局成果。按这些理由理解实验合同；一次合理的局部决策
+本身不是完整预算收益的证据。
+
+#### 首个实现切片
+
+复用现有单 Agent 的 Stride/Yardstick/Explore 路径。固定版本的 benchmark treatment
+在当前决策指令中加入 §5.8 的比较：把已有证据支持的接续与少量合理路线比较，
+指出依赖和可区分结果的下一边界，然后执行首个连贯切片。证据与预测使用已有 finding
+和 plan reasoning；即时选择使用支持的 `next_probe` 与 Yardstick 字段。
+不加 v0 不支持的字段、不要求额外模型调用或每 Turn 填表。
+
+首个实现 PR 包含有界指令修改、已有 benchmark 配置/manifest 中显式选择 treatment
+的方式，以及一次真实路径的回读/接续场景，展示模型接下来实际做了什么。保持默认行为。
+固定实际采用的 policy、源码和投影；更丰富的投影未合并时可用已有详情读取。
+源码交付和模型采用只验证路径，不证明效果。双会话 Controller/Worker、数值 fidelity
+引擎和学习型策略均非前置条件。后续 schema 修改要有已观察到的 producer/consumer 缺口。
+
+<a id="action-value-episode"></a>
+
+#### 动作价值证据的片段读回
+
+首个实现切片应从前瞻选定的有意义决策点，展示一个可接续的真实片段：
+**当时状态 → 事前预测与选择 → 实际工作／消耗 → 返回证据及下一决定 → 冻结终局**。
+数据语义见[研究说明 §9](../../research/budgeted-research-planning.zh-CN.md#action-value-evidence)，
+owner 与负例见[联合 RFC §5.9、C17–C18](target-yardstick-stride-decisions-v0.zh-CN.md#policy-evolution)。
+复用已有 plan/finding/measurement/followthrough；原记录缺失时报告不能恢复，
+不事后补造预测，不为补齐片段增加模型或 Native 调用。采集与分析开销进入完整成本。
+若全程尚未结束，终局先保留为待关联，在预定终点结算；不为完成读回追加一轮运行。
+
+读回需要明确关键预测有没有被支持或推翻，以及实际下一段工作如何处理它；
+有据继续原计划也是采用。两小时后的局部涨分不能充当十八小时终局标签，
+未选路线没有结果也不填零。延迟增益保留相关工作链，而非全部归给最后一次 switch。
+
+这条读回证明的是关联与可分析性；合成示例可验证缺失／迟到／修订处理，不能替代真实采用。
+正式比较保留全部预选片段，包括失败、取消、无收益和证据不足，避免只展示成功故事。
+分别报告预测校准、采用与决策变化、同状态配对差异、从头终局及新任务收益；
+前一层通过不自动使后一层通过。学习／校准留出隔离任务、来源 run 或同父分叉家族，
+仍沿用下述 pilot 与完整预算合同，不另起一套实验或放宽反馈权限。
+
+#### 可负担的条件效应 pilot
+
+先选三个互补任务类型，使用固定 upstream 版本的任务名称：
+
+| 任务 | 要研究的机制 |
+| --- | --- |
+| ANN 向量搜索 | 投入不同搜索机制可能经过多步才产生 native 增益。 |
+| Ad placement | 本地排序可能与 native 结果冲突；增加本地样本未必消除偏差。 |
+| Grid 优化 | 均值更好仍可能违反硬正确性或尾部耗时约束。 |
+
+这些是选题假设，不是新的实测结论。比较两组：**当前 LoopX 策略**和**同一路径加预算内
+规划**。两组获得相同的可用证据、资源事实、模型/工具、反馈和验收规则；冻结 context
+投影、初始候选、资源争用规则及源码。推理变化是 treatment，其开销计入预算。
+不能只给规划组修好的代理指标或额外 native 评测。
+
+一个有界起点是 **3 题 × 2 个独立产生、前瞻选定的 checkpoint × 2 组 × 3 小时
+= 36 个额外 worker 小时**。另报状态生成、控制和评测成本。每题的两个来源 run、
+checkpoint 规则和分配都在结果产生前选定，不挑有利峰值。小 pilot 用于筛查机制，
+不足以单独支持一般性收益结论；启动前冻结资源上限。
+
+沿用[同状态接续边界](hierarchical-agent-stride-control-v0.zh-CN.md#matched-research-continuation)
+估计同状态反事实差异
+$\tau_B(s; a, a_0, \pi) = \mathbb{E}[Y_B^{a,\pi} - Y_B^{a_0,\pi} \mid S_0 = s]$，
+而非用混淆了起点状态的观察频率给动作排序：复制 workspace 不等于共享 research state。
+候选/frontier、已验收 incumbent、证据、memory、待返回结果、可用预算及 native 提交历史/cooldown
+必须可等价恢复，同时使用新的 run 身份并继承不可变来源关联。优先选无待处理结果的静默 checkpoint
+以减少歧义。[适配器](../../../benchmark/edgebench/README.md)目前不保证 native judge 重启/cooldown
+连续性（已合入 `main` 的 [#8499](https://github.com/loopx-project/loopx/pull/8499) 及
+C1 集成分支上的 [#8480](https://github.com/loopx-project/loopx/pull/8480) 仅验证带受信
+`--validation-command-json` 的单 worker `--worker turn-resume` 执行与原唤醒恢复，不构成
+checkpoint 分叉恢复证明）；准入配对前验证所需恢复接缝。
+若不可用，则改成从头匹配比较并报告真实预算，不能把新注册会话称为 checkpoint fork；
+这不要求先构建通用 replay 平台。
+
+保留 native cooldown 和终局选择。如果三小时容不下有用的多步路线及协议允许的确认，
+将 pilot 标为信息不足，为下一次预注册实验调整时长，不放宽 cooldown 或事后增加
+评测机会。有效配对只估计该 checkpoint 后三小时的条件效应，不能证明从头运行
+十八小时的策略效应。
+
+#### 完整预算收益与后续细化
+
+区分候选泛化和控制策略泛化。运行中可以按冻结的 treatment 使用 Native 反馈；
+冻结策略是冻结如何响应反馈的规则，不是禁止适应。用来调参、筛选该规则的任务与结果，
+属于开发证据，不是独立迁移测试。新任务确认使用冻结的控制策略，保留独立候选检查与
+控制策略留出任务的区别；同题重复 seed 不能替代任务覆盖。
+
+pilot 有用后，从头比较**强 Official 接续、当前 LoopX、选中的规划 treatment**，
+按 task/model/seed 匹配，单次预算十八小时。确认性结果采集前冻结重复次数、资源
+上限、具有实际意义的改善/非劣效界限、终局选择和分析方法。保留第 5 节要求的基线
+证据；局部 pilot 不能替代完整证据计划。报告 6/12/18 小时曲线，以十八小时 native
+结果为主；首提/启动优势与持续接续收益分开。早期落后可能换来后期提升，但事后
+看到突破不能证明当时坚持合理。
+
+采用 native 验收结果及冻结的 best/final 规则，不用最高本地分数或未经评测的最终
+workspace。按预先声明的处理保留正确性失败、未完成评分、取消与覆盖缺失。每项
+结果绑定精确候选、evaluator/input 和提交身份。报告配对效应与不确定性、首次验收
+改善时间、完整 token/墙钟时间、控制及评测成本。不把原始 QPS 和无关任务分数相加；
+报告分任务效应，聚合只用 benchmark 声明的归一化规则。
+
+把行动前预测与真实方法、资源、中间证据及终局结果对照，区分预测价值、实际采用、
+信息与确认收益。分析延迟收益时关联相关工作序列，不自动只归给最后一步；观察关联
+仍不是因果结论。只有具体疑问值得时，再增加可负担的 lookahead 深度或校准消融，
+不一开始铺开全因子矩阵。在对比 Phase 1（`KL-UCB` + 批屏障记忆）与 Phase 2 Checkpoint-Forked
+`Segment Flow-GRPO`（基于 $O(1)$ 状态投影的 $\Delta T$ rollout；[联合决策 §5.9](target-yardstick-stride-decisions-v0.zh-CN.md#policy-evolution)）
+或评估 `KeepRaw` / `FoldToReceipt` / `EpochReset` 策略时，须与原生终局分数一并报告倾向度加权
+Horvitz-Thompson arm 对比（§6.2）、冷/温 KV-cache token 拆分及反 Reward-Hacking 根因认证通过率。
+
+重复终局收益达到冻结的界限与不确定性要求，且无不可接受的正确性、资源或权限
+回归，才扩大实验。保留负结果及不确定结果。冻结选中策略后再测 held-out 任务和
+工作负载；被自适应查询的 native 反馈属于开发证据。校准预测和学习型分配必须在
+同样完整预算下超过已资格化的当前模型策略。benchmark 证据本身不授权 production
+推广或把原始题目数据用于训练。
 
 ## 9. Benchmark 集成计划
 
@@ -566,6 +1172,54 @@ characterize native subset run 与官方 result reduction 后才新增 Pier/Harb
 DeepSWE 也是第 7.1 节 benchmark capability 的第一孵化环境。pilot 应一次提炼一个 cohesive、
 经过测试的 seam；不能整体保留 legacy benchmark 目录，也不能在真实 call site 提出需求前
 先重写整个目录。
+
+### 9.4 StartupBench
+
+固定 upstream revision、任务集与 rubric 合同后才新增 adapter。第一份 package 应包含：
+
+1. deterministic public task sampling 与固定 workspace/参考材料；
+2. 在 license-compatible slice 上做 native no-LoopX reproduction，并与公开
+   rubric score 对齐 outcome parity；
+3. passive LoopX trajectory/result reduction，不把任务场景、参考答案或生成
+   artifact 留在 reusable state；
+4. 一个带 preregistered hypothesis 的 governed delivery/recovery experiment；
+5. authority-parity audit，把 Agent-as-Judge 框架视为 benchmark 原生证据，
+   而不是生产 oracle。
+
+StartupBench 材料必须留在 LoopX 公共 state、memory 与 skills 之外；只有紧凑的
+qualification receipt 与 artifact 级 evidence pointer 可以进入控制平面。
+
+### 9.5 LoopsBench
+
+固定 repository revision、任务集、Docker image 与 verifier 语义后才新增 adapter。
+第一份 package 应包含：
+
+1. oracle smoke 与一次通过内置 adapter 的原生 reproduction；
+2. 在不保留原始 verifier output 的前提下 reduction incomplete/partial/complete
+   verifier outcome；
+3. passive stall/repetition 与依赖图有序工作的 characterization；
+4. 在固定多单元任务上做一个 semantic-replan ablation；
+5. runner-to-adapter conformance 测试，区分 solver、verifier 与 infrastructure
+   失败，并做干净的网络/容器隔离 attestation。
+
+verifier 分层是 benchmark 合同：LoopX 应把它当作该 benchmark 提供的 evidence，
+不得泛化为生产 completion 语义。
+
+### 9.6 WideSearch
+
+固定 dataset revision、检索窗口与 judge model 后才新增 adapter。第一份 package 应包含：
+
+1. 通过 Harbor adapter 做 deterministic task generation，固定 split 与 judge
+   configuration；
+2. 在 public slice 上做 native no-LoopX reproduction，Item F1 parity；
+3. passive LoopX reduction，在 `widesearch-permitted-solving` 策略下记录
+   loopback/external network evidence，且不削弱 fail-closed 的受限资源拒绝；
+4. 一个带 preregistered hypothesis 的 governed evidence-gating experiment
+   （citation/URL/date/number 验证）；
+5. anti-cheating audit，覆盖检索窗口固定与原始网页内容对 reusable state 的污染。
+
+外部网络访问是 benchmark 原生 `permitted_solving`；不得成为通用生产网络
+authority，也不得绕过任何模式下保持 fail-closed 的受限资源拒绝。
 
 ## 10. 协作合同
 
@@ -654,6 +1308,35 @@ release promise：
 当前仓库最强的是 E0--E2；E3 是下一阶段工程与研究目标，E4 仍是未来 promotion gate。
 一个 adapter 可以在工程上达到 E1，但其 study 仍然只有 C0；如果 E2 runtime evidence
 不完整，C2 result 也不成立。
+
+[共享 Codex 研究 runtime](../../../benchmark/runtime/RUNTIME.md) 是
+LHTB/SWE-Marathon 原生桥接的工程检查点：共享 trial 初始化，复用产品的
+heartbeat、Turn 和 Goal 执行，并保留原生验证。合成 Harbor conformance
+只验证这条工程路径；E3 matched study 和 E4 跨 benchmark 结论仍需独立验收。
+
+任务入口是独立的消融轴：runner 预写执行 Todo，或模型通过产品 `todo plan`
+检查点进行规划。规划先于所选执行驱动，复用 Goal planner 和 Todo 增量契约，
+消耗 phase 总预算但不计作 advancement。验收须读回任务身份和真实 Todo，保留
+阻塞状态，并披露独立的规划会话；合成任务通过不能证明与交互式 `$loopx` 启动
+等价，也不能证明规划效果提升。
+
+当前 adapter 提示边界将默认 native EdgeBench wrapper 收敛到任务、工具和评测
+context，并移除共享 benchmark 规划策略前缀。保留简短的目标与完成条件提示：
+持续进行有价值的优化；实现、测试通过和提交本身不代表目标完成。不再重复通用的
+停止、预算耗尽或 blocker 提醒；任务自身要求和 Core 首次交付契约保持不变；可选 native Goal
+续跑不再额外要求提交前先证明改进。Native 提交提示在周期采样间隔为正或为零时
+都不包含周期采样说明；原间隔配置、host 采样与选择行为不变。保留手动/终态提交、
+结果与源码身份绑定和可恢复性提示。
+Blind 与 best-only 提示按已解析的 runner 间隔保留自动采样说明，不扩大各模式声明的反馈范围。
+这是新 run 的行为变化，须独立于反馈模式固定版本。提示交付和读回只验证工程边界；能否更早
+获得有用反馈、能否改善结果，仍是尚未验证的 E3 研究问题。
+
+已合入 `main` 的 [#8499](https://github.com/loopx-project/loopx/pull/8499) 补齐了
+EdgeBench 显式单 worker `--worker turn-resume` 入口（配合受信 `--validation-command-json`，
+沿既有 journal、校验与结算通过原唤醒恢复丢失回复，同时保持默认 runner 与 schema 不变；
+[#8480](https://github.com/loopx-project/loopx/pull/8480) 记录对应的 C1 集成分支验证）。
+这只验证 E1/E2 执行与恢复接缝；不证明 §8.7 所需的静默 checkpoint 分叉恢复等价、E3/C2 匹配预算净收益
+（$\Delta J(B \mid s_0) > 0$），也不代表 C1 默认 schema 切换。
 
 ### 11.3 必需的 delivery slice
 
@@ -832,6 +1515,10 @@ promotion 或修改 LoopX default。
 | 2026-08-16 | 采用 ALE、LHTB 与 DeepSWE 作为互补初始组合；区分能力论证与机制研究；要求原生 outcome 与 typed treatment integrity。 |
 | 2026-08-16 | 以当前 DeepSWE pilot 驱动 LoopX benchmark capability 设计；legacy code/research 只作为复用候选，并加入结构化反作弊与 authority-parity qualification。 |
 | 2026-08-23 | 增加工程 readiness 阶梯与有界 delivery-slice 规则，将仓库建设与 C0--C4 研究主张分开跟踪。 |
+| 2026-08-25 | 把 StartupBench、LoopsBench 与 WideSearch 加入 benchmark primer 与集成计划，作为第二组互补 trio；每个 benchmark 必须在原生 metric space 报告，且 benchmark 材料不得进入可复用的 LoopX state。 |
+| 2026-10-16 | 将[反馈优先观察](https://github.com/loopx-project/loopx/blob/1d60e7edb2a05fe048767444f872934c3adef992/deprecate/benchmark-legacy/edgebench/feedback-first-observations-20261016.md)归入历史报告；运行器源码子集与配置投影修复仍属 E0/E1，混合处理、中断和进行中的观察不关闭 E2/E3，也不分离单一规划效应。通用 guard 重入放宽待受影响调用方独立验证。 |
+| 2026-11-15 | 确立 Bitter-Lesson 边界与五类受治理控制面失败机制（§2.2），要求 episode 型 RSI / 标量优化赛道的 C2/C3 主张纳入匹配且保留完整成本记账的 Raw-Artifact Reset Baseline（新实跑或合格历史复用，§5.2），并采纳 2026-11 Benchmark 组合优先级排序（§3.8）：**P0**（`EdgeBench`、`FrontierCS-2`、`LHTB / LHTB 2.0`、`LoopsBench`）、**P1**（`SWE-Marathon`、`PaperBenchX` 优先于 `PaperBench`、`ALE` 区别于 `ALE-Bench`、`WideSearch`、`KernelBench` / `AlgoTune`）、**P2**（`ALE-Bench`、`StartupBench`、`MLE-bench`、`tb-science` 仅保留单次迁移样本——因 CI 锁定 `28800s` 预算与 100% 二值 `reward.txt` 排除出 RSI），以及 **仅作对照 / 降级**（`DeepSWE`、`SWE-bench Pro`、`CORE-Bench`、`ScienceAgentBench`、`BixBench`、`FrontierScience`、已废弃 `RE-Bench`）；多臂扩展以统一 `benchmark/runtime/` + Stop-hook E0–E2 就绪及 Linux x86\_64 / GPU 宿主机为前置门槛。 |
+| 2026-11-22 | 确立闭环阻塞的**四层漏斗验证协议**（§5.5：Tier 0 离线不变量与 `benchmark/proxy_order.py` 校准仅证 E0 -> Tier 1 低于适用预算的快速效率对齐门 -> 在 §8.7 恢复接缝已证明时启用 Tier 2 静止检查点反事实标定，不存在已证明恢复接缝时保留 §8.7 从起点匹配比较路线而不伪造 checkpoint 分叉、亦不放松恢复验证 -> Tier 3 在原生 benchmark 时长或独立的预声明扩展预算探针下复现晋升，如 LHTB 2.0 原生 `3h`、FrontierCS-2 原生 `5h`、二者任一 `10h+` 扩展探针、EdgeBench `18h–20h`，区分单研究 `C2` 与跨族 `C3`）。原生预算是官方可比性与 leaderboard 合同，不是内部研究时长上限；扩展探针必须匹配所有 arm，只能报告限定于所选预算的 C2，且不得汇总或改名成原生 cell。这样既不降低 §4 C2–C4 主张门槛与 §11.2 就绪门禁，也能提前剪枝运行时与协议退化，并诚实检验长程优势。 |
 
 ## 18. 参考资料
 
@@ -840,12 +1527,79 @@ promotion 或修改 LoopX default。
 - [Agents' Last Exam 评估框架](https://github.com/rdi-berkeley/agents-last-exam)
 - [Long-Horizon Terminal Benchmark 仓库](https://github.com/zli12321/LHTB)
 - [LHTB benchmark report](https://zli12321.github.io/LHTB/index.html)
+- [LHTB 论文](https://arxiv.org/abs/2607.08964)
 - [DeepSWE 项目与 leaderboard](https://deepswe.datacurve.ai/)
 - [DeepSWE 论文](https://arxiv.org/abs/2607.07946)
 - [DeepSWE 运行指南](https://deepswe.datacurve.ai/run)
+- [StartupBench 项目](https://startupbench.github.io/)
+- [StartupBench 论文](https://startupbench.github.io/assets/StartupBench.pdf)
+- [StartupBench arXiv](https://arxiv.org/abs/2608.17800)
+- [LoopsBench 项目](https://loopsbench.ai/)
+- [LoopsBench 仓库](https://github.com/microsoft/Loopsbench)
+- [LoopsBench 论文](https://arxiv.org/abs/2608.00267)
+- [LoopsBench 数据集](https://huggingface.co/datasets/LoopsBench/LoopsBench)
+- [WideSearch 项目](https://widesearch-seed.github.io/)
+- [WideSearch 仓库](https://github.com/ByteDance-Seed/WideSearch)
+- [WideSearch 论文](https://arxiv.org/abs/2508.07999)
+- [WideSearch 数据集](https://huggingface.co/datasets/ByteDance-Seed/WideSearch)
+- [EdgeBench 仓库](https://github.com/ByteDance-Seed/EdgeBench)
+- [FrontierCS-2 项目](https://frontier-cs.org/)
+- [FrontierCS-2 仓库](https://github.com/FrontierCS/FrontierCS-2)
+- [FrontierCS-2 论文](https://arxiv.org/abs/2610.29932)
+- [SWE-Marathon 仓库](https://github.com/abundant-ai/swe-marathon)
+- [SWE-Marathon 论文](https://arxiv.org/abs/2606.07682)
+- [PaperBenchX 仓库](https://github.com/UniPat-AI/PaperBenchX)
+- [PaperBenchX 论文](https://arxiv.org/abs/2610.39744)
+- [PaperBench 参考实现](https://github.com/openai/frontier-evals/tree/main/project/paperbench)
+- [PaperBench 论文](https://arxiv.org/abs/2504.01848)
+- [KernelBench 仓库](https://github.com/ScalingIntelligence/KernelBench)
+- [KernelBench 论文](https://arxiv.org/abs/2502.10517)
+- [AlgoTune 仓库](https://github.com/oripress/AlgoTune)
+- [AlgoTune 论文](https://arxiv.org/abs/2507.15887)
+- [ALE-Bench (SakanaAI) 仓库](https://github.com/SakanaAI/ALE-Bench)
+- [ALE-Bench 论文](https://arxiv.org/abs/2506.09050)
+- [MLE-bench 仓库](https://github.com/openai/mle-bench)
+- [MLE-bench 论文](https://arxiv.org/abs/2410.07095)
+- [Terminal-Bench Science 项目](https://www.terminal-bench-science.ai/)
+- [Terminal-Bench Science 仓库](https://github.com/harbor-framework/terminal-bench-science)
+- [SWE-bench Pro 仓库](https://github.com/scaleapi/SWE-bench_Pro-os)
+- [SWE-bench Pro 论文](https://arxiv.org/abs/2509.16941)
+- [CORE-Bench 仓库](https://github.com/siegelz/core-bench)
+- [CORE-Bench 论文](https://arxiv.org/abs/2409.11363)
+- [ScienceAgentBench 仓库](https://github.com/OSU-NLP-Group/ScienceAgentBench)
+- [ScienceAgentBench 论文](https://arxiv.org/abs/2410.05080)
+- [BixBench 仓库](https://github.com/Future-House/BixBench)
+- [BixBench 论文](https://arxiv.org/abs/2503.00096)
+- [RE-Bench（已废弃）仓库](https://github.com/METR/RE-Bench)
+- [RE-Bench 论文](https://arxiv.org/abs/2411.15114)
+- [Meta-Harness 论文](https://arxiv.org/abs/2603.28052)
+- [Meta-Harness 仓库](https://github.com/stanford-iris-lab/meta-harness)
+- [RRSI 论文](https://arxiv.org/abs/2609.24972)
+- [RRSI 仓库](https://github.com/google-research/rrsi)
+- [Harness Updating Is Not Harness Benefit](https://arxiv.org/abs/2605.30621)
+- [Agentic Harness Engineering (AHE)](https://arxiv.org/abs/2604.25850)
+- [Self-Harness](https://arxiv.org/abs/2606.09498)
+- [Reward Hacking Benchmark (RHB)](https://arxiv.org/abs/2605.02964)
+- [DuoDiscover 论文](https://arxiv.org/abs/2610.17184)
+- [AgentFlow 论文](https://arxiv.org/abs/2510.05592)
+- [HELIX 论文](https://arxiv.org/abs/2608.13951)
+- [AlphaEvolve 论文](https://arxiv.org/abs/2506.13131)
+- [Darwin Gödel Machine (DGM) 论文](https://arxiv.org/abs/2505.22954)
+- [Darwin Gödel Machine 仓库](https://github.com/jennyzzt/dgm)
+- [LangChain: Improving Deep Agents with harness engineering](https://www.langchain.com/blog/improving-deep-agents-with-harness-engineering)
+- [Vercel `d0`: We removed 80% of our agent's tools](https://vercel.com/blog/we-removed-80-percent-of-our-agents-tools)
+- [METR: Recent frontier models are reward hacking](https://metr.org/blog/2025-06-05-recent-reward-hacking/)
+- [Anthropic: Demystifying evals for AI agents](https://www.anthropic.com/research/demystifying-evals-for-ai-agents)
+- [Anthropic: Effective harnesses for long-running agents](https://www.anthropic.com/research/effective-harnesses-for-long-running-agents)
+- [Anthropic: Harness design for long-running application development](https://www.anthropic.com/research/harness-design-long-running-apps)
+- [LoopX：上下文交付研究](https://loopx-project.github.io/loopx/blog/context-delivery/)
+- [LoopX：EdgeBench 反馈与记忆研究](https://loopx-project.github.io/loopx/blog/edgebench-feedback-and-memory/)
+- [LoopX：EdgeBench 长程修复研究](https://loopx-project.github.io/loopx/blog/edgebench-long-horizon-repairs/)
+- [前沿科学研究计划 v0](./frontier-science-research-program-v0.zh-CN.md)
+- [探索性 benchmark 行为发现](../../reference/benchmark-behavior-findings.md)
 - [Benchmark 研究工作区](https://github.com/huangruiteng/loopx/blob/main/benchmark/README.md)
 - [DeepSWE 研究实践](https://github.com/huangruiteng/loopx/blob/main/benchmark/deepswe/README.md)
-- [旧 Benchmark 归档](https://github.com/huangruiteng/loopx/blob/main/deprecate/benchmark-legacy/README.md)
+- [旧 Benchmark 历史](https://github.com/loopx-project/loopx/tree/54d42da44283bb414b24f71d16642c25cbcaf5dd/deprecate/benchmark-legacy)
 - [长程 Agent 分层步幅控制 v0](./hierarchical-agent-stride-control-v0.zh-CN.md)
 - [研究型探索控制面 v0](./research-exploration-control-plane-v0.zh-CN.md)
 - [Human Attention Wishlist v0](./human-attention-wishlist-v0.zh-CN.md)

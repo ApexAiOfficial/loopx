@@ -196,7 +196,7 @@
         "revision": "candidate-v1",
         "summary": "Active method unchanged."
       },
-      "metrics": [
+  "metrics": [
         {
           "detail": "No company-specific residual passed every frozen gate.",
           "id": "validated-alpha",
@@ -209,10 +209,125 @@
           "id": "method-state",
           "label": "Active method",
           "tone": "neutral",
-          "value": "unchanged"
-        }
+      "value": "unchanged"
+    }
+  ],
+  "source_period_metrics": [
+    {
+      "account_nav_treatment": "venue_liquidity_only",
+      "account_scope": "venue",
+      "account_value_role": "withdrawable",
+      "admission_reason": "source_period_metric_is_evidence_only",
+      "anomaly_state": "clear",
+      "coverage_state": "complete",
+      "denominator_scope": [],
+      "double_counted_components": [],
+      "duplicate_of": null,
+      "event_at": "2026-01-15T12:00:00+00:00",
+      "event_id": "venue-liquidity-20260115",
+      "event_identity": {
+        "event_at": "2026-01-15T12:00:00+00:00",
+        "instrument_id": "SYN-USDC",
+        "namespace": "synthetic.account.metric",
+        "scope_id": "synthetic-venue",
+        "source_event_id": "venue-liquidity-20260115"
+      },
+      "event_namespace": "synthetic.account.metric",
+      "expected_components": [
+        "venue-withdrawable"
       ],
-      "research_ledger": [
+      "fee_inclusion": "not_applicable",
+      "gap_reasons": [],
+      "includes_isolated_margin": false,
+      "independent_evidence": true,
+      "instrument_id": "SYN-USDC",
+      "label": "Venue withdrawable",
+      "lineage_id": "synthetic-venue-liquidity",
+      "lineage_state": "primary",
+      "methodology_state": "verified",
+      "metric_basis": "realized_cash",
+      "metric_id": "synthetic-venue-withdrawable",
+      "metric_semantics": "withdrawable",
+      "missing_components": [],
+      "numerator_scope": [
+        "venue-withdrawable"
+      ],
+      "observation_authority": "source_reported_exact",
+      "observed_components": [
+        "venue-withdrawable"
+      ],
+      "period_end": "2026-01-15",
+      "period_start": "2026-01-15",
+      "ready_eligible": false,
+      "scope_id": "synthetic-venue",
+      "sign_basis": "not_signed",
+      "source_ref": "source:synthetic-venue-liquidity",
+      "source_state": "ok",
+      "unit": "USDC",
+      "value": 0,
+      "value_origin": "source_reported",
+      "value_precision": "exact"
+    }
+  ],
+  "spot_market_identity": {
+    "contexts": [
+      {
+        "coin": "SYN-SPOT",
+        "mark_price": 4.25,
+        "observed_at": "2026-01-15T12:00:00+00:00",
+        "source_ref": "source:synthetic-spot-context"
+      }
+    ],
+    "markets": [
+      {
+        "backing_inference": "not_inferred",
+        "base_asset": {
+          "index": 4,
+          "symbol": "SYN"
+        },
+        "canonicality": "noncanonical_name",
+        "context_coin": "SYN-SPOT",
+        "mark_price": 4.25,
+        "observed_at": "2026-01-15T12:00:00+00:00",
+        "pair_name": "SYN-SPOT",
+        "quote_asset": {
+          "index": 0,
+          "symbol": "USDC"
+        },
+        "ready_eligible": false,
+        "source_refs": [
+          "source:synthetic-spot-pair",
+          "source:synthetic-syn",
+          "source:synthetic-usdc",
+          "source:synthetic-spot-context"
+        ]
+      }
+    ],
+    "pairs": [
+      {
+        "asset_indexes": [
+          4,
+          0
+        ],
+        "is_canonical": false,
+        "name": "SYN-SPOT",
+        "source_ref": "source:synthetic-spot-pair"
+      }
+    ],
+    "tokens": [
+      {
+        "index": 0,
+        "source_ref": "source:synthetic-usdc",
+        "symbol": "USDC"
+      },
+      {
+        "index": 4,
+        "source_ref": "source:synthetic-syn",
+        "symbol": "SYN"
+      }
+    ]
+  },
+  "research_ledger": [
         {
           "case_id": "case-rejected-residual",
           "decision": "rejected",

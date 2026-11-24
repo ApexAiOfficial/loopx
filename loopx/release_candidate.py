@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import importlib
+from concurrent.futures import ThreadPoolExecutor
+import os
+import sys
+from importlib.metadata import PackageNotFoundError, distribution
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .command_invocation import command_argv
+from .python_install_owner import (
+    distribution_record_path,
+    installed_loopx_distribution,
+    verified_distribution_console,
+)
+from .release_manifest import release_runtime_identity
 
 
 REPRESENTATIVE_CLI_IMPORTS = (
@@ -20,7 +30,7 @@ REPRESENTATIVE_CLI_COMMANDS = (
     ("status_help", ("status", "--help")),
     ("quota_help", ("quota", "--help")),
 )
-REPRESENTATIVE_PACKAGE_PATHS = (
+REPRESENTATIVE_DISTRIBUTION_PATHS = (
     "loopx/cli.py",
     "loopx/doctor.py",
     "loopx/history.py",
@@ -30,13 +40,20 @@ REPRESENTATIVE_PACKAGE_PATHS = (
     "loopx/cli_commands/doctor.py",
     "loopx/cli_commands/quota.py",
     "loopx/cli_commands/status.py",
+)
+REPRESENTATIVE_PACKAGE_PATHS = (
+    *REPRESENTATIVE_DISTRIBUTION_PATHS,
     "scripts/loopx",
+)
+CORE_CLI_IMPORTS = ("loopx.cli_runtime", *REPRESENTATIVE_CLI_IMPORTS[1:])
+CORE_DISTRIBUTION_PATHS = (
+    "loopx/entrypoint.py", "loopx/cli_runtime.py", *REPRESENTATIVE_DISTRIBUTION_PATHS[1:],
 )
 
 
-def _import_summary() -> dict[str, Any]:
+def _import_summary(module_names: Sequence[str] = REPRESENTATIVE_CLI_IMPORTS) -> dict[str, Any]:
     results: dict[str, str] = {}
-    for module_name in REPRESENTATIVE_CLI_IMPORTS:
+    for module_name in module_names:
         try:
             importlib.import_module(module_name)
         except Exception as exc:  # pragma: no cover - partial-package errors vary
@@ -51,30 +68,30 @@ def _import_summary() -> dict[str, Any]:
     }
 
 
-def _command_summary(command_path: Path | None) -> dict[str, Any]:
+def _command_summary(
+    command_path: Path | None, *, invocation_argv: Sequence[str] | None = None,
+) -> dict[str, Any]:
     if command_path is None:
         return {"ok": False, "results": {}, "failed": ["command_missing"]}
 
-    results: dict[str, dict[str, Any]] = {}
-    for probe_name, args in REPRESENTATIVE_CLI_COMMANDS:
+    def probe(item: tuple[str, tuple[str, ...]]) -> tuple[str, dict[str, Any]]:
+        probe_name, args = item
         try:
             result = subprocess.run(
-                command_argv(command_path, args),
+                [*invocation_argv, *args] if invocation_argv is not None else command_argv(command_path, args),
                 check=False,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=30,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            results[probe_name] = {
-                "ok": False,
-                "detail": f"{type(exc).__name__}: {exc}",
-            }
-            continue
-        results[probe_name] = {
-            "ok": result.returncode == 0,
-            "returncode": result.returncode,
-        }
+            return probe_name, {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
+        return probe_name, {"ok": result.returncode == 0, "returncode": result.returncode}
+
+    # These are read-only version/catalog/help probes. Preserve every result
+    # and its timeout while avoiding serial interpreter startup costs.
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = dict(executor.map(probe, REPRESENTATIVE_CLI_COMMANDS))
     failed = sorted(name for name, result in results.items() if not result.get("ok"))
     return {
         "ok": not failed,
@@ -83,17 +100,90 @@ def _command_summary(command_path: Path | None) -> dict[str, Any]:
     }
 
 
-def _package_path_summary(package_root: Path) -> dict[str, Any]:
+def _package_path_summary(
+    package_root: Path,
+    required_paths: Sequence[str] = REPRESENTATIVE_PACKAGE_PATHS,
+) -> dict[str, Any]:
     missing = [
         relative
-        for relative in REPRESENTATIVE_PACKAGE_PATHS
+        for relative in required_paths
         if not (package_root / relative).is_file()
     ]
     return {
         "ok": not missing,
-        "required": list(REPRESENTATIVE_PACKAGE_PATHS),
+        "required": list(required_paths),
         "missing": missing,
     }
+
+
+def _distribution_command_summary(command_path: Path | None) -> dict[str, Any]:
+    if command_path is None:
+        return {
+            "ok": False,
+            "command": None,
+            "recorded_commands": [],
+            "error": "command_missing",
+        }
+
+    try:
+        installed = installed_loopx_distribution(distribution)
+    except PackageNotFoundError:
+        return {
+            "ok": False,
+            "command": str(command_path),
+            "recorded_commands": [],
+            "error": "distribution_missing",
+        }
+
+    recorded_commands: set[Path] = set()
+    verified_commands: set[Path] = set()
+    recorded_module = False
+    resolved_command = command_path.resolve()
+    standalone_core = getattr(installed, "name", None) == "loopx-core"
+    for item in installed.files or ():
+        if standalone_core and str(item) == "loopx/entrypoint.py":
+            recorded_module = (
+                distribution_record_path(item).resolve() == resolved_command
+                == Path(__file__).with_name("entrypoint.py").resolve()
+            )
+        if Path(str(item)).name.lower() not in {
+            "loopx",
+            "loopx.exe",
+            "loopx-script.py",
+        }:
+            continue
+        recorded = distribution_record_path(item)
+        verified = verified_distribution_console(recorded)
+        recorded_commands.add(verified if verified is not None else recorded)
+        if verified is not None:
+            verified_commands.add(verified)
+    return {
+        "ok": resolved_command in verified_commands or (recorded_module and bool(verified_commands)),
+        **({"distribution_name": "loopx-core"} if getattr(installed, "name", None) == "loopx-core" else {}),
+        "command": str(resolved_command),
+        "recorded_commands": sorted(str(path) for path in recorded_commands),
+        "error": None if recorded_commands else "console_script_not_recorded",
+    }
+
+
+def _representative_cli_checks(
+    imports: dict[str, Any],
+    commands: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "representative_cli_imports",
+            "required": True,
+            "ok": bool(imports.get("ok")),
+            "detail": ",".join(imports.get("failed") or []) or "ok",
+        },
+        {
+            "id": "representative_cli_commands",
+            "required": True,
+            "ok": bool(commands.get("ok")),
+            "detail": ",".join(commands.get("failed") or []) or "ok",
+        },
+    ]
 
 
 def collect_release_candidate_checks(
@@ -119,18 +209,7 @@ def collect_release_candidate_checks(
                 f"invocation_root={invocation_root}; package_root={package_root}"
             ),
         },
-        {
-            "id": "representative_cli_imports",
-            "required": True,
-            "ok": bool(imports.get("ok")),
-            "detail": ",".join(imports.get("failed") or []) or "ok",
-        },
-        {
-            "id": "representative_cli_commands",
-            "required": True,
-            "ok": bool(commands.get("ok")),
-            "detail": ",".join(commands.get("failed") or []) or "ok",
-        },
+        *_representative_cli_checks(imports, commands),
         {
             "id": "representative_package_paths",
             "required": True,
@@ -148,3 +227,124 @@ def collect_release_candidate_checks(
             "package_paths": package_paths,
         },
     }
+
+
+def collect_python_distribution_checks(
+    *,
+    command_path: Path | None,
+    package_root: Path,
+) -> dict[str, Any]:
+    """Validate a wheel/sdist install without requiring source-only wrappers."""
+
+    distribution_command = _distribution_command_summary(command_path)
+    verified_command = Path(distribution_command["command"]) if distribution_command["ok"] else None
+    standalone_core = distribution_command.get("distribution_name") == "loopx-core"
+    imports = _import_summary(CORE_CLI_IMPORTS) if standalone_core else _import_summary()
+    if standalone_core and verified_command == Path(__file__).with_name("entrypoint.py").resolve():
+        commands = _command_summary(
+            verified_command, invocation_argv=[sys.executable, "-I", "-m", "loopx.entrypoint"],
+        )
+    else:
+        commands = _command_summary(verified_command)
+    package_paths = _package_path_summary(
+        package_root,
+        CORE_DISTRIBUTION_PATHS if standalone_core else REPRESENTATIVE_DISTRIBUTION_PATHS,
+    )
+    checks = [
+        {
+            "id": "command_package_same_distribution",
+            "required": True,
+            "ok": bool(distribution_command.get("ok")),
+            "detail": (
+                f"command={distribution_command.get('command')}; "
+                "recorded_commands="
+                f"{','.join(distribution_command.get('recorded_commands') or []) or 'none'}"
+            ),
+        },
+        *_representative_cli_checks(imports, commands),
+        {
+            "id": "representative_distribution_paths",
+            "required": True,
+            "ok": bool(package_paths.get("ok")),
+            "detail": ",".join(package_paths.get("missing") or []) or "ok",
+        },
+    ]
+    return {
+        "schema_version": "loopx_python_distribution_checks_v0",
+        "ok": all(check["ok"] for check in checks),
+        "checks": checks,
+        "representative_cli": {
+            "imports": imports,
+            "commands": commands,
+            "package_paths": package_paths,
+        },
+        "distribution_command": distribution_command,
+    }
+
+
+def collect_deep_install_checks(
+    *,
+    command_path: Path | None,
+    invocation_path: Path | None,
+    package_root: Path,
+    invocation_root: Path | None,
+    distribution_root: str | Path | None,
+) -> dict[str, Any]:
+    """Select the deep-check contract for the proven installation shape."""
+
+    if distribution_root is not None:
+        return collect_python_distribution_checks(
+            command_path=invocation_path or command_path,
+            package_root=Path(distribution_root),
+        )
+    return collect_release_candidate_checks(
+        command_path=command_path,
+        package_root=package_root,
+        invocation_root=invocation_root,
+    )
+
+
+def collect_installation_doctor(*, deep: bool) -> dict[str, Any]:
+    """Validate the package/toolchain without opening registered user projects.
+
+    Installers must not depend on workspace availability or macOS folder
+    consent. Keep the same representative package and runtime semantic checks
+    as deep doctor; ambient Goal, skill and provider health is a separate read.
+    """
+    from .control_plane.effect_runtime import collect_effect_runtime_readiness
+    from .command_invocation import resolve_command_path
+    from .doctor import doctor_invocation_path, python_distribution_install
+
+    invocation, module_owns_route = doctor_invocation_path()
+    command = invocation if module_owns_route else invocation or resolve_command_path("loopx")
+    package_root = Path(__file__).resolve().parents[1]
+    selected = os.environ.get("LOOPX_RELEASE_ROOT")
+    runtime = collect_effect_runtime_readiness(deep=deep)
+    checks = [
+        {"id": "command_available", "required": True, "ok": command is not None},
+        {"id": "typescript_effect_runtime_ready", "required": True,
+         "ok": bool(runtime.get("ready")), "detail": runtime.get("status")},
+    ]
+    payload: dict[str, Any] = {
+        "mode": "deep" if deep else "standard",
+        "scope": "installation_only",
+        "service_runtime_identity": release_runtime_identity(),
+        "python": {"executable": sys.executable},
+        "checks": checks,
+        "typescript_control_plane": runtime,
+        "path": {"loopx": str(command) if command else None},
+    }
+    if deep:
+        candidate = collect_deep_install_checks(
+            command_path=command,
+            invocation_path=invocation,
+            package_root=package_root,
+            invocation_root=Path(selected).expanduser().resolve() if selected else package_root,
+            distribution_root=python_distribution_install(
+                Path(__file__).with_name("doctor.py").resolve()
+            ).get("root"),
+        )
+        checks.extend(candidate["checks"])
+        payload["release_candidate"] = candidate
+    payload["ok"] = all(check["ok"] for check in checks)
+    return payload

@@ -5,7 +5,10 @@ from pathlib import Path
 from typing import Any
 
 from .agent_registry import registered_agent_ids_from_registry
-from .bootstrap_command_pack import inspect_bootstrap_connection
+from .bootstrap_command_pack import (
+    resolve_bootstrap_activation_registry,
+    resolve_bootstrap_project_route,
+)
 from .capabilities.change_quality.policy import change_quality_goal_policy
 from .host_loop_activation import (
     agent_type_uses_host_managed_skills,
@@ -14,14 +17,27 @@ from .host_loop_activation import (
     render_agent_type_catalog_markdown,
     scheduler_command_binding_for_agent_type,
 )
+from .history import load_registry
 from .install_contract import NO_CLONE_INSTALL_URL
+from .kiro_cli_goal_mode import (
+    KIRO_CLI_GOAL_CLEAR_COMMAND,
+    KIRO_CLI_GOAL_COMPLETION_TOOL,
+    KIRO_CLI_GOAL_DEFAULT_MAX_ITERATIONS,
+    kiro_cli_goal_invocation,
+)
+from .kiro_cli_goal_mode import (
+    SKILLS_ROOT_LABEL as KIRO_CLI_SKILLS_ROOT_LABEL,
+)
 from .project_prompt import (
+    host_command,
     render_available_capability_args,
     render_codex_cli_install_preflight,
+    render_optional_cli_arg,
     render_quota_guard_command,
     shell_arg,
+    shell_arg_for_host,
 )
-from .registry import read_json, registry_goals
+from .registry import registry_goals
 from .skill_install_readback import (
     ARK_MANAGED_AGENT_REQUIRED_SKILL_IDS,
     configured_host_skills_dir,
@@ -36,25 +52,33 @@ CHANGE_QUALITY_SKILL_ID = "loopx-change-quality"
 
 def _surface_install_command(agent_type: str, cli_bin: str, project: str) -> str | None:
     if agent_type in {"codex-app", "codex-app-ssh", "codex-ide-plugin", "codex-cli"}:
-        return f"{shell_arg(cli_bin)} slash-commands --install --surface codex"
+        return f"{host_command(cli_bin)} slash-commands --install --surface codex"
     if agent_type == "claude-code":
-        return f"{shell_arg(cli_bin)} slash-commands --install --surface claude-code"
+        return f"{host_command(cli_bin)} slash-commands --install --surface claude-code"
     if agent_type == "opencode":
         return (
-            f"{shell_arg(cli_bin)} slash-commands --install --surface opencode "
+            f"{host_command(cli_bin)} slash-commands --install --surface opencode "
             "--with-goal-bridge"
         )
     if agent_type == "gemini-cli":
-        return f"{shell_arg(cli_bin)} slash-commands --install --surface gemini"
+        return f"{host_command(cli_bin)} slash-commands --install --surface gemini"
     if agent_type == "cursor-agent":
-        return f"{shell_arg(cli_bin)} slash-commands --install --surface cursor"
+        return f"{host_command(cli_bin)} slash-commands --install --surface cursor"
+    if agent_type == "zcode":
+        return f"{host_command(cli_bin)} slash-commands --install --surface zcode"
+    if agent_type == "agy":
+        return f"{host_command(cli_bin)} slash-commands --install --surface agy"
+    if agent_type == "antigravity-app":
+        return f"{host_command(cli_bin)} slash-commands --install --surface antigravity-app"
+    if agent_type == "kiro-cli":
+        return f"{host_command(cli_bin)} slash-commands --install --surface kiro-cli"
     if agent_type == "pi":
         # The slash-commands installer resolves the Pi extension target through
         # --pi-project; pass the resolved project so the command stays correct
         # when agent-onboard runs from any cwd.
         return (
-            f"{shell_arg(cli_bin)} slash-commands --install --surface pi "
-            f"--pi-project {shell_arg(project)}"
+            f"{host_command(cli_bin)} slash-commands --install --surface pi "
+            f"--pi-project {shell_arg_for_host(project)}"
         )
     return None
 
@@ -86,15 +110,15 @@ def _project_skill_command(
     execute: bool = False,
 ) -> str:
     parts = [
-        shell_arg(cli_bin),
+        host_command(cli_bin),
         "project-skill",
         command,
         "--project",
-        shell_arg(project),
+        shell_arg_for_host(project),
         "--skill",
-        shell_arg(skill_id),
+        shell_arg_for_host(skill_id),
         "--surface",
-        shell_arg(surface),
+        shell_arg_for_host(surface),
     ]
     if execute:
         parts.append("--execute")
@@ -227,7 +251,7 @@ def _skill_delivery_contract(
                 else {}
             )
         ),
-        "source_repository": "https://github.com/huangruiteng/loopx",
+        "source_repository": "https://github.com/loopx-project/loopx",
         "source_directories": [
             f"skills/{skill_id}"
             for skill_id in required_skill_ids
@@ -264,9 +288,11 @@ def _bootstrap_pack_command(
     cli_bin: str,
     task_text: str | None,
     available_capabilities: list[str] | None,
+    runtime_root: str | None,
 ) -> str:
     surface_by_type = {
         "codex-app": "codex-app",
+        "trae_app": "trae_app",
         "codex-app-ssh": "codex-app-ssh",
         "codex-ide-plugin": "codex-ide-plugin",
         "codex-cli": "codex-cli-tui",
@@ -276,6 +302,10 @@ def _bootstrap_pack_command(
         "pi": "pi",
         "gemini-cli": "gemini-cli",
         "cursor-agent": "cursor-agent",
+        "zcode": "zcode",
+        "agy": "agy",
+        "antigravity-app": "antigravity-app",
+        "kiro-cli": "kiro-cli",
         "deepseek-harness": "deepseek-harness",
         "deepseek-harness-native": "deepseek-harness-native",
         "ark-managed-agent": "ark-managed-agent",
@@ -283,27 +313,29 @@ def _bootstrap_pack_command(
         "other-agent": "other-agent",
     }
     parts = [
-        shell_arg(cli_bin),
+        host_command(cli_bin) + render_optional_cli_arg("--runtime-root", runtime_root),
         "bootstrap-command-pack",
         "--project",
-        shell_arg(project),
+        shell_arg_for_host(project),
         "--goal-id",
-        shell_arg(goal_id),
+        shell_arg_for_host(goal_id),
         "--host-surface",
-        shell_arg(surface_by_type[agent_type]),
+        shell_arg_for_host(surface_by_type[agent_type]),
     ]
     if agent_id:
-        parts.extend(["--agent-id", shell_arg(agent_id)])
+        parts.extend(["--agent-id", shell_arg_for_host(agent_id)])
     if task_text:
-        parts.extend(["--goal-text", shell_arg(task_text)])
+        parts.extend(["--goal-text", shell_arg_for_host(task_text)])
     for capability in available_capabilities or []:
-        parts.extend(["--available-capability", shell_arg(capability)])
+        parts.extend(["--available-capability", shell_arg_for_host(capability)])
     return " ".join(parts)
 
 
 def _start_instruction(agent_type: str) -> str:
     if agent_type == "codex-app":
         return "Use `$loopx <task>` or select the LoopX skill from `/skills`; Codex App should then create/update the heartbeat automation."
+    if agent_type == "trae_app":
+        return "Use `$loopx <task>` or select the LoopX skill from `/skills`; Trae App should then create/update the heartbeat automation."
     if agent_type == "codex-app-ssh":
         return "Use `$loopx <task>` or select the LoopX skill from `/skills`; after todos are written, set `/goal <task_body>` in the visible Codex App task."
     if agent_type == "codex-ide-plugin":
@@ -330,6 +362,48 @@ def _start_instruction(agent_type: str) -> str:
             "carry the generated heartbeat task body as the session objective and "
             "start every following turn with `quota should-run`, reading state through "
             "the registered `loopx` MCP server or the CLI."
+        )
+    if agent_type == "zcode":
+        return (
+            "Invoke `$loopx` (or the LoopX skill from `ZCODE_HOME/skills`); after "
+            "todo writeback, carry the generated heartbeat task body as the "
+            "session objective and start every following turn with `quota should-run`."
+        )
+    if agent_type == "agy":
+        return (
+            "Invoke the LoopX skill from the fixed agy skills root "
+            "`~/.gemini/antigravity-cli/skills` via `/loopx <task>`; after todo "
+            "writeback, bind the objective with the native `/goal <task_body>` "
+            "command (agy audits work until `<!-- GOAL_COMPLETE -->`; cancel "
+            "with `<!-- GOAL_CANCELLED -->`), start every following turn, wake "
+            "and audit-continuation with `quota should-run`, and arm the next "
+            "bounded wake with the native `schedule` tool (DurationSeconds + "
+            "wake Prompt; recurring via MaxIterations) when quota allows more "
+            "work."
+        )
+    if agent_type == "antigravity-app":
+        return (
+            "Invoke the LoopX skill from `~/.gemini/config/skills` via `/loopx <task>`; "
+            "after todo writeback, start every turn with `quota should-run`, suspend "
+            "directly via the native `schedule(DurationSeconds=..., Prompt=...)` tool "
+            "when `waiting_external` or CI checks are pending (instead of polling), "
+            "and optionally configure `~/.gemini/config/sidecar.json` for background "
+            "periodic heartbeats."
+        )
+    if agent_type == "kiro-cli":
+        return (
+            f"Run `/loopx <task>` (the LoopX skill installed in "
+            f"`{KIRO_CLI_SKILLS_ROOT_LABEL}`); after todo writeback, bind the "
+            f"objective with the native `{kiro_cli_goal_invocation()}` command, "
+            f"stating the todo's acceptance criteria inside the goal statement "
+            f"because the host derives them from it, and taking N from the "
+            f"remaining quota slots (host default is "
+            f"{KIRO_CLI_GOAL_DEFAULT_MAX_ITERATIONS}; "
+            f"`{KIRO_CLI_GOAL_CLEAR_COMMAND}` cancels). "
+            f"Start every turn and native goal iteration with `quota "
+            f"should-run`, and settle through the built-in "
+            f"`{KIRO_CLI_GOAL_COMPLETION_TOOL}` tool only after LoopX writeback "
+            f"so its completion contract cites the same evidence."
         )
     if agent_type == "deepseek-harness":
         return (
@@ -368,13 +442,18 @@ def build_agent_onboarding_packet(
     cli_bin: str = "loopx",
     task_text: str | None = None,
     available_capabilities: list[str] | None = None,
+    runtime_root_arg: str | None = None,
+    explicit_project_registry: Path | None = None,
 ) -> dict[str, Any]:
     canonical_agent_type = normalize_agent_type(agent_type)
-    inspection = inspect_bootstrap_connection(project, goal_id=goal_id)
+    runtime_root_override, (inspection, _) = resolve_bootstrap_project_route(
+        project, goal_id=goal_id, runtime_root_arg=runtime_root_arg,
+        explicit_project_registry=explicit_project_registry if canonical_agent_type == "codex-app" else None,
+    )
     resolved_project = str(inspection["project"])
     resolved_goal_id = str(inspection["goal_id"])
     registry_path = Path(str(inspection["registry"]))
-    registry = read_json(registry_path) if registry_path.exists() else {}
+    registry = load_registry(registry_path) if registry_path.exists() else {}
     goal = next(
         (
             item
@@ -382,6 +461,21 @@ def build_agent_onboarding_packet(
             if str(item.get("id") or "") == resolved_goal_id
         ),
         {},
+    )
+    from .capabilities.machine_configuration.builtins import (
+        read_builtin_goal_machine_configuration,
+        project_goal_with_builtin_machine_configuration,
+    )
+    from .paths import resolve_runtime_root
+
+    runtime_root = resolve_runtime_root(
+        registry,
+        override=runtime_root_override,
+        registry_path=registry_path,
+    )
+    goal = project_goal_with_builtin_machine_configuration(
+        goal,
+        read_builtin_goal_machine_configuration(runtime_root),
     )
     active_project_skill_ids = (
         [CHANGE_QUALITY_SKILL_ID]
@@ -399,10 +493,17 @@ def build_agent_onboarding_packet(
         registry_path,
         resolved_goal_id,
     )
+    activation_registry = resolve_bootstrap_activation_registry(
+        canonical_agent_type, registry_path,
+        connected=inspection.get("connection_state") == "connected",
+        runtime_root_override=runtime_root_override,
+    )
     host_loop_activation = build_host_loop_activation_packet(
         agent_type=canonical_agent_type,
         goal_id=resolved_goal_id,
         cli_bin=cli_bin,
+        registry=activation_registry,
+        runtime_root=runtime_root_override,
         agent_id=agent_id,
         registered_agents=registered_agents,
         available_capabilities=available_capabilities,
@@ -422,6 +523,7 @@ def build_agent_onboarding_packet(
         cli_bin=cli_bin,
         task_text=task_text,
         available_capabilities=normalized_available_capabilities,
+        runtime_root=runtime_root_override,
     )
     commands: dict[str, Any] = {
         "doctor_or_install": render_codex_cli_install_preflight(
@@ -433,6 +535,8 @@ def build_agent_onboarding_packet(
             render_quota_guard_command(
                 resolved_goal_id,
                 cli_bin=cli_bin,
+                registry_path=activation_registry,
+                runtime_root=runtime_root_override,
                 agent_id=str(selected_agent_id) if selected_agent_id else None,
                 available_capabilities=normalized_available_capabilities,
                 **scheduler_command_binding_for_agent_type(canonical_agent_type),
@@ -441,12 +545,13 @@ def build_agent_onboarding_packet(
             else None
         ),
         "agent_onboard_recheck": (
-            f"{shell_arg(cli_bin)} agent-onboard "
-            f"--agent-type {shell_arg(canonical_agent_type)} "
-            f"--project {shell_arg(resolved_project)} "
-            f"--goal-id {shell_arg(resolved_goal_id)}"
+            f"{host_command(cli_bin)}{render_optional_cli_arg('--runtime-root', runtime_root_override)}"
+            " agent-onboard "
+            f"--agent-type {shell_arg_for_host(canonical_agent_type)} "
+            f"--project {shell_arg_for_host(resolved_project)} "
+            f"--goal-id {shell_arg_for_host(resolved_goal_id)}"
             + (
-                f" --agent-id {shell_arg(str(selected_agent_id))}"
+                f" --agent-id {shell_arg_for_host(str(selected_agent_id))}"
                 if selected_agent_id
                 else ""
             )
@@ -457,11 +562,11 @@ def build_agent_onboarding_packet(
         commands["install_command_facade"] = install_command
     if canonical_agent_type == "codex-cli":
         commands["codex_cli_bootstrap_message"] = (
-            f"{shell_arg(cli_bin)} codex-cli-bootstrap-message "
-            f"--project {shell_arg(resolved_project)} "
-            f"--goal-id {shell_arg(resolved_goal_id)}"
+            f"{host_command(cli_bin)} codex-cli-bootstrap-message "
+            f"--project {shell_arg_for_host(resolved_project)} "
+            f"--goal-id {shell_arg_for_host(resolved_goal_id)}"
             + (
-                f" --agent-id {shell_arg(str(selected_agent_id))}"
+                f" --agent-id {shell_arg_for_host(str(selected_agent_id))}"
                 if selected_agent_id
                 else ""
             )

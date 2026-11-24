@@ -371,7 +371,63 @@ def test_provider_result_cannot_cross_agent_task_scope(
 
     assert session.public_packet["status"] == "empty"
     assert session.public_packet["result_count"] == 0
+    assert session.public_packet["empty_cause"] == "all_provider_items_filtered"
+    assert session.public_packet["provider_item_count"] == 1
+    assert session.public_packet["filtered_item_count"] == 1
+    assert session.public_packet["filtered_reason_counts"] == {"scope_filtered": 1}
+    assert session.public_packet["legacy_record_maintenance"]["status"] == (
+        "not_required"
+    )
     assert provider.retrieve_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "reason_code"),
+    [
+        ({"state": "retired"}, "lifecycle_filtered"),
+        (
+            {"state": "active", "expires_at": "2026-08-02T11:59:59+00:00"},
+            "expiry_filtered",
+        ),
+    ],
+)
+def test_provider_result_lifecycle_filter_is_observable(
+    lifecycle: dict[str, str],
+    reason_code: str,
+) -> None:
+    provider = MemoryProvider()
+    record = active_record()
+    record["lifecycle"] = lifecycle
+    provider.resources[f"{SCOPE_REF}/memory.json"] = json.dumps(record)
+
+    session = execute_reward_memory_recall(
+        recall_request(),
+        provider_binding=binding(),
+        provider=provider,
+    )
+
+    assert session.public_packet["status"] == "empty"
+    assert session.public_packet["empty_cause"] == "all_provider_items_filtered"
+    assert session.public_packet["filtered_reason_counts"] == {reason_code: 1}
+    assert session.filtered_items[0].reason_code == reason_code
+
+
+def test_malformed_provider_record_is_counted_without_exposing_content() -> None:
+    provider = MemoryProvider()
+    provider.resources[f"{SCOPE_REF}/memory.json"] = "private malformed payload"
+
+    session = execute_reward_memory_recall(
+        recall_request(),
+        provider_binding=binding(),
+        provider=provider,
+    )
+
+    assert session.public_packet["status"] == "empty"
+    assert session.public_packet["empty_cause"] == "all_provider_items_filtered"
+    assert session.public_packet["filtered_reason_counts"] == {
+        "record_contract_filtered": 1
+    }
+    assert "private malformed payload" not in json.dumps(session.public_packet)
 
 
 @pytest.mark.parametrize(
@@ -443,3 +499,7 @@ def test_bounded_agentic_queries_find_subtle_semantics_and_ignore_unrelated() ->
     assert found.public_packet["provider_call_count"] == 3
     assert empty.public_packet["status"] == "empty"
     assert empty.public_packet["provider_call_count"] == 3
+    assert empty.public_packet["empty_cause"] == "provider_returned_no_items"
+    assert empty.public_packet["provider_item_count"] == 0
+    assert empty.public_packet["filtered_item_count"] == 0
+    assert empty.public_packet["filtered_reason_counts"] == {}

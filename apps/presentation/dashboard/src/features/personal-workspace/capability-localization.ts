@@ -1,0 +1,303 @@
+import type { CapabilityConfigurationCatalog } from "../../data/chat";
+import type { WorkspaceLocale } from "./i18n";
+
+type CapabilityDescriptor = CapabilityConfigurationCatalog["capabilities"][number];
+type LocalizedCopy = Readonly<{
+  description: string;
+  displayName: string;
+  readOnlyReason?: string;
+}>;
+
+type FieldCopy = Record<string, Readonly<{ description?: string; label: string; options?: Record<string, string> }>>;
+
+const capabilityCopy: Record<WorkspaceLocale, Record<string, LocalizedCopy>> = {
+  en: {
+    context_delivery: {displayName: "Progressive context", description: "Read current requirements before supporting material. Supported hosts can reuse unchanged context independently."},
+    codex_chat: {displayName: "Codex Goal conversation defaults", description: "Choose the native Codex profile, model, speed tier and reasoning effort for new Goal conversations. Existing conversations keep their original history. This does not start or reconfigure an active Agent Loop, worker or steward."},
+    decision_context: {displayName: "Find evidence", description: "Find advisory evidence with a temporary private profile. OpenViking and BM25 are retrieval implementations; this page does not save a binding or enable automatic memory."},
+    content_ops: {displayName: "Content production", description: "Prepare source-backed outlines, compose local videos or generate cloud images and footage with the optional media provider. Review the result before sharing."},
+    goal_storage: { displayName: "New Goal authority", description: "New Goals default to canonical SQLite with hard leases. Choose storage and execution policy for future Goals. Existing Goals require a separate backed-up migration." },
+    manager_runtime: {
+      displayName: "Runtime",
+      description: "Selects the persistent host-tool profile used by owner manager conversations.",
+    },
+    steward_executor: {
+      displayName: "Model and executor",
+      description: "Guides the steward executor, model, and selection boundary for this machine. A pinned route blocks substitution; a flexible pool permits only authorized fallback.",
+    },
+    steward_memory: {
+      displayName: "Isolated OpenViking memory",
+      description: "Connects owner private steward conversations to an isolated OpenViking memory namespace with per-speaker preferences and bounded recall.",
+    },
+    todo_replan_cadence: { displayName: "Goal review and stride", description: "Set review frequency. Evidence-conditioned stride (v1) is always on and reviews work scope and route changes." },
+    change_quality_qualification: {
+      displayName: "Change quality qualification",
+      description: "Prepares a provider-neutral review packet, allows at most one policy-authorized safe-fix pass, and can require an exact-diff receipt.",
+    },
+    progress_review: {
+      displayName: "Progress-review sentinel",
+      description: "Records typed drift receipts from an external bounded review of scoped file deltas; assist may raise the existing autonomous replan obligation.",
+    },
+    explore_graph: {
+      displayName: "Explore Graph",
+      description: "Organizes bounded exploration as a typed evidence graph so branches, findings, and synthesis remain inspectable.",
+    },
+    explore_harness: {
+      displayName: "Explore Harness",
+      description: "Keeps an exploration evidence graph with optional branch planning. Explicit composition replans require a bound experiment or typed result; worker permissions and task completion remain separate.",
+    },
+    lark_event_inbox: {
+      displayName: "Lark event inbox",
+      description: "Receives provider events through a local-private inbox binding before LoopX projects them into governed work.",
+      readOnlyReason: "This capability requires a local-private inbox binding. Manage it in Lark settings or through the capability CLI.",
+    },
+    lark_kanban_heartbeat_sync: {
+      displayName: "Lark Kanban heartbeat sync",
+      description: "Synchronizes accepted LoopX work state to the configured Lark Kanban heartbeat surface.",
+    },
+    local_authority_shadow: {
+      displayName: "Retired authority observation",
+      description: "No longer writes observations. Retained records are read-only, not promotion evidence.",
+      readOnlyReason: "Clear the old setting with configure-goal --clear-local-authority-shadow. Runtime shadow requires separate configuration and bootstrap.",
+    },
+    coordination_runtime_shadow: {
+      displayName: "Coordination runtime shadow",
+      description: "Captures transaction-bound Todo and task-lease mutations for reviewed whole-Goal coordination-authority promotion.",
+    },
+    multi_subagent: {
+      displayName: "Adaptive child capacity",
+      description: "Sets bounded child-agent capacity and the public-safe responsibility domains in which parallel work may be delegated.",
+    },
+    peer_task_coordination: {
+      displayName: "Registered-peer task coordination",
+      description: "Routes explicitly scoped peer-owned work to one registered coordinator without granting cross-owner mutation authority.",
+    },
+    periodic_report: {
+      displayName: "Periodic reports",
+      description: "Turns validated Goal stage progress into a frozen report and automatically delivers it through the configured Goal Channel with exact readback.",
+    },
+    pull_request_review: {
+      displayName: "Pull-request review",
+      description: "Sets forward/reverse PR review directions with machine, Goal and Agent settings; it never grants GitHub, Todo, push, or merge authority.",
+    },
+    reward_memory: {
+      displayName: "Experience learning (experimental)",
+      description: "Configures a reviewed local-private provider binding for Goal-scoped Agent recall and evidence-backed outcome learning.",
+    },
+  },
+  "zh-CN": {
+    context_delivery: {displayName: "渐进上下文", description: "先展示当前目标与约束，按需读取材料；支持的宿主可独立复用跨轮上下文。"},
+    codex_chat: {displayName: "Codex Goal 对话默认值", description: "分别选择 Codex 配置来源、模型、速度档和推理强度，作用于本机的新 Goal 对话。已有对话保留原历史；不会启动或重配正在运行的 Agent Loop、工作 Agent 或管家。"},
+    decision_context: {displayName: "资料召回", description: "通过临时私有配置查找参考证据。OpenViking、BM25 是检索实现；本页不保存绑定，也不启用自动记忆。"},
+    content_ops: {displayName: "内容制作", description: "准备有来源的提纲，使用可选媒体扩展制作本机视频、生成云端图像与镜头，检查作品后再分享。"},
+    goal_storage: { displayName: "新 Goal 的权威存储", description: "新 Goal 默认使用 canonical SQLite 与 hard lease；可选择之后新 Goal 的存储与执行策略。已有 Goal 仍需单独备份、迁移。" },
+    manager_runtime: {
+      displayName: "运行环境",
+      description: "选择管家会话持续生效的宿主工具模式。",
+    },
+    steward_executor: {
+      displayName: "模型与执行器",
+      description: "配置本机管家的执行器、模型与选择边界；锁定路径禁止替代，灵活池只允许在已授权范围内回退。",
+    },
+    steward_memory: {
+      displayName: "独立 OpenViking 长期记忆",
+      description: "为本人私聊管家启用独立身份的 OpenViking 记忆命名空间：按已验证发言人持久化偏好、跨会话按需检索并限制超时，不向群聊或工作 Agent 泄露。",
+    },
+    todo_replan_cadence: { displayName: "Goal 复盘与步幅", description: "设置复盘周期。依据证据的步幅策略（v1）始终开启，复核工作大小与路线变化。" },
+    change_quality_qualification: {
+      displayName: "变更质量验证",
+      description: "生成与 Provider 无关的审阅包，最多允许一次策略授权的安全修复，并可要求精确 diff 回执。",
+    },
+    progress_review: {
+      displayName: "进展评估哨兵",
+      description: "记录外部有界评估对限定文件变化给出的类型化漂移回执；assist 模式可触发已有的自主重规划义务。",
+    },
+    explore_graph: {
+      displayName: "探索图谱",
+      description: "把有界探索组织为 typed 证据图，让探索分支、发现与综合结论都可检查、可追溯。",
+    },
+    explore_harness: {
+      displayName: "探索 Harness",
+      description: "记录探索证据图谱，可选开启分支规划。显式组合的重新规划需绑定实验或类型化结果；派生 Agent 权限与任务完成独立判断。",
+    },
+    lark_event_inbox: {
+      displayName: "飞书事件收件箱",
+      description: "通过本机私有收件箱接收 Provider 事件，再由 LoopX 将其投影为受治理的工作。",
+      readOnlyReason: "此能力依赖本机私有的收件箱绑定，请在飞书设置或 capability CLI 中管理。",
+    },
+    lark_kanban_heartbeat_sync: {
+      displayName: "飞书看板心跳同步",
+      description: "把 LoopX 已接受的工作状态同步到配置好的飞书看板心跳界面。",
+    },
+    local_authority_shadow: {
+      displayName: "已退役的 Authority 观测",
+      description: "不再写入观测。保留记录只读，不能作为晋升证据。",
+      readOnlyReason: "通过 configure-goal --clear-local-authority-shadow 清理旧设置；Runtime shadow 需要另行配置与 bootstrap。",
+    },
+    coordination_runtime_shadow: {
+      displayName: "协调 Runtime 影子",
+      description: "捕获事务绑定的 Todo 与 task lease 变更，为经评审的整 Goal 协调 Authority 晋级提供证据。",
+    },
+    multi_subagent: {
+      displayName: "自适应子 Agent 容量",
+      description: "限定子 Agent 容量与可公开的职责域，只有落在这些边界内的工作才能并行委派。",
+    },
+    peer_task_coordination: {
+      displayName: "已注册 Peer 任务协调",
+      description: "把明确限定的 Peer 工作路由给一个已注册协调者，不授予跨 Owner 修改权限。",
+    },
+    periodic_report: {
+      displayName: "周期报告",
+      description: "把经过验证的 Goal 阶段进展整理为冻结报告，并通过配置的 Goal Channel 自动发送和精确回读。",
+    },
+    pull_request_review: {
+      displayName: "Pull-request Review",
+      description: "配置公开 GitHub PR 审阅队列的本机默认排序；不会授予 GitHub、Todo、push 或 merge 权限。",
+    },
+    reward_memory: {
+      displayName: "经验学习（实验）",
+      description: "为 Goal 内 Agent 的召回与证据化结果学习配置经过审阅的本机私有 Provider 绑定。",
+    },
+  },
+};
+
+const fieldCopy: Record<WorkspaceLocale, FieldCopy> = {
+  en: {
+    new_goal_provider: { label: "New Goal storage provider", description: "File or SQLite; frozen at creation, independently of execution policy." },
+    canonical_creation: { label: "Create canonical authority", description: "Required for new Goals in 2.0. An older disabled setting remains visible until you enable it; existing Goals require import." },
+    new_goal_handoff_mode: { label: "New Goal execution policy", description: "soft_claim or hard_lease, used with canonical creation. Agents inherit the Goal policy; tool authority is unchanged." },
+    runtime_profile: { label: "Runtime profile", description: "Use local host tools by default, or restrict the steward to LoopX reads. Protected operations retain their own checks.", options: { trusted_owner: "Local tools", restricted: "Read-only" } },
+    selection_policy: { label: "Selection policy", description: "Preferred allows an explicit user choice; pinned rejects another executor; flexible permits fallback only inside the eligible pool." },
+    executor_endpoint: { label: "Primary steward executor", description: "The preferred or pinned executor for this machine. In a flexible pool it is tried first when available." },
+    eligible_endpoints: { label: "Flexible eligible executors", description: "One authorized executor per line. Use only with flexible selection and include the primary executor." },
+    executor_model: { label: "Model", description: "Optional model for the selected executor. Leave blank to keep the executor's own default." },
+    executor_reasoning_effort: { label: "Reasoning effort", description: "Optional reasoning effort for the selected executor. Leave blank to keep the executor's own default." },
+    user_space: { label: "User space", description: "OpenViking user space isolating steward memory on this machine." },
+    auto_recall: { label: "Auto recall history", description: "Search past steward events automatically on substantive private messages." },
+    recall_timeout_seconds: { label: "Recall timeout (seconds)", description: "Wait budget (1–15s) before continuing without recalled memory." },
+    count_unit: { label: "Review after", description: "Work Turns require accepted settlement; polls and retries do not count.", options: { completed_todos: "Completed Todos", effective_turns: "Settled work Turns" } },
+    planning_horizon_goal: { label: "Show Goal in planning horizon", description: "Default on. Keep the original Goal and acceptance visible before choosing work. Turn off for rollback or comparisons; replan, stride and execution authority are unchanged." },
+    yardstick_enabled: { label: "Review measurement criteria", description: "Default off. Review measurement scope and feedback using available Explore evidence. Requires Explore evidence; does not enable it or authorize execution." },
+    count: { label: "Number between reviews", description: "Settled work Turns: 1–6; completed Todos: 1–5. Goal overrides take precedence over device defaults." },
+    allowed_domains: { label: "Allowed responsibility domains", description: "Enter one bounded, public-safe domain per line." },
+    coordinator_agent_id: { label: "Coordinator Agent", description: "Use an already registered Agent id; leave blank to disable coordination." },
+    enabled: { label: "Enabled" },
+    model: { label: "Child model", description: "For example gpt-5.6-luna. Blank clears the child model preference." },
+    reasoning_effort: { label: "Child reasoning effort", description: "For example max; the host must support this model and effort." },
+    max_children: { label: "Maximum children", description: "Hard upper bound for concurrently delegated child work." },
+    profile: { label: "Planner profile", description: "Select one registered Explore Harness profile." },
+    composition_mode: { label: "Composition policy", description: "Replan requires an exact experiment successor or typed result; it grants no execution authority.", options: {disabled: "Off", explicit_only: "Explicit candidates"} },
+    composition_scope_id: { label: "Research coverage scope", description: "An opaque scope id required by the explicit-only composition policy." },
+    profile_preset: { label: "Report profile", description: "Capability-owned report profile, such as weekly-progress." },
+    review_required: { label: "Request review when ready", description: "For reports returned to this Goal's original conversation. Each edition stays on Home until you handle its review." },
+    wait_for_ci: { label: "Wait for CI", description: "Disable to use local validation without querying or waiting for CI. Merge authority is unchanged." },
+    review_order: { label: "Review direction", description: "Forward visits other authors first and oldest first. Reverse inverts the whole actionable queue." },
+    agent_orders: { label: "Agent review directions", description: "Use the Goal default or choose a direction for each registered Agent." },
+    owner_logins: { label: "Additional owner accounts", description: "One GitHub login per line. These accounts and the signed-in reviewer share the owner queue; review and merge permissions stay unchanged." },
+    route_ref: { label: "Goal Channel route", description: "Public route alias only; credentials and provider identifiers stay outside this form." },
+    safe_fix: { label: "Allow one bounded safe-fix pass" },
+    strict_receipt: { label: "Require an exact-diff receipt" },
+    timezone: { label: "Timezone", description: "Use an IANA timezone, for example Asia/Shanghai." },
+    schedule: { label: "Calendar reports", description: "Optional daily or weekly reports; no schedule preserves stage-only delivery." },
+    config_path: { label: "Local-private configuration path", description: "Repo-relative ignored JSON under .loopx/config/. Leave blank to retain the current binding; the path is never returned." },
+    enabled_agents: { label: "Enabled Goal Agents", description: "Enter one registered Goal-local Agent id per line. A private binding currently accepts exactly one Agent." },
+  },
+  "zh-CN": {
+    new_goal_provider: { label: "新 Goal 的存储 provider", description: "选择 File 或 SQLite；创建时固定，与执行策略分别选择。" },
+    canonical_creation: { label: "建立 canonical 权威存储", description: "2.0 新建 Goal 必须启用。旧的关闭设置会保留显示，需自行启用；已有 Goal 需导入。" },
+    new_goal_handoff_mode: { label: "新 Goal 的执行策略", description: "canonical 创建使用 soft_claim 或 hard_lease。Agent 继承 Goal 策略；不授予工具权限。" },
+    runtime_profile: { label: "运行模式", description: "默认使用本机工具，也可限制为只读 LoopX 状态；受保护操作仍单独校验。", options: { trusted_owner: "本机工具", restricted: "只读" } },
+    selection_policy: { label: "选择策略", description: "preferred 允许用户显式改选；pinned 拒绝其他执行器；flexible 只在已授权资源池内回退。" },
+    executor_endpoint: { label: "首选管家执行器", description: "本机首选或锁定的执行器；灵活池模式下优先尝试它。" },
+    eligible_endpoints: { label: "灵活池可用执行器", description: "每行一个已授权执行器，仅用于 flexible；必须包含首选执行器。" },
+    executor_model: { label: "模型", description: "所选执行器使用的模型，可留空；留空表示沿用执行器自身的默认模型。" },
+    executor_reasoning_effort: { label: "推理档位", description: "所选执行器使用的推理档位，可留空；留空表示沿用执行器自身的默认档位。" },
+    user_space: { label: "记忆用户空间", description: "本机管家在 OpenViking 中隔离使用的 user space 标识。" },
+    auto_recall: { label: "跨会话自动召回", description: "收到非命令的实质私聊消息时，执行一次有界历史事件检索。" },
+    recall_timeout_seconds: { label: "召回超时（秒）", description: "等待记忆读取的上限（1–15 秒）；超时后跳过记忆直接恢复正常回复。" },
+    count_unit: { label: "复核计数依据", description: "有效工作 Turn 须完成结算；轮询和重复重试不计数。", options: { completed_todos: "已完成 Todo", effective_turns: "已结算工作 Turn" } },
+    planning_horizon_goal: { label: "在规划视野中显示 Goal", description: "默认开启，选择工作前可见原目标与验收要求。可为回滚或对照实验关闭；不改变复盘、步幅策略或执行权限。" },
+    yardstick_enabled: { label: "复核衡量标准", description: "默认关闭。使用已有 Explore 证据复核测量范围与反馈；需有可用的 Explore 证据，不会自动启用它或授予执行权限。" },
+    count: { label: "两次复核间的数量", description: "已结算工作 Turn 为 1–6，已完成 Todo 为 1–5；Goal 显式设置优先于设备默认值。" },
+    allowed_domains: { label: "允许的职责域", description: "每行填写一个有边界、可公开的职责域。" },
+    coordinator_agent_id: { label: "协调 Agent", description: "填写一个已经注册的 Agent ID；留空表示关闭协调。" },
+    enabled: { label: "启用" },
+    model: { label: "子 Agent 模型", description: "例如 gpt-5.6-luna；留空清除模型偏好。" },
+    reasoning_effort: { label: "子 Agent 推理档位", description: "例如 max；宿主须支持所选模型与档位。" },
+    max_children: { label: "最大子 Agent 数", description: "可同时委派的子任务硬上限。" },
+    profile: { label: "规划 Profile", description: "选择一个已注册的 Explore Harness profile。" },
+    composition_mode: { label: "组合策略", description: "重新规划需要精确的实验后继或类型化结果；它不授予执行权限。", options: {disabled: "关闭", explicit_only: "仅显式候选"} },
+    composition_scope_id: { label: "研究覆盖范围", description: "显式组合策略要求填写不含私有内容的范围标识。" },
+    profile_preset: { label: "报告 Profile", description: "由该能力管理的报告 profile，例如 weekly-progress。" },
+    review_required: { label: "材料就绪后请求验收", description: "适用于回到本 Goal 原工作对话的报告。每个版本独立提醒，处理审阅后从首页移除。" },
+    wait_for_ci: { label: "等待 CI", description: "关闭后使用本地验证，不查询或等待 CI；不改变合并权限。" },
+    review_order: { label: "审阅方向", description: "正向先审其他作者，同层先审较早就绪的 PR；反向将整个可执行队列倒序。" },
+    agent_orders: { label: "Agent 审阅方向", description: "每个注册 Agent 可继承 Goal，或单独选择正向、反向。" },
+    owner_logins: { label: "额外所有者账号", description: "每行一个 GitHub 登录名，与当前登录的审阅账号一起计入 owner 队列；不改变审阅或合并权限。" },
+    route_ref: { label: "Goal Channel 路由", description: "只填写公开 route alias；凭据与 Provider 标识不会进入此表单。" },
+    safe_fix: { label: "允许一次有界安全修复" },
+    strict_receipt: { label: "要求精确 diff 回执" },
+    timezone: { label: "时区", description: "使用 IANA 时区，例如 Asia/Shanghai。" },
+    schedule: { label: "日历汇报", description: "可选每日或每周计划；未设置时保持阶段结束汇报。" },
+    config_path: { label: "本机私有配置路径", description: "填写 .loopx/config/ 下、相对仓库且被忽略的 JSON；留空保留当前绑定，路径不会被回传。" },
+    enabled_agents: { label: "已启用的 Goal Agent", description: "每行填写一个已注册的 Goal 内 Agent ID；私有绑定当前只接受一个 Agent。" },
+  },
+};
+
+export function localizeCapability(
+  capability: CapabilityDescriptor,
+  locale: WorkspaceLocale,
+): CapabilityDescriptor {
+  const copy = capabilityCopy[locale][capability.capability_id];
+  if (!copy) return capability;
+  return {
+    ...capability,
+    display_name: copy.displayName,
+    description: copy.description,
+    configuration_editor: {
+      ...capability.configuration_editor,
+      ...(copy.readOnlyReason ? { read_only_reason: copy.readOnlyReason } : {}),
+    },
+  };
+}
+
+export function localizedCapabilityFieldCopy(locale: WorkspaceLocale, capabilityId?: string): FieldCopy {
+  if (capabilityId === "context_delivery") return {...fieldCopy[locale], mode: locale === "zh-CN" ? {
+    label: "渐进读取", description: "适用于各宿主；关闭后保留完整内联输入。", options: {off: "关闭", on: "开启"},
+  } : {
+    label: "Progressive reads", description: "Applies across hosts; off keeps full inline input.", options: {off: "Off", on: "On"},
+  }, delta_delivery: locale === "zh-CN" ? {
+    label: "跨轮差分", description: "仅在支持连续性的宿主自动启用；可独立关闭，保留渐进读取。", options: {off: "关闭", auto: "自动"},
+  } : {
+    label: "Cross-Turn Delta", description: "Automatic only on supported continuity hosts; off preserves progressive reads.", options: {off: "Off", auto: "Automatic"},
+  }};
+  if (capabilityId === "codex_chat") return {...fieldCopy[locale], ...(locale === "zh-CN" ? {
+    codex_profile: {label: "Codex 配置来源", description: "选择已有本机配置，例如 codex-gpt。账户和凭据留在原目录，不复制；留空继承服务配置。"},
+    model: {label: "对话模型", description: "例如 gpt-6.1-sol；留空继承所选 Codex 配置的模型。"},
+    reasoning_effort: {label: "推理强度", description: "例如 high；与模型和速度档分别设置。"},
+    service_tier: {label: "速度档", description: "例如 fast；由原生执行器校验可用性，不保证每次请求均获加速。"},
+  } : {
+    codex_profile: {label: "Codex configuration profile", description: "Existing local configuration, for example codex-gpt. Credentials remain in their original home. Blank inherits the service profile."},
+    model: {label: "Conversation model", description: "For example gpt-6.1-sol; blank inherits the selected Codex profile."},
+    reasoning_effort: {label: "Reasoning effort", description: "For example high; independent of the model and speed tier."},
+    service_tier: {label: "Speed tier", description: "For example fast; the native executor validates support. Acceleration is not guaranteed for every request."},
+  })};
+  if (capabilityId === "reward_memory") return {...fieldCopy[locale], agent_id: locale === "zh-CN" ? {
+    label: "独立绑定的 Agent", description: "选择已注册的 Agent；留空编辑共享绑定。", options: {"": "共享绑定"},
+  } : { label: "Independent Agent binding", description: "Select a registered Agent; leave blank for the shared binding.", options: {"": "Shared binding"} }};
+  if (capabilityId === "explore_harness") return {...fieldCopy[locale], mode: locale === "zh-CN" ? {
+    label: "探索模式", description: "规划包含证据图谱；派生 Agent 和执行权限仍单独控制。",
+    options: {off: "关闭", evidence: "仅记录证据", planning: "证据与规划"},
+  } : {
+    label: "Exploration mode", description: "Planning includes the evidence graph; worker and execution permissions remain separate.",
+    options: {off: "Off", evidence: "Evidence only", planning: "Evidence and planning"},
+  }};
+  if (capabilityId === "steward_memory") return {...fieldCopy[locale], enabled: locale === "zh-CN" ? {
+    label: "启用", description: "为本人私聊管家开启独立 OpenViking 长期记忆。",
+  } : {
+    label: "Enabled", description: "Enable isolated OpenViking long-term memory for owner private steward conversations.",
+  }};
+  return fieldCopy[locale];
+}
+
+export const localizedCapabilityIds = Object.freeze(Object.keys(capabilityCopy.en).sort());

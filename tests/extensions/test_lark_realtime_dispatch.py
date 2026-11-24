@@ -1,0 +1,731 @@
+"""Realtime transport isolation through the real routing, Inbox and reply owners."""
+
+from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+import json
+import os
+from pathlib import Path
+import threading
+import time
+
+import pytest
+
+from loopx.extensions.lark import goal_topic_runtime as runtime
+from loopx.extensions.lark.event_inbox import inspect_lark_event_inbox
+from loopx.extensions.lark.goal_channel_contracts import read_goal_channel_binding
+from loopx.extensions.lark.goal_channel_targets import read_goal_channel_targets
+from loopx.extensions.lark.goal_topic_runtime_service import (
+    LarkGoalTopicRuntimeService,
+    ProfileTransport,
+    ProfileWorkerFingerprint,
+)
+from test_lark_goal_topic_runtime import _reply_runner, _seed_legacy_topic
+
+
+def _snapshot(tmp_path):
+    targets, bindings = tmp_path / "targets.json", tmp_path / "bindings.json"
+    _seed_legacy_topic(targets, bindings)
+    alpha = read_goal_channel_binding(bindings)
+    beta = deepcopy(alpha)
+    binding = beta["bindings"].pop("goal-alpha")
+    next(iter(binding["connections"].values()))["topic"]["root_message_id"] = (
+        "om_topic_beta"
+    )
+    beta["bindings"]["goal-beta"] = binding
+    return {
+        "target_payload": read_goal_channel_targets(targets),
+        "binding_payloads": {"goal-alpha": alpha, "goal-beta": beta},
+    }
+
+
+def _event(message, topic="alpha"):
+    return {
+        "event_id": f"evt_{message}",
+        "message_id": f"om_{message}",
+        "chat_id": "oc_public_fixture",
+        "root_id": f"om_topic_{topic}",
+        "sender_type": "user",
+        "sender_id": "ou_public_owner",
+        "mentions": [{"id": "cli_public_fixture"}],
+        "create_time": datetime.now(UTC).isoformat(),
+        "content": "@linkmacbot public synthetic question",
+    }
+
+
+class _Consumer:
+    def __init__(self, lines):
+        self.stdout = lines
+        self.waited = False
+
+    def poll(self):
+        return 0
+
+    def wait(self, timeout=None):
+        self.waited = True
+        return 0
+
+
+class _IdleConsumer(_Consumer):
+    """A live pipe stays idle until its owning listener terminates it."""
+
+    def __init__(self):
+        reader, writer = os.pipe()
+        super().__init__(os.fdopen(reader, encoding="utf-8"))
+        self._writer = os.fdopen(writer, "w", encoding="utf-8", buffering=1)
+        self.terminated = threading.Event()
+
+    def send(self, line):
+        self._writer.write(line + "\n")
+
+    def poll(self):
+        return 0 if self.terminated.is_set() else None
+
+    def terminate(self):
+        self._writer.close()
+        self.terminated.set()
+
+    def close(self):
+        self.terminate()
+        self.stdout.close()
+
+
+def _thread_reply_runner():
+    local = threading.local()
+
+    def run(args):
+        if not hasattr(local, "state"):
+            local.state = {}
+        return _reply_runner(local.state)(args)
+
+    return run
+
+
+def _start(tmp_path, snapshot, lines, answer, stop=None, health=None):
+    consumer = _Consumer(lines)
+    options = dict(
+        profile="mew",
+        snapshot_provider=lambda: snapshot,
+        stop=stop or threading.Event(),
+        runtime_root=tmp_path / "runtime",
+        answer=answer,
+        process_factory=lambda _args: consumer,
+        provider_runner=None,
+        reply_runner=_thread_reply_runner(),
+        health_sink=health.append if health is not None else None,
+    )
+    return consumer, options
+
+
+def _processed(tmp_path):
+    return sum(
+        inspect_lark_event_inbox(project=tmp_path / "runtime", config_path=path)[
+            "processed_count"
+        ]
+        for path in (tmp_path / "runtime/.loopx/config/lark-goal-topics").glob("*.json")
+    )
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_slow_role_does_not_block_another_role_but_its_followup_stays_ordered(
+    tmp_path,
+    batch,
+):
+    snapshot = _snapshot(tmp_path)
+    active, release, beta_done, followup = [threading.Event() for _ in range(4)]
+    health = []
+    order = []
+
+    def answer(route, _text):
+        message = route["message_id"]
+        order.append(message)
+        if message == "om_alpha_first":
+            active.set()
+            assert release.wait(5)
+        elif message == "om_alpha_followup":
+            followup.set()
+        else:
+            beta_done.set()
+        return "Public synthetic reply"
+
+    def lines():
+        yield "[event] ready event_key=im.message.receive_v1\n"
+        yield json.dumps(_event("alpha_first"))
+        assert active.wait(5)
+        events = [_event("alpha_followup"), _event("beta_first", "beta")]
+        if batch:
+            yield json.dumps(events)
+        else:
+            yield from map(json.dumps, events)
+        yield "[event] exited (reason: timeout)\n"
+
+    consumer, options = _start(tmp_path, snapshot, lines(), answer, health=health)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(runtime.stream_lark_goal_topic_profile, **options)
+        try:
+            assert beta_done.wait(3), "An unrelated role waited for the slow answer"
+            assert not followup.is_set()
+            assert not future.done(), (
+                "Consumer ownership ended before active work settled"
+            )
+            assert not consumer.waited
+        finally:
+            release.set()
+        result = future.result(timeout=8)
+    assert result["event_count"] == result["replied_count"] == 3
+    assert result["status"] == "stream_ended"
+    assert order == ["om_alpha_first", "om_beta_first", "om_alpha_followup"]
+    assert _processed(tmp_path) == 3
+    assert sum(update.get("event_count", 0) for update in health) == 3
+    assert "public synthetic question" not in json.dumps(health)
+
+
+@pytest.mark.parametrize("disable", [False, True])
+def test_waiting_message_uses_fresh_binding_and_stop_never_acknowledges_it(
+    tmp_path,
+    disable,
+):
+    snapshot = _snapshot(tmp_path)
+    active, release, queued = [threading.Event() for _ in range(3)]
+    stop = threading.Event()
+    answers = []
+    health = []
+
+    def answer(route, _text):
+        answers.append(route["message_id"])
+        active.set()
+        assert release.wait(5)
+        return "Public synthetic reply"
+
+    def lines():
+        yield "[event] ready event_key=im.message.receive_v1\n"
+        yield json.dumps(_event("alpha_first"))
+        assert active.wait(5)
+        yield json.dumps(_event("alpha_waiting"))
+        queued.set()
+        assert release.wait(5)
+        yield "[event] exited (reason: timeout)\n"
+
+    _consumer, options = _start(tmp_path, snapshot, lines(), answer, stop, health)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(runtime.stream_lark_goal_topic_profile, **options)
+        try:
+            assert queued.wait(5)
+            if disable:
+                next(
+                    iter(
+                        snapshot["binding_payloads"]["goal-alpha"]["bindings"][
+                            "goal-alpha"
+                        ]["connections"].values()
+                    )
+                )["enabled"] = False
+            else:
+                stop.set()
+        finally:
+            release.set()
+        result = future.result(timeout=8)
+    assert answers == ["om_alpha_first"]
+    assert result["replied_count"] == 1
+    assert _processed(tmp_path) == 1
+    assert not list((tmp_path / "runtime").rglob("om_alpha_waiting.json"))
+    if disable:
+        assert any(
+            update.get("last_event_status") == "ignored"
+            and update.get("last_event_reason") == "topic_mismatch"
+            for update in health
+        )
+    else:
+        assert result["status"] == "stopped"
+
+
+def test_explicit_session_groups_topics_but_different_sessions_are_independent(
+    tmp_path, monkeypatch
+):
+    snapshot = _snapshot(tmp_path)
+    monkeypatch.setattr(
+        runtime,
+        "decide_lark_topic_event",
+        lambda **kwargs: {
+            "route": {
+                "session_id": "session-public",
+                "app_ref": "mew",
+                "target_ref": "fixture",
+                "topic_root_message_id": kwargs["event"]["root_id"],
+            }
+        },
+    )
+    keys = [
+        runtime._profile_event_lane(
+            profile="mew",
+            snapshot=snapshot,
+            event=_event("message", topic),
+            runtime_root=tmp_path,
+        )
+        for topic in ("alpha", "beta")
+    ]
+    assert keys[0][0] != keys[1][0]
+    assert keys[0][1] == keys[1][1] == "session.session-public"
+    monkeypatch.setattr(
+        runtime,
+        "decide_lark_topic_event",
+        lambda **kwargs: {
+            "route": {
+                "session_id": "session-new",
+                "app_ref": "mew",
+                "target_ref": "fixture",
+                "topic_root_message_id": kwargs["event"]["root_id"],
+            }
+        },
+    )
+    updated = runtime._profile_event_lane(
+        profile="mew",
+        snapshot=snapshot,
+        event=_event("message", "beta"),
+        runtime_root=tmp_path,
+    )
+    assert updated[0] == keys[1][0]
+    assert updated[1] != keys[1][1]
+
+
+def test_inactive_profile_keeps_the_native_listener_and_dispatch_off(
+    tmp_path, monkeypatch
+):
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError(
+            "An inactive profile must allocate no consumer or dispatcher"
+        )
+
+    monkeypatch.setattr(runtime, "ProfileEventDispatch", unexpected)
+    result = runtime.stream_lark_goal_topic_profile(
+        profile="mew",
+        snapshot_provider=lambda: {},
+        stop=threading.Event(),
+        runtime_root=tmp_path / "runtime",
+        answer=unexpected,
+        process_factory=unexpected,
+    )
+    assert result["status"] == "inactive"
+    assert result["event_count"] == result["replied_count"] == 0
+    assert not (tmp_path / "runtime").exists()
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_native_group_topic_admission_does_not_block_another_topics_control(
+    tmp_path, batch
+):
+    # Native bindings have no legacy Goal/topic routing rows. A missing legacy
+    # route must not collapse every native topic in this group onto one lane.
+    snapshot = {"private_profiles": {"mew": {
+        "cli_bin": "fake-lark", "provider_ref": "a" * 24,
+    }}}
+    active, release, beta_done, followup = [threading.Event() for _ in range(4)]
+    order = []
+
+    def admit(profile, event):
+        assert profile == "mew"
+        message = event["message_id"]
+        order.append(message)
+        if message == "om_alpha_first":
+            active.set()
+            assert release.wait(5)
+        elif message == "om_alpha_followup":
+            followup.set()
+        else:
+            assert event["content"] == "/stop"
+            beta_done.set()
+        return {"status": "command_recorded"}
+
+    def native_event(message, topic="alpha"):
+        return {**_event(message, topic), "chat_type": "group", "message_type": "text"}
+
+    def lines():
+        yield "[event] ready event_key=im.message.receive_v1\n"
+        yield json.dumps(native_event("alpha_first"))
+        assert active.wait(5)
+        events = [native_event("alpha_followup"),
+                  {**native_event("beta_control", "beta"), "content": "/stop"}]
+        if batch:
+            yield json.dumps(events)
+        else:
+            yield from map(json.dumps, events)
+        yield "[event] exited (reason: timeout)\n"
+
+    def unexpected(*_args):
+        raise AssertionError("Native events must retain their native admission owner")
+
+    consumer, options = _start(tmp_path, snapshot, lines(), unexpected)
+    options["private_admitter"] = admit
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(runtime.stream_lark_goal_topic_profile, **options)
+        try:
+            assert beta_done.wait(1), "Another native topic's control waited for admission"
+            assert not followup.is_set(), "One topic lost its source FIFO"
+            assert not consumer.waited
+        finally:
+            release.set()
+        result = future.result(timeout=8)
+    assert result["event_count"] == 3
+    assert result["replied_count"] == 0  # Core delivery, not the legacy reply path.
+    assert order == ["om_alpha_first", "om_beta_control", "om_alpha_followup"]
+    assert not (tmp_path / "runtime").exists()
+
+
+def test_native_source_lanes_preserve_topic_and_private_sender_order(tmp_path, monkeypatch):
+    snapshot = _snapshot(tmp_path)
+    snapshot["private_profiles"] = {
+        "mew": {"provider_ref": "a" * 24, "audience": "group"},
+        "alias": {"provider_ref": "a" * 24, "audience": "group"},
+        "other": {"provider_ref": "b" * 24, "audience": "group"},
+    }
+
+    def unexpected(**_kwargs):
+        raise AssertionError("Native source scheduling must not select a legacy route")
+
+    monkeypatch.setattr(runtime, "_profile_event_route", unexpected)
+
+    def lane(event, profile="mew"):
+        return runtime._profile_event_lane(
+            profile=profile, snapshot=snapshot, event=event, runtime_root=tmp_path
+        )
+
+    group = {**_event("first"), "chat_type": "group"}
+    first = lane(group)
+    assert first == lane({**group, "message_id": "om_next", "sender_id": "ou_other"})
+    assert first == lane(group, "alias")  # Same verified App's source shape.
+    assert first != lane(group, "other")
+    assert first != lane({**group, "root_id": "om_topic_beta"})
+    assert first != lane({**group, "chat_id": "oc_other"})
+    # A group root and its replies keep FIFO. A private sender cannot shard its
+    # queue by supplying a different root; Core private source identity ignores it.
+    root = {**group, "root_id": "", "message_id": "om_topic_alpha"}
+    assert first == lane(root)
+    private = {**group, "chat_type": "p2p"}
+    assert lane(private) == lane({**private, "root_id": "om_fake", "message_id": "om_next"})
+    assert lane(private) != lane({**private, "sender_id": "ou_other"})
+    assert not (tmp_path / "runtime").exists()
+
+
+@pytest.mark.parametrize("invalid", [
+    {"sender_id": ""}, {"chat_id": "invalid"},
+    {"message_id": "../escape"}, {"root_id": "", "parent_id": "om_parent"},
+])
+def test_malformed_native_source_hint_keeps_conservative_lane(tmp_path, invalid):
+    snapshot = {"private_profiles": {"mew": {"provider_ref": "a" * 24}}}
+    event = {**_event("first"), "chat_type": "group", **invalid}
+    lane = runtime._profile_event_lane(
+        profile="mew", snapshot=snapshot, event=event, runtime_root=tmp_path
+    )
+    assert lane[0].startswith("unmatched.")
+    assert len(lane) == 1
+    assert not list(tmp_path.iterdir())
+
+
+def test_reader_failure_drains_active_work_and_cleans_up_without_accepting_buffered_input(
+    tmp_path,
+):
+    snapshot = _snapshot(tmp_path)
+    active, release = threading.Event(), threading.Event()
+    answers = []
+
+    def answer(route, _text):
+        answers.append(route["message_id"])
+        active.set()
+        assert release.wait(5)
+        return "Public synthetic reply"
+
+    def lines():
+        yield "[event] ready event_key=im.message.receive_v1\n"
+        yield json.dumps(_event("alpha_first"))
+        assert active.wait(5)
+        yield json.dumps(_event("alpha_waiting"))
+        raise OSError("synthetic reader failure")
+
+    consumer, options = _start(tmp_path, snapshot, lines(), answer)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(runtime.stream_lark_goal_topic_profile, **options)
+        try:
+            with pytest.raises(TimeoutError):
+                future.result(timeout=0.1)
+            assert not consumer.waited
+        finally:
+            release.set()
+        with pytest.raises(OSError, match="synthetic reader failure"):
+            future.result(timeout=8)
+    assert consumer.waited
+    assert answers == ["om_alpha_first"]
+    assert _processed(tmp_path) == 1
+    assert not list((tmp_path / "runtime").rglob("om_alpha_waiting.json"))
+
+
+@pytest.mark.parametrize("active_answer", [False, True])
+def test_idle_handler_failure_unblocks_reader_and_retains_active_answer_ownership(
+    tmp_path, monkeypatch, active_answer
+):
+    snapshot = _snapshot(tmp_path)
+    active, release, failed = [threading.Event() for _ in range(3)]
+    health, answers = [], []
+    poll = runtime.poll_lark_goal_topic_profile_once
+
+    def failing_poll(**kwargs):
+        event = json.loads(kwargs["consume_runner"]([])["stdout"])
+        if event["message_id"] == "om_beta_failure":
+            failed.set()
+            raise OSError("synthetic handler failure")
+        return poll(**kwargs)
+
+    def answer(route, _text):
+        answers.append(route["message_id"])
+        active.set()
+        assert release.wait(8)
+        return "Public synthetic reply"
+
+    monkeypatch.setattr(runtime, "poll_lark_goal_topic_profile_once", failing_poll)
+    consumer = _IdleConsumer()
+    stop = threading.Event()
+    _unused, options = _start(tmp_path, snapshot, [], answer, stop, health)
+    options["process_factory"] = lambda _args: consumer
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(runtime.stream_lark_goal_topic_profile, **options)
+        try:
+            consumer.send("[event] ready event_key=im.message.receive_v1")
+            if active_answer:
+                consumer.send(json.dumps(_event("alpha_first")))
+                assert active.wait(5)
+                consumer.send(json.dumps(_event("alpha_waiting")))
+            consumer.send(json.dumps(_event("beta_failure", "beta")))
+            assert failed.wait(5)
+            # No subsequent line or provider disconnect may be needed to
+            # expose the failure and enter the existing service retry path.
+            assert consumer.terminated.wait(3), "Idle reader hid a handler failure"
+            assert health[-1]["status"] == "failed"
+            assert health[-1]["error_code"] == "lark_event_listener_failed"
+            assert not stop.is_set(), "Failure was mistaken for a requested stop"
+            if active_answer:
+                assert not future.done()
+                assert not consumer.waited
+        finally:
+            release.set()
+            consumer.terminate()
+        try:
+            with pytest.raises(OSError, match="synthetic handler failure"):
+                future.result(timeout=8)
+        finally:
+            consumer.close()
+    assert consumer.waited
+    assert answers == (["om_alpha_first"] if active_answer else [])
+    assert _processed(tmp_path) == int(active_answer)
+    assert not list((tmp_path / "runtime").rglob("om_alpha_waiting.json"))
+    assert not list((tmp_path / "runtime").rglob("om_beta_failure.json"))
+    assert health[-1]["status"] == "failed", "Late answer hid the listener failure"
+    assert "synthetic handler failure" not in json.dumps(health)
+
+
+def test_idle_handler_failure_reconnects_through_the_existing_service_owner(
+    tmp_path, monkeypatch
+):
+    snapshot = _snapshot(tmp_path)
+    consumer = _IdleConsumer()
+    stop = threading.Event()
+    attempts, health = [], []
+    stream = runtime.stream_lark_goal_topic_profile
+    poll = runtime.poll_lark_goal_topic_profile_once
+    service = LarkGoalTopicRuntimeService(
+        snapshot_provider=lambda: snapshot,
+        runtime_root=tmp_path / "runtime",
+        runtime_controller=object(),
+    )
+    # Keep the real machine/App lease in the fixture, never in the user's home.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    update_health = service._update_health
+
+    def record_health(profile, **updates):
+        update_health(profile, **updates)
+        health.append(service.health_snapshot()[profile])
+
+    def failing_poll(**kwargs):
+        if not consumer.waited:
+            raise OSError("synthetic handler failure")
+        return poll(**kwargs)
+
+    def owned_stream(**kwargs):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            consumer.send("[event] ready event_key=im.message.receive_v1")
+            consumer.send(json.dumps(_event("beta_failure", "beta")))
+            return stream(**kwargs, process_factory=lambda _args: consumer)
+        assert consumer.waited, "New consumer started before the old owner settled"
+        replacement = _Consumer(
+            [
+                "[event] ready event_key=im.message.receive_v1\n",
+                "[event] exited (reason: timeout)\n",
+            ]
+        )
+        result = stream(**kwargs, process_factory=lambda _args: replacement)
+        assert result["ok"] and replacement.waited
+        stop.set()
+        service._closed.set()
+        return result
+
+    monkeypatch.setattr(service, "_update_health", record_health)
+    monkeypatch.setattr(runtime, "poll_lark_goal_topic_profile_once", failing_poll)
+    monkeypatch.setattr(runtime, "stream_lark_goal_topic_profile", owned_stream)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(service._poll_profile, "mew", stop)
+            try:
+                future.result(timeout=6)
+            finally:
+                stop.set()
+                service._closed.set()
+                consumer.terminate()
+    finally:
+        consumer.close()
+    assert attempts == [1, 2]
+    assert any(row["status"] == "failed" for row in health)
+    assert any(
+        row["status"] == "retrying"
+        and row["restart_count"] == 1
+        and row["error_code"] == "lark_event_listener_failed"
+        for row in health
+    )
+    assert health[-1]["status"] == "listening"
+    assert health[-1]["restart_count"] == 1
+    assert _processed(tmp_path) == 0
+
+
+def test_profile_without_steerable_binding_keeps_four_ordinary_workers(
+    tmp_path, monkeypatch
+):
+    snapshot = {
+        "private_profiles": {
+            "mew": {"cli_bin": "fake-lark", "provider_ref": "a" * 24}
+        }
+    }
+    all_four = threading.Barrier(4, timeout=3)
+    release = threading.Event()
+    entered = []
+    stop = threading.Event()
+
+    def admit(_profile, event):
+        entered.append(event["message_id"])
+        all_four.wait()
+        assert release.wait(5)
+        if len(entered) == 4:
+            stop.set()
+        return {"status": "command_recorded"}
+
+    def lines():
+        yield "[event] ready event_key=im.message.receive_v1\n"
+        for index in range(4):
+            yield json.dumps(
+                {
+                    **_event(f"role_{index}", f"topic_{index}"),
+                    "chat_type": "group",
+                    "message_type": "text",
+                }
+            )
+        assert release.wait(5)
+        yield "[event] exited (reason: timeout)\n"
+
+    service = LarkGoalTopicRuntimeService(
+        snapshot_provider=lambda: snapshot,
+        runtime_root=tmp_path / "runtime",
+        runtime_controller=object(),
+        private_conversations=object(),
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(service, "_admit_private", admit)
+    stream = runtime.stream_lark_goal_topic_profile
+
+    def owned_stream(**kwargs):
+        result = stream(**{**kwargs, "process_factory": lambda _args: _Consumer(lines())})
+        service._closed.set()
+        return result
+
+    monkeypatch.setattr(runtime, "stream_lark_goal_topic_profile", owned_stream)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(service._poll_profile, "mew", stop)
+        try:
+            deadline = threading.Event()
+            started = time.monotonic()
+            while len(entered) < 4 and time.monotonic() - started < 5.0 and not deadline.wait(0.02):
+                pass
+            assert len(entered) == 4
+        finally:
+            release.set()
+            stop.set()
+            service._closed.set()
+        future.result(timeout=6)
+
+
+def test_poll_profile_direct_unmanaged_call_runs_and_close_sets_stop_under_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    snapshot = _snapshot(tmp_path)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    entered: list[str] = []
+
+    def fake_stream(*, profile: str, stop: threading.Event, **_kwargs: object) -> dict[str, object]:
+        entered.append(profile)
+        stop.set()
+        return {"ok": True, "status": "stopped"}
+
+    monkeypatch.setattr(runtime, "stream_lark_goal_topic_profile", fake_stream)
+    service = LarkGoalTopicRuntimeService(
+        snapshot_provider=lambda: snapshot,
+        runtime_root=tmp_path / "runtime",
+        runtime_controller=object(),
+    )
+    try:
+        direct_stop = threading.Event()
+        service._poll_profile("mew", direct_stop)
+        assert entered == ["mew"]
+        assert service.active_profiles() == []
+
+        entered.clear()
+        other_stop = threading.Event()
+        fingerprint = ProfileWorkerFingerprint(
+            transport=ProfileTransport(
+                cli_bin="fake-lark",
+                app_id="",
+                consumer_lease_key="mew",
+                callback_chats=(),
+                other_binding_id="",
+            )
+        )
+        with service._lock:
+            service._workers["mew"] = (threading.Event(), threading.current_thread(), fingerprint)
+        service._poll_profile("mew", other_stop)
+        assert entered == []
+        assert service.active_profiles() == []
+    finally:
+        service.close()
+
+    worker_started = threading.Event()
+    seen_stop: list[threading.Event] = []
+
+    def managed_poller(_profile: str, stop: threading.Event) -> None:
+        seen_stop.append(stop)
+        worker_started.set()
+        assert stop.wait(5)
+
+    managed_service = LarkGoalTopicRuntimeService(
+        snapshot_provider=lambda: snapshot,
+        runtime_root=tmp_path / "runtime-managed",
+        runtime_controller=object(),
+        profile_poller=managed_poller,
+    )
+    try:
+        managed_service.refresh()
+        assert worker_started.wait(5)
+        worker_stop = seen_stop[0]
+    finally:
+        managed_service.close()
+    assert worker_stop.is_set()
+    with managed_service._lock:
+        assert managed_service._workers == {}
+    assert [
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("loopx-lark-") and thread.is_alive()
+    ] == []

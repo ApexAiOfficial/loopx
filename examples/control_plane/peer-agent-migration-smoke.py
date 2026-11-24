@@ -312,6 +312,7 @@ def main() -> int:
 
         heartbeat = build_heartbeat_prompt(
             goal_id=GOAL_ID,
+            registry_path=fresh_registry,
             thin=True,
             agent_id=AGENTS[0],
             agent_scopes=["peer task claims and leases"],
@@ -319,12 +320,14 @@ def main() -> int:
         )
         assert heartbeat["agent_model"] == "peer_v1", heartbeat
         assert heartbeat["agent_role"] == "peer-agent", heartbeat
+        assert str(fresh_registry) in heartbeat["task_body"], heartbeat
         assert "primary_agent" not in heartbeat, heartbeat
         assert "side_agent_handoff_agent" not in heartbeat, heartbeat
         assert "single primary" not in heartbeat["task_body"].lower(), heartbeat
         assert "side-agent" not in heartbeat["task_body"].lower(), heartbeat
         assert "equal peer" in heartbeat["task_body"].lower(), heartbeat
-        assert "no cross-agent authority" in heartbeat["task_body"].lower(), heartbeat
+        assert "Follow user authority and repository rules" in heartbeat["task_body"], heartbeat
+        assert "Gate only the affected path" in heartbeat["task_body"], heartbeat
 
     print("peer-agent-migration-smoke ok")
     return 0

@@ -21,9 +21,7 @@ from loopx.control_plane.scheduler.execution_context import (
     SchedulerRuntimeProfile,
     scheduler_execution_context_for_runtime_profile,
 )
-from loopx.control_plane.work_items.interaction_contract import (
-    build_protocol_action_packet,
-)
+from loopx.control_plane.turn_driver.host_candidate import extract_turn_authority
 
 
 STATE_MATRIX = json.loads(
@@ -31,7 +29,6 @@ STATE_MATRIX = json.loads(
         encoding="utf-8"
     )
 )
-
 
 def _deep_update(target: dict[str, Any], patch: dict[str, Any]) -> None:
     for key, value in patch.items():
@@ -87,6 +84,13 @@ def _full_decision() -> dict[str, object]:
                 "delivery_allowed": True,
                 "quiet_noop_allowed": False,
                 "primary_action": "advance one product-path slice",
+                "required_reads": [
+                    {"kind": "repository", "command": "git status --short", "reason": "inspect state"},
+                    {"source": "goal_state", "command": "cat -- /tmp/fixture-goal/state.md",
+                     "reason": "Read the whole Goal intent, acceptance and stops before work/replan."},
+                    {"source": "selected_todo", "command": "loopx --format json todo list --goal-id fixture-goal --todo-id todo_fixture0001",
+                     "reason": "Read full current work requirements before work."},
+                ],
             },
             "cli_channel": {
                 "next_cli_actions": [
@@ -97,13 +101,6 @@ def _full_decision() -> dict[str, object]:
                 "spend_after_validation": True,
                 "spend_policy": "spend once after validated writeback",
             },
-            "required_reads": [
-                {
-                    "kind": "repository",
-                    "command": "git status --short",
-                    "reason": "inspect state",
-                }
-            ],
         },
         "goal_boundary": {
             "adapter": {"kind": "fixture", "status": "connected-read-only"},
@@ -193,7 +190,6 @@ def _full_decision() -> dict[str, object]:
         "goal_frontier_projection": {"large_diagnostic_lane": ["y" * 4_000]},
         "plan_summary": {"large_diagnostic_lane": ["z" * 4_000]},
     }
-    source["protocol_action_packet"] = build_protocol_action_packet(source)
     return source
 
 
@@ -207,7 +203,6 @@ def test_turn_envelope_state_matrix_preserves_parity_and_budget(
 ) -> None:
     source = _full_decision()
     _deep_update(source, case["patch"])
-    source["protocol_action_packet"] = build_protocol_action_packet(source)
 
     envelope = build_turn_envelope(source)
 
@@ -219,12 +214,7 @@ def test_turn_envelope_state_matrix_preserves_parity_and_budget(
         "expected_action_signature_coverage",
         "turn_envelope_action_dimensions_v0",
     )
-    assert (
-        envelope["contract_capsule"]["protocol_action_packet"][
-            "reconstruction_verified"
-        ]
-        is True
-    )
+    assert "protocol_action_packet" not in envelope["contract_capsule"]
     assert envelope["compaction"]["within_budget"] is True
     assert envelope["compaction"]["envelope_json_bytes"] <= TURN_ENVELOPE_BUDGET_BYTES
     assert (
@@ -315,6 +305,43 @@ def test_turn_envelope_compacts_replan_help_without_losing_successor_execution()
     ) == turn_envelope_action_signature_document(envelope)
 
 
+@pytest.mark.parametrize("carrier", ["agent_channel", "interaction", "payload"])
+def test_required_read_obligations_reach_signed_host_requests(carrier: str) -> None:
+    from loopx.control_plane.turn_driver.codex_cli import _prompt
+    from loopx.control_plane.turn_driver.host_candidate import render_prompt
+
+    source = _full_decision()
+    read = {
+        "command": "loopx context read --source 'quoted path'",
+        "ordering": "before_work",
+        "hook_id": "fixture.context",
+        "capability_id": "fixture",
+    }
+    interaction = source["interaction_contract"]
+    if carrier == "agent_channel":
+        interaction["agent_channel"]["required_reads"] = [read]
+        interaction["required_reads"] = [{"command": "stale root read"}]
+    elif carrier == "interaction":
+        del interaction["agent_channel"]["required_reads"]
+        interaction["required_reads"] = [read]
+    else:
+        del interaction["agent_channel"]["required_reads"]
+        interaction.pop("required_reads", None)
+        source["required_reads"] = [read]
+    envelope = build_turn_envelope(source)
+    request = {"turn_envelope": envelope}
+    authority = extract_turn_authority(request)
+    assert authority["required_reads"] == [read]
+    # Both shipped host renderers receive the exact obligations, not a count.
+    assert json.dumps(read, sort_keys=True, separators=(",", ":")) in render_prompt(authority)
+    assert json.dumps(read, sort_keys=True, separators=(",", ":")) in _prompt(request)
+    for field in ("command", "ordering", "hook_id", "capability_id"):
+        tampered = deepcopy(request)
+        tampered["turn_envelope"]["required_reads"][0][field] = "different"
+        with pytest.raises(ValueError, match="signature"):
+            extract_turn_authority(tampered)
+
+
 def test_turn_envelope_derives_canonical_slots_through_effect_turn() -> None:
     source = _full_decision()
     turn = interpret_quota_should_run_packet(
@@ -355,23 +382,7 @@ def test_turn_envelope_derives_canonical_slots_through_effect_turn() -> None:
         == "advance_primary_outcome_or_write_blocker"
     )
     assert envelope["contract_capsule"]["automation_liveness"]["pause_allowed"] is False
-    assert envelope["contract_capsule"]["protocol_action_packet"] == {
-        "schema_version": "protocol_action_packet_v0",
-        "present": True,
-        "summary_hash": envelope["contract_capsule"]["protocol_action_packet"][
-            "summary_hash"
-        ],
-        "derivation_status": "verified",
-        "reconstruction_verified": True,
-        "llm_policy": "no_api",
-        "candidate_derivation_inputs": [
-            "action",
-            "user",
-            "work_lane_contract",
-            "automation_liveness",
-            "scheduler",
-        ],
-    }
+    assert "protocol_action_packet" not in envelope["contract_capsule"]
     assert envelope["action_signature"]["matches"] is True
     assert (
         envelope["action_signature"]["source_hash"]
@@ -447,7 +458,7 @@ def test_turn_envelope_preserves_signed_adaptive_orchestration_contract() -> Non
     ) == turn_envelope_action_signature_document(envelope)
 
 
-def test_three_long_child_briefs_stay_within_turn_envelope_budget() -> None:
+def test_three_long_child_briefs_preserve_required_reads_within_budget() -> None:
     long_objective = "Validate " + "evidence " * 55
     items = [
         {
@@ -457,7 +468,7 @@ def test_three_long_child_briefs_stay_within_turn_envelope_budget() -> None:
             "action_kind": "implement",
             "task_domain": "code",
             "text": "Implement the primary slice.",
-                "required_write_scopes": ["loopx/**"],
+            "required_write_scopes": ["loopx/**"],
         },
         *[
             {
@@ -500,7 +511,9 @@ def test_three_long_child_briefs_stay_within_turn_envelope_budget() -> None:
     assert contract is not None
     assert len(contract["eligible_child_lanes"]) == 3
     assert envelope["action_signature"]["matches"] is True
-    assert envelope["compaction"]["envelope_json_bytes"] < TURN_ENVELOPE_BUDGET_BYTES
+    assert any(read.get("source") == "selected_todo" for read in envelope["required_reads"])
+    assert envelope["compaction"]["budget_bytes"] == TURN_ENVELOPE_BUDGET_BYTES
+    assert "warning" not in envelope["compaction"]
     assert envelope["compaction"]["within_budget"] is True
 
 
@@ -515,6 +528,30 @@ def test_turn_envelope_full_decision_preserves_codex_app_profile() -> None:
     assert envelope["detail_ref"]["full_decision"] == (
         "loopx --format json quota should-run --goal-id fixture-goal "
         "--agent-id codex-fixture --codex-app"
+    )
+
+
+def test_turn_envelope_detail_refs_preserve_explicit_runtime_root() -> None:
+    payload = _full_decision()
+    payload["runtime_root"] = "/tmp/loopx custom runtime"
+
+    envelope = build_turn_envelope(
+        payload,
+        scheduler_execution_context=scheduler_execution_context_for_runtime_profile(
+            SchedulerRuntimeProfile.CODEX_CLI_VISIBLE
+        ),
+    )
+
+    command_prefix = "loopx --runtime-root '/tmp/loopx custom runtime'"
+    detail_ref = envelope["detail_ref"]
+    assert detail_ref["full_decision"].startswith(
+        f"{command_prefix} --format json quota should-run"
+    )
+    assert detail_ref["todo_detail"] == (
+        f"{command_prefix} --format json todo list --goal-id fixture-goal"
+    )
+    assert detail_ref["status_detail"] == (
+        f"{command_prefix} --format json status --goal-id fixture-goal"
     )
 
 
@@ -641,11 +678,11 @@ def test_turn_envelope_omits_oversized_scheduler_argv_instead_of_truncating() ->
     assert "ack_cli_args" not in codex_app
     assert codex_app["ack_cli_args_detail_ref"] == {
         "reason": "omitted_to_preserve_executable_argv",
-        "request": "loopx quota should-run --include-detail scheduler",
+        "detail_ref": "full_decision.scheduler_hint.codex_app.ack_hint.cli_args",
     }
 
 
-def test_turn_envelope_stays_actionable_during_scheduler_reset() -> None:
+def test_turn_envelope_preserves_distinct_selected_text_during_scheduler_reset() -> None:
     source = _full_decision()
     todo_text = (
         "[P1] Continue host-neutral Agent CLI orchestration with start and resume, "
@@ -737,27 +774,22 @@ def test_turn_envelope_stays_actionable_during_scheduler_reset() -> None:
     codex_app = source["scheduler_hint"]["codex_app"]
     codex_app["ack_hint"]["cli_args"] = ack_cli_args
     codex_app["failure_hint"] = {"cli_args": failure_cli_args}
-    source["protocol_action_packet"] = build_protocol_action_packet(source)
 
     envelope = build_turn_envelope(source)
     compact_app = envelope["scheduler"]["codex_app"]
 
-    assert envelope["action"]["selected_todo"]["text_ref"] == (
-        "action.recommended_action"
-    )
-    assert "text" not in envelope["action"]["selected_todo"]
+    assert envelope["action"]["selected_todo"]["text"] == source["selected_todo"]["text"]
+    assert "text_ref" not in envelope["action"]["selected_todo"]
     assert compact_app["ack_cli_args"] == ack_cli_args
     assert "failure_cli_args" not in compact_app
     assert compact_app["failure_cli_args_detail_ref"] == {
         "reason": "cold_path_until_host_update_failure",
-        "request": "loopx quota should-run --include-detail scheduler",
+        "detail_ref": "full_decision.scheduler_hint.codex_app.failure_hint.cli_args",
     }
     assert envelope["action_signature"]["matches"] is True
     assert envelope["compaction"]["within_budget"] is True
     assert envelope["compaction"]["envelope_json_bytes"] <= TURN_ENVELOPE_BUDGET_BYTES
-    assert envelope["compaction"]["envelope_json_bytes"] >= (
-        TURN_ENVELOPE_BUDGET_BYTES - 1_024
-    )
+    # Compression may create additional headroom; there is no minimum size.
 
 
 def test_turn_envelope_keeps_concrete_user_gate() -> None:
@@ -817,35 +849,194 @@ def test_action_signature_detects_semantic_drift() -> None:
     ) != turn_envelope_action_signature_document(envelope)
 
 
-def test_protocol_packet_derivation_keeps_only_real_residue() -> None:
+
+
+
+
+@pytest.mark.parametrize("path_segments", [170, 1_500])
+def test_signed_host_action_preserves_a_long_complete_command(
+    path_segments: int,
+) -> None:
     source = _full_decision()
-    source["interaction_contract"]["agent_channel"]["primary_action"] = (
-        "a newer canonical action projection"
+    command = (
+        "loopx quota should-run --registry /"
+        + "project/" * path_segments
+        + " --codex-app"
     )
+    assert len(command) > 1_200
+    source["interaction_contract"]["agent_channel"]["primary_action"] = command
 
     envelope = build_turn_envelope(source)
-    packet = envelope["contract_capsule"]["protocol_action_packet"]
 
-    assert packet["derivation_status"] == "verified_with_residue"
-    assert packet["reconstruction_verified"] is True
-    assert packet["residue"] == {"agent_action": "advance one product-path slice"}
-    assert "summary" not in packet
     assert envelope["action_signature"]["matches"] is True
+    assert envelope["action"]["primary_action"] == command
+    assert extract_turn_authority({"turn_envelope": envelope})["primary_action"] == command
+    if path_segments == 1_500:
+        assert envelope["compaction"]["within_budget"] is False
 
 
-def test_protocol_packet_derivation_retains_unverified_summary() -> None:
+def test_modern_decision_through_real_readers() -> None:
+    """The summary is an observation; the typed decision owns execution."""
     source = _full_decision()
-    source["protocol_action_packet"]["summary"] = "legacy opaque packet"
-
+    before = deepcopy(source)
+    turn = interpret_quota_should_run_packet(source)
     envelope = build_turn_envelope(source)
-    packet = envelope["contract_capsule"]["protocol_action_packet"]
+    authority = extract_turn_authority({"turn_envelope": envelope})
 
-    assert packet["derivation_status"] == "unverified_retain_summary"
-    assert packet["reconstruction_verified"] is False
-    assert packet["summary"] == "legacy opaque packet"
+    assert source == before  # Reading does not rewrite the input packet.
+    assert turn.observation.effective_action == "normal_run"
+    assert turn.observation.should_run is True
+    assert turn.interpretation.route == "advancement_task"
+    assert list(turn.next_effect.cli_actions) == [
+        "loopx refresh-state --goal-id fixture-goal --classification validated",
+        "loopx quota spend-slot --goal-id fixture-goal --execute",
+    ]
+    assert turn.observation.protocol_summary is None
+    assert authority["primary_action"] == "advance one product-path slice"
+    assert authority["write_scope"] == ["loopx/**", "tests/**"]
+    assert envelope["writeback"]["spend_allowed_now"] is False
+    assert envelope["writeback"]["spend_after_validation"] is True
+    assert envelope["execution_policy"]["safe_bypass_allowed"] is False
+    assert quota_action_signature_document(source) == turn_envelope_action_signature_document(envelope)
+    capsule = envelope["contract_capsule"]
+    assert "protocol_action_packet" not in capsule
 
 
-def test_protocol_packet_monitor_action_derives_without_residue() -> None:
+def test_ordinary_host_preserves_signed_surrounding_turn_policies() -> None:
+    from loopx.control_plane.turn_driver.host_candidate import render_prompt
+
+    source = _full_decision()
+    source.update(should_run=False, normal_delivery_allowed=False, decision='skip',
+                  effective_action='quota_skip', action_required=True, open_count=1)
+    source['execution_obligation']['must_attempt_work'] = False
+    source['work_lane_contract']['must_attempt_work'] = False
+    source['interaction_contract']['cli_channel'].update(
+        next_cli_actions=[], spend_allowed_now=False, spend_after_validation=False,
+    )
+    source['interaction_contract']['user_channel'].update(action_required=True, notify='NOTIFY')
+    source['interaction_contract']['agent_channel'].update(
+        must_attempt=False, delivery_allowed=False, quiet_noop_allowed=False,
+    )
+    source['interaction_contract']['response_plan'] = {
+        'schema_version': 'interaction_response_plan_v0',
+        'kind': 'surface_user_gate', 'decision': 'ask_user', 'action_sequence': ['notify', 'wait'],
+        'silent_wait_allowed': False,
+    }
+    source['task_orchestration_contract'] = {
+        'schema_version': 'task_orchestration_contract_v1',
+        'mode': 'task_scoped_peer', 'activation_allowed': False,
+        'writeback_owner': 'task_coordinator',
+    }
+    envelope = build_turn_envelope(source)
+    assert not envelope.get('replan_action_packet')
+    authority = extract_turn_authority({'turn_envelope': envelope})
+    prompt = render_prompt(authority)
+    delivered, _ = json.JSONDecoder().raw_decode(prompt.split('Turn authority JSON:\n', 1)[1])
+    assert delivered['user']['notify'] == 'NOTIFY'
+    assert delivered['action']['must_attempt'] is False
+    assert delivered['action']['delivery_allowed'] is False
+    assert delivered['action']['quiet_noop_allowed'] is False
+    assert delivered['should_run'] is False
+    assert delivered['effective_action'] == 'quota_skip'
+    assert delivered['execution_policy']['normal_delivery_allowed'] is False
+    assert delivered['execution_policy']['safe_bypass_allowed'] is False
+    assert delivered['task_orchestration_contract']['activation_allowed'] is False
+    assert delivered['response_plan']['silent_wait_allowed'] is False
+    for field in ('user', 'execution_policy', 'scheduler', 'response_plan', 'task_orchestration_contract'):
+        assert delivered[field] == envelope[field]
+        altered = deepcopy(envelope)
+        del altered[field]
+        with pytest.raises(ValueError, match='action signature'):
+            extract_turn_authority({'turn_envelope': altered})
+    # Carrying policy is not delegating its effects to the model. The native
+    # executor still applies settlement and scheduler operations after return.
+    assert 'do not execute state writeback, quota or scheduler commands' in prompt
+    assert 'writeback' not in authority
+
+
+@pytest.mark.parametrize("user_required", [False, True], ids=["quiet-wait", "user-gate"])
+def test_missing_protocol_packet_cannot_reopen_a_non_delivery_decision(user_required: bool) -> None:
+    source = _full_decision()
+    source.update(
+        should_run=False, normal_delivery_allowed=False,
+        effective_action="quota_skip", decision="skip",
+        action_required=user_required, open_count=int(user_required),
+    )
+    source["execution_obligation"]["must_attempt_work"] = False
+    source["work_lane_contract"]["must_attempt_work"] = False
+    interaction = source["interaction_contract"]
+    interaction["user_channel"].update(
+        action_required=user_required, notify="NOTIFY" if user_required else "DONT_NOTIFY",
+    )
+    interaction["agent_channel"].update(
+        must_attempt=False, delivery_allowed=False, quiet_noop_allowed=not user_required,
+    )
+    interaction["cli_channel"].update(
+        next_cli_actions=[], spend_allowed_now=False, spend_after_validation=False,
+    )
+    envelope = build_turn_envelope(source)
+    turn = interpret_quota_should_run_packet(source)
+    assert turn.observation.should_run is False
+    assert turn.observation.protocol_summary is None
+    assert not turn.next_effect.cli_actions
+    assert envelope["action"]["must_attempt"] is False
+    assert envelope["action"]["delivery_allowed"] is False
+    assert envelope["user"]["action_required"] is user_required
+    assert envelope["action"]["quiet_noop_allowed"] is (not user_required)
+    assert envelope["writeback"]["spend_after_validation"] is False
+    assert envelope["writeback"]["spend_allowed_now"] is False
+
+
+@pytest.mark.parametrize("corruption", ["missing", "mismatch", "forged_equal_hashes", "action", "capsule"])
+def test_modern_envelope_does_not_bypass_host_signature_check(corruption: str) -> None:
+    envelope = build_turn_envelope(_full_decision())
+    if corruption == "missing":
+        envelope.pop("action_signature")
+    elif corruption == "mismatch":
+        envelope["action_signature"]["matches"] = False
+    elif corruption == "forged_equal_hashes":
+        envelope["action_signature"].update(
+            source_hash="sha256:" + "0" * 64, envelope_hash="sha256:" + "0" * 64,
+        )
+    elif corruption == "action":
+        envelope["action"]["primary_action"] = "perform an unsigned replacement action"
+    else:
+        envelope["contract_capsule"]["work_lane_contract"]["must_attempt_work"] = False
+    with pytest.raises(ValueError, match="action signature is missing or does not match"):
+        extract_turn_authority({"turn_envelope": envelope})
+
+
+@pytest.mark.parametrize("has_packet", [False, True])
+def test_quota_presentation_preserves_collection_failure(has_packet: bool, monkeypatch) -> None:
+    from loopx.cli_commands.quota import _project_quota_cli_payload
+    from argparse import Namespace
+
+    failure: dict[str, Any] = {
+        "ok": False, "decision": "skip", "should_run": False,
+        "error_code": "quota_unexpected_collection_error",
+        "status": "quota_collection_failed",
+    }
+    if has_packet:
+        failure["protocol_action_packet"] = {
+            "schema_version": "protocol_action_packet_v0", "summary": "retired summary",
+        }
+    before = deepcopy(failure)
+    args = Namespace(quota_command="should-run", turn_envelope=True)
+
+    def unexpected_runtime(*_args, **_kwargs):
+        pytest.fail("A collection failure cannot reenter its unavailable runtime")
+
+    monkeypatch.setattr("loopx.control_plane.effect_runtime.effect_runtime_result", unexpected_runtime)
+    if has_packet:
+        from loopx.control_plane.effect_runtime import EffectRuntimeRejected
+        with pytest.raises(EffectRuntimeRejected, match="unsupported format: protocol_action_packet"):
+            _project_quota_cli_payload(failure, args, frozenset(), None)
+    else:
+        assert _project_quota_cli_payload(failure, args, frozenset(), None) == before
+    assert failure == before
+
+
+def test_monitor_quiet_action_preserves_typed_obligations() -> None:
     source = _full_decision()
     source["execution_obligation"]["must_attempt_work"] = False
     source["interaction_contract"]["mode"] = "monitor_quiet_skip"
@@ -864,18 +1055,14 @@ def test_protocol_packet_monitor_action_derives_without_residue() -> None:
             "must_attempt_work": False,
         }
     )
-    source["protocol_action_packet"] = build_protocol_action_packet(source)
 
     envelope = build_turn_envelope(source)
-    packet = envelope["contract_capsule"]["protocol_action_packet"]
-
-    assert packet["derivation_status"] == "verified"
-    assert packet["reconstruction_verified"] is True
-    assert "residue" not in packet
-    assert "summary" not in packet
+    assert "protocol_action_packet" not in envelope["contract_capsule"]
+    assert envelope["action"]["must_attempt"] is False
+    assert envelope["action"]["primary_action"] == "record at most one monitor poll, then stay quiet"
 
 
-def test_contract_capsule_stays_bounded_with_replan_and_vision_contracts() -> None:
+def test_contract_capsule_keeps_vision_obligations_under_budget_pressure() -> None:
     source = _full_decision()
     source["execution_profile"] = {
         "cadence": "bounded_progress_segment",
@@ -924,5 +1111,27 @@ def test_contract_capsule_stays_bounded_with_replan_and_vision_contracts() -> No
         envelope["contract_capsule"]["agent_scope_frontier"]["requires_replan"] is True
     )
     assert envelope["contract_capsule"]["vision_continuation_audit"]["required"] is True
-    assert envelope["compaction"]["within_budget"] is True
-    assert envelope["compaction"]["envelope_json_bytes"] < TURN_ENVELOPE_BUDGET_BYTES
+    audit = envelope["contract_capsule"]["vision_continuation_audit"]
+    assert audit["required_before_closeout"] == source["vision_continuation_audit"]["required_before_closeout"]
+    assert audit["recommended_action"] == source["vision_continuation_audit"]["recommended_action"]
+    # The existing 8 KiB limit is diagnostic. Retaining obligations must warn,
+    # rather than silently discard clauses or reinterpret this as admission.
+    assert envelope["compaction"]["within_budget"] is False
+    assert envelope["compaction"]["budget_bytes"] == TURN_ENVELOPE_BUDGET_BYTES
+    assert envelope["compaction"]["warning"]["code"] == "turn_envelope_budget_exceeded"
+    assert envelope["ok"] is True
+
+
+def test_turn_envelope_retains_configured_cadence_floor_and_host_boundary() -> None:
+    source = _full_decision()
+    app = source["scheduler_hint"]["codex_app"]
+    policy = {"min_interval_minutes": 1440, "configuration_revision": 3,
+              "enforcement": "scheduler_recommendation"}
+    guarantee = {"pre_model_atomic_admission": "not_qualified",
+                 "model_wakeup_tokens_prevented": False}
+    app["execution_interval_policy"] = policy
+    app["guarantee"] = guarantee
+    envelope = build_turn_envelope(source)
+    projected = envelope["scheduler"]["codex_app"]
+    assert projected["execution_interval_policy"] == policy
+    assert projected["guarantee"] == guarantee

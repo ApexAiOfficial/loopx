@@ -164,6 +164,10 @@ def test_module_plan() -> None:
     assert payload["mode"] == "update", payload
     assert payload["dry_run"] is True, payload
     assert payload["execute_requested"] is False, payload
+    assert payload["requested_action"] == "plan", payload
+    assert payload["changes_applied"] is False, payload
+    assert payload["next_action"]["command"].startswith("loopx update apply"), payload
+    assert payload["next_action"]["requires_explicit_approval"] is True, payload
     assert payload["current"]["requires_upgrade"] is True, payload
     assert payload["current"]["current_version"] == __version__, payload
     assert payload["current"]["current_version_tag"] == release_version_tag(), payload
@@ -179,21 +183,24 @@ def test_module_plan() -> None:
     assert payload["plan"]["backup"]["rollback_release_id"] == "20260621T170342Z", payload
     assert "loopx update --rollback 20260621T170342Z" in payload["plan"]["backup"]["rollback_command"], payload
     assert "ln -sfn" not in payload["plan"]["backup"]["rollback_command"], payload
-    assert "LOOPX_ARCHIVE_URL=https://example.invalid/loopx.tar.gz" in payload["plan"]["install_command"], payload
+    assert "--archive-url https://example.invalid/loopx.tar.gz" in payload["plan"]["install_command"], payload
     rendered = render_update_plan_markdown(payload)
+    assert "**No update was applied.**" in rendered, rendered
+    assert "## Next Action" in rendered, rendered
+    assert "loopx update apply" in rendered, rendered
     assert f"Current version tag: `{release_version_tag()}`" in rendered, rendered
     assert f"Manifest package version tag: `{release_version_tag()}`" in rendered, rendered
 
 
-def test_default_source_uses_stable_ref() -> None:
+def test_installed_stable_channel_is_inherited() -> None:
     with mock.patch.dict(os.environ, {}, clear=True):
         payload = build_update_plan(doctor_payload=fake_doctor_payload())
     assert payload["source"]["ref"] == DEFAULT_UPDATE_REF == "stable", payload
     assert payload["source"]["channel"] == "github_archive_stable", payload
-    assert payload["source"]["ref_source"] == "default_stable", payload
+    assert payload["source"]["ref_source"] == "installed_manifest", payload
     assert "/tar.gz/stable" in payload["source"]["archive_url"], payload
-    assert "LOOPX_REF=stable" in payload["plan"]["install_command"], payload
-    assert "LOOPX_ARCHIVE_URL=" not in payload["plan"]["install_command"], payload
+    assert payload["plan"]["install_command"] == "loopx update apply --repo example/loopx --ref stable", payload
+    assert "--archive-url" not in payload["plan"]["install_command"], payload
     default_env = _installer_env_for_source(
         payload["source"],
         base_env={"LOOPX_ARCHIVE_URL": "https://stale.invalid/archive.tar.gz"},
@@ -209,47 +216,19 @@ def test_explicit_archive_url_reaches_installer() -> None:
         doctor_payload=fake_doctor_payload(),
     )
     assert payload["source"]["channel"] == "github_archive_url_override", payload
-    assert "LOOPX_ARCHIVE_URL=https://example.invalid/loopx.tar.gz" in payload["plan"]["install_command"], payload
-    assert "set -o errexit -o pipefail" in payload["plan"]["install_command"], payload
-    assert "export LOOPX_REPO=example/loopx" in payload["plan"]["install_command"], payload
-    assert "export LOOPX_REF=fixture" in payload["plan"]["install_command"], payload
+    assert "--archive-url https://example.invalid/loopx.tar.gz" in payload["plan"]["install_command"], payload
+    assert "loopx update apply" in payload["plan"]["install_command"], payload
+    assert "--repo example/loopx" in payload["plan"]["install_command"], payload
+    assert "--ref fixture" in payload["plan"]["install_command"], payload
     installer_env = _installer_env_for_source(payload["source"], base_env={})
     assert installer_env["LOOPX_ARCHIVE_URL"] == "https://example.invalid/loopx.tar.gz", installer_env
 
 
-def test_update_preview_stops_before_doctor_when_download_fails() -> None:
-    payload = build_update_plan(
-        repo="example/loopx",
-        ref="fixture",
-        archive_url="https://example.invalid/loopx.tar.gz",
-        execute=False,
-        doctor_payload=fake_doctor_payload(),
-    )
-    with TemporaryDirectory() as tmpdir:
-        bin_dir = Path(tmpdir)
-        marker_path = bin_dir / "doctor-ran"
-        curl_bin = bin_dir / "curl"
-        curl_bin.write_text("#!/usr/bin/env bash\nexit 22\n", encoding="utf-8")
-        curl_bin.chmod(0o755)
-        loopx_bin = bin_dir / "loopx"
-        loopx_bin.write_text(
-            "#!/usr/bin/env bash\n"
-            f"touch {json.dumps(str(marker_path))}\n"
-            "exit 0\n",
-            encoding="utf-8",
-        )
-        loopx_bin.chmod(0o755)
-        env = dict(os.environ)
-        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
-        result = subprocess.run(
-            ["bash", "-c", payload["plan"]["install_command"]],
-            text=True,
-            capture_output=True,
-            env=env,
-        )
-
-        assert result.returncode == 22, result
-        assert not marker_path.exists(), result
+def test_update_preview_uses_managed_download_path() -> None:
+    payload = build_update_plan(doctor_payload=fake_doctor_payload())
+    command = payload["plan"]["install_command"]
+    assert command.startswith("loopx update apply"), command
+    assert "curl" not in command, command
 
 
 def test_execute_update_propagates_installer_download_failure() -> None:
@@ -283,10 +262,13 @@ def test_execute_update_propagates_installer_download_failure() -> None:
 
     assert result["ok"] is False, result
     install_command = run.call_args_list[0].args[0]
-    assert install_command[:2] == ["bash", "-lc"], install_command
-    assert "set -o pipefail" in install_command[2], install_command
+    assert install_command[0] == "curl", install_command
+    assert "--output" in install_command, install_command
     assert result["execution"]["install_returncode"] == 22, result
     assert result["execution"]["doctor_returncode"] == 0, result
+    assert result["execution"]["installer_download"]["stage"] == "installer_download", result
+    assert result["changes_applied"] is False, result
+    assert "Download attempt 1: HTTP `0`, curl `22`" in render_update_plan_markdown(result)
 
 
 def test_active_release_python_reaches_installer() -> None:
@@ -349,6 +331,7 @@ def test_execute_update_uses_persisted_release_python() -> None:
         (release_root / ".loopx-python").write_text(f"{missing_python}\n", encoding="utf-8")
         payload = build_update_plan(
             execute=True,
+            build_from_source=True,
             doctor_payload=fake_doctor_payload_for_release(release_root, home=home),
         )
         failed = subprocess.CompletedProcess(
@@ -403,6 +386,7 @@ class FakeVersionResponse:
 def test_check_compares_selected_source_version() -> None:
     with mock.patch("loopx.self_update.urlopen", return_value=FakeVersionResponse("9.9.9")) as fetch:
         payload = build_update_plan(
+            build_from_source=True,
             repo="example/loopx",
             ref="stable",
             check_only=True,
@@ -421,18 +405,21 @@ def test_check_compares_selected_source_version() -> None:
 
     with mock.patch("loopx.self_update.urlopen", return_value=FakeVersionResponse(__version__)):
         current_payload = build_update_plan(
+            build_from_source=True,
             repo="example/loopx",
             ref="stable",
             check_only=True,
             doctor_payload=fake_fresh_doctor_payload(),
         )
     assert current_payload["source_version_check"]["matches_current"] is True, current_payload
-    assert "no update needed" in current_payload["recommended_action"], current_payload
+    assert current_payload["source_commit_check"]["status"] == "not_requested", current_payload
+    assert "no update needed" not in current_payload["recommended_action"], current_payload
 
 
 def test_check_degrades_when_source_version_is_unavailable() -> None:
     with mock.patch("loopx.self_update.urlopen", side_effect=OSError("offline")):
         payload = build_update_plan(
+            build_from_source=True,
             repo="example/loopx",
             ref="stable",
             check_only=True,
@@ -443,6 +430,54 @@ def test_check_degrades_when_source_version_is_unavailable() -> None:
     assert source_check["status"] == "unavailable", payload
     assert source_check["attempted"] is True, payload
     assert "could not be checked" in payload["recommended_action"], payload
+
+
+def immutable_fresh_doctor_payload(ref: str) -> dict[str, object]:
+    payload = fake_fresh_doctor_payload()
+    freshness = payload["install_freshness"]
+    assert isinstance(freshness, dict)
+    freshness["manifest_source_ref"] = ref
+    freshness["freshness_source_label"] = f"example/loopx@{ref}"
+    freshness["freshness_source_git_commit"] = None
+    return payload
+
+
+def test_immutable_source_ref_qualifies_activation() -> None:
+    pinned = INSTALLED_COMMIT
+    with mock.patch(
+        "loopx.self_update.urlopen",
+        return_value=FakeVersionResponse(__version__),
+    ):
+        activated = build_update_plan(
+            repo="example/loopx",
+            build_from_source=True,
+            ref=pinned,
+            check_only=True,
+            doctor_payload=immutable_fresh_doctor_payload(pinned),
+        )
+    qualification = activated["runtime_activation_qualification"]
+    assert qualification["decision"] == "runtime_active", activated
+    assert qualification["runtime_active"] is True, activated
+    assert qualification["target_source_commit"] == pinned, activated
+    assert qualification["revision_relation"] == "same", activated
+    assert "no update needed" in activated["recommended_action"], activated
+
+    other = TARGET_COMMIT
+    unproven = build_update_plan(
+        repo="example/loopx",
+        build_from_source=True,
+        ref=other,
+        check_only=True,
+        doctor_payload=immutable_fresh_doctor_payload(other),
+    )
+    mismatch = unproven["runtime_activation_qualification"]
+    assert mismatch["decision"] == "activation_qualification_required", unproven
+    assert mismatch["target_source_commit"] == other, unproven
+    assert "does not match the selected immutable source commit" in mismatch["reason"], unproven
+    assert mismatch["successor"] == {
+        "required": True,
+        "kind": "activation_qualification",
+    }, unproven
 
 
 def test_rollback_previous_executes_with_temp_home() -> None:
@@ -539,7 +574,8 @@ def test_cli_rollback_previous_with_temp_home() -> None:
                 "previous",
             ],
             cwd=REPO_ROOT,
-            env={"HOME": str(home), "PATH": f"{home / '.local' / 'bin'}:{os.environ.get('PATH', '')}"},
+            env={"HOME": str(home), "PATH": f"{home / '.local' / 'bin'}:{os.environ.get('PATH', '')}",
+                 "LOOPX_USAGE_PING": "0"},
             text=True,
             capture_output=True,
         )
@@ -553,9 +589,9 @@ def test_cli_rollback_previous_with_temp_home() -> None:
 
 def main() -> int:
     test_module_plan()
-    test_default_source_uses_stable_ref()
+    test_installed_stable_channel_is_inherited()
     test_explicit_archive_url_reaches_installer()
-    test_update_preview_stops_before_doctor_when_download_fails()
+    test_update_preview_uses_managed_download_path()
     test_execute_update_propagates_installer_download_failure()
     test_active_release_python_reaches_installer()
     test_active_release_python_marker_fails_closed()
@@ -563,6 +599,7 @@ def main() -> int:
     test_fresh_check_is_noop_recommendation()
     test_check_compares_selected_source_version()
     test_check_degrades_when_source_version_is_unavailable()
+    test_immutable_source_ref_qualifies_activation()
     test_rollback_previous_executes_with_temp_home()
     test_rollback_restores_previous_when_doctor_fails()
     test_cli_check()

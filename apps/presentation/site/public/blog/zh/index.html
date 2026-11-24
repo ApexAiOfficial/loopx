@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fafafa">
+  <title>LoopX 博客 · LoopX</title>
+  <meta name="description" content="关于长程 Agent 的设计、工程与实践。">
+  <link rel="canonical" href="https://loopx-project.github.io/loopx/blog/zh/">
+  <link rel="alternate" hreflang="en" href="https://loopx-project.github.io/loopx/blog/">
+  <link rel="alternate" hreflang="zh-CN" href="https://loopx-project.github.io/loopx/blog/zh/">
+  <link rel="alternate" hreflang="x-default" href="https://loopx-project.github.io/loopx/blog/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="LoopX">
+  <meta property="og:locale" content="zh_CN">
+  <meta property="og:title" content="LoopX 博客">
+  <meta property="og:description" content="关于长程 Agent 的设计、工程与实践。">
+  <meta property="og:url" content="https://loopx-project.github.io/loopx/blog/zh/">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="../../blog/blog.css">
+  <script type="module" src="../../blog/blog-index.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">跳至正文</a>
+<header class="site-header">
+  <a class="brand" href="../../?lang=zh" aria-label="LoopX 首页"><span class="product-mark" aria-hidden="true"><i></i><i></i></span>LoopX</a>
+  <nav aria-label="主导航">
+    <a href="../../blog/zh/" aria-current="page">Blog</a>
+    <a href="../../docs/book/">文档</a>
+  </nav>
+  <div class="header-actions"><a class="language" href="../../blog/" lang="en" hreflang="en" aria-label="Read in English">EN</a><a class="github" href="https://github.com/loopx-project/loopx">GitHub <span aria-hidden="true">↗</span></a></div>
+</header>
+<main id="main" class="blog-index">
+  <div class="index-heading"><p class="eyebrow">LoopX · 博客</p><h1>长程工作的工程实践。</h1><p class="lead">关于长程 Agent 的设计、工程与实践。</p></div>
+  <nav class="reading-routes" aria-labelledby="reading-routes"><h2 id="reading-routes">按问题阅读</h2><ul><li><b>先了解 LoopX</b><span>长程工作需要保留哪些判断与责任？</span><p><a href="from-one-shot-agents-to-long-horizon-control/">核心架构</a> <span aria-hidden="true">→</span> <a href="application-scenarios/">应用场景</a></p></li><li><b>控制规则怎样修</b><span>从重试、事务、执行权与恢复的反例读起。</span><p><a href="typescript-control-plane-refactor/">TypeScript 语义重构</a></p></li><li><b>下一步读什么</b><span>用一个任务理解渐进式读取与周期差分。</span><p><a href="context-delivery/">Context delivery</a></p></li><li><b>机制是否有用</b><span>把起点、后程增量、成果保留和完整成本分开。</span><p><a href="edgebench-feedback-and-memory/">EdgeBench 研究</a> <span aria-hidden="true">→</span> <a href="five-freshness-incidents/">事故复盘</a></p></li></ul></nav>
+  <article class="post-listing">
+    <div><p class="eyebrow">Context delivery · 机制与实例</p><p class="listing-date"><time datetime="2026-11-01">2026 年 11 月 1 日</time> · <span>11 月 14 日更新</span></p></div>
+    <div><h2><a href="context-delivery/">Agent 读上下文，也需要一套“查书”的方法</a></h2><p>核对 EdgeBench 的十组记录分数，其中四组的时长接近 18 小时，其余涉及历史运行或未跑满的记录。文章也分别交代渐进视图 32.5%、ANN 周期内增量轮缩减 74.25% 和首读 3.0% / 5.0% 各自的测量基线。</p><a class="read-post" href="context-delivery/">阅读全文 <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">研究札记 · EdgeBench 与 LHTB</p><p class="listing-date"><time datetime="2026-10-16">2026 年 10 月 16 日</time></p></div>
+    <div><h2><a href="edgebench-long-horizon-repairs/">EdgeBench / LHTB：一轮历史试跑的工程复盘</a></h2><p>songoow 对历史 EdgeBench/LHTB 实验配置的探索性工程记录，包含提前中断、局部修复与待验证假设。feedback-first 开关已撤回；不代表 LoopX 官方或正式评测结论及当前版本能力。</p><a class="read-post" href="edgebench-long-horizon-repairs/">阅读全文 <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">LoopX 2.0 · 工程复盘</p><p class="listing-date"><time datetime="2026-10-16">2026 年 10 月 16 日</time></p></div>
+    <div><h2><a href="typescript-control-plane-refactor/">LoopX 2.0：两个月的 TypeScript 控制面重构</a></h2><p>从最初的渐进迁移方案，到完整事务、共享权威、语义约束和旧路径退役。记录方案怎样被真实调用与反例修正。</p><a class="read-post" href="typescript-control-plane-refactor/">阅读全文 <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">Agentic Software · 开发范式</p><p class="listing-date"><time datetime="2026-10-14">2026 年 10 月 14 日</time></p></div>
+    <div><h2><a href="semantic-software-development/">Agentic Software：从代码生成到长程自主研发</a></h2><p>以 LoopX 为例，讨论 Agentic Software 的通用基础设施：让目标、证据与人的反馈跨越会话，把探索推进为可验证的交付。</p><a class="read-post" href="semantic-software-development/">阅读全文 <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">研究札记 · EdgeBench</p><p class="listing-date"><time datetime="2026-10-05">2026 年 10 月 5 日初稿</time> · <span>11 月 3 日修订</span></p></div>
+    <div><h2><a href="edgebench-feedback-and-memory/">让 Agent 多做十小时，究竟多做出了什么？</a></h2><p>从可信反馈到长程研究：区分 Stride 动作选择与分数转移，明确未对账结果、25 次复盘与 17 个有分数转移，并保留 Yardstick 反例。</p><a class="read-post" href="edgebench-feedback-and-memory/">阅读全文 <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">设计观点 · 系统级自迭代</p><p class="listing-date"><time datetime="2026-10-02">2026 年 10 月 2 日</time></p></div>
+    <div><h2><a href="long-horizon-rsi/">通用长程能力，是 RSI 的先决条件</a></h2><p>从早期 Meta Goal、通用长程系统到 Personal Workspace：四个月的自举历史与 6,848 个非合并提交，说明改进如何进入下一轮工作。</p><a class="read-post" href="long-horizon-rsi/">阅读全文 <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">事故复盘 · 实践记录</p><p class="listing-date"><time datetime="2026-09-26">2026 年 9 月 26 日</time></p></div>
+    <div><h2><a href="five-freshness-incidents/">47 天 5 次新鲜度事故：一次 LoopX 事故复盘</a></h2><p>我们自己的顾问 Agent 5 次基于过期、残缺或没读到的信源作答，而健康信号全是绿的。哪里坏了，为什么逐个修补不够，以及让缺口可见的合同。</p><a class="read-post" href="five-freshness-incidents/">阅读全文 <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">场景 · 实践与研究</p><p class="listing-date"><time datetime="2026-09-18">2026 年 9 月 18 日</time></p></div>
+    <div><h2><a href="application-scenarios/">LoopX 用在哪里：复杂任务、开放探索与持续交付</a></h2><p>沿三个工作场景理解目标、证据与交付责任，并列解读 SWE-Marathon、DeepSWE × Sol 与 V4 Flash max 的研究信号。</p><a class="read-post" href="application-scenarios/">阅读全文 <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">Agent-native Kanban · 长程协作</p><p class="listing-date"><time datetime="2026-09-15">2026 年 9 月 15 日</time></p></div>
+    <div><h2><a href="agent-facing-kanban/">LoopX：长程 Agent 的原生 Kanban</a></h2><p>用四张图理解 Goal、Todo、认领、租约、门禁、证据与共享权威状态，再看它们如何支持长程协作。</p><a class="read-post" href="agent-facing-kanban/">阅读全文 <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <article class="post-listing">
+    <div><p class="eyebrow">架构 · 设计笔记</p><p class="listing-date"><time datetime="2026-09">2026 年 9 月</time></p></div>
+    <div><h2><a href="from-one-shot-agents-to-long-horizon-control/">从一次性 Agent 到长程控制面</a></h2><p>LoopX 如何用目标、状态内核与 Effect Program，让工作跨越会话、吸收人类判断，并从中断中恢复。</p><a class="read-post" href="from-one-shot-agents-to-long-horizon-control/">阅读全文 <span aria-hidden="true">↗</span></a></div>
+  </article>
+  <section class="prose" aria-labelledby="community-reading">
+    <h2 id="community-reading">社区阅读</h2>
+    <h3><a href="https://blog.csdn.net/xiaofeng10330111/article/details/163927600">从上下文窗口到控制平面：长周期 AI Agent 如何实现可持续、可治理与可恢复运行</a></h3>
+    <p>作者：<strong>张彦峰ZYF</strong> · CSDN 中文原创 · CC BY-SA 4.0。</p>
+    <p>从目标、证据、人类决策与恢复机制理解长周期 Agent 的社区解读。文中的有界验证转移（BVT）及指标属于作者提出的设计建议；LoopX 当前行为请结合<a href="../../docs/book/">开发者手册</a>与实现证据核对。</p>
+    <p>原文的参考资料包括 <a href="https://dev.to/arshtechpro/loopx-a-control-plane-for-ai-agents-that-have-to-keep-working-for-days-47n">ArshTechPro 对 LoopX 的介绍</a>。此处保留原作者的完整正文入口。</p>
+    <a class="read-post" href="https://blog.csdn.net/xiaofeng10330111/article/details/163927600">到 CSDN 阅读原文 <span aria-hidden="true">↗</span></a>
+  </section>
+  <div class="index-note"><span>开始使用 LoopX</span><a href="../../docs/book/">打开开发者手册 →</a></div>
+</main>
+<footer class="site-footer"><a class="brand" href="../../?lang=zh">LoopX</a><p>让工作持续推进，让判断由人掌握。</p><a href="../../blog/zh/">全部文章 ↑</a></footer>
+</body>
+</html>

@@ -54,10 +54,10 @@ state machine.
 
 ## MVP Surface
 
-Add an explicit Agent Management section to the ops/dashboard surface after the
-projection exists. It can live inside the existing `/frontstage?mode=ops`
-workspace or the main dashboard home; the first implementation should choose
-the route with the least duplication of status loading and URL filters.
+Add an explicit Agent Management section to Personal Workspace after the
+projection exists. The deprecated `/deprecated/frontstage/ops` route may keep
+rendering the old projection for diagnostics, but must not receive the product
+implementation.
 
 The first screen should answer five questions:
 
@@ -230,6 +230,13 @@ real agent ids, todo ids, states, and timestamps where safe, redacts private
 local text, and does not invent workspace or handoff fields when the live
 projection does not have them. The synthetic smoke still covers workspace,
 handoff, and stale-claim rendering as a contract fixture.
+
+Todo rows that exist only in the rollout event log have no task text, so the
+index titles them by `todo_id` with
+`title_source: "event_audit"` and keeps the rollout audit sentence in
+`latest_event_summary`. An audit line is never rendered as a task title; rows
+that also exist in the attention queue keep their queue text and have no
+`title_source`.
 
 ## Next Slice
 

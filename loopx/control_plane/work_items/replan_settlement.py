@@ -6,32 +6,45 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from ..coordination.coordination_state_contract_generated import (
+    REPLAN_SETTLEMENT_LIFECYCLE_REENTRY_REQUEST_SCHEMA,
+    REPLAN_SETTLEMENT_LIFECYCLE_REENTRY_RESULT_SCHEMA,
+    REPLAN_SETTLEMENT_REQUEST_SCHEMA as GENERATED_REPLAN_SETTLEMENT_REQUEST_SCHEMA,
+    REPLAN_SETTLEMENT_RESULT_SCHEMA,
+)
 
-REPLAN_SETTLEMENT_REQUEST_SCHEMA = "loopx_replan_settlement_request_v0"
-REPLAN_SETTLEMENT_CONTRACT_SCHEMA = "replan_settlement_contract_v0"
-TODO_LIFECYCLE_REENTRY_REQUEST_SCHEMA = "loopx_todo_lifecycle_reentry_request_v0"
-TODO_LIFECYCLE_REENTRY_SCHEMA = "todo_lifecycle_settlement_reentry_v0"
+REPLAN_SETTLEMENT_REQUEST_SCHEMA = GENERATED_REPLAN_SETTLEMENT_REQUEST_SCHEMA
+REPLAN_SETTLEMENT_CONTRACT_SCHEMA = REPLAN_SETTLEMENT_RESULT_SCHEMA
+TODO_LIFECYCLE_REENTRY_REQUEST_SCHEMA = REPLAN_SETTLEMENT_LIFECYCLE_REENTRY_REQUEST_SCHEMA
+TODO_LIFECYCLE_REENTRY_SCHEMA = REPLAN_SETTLEMENT_LIFECYCLE_REENTRY_RESULT_SCHEMA
 
 
 def project_todo_lifecycle_settlement_reentry(
     *,
     goal_id: str,
+    runtime_root: str | None = None,
     triggers: list[dict[str, Any]],
     lifecycle_actor_args: list[str],
     quota_scoped_args: list[str],
+    quota_guard_argv: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return TS-owned exact actions for a terminal Todo succession gap."""
 
     try:
+        request = {
+            "schema_version": TODO_LIFECYCLE_REENTRY_REQUEST_SCHEMA,
+            "goal_id": goal_id,
+            "triggers": triggers,
+            "lifecycle_actor_args": lifecycle_actor_args,
+            "quota_scoped_args": quota_scoped_args,
+        }
+        if runtime_root is not None:
+            request["runtime_root"] = runtime_root
+        if quota_guard_argv is not None:
+            request["quota_guard_argv"] = quota_guard_argv
         result = effect_runtime_result(
             "work_item.replan_settlement.reentry",
-            {
-                "schema_version": TODO_LIFECYCLE_REENTRY_REQUEST_SCHEMA,
-                "goal_id": goal_id,
-                "triggers": triggers,
-                "lifecycle_actor_args": lifecycle_actor_args,
-                "quota_scoped_args": quota_scoped_args,
-            },
+            request,
         )
     except EffectRuntimeRejected as exc:
         raise ValueError(str(exc)) from None

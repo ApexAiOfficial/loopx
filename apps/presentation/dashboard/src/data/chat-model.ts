@@ -1,3 +1,8 @@
+import type { GoalDraft } from "../../../../../loopx/control_plane/collaboration/goal_draft.js";
+export type LoopXModeSettings = { agent_id: string; token_budget: number };
+/** A host-granted workspace an ordinary conversation may be scoped to. */
+export type ChatProject = { project_ref: string; title: string; grant: "workspace_read" | "workspace_write"; goal_workspace_ref?: string };
+
 export type ChatTodo = {
   todo_id: string | null;
   role: string | null;
@@ -46,6 +51,23 @@ export type ChatCapabilities = {
   approval_policy: string;
   todo_write: string;
   goal_id: string | null;
+  manager?: {
+    scope: "owner_global";
+    model: string;
+    reasoning_effort: string;
+    runtime: {
+      schema_version: "manager_runtime_effective_profile_v0";
+      runtime_profile: "restricted" | "trusted_owner";
+      source: string;
+      configuration_revision: string;
+      standing_grant: string;
+      sandbox: string;
+      approval_policy: string;
+      tool_classes: string[];
+      status: string;
+      repair?: string;
+    };
+  };
   streaming?: boolean;
   resume?: boolean;
   interrupt?: boolean;
@@ -60,12 +82,35 @@ export type ChatCapabilities = {
   }>;
 };
 
+export type CollaborationReadback = {
+  schema_version: "collaboration_request_readback_v0";
+  request_id: string;
+  agent_id: string;
+  goal_id?: string;
+  decision_reason?: string;
+  request_revision?: number;
+  control_route?: import("./request-control").RequestControlRoute;
+  request_control?: import("./request-control").RequestControlView | null;
+  brief: {
+    purpose: string;
+    context: string;
+    constraints: string[];
+    inputs: { ref: string; description: string; sha256?: string }[];
+    acceptance: string[];
+    return_requirement: string;
+  };
+  read_status: string;
+  decision: string;
+  returns: { phase: string; status: string; error?: string | null; request_revision?: number | null }[];
+};
+
 export type ChatRouteCandidate = {
   agentId: string;
   available: boolean;
 };
 
-export function selectAvailableChatAgent<T extends ChatRouteCandidate>(
+/** Prefer an executable route; keep an unavailable candidate for diagnosis when none can run. */
+export function selectChatAgent<T extends ChatRouteCandidate>(
   options: T[],
   preferredAgentId: string | undefined,
   defaultAgentId: string,
@@ -74,24 +119,55 @@ export function selectAvailableChatAgent<T extends ChatRouteCandidate>(
     option.agentId === preferredAgentId && option.available
   ) ?? options.find((option) =>
     option.agentId === defaultAgentId && option.available
-  ) ?? options.find((option) => option.available);
+  ) ?? options.find((option) => option.available)
+    ?? options.find((option) => option.agentId === preferredAgentId)
+    ?? options.find((option) => option.agentId === defaultAgentId)
+    ?? options[0];
   if (!selected) {
-    throw new Error("Chat requires at least one available route");
+    throw new Error("Chat requires at least one route");
   }
   return selected;
 }
 
 export type TodoProposal = {
   kind: "todo";
+  goal_id?: string;
   text: string;
   priority: "P0" | "P1" | "P2";
   rationale: string;
 };
 
+/**
+ * An admitted steward team plan that rode in a Turn response.
+ *
+ * It is not a Todo and it is not a confirmation: the host validated the plan
+ * before it surfaced it, and the surface that confirms it is the typed
+ * `team.plan` action the manager channel stores as a card. Reading it here only
+ * keeps the answer intact, so a manager Turn that carries a preview still
+ * reaches the owner instead of failing the response schema.
+ */
+export type TeamPlanPreviewProposal = {
+  kind: "steward_team_plan_preview";
+  preview: Record<string, unknown>;
+};
+
+export type AgentProposal = TodoProposal | TeamPlanPreviewProposal;
+
+export function isTodoProposal(proposal: AgentProposal): proposal is TodoProposal {
+  return proposal.kind === "todo";
+}
+
+export function isTeamPlanPreviewProposal(
+  proposal: AgentProposal,
+): proposal is TeamPlanPreviewProposal {
+  return proposal.kind === "steward_team_plan_preview";
+}
+
 export type AgentResponse = {
+  goal_draft?: GoalDraft | null;
   schema_version: "loopx_chat_agent_response_v0";
   message: string;
-  proposals: TodoProposal[];
+  proposals: AgentProposal[];
   gate: {
     kind: string;
     summary: string;

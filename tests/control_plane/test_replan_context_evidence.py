@@ -1,0 +1,469 @@
+from __future__ import annotations
+
+import json
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from loopx.control_plane.runtime.agent_evidence_history import goal_history_runs
+from loopx.control_plane.work_items.replan_context_codec import project_replan_context, replan_history_from_status
+
+
+def _run(**changes):
+    return {
+        "goal_id": "evidence-goal", "agent_id": "agent-a",
+        "generated_at": "2026-08-18T01:00:00Z",
+        "classification": "bounded_probe",
+        "health_check": "Negative result changes the next probe.",
+        **changes,
+    }
+
+
+def test_history_contract_errors_are_not_empty_results():
+    assert goal_history_runs({"goals": []}, "evidence-goal") == []
+    assert goal_history_runs({"goals": [{"id": "evidence-goal", "latest_runs": []}]}, "evidence-goal") == []
+    for bad in [{}, {"ok": False, "goals": []}, {"goals": None},
+                {"goals": [{"id": "evidence-goal"}]}, {"runs": [None]}]:
+        with pytest.raises(ValueError):
+            goal_history_runs(bad, "evidence-goal")
+    for status in [{}, {"run_history": None}, {"run_history": {"goals": [{"id": "evidence-goal"}]}}]:
+        with pytest.raises(ValueError):
+            replan_history_from_status(status, "evidence-goal")
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_replan_keeps_open_outcome_requirements_and_their_evidence(configured):
+    declaration = {"schema_version": "loopx_goal_outcomes_v0", "revision": 2,
+        "current_lifetime": True, "execution_authority_granted": False,
+        "goal_completion_assessed": False, "acceptance_gaps": [], "outcomes": [{
+            "id": "artifact", "owner_agent_id": "agent-a", "objective": "Deliver a correct artifact",
+            "todo_ids": ["todo-a"], "work": [{"todo_id": "todo-a", "status": "open"}],
+            "requirements": [{"id": "correct", "description": "Preserve the required behavior",
+                "status": "unverified", "planning_satisfied": False,
+                "agent_review": {"conclusion": "unmet", "basis_current": True,
+                    "independently_verified": False, "evidence_refs": ["probe:negative"],
+                    "note": "The diagnostic exposed a remaining mismatch"}}]}]}
+    acceptance = {"outcome_requirements": declaration}
+    if configured:
+        acceptance.update(outcome_id="artifact", objective="Deliver a correct artifact",
+            criteria=[{"id": "correct", "description": "Preserve the required behavior"}],
+            revision=1, digest="a" * 64, status="failed",
+            tasks=[{"todo_id": "todo-a", "state": "ready", "criterion_ids": ["correct"]}],
+            verification={"contract_revision": 1, "contract_digest": "a" * 64, "todo_id": None,
+                "results": [{"criterion_id": "correct", "passed": False, "exit_code": 1}]})
+    context = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=(),
+        goal_acceptance_contract=acceptance)
+    assert context["core_goal"]["acceptance_contract"] == acceptance
+    assert context["core_goal"]["objective_missing"], "a supporting outcome cannot replace root intent"
+    changed = json.loads(json.dumps(acceptance))
+    changed["outcome_requirements"]["outcomes"][0]["requirements"][0]["agent_review"]["evidence_refs"] = ["probe:new"]
+    next_context = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=(),
+        goal_acceptance_contract=changed)
+    assert next_context["context_id"] != context["context_id"], "changed outcome evidence belongs to the decision basis"
+
+
+def test_empty_acceptance_stays_absent_and_configured_evidence_survives_without_outcomes():
+    from loopx.control_plane.work_items.replan_context_codec import goal_context_facts
+
+    assert goal_context_facts(None, "evidence-goal", {}) == {}
+    assert goal_context_facts(None, "evidence-goal", {"enabled": False, "criteria": []}) == {}
+    checks = {"objective": "Check one task", "criteria": [], "scope": {"kind": "all_advancement"},
+        "status": "unverified", "tasks": [], "verification": None}
+    assert goal_context_facts(None, "evidence-goal", checks) == {"acceptance_contract": checks}
+
+
+def test_projection_rejects_invalid_typed_records_and_preserves_scoped_prose():
+    for invalid in [None, {}, {"schema_version": "future"}]:
+        with pytest.raises(ValueError):
+            project_replan_context(goal_id="evidence-goal", agent_id="agent-a",
+                                   runs=[_run(progress_observation=invalid)])
+    context = project_replan_context(
+        goal_id="evidence-goal", agent_id="agent-a",
+        runs=[_run(health_check="access_key=private-value"),
+              _run(agent_id="agent-b", health_check="other Agent detail")],
+    )
+    assert len(context["evidence"]) == 1
+    assert "access_key=private-value" in context["evidence"][0]["summary"]
+    assert "other Agent detail" not in json.dumps(context)
+
+
+@pytest.mark.parametrize("source", ["active_state", "registry"])
+@pytest.mark.parametrize("objective", [
+    "Read /home/runner/work/task.md and meet its acceptance criteria.",
+    "Optimize the accepted result. Write test inputs to /tmp/task-seeds.txt.",
+])
+def test_goal_and_evidence_paths_survive_scoped_replan(
+    tmp_path: Path, source: str, objective: str,
+) -> None:
+    project, runtime = tmp_path / "project", tmp_path / "runtime"
+    project.mkdir()
+    state = project / "ACTIVE_GOAL_STATE.md"
+    state.write_text(f"# Goal\n\n## Objective\n{objective}\n")
+    goal = {"id": "evidence-goal", "repo": str(project),
+            "status": "active-read-only", "domain": "fixture", "objective": objective}
+    if source == "active_state":
+        goal.update(state_file=state.name, objective="Older registered objective")
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"common_runtime_root": str(runtime), "goals": [goal]}))
+    index = runtime / "goals/evidence-goal/runs/index.jsonl"
+    index.parent.mkdir(parents=True)
+    index.write_text(json.dumps(_run(health_check="Read /home/runner/private/result.json",
+                                    recommended_action="access_key=synthetic-secret")) + "\n")
+
+    context = project_replan_context(
+        goal_id="evidence-goal", agent_id="agent-a", runs=(),
+        source_status={"registry": str(registry), "runtime_root": str(runtime),
+                       "run_history": {"runs": []}},
+    )
+    assert context["core_goal"]["objective"] == objective
+    assert context["core_goal"]["objective_source"] == source
+    assert context["core_goal"]["objective_missing"] is False
+    evidence = json.dumps(context["evidence"])
+    assert "/home/runner/private/result.json" in evidence
+    assert "synthetic-secret" in evidence
+    from loopx.control_plane.runtime.public_safety import public_safe_compact_text
+    assert public_safe_compact_text(objective) is None
+    assert public_safe_compact_text("access_key=synthetic-secret") is None
+
+
+def test_scoped_goal_keeps_original_text_without_public_filtering(tmp_path: Path) -> None:
+    from loopx.control_plane.work_items.replan_context_codec import goal_context_facts
+
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"goals": [{"id": "evidence-goal",
+        "objective": "Inspect access_key=synthetic-secret before continuing."}]}))
+    facts = goal_context_facts({"registry": str(registry)}, "evidence-goal", None)
+    assert facts["registry_objective"] == "Inspect access_key=synthetic-secret before continuing."
+
+
+def test_scoped_evidence_preserves_complete_multiline_source_and_readback() -> None:
+    observation = ("Read /home/runner/work/results.json.\n" + "observed detail " * 80
+                   + "\nTail constraint: preserve the original acceptance threshold.")
+    action = "Use access_key=synthetic-secret only in the authorized local fixture."
+    runs = [_run(health_check=observation, recommended_action=action)]
+    context = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=runs)
+    evidence = context["evidence"][0]
+    assert observation in evidence["summary"]
+    assert action in evidence["summary"]
+    readback = project_replan_context(goal_id="evidence-goal", agent_id="agent-a",
+                                      runs=runs, evidence_ref=evidence["evidence_ref"])
+    assert readback["evidence"]["health_check"] == observation
+    assert readback["evidence"]["recommended_action"] == action
+
+
+def test_real_history_reads_the_projected_reference_and_rejects_stale_scope(tmp_path: Path):
+    runtime = tmp_path / "runtime"
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({
+        "schema_version": 1, "common_runtime_root": str(runtime),
+        "goals": [{"id": "evidence-goal", "status": "active-read-only", "domain": "fixture"}],
+    }))
+    index = runtime / "goals/evidence-goal/runs/index.jsonl"
+    index.parent.mkdir(parents=True)
+    index.write_text(json.dumps(_run()) + "\n")
+    context = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=(),
+                                    source_status={"registry": str(registry), "runtime_root": str(runtime),
+                                                   "run_history": {"goals": []}})
+    evidence = context["evidence"][0]
+    prefix = [sys.executable, "-m", "loopx.cli", "--registry", str(registry), "--format", "json"]
+    args = shlex.split(evidence["read_action"])[1:]
+    assert "--registry" in args and "--runtime-root" in args
+    result = subprocess.run([*prefix, *args], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["evidence"]["health_check"] == _run()["health_check"]
+    for agent in ("agent-b", "missing-agent"):
+        rejected = subprocess.run([*prefix, *[agent if arg == "agent-a" else arg for arg in args]],
+                                  capture_output=True, text=True, check=False)
+        assert rejected.returncode == 1
+        assert "unavailable" in json.loads(rejected.stdout)["error"]
+    index.write_text("")
+    stale = subprocess.run([*prefix, *args], capture_output=True, text=True, check=False)
+    assert stale.returncode == 1
+    assert "unavailable" in json.loads(stale.stdout)["error"]
+    removed = subprocess.run([*prefix, "evidence-log"], capture_output=True, text=True, check=False)
+    assert removed.returncode == 2
+    assert "invalid choice" in removed.stderr
+    assert not (runtime / "goals/evidence-goal/rollout-event-log.jsonl").exists()
+
+
+def test_old_evidence_survives_display_limit_and_core_goal_uses_registered_state(tmp_path: Path):
+    runtime, project = tmp_path / "runtime", tmp_path / "project"
+    project.mkdir()
+    (project / "ACTIVE_GOAL_STATE.md").write_text("# Goal\n\n## Objective\n> Deliver the accepted outcome across the whole workload.\n\n## Agent Todo\n- Run another probe.\n")
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"common_runtime_root": str(runtime), "goals": [{
+        "id": "evidence-goal", "repo": str(project), "state_file": "ACTIVE_GOAL_STATE.md",
+        "objective": "Original registered objective", "status": "active-read-only", "domain": "fixture",
+    }]}))
+    index = runtime / "goals/evidence-goal/runs/index.jsonl"
+    index.parent.mkdir(parents=True)
+    old = _run(progress_observation={"schema_version": "typed_progress_observation_v0",
+        "result_class": "advanced", "work_item_id": "old-work", "evidence_ids": ["old-best"]})
+    newer = [_run(generated_at=f"2026-08-19T01:{i//60:02}:{i%60:02}Z", progress_observation={
+        "schema_version": "typed_progress_observation_v0", "result_class": "unchanged",
+        "work_item_id": "new-work", "evidence_ids": ["repeat-proof"]}) for i in range(180)]
+    index.write_text("".join(json.dumps(row) + "\n" for row in [old, *newer]))
+    context = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=(),
+        source_status={"registry": str(registry), "runtime_root": str(runtime), "run_history": {
+            "goals": [{"id": "evidence-goal", "latest_runs": newer[-3:]}]}},
+        goal_acceptance_contract={"criteria": [], "scope": {"kind": "selected_work", "todo_ids": ["new-work"]},
+                                  "objective": "Validate only the new route"})
+    assert context["from_full_index"] is True
+    assert context["evidence_count"] == 181
+    assert len(context["evidence"]) == 2
+    assert context["core_goal"]["objective"] == "Deliver the accepted outcome across the whole workload."
+    assert context["core_goal"]["acceptance_contract"]["scope"]["kind"] == "selected_work"
+    command = context["evidence_read_action_template"].replace(
+        "{evidence_ref}", context["evidence"][-1]["evidence_ref"])
+    result = subprocess.run([sys.executable, "-m", "loopx.cli", *shlex.split(command)[1:]], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["evidence"]["progress_observation"]["evidence_ids"] == ["old-best"]
+
+
+@pytest.mark.parametrize("peer_count", [0, 1, 3])
+def test_generated_omitted_read_recovers_full_agent_history_before_limit(tmp_path, peer_count):
+    runtime, registry = tmp_path / "runtime", tmp_path / "registry.json"
+    registry.write_text(json.dumps({"common_runtime_root": str(runtime), "goals": [{
+        "id": "evidence-goal", "status": "active-read-only", "domain": "fixture",
+    }]}))
+    index = runtime / "goals/evidence-goal/runs/index.jsonl"
+    index.parent.mkdir(parents=True)
+    start = datetime(2026, 8, 18, tzinfo=timezone.utc)
+    own = []
+    for i in range(221):
+        own.append(_run(generated_at=(start + timedelta(seconds=i)).isoformat(),
+            progress_observation={"schema_version": "typed_progress_observation_v0",
+                "result_class": "advanced" if i == 0 else "unchanged",
+                "surface_id": f"route-{i}" if i < 41 else "repeated-route",
+                "evidence_ids": ["public-proof"]}))
+    peers = [_run(agent_id=f"peer-{peer}",
+        generated_at=(start + timedelta(days=peer + 1, seconds=i)).isoformat())
+        for peer in range(peer_count) for i in range(240)]
+    # Index presentation order is irrelevant; chronology and attribution own the read.
+    before = "".join(json.dumps(row) + "\n" for row in [*reversed(peers), *own]).encode()
+    index.write_bytes(before)
+    context = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=(),
+        source_status={"registry": str(registry), "runtime_root": str(runtime),
+                       "run_history": {"goals": []}})
+    assert context["evidence_count"] == 221
+    assert context["omitted_evidence"]["distinct_observation_count"] == 18
+    args = shlex.split(context["omitted_evidence"]["read_action"])[1:]
+    prefix = [sys.executable, "-m", "loopx.cli"]
+    result = subprocess.run([*prefix, *args], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    goal = payload["goals"][0]
+    expected = {row["progress_observation"]["surface_id"] for row in own}
+    for rows in (payload["runs"], goal["latest_runs"]):
+        assert len(rows) == 221
+        assert all(row["agent_id"] == "agent-a" for row in rows)
+        assert {row["progress_observation"]["surface_id"] for row in rows} == expected
+    assert goal["latest_status_run"]["agent_id"] == "agent-a"
+    short_args = ["10" if arg == "221" else arg for arg in args]
+    short = subprocess.run([*prefix, *short_args], capture_output=True, text=True)
+    assert short.returncode == 0, short.stdout + short.stderr
+    short_payload = json.loads(short.stdout)
+    assert len(short_payload["runs"]) == len(short_payload["goals"][0]["latest_runs"]) == 10
+    assert short_payload["goals"][0]["latest_status_run"]["agent_id"] == "agent-a"
+    assert index.read_bytes() == before
+    assert not (runtime / "goals/evidence-goal/rollout-event-log.jsonl").exists()
+
+
+@pytest.mark.parametrize("count", [40, 12000])
+def test_truncated_display_cannot_make_an_old_blocker_new(count):
+    from datetime import datetime, timedelta, timezone
+    from loopx.control_plane.work_items.progress_observation import semantic_delta_from_writeback
+
+    start = datetime(2026, 8, 19, 1, tzinfo=timezone.utc)
+    rows = [_run(generated_at=(start + timedelta(seconds=i)).isoformat(), progress_observation={
+        "schema_version": "typed_progress_observation_v0", "result_class": "blocked",
+        "blocker_id": f"blocker-{i}", "evidence_ids": [f"proof-{i}"],
+    }) for i in range(count)]
+    obligation = {"obligation_id": "replan-aaaaaaaaaaaaaaaa", "triggers": [{"kind": "typed_progress_repeat"}],
+                  "progress_baseline": rows[-1]["progress_observation"]}
+    obligation["replan_context"] = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=rows, obligation=obligation)
+    assert obligation["replan_context"]["coverage_truncated"] is True
+    assert not any(row.get("blocker_id") == "blocker-0" for row in obligation["replan_context"]["coverage_ledger"])
+    from loopx.control_plane.work_items.progress_observation import build_replan_action_packet
+
+    packet = build_replan_action_packet(obligation, goal_id="evidence-goal", agent_id="agent-a")
+    stop_vision = {
+        "vision_patch": {"acceptance_summary": "Stop repeating already-recorded blockers."},
+        "path_delta": {"outcome": "stop", "evidence_refs": ["proof-0"]},
+        "stride_decision": packet["stride_control"]["minimal_example"],
+    }
+    with pytest.raises(ValueError, match="complete evidence history"):
+        semantic_delta_from_writeback(
+            obligation=obligation, progress_observation=rows[0]["progress_observation"],
+            agent_vision=stop_vision,
+        )
+    result = semantic_delta_from_writeback(
+        obligation=obligation, progress_observation=rows[0]["progress_observation"],
+        agent_vision=stop_vision, history_runs=rows,
+    )
+    assert result["accepted"] is False
+    assert result["reason_code"] == "progress_observation_replayed"
+
+
+def test_dense_context_uses_shared_private_snapshot_transport(monkeypatch):
+    from loopx.control_plane.work_items import replan_history_codec
+
+    expected = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=[_run()])
+    monkeypatch.setattr(replan_history_codec, "MAX_REQUEST_BYTES", 1)
+    assert project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=[_run()]) == expected
+
+
+def _settled_pair(*, goal_id="evidence-goal", agent_id="agent-a", todo_id="todo-a", turn_instance_id="turn-a"):
+    effect_id = f"{goal_id}:{agent_id}:{todo_id}:{turn_instance_id}"
+    identity = {"schema_version": "quota_settlement_identity_v0", "goal_id": goal_id,
+        "agent_id": agent_id, "todo_id": todo_id, "turn_instance_id": turn_instance_id, "effect_id": effect_id}
+    work = _run(goal_id=goal_id, agent_id=agent_id, todo_id=todo_id, turn_instance_id=turn_instance_id,
+        settlement_identity=identity, recommended_action="Retain the negative finding and try the next route.",
+        progress_observation={"schema_version": "typed_progress_observation_v0",
+            "result_class": "unchanged", "surface_id": "surface-a", "work_item_id": todo_id})
+    accounting = {key: value for key, value in work.items() if key != "progress_observation"}
+    accounting.update(classification="quota_slot_spent", generated_at="2026-08-18T01:00:01Z",
+        quota_spend_commit={"schema_version": "quota_spend_commit_receipt_v0",
+            "effect_id": f"{effect_id}#quota_spend"})
+    return work, accounting
+
+
+def test_matched_accounting_keeps_new_health_and_all_published_references(tmp_path):
+    work, accounting = _settled_pair()
+    # Obtain references through the original codec shape. Identity facts must not
+    # alter a published row's digest, even after the display can reduce repetition.
+    legacy = [{key: value for key, value in row.items()
+        if key not in ("settlement_identity", "quota_spend_commit", "turn_instance_id")}
+        for row in (work, accounting)]
+    old = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=legacy)
+    reduced = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=[work, accounting])
+    assert len(reduced["evidence"]) == 1
+    assert reduced["coverage_ledger"] == old["coverage_ledger"]
+    assert reduced["evidence_count"] == old["evidence_count"] == 2
+    # Different health is independent evidence, including failures: retain its
+    # complete summary while removing only the already shown continuation.
+    warning = {**accounting, "health_check": "The storage validation failed; repair before continuing."}
+    retained = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=[work, warning])
+    assert len(retained["evidence"]) == 2
+    assert retained["evidence"][0]["summary"] == warning["health_check"]
+    assert retained["evidence"][1]["summary"].endswith(work["recommended_action"])
+    runtime, registry = tmp_path / "runtime", tmp_path / "registry.json"
+    registry.write_text(json.dumps({"common_runtime_root": str(runtime), "goals": [{
+        "id": "evidence-goal", "status": "active-read-only", "domain": "fixture"}]}))
+    index = runtime / "goals/evidence-goal/runs/index.jsonl"
+    index.parent.mkdir(parents=True)
+    source = "".join(json.dumps(row) + "\n" for row in (work, accounting))
+    index.write_text(source)
+    for row in old["evidence"]:
+        result = subprocess.run([sys.executable, "-m", "loopx.cli", "--registry", str(registry),
+            "--runtime-root", str(runtime), "--format", "json", "history", "--goal-id", "evidence-goal",
+            "--agent-id", "agent-a", "--evidence-ref", row["evidence_ref"]], capture_output=True, text=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout)["evidence"]["recommended_action"] == work["recommended_action"]
+    assert index.read_text() == source
+
+
+@pytest.mark.parametrize("change", [
+    {"settlement_identity": None}, {"quota_spend_commit": None}, {"turn_instance_id": "turn-b"},
+    {"quota_spend_commit": {"schema_version": "future", "effect_id": "evidence-goal:agent-a:todo-a:turn-a#quota_spend"}},
+    {"quota_spend_commit": {"schema_version": "quota_spend_commit_receipt_v0", "effect_id": "other#quota_spend"}},
+    {"classification": "future_accounting"}, {"recommended_action": "Keep an additional obligation."},
+    {"delivery_outcome": "outcome_failure"},
+])
+def test_unproven_or_different_accounting_preserves_full_context(change):
+    work, accounting = _settled_pair()
+    accounting.update(change)
+    with_identity = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=[work, accounting])
+    legacy = [{key: value for key, value in row.items()
+        if key not in ("settlement_identity", "quota_spend_commit", "turn_instance_id")}
+        for row in (work, accounting)]
+    assert with_identity == project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=legacy)
+
+
+def test_complete_continuation_text_distinguishes_tails_and_snapshot_parity(monkeypatch):
+    from loopx.control_plane.work_items import replan_history_codec
+    work, accounting = _settled_pair()
+    work["recommended_action"] = "Retain the accepted requirement. " * 20 + " Tail A."
+    accounting["recommended_action"] = work["recommended_action"][:-2] + "B."
+    context = project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=[work, accounting])
+    assert len(context["evidence"]) == 2
+    summaries = [row["summary"] for row in context["evidence"]]
+    assert summaries[0] != summaries[1]
+    assert any(summary.endswith("Tail A.") for summary in summaries)
+    assert any(summary.endswith("Tail B.") for summary in summaries)
+    monkeypatch.setattr(replan_history_codec, "MAX_REQUEST_BYTES", 1)
+    assert project_replan_context(goal_id="evidence-goal", agent_id="agent-a", runs=[work, accounting]) == context
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_real_quota_cli_preserves_the_replan_obligation_while_reducing_accounting(tmp_path, monkeypatch, provider):
+    from test_replan_successor_guard_reentry import _fixture, _guard, GOAL, AGENT
+
+    call, runtime, index = _fixture(tmp_path, monkeypatch, provider)
+    work, accounting = _settled_pair(goal_id=GOAL, agent_id=AGENT)
+    # Keep the fixture's existing required-vision evidence. This changes only
+    # metadata in the disposable read model, never an active authority store.
+    prior = index.read_text()
+    legacy = [{key: value for key, value in row.items()
+        if key not in ("settlement_identity", "quota_spend_commit", "turn_instance_id")}
+        for row in (work, accounting)]
+    index.write_text(prior + "".join(json.dumps(row) + "\n" for row in legacy))
+    before = _guard(call, "turn-accounting-before")["autonomous_replan_obligation"]
+    index.write_text(prior + "".join(json.dumps(row) + "\n" for row in (work, accounting)))
+    source = index.read_bytes()
+    after = _guard(call, "turn-accounting-after")["autonomous_replan_obligation"]
+    assert after["obligation_id"] == before["obligation_id"]
+    assert after["triggers"] == before["triggers"]
+    left, right = before["replan_context"], after["replan_context"]
+    for key in ("core_goal", "coverage_ledger", "uncovered_frontier", "evidence_count"):
+        assert right[key] == left[key]
+    assert len(right["evidence"]) == len(left["evidence"]) - 1
+    assert index.read_bytes() == source
+
+
+def test_unscoped_replan_assignment_ignores_evidence_and_presentation_changes():
+    from loopx.control_plane.goals.goal_frontier import autonomous_replan_scope_decision
+
+    obligation = {"schema_version": "autonomous_replan_obligation_v0", "required": True,
+                  "triggers": [{"kind": "periodic_review_due"}]}
+    selected = []
+    for extra in [{}, {"recommended_action": "different presentation"},
+                  {"replan_context": {"evidence": [{"summary": "new observation"}]}},
+                  {"replan_novelty_policy": {"evidence_source": "legacy-source"}}]:
+        decisions = [
+            autonomous_replan_scope_decision({**obligation, **extra}, agent_id=agent,
+                                            registered_agent_ids=["agent-a", "agent-b"])
+            for agent in ["agent-a", "agent-b"]
+        ]
+        assert sum(decision["applies"] for decision in decisions) == 1
+        selected.extend(decision["selected_peer_agent"] for decision in decisions)
+    assert len(set(selected)) == 1
+
+
+def test_native_recovery_reads_its_event_source_without_the_removed_cli(tmp_path: Path):
+    from loopx.kunluncode_goal_mode.control_plane import LoopXControlPlane
+
+    runtime = tmp_path / "runtime"
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"common_runtime_root": str(runtime), "goals": []}))
+    log = runtime / "goals/evidence-goal/rollout-event-log.jsonl"
+    log.parent.mkdir(parents=True)
+    event = {"schema_version": "loopx_rollout_event_v0", "goal_id": "evidence-goal",
+             "agent_id": "agent-a", "todo_id": "todo-a", "event_id": "event-a",
+             "event_kind": "refresh_state", "classification": "kunluncode_native_goal_verified",
+             "recorded_at": "2026-08-18T01:00:00Z"}
+    log.write_text("\n".join(json.dumps(item) for item in [
+        event, {**event, "agent_id": "agent-b"}, {**event, "todo_id": "todo-b"},
+        {**event, "recorded_at": "2026-08-17T01:00:00Z"},
+    ]) + "\n")
+    before = log.read_bytes()
+    control = LoopXControlPlane(tmp_path, {"registry": "registry.json",
+                                         "goal_id": "evidence-goal", "agent_id": "agent-a"})
+    result = control.evidence_since("2026-08-18T00:00:00Z", todo_id="todo-a")
+    assert result["ledger_count"] == 1
+    assert result["ledger"][0]["event_id"] == "event-a"
+    assert log.read_bytes() == before

@@ -1,21 +1,18 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
+from dataclasses import dataclass
+import os
 from pathlib import Path
+import shlex
 from typing import Any
 
-from ...rollout_event_log import load_rollout_events, rollout_event_log_path
-from ...turn_identity import normalize_turn_instance_id
-from ..todos.contract import (
-    normalize_todo_claimed_by,
-    normalize_todo_id,
-    normalize_todo_replan_obligation_id,
-)
-from ..work_items.delivery_outcome import (
-    ACCOUNTABLE_DELIVERY_OUTCOMES,
-    normalize_delivery_outcome,
-)
+from ...command_invocation import loopx_cli_argv
+from ...install_contract import render_host_cli_command
+from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from ..settlement_driver import decode_settlement_result
+from .accounting_admission import quota_accounting_admission
+from .error_codes import HeartbeatReceiptIdentityConflictError
 from .effect_program import (
     SETTLEMENT_IDENTITY_SCHEMA_VERSION,
     SETTLEMENT_PLAN_SCHEMA_VERSION,
@@ -29,21 +26,251 @@ from .effect_program import (
     SettlementStep,
     SettlementStepKind,
     ReceiptBoundMonitorPhase,
-    ReceiptBoundTerminalPhase,
+    ReceiptBoundReplayPhase,
     build_codex_app_settlement_plan,
     build_turn_scoped_cli_settlement_plan,
     settlement_binding_args,
-    receipt_bound_monitor_phase,
-    receipt_bound_terminal_phase,
     settlement_result_payload,
     settlement_step_command,
+    turn_instance_arg,
 )
-from .heartbeat_receipt import find_heartbeat_receipt
-from .monitor_poll import find_quota_monitor_poll_turn
-from .settlement_workspace_causality import (
-    delivery_workspace_causality_from_event_details,
+
+QUOTA_SETTLEMENT_READBACK_REQUEST_SCHEMA = (
+    "loopx_quota_settlement_readback_request_v0"
 )
-from ..settlement_driver import effect_ids_match, settlement_receipt
+QUOTA_SETTLEMENT_READBACK_RESULT_SCHEMA = (
+    "loopx_quota_settlement_readback_result_v0"
+)
+SEMANTIC_REPLAN_GUARD_SCHEMA = "semantic_replan_guard_v0"
+
+
+def _checkpoint_instructions(checkpoint: Mapping[str, Any]) -> str:
+    lines = [
+        "Submit a checkpoint-only refresh with the same Goal, Agent, Todo/obligation, "
+        "Turn, and delivery fields, from the original working directory.",
+        "- Read first: Run `loopx checkpoint-context` with the same `--goal-id`, "
+        "`--agent-id`, `--todo-id` or `--replan-obligation-id`, `--turn-instance-id`, "
+        "and original registry/runtime/project/state-file options. Include "
+        "`--dependency-todo-id` for any additional upstream Todo result used in the "
+        "judgment. Read its returned basis and judge again; echo `read_context_id` "
+        "as `--checkpoint-read-context` in the supplement. Confirmations for the "
+        "same Turn are serial: a reread replaces the old receipt. If stale or "
+        "replaced, reread and rejudge; never substitute a new token onto an old judgment.",
+        "- Preserve: Keep original values and presence for target, scope, and isolation "
+        "options: `--registry`, `--runtime-root`, `--project`, `--state-file`, "
+        "`--progress-scope`, `--agent-lane`, `--available-capability`, "
+        "`--no-global-sync`, `--suppress-external-sinks`, `--resume-external-sinks`; "
+        "identity and delivery options: "
+        "`--goal-id`, `--agent-id`, `--todo-id`, `--replan-obligation-id`, "
+        "`--turn-instance-id`, `--completion-todo-id`, `--completion-turn-key`, "
+        "`--classification`, `--recommended-action`, `--delivery-batch-scale`, "
+        "`--delivery-outcome`, `--delivery-boundary`, `--delivery-workspace-path`, "
+        "`--progress-result-class`, `--progress-surface-id`, `--progress-hypothesis-id`, "
+        "`--progress-probe-kind`, `--progress-blocker-id`, `--progress-coverage-scope-id`, "
+        "`--progress-evidence-id`, `--progress-coverage-complete`. Do not add options absent "
+        "from the original command or change its delivery target.",
+        "- Remove: Remove previously executed state-mutation options, even when their "
+        "values are unchanged: `--next-action`, `--next-action-basis`, `--autonomous-replan-recorded`, "
+        "`--repair-delta-kind`, `--usage-json`, `--usage-codex-session`. "
+        "Remove dependent options that become invalid without them.",
+        "- Add: Echo `--checkpoint-read-context` from the read, and add only one valid vision decision: a valid `--agent-vision-json` packet "
+        "or inline `--vision-*` patch containing your authored vision content.",
+    ]
+    if checkpoint.get("missing_baseline") is True:
+        lines.append(
+            "No persisted vision baseline is available; an unchanged reason cannot "
+            "satisfy this checkpoint."
+        )
+    else:
+        lines[-1] += (
+            " Alternatively use `--vision-unchanged-reason` only if a persisted vision "
+            "exists and its scope and acceptance still apply."
+        )
+    lines.append(
+        "Do not repeat implementation, manufacture a successor, or begin another "
+        "Turn solely to repair this checkpoint. Keep the ordinary one-spend "
+        "settlement order. Recovery remains subject to existing validation and "
+        "does not certify acceptance or bypass replan, identity, or terminal gates."
+    )
+    return "\n".join(lines)
+
+
+def render_first_refresh_checkpoint_hint(payload: dict[str, Any]) -> list[str]:
+    """Explain the first committed missing checkpoint without changing admission."""
+    recovery = payload.get("refresh_recovery")
+    identity = payload.get("settlement_identity")
+    checkpoint = payload.get("vision_checkpoint")
+    if (
+        payload.get("ok") is True
+        and payload.get("appended") is True
+        and payload.get("dry_run") is False
+        and isinstance(recovery, dict)
+        and recovery.get("decision") == "append"
+        and recovery.get("reason") == "first_writeback"
+        and isinstance(identity, dict)
+        and identity
+        and isinstance(checkpoint, dict)
+        and checkpoint.get("required") is True
+        and checkpoint.get("satisfied") is False
+        and checkpoint.get("decision") == "missing_required"
+    ):
+        return [
+            "The writeback succeeded, but the required vision checkpoint is still unsatisfied.",
+            _checkpoint_instructions(checkpoint),
+        ]
+    return []
+
+
+def render_refresh_recovery_markdown(payload: dict[str, Any]) -> str | None:
+    """Present an admitted recovery result without deriving settlement policy."""
+    recovery = payload.get("refresh_recovery") or {}
+    if recovery.get("decision") not in {"replay", "repair_receipt", "reject"}:
+        return None
+    lines = [
+        "# LoopX State Refresh",
+        "",
+        f"- ok: `{payload.get('ok')}`",
+        f"- recovery: `{recovery['decision']}`",
+        f"- reason: `{recovery.get('reason')}`",
+        "- appended: `False` — original writeback preserved; no new delivery or spend.",
+    ]
+    lines.extend(render_settlement_progress_markdown(payload))
+    checkpoint = payload.get("vision_checkpoint") or {}
+    if checkpoint:
+        lines.append(
+            f"- vision_checkpoint: `{checkpoint.get('decision')}`; satisfied={checkpoint.get('satisfied')}"
+        )
+    if payload.get("error"):
+        lines.append(str(payload["error"]))
+    elif checkpoint.get("satisfied") is False:
+        lines.append(_checkpoint_instructions(checkpoint))
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaSpendPrecheck:
+    identity: SettlementResult[SettlementIdentity]
+    settlement: SettlementResult[dict[str, Any]]
+    progress: dict[str, Any] | None
+    spend_run_present: bool
+    spend_request_rejection: SettlementResult[dict[str, Any]] | None
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaSettlementReadback:
+    identity: SettlementResult[SettlementIdentity]
+    writeback: SettlementResult[dict[str, Any]]
+    spend: SettlementResult[dict[str, Any]]
+    delivery: SettlementResult[dict[str, Any]]
+    settlement: SettlementResult[dict[str, Any]]
+    terminal_closeout: SettlementResult[dict[str, Any]]
+    terminal_settlement: SettlementResult[dict[str, Any]]
+    workspace_causality: dict[str, str] | None
+    semantic_replan_guard: dict[str, Any] | None
+    writeback_run: dict[str, Any] | None
+    spend_run: dict[str, Any] | None
+    heartbeat_receipt: dict[str, Any] | None
+    writeback_event: dict[str, Any] | None
+    spend_event: dict[str, Any] | None
+    completion_event: dict[str, Any] | None
+    monitor_phase: ReceiptBoundMonitorPhase | None
+    replay_phase: ReceiptBoundReplayPhase | None
+    supersede_event: dict[str, Any] | None = None
+    refresh_recovery: dict[str, Any] | None = None
+    external_delivery: dict[str, Any] | None = None
+    progress: dict[str, Any] | None = None
+    native_child_admission: dict[str, Any] | None = None
+    heartbeat_reentry_qualification: dict[str, Any] | None = None
+    successor_replan_pending: bool = False
+    replan_execution_pending: bool = False
+    admission_recorded_at: str | None = None
+    admission_event_id: str | None = None
+    prepared_lease: dict[str, Any] | None = None
+    prepared_lease_required: bool = False
+
+
+def render_owed_host_command(argv: list[str]) -> str:
+    return render_host_cli_command(argv)
+
+
+def attach_settlement_progress(
+    payload: dict[str, Any],
+    readback: QuotaSettlementReadback,
+    *,
+    registry_path: Path | None = None,
+    runtime_root: Path | None = None,
+    goal_ref: Mapping[str, Any] | None = None,
+) -> None:
+    """Render the TS-owned receipt progress without deriving a second settlement rule."""
+    progress = readback.progress
+    if not isinstance(progress, dict) or progress.get("schema_version") != "quota_settlement_progress_v0":
+        raise RuntimeError("TypeScript quota settlement progress missing or invalid")
+    payload["settlement_progress"] = dict(progress)
+    payload.pop("settlement_owed", None)
+    identity = readback.identity.value
+    if payload.get("ok") is not True or progress.get("next_step") != "quota_spend" or identity is None:
+        return
+    route = loopx_cli_argv()
+    prefix = shlex.join(route)
+    if registry_path is not None:
+        prefix += f" --registry {shlex.quote(str(registry_path))}"
+    if runtime_root is not None:
+        prefix += f" --runtime-root {shlex.quote(str(runtime_root))}"
+    plan = build_turn_scoped_cli_settlement_plan(
+        goal_id=identity.goal_id,
+        agent_id=identity.agent_id,
+        todo_id=identity.todo_id,
+        replan_obligation_id=identity.replan_obligation_id,
+        turn_instance_id=identity.turn_instance_id,
+        command_prefix=prefix,
+        scoped_cli_args="",
+        lifecycle_actor_args="",
+        quota_spend_source=progress["quota_spend_source"],
+        goal_ref=goal_ref,
+    )
+    command = settlement_step_command(plan.as_dict(), SettlementStepKind.QUOTA_SPEND)
+    owed = {
+        **identity.as_dict(), "schema_version": "turn_settlement_owed_v0",
+        "kind": "quota_spend", "recovery_does_not_spend": True,
+        "reason": (
+            "quota spend is committed but its receipt is missing; retry the same identity to repair it without another debit"
+            if progress["state"] == "spend_receipt_required" else
+            "writeback is verified; execute quota spend once for the same settlement identity"
+        ),
+        "command": command,
+    }
+    # PowerShell quoting applies to every argument, even with an unquoted launcher.
+    # Keep the argv for the composed CLI so it does not have to parse shell text.
+    if os.name == "nt" or route[0].lower().endswith(".ps1"):
+        argv = shlex.split(command)
+        owed.update(command=render_owed_host_command(argv), command_argv=argv)
+    payload["settlement_owed"] = owed
+
+
+def render_settlement_progress_markdown(payload: dict[str, Any]) -> list[str]:
+    recovery = payload.get("settlement_recovery")
+    if isinstance(recovery, dict):
+        identity = recovery["settlement_identity"]
+        label = "Pending settlement" if recovery.get("settlement_progress") else "Settlement readback"
+        lines = [f"- {label}: `{identity['turn_instance_id']}`", recovery["instruction"]]
+        for command in recovery["next_cli_actions"]:
+            lines.extend(["", "```sh", command, "```"])
+        return lines
+    if payload.get("settlement_recovery_error"):
+        return [f"- Settlement recovery could not be read: {payload['settlement_recovery_error']}"]
+    progress = payload.get("settlement_progress")
+    if not isinstance(progress, dict):
+        return []
+    lines = [f"- settlement: `{progress.get('state')}`"]
+    if progress.get("closeout_kind") == "typed_blocked_writeback_no_spend":
+        lines.append("- closeout: typed blocked writeback; no quota slot spent")
+    elif progress.get("closeout_kind") == "capability_duty_retired_no_spend":
+        lines.append("- closeout: exact invalidated capability duty retired; no quota slot spent")
+    owed = payload.get("settlement_owed")
+    if isinstance(owed, dict):
+        lines.extend([f"- settlement_owed: {owed['reason']}", "", "```sh", owed["command"], "```"])
+    return lines
+
 
 __all__ = [
     "SETTLEMENT_IDENTITY_SCHEMA_VERSION",
@@ -59,566 +286,310 @@ __all__ = [
     "SettlementStepKind",
     "build_codex_app_settlement_plan",
     "build_turn_scoped_cli_settlement_plan",
-    "find_quota_spend_run_by_effect_ref",
-    "find_settlement_spend_run",
-    "find_settlement_step_event",
-    "find_settlement_writeback",
-    "infer_persisted_heartbeat_settlement_identity",
-    "receipt_bound_monitor_settlement_phase",
-    "receipt_bound_terminal_settlement_phase",
-    "require_settlement_spend",
-    "require_settlement_terminal_closeout",
-    "require_settlement_writeback",
-    "resolve_heartbeat_settlement_identity",
-    "resolve_settlement_delivery_workspace_causality",
+    "read_heartbeat_settlement",
     "settlement_binding_args",
     "settlement_result_payload",
     "settlement_step_command",
+    "turn_instance_arg",
 ]
 
 
-def receipt_bound_monitor_settlement_phase(
-    runtime_root: Path,
+def _readback_result(
+    payload: Any,
     *,
-    goal_id: str,
-    agent_id: str | None,
-    todo_id: str | None,
-    turn_instance_id: str | None,
-) -> ReceiptBoundMonitorPhase | None:
-    """Resolve the typed phase for one receipt-bound monitor turn.
-
-    A missing matching poll remains explicitly ``poll_due`` even when mutable
-    Todo scheduling metadata has moved into the future.  An unchanged poll is
-    terminal by itself.  A material poll is terminal only after the exact
-    heartbeat identity has both durable writeback and quota-spend receipts.
-    ``None`` is reserved for an invalid receipt identity or runtime failure.
-    """
-
-    normalized_agent_id = normalize_todo_claimed_by(agent_id)
-    normalized_todo_id = normalize_todo_id(todo_id)
-    try:
-        normalized_turn_id = normalize_turn_instance_id(turn_instance_id)
-    except ValueError:
-        return None
-    if not normalized_agent_id or not normalized_todo_id or not normalized_turn_id:
-        return None
-    poll = find_quota_monitor_poll_turn(
-        runtime_root,
-        goal_id=goal_id,
-        agent_id=normalized_agent_id,
-        turn_instance_id=normalized_turn_id,
-    )
-    if not isinstance(poll, Mapping):
-        return receipt_bound_monitor_phase(
-            poll_present=False,
-            material_change=False,
-            durable_writeback_present=False,
-            quota_spend_present=False,
-        )
-    if normalize_todo_id(poll.get("todo_id")) != normalized_todo_id:
-        return receipt_bound_monitor_phase(
-            poll_present=False,
-            material_change=False,
-            durable_writeback_present=False,
-            quota_spend_present=False,
-        )
-    material_change = poll.get("material_change") is True
-    if not material_change:
-        return receipt_bound_monitor_phase(
-            poll_present=True,
-            material_change=False,
-            durable_writeback_present=False,
-            quota_spend_present=False,
-        )
-    identity_result = resolve_heartbeat_settlement_identity(
-        runtime_root,
-        goal_id=goal_id,
-        agent_id=normalized_agent_id,
-        todo_id=normalized_todo_id,
-        turn_instance_id=normalized_turn_id,
-    )
-    identity = identity_result.value
-    durable_writeback_present = bool(
-        identity is not None
-        and require_settlement_writeback(runtime_root, identity).value is not None
-    )
-    quota_spend_present = bool(
-        identity is not None
-        and require_settlement_spend(runtime_root, identity).value is not None
-    )
-    return receipt_bound_monitor_phase(
-        poll_present=True,
-        material_change=True,
-        durable_writeback_present=durable_writeback_present,
-        quota_spend_present=quota_spend_present,
-    )
-
-
-def receipt_bound_terminal_settlement_phase(
-    runtime_root: Path,
-    *,
-    goal_id: str,
-    agent_id: str | None,
-    todo_id: str | None,
-    turn_instance_id: str | None,
-    replan_obligation_id: str | None = None,
-) -> ReceiptBoundTerminalPhase | None:
-    """Resolve terminal settlement for the exact persisted receipt identity.
-
-    Terminal replay is complete only after the identity has durable writeback,
-    quota-spend, and explicit no-follow-up closeout receipts.  An identity with
-    no terminal closeout remains open; a partial terminal chain remains pending
-    and therefore cannot suppress live work selection.
-    """
-
-    identity_result = resolve_heartbeat_settlement_identity(
-        runtime_root,
-        goal_id=goal_id,
-        agent_id=agent_id,
-        todo_id=todo_id,
-        turn_instance_id=turn_instance_id,
-        replan_obligation_id=replan_obligation_id,
-    )
-    identity = identity_result.value
-    if identity is None:
-        return None
-    terminal_closeout_present = (
-        require_settlement_terminal_closeout(runtime_root, identity).value is not None
-    )
-    durable_writeback_present = (
-        require_settlement_writeback(runtime_root, identity).value is not None
-    )
-    quota_spend_present = (
-        require_settlement_spend(runtime_root, identity).value is not None
-    )
-    return receipt_bound_terminal_phase(
-        terminal_closeout_present=terminal_closeout_present,
-        durable_writeback_present=durable_writeback_present,
-        quota_spend_present=quota_spend_present,
-    )
-
-
-def resolve_settlement_delivery_workspace_causality(
-    runtime_root: Path,
-    identity: SettlementIdentity,
-) -> dict[str, str] | None:
-    receipt_event = find_heartbeat_receipt(
-        runtime_root,
-        goal_id=identity.goal_id,
-        agent_id=identity.agent_id,
-        turn_instance_id=identity.turn_instance_id,
-    )
-    if not isinstance(receipt_event, Mapping):
-        return None
-    details_value = receipt_event.get("details")
-    details = details_value if isinstance(details_value, Mapping) else {}
-    return delivery_workspace_causality_from_event_details(
-        details,
-        todo_id=identity.todo_id,
-    )
-
-
-def _identity_mismatch(reason: str) -> SettlementResult[SettlementIdentity]:
-    return SettlementResult.failed(
-        kind=SettlementFailureKind.IDENTITY_MISMATCH,
-        step_kind=SettlementStepKind.VALIDATION,
-        reason=reason,
-    )
-
-
-def resolve_heartbeat_settlement_identity(
-    runtime_root: Path,
-    *,
-    goal_id: str,
-    agent_id: str | None,
-    todo_id: str | None,
-    turn_instance_id: str | None,
-    replan_obligation_id: str | None = None,
-) -> SettlementResult[SettlementIdentity]:
-    normalized_agent_id = normalize_todo_claimed_by(agent_id)
-    normalized_todo_id = normalize_todo_id(todo_id)
-    normalized_replan_obligation_id = normalize_todo_replan_obligation_id(
-        replan_obligation_id
-    )
-    try:
-        normalized_turn_id = normalize_turn_instance_id(turn_instance_id)
-    except ValueError as exc:
-        return SettlementResult.failed(
-            kind=SettlementFailureKind.INVALID_IDENTITY,
-            step_kind=SettlementStepKind.VALIDATION,
-            reason=str(exc),
-        )
-    if (
-        not normalized_agent_id
-        or not normalized_turn_id
-        or bool(normalized_todo_id) == bool(normalized_replan_obligation_id)
-    ):
-        return SettlementResult.failed(
-            kind=SettlementFailureKind.INVALID_IDENTITY,
-            step_kind=SettlementStepKind.VALIDATION,
-            reason=(
-                "turn-scoped settlement requires agent_id, turn_instance_id, and "
-                "exactly one todo_id or replan_obligation_id"
-            ),
-        )
-    try:
-        receipt_event = find_heartbeat_receipt(
-            runtime_root,
-            goal_id=goal_id,
-            agent_id=normalized_agent_id,
-            turn_instance_id=normalized_turn_id,
-        )
-    except ValueError as exc:
-        return _identity_mismatch(str(exc))
-    if receipt_event is None:
-        return SettlementResult.failed(
-            kind=SettlementFailureKind.RECEIPT_MISSING,
-            step_kind=SettlementStepKind.VALIDATION,
-            reason=(
-                "matching quota should-run heartbeat receipt is missing; rerun the "
-                "guard with the same turn_instance_id"
-            ),
-        )
-    details_value = receipt_event.get("details")
-    details = details_value if isinstance(details_value, Mapping) else {}
-    receipt_todo_id = normalize_todo_id(details.get("todo_id"))
-    receipt_replan_obligation_id = normalize_todo_replan_obligation_id(
-        details.get("replan_obligation_id")
-    )
-    if (
-        receipt_todo_id != normalized_todo_id
-        or receipt_replan_obligation_id != normalized_replan_obligation_id
-    ):
-        return SettlementResult.failed(
-            kind=SettlementFailureKind.IDENTITY_MISMATCH,
-            step_kind=SettlementStepKind.VALIDATION,
-            reason=(
-                "settlement binding does not match the original quota guard: "
-                f"receipt todo={receipt_todo_id or 'missing'} and "
-                "replan_obligation_id="
-                f"{receipt_replan_obligation_id or 'missing'}, requested "
-                f"todo={normalized_todo_id or 'missing'} and "
-                "replan_obligation_id="
-                f"{normalized_replan_obligation_id or 'missing'}"
-            ),
-        )
-    identity = SettlementIdentity(
-        goal_id=goal_id,
-        agent_id=normalized_agent_id,
-        todo_id=normalized_todo_id,
-        turn_instance_id=normalized_turn_id,
-        replan_obligation_id=normalized_replan_obligation_id,
-    )
-    receipt_effect_id = str(details.get("settlement_effect_id") or "").strip()
-    if not effect_ids_match(receipt_effect_id, identity.effect_id):
-        return SettlementResult.failed(
-            kind=SettlementFailureKind.IDENTITY_MISMATCH,
-            step_kind=SettlementStepKind.VALIDATION,
-            reason=(
-                "settlement effect does not match the original quota guard: "
-                f"receipt effect is {receipt_effect_id} but expected "
-                f"{identity.effect_id}"
-            ),
-        )
-    event_id = str(receipt_event.get("event_id") or "").strip() or None
-    return SettlementResult.pure(
-        identity,
-        receipts=(
-            settlement_receipt(
-                identity,
-                step_kind=SettlementStepKind.VALIDATION,
-                source_ref=f"rollout_event:{event_id}" if event_id else None,
-            ),
+    identity: bool = False,
+) -> SettlementResult[Any]:
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("TypeScript quota settlement readback result shape mismatch")
+    result = payload.get("result")
+    projection = payload.get("payload")
+    if not isinstance(result, Mapping) or not isinstance(projection, Mapping):
+        raise RuntimeError("TypeScript quota settlement readback result shape mismatch")
+    return decode_settlement_result(
+        result,
+        value_decoder=(
+            SettlementIdentity.from_runtime_payload if identity else None
         ),
+        projection_payload=projection,
     )
 
 
-def _run_index_records(runtime_root: Path, goal_id: str) -> list[dict[str, Any]]:
-    index_path = runtime_root / "goals" / goal_id / "runs" / "index.jsonl"
-    if not index_path.exists():
-        return []
-    records: list[dict[str, Any]] = []
-    try:
-        lines = index_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    for line in lines:
+def _optional_readback_record(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise RuntimeError("TypeScript quota settlement readback result shape mismatch")
+    return dict(value)
+
+
+def _optional_readback_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("TypeScript quota settlement readback result shape mismatch")
+    return value
+
+
+def _semantic_replan_guard(value: Any) -> dict[str, Any] | None:
+    guard = _optional_readback_record(value)
+    if guard is None:
+        return None
+    scope = guard.get("scope")
+    selected_obligation_id = guard.get("selected_obligation_id")
+    selected_obligation_is_malformed = (
+        selected_obligation_id is not None
+        and not isinstance(selected_obligation_id, str)
+    )
+    legacy_guard_claims_selection = (
+        scope == "legacy_unscoped" and selected_obligation_id is not None
+    )
+    if (
+        guard.get("schema_version") != SEMANTIC_REPLAN_GUARD_SCHEMA
+        or scope not in {"legacy_unscoped", "turn_guard"}
+        or selected_obligation_is_malformed
+        or legacy_guard_claims_selection
+    ):
+        raise RuntimeError("TypeScript semantic replan guard shape mismatch")
+    result: dict[str, Any] = {
+        "schema_version": SEMANTIC_REPLAN_GUARD_SCHEMA,
+        "scope": str(scope),
+        "selected_obligation_id": selected_obligation_id,
+    }
+    if "selected_capability_guard" in guard:
+        capability = guard["selected_capability_guard"]
+        if not isinstance(capability, dict) or selected_obligation_id is None:
+            raise RuntimeError("selected capability guard requires a typed object and obligation")
+        # The TS readback owner validates the schema and ids. Preserve the
+        # selected authority evidence when adapting the receipt to refresh.
+        result["selected_capability_guard"] = dict(capability)
+    if "selected_review_source" in guard:
+        review = guard["selected_review_source"]
+        if not isinstance(review, dict) or selected_obligation_id is None:
+            raise RuntimeError("selected review source requires a typed object and obligation")
+        # Semantic eligibility and scalar bounds belong to the TS owner.
+        result["selected_review_source"] = dict(review)
+    return result
+
+
+def _read_heartbeat_settlement_payload(
+    runtime_root: Path,
+    *,
+    goal_id: str,
+    fields: Mapping[str, Any],
+    registry_path: Path | None,
+    goal_ref: Mapping[str, Any] | None,
+    source_admission: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any] | None:
+    def read(admission: Mapping[str, Any] | None) -> Any:
         try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(record, dict):
-            records.append(record)
-    return records
+            return effect_runtime_result(
+                "quota.settlement.read",
+                {
+                    "schema_version": QUOTA_SETTLEMENT_READBACK_REQUEST_SCHEMA,
+                    "runtime_root": str(runtime_root.expanduser()),
+                    "goal_id": goal_id,
+                    **fields,
+                    **({"goal_ref": dict(goal_ref)} if goal_ref is not None else {}),
+                    **(
+                        {"source_admission": dict(admission)}
+                        if admission is not None
+                        else {}
+                    ),
+                },
+                large_local_snapshot=True,
+            )
+        except EffectRuntimeRejected as exc:
+            if exc.diagnostic_code == "heartbeat_receipt_identity_conflict":
+                raise HeartbeatReceiptIdentityConflictError(str(exc)) from None
+            raise ValueError(str(exc)) from None
+
+    if source_admission is not None:
+        payload = read(source_admission)
+    else:
+        with quota_accounting_admission(
+            runtime_root=runtime_root,
+            registry_path=registry_path,
+            goal_id=goal_id,
+            goal_ref=goal_ref,
+            operation="quota-settlement-read",
+            lock_legacy_index=False,
+        ) as admission:
+            payload = read(admission)
+    if not isinstance(payload, Mapping) or (
+        payload.get("schema_version")
+        != QUOTA_SETTLEMENT_READBACK_RESULT_SCHEMA
+    ):
+        raise RuntimeError("TypeScript quota settlement readback result shape mismatch")
+    if payload.get("found") is False:
+        if set(payload) != {"schema_version", "found"}:
+            raise RuntimeError(
+                "TypeScript quota settlement readback result shape mismatch"
+            )
+        return None
+    if payload.get("found") is not True:
+        raise RuntimeError("TypeScript quota settlement readback result shape mismatch")
+    return payload
 
 
-def infer_persisted_heartbeat_settlement_identity(
+def read_quota_spend_precheck(
     runtime_root: Path,
     *,
     goal_id: str,
     agent_id: str | None,
     todo_id: str | None,
-) -> SettlementResult[SettlementIdentity] | None:
-    """Recover the latest typed heartbeat identity when a caller omits its turn id.
+    turn_instance_id: str | None,
+    replan_obligation_id: str | None = None,
+    infer_turn_instance_id: bool = False,
+    allow_unbound_binding: bool = False,
+    registry_path: Path | None = None,
+    goal_ref: Mapping[str, Any] | None = None,
+    spend_request: Mapping[str, Any] | None = None,
+) -> QuotaSpendPrecheck | None:
+    """Read the identity and replay controls before building a fresh preview."""
 
-    This is a compatibility recovery seam, not a second source of truth. It
-    considers only the newest same-agent accountable writeback or spend, and
-    then revalidates that candidate against the original heartbeat guard.
-    Unrelated Todo lineages and legacy untyped runs fall back to the existing
-    frontier binding rules.
-    """
-
-    normalized_agent_id = normalize_todo_claimed_by(agent_id)
-    normalized_todo_id = normalize_todo_id(todo_id)
-    if not normalized_agent_id or not normalized_todo_id:
-        return None
-
-    candidate: dict[str, Any] | None = None
-    for run in reversed(_run_index_records(runtime_root, goal_id)):
-        run_agent_id = normalize_todo_claimed_by(run.get("agent_id"))
-        if run_agent_id and run_agent_id != normalized_agent_id:
-            continue
-        classification = str(run.get("classification") or "").strip()
-        delivery_outcome = normalize_delivery_outcome(run.get("delivery_outcome"))
-        if classification == "quota_slot_voided":
-            continue
-        if classification == "quota_scheduler_ack":
-            continue
-        if classification == "quota_monitor_poll" and run.get("material_change") is not True:
-            continue
-        if (
-            classification == "state_refreshed"
-            and delivery_outcome not in ACCOUNTABLE_DELIVERY_OUTCOMES
-        ):
-            continue
-        if (
-            classification == "quota_slot_spent"
-            or delivery_outcome in ACCOUNTABLE_DELIVERY_OUTCOMES
-        ):
-            candidate = run
-            break
-        return None
-
-    if candidate is None:
-        return None
-    candidate_todo_id = normalize_todo_id(candidate.get("todo_id"))
-    if candidate_todo_id != normalized_todo_id:
-        return None
-    candidate_turn_id = str(candidate.get("turn_instance_id") or "").strip()
-    if not candidate_turn_id:
-        return None
-
-    identity = SettlementIdentity(
-        goal_id=goal_id,
-        agent_id=normalized_agent_id,
-        todo_id=normalized_todo_id,
-        turn_instance_id=candidate_turn_id,
-    )
-    persisted_value = candidate.get("settlement_identity")
-    persisted = persisted_value if isinstance(persisted_value, Mapping) else {}
-    for field, expected in (
-        ("goal_id", identity.goal_id),
-        ("agent_id", identity.agent_id),
-        ("todo_id", identity.todo_id),
-        ("turn_instance_id", identity.turn_instance_id),
-        ("effect_id", identity.effect_id),
-    ):
-        actual = str(persisted.get(field) or "").strip()
-        if actual and actual != expected:
-            return _identity_mismatch(
-                "persisted settlement identity mismatch: "
-                f"{field} is {actual} but expected {expected}"
-            )
-
-    return resolve_heartbeat_settlement_identity(
+    payload = _read_heartbeat_settlement_payload(
         runtime_root,
         goal_id=goal_id,
-        agent_id=normalized_agent_id,
-        todo_id=normalized_todo_id,
-        turn_instance_id=candidate_turn_id,
+        fields={
+            "agent_id": agent_id,
+            "todo_id": todo_id,
+            "turn_instance_id": turn_instance_id,
+            "replan_obligation_id": replan_obligation_id,
+            "infer_turn_instance_id": infer_turn_instance_id,
+            "allow_unbound_binding": allow_unbound_binding,
+            "spend_precheck": True,
+            **({"spend_request": dict(spend_request)} if spend_request is not None else {}),
+        },
+        registry_path=registry_path,
+        goal_ref=goal_ref,
     )
-
-
-def find_settlement_writeback(
-    runtime_root: Path,
-    identity: SettlementIdentity,
-) -> dict[str, Any] | None:
-    for run in reversed(_run_index_records(runtime_root, identity.goal_id)):
-        if str(run.get("turn_instance_id") or "") != identity.turn_instance_id:
-            continue
-        if not _run_matches_settlement_binding(run, identity):
-            continue
-        run_agent_id = normalize_todo_claimed_by(run.get("agent_id"))
-        if run_agent_id != identity.agent_id:
-            continue
-        if (
-            normalize_delivery_outcome(run.get("delivery_outcome"))
-            not in ACCOUNTABLE_DELIVERY_OUTCOMES
-        ):
-            continue
-        return run
-    return None
-
-
-def _run_matches_settlement_binding(
-    run: Mapping[str, Any],
-    identity: SettlementIdentity,
-) -> bool:
-    return bool(
-        normalize_todo_id(run.get("todo_id")) == identity.todo_id
-        and normalize_todo_replan_obligation_id(
-            run.get("replan_obligation_id")
-        )
-        == identity.replan_obligation_id
-    )
-
-
-def find_settlement_step_event(
-    runtime_root: Path,
-    identity: SettlementIdentity,
-    *,
-    event_kind: str,
-) -> dict[str, Any] | None:
-    events = load_rollout_events(rollout_event_log_path(runtime_root, identity.goal_id))
-    for event in reversed(events):
-        if event.get("event_kind") != event_kind:
-            continue
-        if str(event.get("goal_id") or "") != identity.goal_id:
-            continue
-        if str(event.get("agent_id") or "") != identity.agent_id:
-            continue
-        if str(event.get("run_id") or "") != identity.turn_instance_id:
-            continue
-        details_value = event.get("details")
-        details = details_value if isinstance(details_value, Mapping) else {}
-        if str(details.get("settlement_effect_id") or "") != identity.effect_id:
-            continue
-        return event
-    return None
-
-
-def require_settlement_terminal_closeout(
-    runtime_root: Path,
-    identity: SettlementIdentity,
-) -> SettlementResult[dict[str, Any]]:
-    receipt_event = find_settlement_step_event(
-        runtime_root,
-        identity,
-        event_kind="todo_complete",
-    )
-    details_value = receipt_event.get("details") if receipt_event else None
-    details = details_value if isinstance(details_value, Mapping) else {}
-    if receipt_event is None or details.get("no_followup") is not True:
-        return SettlementResult.failed(
-            kind=SettlementFailureKind.RECEIPT_MISSING,
-            step_kind=SettlementStepKind.TERMINAL_CLOSEOUT,
-            reason="matching terminal no-follow-up closeout receipt is missing",
-        )
-    event_id = str(receipt_event.get("event_id") or "").strip()
-    return SettlementResult.pure(
-        receipt_event,
-        receipts=(
-            settlement_receipt(
-                identity,
-                step_kind=SettlementStepKind.TERMINAL_CLOSEOUT,
-                source_ref=f"rollout_event:{event_id}" if event_id else None,
-            ),
+    if payload is None:
+        return None
+    spend_run_present = payload.get("spend_run_present")
+    if not isinstance(spend_run_present, bool):
+        raise RuntimeError("TypeScript quota spend precheck result shape mismatch")
+    return QuotaSpendPrecheck(
+        identity=_readback_result(payload.get("identity"), identity=True),
+        settlement=_readback_result(payload.get("settlement")),
+        progress=_optional_readback_record(payload.get("progress")),
+        spend_run_present=spend_run_present,
+        spend_request_rejection=(
+            _readback_result(payload["spend_request_rejection"])
+            if "spend_request_rejection" in payload else None
         ),
     )
 
 
-def require_settlement_writeback(
-    runtime_root: Path,
-    identity: SettlementIdentity,
-) -> SettlementResult[dict[str, Any]]:
-    run = find_settlement_writeback(runtime_root, identity)
-    receipt_event = find_settlement_step_event(
-        runtime_root,
-        identity,
-        event_kind="refresh_state",
-    )
-    if run is None or receipt_event is None:
-        return SettlementResult.failed(
-            kind=SettlementFailureKind.WRITEBACK_MISSING,
-            step_kind=SettlementStepKind.DURABLE_WRITEBACK,
-            reason=(
-                "matching accountable refresh-state receipt is missing for the "
-                "original settlement identity"
-            ),
-        )
-    event_id = str(receipt_event.get("event_id") or "").strip()
-    return SettlementResult.pure(
-        run,
-        receipts=(
-            settlement_receipt(
-                identity,
-                step_kind=SettlementStepKind.DURABLE_WRITEBACK,
-                source_ref=f"rollout_event:{event_id}" if event_id else None,
-            ),
-        ),
-    )
-
-
-def find_settlement_spend_run(
-    runtime_root: Path,
-    identity: SettlementIdentity,
-) -> dict[str, Any] | None:
-    for run in reversed(_run_index_records(runtime_root, identity.goal_id)):
-        if str(run.get("classification") or "") != "quota_slot_spent":
-            continue
-        if str(run.get("turn_instance_id") or "") != identity.turn_instance_id:
-            continue
-        if not _run_matches_settlement_binding(run, identity):
-            continue
-        if normalize_todo_claimed_by(run.get("agent_id")) != identity.agent_id:
-            continue
-        return run
-    return None
-
-
-def find_quota_spend_run_by_effect_ref(
+def read_heartbeat_settlement(
     runtime_root: Path,
     *,
     goal_id: str,
-    effect_ref: str,
-) -> dict[str, Any] | None:
-    """Return the durable quota run for one provider-owned effect attempt."""
+    agent_id: str | None,
+    todo_id: str | None,
+    turn_instance_id: str | None,
+    replan_obligation_id: str | None = None,
+    infer_turn_instance_id: bool = False,
+    allow_unbound_binding: bool = False,
+    resolve_original_binding: bool = False,
+    pending_closeout: bool = False,
+    refresh_retry: dict[str, Any] | None = None,
+    registry_path: Path | None = None,
+    goal_ref: Mapping[str, Any] | None = None,
+    source_admission: Mapping[str, Any] | None = None,
+    borrow_source_admission: bool = False,
+    heartbeat_reentry_guard: dict[str, Any] | None = None,
+    include_record_bodies: bool = True,
+    tolerate_malformed_history: bool = False,
+) -> QuotaSettlementReadback | None:
+    """Read one complete heartbeat settlement through the TS domain owner."""
 
-    normalized_effect_ref = str(effect_ref or "").strip()
-    if not normalized_effect_ref:
-        return None
-    for run in reversed(_run_index_records(runtime_root, goal_id)):
-        if str(run.get("classification") or "") != "quota_slot_spent":
-            continue
-        if str(run.get("effect_ref") or "") == normalized_effect_ref:
-            return run
-    return None
-
-
-def require_settlement_spend(
-    runtime_root: Path,
-    identity: SettlementIdentity,
-) -> SettlementResult[dict[str, Any]]:
-    run = find_settlement_spend_run(runtime_root, identity)
-    receipt_event = find_settlement_step_event(
+    payload = _read_heartbeat_settlement_payload(
         runtime_root,
-        identity,
-        event_kind="quota_spend",
-    )
-    if run is None or receipt_event is None:
-        return SettlementResult.failed(
-            kind=SettlementFailureKind.RECEIPT_MISSING,
-            step_kind=SettlementStepKind.QUOTA_SPEND,
-            reason="matching quota spend receipt is missing",
-        )
-    event_id = str(receipt_event.get("event_id") or "").strip()
-    return SettlementResult.pure(
-        run,
-        receipts=(
-            settlement_receipt(
-                identity,
-                step_kind=SettlementStepKind.QUOTA_SPEND,
-                source_ref=f"rollout_event:{event_id}" if event_id else None,
+        goal_id=goal_id,
+        fields={
+            "agent_id": agent_id,
+            "todo_id": todo_id,
+            "turn_instance_id": turn_instance_id,
+            "replan_obligation_id": replan_obligation_id,
+            "infer_turn_instance_id": infer_turn_instance_id,
+            "allow_unbound_binding": allow_unbound_binding,
+            **(
+                {"include_record_bodies": include_record_bodies}
+                if include_record_bodies is not True
+                else {}
             ),
+            **(
+                {"tolerate_malformed_history": True}
+                if tolerate_malformed_history
+                else {}
+            ),
+            **({"resolve_original_binding": True} if resolve_original_binding else {}),
+            **({"pending_closeout": True} if pending_closeout else {}),
+            **({"refresh_retry": refresh_retry} if refresh_retry is not None else {}),
+            **({"borrow_source_admission": True} if borrow_source_admission else {}),
+            **(
+                {"heartbeat_reentry_guard": heartbeat_reentry_guard}
+                if heartbeat_reentry_guard is not None
+                else {}
+            ),
+        },
+        registry_path=registry_path,
+        goal_ref=goal_ref,
+        source_admission=source_admission,
+    )
+    if payload is None:
+        return None
+    workspace_causality = _optional_readback_record(
+        payload.get("workspace_causality")
+    )
+    monitor_phase = payload.get("monitor_phase")
+    replay_phase = payload.get("replay_phase")
+    if monitor_phase not in {None, "poll_due", "settlement_pending", "settled"} or (
+        replay_phase not in {None, "open", "settlement_pending", "settled"}
+    ):
+        raise RuntimeError("TypeScript quota settlement readback result shape mismatch")
+    return QuotaSettlementReadback(
+        identity=_readback_result(payload.get("identity"), identity=True),
+        writeback=_readback_result(payload.get("writeback")),
+        spend=_readback_result(payload.get("spend")),
+        delivery=_readback_result(payload.get("delivery")),
+        settlement=_readback_result(payload.get("settlement")),
+        terminal_closeout=_readback_result(payload.get("terminal_closeout")),
+        terminal_settlement=_readback_result(payload.get("terminal_settlement")),
+        workspace_causality=(
+            {str(key): str(value) for key, value in workspace_causality.items()}
+            if workspace_causality is not None
+            else None
         ),
+        semantic_replan_guard=_semantic_replan_guard(
+            payload.get("semantic_replan_guard")
+        ),
+        writeback_run=_optional_readback_record(payload.get("writeback_run")),
+        refresh_recovery=_optional_readback_record(payload.get("refresh_recovery")),
+        external_delivery=_optional_readback_record(payload.get("external_delivery")),
+        progress=_optional_readback_record(payload.get("progress")),
+        native_child_admission=_optional_readback_record(payload.get("native_child_admission")),
+        heartbeat_reentry_qualification=_optional_readback_record(payload.get("heartbeat_reentry_qualification")),
+        successor_replan_pending=payload.get("successor_replan_pending") is True,
+        replan_execution_pending=payload.get("replan_execution_pending") is True,
+        spend_run=_optional_readback_record(payload.get("spend_run")),
+        heartbeat_receipt=_optional_readback_record(payload.get("heartbeat_receipt")),
+        writeback_event=_optional_readback_record(payload.get("writeback_event")),
+        spend_event=_optional_readback_record(payload.get("spend_event")),
+        completion_event=_optional_readback_record(payload.get("completion_event")),
+        supersede_event=_optional_readback_record(payload.get("supersede_event")),
+        monitor_phase=(
+            ReceiptBoundMonitorPhase(str(monitor_phase))
+            if monitor_phase is not None
+            else None
+        ),
+        replay_phase=(
+            ReceiptBoundReplayPhase(str(replay_phase))
+            if replay_phase is not None
+            else None
+        ),
+        admission_recorded_at=_optional_readback_text(payload.get("admission_recorded_at")),
+        admission_event_id=_optional_readback_text(payload.get("admission_event_id")),
+        prepared_lease=_optional_readback_record(payload.get("prepared_lease")),
+        prepared_lease_required=payload.get("prepared_lease_required") is True,
     )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canary the interaction/protocol state machine across major quota modes."""
+"""Canary the structured interaction state machine across major quota modes."""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ from loopx.control_plane.work_items.execution_obligation import (  # noqa: E402
     build_execution_obligation,
 )
 from loopx.control_plane.work_items.interaction_contract import (  # noqa: E402
+    _build_interaction_contract_projection,
     build_interaction_contract,
-    build_protocol_action_packet,
     user_channel_action_required,
 )
 from loopx.control_plane.work_items.work_lane import build_work_lane_contract  # noqa: E402
@@ -165,7 +165,9 @@ def base_payload(
             "first_open_items": [advancement_item()] if should_run else [],
         },
         "automation_liveness": {
-            "automation_action": "execute_bounded_work" if should_run else "keep_active_quiet",
+            "automation_action": "execute_bounded_work"
+            if should_run
+            else "keep_active_quiet",
             "pause_allowed": False,
         },
     }
@@ -181,17 +183,17 @@ def base_payload(
 
 
 def finalize(payload: dict[str, Any]) -> dict[str, Any]:
-    payload["interaction_contract"] = build_interaction_contract(
+    payload["interaction_contract"], arbitration = _build_interaction_contract_projection(
         payload,
+        agent_scope_frontier_actions=[action.value for action in AgentScopeFrontierAction],
         scheduler_execution_context=APP_SCHEDULER_CONTEXT,
     )
     payload["scheduler_hint"] = build_scheduler_hint(
         payload,
         user_action_required=user_channel_action_required(payload),
-        agent_scope_frontier_actions=[action.value for action in AgentScopeFrontierAction],
+        arbitration=arbitration,
         scheduler_execution_context=APP_SCHEDULER_CONTEXT,
     )
-    payload["protocol_action_packet"] = build_protocol_action_packet(payload)
     return payload
 
 
@@ -272,7 +274,7 @@ def _assert_cross_layer_case(
     must_attempt: bool = True,
     quiet: bool = False,
     spend: bool = True,
-    summary_fragments: tuple[str, ...] = (),
+    action_fragment: str | None = None,
     cli_fragments: tuple[str, ...] = (),
 ) -> None:
     contract = payload["interaction_contract"]
@@ -289,13 +291,13 @@ def _assert_cross_layer_case(
     assert contract["agent_channel"]["quiet_noop_allowed"] is quiet, (name, contract)
     assert contract["cli_channel"]["spend_after_validation"] is spend, (name, contract)
     assert scheduler_hint["action"] == scheduler, (name, scheduler_hint)
-    assert scheduler_hint["codex_app"]["recommended_interval_minutes"] == interval, (
+    assert scheduler_hint["app_automation"]["recommended_interval_minutes"] == interval, (
         name,
         scheduler_hint,
     )
-    summary = payload["protocol_action_packet"]["summary"]
-    for fragment in summary_fragments:
-        assert fragment in summary, (name, summary)
+    assert "protocol_action_packet" not in payload, (name, payload)
+    if action_fragment is not None:
+        assert action_fragment in contract["agent_channel"]["primary_action"], (name, contract)
     cli_actions = " ".join(contract["cli_channel"]["next_cli_actions"])
     for fragment in cli_fragments:
         assert fragment in cli_actions, (name, cli_actions)
@@ -315,7 +317,6 @@ def assert_cross_layer_state_machine_matrix() -> None:
         lane="advancement_task",
         obligation="advance_one_bounded_segment",
         interaction="bounded_delivery",
-        summary_fragments=("lane=advancement_task", "scheduler=run_now"),
     )
     _assert_cross_layer_case(
         "due monitor preemption",
@@ -323,7 +324,7 @@ def assert_cross_layer_state_machine_matrix() -> None:
         lane="continuous_monitor",
         obligation="attempt_due_monitor",
         interaction="bounded_delivery",
-        summary_fragments=("lane=continuous_monitor", "todo_due_monitor"),
+        action_fragment="todo_due_monitor",
     )
     _assert_cross_layer_case(
         "monitor schedule gap repair",
@@ -331,10 +332,7 @@ def assert_cross_layer_state_machine_matrix() -> None:
         lane="advancement_task",
         obligation="repair_monitor_schedule_metadata",
         interaction="bounded_delivery",
-        summary_fragments=(
-            "lane=advancement_task",
-            "repair the selected continuous_monitor todo",
-        ),
+        action_fragment="repair the selected continuous_monitor todo",
     )
     _assert_cross_layer_case(
         "monitor quiet wait",
@@ -354,10 +352,6 @@ def assert_cross_layer_state_machine_matrix() -> None:
         must_attempt=False,
         quiet=True,
         spend=False,
-        summary_fragments=(
-            "lane=continuous_monitor",
-            "scheduler=backoff_until_material_transition",
-        ),
     )
     _assert_cross_layer_case(
         "agent scope wait",
@@ -375,13 +369,11 @@ def assert_cross_layer_state_machine_matrix() -> None:
         must_attempt=False,
         quiet=True,
         spend=False,
-        summary_fragments=("scheduler=backoff_until_reassigned",),
     )
     _assert_cross_layer_case(
         "successor replan",
         _successor_replan_payload(),
         interaction=AgentScopeFrontierAction.SUCCESSOR_REPLAN_REQUIRED.value,
-        summary_fragments=("scheduler=run_now",),
         cli_fragments=("todo_deferred_successor",),
     )
 
@@ -401,10 +393,9 @@ def assert_bounded_delivery_bundle() -> None:
     assert contract["agent_channel"]["quiet_noop_allowed"] is False, contract
     assert contract["cli_channel"]["spend_after_validation"] is True, contract
     assert payload["scheduler_hint"]["action"] == "run_now", payload
-    summary = payload["protocol_action_packet"]["summary"]
-    assert "actor=agent" in summary, summary
-    assert "lane=advancement_task" in summary, summary
-    assert "scheduler=run_now" in summary, summary
+    assert contract["user_channel"]["action_required"] is False, contract
+    assert payload["work_lane_contract"]["lane"] == "advancement_task", payload
+    assert "protocol_action_packet" not in payload, payload
 
 
 def assert_user_notice_can_coexist_with_bounded_delivery() -> None:
@@ -470,10 +461,41 @@ def assert_user_action_is_non_blocking_notice() -> None:
     ], contract
     assert contract["agent_channel"]["must_attempt"] is True, contract
     assert contract["agent_channel"]["delivery_allowed"] is True, contract
-    summary = payload["protocol_action_packet"]["summary"]
-    assert "actor=agent" in summary, summary
-    assert "user_action_required=false" in summary, summary
-    assert "user_action_pending=true" in summary, summary
+    assert "protocol_action_packet" not in payload, payload
+
+
+def assert_gate_cooldown_suppresses_non_blocking_notice() -> None:
+    payload = base_payload(
+        should_run=False,
+        effective_action="monitor_quiet_skip",
+        work_lane=monitor_quiet_lane(),
+        heartbeat_mode="monitor_quiet_until_material_transition",
+    )
+    user_action = {
+        "todo_id": "todo_user_action_cooldown",
+        "status": "open",
+        "task_class": "user_action",
+        "text": "Confirm one bounded action.",
+    }
+    payload["user_todo_summary"] = {
+        "first_open_items": [user_action],
+        "user_action_items": [user_action],
+    }
+    payload["user_gate_notification_cooldown"] = {
+        "notification_due": False,
+        "notification_suppressed": True,
+        "reason": "the same gate is outside its explicit reminder window",
+    }
+    contract = build_interaction_contract(
+        payload,
+        scheduler_execution_context=APP_SCHEDULER_CONTEXT,
+    )
+    user_channel = contract["user_channel"]
+    assert contract["mode"] == "user_gate_cooldown_wait", contract
+    assert user_channel["action_required"] is False, contract
+    assert user_channel["notify"] == "DONT_NOTIFY", contract
+    assert "non_blocking" not in user_channel, contract
+    assert "actions" not in user_channel, contract
 
 
 def assert_monitor_quiet_skip_is_no_spend() -> None:
@@ -493,8 +515,12 @@ def assert_monitor_quiet_skip_is_no_spend() -> None:
     assert contract["cli_channel"]["spend_policy"] == (
         "no spend for unchanged heartbeat stall receipt"
     ), contract
-    assert "heartbeat_receipt" in contract["cli_channel"]["next_cli_actions"][0], contract
-    assert "--turn-instance-id" in contract["cli_channel"]["next_cli_actions"][0], contract
+    assert "heartbeat_receipt" in contract["cli_channel"]["next_cli_actions"][0], (
+        contract
+    )
+    assert "--turn-instance-id" in contract["cli_channel"]["next_cli_actions"][0], (
+        contract
+    )
     assert "LOOPX_TURN" in contract["cli_channel"]["next_cli_actions"][0], contract
 
 
@@ -514,7 +540,9 @@ def assert_autonomous_replan_projects_accountable_settlement() -> None:
     assert contract["mode"] == "autonomous_replan", payload
     assert contract["agent_channel"]["must_attempt"] is True, contract
     assert contract["cli_channel"]["spend_after_validation"] is True, contract
-    assert "accountable replan delta" in contract["cli_channel"]["spend_policy"], contract
+    assert "accountable replan delta" in contract["cli_channel"]["spend_policy"], (
+        contract
+    )
     assert "surface_only" in contract["cli_channel"]["spend_policy"], contract
     settlement = contract["cli_channel"]["settlement_plan"]
     assert settlement["identity"]["binding_kind"] == "autonomous_replan", contract
@@ -550,7 +578,9 @@ def assert_agent_scope_wait_is_quiet_noop() -> None:
 def assert_successor_replan_is_validated_spend_path() -> None:
     payload = _successor_replan_payload()
     contract = payload["interaction_contract"]
-    assert contract["mode"] == AgentScopeFrontierAction.SUCCESSOR_REPLAN_REQUIRED.value, payload
+    assert (
+        contract["mode"] == AgentScopeFrontierAction.SUCCESSOR_REPLAN_REQUIRED.value
+    ), payload
     assert contract["agent_channel"]["must_attempt"] is True, contract
     assert contract["cli_channel"]["spend_after_validation"] is True, contract
     assert contract["cli_channel"]["spend_policy"].startswith("spend once"), contract
@@ -559,29 +589,26 @@ def assert_successor_replan_is_validated_spend_path() -> None:
     assert any("spend-slot" in action for action in actions), actions
 
 
-def assert_required_reads_are_mirrored_into_execution_channels() -> None:
+def assert_required_reads_have_one_agent_execution_carrier() -> None:
     payload = base_payload(
         should_run=True,
         effective_action="normal_run",
         work_lane=advancement_lane(),
         heartbeat_mode="steering_audit_then_one_step",
     )
-    payload["required_reads"] = [
+    expected = [
         {
             "kind": "agent_scoped_evidence_log",
             "command": "  loopx evidence-log --goal-id interaction-state-machine-goal  ",
         }
     ]
+    # Reads have one authoritative execution carrier. Commands stay verbatim;
+    # display compaction must not change quoted arguments.
+    payload["required_reads"] = expected
     payload = finalize(payload)
     contract = payload["interaction_contract"]
-    expected = [
-        {
-            "kind": "agent_scoped_evidence_log",
-            "command": "loopx evidence-log --goal-id interaction-state-machine-goal",
-        }
-    ]
     assert contract["agent_channel"]["required_reads"] == expected, contract
-    assert contract["cli_channel"]["required_reads"] == expected, contract
+    assert "required_reads" not in contract["cli_channel"], contract
     assert "required_reads" not in contract["user_channel"], contract
 
 
@@ -590,11 +617,12 @@ def main() -> int:
     assert_bounded_delivery_bundle()
     assert_user_notice_can_coexist_with_bounded_delivery()
     assert_user_action_is_non_blocking_notice()
+    assert_gate_cooldown_suppresses_non_blocking_notice()
     assert_monitor_quiet_skip_is_no_spend()
     assert_autonomous_replan_projects_accountable_settlement()
     assert_agent_scope_wait_is_quiet_noop()
     assert_successor_replan_is_validated_spend_path()
-    assert_required_reads_are_mirrored_into_execution_channels()
+    assert_required_reads_have_one_agent_execution_carrier()
     return 0
 
 

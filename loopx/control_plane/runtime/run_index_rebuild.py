@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ...file_lock import exclusive_run_index_lock
 from .run_artifacts import run_file_stem
 from .run_index_duplicates import classify_index_duplicate_records, index_identity
 
@@ -36,8 +37,27 @@ def _event_identity(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def split_index_lines(text: str) -> list[str]:
+    """Return the physical records of a run-index file.
+
+    Records are separated by LF. A JSON string value may contain U+0085,
+    U+2028 or U+2029 (the writer uses ``ensure_ascii=False``), and those
+    characters are data, not record boundaries.
+
+    A trailing LF terminates the last record instead of opening an empty one,
+    so the physical line count, and therefore every line number and every
+    byte the rewrite consumers serialize back, matches what the writer
+    produced. A record that is genuinely empty keeps its place.
+    """
+
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def read_index_rows(index_path: Path) -> tuple[list[str], list[tuple[int, dict[str, Any]]]]:
-    raw_lines = index_path.read_text(encoding="utf-8").splitlines()
+    raw_lines = split_index_lines(index_path.read_text(encoding="utf-8"))
     rows: list[tuple[int, dict[str, Any]]] = []
     for line_number, line in enumerate(raw_lines, start=1):
         if not line.strip():
@@ -189,75 +209,84 @@ def apply_reviewed_collision_rebuild(
     digest_prefix = plan_sha256[:16]
     for raw_index_path, groups in groups_by_index.items():
         index_path = Path(raw_index_path)
-        raw_lines, parsed_rows = read_index_rows(index_path)
-        rows_by_line = dict(parsed_rows)
-        replacements: dict[int, dict[str, Any]] = {}
-        recovery_paths: list[str] = []
+        with exclusive_run_index_lock(
+            index_path,
+            operation="history_index_collision_rebuild",
+        ):
+            raw_lines, parsed_rows = read_index_rows(index_path)
+            rows_by_line = dict(parsed_rows)
+            replacements: dict[int, dict[str, Any]] = {}
+            recovery_paths: list[str] = []
 
-        for group in groups:
-            source_identity = group.get("source_identity") or {}
-            generated_at = str(source_identity.get("generated_at") or "")
-            stem = run_file_stem(generated_at)
-            group_token = _sha256(source_identity)[:8]
-            for ordinal, row_spec in enumerate(group.get("rows") or [], start=1):
-                line_number = int(row_spec["line_number"])
-                source_record = rows_by_line.get(line_number)
-                if source_record is None or _sha256(source_record) != row_spec.get("row_sha256"):
-                    raise ValueError(
-                        f"reviewed collision row changed before rebuild: {index_path}:{line_number}"
+            for group in groups:
+                source_identity = group.get("source_identity") or {}
+                generated_at = str(source_identity.get("generated_at") or "")
+                stem = run_file_stem(generated_at)
+                group_token = _sha256(source_identity)[:8]
+                for ordinal, row_spec in enumerate(group.get("rows") or [], start=1):
+                    line_number = int(row_spec["line_number"])
+                    source_record = rows_by_line.get(line_number)
+                    if source_record is None or _sha256(source_record) != row_spec.get(
+                        "row_sha256"
+                    ):
+                        raise ValueError(
+                            f"reviewed collision row changed before rebuild: {index_path}:{line_number}"
+                        )
+                    recovery_stem = f"{stem}-collision-rebuild-{digest_prefix}-{group_token}-{ordinal}"
+                    json_path = index_path.parent / f"{recovery_stem}.json"
+                    markdown_path = index_path.parent / f"{recovery_stem}.md"
+                    rebuilt_record = dict(source_record)
+                    rebuilt_record["json_path"] = str(json_path)
+                    rebuilt_record["markdown_path"] = str(markdown_path)
+                    rebuilt_record["artifact_rebuild"] = {
+                        "schema_version": COLLISION_RECOVERY_ARTIFACT_SCHEMA,
+                        "review_plan_sha256": plan_sha256,
+                        "source_identity": source_identity,
+                        "source_line_number": line_number,
+                        "event_identity": row_spec.get("event_identity") or {},
+                        "ambiguous_legacy_artifact_claimed": False,
+                    }
+                    recovery_payload = {
+                        "schema_version": COLLISION_RECOVERY_ARTIFACT_SCHEMA,
+                        "artifact_rebuild": rebuilt_record["artifact_rebuild"],
+                        "index_record": source_record,
+                    }
+                    _write_new_or_verify(
+                        json_path,
+                        json.dumps(recovery_payload, ensure_ascii=False, indent=2)
+                        + "\n",
                     )
-                recovery_stem = (
-                    f"{stem}-collision-rebuild-{digest_prefix}-{group_token}-{ordinal}"
-                )
-                json_path = index_path.parent / f"{recovery_stem}.json"
-                markdown_path = index_path.parent / f"{recovery_stem}.md"
-                rebuilt_record = dict(source_record)
-                rebuilt_record["json_path"] = str(json_path)
-                rebuilt_record["markdown_path"] = str(markdown_path)
-                rebuilt_record["artifact_rebuild"] = {
-                    "schema_version": COLLISION_RECOVERY_ARTIFACT_SCHEMA,
-                    "review_plan_sha256": plan_sha256,
-                    "source_identity": source_identity,
-                    "source_line_number": line_number,
-                    "event_identity": row_spec.get("event_identity") or {},
-                    "ambiguous_legacy_artifact_claimed": False,
-                }
-                recovery_payload = {
-                    "schema_version": COLLISION_RECOVERY_ARTIFACT_SCHEMA,
-                    "artifact_rebuild": rebuilt_record["artifact_rebuild"],
-                    "index_record": source_record,
-                }
-                _write_new_or_verify(
-                    json_path,
-                    json.dumps(recovery_payload, ensure_ascii=False, indent=2) + "\n",
-                )
-                _write_new_or_verify(markdown_path, _recovery_markdown(rebuilt_record))
-                replacements[line_number] = rebuilt_record
-                recovery_paths.extend((str(json_path), str(markdown_path)))
+                    _write_new_or_verify(
+                        markdown_path, _recovery_markdown(rebuilt_record)
+                    )
+                    replacements[line_number] = rebuilt_record
+                    recovery_paths.extend((str(json_path), str(markdown_path)))
 
-        backup_path = index_path.with_name(
-            f"index.pre-collision-rebuild-{digest_prefix}.jsonl"
-        )
-        original_content = "".join(line + "\n" for line in raw_lines)
-        _write_new_or_verify(backup_path, original_content)
-        rebuilt_lines = [
-            json.dumps(replacements[line_number], ensure_ascii=False)
-            if line_number in replacements
-            else line
-            for line_number, line in enumerate(raw_lines, start=1)
-        ]
-        tmp_path = index_path.with_name(f"index.collision-rebuild-{digest_prefix}.tmp")
-        tmp_path.write_text(
-            "".join(line + "\n" for line in rebuilt_lines),
-            encoding="utf-8",
-        )
-        tmp_path.replace(index_path)
-        rebuilt_indexes.append(
-            {
-                "index_path": str(index_path),
-                "backup_path": str(backup_path),
-                "preserved_row_count": len(replacements),
-                "recovery_paths": recovery_paths,
-            }
-        )
+            backup_path = index_path.with_name(
+                f"index.pre-collision-rebuild-{digest_prefix}.jsonl"
+            )
+            original_content = "".join(line + "\n" for line in raw_lines)
+            _write_new_or_verify(backup_path, original_content)
+            rebuilt_lines = [
+                json.dumps(replacements[line_number], ensure_ascii=False)
+                if line_number in replacements
+                else line
+                for line_number, line in enumerate(raw_lines, start=1)
+            ]
+            tmp_path = index_path.with_name(
+                f"index.collision-rebuild-{digest_prefix}.tmp"
+            )
+            tmp_path.write_text(
+                "".join(line + "\n" for line in rebuilt_lines),
+                encoding="utf-8",
+            )
+            tmp_path.replace(index_path)
+            rebuilt_indexes.append(
+                {
+                    "index_path": str(index_path),
+                    "backup_path": str(backup_path),
+                    "preserved_row_count": len(replacements),
+                    "recovery_paths": recovery_paths,
+                }
+            )
     return rebuilt_indexes

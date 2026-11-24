@@ -1,18 +1,25 @@
 from __future__ import annotations
+from .effective_action import EffectiveAction
 
-import fnmatch
+from pathlib import Path
 from typing import Any
 
-from ...state_projection import is_user_wait_text
+from ...repository_identity import resolve_project_identity
+from ...state_projection import actions_are_projection_aligned, is_user_wait_text
+from ..effect_runtime import (
+    EffectRuntimeRemoteError, EffectRuntimeStartupError, effect_runtime_result,
+)
 from ..todos.contract import (
     TODO_TASK_CLASS_ADVANCEMENT,
     normalize_required_write_scopes,
+    normalize_todo_task_repository,
 )
-from ..todos.projection import (
+from ..todos.todo_semantics import (
     todo_item_is_actionable_open,
     todo_item_task_class,
 )
 from ..work_items.primary_action import protocol_action_text
+from .selected_todo_projection import lookup_raw_todo
 
 
 def open_todo_count(summary: dict[str, Any] | None) -> int:
@@ -98,6 +105,37 @@ def build_state_projection_gap_repair_hint(
         return None
     if open_todo_count(user_todo_summary) > 0 or open_todo_count(agent_todo_summary) > 0:
         return None
+    # A deferred advancement Todo with a pending dated resume is already the
+    # concrete projection of Next Action.  It is temporarily unrunnable, not
+    # missing, so asking for Todo expansion would defeat its bounded wait.
+    evidence = gap.get("first_evidence")
+    deferred = (
+        agent_todo_summary.get("deferred_items")
+        if isinstance(agent_todo_summary, dict)
+        else None
+    )
+    if (
+        isinstance(evidence, list)
+        and evidence
+        and gap.get("evidence_count") == len(evidence)
+        and isinstance(deferred, list)
+        and all(
+            isinstance(entry, dict)
+            and entry.get("kind") == "next_action_executable_without_agent_todo"
+            and entry.get("target_role") == "agent"
+            and any(
+                isinstance(item, dict)
+                and item.get("task_class") == TODO_TASK_CLASS_ADVANCEMENT
+                and item.get("status") == "deferred"
+                and item.get("resume_ready") is False
+                and str(item.get("resume_when") or "").startswith("resume_at:")
+                and actions_are_projection_aligned(entry.get("text"), item.get("text"))
+                for item in deferred
+            )
+            for entry in evidence
+        )
+    ):
+        return None
     must_attempt = bool(
         work_lane_contract
         and work_lane_contract.get("must_attempt_work") is True
@@ -108,7 +146,7 @@ def build_state_projection_gap_repair_hint(
         "source": "quota.should-run",
         "trigger": "state_projection_gap",
         "recommended_mode": "repair_state_projection_gap",
-        "effective_action": "state_projection_gap_repair",
+        "effective_action": EffectiveAction.STATE_PROJECTION_GAP_REPAIR.value,
         "allowed": True,
         "notify": "DONT_NOTIFY",
         "reason": (
@@ -128,17 +166,45 @@ def build_state_projection_gap_repair_hint(
     }
 
 
-def write_scope_allowed(required_scope: str, allowed_scopes: list[str]) -> bool:
-    required = str(required_scope or "").strip()
-    if not required:
-        return True
-    for allowed in allowed_scopes:
-        pattern = str(allowed or "").strip()
-        if not pattern:
-            continue
-        if required == pattern:
+def _write_scope_coverage(
+    required_scopes: list[str], scope_groups: list[list[str]],
+) -> list[list[bool]]:
+    """Transport one batch to the same scope owner used by child admission."""
+    checks = [
+        {"required": required, "allowed": allowed}
+        for allowed in scope_groups for required in required_scopes
+    ]
+    response = effect_runtime_result("quota.write_scope_coverage", {"checks": checks})
+    covered = response.get("covered") if isinstance(response, dict) else None
+    if (not isinstance(covered, list) or len(covered) != len(checks)
+            or any(not isinstance(value, bool) for value in covered)):
+        raise TypeError("invalid typed write-scope coverage result")
+    width = len(required_scopes)
+    return [covered[index:index + width] for index in range(0, len(covered), width)]
+
+
+def _goal_boundary_covers_repo_root(
+    allowed_scopes: list[str],
+    *,
+    goal_repo: str | Path | None = None,
+) -> bool:
+    if not allowed_scopes:
+        return False
+    repo_roots: set[str] = set()
+    if goal_repo is not None:
+        raw_repo = str(goal_repo).strip()
+        if raw_repo:
+            repo_roots.add(Path(raw_repo).as_posix().rstrip("/"))
+            try:
+                repo_roots.add(Path(raw_repo).expanduser().resolve(strict=False).as_posix().rstrip("/"))
+            except OSError:
+                pass
+    for raw in allowed_scopes:
+        clean = str(raw).strip()
+        if clean in {"**", "./**", "/**", ".", "./"}:
             return True
-        if fnmatch.fnmatchcase(required, pattern):
+        norm = clean.rstrip("/")
+        if norm in repo_roots or (clean.endswith("/**") and clean[:-3].rstrip("/") in repo_roots):
             return True
     return False
 
@@ -150,6 +216,8 @@ def build_boundary_projection_repair_hint(
     candidate_should_run: bool,
     capability_gate: dict[str, Any] | None = None,
     selected_todo: dict[str, Any] | None = None,
+    raw_agent_todo_summary: dict[str, Any] | None = None,
+    goal_repo: str | Path | None = None,
 ) -> dict[str, Any] | None:
     if not candidate_should_run or not isinstance(agent_todo_summary, dict):
         return None
@@ -179,6 +247,14 @@ def build_boundary_projection_repair_hint(
         break
     if not selected:
         return None
+    raw_match = lookup_raw_todo(raw_agent_todo_summary, selected.get("todo_id"))
+    if raw_match:
+        selected = {
+            **raw_match,
+            **selected,
+            **({"task_repository": raw_match["task_repository"]}
+               if not selected.get("task_repository") and raw_match.get("task_repository") else {}),
+        }
 
     required_scopes = normalize_required_write_scopes(
         selected.get("required_write_scopes")
@@ -186,25 +262,44 @@ def build_boundary_projection_repair_hint(
     if not required_scopes:
         return None
     boundary = goal_boundary if isinstance(goal_boundary, dict) else {}
-    allowed_scopes = normalize_required_write_scopes(boundary.get("write_scope"))
-    missing_scopes = [
-        scope
-        for scope in required_scopes
-        if not write_scope_allowed(scope, allowed_scopes)
+    raw_allowed = [
+        str(value).strip()
+        for value in (boundary.get("write_scope") or [])
+        if isinstance(value, str) and str(value).strip()
     ]
+    if _goal_boundary_covers_repo_root(raw_allowed, goal_repo=goal_repo):
+        return None
+    allowed_scopes = normalize_required_write_scopes(raw_allowed)
+    active_coverage = _write_scope_coverage(required_scopes, [allowed_scopes])[0]
+    missing_scopes = [scope for scope, covered in zip(required_scopes, active_coverage) if not covered]
     if not missing_scopes:
         return None
-    selected_text = protocol_action_text(selected.get("text"), limit=220)
+    # Goal-relative grants apply unless the two repositories are known to differ.
+    task_repository = normalize_todo_task_repository(selected.get("task_repository"))
+    if task_repository:
+        goal_repository = normalize_todo_task_repository(boundary.get("task_repository"))
+        if not goal_repository and goal_repo:
+            try:
+                goal_repository = resolve_project_identity(goal_repo)
+            except ValueError:
+                pass
+        if goal_repository and goal_repository.casefold() != task_repository.casefold():
+            return None
     boundary_authority = (
         boundary.get("checkpointed_boundary_authority")
         if isinstance(boundary.get("checkpointed_boundary_authority"), dict)
         else None
     )
+    inactive_entries = [
+        entry for entry in (boundary_authority or {}).get("entries", []) or []
+        if isinstance(entry, dict) and entry.get("active") is not True
+    ]
+    selected_text = protocol_action_text(selected.get("text"), limit=220)
     repair: dict[str, Any] = {
         "source": "quota.should-run",
         "trigger": "required_write_scope_missing_from_goal_boundary",
         "recommended_mode": "repair_boundary_projection",
-        "effective_action": "boundary_projection_repair",
+        "effective_action": EffectiveAction.BOUNDARY_PROJECTION_REPAIR.value,
         "blocked_action_scope": "boundary_projection",
         "allowed": True,
         "notify": "DONT_NOTIFY",
@@ -239,11 +334,17 @@ def build_boundary_projection_repair_hint(
             "active_write_scope": boundary_authority.get("active_write_scope"),
         }
         inactive_candidates = []
-        for entry in boundary_authority.get("entries") or []:
-            if not isinstance(entry, dict) or entry.get("active") is True:
-                continue
-            scopes = normalize_required_write_scopes(entry.get("write_scope"))
-            if any(write_scope_allowed(scope, scopes) for scope in missing_scopes):
+        try:
+            inactive_coverage = _write_scope_coverage(missing_scopes, [
+                normalize_required_write_scopes(entry.get("write_scope"))
+                for entry in inactive_entries
+            ]) if inactive_entries else []
+        except (EffectRuntimeRemoteError, EffectRuntimeStartupError, TypeError):
+            # Optional provenance hints cannot overturn the active decision or
+            # hide the repair for uncovered writes. Active failures still raise.
+            inactive_coverage = []
+        for entry, entry_coverage in zip(inactive_entries, inactive_coverage):
+            if any(entry_coverage):
                 inactive_candidates.append(
                     {
                         key: entry.get(key)

@@ -17,10 +17,10 @@ from loopx.control_plane.scheduler.execution_context import (  # noqa: E402
 )
 from loopx.status import compact_todo_group  # noqa: E402
 from loopx.control_plane.todos.handoff_gate import (  # noqa: E402
-    build_todo_handoff_gate_lanes,
     build_todo_handoff_gate_states,
     handoff_ready_successor_todo_ids,
 )
+from loopx.control_plane.todos.quota_selection import project_quota_planning  # noqa: E402
 
 
 GOAL_ID = "cleared-blocker-successor-gate-fixture"
@@ -122,11 +122,15 @@ def assert_handoff_gate_lanes_and_ready_successors_are_todo_context_helpers() ->
     summary = agent_todo_summary([review_gate, successor, blocked_gate])
 
     assert handoff_ready_successor_todo_ids(summary) == {"todo_followup_slice"}, summary
-    lanes = build_todo_handoff_gate_lanes(
+    open_items = [item for item in summary["items"] if not item["done"]]
+    lanes = project_quota_planning(
         summary,
+        all_open_items=open_items,
+        source_open_count=len(open_items),
         agent_identity={"agent_id": BLOCKED_AGENT},
-        item_limit=10,
-    )
+        filter_user_gate_blocks_agent=False,
+        available_capabilities=[],
+    )["handoff_lanes"]
     assert lanes["handoff_gate_count"] == 2, lanes
     assert lanes["current_agent_handoff_gate_count"] == 2, lanes
     assert lanes["current_agent_cleared_without_successor_handoff_count"] == 1, lanes
@@ -234,7 +238,7 @@ def value_successor() -> dict:
         todo_id="todo_value_successor",
         text="[P0] Continue value exploration with the reviewed connector scope.",
         claimed_by=BLOCKED_AGENT,
-        resume_when="todo_done:todo_review_gate",
+        unblocks_todo_id="todo_review_gate",
     )
 
 
@@ -337,10 +341,10 @@ def assert_cleared_blocker_requires_successor_replan() -> None:
     scheduler = payload["scheduler_hint"]
     assert scheduler["action"] == "run_now", scheduler
     assert scheduler["cadence_class"] == "active_work", scheduler
-    assert scheduler["codex_app"]["recommended_rrule"] == "FREQ=MINUTELY;INTERVAL=3", scheduler
-    assert scheduler["codex_app"]["recommended_interval_minutes"] == 3, scheduler
-    assert scheduler["codex_app"]["stateful_backoff"]["apply_needed"] is True, scheduler
-    assert scheduler["codex_app"]["no_spend_for_cadence_change"] is True, scheduler
+    assert scheduler["app_automation"]["recommended_rrule"] == "FREQ=MINUTELY;INTERVAL=3", scheduler
+    assert scheduler["app_automation"]["recommended_interval_minutes"] == 3, scheduler
+    assert scheduler["app_automation"]["stateful_backoff"]["apply_needed"] is True, scheduler
+    assert scheduler["app_automation"]["no_spend_for_cadence_change"] is True, scheduler
 
 
 def assert_stale_handoff_closeout_stays_with_its_executor() -> None:
@@ -456,12 +460,14 @@ def assert_completed_successor_keeps_old_gate_cleared() -> None:
     assert summary["current_agent_cleared_without_successor_handoff_count"] == 0, payload
 
 
-def assert_superseded_completed_blocker_does_not_wake_agent() -> None:
+def assert_resolved_supersession_does_not_wake_agent() -> None:
     payload = build_quota_should_run(
         status_payload(
             [
                 primary_owned_todo(),
                 handoff_review(status="done", superseded_by="todo_value_successor"),
+                todo_item(todo_id="todo_value_successor", text="Verified replacement",
+                          status="done", no_followup=True),
             ],
             recommended_action="Wait for main-control after superseded handoff.",
         ),
@@ -503,7 +509,7 @@ def main() -> int:
     assert_archived_completed_blocker_does_not_wake_agent()
     assert_existing_successor_runs_normally()
     assert_completed_successor_keeps_old_gate_cleared()
-    assert_superseded_completed_blocker_does_not_wake_agent()
+    assert_resolved_supersession_does_not_wake_agent()
     assert_no_followup_completed_blocker_does_not_wake_agent()
     print("quota-cleared-blocker-successor-gate-smoke ok")
     return 0

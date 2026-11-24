@@ -1,0 +1,352 @@
+// Runs the collector against real SQLite through a minimal D1-shaped shim.
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+import test from "node:test";
+import { createServer } from "node:http";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { configure, configureContext, observe } from "../../../loopx/control_plane/runtime/usage_statistics.ts";
+
+import { MAX_BODY_BYTES, handle, purge, suppressSmall, validatePing } from "../src/collector.js";
+
+const SCHEMA = readFileSync(new URL("../schema.sql", import.meta.url), "utf8");
+
+function d1() {
+  const db = new DatabaseSync(":memory:");
+  db.exec(SCHEMA);
+  // D1 returns plain objects; node:sqlite returns null-prototype rows.
+  const plain = (row) => (row ? { ...row } : null);
+  const statement = (sql, params = []) => ({
+    bind: (...args) => statement(sql, args),
+    run: async () => db.prepare(sql).run(...params),
+    all: async () => ({ results: db.prepare(sql).all(...params).map(plain) }),
+    first: async () => plain(db.prepare(sql).get(...params)),
+  });
+  const raw = {
+    all: (sql) => db.prepare(sql).all().map(plain),
+    get: (sql) => plain(db.prepare(sql).get()),
+    query: (sql, params) => db.prepare(sql).all(params).map(plain),
+  };
+  return {
+    raw,
+    prepare: (sql) => statement(sql),
+    batch: async (statements) => {
+      db.exec("BEGIN");
+      try {
+        for (const stmt of statements) await stmt.run();
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+}
+
+const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+const ping = (n, extra = {}) => ({
+  schema: "loopx_usage_ping_v0",
+  install_id: id(n),
+  version: "1.2.0",
+  os: "darwin",
+  python: "3.12",
+  channel: "pip",
+  ...extra,
+});
+const post = (body, headers = { "content-type": "application/json" }) =>
+  new Request("https://collector.example/v0/ping", {
+    method: "POST",
+    headers,
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
+const at = (day) => new Date(`${day}T12:00:00Z`);
+
+test("validation accepts exactly the documented payload", () => {
+  assert.ok(validatePing(ping(1)).ping);
+  assert.match(validatePing({ ...ping(1), hostname: "laptop" }).error, /fields must be exactly/);
+  assert.match(validatePing({ ...ping(1), install_id: "not-a-uuid" }).error, /UUIDv4/);
+  assert.match(validatePing({ ...ping(1), os: "haiku" }).error, /os/);
+  assert.match(validatePing({ ...ping(1), channel: "/Users/me/loopx" }).error, /channel/);
+  assert.match(validatePing({ ...ping(1), version: 120 }).error, /string/);
+  assert.match(validatePing([ping(1)]).error, /object/);
+});
+
+test("ping endpoint rejects wrong method, type, size and JSON", async () => {
+  const db = d1();
+  const get = await handle(new Request("https://collector.example/v0/ping"), db);
+  assert.equal(get.status, 405);
+  assert.equal((await handle(post(ping(1), { "content-type": "text/plain" }), db)).status, 415);
+  assert.equal((await handle(post("x".repeat(MAX_BODY_BYTES + 1)), db)).status, 413);
+  assert.equal((await handle(post("{"), db)).status, 400);
+  assert.equal(db.raw.get("SELECT COUNT(*) AS n FROM pings").n, 0);
+});
+
+test("one row per installation per day; first day kept; only payload fields stored", async () => {
+  const db = d1();
+  assert.equal((await handle(post(ping(1)), db, at("2026-10-01"))).status, 204);
+  assert.equal((await handle(post(ping(1, { version: "1.2.1" })), db, at("2026-10-01"))).status, 204);
+  await handle(post(ping(1)), db, at("2026-10-02"));
+  const rows = db.raw.all("SELECT * FROM pings ORDER BY day");
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].version, "1.2.1");
+  assert.deepEqual(Object.keys(rows[0]).sort(), ["arch", "channel", "day", "install_id", "os", "python", "version"]);
+  assert.deepEqual(db.raw.all("SELECT * FROM installs"), [{ install_id: id(1), first_day: "2026-10-01" }]);
+});
+
+test("stats report monthly active, new installs and suppressed breakdowns", async () => {
+  const db = d1();
+  for (let n = 1; n <= 6; n++) await handle(post(ping(n)), db, at("2026-09-10"));
+  for (let n = 1; n <= 3; n++) await handle(post(ping(n)), db, at("2026-10-03"));
+  await handle(post(ping(7, { os: "linux" })), db, at("2026-10-04"));
+  await handle(post(ping(8, { os: "linux" })), db, at("2026-10-05"));
+  const response = await handle(new Request("https://collector.example/v0/stats"), db, at("2026-10-05"));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("access-control-allow-origin"), "*");
+  const stats = await response.json();
+  const month = (m) => stats.months.find((row) => row.month === m);
+  assert.equal(stats.months.length, 12);
+  assert.deepEqual(month("2026-09"), { month: "2026-09", monthly_active: 6, new_installs: 6 });
+  assert.deepEqual(month("2026-10"), { month: "2026-10", monthly_active: 5, new_installs: 2 });
+  assert.equal(stats.rolling_30d_active, 8); // window reaches back to 2026-09-06
+  // 3 darwin + 2 linux: both under the threshold, so neither is published.
+  assert.deepEqual(stats.current_month_breakdown.os, { other: 5 });
+  assert.deepEqual(stats.current_month_breakdown.version, { "1.2.0": 5 });
+});
+
+test("suppressSmall folds small buckets into other", () => {
+  assert.deepEqual(
+    suppressSmall([
+      { key: "1.2.0", installs: 9 },
+      { key: "1.1.0", installs: 2 },
+      { key: "1.0.0", installs: 1 },
+    ]),
+    { "1.2.0": 9, other: 3 },
+  );
+});
+
+test("purge drops rows past retention and orphaned installs", async () => {
+  const db = d1();
+  await handle(post(ping(1)), db, at("2025-01-01"));
+  await handle(post(ping(2)), db, at("2026-09-01"));
+  await purge(db, "2026-09-26");
+  assert.deepEqual(db.raw.all("SELECT install_id FROM installs"), [{ install_id: id(2) }]);
+  assert.equal(db.raw.get("SELECT COUNT(*) AS n FROM pings").n, 1);
+});
+
+test("unknown paths are 404", async () => {
+  assert.equal((await handle(new Request("https://collector.example/"), d1())).status, 404);
+});
+
+test("installation profiles replace exact days idempotently, reject private fields and never expose IDs publicly", async () => {
+  const db = d1();
+  const profile = { activity_day: "2026-10-01", version: "1.2.4", context: "maintainer",
+    revision: 1, cli: [{ feature: "memory", count: 2 }],
+    runtime: [{ measurement: "codex_turn", observed_minutes: 120 }], truncated: false };
+  const payload = { schema: "loopx_installation_usage_v1", install_id: id(1), profiles: [profile] };
+  const request = value => new Request("https://collector.example/v1/installation", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(value),
+  });
+  for (let i = 0; i < 2; i++) assert.equal((await handle(request(payload), db, at("2026-10-02"))).status, 204);
+  assert.equal(db.raw.get("SELECT COUNT(*) AS n FROM installation_usage").n, 1);
+  assert.equal(JSON.parse(db.raw.get("SELECT cli FROM installation_usage").cli)[0].count, 2);
+  const newer = { ...profile, revision: 3, cli: [{ feature: "memory", count: 4 }] };
+  await handle(request({ ...payload, profiles: [newer] }), db, at("2026-10-02"));
+  await handle(request(payload), db, at("2026-10-02"));
+  assert.equal(JSON.parse(db.raw.get("SELECT cli FROM installation_usage").cli)[0].count, 4);
+  await handle(request({ ...payload, profiles: [{ ...newer, revision: 4, context: "personal" }] }), db, at("2026-10-02"));
+  assert.equal(db.raw.get("SELECT context FROM installation_usage").context, "maintainer", "historical context never relabeled");
+  assert.equal((await handle(request({ ...payload, prompt: "private" }), db, at("2026-10-02"))).status, 400);
+  assert.equal((await handle(request({ ...payload, profiles: [{ ...profile, activity_day: "2026-09-01" }] }), db, at("2026-10-02"))).status, 400);
+  assert.equal((await handle(new Request("https://collector.example/v1/installation"), db)).status, 405);
+  const stats = await (await handle(new Request("https://collector.example/v0/stats"), db, at("2026-10-02"))).json();
+  assert.equal(JSON.stringify(stats).includes(id(1)), false);
+  await purge(db, "2026-10-30");
+  assert.equal(db.raw.get("SELECT COUNT(*) AS n FROM installation_usage").n, 1, "30 activity days including today are retained");
+  await purge(db, "2026-10-31");
+  assert.equal(db.raw.get("SELECT COUNT(*) AS n FROM installation_usage").n, 0);
+});
+
+test("installation migration is additive and preserves the existing ping history", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec("CREATE TABLE pings(day TEXT, install_id TEXT); INSERT INTO pings VALUES ('2026-09-30', 'legacy');");
+  const migration = readFileSync(new URL("../migrations/0005-installation-usage.sql", import.meta.url), "utf8");
+  db.exec(migration); db.exec(migration);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM pings").get().n, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM installation_usage").get().n, 0);
+});
+
+for (const version of ["1.2.4", "2.0.0a1", "2.0.0b2", "2.0.0rc3"]) {
+  test(`real client HTTP to SQLite preserves versions, intervals and operator queries (${version})`, async t => {
+    const db = d1(), now = at("2026-10-01");
+    const server = createServer(async (request, response) => {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const result = await handle(new Request("http://collector.example" + request.url, {
+        method: request.method, headers: request.headers, body: Buffer.concat(chunks),
+      }), db, now);
+      response.writeHead(result.status); response.end(await result.text());
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    const root = await mkdtemp(join(tmpdir(), "loopx-real-collector-")), path = join(root, "usage.json");
+    t.after(async () => { server.closeAllConnections(); server.close(); await rm(root, { recursive: true, force: true }); });
+    const ctx = { env: { LOOPX_USAGE_PING: "1",
+      LOOPX_USAGE_PING_ENDPOINT: "http://127.0.0.1:" + server.address().port + "/v1/ping" },
+      version, python: "3.13", channel: "source", now };
+    await configureContext(path, ctx, "personal"); await configure(path, ctx, "enable");
+    const generation = JSON.parse(await readFile(path, "utf8")).generation;
+    const interval = { key: "a".repeat(64), measurement: "codex_turn", host: "codex_app",
+      start: now.getTime() - 60 * 60000, end: now.getTime() };
+    await observe(path, ctx, generation, { feature: "turn", count: 1, outcome: "ok", error: "none", duration: "lt_1s" }, undefined, interval, undefined, {
+      feature: "turn", operation: "default", outcome: "ok", error: "none", duration: "lt_1s", count: 1,
+      version, activity_day: "2026-10-01", context: "personal", signal: "none",
+    });
+    const row = db.raw.get("SELECT * FROM installation_usage");
+    assert.equal(row.context, "personal");
+    assert.equal(row.version, version);
+    assert.equal(db.raw.get("SELECT version FROM pings").version, version);
+    assert.equal(db.raw.get("SELECT version FROM diagnostic_counts").version, version);
+    assert.deepEqual(JSON.parse(row.runtime), [{ measurement: "codex_turn", observed_minutes: 60 }]);
+    // Real SQL consumer: independent mathematical oracle is one 60-minute interval, not Goal span.
+    const source = readFileSync(new URL("../queries/installation-usage.sql", import.meta.url), "utf8");
+    const queries = source.replace(/--[^\n]*/g, "").split(";").filter(sql => sql.trim());
+    const bindings = { from_day: "2026-10-01", through_day: "2026-10-02" };
+    for (const sql of queries) {
+      // Query uses named bind parameters; qualify against real SQLite.
+      assert.equal(db.raw.query(sql, bindings).length, 1);
+    }
+    const runtime = db.raw.all(
+      "SELECT SUM(json_extract(j.value, '$.observed_minutes')) AS minutes FROM installation_usage i, json_each(i.runtime) j",
+    );
+    assert.equal(runtime[0].minutes, 60);
+  });
+}
+
+test("v1 heartbeat has architecture; aggregates reject identifiers and store only counters", async () => {
+  const db = d1();
+  const request = (path, value) => new Request("https://collector.example" + path, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(value),
+  });
+  const heartbeat = { ...ping(1), schema: "loopx_usage_ping_v1", arch: "arm64" };
+  assert.equal((await handle(request("/v1/ping", heartbeat), db)).status, 204);
+  for (const version of ["2.0.0a1/private", "2.0.0+private", "2.0.0a1\n"]) {
+    assert.equal((await handle(request("/v1/ping", { ...heartbeat, version }), db)).status, 400);
+  }
+  const row = { feature: "todo", outcome: "ok", duration: "lt_1s", error: "none", count: 6 };
+  const aggregate = { schema: "loopx_usage_aggregate_v1", counters: [row] };
+  assert.equal((await handle(request("/v1/aggregate", { ...aggregate, install_id: id(1) }), db)).status, 400);
+  assert.equal((await handle(request("/v1/aggregate", aggregate), db)).status, 204);
+  assert.equal((await handle(request("/v1/aggregate", aggregate), db)).status, 204);
+  assert.equal(db.raw.get("SELECT count FROM usage_counts").count, 12);
+  assert.deepEqual(Object.keys(db.raw.get("SELECT * FROM usage_counts")).sort(), ["count", "day", "duration", "error", "feature", "outcome"]);
+  assert.equal(db.raw.get("SELECT arch FROM pings").arch, "arm64");
+  const stats = await (await handle(new Request("https://collector.example/v1/aggregate-stats"), db)).json();
+  assert.deepEqual(stats.totals.feature, { todo: 12 });
+  assert.equal("install_id" in stats, false);
+});
+
+test("existing v0 database upgrades without deleting heartbeat history", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec("CREATE TABLE pings (day TEXT, install_id TEXT, version TEXT, os TEXT, python TEXT, channel TEXT, PRIMARY KEY(day, install_id)); INSERT INTO pings VALUES ('2026-09-26', 'old', '1.2.0', 'linux', '3.13', 'pip');");
+  db.exec(readFileSync(new URL("../migrations/0001-basic-usage.sql", import.meta.url), "utf8"));
+  assert.equal(db.prepare("SELECT arch FROM pings").get().arch, "other");
+  assert.equal(db.prepare("SELECT count(*) n FROM pings").get().n, 1);
+  db.close();
+});
+
+test("Goal duration ingestion uses real SQL, rejects identity, suppresses small cells and expires counts", async () => {
+  const db = d1();
+  const send = value => new Request("https://collector.example/v1/goals", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(value),
+  });
+  const value = { schema: "loopx_goal_usage_aggregate_v1", counters: [{ measurement: "host_call", host: "unknown", span: "lt_30d", duration: "lt_1d", count: 3 }] };
+  for (const field of ["goal_id", "install_id", "timestamp", "prompt"]) {
+    assert.equal((await handle(send({ ...value, [field]: "private" }), db)).status, 400);
+  }
+  assert.equal((await handle(send(value), db, at("2026-09-01"))).status, 204);
+  const stats = () => handle(new Request("https://collector.example/v1/goal-stats"), db, at("2026-09-02")).then(r => r.json());
+  assert.deepEqual((await stats()).measurements.host_call, { span: {}, duration: {}, host: {} });
+  await handle(send(value), db, at("2026-09-01"));
+  assert.deepEqual((await stats()).measurements.host_call, { span: { lt_30d: 6 }, duration: { lt_1d: 6 }, host: { unknown: 6 } });
+  assert.deepEqual(Object.keys(db.raw.get("SELECT * FROM goal_duration_counts")).sort(), ["count", "day", "duration", "host", "measurement", "span"]);
+  await purge(db, "2026-10-02");
+  assert.equal(db.raw.get("SELECT COUNT(*) n FROM goal_duration_counts").n, 0);
+});
+
+test("Goal migration is additive and preserves existing aggregate counters", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec("CREATE TABLE usage_counts (count INTEGER); INSERT INTO usage_counts VALUES (7)");
+  const migration = readFileSync(new URL("../migrations/0002-goal-usage.sql", import.meta.url), "utf8");
+  db.exec(migration); db.exec(migration);
+  assert.equal(db.prepare("SELECT count FROM usage_counts").get().count, 7);
+  assert.equal(db.prepare("SELECT count(*) n FROM goal_usage_counts").get().n, 0);
+  db.close();
+});
+
+test("measurement migration preserves historical counts and is safe to repeat", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(readFileSync(new URL("../migrations/0002-goal-usage.sql", import.meta.url), "utf8"));
+  db.exec("INSERT INTO goal_usage_counts VALUES ('2026-09-01','lt_7d','lt_6h',8)");
+  const migration = readFileSync(new URL("../migrations/0003-goal-duration-sources.sql", import.meta.url), "utf8");
+  db.exec(migration); db.exec(migration);
+  assert.deepEqual({...db.prepare("SELECT * FROM goal_duration_counts").get()}, {
+    day:"2026-09-01", measurement:"host_call", host:"unknown", span:"lt_7d", duration:"lt_6h", count:8,
+  });
+  assert.equal(db.prepare("SELECT count FROM goal_usage_counts").get().count,8);
+  db.close();
+});
+
+test("diagnostics store separate activity/receipt days, preserve legacy data and reject private/late fields", async () => {
+  const db = d1();
+  const send = value => new Request("https://collector.example/v1/aggregate", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(value),
+  });
+  const row = { feature: "pr-review", operation: "merge-readiness", outcome: "blocked", error: "not_ready", duration: "lt_1s", count: 6,
+    version: "1.2.3", activity_day: "2026-09-29", context: "maintainer", signal: "none" };
+  const value = { schema: "loopx_usage_diagnostics_v1", counters: [row] };
+  for (const field of ["install_id", "goal_id", "arguments", "ip", "raw_error"]) {
+    assert.equal((await handle(send({ ...value, [field]: "private" }), db, at("2026-09-30"))).status, 400);
+  }
+  assert.equal((await handle(send(value), db, at("2026-09-30"))).status, 204);
+  assert.equal((await handle(send({ ...value, counters: [{ ...row, activity_day: "2026-10-01" }] }), db, at("2026-09-30"))).status, 400);
+  assert.equal((await handle(send({ ...value, counters: [{ ...row, activity_day: "2026-09-01" }] }), db, at("2026-09-30"))).status, 400);
+  const stored = db.raw.get("SELECT * FROM diagnostic_counts");
+  assert.equal(stored.receipt_day, "2026-09-30"); assert.equal(stored.activity_day, "2026-09-29");
+  assert.equal("install_id" in stored, false);
+  const stats = await (await handle(new Request("https://collector.example/v1/diagnostic-stats"), db, at("2026-09-30"))).json();
+  assert.deepEqual(stats.totals.outcome, { blocked: 6 });
+  assert.deepEqual(stats.totals.context, { maintainer: 6 });
+  await purge(db, "2026-11-01");
+  assert.equal(db.raw.get("SELECT COUNT(*) n FROM diagnostic_counts").n, 0);
+});
+
+test("return cohorts require matured observation windows, deduplicate days and omit small cells", async () => {
+  const db = d1();
+  for (let n = 1; n <= 10; n++) {
+    await handle(post(ping(n)), db, at("2026-09-01"));
+    if (n <= 5) {
+      await handle(post(ping(n)), db, at("2026-09-03"));
+      await handle(post(ping(n)), db, at("2026-09-03"));
+    }
+  }
+  await handle(post(ping(11)), db, at("2026-09-29")); // too recent for 7-day eligibility
+  const stats = await (await handle(new Request("https://collector.example/v1/adoption-stats"), db, at("2026-09-30"))).json();
+  assert.deepEqual(stats.cohorts.within_7d, { eligible: 10, returned: 5 });
+  assert.equal(stats.cohorts.within_1d, null); assert.equal(stats.cohorts.within_30d, null);
+  assert.deepEqual(stats.active_day_distribution, { "1": 6, "2_3": 5 });
+  assert.equal(JSON.stringify(stats).includes(id(1)), false);
+  await handle(post(ping(6)), db, at("2026-09-04"));
+  const smallComplement = await (await handle(new Request("https://collector.example/v1/adoption-stats"), db, at("2026-09-30"))).json();
+  assert.equal(smallComplement.cohorts.within_7d, null);
+});
+
+test("diagnostics migration is repeatable and never reattributes legacy observations", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec("CREATE TABLE usage_counts (count INTEGER); INSERT INTO usage_counts VALUES (7)");
+  const migration = readFileSync(new URL("../migrations/0004-diagnostics.sql", import.meta.url), "utf8");
+  db.exec(migration); db.exec(migration);
+  assert.equal(db.prepare("SELECT count FROM usage_counts").get().count, 7);
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM diagnostic_counts").get().n, 0);
+  db.close();
+});

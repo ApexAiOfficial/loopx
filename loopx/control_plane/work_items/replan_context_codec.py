@@ -1,0 +1,245 @@
+"""Scoped source codec for the TypeScript-owned replan evidence view."""
+from __future__ import annotations
+
+from typing import Any, cast
+
+from ..goals.acceptance_readback import configured_checks
+
+from collections.abc import Iterable, Mapping
+from pathlib import Path
+import hashlib
+import shlex
+
+from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from ..runtime.time import parse_timestamp
+from ..runtime.agent_evidence_history import goal_history_runs
+
+
+def _source_text(value: Any) -> str | None:
+    """Keep decision input complete; publication owns its own redaction."""
+    text = str(value or "").strip()
+    return text or None
+
+
+def replan_history_from_status(status: Mapping[str, Any], goal_id: str) -> list[dict[str, Any]]:
+    history = status.get("run_history")
+    if not isinstance(history, Mapping):
+        raise ValueError("replan context requires the run_history source")
+    snapshot = goal_history_runs(history, goal_id)
+    # A real host route supplies both authorities. Pure snapshot callers stay
+    # pure; live replan/handoff reads are independent of the display limit.
+    if status.get("registry") and status.get("runtime_root"):
+        from ...history import load_index_snapshot, validate_goal_id_path_segment
+
+        goal = validate_goal_id_path_segment(goal_id)
+        path = Path(str(status["runtime_root"])) / "goals" / goal / "runs" / "index.jsonl"
+        return load_index_snapshot(path, include_artifact_status=False).records
+    return snapshot
+
+
+def replan_evidence_rows(runs: Iterable[Mapping[str, Any]], *, goal_id: str, agent_id: str | None,
+    include_decisions: bool = False, history_newest_first: bool | None = None,
+) -> list[dict[str, Any]]:
+    from .progress_observation import normalize_progress_observation
+
+    if history_newest_first is not None and not isinstance(history_newest_first, bool):
+        raise ValueError("history_newest_first must be a boolean or unknown")
+    # Carrier order is an IO fact. Keep the wire
+    # rows in their original order so ordinary evidence/reference parity holds.
+    # Arbitrary iterables supply no causal positions unless the caller knows
+    # their order; real indexes are append ordered, compact history is newest first.
+    if include_decisions and history_newest_first is True:
+        runs = list(runs)
+        newest_position = len(runs) - 1
+    else:
+        newest_position = None
+    ordered_history = include_decisions and history_newest_first is not None
+    rows = []
+    for position, run in enumerate(runs):
+        if not isinstance(run, Mapping):
+            raise ValueError("replan history row must be an object")
+        # Legacy compact records may omit the enclosing Goal id. Agent attribution
+        # is never guessed: another or unattributed lane cannot supply scoped proof.
+        run_goal = run.get("goal_id", goal_id)
+        run_agent = run.get("agent_id")
+        if run_goal != goal_id or (agent_id and run_agent != agent_id):
+            continue
+        timestamp = parse_timestamp(run.get("generated_at"))
+        if timestamp is None:
+            raise ValueError("replan evidence has an invalid generated_at timestamp")
+        progress = run.get("progress_observation")
+        if "progress_observation" in run:
+            if not isinstance(progress, Mapping):
+                raise ValueError("replan evidence progress_observation must be an object")
+            if progress.get("schema_version") != "typed_progress_observation_v0":
+                raise ValueError("unsupported replan evidence progress_observation schema_version")
+            progress = normalize_progress_observation(progress)
+        row: dict[str, Any] = {
+            "goal_id": run_goal,
+            "agent_id": run_agent,
+            "generated_at": str(run["generated_at"]),
+            "observed_at": timestamp.timestamp(),
+            "progress_observation": progress,
+        }
+        for key in ("classification", "delivery_outcome", "health_check", "recommended_action", "todo_id"):
+            text = _source_text(run.get(key))
+            if text:
+                row[key] = text
+        history_position = newest_position - position if newest_position is not None else position
+        if "settlement_identity" in run or "quota_spend_commit" in run or (include_decisions and "agent_vision" in run):
+            # Transport facts, not a Python eligibility decision. Complete-text
+            # digests prevent a shared display prefix from erasing distinct tails.
+            # This private wire metadata is excluded from public reference identity.
+            source: dict[str, Any] = {
+                "goal_id": run_goal,
+                "agent_id": run_agent,
+                "todo_id": run.get("todo_id"),
+                "turn_instance_id": run.get("turn_instance_id"),
+            }
+            # Facts only: the typed replan owner qualifies the prior decision
+            # and orders subsequent observations. Do not classify research
+            # progress or infer adoption from prose in this transport codec.
+            if include_decisions:
+                from ..goals.goal_vision_read_model import parse_vision_todo_delta_entries
+
+                if ordered_history:
+                    source["history_position"] = history_position
+                source["goal_ref"] = run.get("goal_ref")
+                source["agent_vision"] = run.get("agent_vision")
+                vision = run.get("agent_vision")
+                source["planned_todo_ids"] = list(dict.fromkeys(
+                    todo_id for _, todo_id in parse_vision_todo_delta_entries(
+                        vision.get("todo_delta") if isinstance(vision, Mapping) else None
+                    )
+                ))
+                source["autonomous_replan_ack"] = run.get("autonomous_replan_ack")
+                source["replan_obligation_id"] = run.get("replan_obligation_id")
+            for key, fields in (("settlement_identity", (
+                "schema_version", "goal_id", "agent_id", "todo_id", "turn_instance_id", "effect_id",
+                "binding_kind", "binding_id", "replan_obligation_id", "request_subject")),
+                ("quota_spend_commit", ("schema_version", "effect_id"))):
+                value = run.get(key)
+                if isinstance(value, Mapping):
+                    source[key] = {field: value[field] for field in fields if field in value}
+                elif key == "settlement_identity" and value is not None:
+                    # Preserve the presence of a malformed identity without forwarding its contents.
+                    source[key] = {}
+                else:
+                    source[key] = None
+            for key in ("recommended_action", "health_check", "delivery_outcome"):
+                value = run.get(key)
+                source[key + "_digest"] = hashlib.sha256(value.encode()).hexdigest() if isinstance(value, str) else None
+            row["_source_facts"] = source
+        elif ordered_history and progress is not None:
+            # An older typed observation can still have a known index position.
+            row["_source_facts"] = {"history_position": history_position, "goal_ref": run.get("goal_ref")}
+        rows.append(row)
+    return rows
+
+
+def goal_context_facts(status: Mapping[str, Any] | None, goal_id: str, acceptance: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Read existing Goal sources; source precedence belongs to TypeScript."""
+    def goal_text(value: Any) -> str | None:
+        if value is not None and not isinstance(value, str):
+            raise ValueError("Goal objective must be text")
+        return _source_text(value)
+
+    facts: dict[str, Any] = {}
+    if status and status.get("registry"):
+        from ...agent_registry import load_goal_from_registry
+        from ...materials import goal_state_path
+        from ..goals.active_state_metadata import active_state_section_text, split_state_frontmatter
+
+        goal = load_goal_from_registry(Path(str(status["registry"])), goal_id)
+        if goal:
+            if goal.get("goal_instance_id"):
+                facts["goal_ref"] = {"goal_id": goal_id, "goal_instance_id": goal["goal_instance_id"]}
+            facts["registry_objective"] = goal_text(goal.get("objective"))
+            path = goal_state_path(goal)
+            if path:
+                facts["goal_read_action"] = "cat -- " + shlex.quote(str(path.resolve()))
+            if path and path.exists():
+                state = path.read_text(encoding="utf-8")
+                metadata, _ = split_state_frontmatter(state)
+                objective = active_state_section_text(state, "Objective") or metadata.get("objective")
+                facts["active_state_objective"] = goal_text(objective)
+    if acceptance and (configured_checks(acceptance) is not None or acceptance.get("outcome_requirements") or acceptance.get("goal_objective")):
+        # This is the acceptance owner's public projection, including its scope.
+        # It must never be mistaken for the whole Goal's original objective.
+        # Default outcome review exists without executable checks. Carry its
+        # current evidence and linked open work into periodic/stall decisions,
+        # not only the uncovered-work trigger. Configured checks also need their
+        # result/binding/lifetime evidence, not just a summary status. Reuse the
+        # same complete readback as ordinary work; no new read or verdict.
+        facts["acceptance_contract"] = dict(acceptance)
+    return facts
+
+
+def project_replan_context(
+    *, goal_id: str, agent_id: str | None, runs: Iterable[Mapping[str, Any]],
+    obligation: Mapping[str, Any] | None = None, evidence_ref: str | None = None,
+    source_status: Mapping[str, Any] | None = None,
+    goal_acceptance_contract: Mapping[str, Any] | None = None,
+    explore_context: Mapping[str, Any] | None = None,
+    history_newest_first: bool | None = None,
+    todo_items: Iterable[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    from .replan_history_codec import project_replan_request
+
+    prefix = ["loopx"]
+    if source_status is not None:
+        runs = replan_history_from_status(source_status, goal_id)
+        history_newest_first = not bool(source_status.get("registry") and source_status.get("runtime_root"))
+        for field, option in (("registry", "--registry"), ("runtime_root", "--runtime-root")):
+            if source_status.get(field):
+                prefix.extend([option, str(source_status[field])])
+    try:
+        return cast(dict[str, Any], project_replan_request({
+            "operation": "resolve" if evidence_ref is not None else "project",
+            "goal_id": goal_id, "agent_id": agent_id,
+            "obligation": dict(obligation) if obligation is not None else None,
+            "rows": replan_evidence_rows(runs, goal_id=goal_id, agent_id=agent_id,
+                include_decisions=bool(agent_id),
+                history_newest_first=history_newest_first),
+            # Canonical caller-owned facts only. TypeScript joins the declared
+            # work with the accepted decision and causally later observations.
+            **({"todo_items": [{key: item[key] for key in (
+                "todo_id", "goal_id", "role", "status", "claimed_by", "task_class", "action_kind",
+            ) if key in item} for item in todo_items]} if agent_id and todo_items is not None else {}),
+            **({"explore_context": explore_context} if explore_context is not None else {}),
+            "evidence_ref": evidence_ref,
+            "read_prefix": shlex.join(prefix),
+            "goal_facts": goal_context_facts(source_status, goal_id, goal_acceptance_contract) if evidence_ref is None else {},
+            "from_full_index": bool(source_status and source_status.get("registry") and source_status.get("runtime_root")),
+        }, method="work_item.replan_context"))
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None
+
+
+def validate_replan_context(context: Any) -> dict[str, Any]:
+    try:
+        return cast(dict[str, Any], effect_runtime_result("work_item.replan_context.project", {
+            "operation": "validate", "context": context,
+        }))
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None
+
+
+def replay_stride_review_evidence(
+    *, context: Mapping[str, Any], review: Mapping[str, Any], runs: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Transport complete existing history; return only the cited source facts."""
+    from .replan_history_codec import project_replan_request
+
+    previous = context["decision_followthrough"]["previous_decision"]
+    try:
+        return cast(dict[str, Any], project_replan_request({
+            "operation": "review_evidence", "obligation": None, "goal_id": context["goal_id"],
+            "agent_id": context["agent_id"], "previous_decision_ref": previous["evidence_ref"],
+            "evidence_refs": review.get("evidence_refs", []),
+            "goal_facts": {"goal_ref": previous.get("goal_ref")},
+            "rows": replan_evidence_rows(runs, goal_id=context["goal_id"], agent_id=context["agent_id"],
+                include_decisions=True, history_newest_first=True),
+        }, method="work_item.replan_context"))
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None

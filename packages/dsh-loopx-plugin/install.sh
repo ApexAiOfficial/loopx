@@ -12,9 +12,10 @@ usage() {
 Usage: ./install.sh [--help]
 
 Build and install the DSH LoopX host plugin into the DSH web profile. This
-installs `/loopx-init`, the same-session Driver, and the loopback-only GoalBar
-Host/Client faces. LoopX itself is not a prerequisite; run `/loopx-init` inside
-DSH afterward to install or upgrade the LoopX CLI and its DSH skills.
+installs the automatic LoopX initializer, `/loopx-init` repair command, the
+same-session Driver, and the loopback-only GoalBar Host/Client faces. LoopX
+itself is not a prerequisite; starting DSH installs or verifies the LoopX CLI
+and its DSH skills before the plugin row becomes ready.
 
 Environment:
   DSH_BIN=/path/to/dsh  Override the package-local DSH CLI.
@@ -47,10 +48,11 @@ need node
 need pnpm
 
 node -e '
-  const [major, minor] = process.versions.node.split(".").map(Number)
-  if (!((major === 22 && minor >= 19) || major >= 24)) process.exit(1)
+  if (!/^\d+\.\d+\.\d+$/.test(process.versions.node)) process.exit(1)
+  const [major, minor, patch] = process.versions.node.split(".").map(Number)
+  if (!((major === 22 && (minor > 22 || (minor === 22 && patch >= 3))) || major >= 24)) process.exit(1)
 ' || {
-  echo "install: Node.js 22.19+ (excluding Node.js 23) is required" >&2
+  echo "install: Node.js 22.22.3+ (excluding Node.js 23 and prereleases) is required" >&2
   exit 2
 }
 pnpm_version="$(pnpm --version)"
@@ -84,7 +86,18 @@ else
   dsh_bin="$SCRIPT_DIR/node_modules/.bin/dsh"
 fi
 [[ -x "$dsh_bin" ]] || { echo "install: DSH CLI is unavailable: $dsh_bin" >&2; exit 2; }
-"$dsh_bin" --version >/dev/null
+dsh_version="$("$dsh_bin" --version)"
+node - "$PACKAGE_JSON" "$dsh_version" <<'NODE' || exit 2
+const fs = require('node:fs')
+const semver = require('node:module').createRequire(process.argv[2])('semver')
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
+const version = process.argv[3].trim()
+const range = manifest.peerDependencies['@deepseek-ai/dsh']
+if (!semver.satisfies(version, range)) {
+  console.error(`install: DSH ${version} is outside the supported peer range ${range}; no profile change was made`)
+  process.exit(1)
+}
+NODE
 
 mkdir -p "$OUTPUT_DIR"
 tarball="$OUTPUT_DIR/$PACKAGE_NAME-$PACKAGE_VERSION.tgz"
@@ -104,6 +117,7 @@ printf '%s' "$profile_dump" | node -e '
     ["loopx-goalbar", "dsh-loopx-plugin"],
     ["loopx-init-command", "dsh-loopx-plugin/init-command"],
     ["loopx-driver", "dsh-loopx-plugin/driver"],
+    ["loopx-shadow-observer", "dsh-loopx-plugin/observer"],
   ]
   const packageNames = dump
     .split(/\r?\n/u)
@@ -125,6 +139,11 @@ printf '%s' "$profile_dump" | node -e '
   exit 1
 }
 
+"$dsh_bin" plugin --profile "$PROFILE_NAME" exec node -e 'const manifest = require("dsh-loopx-plugin/package.json"); if (manifest.name !== "dsh-loopx-plugin" || manifest.version !== process.argv[1]) { throw new Error(`installed plugin version does not match ${process.argv[1]}`); }' "$PACKAGE_VERSION" || {
+  echo 'install: DSH installed package did not match the built version' >&2
+  exit 1
+}
+
 echo "install: installed and verified $PACKAGE_NAME@$PACKAGE_VERSION"
-echo "install: next, run /loopx-init inside DSH"
+echo "install: next, start DSH and use /loopx with your task"
 echo "install: artifact retained at $tarball"

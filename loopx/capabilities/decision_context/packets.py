@@ -5,17 +5,29 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
+
+from ...control_plane.runtime.public_safety import (
+    REMOTE_LOCATION_SURFACE_PATTERN,
+    find_public_safe_local_path,
+)
+from ...public_safe_text import CREDENTIAL_CATEGORIES
+from ...public_safe_text import COMPACT_TOKEN_PATTERN as _TOKEN_RE
+from ...public_safe_text import classify_private_text
 
 DECISION_EVIDENCE_PACKET_SCHEMA_VERSION = "decision_evidence_packet_v0"
 DECISION_PROPOSAL_SCHEMA_VERSION = "decision_proposal_v0"
 DECISION_REVIEW_RECEIPT_SCHEMA_VERSION = "decision_review_receipt_v0"
 DECISION_OUTCOME_RECEIPT_SCHEMA_VERSION = "decision_outcome_receipt_v0"
 
-DECISION_CONTEXT_CAPABILITY_ID = "decision_context"
+# Packet-contract namespace. Capability packets identify the capability with
+# the underscore spelling (the sibling capability emits "material_lifecycle").
+# No consumer joins this value with the hyphenated catalog/extension id in
+# extension_provider.py: they are two slots for the same capability, both
+# consistent with their own siblings, so the spellings stay separate.
+DECISION_CONTEXT_PACKET_CAPABILITY_ID = "decision_context"
 DECISION_OUTCOME_VERIFICATION_STATUSES = {
     "pending",
     "verified",
@@ -27,25 +39,20 @@ DECISION_REVIEW_DISPOSITIONS = {
     "reject",
     "defer",
     "no_change",
+    "observed",
 }
 
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
-_LOCAL_PATH_RE = re.compile(r"(^|[\s:=])(?:/Users/|/private/|/tmp/|~/)")
-_RAW_LOCATION_RE = re.compile(r"(?i)\b(?:https?|file|s3|gs|tos|hdfs)://")
-_CREDENTIAL_RE = re.compile(
-    "(?i)("
-    + "|".join(
-        [
-            "Author" + "ization:",
-            "Bear" + r"er\s+[A-Za-z0-9._-]+",
-            "api" + r"[_-]?key",
-            "pass" + "word",
-            "sec" + "ret",
-            "begin " + r"(?:rsa |open)?private key",
-        ]
-    )
-    + ")"
-)
+# Refs #5136, direction 3: "does this text carry a local path?" is decided once
+# by find_public_safe_local_path; this site keeps its own rejection message and
+# length limit for whatever the owner recognizes.
+#
+# Refs #5136, direction 1: one categorized call decides the credential question.
+# The alternation list this site kept beside SECRET_LIKE_SURFACE_PATTERN was a
+# shape list rather than the "local threshold policy" its comment claimed, and it
+# was byte-identical to the copy in material_lifecycle/_validation.py. The owner
+# covers the one spelling that list reached and its category arms do not -- a
+# credential label glued into a field name -- through the
+# ``include_compound_field_assignment`` opt-in this face passes.
 _UNSAFE_FIELDS = {
     "api_key",
     "content",
@@ -66,11 +73,15 @@ def _compact_text(value: Any, *, field: str, max_len: int = 320) -> str:
         raise ValueError(f"{field} must be non-empty")
     if len(text) > max_len:
         raise ValueError(f"{field} must be at most {max_len} characters")
-    if _LOCAL_PATH_RE.search(text):
+    if find_public_safe_local_path(text) is not None:
         raise ValueError(f"{field} must not contain a local path")
-    if _RAW_LOCATION_RE.search(text):
+    if REMOTE_LOCATION_SURFACE_PATTERN.search(text):
         raise ValueError(f"{field} must use an opaque source reference, not a raw URL")
-    if _CREDENTIAL_RE.search(text):
+    if classify_private_text(
+        text,
+        categories=CREDENTIAL_CATEGORIES,
+        include_compound_field_assignment=True,
+    ):
         raise ValueError(f"{field} contains a credential-like value")
     return text
 
@@ -98,7 +109,7 @@ def _iso_timestamp(value: Any, *, field: str) -> str:
 def _score(value: Any, *, field: str) -> float:
     try:
         score = float(value)
-    except (TypeError, ValueError) as exc:
+    except (OverflowError, TypeError, ValueError) as exc:
         raise ValueError(f"{field} must be a number") from exc
     if not math.isfinite(score) or not 0.0 <= score <= 1.0:
         raise ValueError(f"{field} must be finite and between 0 and 1")
@@ -126,7 +137,7 @@ def _normalize_value(value: Any, *, field: str, kind: str) -> Any:
 
 
 def _normalize_record(
-    value: Mapping[str, Any],
+    value: object,
     *,
     field: str,
     spec: Mapping[str, str],
@@ -204,7 +215,7 @@ def _packet_ref(prefix: str, packet: Mapping[str, Any]) -> str:
 
 def _capability_contract(*, packet_role: str) -> dict[str, Any]:
     return {
-        "capability_id": DECISION_CONTEXT_CAPABILITY_ID,
+        "capability_id": DECISION_CONTEXT_PACKET_CAPABILITY_ID,
         "scope": "goal",
         "default_enabled": False,
         "packet_role": packet_role,
@@ -264,9 +275,9 @@ _PROVIDER_HEALTH_SPEC = {
 
 def build_decision_evidence_packet(
     *,
-    goal_id: str,
-    decision_id: str,
-    observed_at: str,
+    goal_id: object,
+    decision_id: object,
+    observed_at: object,
     changed_facts: Sequence[Mapping[str, Any]] | None = None,
     recalled_claims: Sequence[Mapping[str, Any]] | None = None,
     stale_or_rejected_claims: Sequence[Mapping[str, Any]] | None = None,
@@ -458,23 +469,24 @@ def build_decision_proposal(
 
 def build_decision_review_receipt(
     *,
-    goal_id: str,
-    decision_id: str,
-    evidence_packet_ref: str,
-    recorded_at: str,
-    disposition: str,
-    actor_ref: str,
-    reason_code: str,
-    summary: str,
+    goal_id: object,
+    decision_id: object,
+    evidence_packet_ref: object,
+    recorded_at: object,
+    disposition: object,
+    actor_ref: object,
+    reason_code: object,
+    summary: object,
     proposal_packet_ref: str | None = None,
     gate_todo_id: str | None = None,
     source_event_id: str | None = None,
 ) -> dict[str, Any]:
-    """Record one reviewed proposal or an explicit semantic no-change result.
+    """Record a proposal decision or an evidence-only semantic review.
 
     Review settlement is deliberately separate from outcome observation. A
     user may approve, reject, or defer a proposal before its real-world outcome
-    exists, while a semantic no-change result needs no user authority at all.
+    exists. Observing new facts and recording no material change both need no
+    user-gate authority; neither authorizes an action.
     """
 
     normalized_disposition = _compact_token(
@@ -483,9 +495,9 @@ def build_decision_review_receipt(
     )
     if normalized_disposition not in DECISION_REVIEW_DISPOSITIONS:
         raise ValueError(
-            "disposition must be approve, reject, defer, or no_change"
+            "disposition must be approve, reject, defer, no_change, or observed"
         )
-    gated = normalized_disposition != "no_change"
+    gated = normalized_disposition in {"approve", "reject", "defer"}
     gated_values = {
         "proposal_packet_ref": proposal_packet_ref,
         "gate_todo_id": gate_todo_id,
@@ -502,7 +514,7 @@ def build_decision_review_receipt(
             )
     elif any(value is not None for value in gated_values.values()):
         raise ValueError(
-            "no_change review receipt must not reference a proposal or user gate"
+            f"{normalized_disposition} review receipt must not reference a proposal or user gate"
         )
 
     packet: dict[str, Any] = {
@@ -576,16 +588,16 @@ _INVALIDATED_ASSUMPTION_SPEC = {
 
 def build_decision_outcome_receipt(
     *,
-    goal_id: str,
-    decision_id: str,
-    proposal_packet_ref: str,
-    recorded_at: str,
-    verification_status: str,
-    accepted_decision: Mapping[str, Any],
+    goal_id: object,
+    decision_id: object,
+    proposal_packet_ref: object,
+    recorded_at: object,
+    verification_status: object,
+    accepted_decision: object,
     resulting_transitions: Sequence[Mapping[str, Any]] | None = None,
     observed_outcomes: Sequence[Mapping[str, Any]] | None = None,
     invalidated_assumptions: Sequence[Mapping[str, Any]] | None = None,
-    review_at: str,
+    review_at: object,
 ) -> dict[str, Any]:
     """Build an append-only receipt suitable for existing event/run history."""
 

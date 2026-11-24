@@ -84,7 +84,13 @@ The docs site is a published read model over repository Markdown. The canonical
 source remains the Markdown in `docs/`, while project-local runtime state stays
 ignored and private.
 
-- [Project README](https://github.com/huangruiteng/loopx#readme)
+- [Project README](https://github.com/loopx-project/loopx#readme)
 - [Public/private boundary](public-private-boundary.md)
 - [Status data contract](status-data-contract.md)
 - [Release readiness](product/release-readiness.md)
+
+## Join And Contribute
+
+Use the [community entry-point page](community.md) ([中文](community.zh-CN.md))
+to choose between the pinned discussion, Discord, Lark, WeChat, focused issue
+forms, showcase prompts, and the public ecosystem catalog.

@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import errno
 import argparse
+import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,6 +38,10 @@ from loopx.capabilities.issue_fix.reviewer_notification import (  # noqa: E402
 )
 from loopx.capabilities.issue_fix.reviewer_notification_drain import (  # noqa: E402
     drain_issue_fix_reviewer_notification_queue,
+)
+from loopx.extensions.process_runtime import remove_owned_tree  # noqa: E402
+from loopx.extensions.lark.reviewer_notification import (  # noqa: E402
+    lark_reviewer_notification_sink,
 )
 from loopx.capabilities.issue_fix.pr_lifecycle import (  # noqa: E402
     build_issue_fix_pr_lifecycle_monitor_packet,
@@ -255,6 +259,15 @@ class FakeCombinedRunner:
             }
         if "+messages-send" in command:
             self.lark_calls.append(command)
+            if "--dry-run" in command:
+                content = command[command.index("--content") + 1]
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps(
+                        {"api": [{"body": {"content": content}}]}
+                    ),
+                    "stderr": "",
+                }
             return {
                 "returncode": 0,
                 "stdout": json.dumps({"data": {"message_id": "om_fixture"}}),
@@ -266,6 +279,18 @@ class FakeCombinedRunner:
                 call for call in self.lark_calls if "+messages-send" in call
             )
             content = send_call[send_call.index("--content") + 1]
+            outbound_text = json.loads(content)["text"]
+            readback_content = json.dumps(
+                {
+                    "text": re.sub(
+                        r'<at open_id="ou_private_member">.*?</at>',
+                        "@_user_1",
+                        outbound_text,
+                    )
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
             assert "请帮忙 review PR #42（修复 #40）" in content, content
             assert "reject file URI for consistency check" in content, content
             assert "loopx-reviewer-notification" not in content, content
@@ -276,7 +301,14 @@ class FakeCombinedRunner:
                         "items": [
                             {
                                 "message_id": "om_fixture",
-                                "body": {"content": content},
+                                "body": {"content": readback_content},
+                                "mentions": [
+                                    {
+                                        "key": "@_user_1",
+                                        "id": {"open_id": "ou_private_member"},
+                                        "name": "Service Owner",
+                                    }
+                                ],
                             }
                         ]
                     }
@@ -399,6 +431,7 @@ def main() -> int:
             url="https://github.com/owner/repo/pull/42",
             base_ref="main",
             notification_sinks_input=sinks_input,
+            notification_sink_adapters={"lark_chat": lark_reviewer_notification_sink},
             execute=True,
             runner=combined,
         )
@@ -407,7 +440,7 @@ def main() -> int:
         assert with_secondary["secondary_notification_status"] == "sent_verified"
         assert with_secondary["secondary_notification_verified"] is True
         assert with_secondary["secondary_notifications"]["receipts"]
-        assert len(combined.lark_calls) == 3
+        assert len(combined.lark_calls) == 4
         assert_public_safe(with_secondary)
 
         windowed_sinks_input = json.loads(json.dumps(sinks_input))
@@ -427,6 +460,7 @@ def main() -> int:
             url="https://github.com/owner/repo/pull/42",
             base_ref="main",
             notification_sinks_input=windowed_sinks_input,
+            notification_sink_adapters={"lark_chat": lark_reviewer_notification_sink},
             execute=True,
             generated_at="2026-07-10T02:30:00Z",
             notification_delivery_observed_at="2026-07-10T14:30:00Z",
@@ -484,6 +518,7 @@ def main() -> int:
             url="https://github.com/owner/repo/pull/42",
             base_ref="main",
             notification_sinks_input=sinks_input,
+            notification_sink_adapters={"lark_chat": lark_reviewer_notification_sink},
             execute=True,
             runner=covered_same_runner,
         )
@@ -495,7 +530,7 @@ def main() -> int:
         assert covered_same["secondary_notification_targets"] == ["@service-owner"]
         assert covered_same["secondary_notification_fallback_used"] is False
         assert covered_same["secondary_notification_status"] == "sent_verified"
-        assert len(covered_same_runner.lark_calls) == 3
+        assert len(covered_same_runner.lark_calls) == 4
         assert_public_safe(covered_same)
 
         provider_neutral_fallback = build_issue_fix_reviewer_request_packet(
@@ -536,6 +571,7 @@ def main() -> int:
             url="https://github.com/owner/repo/pull/42",
             base_ref="main",
             notification_sinks_input=sinks_input,
+            notification_sink_adapters={"lark_chat": lark_reviewer_notification_sink},
             execute=True,
             runner=reviewed_combined,
         )
@@ -828,6 +864,7 @@ def main() -> int:
             url="https://github.com/owner/repo/pull/42",
             base_ref="main",
             notification_sinks_input=sinks_input,
+            notification_sink_adapters={"lark_chat": lark_reviewer_notification_sink},
             execute=True,
             runner=failed_combined,
         )
@@ -836,7 +873,7 @@ def main() -> int:
         assert failed_with_lark["secondary_notification_status"] == "sent_verified"
         assert failed_with_lark["secondary_notification_verified"] is True
         assert failed_with_lark["external_writes_performed"] is True
-        assert len(failed_combined.lark_calls) == 3
+        assert len(failed_combined.lark_calls) == 4
         assert_public_safe(failed_with_lark)
 
         preview = build_issue_fix_reviewer_request_packet(
@@ -1056,39 +1093,39 @@ def main() -> int:
                 "scope_ref": reward_binding["scope_ref"],
             }
         ]
-        write(
-            reward_config_path,
-            json.dumps(
+        reward_config = {
+            "schema_version": "reward_memory_experiment_config_v1",
+            "project_provider_binding": reward_project_binding,
+            "corpora": [
                 {
-                    "schema_version": "reward_memory_experiment_config_v1",
-                    "project_provider_binding": reward_project_binding,
-                    "corpora": [
-                        {
-                            "corpus": reward_fixture["corpus"],
-                            "standing_policy": reward_fixture["standing_policy"],
-                        }
-                    ],
-                    "surfaces": [
-                        {
-                            "surface_id": "reviewer_artifact.summary",
-                            "adapter": reward_fixture["adapter"],
-                            "corpus_ids": [reward_corpus_id],
-                            "ingest_corpus_id": reward_corpus_id,
-                            "recall_profile": {
-                                "profile_id": "reviewer_summary_fixture_v1",
-                                "mode": "function_boundary",
-                                "max_queries": 1,
-                                "limit": 5,
-                            },
-                        }
-                    ],
-                    "automation": {
-                        "automatic_recall": True,
-                        "automatic_ingest": False,
-                        "fail_open": True,
+                    "corpus": reward_fixture["corpus"],
+                    "standing_policy": reward_fixture["standing_policy"],
+                }
+            ],
+            "surfaces": [
+                {
+                    "surface_id": "reviewer_artifact.summary",
+                    "adapter": reward_fixture["adapter"],
+                    "corpus_ids": [reward_corpus_id],
+                    "ingest_corpus_id": reward_corpus_id,
+                    "recall_profile": {
+                        "profile_id": "reviewer_summary_fixture_v1",
+                        "mode": "function_boundary",
+                        "max_queries": 1,
+                        "limit": 5,
                     },
                 }
-            ),
+            ],
+            "automation": {
+                "automatic_recall": True,
+                "automatic_ingest": False,
+                "fail_open": True,
+            },
+        }
+        reward_config_text = json.dumps(reward_config)
+        write(reward_config_path, reward_config_text)
+        reward_config_digest = (
+            f"sha256:{hashlib.sha256(reward_config_path.read_bytes()).hexdigest()}"
         )
         registry = path / ".loopx/registry.json"
         write(
@@ -1126,6 +1163,21 @@ def main() -> int:
                                         ".loopx/config/reward-memory/experiment.json"
                                     ),
                                     "enabled_agents": ["fixture-review-agent"],
+                                    "config_digest": reward_config_digest,
+                                    "enablement_receipts": {
+                                        "fixture-review-agent": {
+                                            "schema_version": "reward_memory_enablement_receipt_v0",
+                                            "status": "verified",
+                                            "goal_id": reward_goal_id,
+                                            "agent_id": "fixture-review-agent",
+                                            "config_digest": reward_config_digest,
+                                            "provider_id": reward_project_binding["provider_id"],
+                                            "isolation_mode": "explicit_shared",
+                                            "actor_binding_verified": False,
+                                            "writability_verified": True,
+                                            "exact_readback_verified": True,
+                                        }
+                                    },
                                 }
                             },
                         },
@@ -1308,13 +1360,18 @@ def main() -> int:
         )
         assert disabled_handled is not None
         disabled_preview, _ = disabled_handled
-        disabled_application = disabled_preview[
-            "reviewer_artifact_reward_memory_preview"
-        ]
-        assert disabled_preview["reviewer_artifact_reward_memory_status"] == "blocked"
-        assert disabled_application["automatic_recall"] is False
-        assert disabled_application["recall"]["status"] == "disabled"
-        assert disabled_application["telemetry"]["provider_call_count"] == 0
+        if disabled_preview.get("reward_memory_experiment_status") == "enablement_stale":
+            # Editing the local config without refreshing its registry digest is
+            # an intentional fail-closed enablement boundary.
+            assert "reviewer_artifact_reward_memory_preview" not in disabled_preview
+        else:
+            disabled_application = disabled_preview[
+                "reviewer_artifact_reward_memory_preview"
+            ]
+            assert disabled_preview["reviewer_artifact_reward_memory_status"] == "blocked"
+            assert disabled_application["automatic_recall"] is False
+            assert disabled_application["recall"]["status"] == "disabled"
+            assert disabled_application["telemetry"]["provider_call_count"] == 0
 
         lifecycle_path = default_issue_fix_domain_state_ledger_path(
             project=path,
@@ -1448,7 +1505,7 @@ def main() -> int:
             runner=goal_execute_runner,
         )
         assert goal_execute["secondary_notification_status"] == "sent_verified"
-        assert len(goal_execute_runner.lark_calls) == 7
+        assert len(goal_execute_runner.lark_calls) == 8
         receipt = goal_execute["secondary_notifications"]["receipts"][0]
         receipt_write = persist_issue_fix_reviewer_notification_receipts(
             lifecycle_path,
@@ -2024,21 +2081,10 @@ def main() -> int:
         assert verified_runner.edits == 1
         assert_public_safe(verified_publication)
 
-        subprocess.run(
-            [
-                sys.executable,
-                str(
-                    ROOT
-                    / "examples/issue-fix-reviewer-notification-drain-postwrite-smoke.py"
-                ),
-            ],
-            cwd=ROOT,
-            check=True,
-        )
     finally:
         for attempt in range(10):
             try:
-                shutil.rmtree(path)
+                remove_owned_tree(path)
                 break
             except FileNotFoundError:
                 break

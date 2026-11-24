@@ -62,12 +62,16 @@ Check that the tutorial uses real release surfaces:
 ```bash
 loopx --version
 loopx doctor
+loopx doctor --deep
 loopx start-goal --help
+loopx capability list --format json
 loopx extension --help
 ```
 
 Command existence is not complete workflow validation. Host automation, visible Goal, and Extension
-activation each need their own readback.
+activation each need their own readback. `doctor --deep` also starts and probes the TypeScript Effect
+runtime packaged with the release. A successful return through a migration-time Python facade does not by
+itself prove the TypeScript semantic owner, runtime decoder, and durable effect path.
 
 ### 3. Lifecycle validation
 
@@ -159,7 +163,7 @@ Review manually for:
 
 - credentials, tokens, and cookies;
 - absolute machine paths;
-- `.loopx/`, `.codex/goals/`, or runtime state;
+- `.loopx/`, `.loopx/goals/`, or runtime state;
 - raw agent transcripts, trajectories, and verifier output;
 - private Issues, internal links, and unredacted organizational narrative;
 - temporary probes and generated logs.
@@ -186,7 +190,8 @@ After each LoopX minor release, review:
 - installer and `doctor`;
 - `connect` and `start-goal`;
 - Host surface names;
-- Codex App heartbeat and Codex CLI Goal activation;
+- Codex App heartbeat, Codex CLI Goal activation, and the Runtime Connector Catalog;
+- the TypeScript migration RFC's shipped baseline, active phase, and facade exit conditions;
 - core protocols, state machines, bounded-context ownership, and the quality catalog;
 - Extension manifest, doctor, run, and lifecycle;
 - whether book steps still reproduce on the current official scaffold and command surface.
@@ -212,5 +217,4 @@ Update theory chapters only when the public contract changes, not when internal 
 - [ ] Internal links and the public-boundary scan pass.
 - [ ] The bilingual first screen has owner approval.
 
-Only after these checks should GitHub Pages publish from `main`. Pages is the display surface, not the source
-of content truth or LoopX state.
+Only after these checks should GitHub Pages publish from `main`. Pages is the display surface.

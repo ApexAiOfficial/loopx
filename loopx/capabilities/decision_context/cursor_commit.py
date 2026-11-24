@@ -11,7 +11,7 @@ from typing import Any
 from ...file_lock import exclusive_file_lock
 from ...rollout_event_log import (
     ROLLOUT_EVENT_SCHEMA_VERSION,
-    load_rollout_events,
+    iter_rollout_events,
 )
 from .assembler import (
     DECISION_CONTEXT_ASSEMBLY_SCHEMA_VERSION,
@@ -42,7 +42,6 @@ _LIFECYCLE_WRITEBACK_EVENT_KINDS = {
     "todo_update",
     "validation",
 }
-_LIFECYCLE_WRITEBACK_READ_LIMIT = 1000
 
 
 def _opaque_ref(prefix: str, *values: str) -> str:
@@ -80,6 +79,24 @@ def _event_id(event: Mapping[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(body, ensure_ascii=True, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
+
+
+def _load_exact_rollout_event(
+    event_log_path: Path,
+    event_id: str,
+    *,
+    not_found_error: str,
+) -> Mapping[str, Any]:
+    match: Mapping[str, Any] | None = None
+    for event in iter_rollout_events(event_log_path.expanduser()):
+        if event.get("event_id") != event_id:
+            continue
+        if match is not None:
+            raise ValueError(not_found_error)
+        match = event
+    if match is None:
+        raise ValueError(not_found_error)
+    return match
 
 
 def _load_current_cursors(
@@ -235,6 +252,19 @@ def _validate_review_packet_chain(
             raise ValueError(
                 "decision-context no_change settlement lacks semantic proof"
             )
+    elif disposition == "observed":
+        semantic_rebase = packet.get("semantic_rebase")
+        if (
+            not isinstance(semantic_rebase, Mapping)
+            or semantic_rebase.get("schema_version")
+            != DECISION_SEMANTIC_REBASE_RECEIPT_SCHEMA_VERSION
+            or semantic_rebase.get("status") != "material_change"
+            or semantic_rebase.get("quiet_noop_allowed") is not False
+            or proposal is not None
+        ):
+            raise ValueError(
+                "decision-context observed settlement lacks material review"
+            )
     else:
         if (
             proposal is None
@@ -275,17 +305,11 @@ def resolve_decision_review_source_event(
 ) -> tuple[Mapping[str, Any], str]:
     """Exact-read one user-gate event and infer its review disposition."""
 
-    matches = [
-        event
-        for event in load_rollout_events(
-            event_log_path.expanduser(),
-            limit=_LIFECYCLE_WRITEBACK_READ_LIMIT,
-        )
-        if event.get("event_id") == source_event_id
-    ]
-    if len(matches) != 1:
-        raise ValueError("decision-context user-gate event was not found")
-    event = matches[0]
+    event = _load_exact_rollout_event(
+        event_log_path,
+        source_event_id,
+        not_found_error="decision-context user-gate event was not found",
+    )
     details = event.get("details")
     expected_scope = f"direction:action:{proposal_packet_ref}"
     if (
@@ -319,17 +343,11 @@ def _validate_lifecycle_writeback(
     decision_id: str,
     required_artifact_refs: Collection[str],
 ) -> Mapping[str, Any]:
-    matches = [
-        event
-        for event in load_rollout_events(
-            event_log_path.expanduser(),
-            limit=_LIFECYCLE_WRITEBACK_READ_LIMIT,
-        )
-        if event.get("event_id") == event_id
-    ]
-    if len(matches) != 1:
-        raise ValueError("validated lifecycle writeback event was not found")
-    event = matches[0]
+    event = _load_exact_rollout_event(
+        event_log_path,
+        event_id,
+        not_found_error="validated lifecycle writeback event was not found",
+    )
     if (
         event.get("schema_version") != ROLLOUT_EVENT_SCHEMA_VERSION
         or _event_id(event) != event_id

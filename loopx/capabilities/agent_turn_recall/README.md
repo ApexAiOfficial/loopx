@@ -23,6 +23,10 @@ host-provided `turn_instance_id` produces a `turn_recall_id`.
 
 This gives two useful identities:
 
+Turn ids are opaque host identities, not timestamps. Execution uses the current
+UTC observation time for memory freshness while preserving the original turn
+identity for validation and deduplication.
+
 - a changed Todo, target, phase, or intent changes the situation fingerprint;
 - a new turn changes the recall id and recalls again, even when the situation
   is otherwise unchanged.
@@ -30,6 +34,8 @@ This gives two useful identities:
 Repeated execution with the same recall id may reuse one ignored local receipt.
 The receipt stores only the compact private context needed to reproduce that
 turn's guidance; it never stores provider payloads, credentials, or query text.
+Its path includes collision-safe digests of both `goal_id` and `agent_id`, so
+the same Goal-local Agent name in another Goal cannot reuse the receipt.
 
 ## Usage
 
@@ -64,9 +70,23 @@ keeps turn admission bounded and ensures the recall query uses the same selected
 Todo and interaction state that the host is following. `-` may be used to read
 the packet from stdin when the host owns a safe pipeline.
 
+An explicit selection or requalification may return an `upgraded` committed
+receipt. Recall accepts that packet with its exact settlement identity, checking
+the Goal, Agent, Turn, selected Todo or replan obligation, and canonical effect
+identity. A missing or inconsistent binding is rejected before provider access.
+Legacy `committed` and `replayed` packets without a settlement binding remain
+valid; all existing conflict, freshness, scope and deduplication checks still apply.
+
 The result carries a private `context.guidance` list for agent reasoning. It is
 not action authority. The agent must still obey the current interaction
 contract, capability gates, write scopes, and user gates.
+
+The production `loopx turn run-once --execute` and executing quota admission
+call this hook before the host. The DSH adapter injects the same bounded context
+into the actual task body rather than merely reporting a hit count. At Turn
+start the hook first reconciles any ambiguous evidence-backed outcome write for
+this exact Goal+Agent; successful exact readback can therefore participate in
+the next recall without creating another queue or memory store.
 
 Retrieval relevance and action applicability remain separate. Recalled
 guidance is conditional private context; the agent must compare it with the

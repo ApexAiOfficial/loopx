@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { JsonObject } from "../effect_program.ts";
+import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
+import type { SourceReadStatus } from "../projection_envelope.ts";
 import {
   atomicWriteJson,
   withFileMutationLock,
@@ -11,10 +13,12 @@ import {
 import {
   assertNever,
   jsonObject,
+  pythonString,
   requireJsonObject as requiredObject,
   requireNonEmptyString as requiredString,
   requireStringLiteral,
 } from "../runtime_decode.ts";
+import { parseIsoTimestamp } from "../runtime_timestamp.ts";
 
 export const SCHEDULER_STATE_SCHEMA_VERSION = "loopx_scheduler_state_v0";
 export const SCHEDULER_HOST_UPDATE_FAILURE_SCHEMA_VERSION =
@@ -28,12 +32,18 @@ export const SCHEDULER_STATE_STORE_REQUEST_SCHEMA =
 export const SCHEDULER_STATE_STORE_RESULT_SCHEMA =
   "loopx_scheduler_state_store_result_v0";
 
-export const CODEX_APP_STATEFUL_BACKOFF_STATE_KEY =
+export const APP_AUTOMATION_STATEFUL_BACKOFF_STATE_KEY =
+  "scheduler_hint.app_automation.stateful_backoff";
+export const LEGACY_CODEX_APP_STATEFUL_BACKOFF_STATE_KEY =
   "scheduler_hint.codex_app.stateful_backoff";
+export const CODEX_APP_STATEFUL_BACKOFF_STATE_KEY =
+  LEGACY_CODEX_APP_STATEFUL_BACKOFF_STATE_KEY;
 export const CODEX_APP_SURFACE = "codex_app";
 
 const HOST_UPDATE_FAILURE_CACHE_LIMIT = 4;
 const HOST_UPDATE_FAILURE_TTL_MS = 24 * 60 * 60 * 1_000;
+const SCOPE_SEGMENT_LABEL_LIMIT = 47;
+const SCOPE_SEGMENT_HASH_LENGTH = 16;
 
 export const SCHEDULER_STATE_OPERATIONS = [
   "rrule_for_minutes",
@@ -68,6 +78,14 @@ export interface SchedulerStateLoadResult {
   operation: "load";
   path: string;
   state: JsonObject | null;
+  read_status: SchedulerStateReadStatus;
+}
+
+type SchedulerStateReadStatus = Extract<SourceReadStatus, "read" | "unreadable">;
+
+interface SchedulerStateReadResult {
+  state: JsonObject | null;
+  readStatus: SchedulerStateReadStatus;
 }
 
 interface SchedulerStateWriteResultBase {
@@ -88,15 +106,6 @@ function pythonTruthy(value: unknown): boolean {
   if (typeof value === "string" || Array.isArray(value)) return value.length > 0;
   if (typeof value === "object") return Object.keys(value).length > 0;
   return true;
-}
-
-function pythonString(value: unknown): string {
-  if (value === null || value === undefined) return "None";
-  if (value === true) return "True";
-  if (value === false) return "False";
-  if (typeof value === "string") return value;
-  if (typeof value === "number") return String(value);
-  return String(value);
 }
 
 function stringOrEmpty(value: unknown): string {
@@ -121,7 +130,7 @@ function pythonInteger(value: unknown): number | null {
 
 export function rruleForMinutes(value: unknown): string {
   const minutes = pythonInteger(value);
-  if (minutes === null) throw new Error("scheduler minutes must be an integer");
+  if (minutes === null) throw new EffectRuntimeRequestError("scheduler minutes must be an integer");
   return `FREQ=MINUTELY;INTERVAL=${Math.max(1, minutes)}`;
 }
 
@@ -200,14 +209,26 @@ export function normalizeSchedulerHostUpdateFailures(
   return normalized.slice(-HOST_UPDATE_FAILURE_CACHE_LIMIT);
 }
 
+/** Calendar-checked ISO instant. Blank is null; a missing timezone means UTC. */
 export function schedulerTimestampMilliseconds(value: unknown): number | null {
   const text = trimmed(value);
   if (!text) return null;
-  const timezoneAware = /(?:[zZ]|[+-]\d{2}(?::?\d{2})?)$/.test(text)
-    ? text
-    : `${text}Z`;
-  const parsed = Date.parse(timezoneAware);
-  return Number.isNaN(parsed) ? null : parsed;
+  const parsed = parseIsoTimestamp(text);
+  return parsed === null ? null : parsed.getTime();
+}
+
+/** Blank stays null. Present text that is not a calendar-checked ISO timestamp is rejected. */
+export function requireSchedulerTimestampMilliseconds(
+  value: unknown,
+  label: string,
+): number | null {
+  const text = trimmed(value);
+  if (!text) return null;
+  const parsed = schedulerTimestampMilliseconds(text);
+  if (parsed === null) {
+    throw new EffectRuntimeRequestError(`${label} must be an ISO timestamp`);
+  }
+  return parsed;
 }
 
 export function retainedSchedulerHostUpdateFailures(
@@ -216,7 +237,10 @@ export function retainedSchedulerHostUpdateFailures(
   observedHostRrule: unknown = null,
 ): JsonObject[] {
   const failures = normalizeSchedulerHostUpdateFailures(value);
-  const now = schedulerTimestampMilliseconds(referenceTime) ?? Date.now();
+  const now = requireSchedulerTimestampMilliseconds(
+    referenceTime,
+    "reference_time",
+  ) ?? Date.now();
   const cutoff = now - HOST_UPDATE_FAILURE_TTL_MS;
   const expectedHostRrule = normalizeSchedulerRrule(observedHostRrule);
   return failures.filter((failure) => {
@@ -233,7 +257,7 @@ export function mergeSchedulerHostUpdateFailure(
   referenceTime: unknown = null,
 ): JsonObject[] {
   const normalized = normalizeSchedulerHostUpdateFailure(failure);
-  if (!normalized) throw new Error("scheduler host update failure is invalid");
+  if (!normalized) throw new EffectRuntimeRequestError("scheduler host update failure is invalid");
   const retained = retainedSchedulerHostUpdateFailures(
     value,
     referenceTime,
@@ -336,7 +360,7 @@ export function buildSchedulerState(params: JsonObject): JsonObject {
   if (pythonTruthy(params.source)) state.source = pythonString(params.source);
   const normalized = normalizeSchedulerState(state, scope);
   if (!normalized) {
-    throw new Error("scheduler state is missing required persisted-state fields");
+    throw new EffectRuntimeRequestError("scheduler state is missing required persisted-state fields");
   }
   return normalized;
 }
@@ -346,6 +370,19 @@ function safeSegment(value: unknown): string {
     .replace(/[^0-9A-Za-z_.-]+/g, "-")
     .replace(/^[-._]+|[-._]+$/g, "");
   return safe || "default";
+}
+
+function stableHash(value: string, length: number): string {
+  return createHash("sha256")
+    .update(value, "utf8")
+    .digest("hex")
+    .slice(0, length);
+}
+
+function scopedSegment(value: unknown): string {
+  const raw = trimmed(value);
+  const label = safeSegment(raw).slice(0, SCOPE_SEGMENT_LABEL_LIMIT);
+  return `${label}-${stableHash(raw, SCOPE_SEGMENT_HASH_LENGTH)}`;
 }
 
 function expandUser(path: string): string {
@@ -360,10 +397,22 @@ export function schedulerStatePath(
   runtimeRoot: string,
   scope: SchedulerScope,
 ): string {
-  const stateHash = createHash("sha256")
-    .update(scope.stateKey, "utf8")
-    .digest("hex")
-    .slice(0, 16);
+  const stateHash = stableHash(scope.stateKey, 16);
+  return join(
+    expandUser(runtimeRoot),
+    "goals",
+    scopedSegment(scope.goalId),
+    "scheduler-state",
+    scopedSegment(scope.agentId),
+    scopedSegment(scope.surface),
+    `${stateHash}.json`,
+  );
+}
+
+function legacySchedulerStatePath(
+  runtimeRoot: string,
+  scope: SchedulerScope,
+): string {
   return join(
     expandUser(runtimeRoot),
     "goals",
@@ -371,14 +420,14 @@ export function schedulerStatePath(
     "scheduler-state",
     safeSegment(scope.agentId),
     safeSegment(scope.surface),
-    `${stateHash}.json`,
+    `${stableHash(scope.stateKey, 16)}.json`,
   );
 }
 
 function operationRequest(value: unknown): JsonObject {
   const request = requiredObject(value, "scheduler.state params");
   if (request.schema_version !== SCHEDULER_STATE_OPERATION_REQUEST_SCHEMA) {
-    throw new Error("Scheduler state operation request schema mismatch");
+    throw new EffectRuntimeRequestError("Scheduler state operation request schema mismatch");
   }
   return request;
 }
@@ -453,34 +502,159 @@ function storeRequest(value: unknown, operation: "load" | "write"): {
   request: JsonObject;
   scope: SchedulerScope;
   path: string;
+  legacyPath: string;
 } {
   const request = requiredObject(value, `scheduler.state.${operation} params`);
   if (request.schema_version !== SCHEDULER_STATE_STORE_REQUEST_SCHEMA) {
-    throw new Error("Scheduler state store request schema mismatch");
+    throw new EffectRuntimeRequestError("Scheduler state store request schema mismatch");
   }
   const scope = schedulerScope(request);
-  const path = schedulerStatePath(
-    requiredString(request.runtime_root, "runtime_root"),
-    scope,
+  const runtimeRoot = requiredString(request.runtime_root, "runtime_root");
+  const path = schedulerStatePath(runtimeRoot, scope);
+  const legacyPath = legacySchedulerStatePath(runtimeRoot, scope);
+  return { request, scope, path, legacyPath };
+}
+
+async function migrateLegacySchedulerStateAtPathsUnderLock(
+  scope: SchedulerScope,
+  path: string,
+  legacyPath: string,
+): Promise<SchedulerStateReadResult> {
+  // Probe the legacy file before creating any directory or taking the legacy
+  // lock. The legacy layout uses unbounded safeSegment labels, so an overlong
+  // scope component can make the legacy path unaddressable (ENAMETOOLONG) or
+  // simply absent (ENOENT); either way there is nothing to migrate and the
+  // canonical path must be reported as missing rather than raising an effect
+  // rejection from mkdir on the unbounded legacy directory.
+  try {
+    await readFile(legacyPath, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENAMETOOLONG") {
+      return { state: null, readStatus: "read" };
+    }
+    throw error;
+  }
+  return await withFileMutationLock(legacyPath, async () => {
+    try {
+      const current = normalizeSchedulerState(
+        JSON.parse(await readFile(path, "utf8")),
+        scope,
+      );
+      if (current) return { state: current, readStatus: "read" };
+    } catch {
+      // The canonical path is still absent or unusable; inspect legacy state.
+    }
+    let legacyState: JsonObject | null = null;
+    try {
+      legacyState = normalizeSchedulerState(
+        JSON.parse(await readFile(legacyPath, "utf8")),
+        scope,
+      );
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      return {
+        state: null,
+        readStatus: code === "ENOENT" || code === "ENAMETOOLONG"
+          ? "read"
+          : "unreadable",
+      };
+    }
+    if (!legacyState) return { state: null, readStatus: "unreadable" };
+    await atomicWriteJson(path, stableValue(legacyState) as JsonObject);
+    try {
+      await unlink(legacyPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    return { state: legacyState, readStatus: "read" };
+  });
+}
+
+async function migrateLegacySchedulerState(
+  scope: SchedulerScope,
+  path: string,
+  legacyPath: string,
+): Promise<SchedulerStateReadResult> {
+  return await withFileMutationLock(
+    path,
+    async () =>
+      await migrateLegacySchedulerStateAtPathsUnderLock(
+        scope,
+        path,
+        legacyPath,
+      ),
   );
-  return { request, scope, path };
+}
+
+export async function migrateLegacySchedulerStateUnderLock(
+  runtimeRoot: string,
+  scope: SchedulerScope,
+): Promise<JsonObject | null> {
+  const result = await migrateLegacySchedulerStateAtPathsUnderLock(
+    scope,
+    schedulerStatePath(runtimeRoot, scope),
+    legacySchedulerStatePath(runtimeRoot, scope),
+  );
+  return result.state;
+}
+
+async function readLegacySchedulerState(
+  scope: SchedulerScope,
+  legacyPath: string,
+): Promise<SchedulerStateReadResult> {
+  try {
+    const state = normalizeSchedulerState(
+      JSON.parse(await readFile(legacyPath, "utf8")),
+      scope,
+    );
+    return {
+      state,
+      readStatus: state === null ? "unreadable" : "read",
+    };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENAMETOOLONG") {
+      return { state: null, readStatus: "read" };
+    }
+    if (error instanceof SyntaxError) {
+      return { state: null, readStatus: "unreadable" };
+    }
+    throw error;
+  }
 }
 
 export async function loadSchedulerState(
   value: unknown,
 ): Promise<SchedulerStateLoadResult> {
-  const { scope, path } = storeRequest(value, "load");
+  const { request, scope, path, legacyPath } = storeRequest(value, "load");
   let state: JsonObject | null = null;
+  let readStatus: SchedulerStateReadStatus = "read";
   try {
     state = normalizeSchedulerState(JSON.parse(await readFile(path, "utf8")), scope);
-  } catch {
-    state = null;
+    if (state === null) readStatus = "unreadable";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      try {
+        const legacy = request.migrate_legacy === false
+          ? await readLegacySchedulerState(scope, legacyPath)
+          : await migrateLegacySchedulerState(scope, path, legacyPath);
+        state = legacy.state;
+        readStatus = legacy.readStatus;
+      } catch {
+        readStatus = "unreadable";
+        state = null;
+      }
+    } else {
+      readStatus = "unreadable";
+    }
   }
   return {
     schema_version: SCHEDULER_STATE_STORE_RESULT_SCHEMA,
     operation: "load",
     path,
     state,
+    read_status: readStatus,
   };
 }
 
@@ -503,7 +677,7 @@ export async function writeSchedulerState(
 ): Promise<SchedulerStateWriteResult> {
   const { request, scope, path } = storeRequest(value, "write");
   const state = normalizeSchedulerState(request.state, scope);
-  if (!state) throw new Error("scheduler state does not match target scope or schema");
+  if (!state) throw new EffectRuntimeRequestError("scheduler state does not match target scope or schema");
   return await withFileMutationLock(path, async () => {
     try {
       const existing = normalizeSchedulerState(

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import re
-from typing import Any
 
+from .control_plane.goals.goal_vision_policy import (
+    completed_todo_replan_threshold,
+    normalize_completed_todo_replan_threshold,
+    normalize_effective_turn_replan_threshold,
+)
 from .control_plane.work_items.delivery_outcome import DeliveryOutcome
-
 
 DEFAULT_EXECUTION_PROFILE: dict[str, Any] = {
     "cadence": "bounded_progress_segment",
@@ -150,6 +155,35 @@ def compact_execution_profile(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return profile
 
+    if "planning_horizon_goal" in value:
+        if not isinstance(value["planning_horizon_goal"], bool):
+            raise ValueError("planning_horizon_goal must be a boolean")
+        profile["planning_horizon_goal"] = value["planning_horizon_goal"]
+
+    if "yardstick_enabled" in value:
+        if not isinstance(value["yardstick_enabled"], bool):
+            raise ValueError("yardstick_enabled must be a boolean")
+        profile["yardstick_enabled"] = value["yardstick_enabled"]
+
+    if "stride_strategy" in value:
+        # Removed live switch: a saved Goal may still record "off" or
+        # "evidence_conditioned_v1". Decode it as history, then drop it so no
+        # surface displays or acts on it; evidence-conditioned stride is live.
+        from .control_plane.work_items.stride_policy_codec import normalize_stride_strategy
+        normalize_stride_strategy(value["stride_strategy"])
+
+    if "replan_after_effective_turns" in value and "replan_after_completed_todos" in value:
+        raise ValueError("choose one review cadence unit")
+    if "replan_after_effective_turns" in value:
+        profile["replan_after_effective_turns"] = normalize_effective_turn_replan_threshold(
+            value["replan_after_effective_turns"]
+        )
+
+    if "replan_after_completed_todos" in value:
+        # Retain explicit legacy-unit overrides, including five. Omitting one
+        # now means inheriting the settled-Turn default.
+        profile["replan_after_completed_todos"] = completed_todo_replan_threshold(value)
+
     if "turn_granularity" in value:
         turn_granularity = normalize_turn_granularity(value.get("turn_granularity"))
         if turn_granularity == TURN_GRANULARITY_FINE:
@@ -160,7 +194,7 @@ def compact_execution_profile(value: Any) -> dict[str, Any]:
     profile["must_include"] = _label_list(value.get("must_include"), list(profile["must_include"]))
     profile["spend_rule"] = _label(value.get("spend_rule"), str(profile["spend_rule"]))
 
-    raw_policy = value.get("degradation_policy") if isinstance(value.get("degradation_policy"), dict) else {}
+    raw_policy = cast(dict[str, Any], value.get("degradation_policy")) if isinstance(value.get("degradation_policy"), dict) else {}
     policy = dict(profile["degradation_policy"])
     policy["small_scale_streak_threshold"] = _positive_int(
         raw_policy.get("small_scale_streak_threshold"),
@@ -169,7 +203,7 @@ def compact_execution_profile(value: Any) -> dict[str, Any]:
     policy["on_degradation"] = _label(raw_policy.get("on_degradation"), str(policy["on_degradation"]))
     profile["degradation_policy"] = policy
 
-    raw_floor = value.get("outcome_floor") if isinstance(value.get("outcome_floor"), dict) else {}
+    raw_floor = cast(dict[str, Any], value.get("outcome_floor")) if isinstance(value.get("outcome_floor"), dict) else {}
     floor = dict(profile["outcome_floor"])
     floor["required_when"] = _label(raw_floor.get("required_when"), str(floor["required_when"]))
     floor["surface_streak_threshold"] = _positive_int(
@@ -188,6 +222,102 @@ def compact_execution_profile(value: Any) -> dict[str, Any]:
     if execution_profile_is_fine_grained(profile):
         _apply_fine_grained_contract(profile)
     return profile
+
+
+def configure_execution_profile(
+    profile: Any,
+    *,
+    turn_granularity: str | None = None,
+    replan_after_completed_todos: int | None = None,
+) -> dict[str, Any]:
+    normalized = compact_execution_profile(profile)
+    if turn_granularity is not None:
+        normalized = execution_profile_with_turn_granularity(normalized, turn_granularity)
+    requested_threshold = (
+        replan_after_completed_todos
+        if replan_after_completed_todos is not None
+        else profile.get("replan_after_completed_todos") if isinstance(profile, dict) else None
+    )
+    configured_threshold = (
+        normalize_completed_todo_replan_threshold(requested_threshold)
+        if requested_threshold is not None
+        else None
+    )
+    if configured_threshold is not None:
+        normalized["replan_after_completed_todos"] = configured_threshold
+    configured = compact_execution_profile(normalized)
+    if configured_threshold is not None:
+        # The default value still represents an explicit Goal override. Keep the
+        # field so a machine default can change without silently changing this Goal.
+        configured["replan_after_completed_todos"] = configured_threshold
+    return configured
+
+
+def apply_goal_execution_profile_change(
+    goal: dict[str, Any],
+    *,
+    turn_granularity: str | None,
+    replan_after_completed_todos: int | None,
+    clear_replan_after_completed_todos: bool,
+    replan_after_effective_turns: int | None = None,
+    clear_replan_after_effective_turns: bool = False,
+    planning_horizon_goal: bool | None = None,
+    clear_planning_horizon_goal: bool = False,
+    yardstick_enabled: bool | None = None,
+    clear_yardstick_enabled: bool = False,
+) -> None:
+    if (
+        clear_replan_after_completed_todos
+        and replan_after_completed_todos is not None
+    ):
+        raise ValueError(
+            "--clear-execution-replan-after-todos cannot be combined with "
+            "--execution-replan-after-todos"
+        )
+    if replan_after_effective_turns is not None and (
+        replan_after_completed_todos is not None or clear_replan_after_effective_turns
+    ):
+        raise ValueError("choose one review cadence override or clear operation")
+    if planning_horizon_goal is not None and clear_planning_horizon_goal:
+        raise ValueError("choose a planning horizon Goal override or clear operation")
+    if yardstick_enabled is not None and clear_yardstick_enabled:
+        raise ValueError("choose a Yardstick override or clear operation")
+    raw = goal.get("execution_profile")
+    profile = dict(raw) if isinstance(raw, dict) else {}
+    if (
+        yardstick_enabled is None
+        and not (clear_yardstick_enabled and "yardstick_enabled" in profile)
+        and planning_horizon_goal is None
+        and not clear_planning_horizon_goal
+        and turn_granularity is None
+        and replan_after_completed_todos is None
+        and replan_after_effective_turns is None
+        and not clear_replan_after_effective_turns
+        and not (clear_replan_after_completed_todos and "replan_after_completed_todos" in profile)
+    ):
+        return
+    if clear_yardstick_enabled:
+        profile.pop("yardstick_enabled", None)
+    if yardstick_enabled is not None:
+        profile["yardstick_enabled"] = yardstick_enabled
+    if clear_planning_horizon_goal:
+        profile.pop("planning_horizon_goal", None)
+    if planning_horizon_goal is not None:
+        profile["planning_horizon_goal"] = planning_horizon_goal
+    if clear_replan_after_effective_turns or replan_after_completed_todos is not None:
+        profile.pop("replan_after_effective_turns", None)
+    if replan_after_completed_todos is not None:
+        profile["replan_after_completed_todos"] = replan_after_completed_todos
+    if replan_after_effective_turns is not None:
+        profile["replan_after_effective_turns"] = replan_after_effective_turns
+        profile.pop("replan_after_completed_todos", None)
+    if clear_replan_after_completed_todos:
+        profile.pop("replan_after_completed_todos", None)
+    goal["execution_profile"] = configure_execution_profile(
+        profile,
+        turn_granularity=turn_granularity,
+        replan_after_completed_todos=replan_after_completed_todos,
+    )
 
 
 def normalize_turn_granularity(value: Any) -> str:
@@ -234,7 +364,7 @@ def execution_profile_with_turn_granularity(
 
 def execution_profile_threshold(profile: dict[str, Any] | None) -> int:
     normalized = compact_execution_profile(profile)
-    policy = normalized.get("degradation_policy") if isinstance(normalized.get("degradation_policy"), dict) else {}
+    policy = cast(dict[str, Any], normalized.get("degradation_policy")) if isinstance(normalized.get("degradation_policy"), dict) else {}
     return _positive_int(
         policy.get("small_scale_streak_threshold"),
         int(DEFAULT_EXECUTION_PROFILE["degradation_policy"]["small_scale_streak_threshold"]),
@@ -243,7 +373,7 @@ def execution_profile_threshold(profile: dict[str, Any] | None) -> int:
 
 def execution_profile_outcome_floor(profile: dict[str, Any] | None) -> dict[str, Any]:
     normalized = compact_execution_profile(profile)
-    floor = normalized.get("outcome_floor") if isinstance(normalized.get("outcome_floor"), dict) else {}
+    floor = cast(dict[str, Any], normalized.get("outcome_floor")) if isinstance(normalized.get("outcome_floor"), dict) else {}
     return dict(floor)
 
 
@@ -257,11 +387,11 @@ def outcome_floor_threshold(profile: dict[str, Any] | None) -> int:
 
 def execution_profile_summary(profile: dict[str, Any] | None) -> str:
     normalized = compact_execution_profile(profile)
-    policy = normalized.get("degradation_policy") if isinstance(normalized.get("degradation_policy"), dict) else {}
-    floor = normalized.get("outcome_floor") if isinstance(normalized.get("outcome_floor"), dict) else {}
+    policy = cast(dict[str, Any], normalized.get("degradation_policy")) if isinstance(normalized.get("degradation_policy"), dict) else {}
+    floor = cast(dict[str, Any], normalized.get("outcome_floor")) if isinstance(normalized.get("outcome_floor"), dict) else {}
     floor_suffix = ""
-    outcome_markers = floor.get("outcome_markers") if isinstance(floor.get("outcome_markers"), list) else []
-    surface_hints = floor.get("surface_only_hints") if isinstance(floor.get("surface_only_hints"), list) else []
+    outcome_markers = cast(list[Any], floor.get("outcome_markers")) if isinstance(floor.get("outcome_markers"), list) else []
+    surface_hints = cast(list[Any], floor.get("surface_only_hints")) if isinstance(floor.get("surface_only_hints"), list) else []
     if outcome_markers or surface_hints:
         floor_suffix = (
             " "
@@ -283,4 +413,10 @@ def execution_profile_summary(profile: dict[str, Any] | None) -> str:
         f"small_streak_threshold={policy.get('small_scale_streak_threshold')}"
         f"{floor_suffix}"
         f"{turn_suffix}"
+        + (
+            f" replan_after_completed_todos={normalized['replan_after_completed_todos']}"
+            if "replan_after_completed_todos" in normalized else ""
+        )
+        + (f" replan_after_effective_turns={normalized['replan_after_effective_turns']}"
+           if "replan_after_effective_turns" in normalized else "")
     )

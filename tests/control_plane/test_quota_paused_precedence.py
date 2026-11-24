@@ -160,7 +160,7 @@ def test_paused_quota_stops_codex_app_heartbeat_until_explicit_resume() -> None:
 
     scheduler = payload["scheduler_hint"]
     assert scheduler["reason_code"] == "quota_paused"
-    codex_app = scheduler["codex_app"]
+    codex_app = scheduler["app_automation"]
     assert codex_app["applicability"] == "applicable"
     assert codex_app["apply"] == "pause_or_delete_current_heartbeat_if_possible"
     assert codex_app["host_action"] == "pause_or_delete_current_heartbeat"
@@ -185,6 +185,43 @@ def test_paused_quota_preserves_unhealthy_status_fact() -> None:
     _assert_authoritatively_paused(payload)
     assert payload["ok"] is False
     assert payload["status_health_ok"] is False
+
+
+@pytest.mark.parametrize("pause", ["compute", "owner", None])
+def test_live_pause_preempts_prior_turn_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pause: str | None,
+) -> None:
+    from loopx.control_plane.quota import live_decision, unsettled_host_turn
+
+    status = quota_status_payload(
+        goal_id=GOAL_ID, status="active", recommended_action="Continue work.",
+        agent_todo_items=[], quota_state="eligible" if pause is None else "paused",
+        quota_extra={
+            "compute": 0 if pause == "compute" else 1,
+            **({"goal_activation_state": "stopped", "pause_cause": "goal_stopped"} if pause == "owner" else {}),
+        },
+        coordination={"agent_model": "peer_v1", "registered_agents": [AGENT_ID]},
+    )
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"goals": []}), encoding="utf-8")
+    recovery = []
+
+    def project_recovery(**kwargs):
+        recovery.append(True)
+        return None
+
+    monkeypatch.setattr(unsettled_host_turn, "_unsettled_host_turn_recovery", project_recovery)
+    payload = live_decision.build_live_quota_should_run_decision(
+        status, goal_id=GOAL_ID, agent_id=AGENT_ID,
+        available_capabilities=None, include_scheduler_detail=True,
+        codex_app_current_rrule=None, registry_path=registry, runtime_root=tmp_path,
+        turn_instance_id="paused-turn", scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
+    )
+    assert recovery == ([True] if pause is None else [])
+    if pause is not None:
+        assert payload["should_run"] is False
+        assert payload["scheduler_hint"]["action"] == "stop_until_explicit_resume"
+        assert _find_execution_signals(payload) == []
 
 
 def _paused_status_with_due_monitor() -> dict:
@@ -330,4 +367,34 @@ def test_configure_goal_rejects_negative_compute(tmp_path: Path) -> None:
             goal_id=GOAL_ID,
             quota_compute=-0.1,
             execute=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("quota_compute", True),
+        ("quota_compute", float("nan")),
+        ("quota_window_hours", float("inf")),
+        ("max_children", True),
+        ("max_children", 1.5),
+    ],
+)
+def test_configure_goal_rejects_invalid_numeric_values(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps({"goals": [{"id": GOAL_ID, "repo": str(tmp_path)}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=field):
+        configure_goal(
+            registry_path=registry,
+            goal_id=GOAL_ID,
+            execute=False,
+            **{field: value},
         )

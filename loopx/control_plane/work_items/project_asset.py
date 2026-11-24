@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 from typing import Any, Callable
 
 from ..runtime.public_safety import (
@@ -8,13 +9,10 @@ from ..runtime.public_safety import (
     compact_text as _compact_text,
     public_safe_compact_text as _runtime_public_safe_compact_text,
 )
+from ..todos.todo_semantics import todo_blocker_reason
 from .autonomous_replan_obligation import run_history_agent_id
 
 
-DEFAULT_MONITOR_SIGNAL_WAITING_ON = "monitor_signal"
-DEFAULT_MONITOR_DISPLAY_STOP_CONDITION = (
-    "stop until a material monitor transition, regression, or concrete blocker appears"
-)
 TODO_PROJECTION_VIEW_SCHEMA_VERSION = "todo_projection_view_v0"
 TODO_PROJECTION_DETAIL_POINTER_SCHEMA_VERSION = "todo_projection_detail_pointer_v0"
 PROJECT_ASSET_TODO_PROJECTION_GAP_SCHEMA_VERSION = "project_asset_todo_projection_gap_v0"
@@ -32,7 +30,7 @@ def project_asset_public_safe_compact_text(value: Any, *, limit: int = 220) -> s
 def project_asset_owner(
     waiting_on: str,
     *,
-    monitor_signal_waiting_on: str = DEFAULT_MONITOR_SIGNAL_WAITING_ON,
+    monitor_signal_waiting_on: str,
 ) -> str:
     if waiting_on == "codex":
         return "codex"
@@ -53,7 +51,7 @@ def project_asset_gate(
     operator_question: str | None,
     missing_gates: list[str] | None,
     status: str,
-    monitor_signal_waiting_on: str = DEFAULT_MONITOR_SIGNAL_WAITING_ON,
+    monitor_signal_waiting_on: str,
 ) -> str:
     if operator_question:
         return "operator_question"
@@ -73,8 +71,8 @@ def project_asset_stop_condition(
     waiting_on: str,
     next_handoff_condition: str | None,
     agent_command: str | None,
-    monitor_signal_waiting_on: str = DEFAULT_MONITOR_SIGNAL_WAITING_ON,
-    monitor_display_stop_condition: str = DEFAULT_MONITOR_DISPLAY_STOP_CONDITION,
+    monitor_signal_waiting_on: str,
+    monitor_display_stop_condition: str,
 ) -> str:
     if next_handoff_condition:
         return next_handoff_condition
@@ -99,7 +97,7 @@ def project_asset_support_mode(
     status: str,
     recommended_action: str,
     agent_command: str | None,
-    monitor_signal_waiting_on: str = DEFAULT_MONITOR_SIGNAL_WAITING_ON,
+    monitor_signal_waiting_on: str,
 ) -> str:
     surface = " ".join(
         str(value or "")
@@ -259,12 +257,30 @@ def attach_active_state_project_asset_fields(
     latest_runs: list[dict[str, Any]] | None = None,
     next_action_projection_warning: Callable[..., dict[str, Any] | None] | None = None,
     autonomous_replan_obligation_from_runs: Callable[..., dict[str, Any] | None] | None = None,
+    external_progress_review: dict[str, Any] | None = None,
+    effective_turn_cadence: dict[str, Any] | None = None,
+    agent_lane_id: str | None = None,
 ) -> dict[str, Any]:
     project_asset = item.get("project_asset")
     if not isinstance(project_asset, dict):
         return {}
 
     attached: dict[str, Any] = {}
+    if effective_turn_cadence is not None and autonomous_replan_obligation_from_runs is not None:
+        autonomous_replan_obligation_from_runs = partial(
+            autonomous_replan_obligation_from_runs, effective_turn_cadence=effective_turn_cadence,
+        )
+    if isinstance(external_progress_review, dict):
+        review_summary = external_progress_review.get("summary")
+        if isinstance(review_summary, dict):
+            item["external_progress_review"] = review_summary
+            project_asset["external_progress_review"] = review_summary
+            attached["external_progress_review"] = review_summary
+        if autonomous_replan_obligation_from_runs is not None:
+            autonomous_replan_obligation_from_runs = partial(
+                autonomous_replan_obligation_from_runs,
+                external_progress_review=external_progress_review,
+            )
     active_next_action = item.get("active_state_next_action")
     if active_next_action:
         project_asset["active_state_next_action"] = active_next_action
@@ -291,6 +307,7 @@ def attach_active_state_project_asset_fields(
         "backlog_hygiene_warning",
         "state_projection_gap",
         "completed_todo_archive_warning",
+        "state_incomplete",
     ):
         value = item.get(key) if isinstance(item.get(key), dict) else None
         if value:
@@ -303,7 +320,13 @@ def attach_active_state_project_asset_fields(
         else None
     )
     if replan_obligation is None and autonomous_replan_obligation_from_runs is not None:
-        agent_ids = sorted(
+        shared_todos = item.get("agent_todos")
+        monitor_todos = {"monitor_open_items":
+            shared_todos.get("monitor_open_items", []) if isinstance(shared_todos, dict) else []}
+        # Status retains shared Goal history for ownership and health checks.
+        # A lane caller only needs that Agent's semantic review obligations;
+        # peer receipts must not become a prerequisite for its settlement.
+        agent_ids = [agent_lane_id] if agent_lane_id is not None else sorted(
             {
                 agent_id
                 for run in latest_runs or []
@@ -317,9 +340,10 @@ def attach_active_state_project_asset_fields(
             if (
                 obligation := autonomous_replan_obligation_from_runs(
                     latest_runs or [],
-                    # The shared todo summary is goal-scoped here. Quota derives
-                    # todo-based replans later from its agent-filtered summary.
-                    agent_todos=None,
+                    # The TS history owner matches monitor intent by Todo,
+                    # target and lane. Share those facts without importing
+                    # goal-scoped advancement/resume decisions into this lane.
+                    agent_todos=monitor_todos,
                     agent_id=agent_id,
                 )
             )
@@ -331,6 +355,7 @@ def attach_active_state_project_asset_fields(
         replan_obligation = autonomous_replan_obligation_from_runs(
             latest_runs or [],
             agent_todos=item.get("agent_todos") if isinstance(item.get("agent_todos"), dict) else None,
+            agent_id=agent_lane_id,
         )
         if replan_obligation:
             item["autonomous_replan_obligation"] = replan_obligation
@@ -351,7 +376,8 @@ def project_asset_handoff_check_projection(item: dict[str, Any]) -> dict[str, An
     if not isinstance(project_asset, dict):
         return None
 
-    quota = project_asset.get("quota") if isinstance(project_asset.get("quota"), dict) else {}
+    raw_quota = project_asset.get("quota")
+    quota = raw_quota if isinstance(raw_quota, dict) else {}
     if not quota and isinstance(item.get("quota"), dict):
         quota = item["quota"]
 
@@ -396,14 +422,20 @@ def build_project_asset(
     agent_command: str | None,
     missing_gates: list[str] | None,
     next_handoff_condition: str | None,
+    monitor_signal_waiting_on: str,
+    monitor_display_stop_condition: str,
 ) -> dict[str, Any]:
     asset = {
-        "owner": project_asset_owner(waiting_on),
+        "owner": project_asset_owner(
+            waiting_on,
+            monitor_signal_waiting_on=monitor_signal_waiting_on,
+        ),
         "gate": project_asset_gate(
             waiting_on=waiting_on,
             operator_question=operator_question,
             missing_gates=missing_gates,
             status=status,
+            monitor_signal_waiting_on=monitor_signal_waiting_on,
         ),
         "support_mode": project_asset_support_mode(
             waiting_on=waiting_on,
@@ -412,12 +444,15 @@ def build_project_asset(
             status=status,
             recommended_action=recommended_action,
             agent_command=agent_command,
+            monitor_signal_waiting_on=monitor_signal_waiting_on,
         ),
         "next_action": recommended_action,
         "stop_condition": project_asset_stop_condition(
             waiting_on=waiting_on,
             next_handoff_condition=next_handoff_condition,
             agent_command=agent_command,
+            monitor_signal_waiting_on=monitor_signal_waiting_on,
+            monitor_display_stop_condition=monitor_display_stop_condition,
         ),
     }
     next_safe_command = project_asset_next_safe_command(agent_command)
@@ -493,6 +528,7 @@ PROJECT_ASSET_TODO_DISPLAY_FIELDS = (
     "source_section",
     "task_class",
     "action_kind",
+    "capability_binding_ref",
     "task_domain",
     "task_repository",
     "required_write_scopes",
@@ -500,6 +536,7 @@ PROJECT_ASSET_TODO_DISPLAY_FIELDS = (
     "target_capabilities",
     "decision_scope",
     "required_decision_scopes",
+    "created_by",
     "claimed_by",
     "bound_agent",
     "goal_bound",
@@ -508,6 +545,7 @@ PROJECT_ASSET_TODO_DISPLAY_FIELDS = (
     "global_gate",
     "unblocks_todo_id",
     "resume_when",
+    "resume_monitor_generation",
     "resume_condition",
     "resume_ready",
     "blocking_monitor_todo_id",
@@ -521,6 +559,9 @@ PROJECT_ASSET_TODO_DISPLAY_FIELDS = (
     "result_hash",
     "consecutive_no_change",
     "material_change",
+    "material_change_generation",
+    "material_change_scope",
+    "material_change_scope_generations",
     "max_no_change_before_replan",
     "route_continuation_replan_required",
     "route_continuation_reason",
@@ -544,6 +585,9 @@ def _project_asset_display_todo_item(item: dict[str, Any]) -> dict[str, Any]:
     title = _compact_text(str(item.get("title") or ""), limit=220)
     if title:
         display["title"] = title
+    reason = todo_blocker_reason(item)
+    if reason:
+        display["reason"] = reason
     return display
 
 
@@ -594,6 +638,14 @@ def build_project_asset_todo_summary(
         "total": total_count,
         **metadata,
     }
+    capability_actions = todos.get("capability_actions")
+    if todo_role == "user" and isinstance(capability_actions, dict):
+        # Derived from the full canonical User Todo source before its generic
+        # display items are capped. This is a bounded projection, not another
+        # review or decision authority.
+        summary["capability_actions"] = dict(capability_actions)
+    if todos.get("advancement_done_count") is not None:
+        summary["advancement_done_count"] = todos.get("advancement_done_count")
     open_items = open_todo_items(todos, limit=item_limit)
     claimed_open_count = todos.get("claimed_open_count")
     if claimed_open_count is None:
@@ -614,6 +666,13 @@ def build_project_asset_todo_summary(
             summary["next_index"] = open_items[0].get("index")
         if open_items[0].get("claimed_by"):
             summary["next_claimed_by"] = open_items[0].get("claimed_by")
+    recent_completed_items = [
+        _project_asset_display_todo_item(dict(item))
+        for item in todos.get("recent_completed_advancement_items", [])
+        if isinstance(item, dict)
+    ][:item_limit]
+    if recent_completed_items:
+        summary["recent_completed_advancement_items"] = recent_completed_items
     monitor_writeback = todos.get("monitor_writeback")
     if isinstance(monitor_writeback, dict):
         summary["monitor_writeback"] = dict(monitor_writeback)

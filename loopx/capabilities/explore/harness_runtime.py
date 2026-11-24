@@ -25,7 +25,6 @@ from .harness_checkpoint import (
 )
 from .router_state import (
     advance_epoch,
-    family_routing_terms,
     initial_router_state,
     observe_epoch,
 )

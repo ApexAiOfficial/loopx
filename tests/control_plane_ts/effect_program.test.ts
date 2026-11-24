@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   commitStepPayload,
   effectProgramFromOrderedSteps,
+  interpretQuotaShouldRunPacket,
+  interpretTurnResultPacket,
   requireMatchingEffectId,
   seedCommittedSteps,
   settlementBindGate,
@@ -11,13 +13,19 @@ import {
   settlementFailed,
   settlementIdentity,
   settlementIdentityFromPlan,
+  settlementIdentityPayload,
   settlementNextAction,
-  receiptBoundMonitorPhase,
-  receiptBoundTerminalPhase,
   settlementPure,
   settlementResultPayload,
 } from "../../loopx/control_plane/effect_program.ts";
+import {
+  receiptBoundMonitorPhase,
+  receiptBoundReplayPhase,
+  receiptBoundTerminalPhase,
+} from "../../loopx/control_plane/quota/settlement_phase.ts";
 import type {
+  BoundSettlementIdentity,
+  SettlementIdentity,
   SettlementResult,
 } from "../../loopx/control_plane/effect_program.ts";
 
@@ -41,6 +49,108 @@ const invalidSettlementResult: SettlementResult<{ value: number }> = {
   },
 };
 void invalidSettlementResult;
+
+const todoIdentity = {
+  ...identityInput, binding_kind: "todo", binding_id: "todo",
+  replan_obligation_id: null, effect_id: "goal:agent:todo:turn",
+} as const satisfies SettlementIdentity;
+// @ts-expect-error a Todo binding cannot simultaneously carry a replan target
+const dualIdentity: SettlementIdentity = { ...todoIdentity, replan_obligation_id: "replan" };
+// @ts-expect-error the discriminant cannot disagree with the active target
+const wrongKindIdentity: SettlementIdentity = { ...todoIdentity, binding_kind: "autonomous_replan" };
+const unboundIdentity = {
+  ...todoIdentity, binding_kind: "unbound", binding_id: "", todo_id: null,
+} as const satisfies SettlementIdentity;
+// @ts-expect-error an unbound plan cannot enter Turn settlement
+const executableIdentity: BoundSettlementIdentity = unboundIdentity;
+void [dualIdentity, wrongKindIdentity, executableIdentity];
+
+function identityTypes(identity: BoundSettlementIdentity): void {
+  if (identity.binding_kind === "todo") {
+    const todo: string = identity.todo_id;
+    const replan: null = identity.replan_obligation_id;
+    void [todo, replan];
+  } else if (identity.binding_kind === "autonomous_replan") {
+    const todo: null = identity.todo_id;
+    const replan: string = identity.replan_obligation_id;
+    void [todo, replan];
+  } else {
+    const request: "request" = identity.binding_kind;
+    const todo: null = identity.todo_id;
+    void [request, todo];
+  }
+  // @ts-expect-error a validated identity cannot be rebound through mutation
+  identity.todo_id = "other";
+}
+void identityTypes;
+
+test("Turn-result verdicts and host actions never become quota actions", () => {
+  for (const resultKind of ["validated_progress", "repair_required", "wait", "host_failure"]) {
+    for (const hostAction of [undefined, null, "", "normal_run", "agent_scope_wait", "wait", "foreign_action", 42, { action: "normal_run" }]) {
+      const packet = {
+        result_kind: resultKind,
+        effective_action: hostAction,
+        failed_phase: "validation",
+        completed_phases: ["host_execute", "typed_result"],
+        next_cli_actions: ["loopx status"],
+        scheduler_hint: {
+          action: "apply_rrule", cadence_class: "repair",
+          codex_app: {
+            ack_hint: { cli_args: ["quota", "scheduler-ack-current"] },
+            failure_hint: { cli_args: ["quota", "scheduler-ack-current", "--failure"] },
+          },
+        },
+      };
+      const before = structuredClone(packet);
+      const turn = interpretTurnResultPacket(packet);
+      const noAction: null = turn.observation.effective_action;
+      // @ts-expect-error result observations cannot hold even a valid quota action
+      const foreignAction: typeof noAction = "normal_run";
+      void foreignAction;
+      assert.equal(noAction, null);
+      assert.equal(turn.observation.decision, resultKind);
+      assert.equal(turn.observation.should_run, false);
+      assert.equal(turn.request.context.failed_phase, "validation");
+      assert.deepEqual(turn.next_effect, {
+        cli_actions: ["loopx status"], execution_mode: null,
+        scheduler_action: "apply_rrule", cadence_class: "repair",
+        ack_cli_args: ["quota", "scheduler-ack-current"],
+        failure_cli_args: ["quota", "scheduler-ack-current", "--failure"],
+      });
+      assert.equal(JSON.parse(JSON.stringify(turn)).observation.effective_action, null);
+      assert.deepEqual(packet, before);
+    }
+  }
+});
+
+test("quota observations retain their string action and ignore host verdict fields", () => {
+  for (const action of ["normal_run", "quota_skip", "agent_scope_wait", "successor_replan_required"]) {
+    const turn = interpretQuotaShouldRunPacket({
+      decision: "run", should_run: true, effective_action: action, result_kind: "wait",
+      interaction_contract: {
+        schema_version: "loopx_interaction_contract_v0", mode: "bounded_delivery",
+        user_channel: { action_required: false, notify: "DONT_NOTIFY" },
+        agent_channel: { must_attempt: true, delivery_allowed: true, quiet_noop_allowed: false },
+        cli_channel: {},
+      },
+    });
+    const quotaAction: string = turn.observation.effective_action;
+    assert.equal(quotaAction, action);
+    assert.equal(turn.observation.decision, "run");
+    assert.equal(turn.observation.should_run, true);
+  }
+  assert.throws(() => interpretQuotaShouldRunPacket({}), /interaction_contract must be an object/);
+});
+
+test("missing or malformed result packets cannot manufacture an action", () => {
+  for (const packet of [undefined, null, [], "wait", {}, { effective_action: "normal_run" }]) {
+    const turn = interpretTurnResultPacket(packet);
+    assert.equal(turn.observation.effective_action, null);
+    assert.equal(turn.observation.decision, "");
+    assert.equal(turn.observation.should_run, false);
+    assert.deepEqual(turn.next_effect.cli_actions, []);
+  }
+});
 
 test("ordered Effect Program steps preserve data and skip malformed entries", () => {
   const program = effectProgramFromOrderedSteps(
@@ -76,7 +186,7 @@ test("settlement identity makes illegal dual bindings unrepresentable", () => {
   );
 });
 
-test("receipt-bound monitor settlement phase is derived from typed receipts", () => {
+test("a committed receipt-bound monitor poll is always a no-spend closeout", () => {
   assert.equal(
     receiptBoundMonitorPhase({
       poll_present: false,
@@ -102,7 +212,16 @@ test("receipt-bound monitor settlement phase is derived from typed receipts", ()
       durable_writeback_present: true,
       quota_spend_present: false,
     }),
-    "settlement_pending",
+    "settled",
+  );
+  assert.equal(
+    receiptBoundMonitorPhase({
+      poll_present: true,
+      material_change: true,
+      durable_writeback_present: false,
+      quota_spend_present: false,
+    }),
+    "settled",
   );
   assert.equal(
     receiptBoundMonitorPhase({
@@ -115,22 +234,67 @@ test("receipt-bound monitor settlement phase is derived from typed receipts", ()
   );
 });
 
-test("receipt-bound terminal settlement requires the full closeout chain", () => {
+test("receipt-bound replay settlement follows its binding and full chain", () => {
   assert.equal(
-    receiptBoundTerminalPhase({
-      terminal_closeout_present: false,
+    receiptBoundReplayPhase({
+      completion_receipt_present: false,
       durable_writeback_present: true,
       quota_spend_present: true,
     }),
     "open",
   );
   assert.equal(
-    receiptBoundTerminalPhase({
-      terminal_closeout_present: true,
+    receiptBoundReplayPhase({
+      binding_kind: "autonomous_replan",
+      completion_receipt_present: false,
+      durable_writeback_present: false,
+      quota_spend_present: true,
+    }),
+    "open",
+  );
+  assert.equal(
+    receiptBoundReplayPhase({
+      binding_kind: "autonomous_replan",
+      completion_receipt_present: false,
       durable_writeback_present: true,
       quota_spend_present: false,
     }),
     "settlement_pending",
+  );
+  assert.equal(
+    receiptBoundReplayPhase({
+      binding_kind: "autonomous_replan",
+      completion_receipt_present: false,
+      durable_writeback_present: true,
+      quota_spend_present: true,
+    }),
+    "settled",
+  );
+  assert.equal(
+    receiptBoundReplayPhase({
+      binding_kind: "todo",
+      writeback_completes_binding: true,
+      completion_receipt_present: false,
+      durable_writeback_present: true,
+      quota_spend_present: true,
+    }),
+    "settled",
+  );
+  assert.equal(
+    receiptBoundReplayPhase({
+      completion_receipt_present: true,
+      durable_writeback_present: true,
+      quota_spend_present: false,
+    }),
+    "settlement_pending",
+  );
+  assert.equal(
+    receiptBoundReplayPhase({
+      completion_receipt_present: true,
+      durable_writeback_present: true,
+      quota_spend_present: true,
+    }),
+    "settled",
   );
   assert.equal(
     receiptBoundTerminalPhase({
@@ -220,10 +384,42 @@ test("commit reduction advances one phase only after a committed payload", () =>
     identity: identityInput,
     step_kind: "quota_spend",
     transaction_phases: ["validation", "durable_writeback", "quota_spend"],
-    payload: { ok: false, error: "budget exhausted" },
+    payload: { ok: false, quota_rejection_action: "throttled_skip", error: "quota exhausted" },
   });
   assert.equal(rejected.completed_phases, null);
   assert.equal(rejected.result.failure?.kind, "budget_rejected");
+});
+
+test("callback failure classification follows the rejecting action, never explanatory prose", () => {
+  const cases = [
+    [{quota_rejection_action: "throttled_skip", reason: "额度已用尽"}, "budget_rejected"],
+    [{quota_rejection_action: "throttled_skip", reason: "budget was exhausted"}, "budget_rejected"],
+    [{reason: "transport failed; budget was not exhausted"}, "quota_spend_rejected"],
+    [{reason: "budget exhausted"}, "quota_spend_rejected"],
+    [{quota_rejection_action: "blocked_wait", reason: "waiting for a budget report"}, "quota_spend_rejected"],
+    [{quota_rejection_action: "future_action", reason: "budget"}, "quota_spend_rejected"],
+    [{quota_rejection_action: 1, reason: "budget"}, "quota_spend_rejected"],
+    [{before: {effective_action: "throttled_skip"}, reason: "workspace refused"}, "quota_spend_rejected"],
+  ] as const;
+  for (const [fields, expected] of cases) {
+    const rejected = commitStepPayload({
+      identity: identityInput, step_kind: "quota_spend",
+      transaction_phases: ["validation", "durable_writeback", "quota_spend"],
+      payload: {ok: false, appended: false, ...fields},
+    });
+    assert.equal(rejected.result.failure?.kind, expected, JSON.stringify(fields));
+    assert.equal(rejected.completed_phases, null);
+    assert.deepEqual(rejected.result.receipts, []);
+  }
+  for (const [step_kind, expected] of [
+    ["durable_writeback", "writeback_rejected"],
+    ["terminal_closeout", "terminal_closeout_rejected"],
+  ] as const) {
+    assert.equal(commitStepPayload({
+      identity: identityInput, step_kind, transaction_phases: [step_kind],
+      payload: {ok: false, quota_rejection_action: "throttled_skip", reason: "budget"},
+    }).result.failure?.kind, expected);
+  }
 });
 
 test("runtime selects the next uncommitted effect instead of Python orchestration", () => {
@@ -262,4 +458,51 @@ test("plan identity and public result payload remain stable at the boundary", ()
     receipts: [],
     failure: null,
   });
+});
+
+test("settlement plan decoding preserves legacy and versioned binding identities", () => {
+  for (const input of [identityInput, { ...identityInput, todo_id: null, replan_obligation_id: "replan" }]) {
+    const expected = settlementIdentity(input);
+    const wire = settlementIdentityPayload(input);
+    for (const identity of [expected, wire, { ...wire, schema_version: undefined }]) {
+      const plan = { settlement_plan: { identity } };
+      const before = structuredClone(plan);
+      assert.deepEqual(settlementIdentityFromPlan(plan).value, expected);
+      assert.deepEqual(plan, before);
+    }
+  }
+});
+
+test("settlement plan decoding rejects coerced and contradictory identities", () => {
+  const todo = settlementIdentityPayload(identityInput);
+  const replan = settlementIdentityPayload({ ...identityInput, todo_id: null, replan_obligation_id: "replan" });
+  const malformed = [
+    ...["goal_id", "agent_id", "turn_instance_id", "todo_id"].flatMap((field) =>
+      [42, true, ["todo"], { id: "todo" }].map((value) => {
+        const identity = { ...todo, [field]: value };
+        // Even a matching serialized effect id cannot make a non-string id legal.
+        identity.effect_id = `${identity.goal_id}:${identity.agent_id}:${identity.todo_id}:${identity.turn_instance_id}`;
+        return identity;
+      }),
+    ),
+    { ...todo, schema_version: "future_identity" },
+    { ...todo, schema_version: null },
+    { ...todo, binding_kind: "autonomous_replan", binding_id: "todo" },
+    { ...todo, binding_kind: "todo", binding_id: "other" },
+    { ...todo, replan_obligation_id: "replan" },
+    { ...todo, replan_obligation_id: false },
+    { ...todo, todo_id: null, effect_id: "goal:agent::turn" },
+    { ...replan, binding_kind: "todo" },
+    { ...replan, binding_id: "other" },
+    { ...replan, binding_kind: undefined },
+    { ...replan, binding_id: undefined },
+    { ...replan, schema_version: "quota_settlement_identity_v0" },
+    { ...replan, replan_obligation_id: 42, binding_id: "42", effect_id: "goal:agent:autonomous_replan:42:turn" },
+  ];
+  for (const identity of malformed) {
+    const result = settlementIdentityFromPlan({ settlement_plan: { identity } });
+    assert.equal(result.failure?.kind, "invalid_identity", JSON.stringify(identity));
+    assert.equal(result.value, null);
+    assert.deepEqual(result.receipts, []);
+  }
 });

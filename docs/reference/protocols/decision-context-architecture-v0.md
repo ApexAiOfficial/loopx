@@ -75,11 +75,16 @@ packet fingerprint and requires authority confirmation. It is not Core truth.
 
 ### `decision_review_receipt_v0`
 
-The settlement layer records one of four dispositions:
+The settlement layer records one of five dispositions:
 
 - `approve`, `reject`, and `defer` exact-read an existing `user_gate` event whose
   scope is `direction:action:<proposal-packet-ref>`;
-- `no_change` requires an explicit semantic rebase receipt and creates no gate.
+- `no_change` requires an explicit no-material-change semantic rebase and creates no gate;
+- `observed` records reviewed material facts without proposing or authorizing an
+  action. It requires a material-change rebase and rejects proposal/gate references.
+
+An empty rebase cannot be settled. Reading or capturing source items alone does
+not prove semantic review; previews validate the same evidence chain before any write.
 
 The receipt proves that the evidence batch was reviewed or found immaterial. It
 allows private source cursors to advance after validated lifecycle writeback,
@@ -195,6 +200,18 @@ goal-and-agent activation status, public-safe source manifests, and an explicitl
 configured read-only `local-file` source adapter. That slice intentionally
 stopped before source orchestration and private cursor checkpoints.
 
+The local-file transport enforces `max_bytes` on the opened regular-file
+handle, reading at most the limit plus one byte to detect overflow. It compares
+file identity, size and modification/change timestamps before and after the
+read, including the current resolved source. Detected growth, replacement or
+in-place change is a provider failure; it cannot advance a capture cursor or
+create an exact-read receipt. A stable explicitly configured symlink remains
+supported. Retry after repairing the source uses the existing capture cadence;
+reviewed cursors still require their settlement owner. This is bounded
+observation, not an atomic filesystem snapshot or a hard network-filesystem
+read deadline; hosts retain their process timeout boundary.
+
+
 The second slice adds `assemble_profile_decision_evidence(...)` as the thin
 host API and `decision-context prepare-evidence` as its read-only CLI preview.
 The profile now resolves enabled source providers, performs bounded scans and
@@ -204,6 +221,14 @@ raw cursor proposals only in-process. The CLI intentionally performs no
 semantic rebase: changed-source cursors remain at `preserve`, so merely scanning
 or reading a source can never mark it absorbed. Sources marked `on_demand` are
 excluded from automatic collection and require explicit source selection.
+
+An explicitly activated profile may also select only an advisory context
+provider. `decision-context recall-context` then accepts one provider-neutral
+scope for that call and returns local-private transient results plus a nested
+public-safe receipt. This path does not mutate the profile, scan authority
+sources, access cursors, create pending settlement, or authorize execution. It
+is the narrow entry point for a copied task locator; durable decision use still
+requires the normal evidence rebase and lifecycle owners.
 
 Private cursor commit remains a separate acceptance boundary. A review may
 cross agent turns, so `prepare-review --execute` stores one private pending

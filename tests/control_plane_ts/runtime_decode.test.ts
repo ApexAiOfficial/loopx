@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { effectRuntimeErrorPayload } from "../../loopx/control_plane/effect_runtime_errors.ts";
 import {
+  assertNever,
   jsonObject,
   optionalNonEmptyString,
+  parseJsonSource,
+  parsedSourceNumberTokens,
   requireBoolean,
   requireInteger,
   requireJsonObject,
@@ -11,6 +15,26 @@ import {
   requireStringArray,
   requireStringLiteral,
 } from "../../loopx/control_plane/runtime_decode.ts";
+
+test("native source numbers retain original spellings across nested object and array reads", () => {
+  const parsed = parseJsonSource('{"plan":{"work_contract":{"measurements":[1.0,-0.0,1152921504606846977,0.125,2],"1":2.0}},"ignored":3.0}');
+  assert.deepEqual(parsedSourceNumberTokens(parsed.value, parsed.numbers), [
+    [["plan", "work_contract", "1"], "2.0"],
+    [["plan", "work_contract", "measurements", 0], "1.0"],
+    [["plan", "work_contract", "measurements", 1], "-0.0"],
+    [["plan", "work_contract", "measurements", 2], "1152921504606846977"],
+    [["ignored"], "3.0"],
+  ]);
+  const contract = requireJsonObject(requireJsonObject(requireJsonObject(parsed.value, "root").plan, "plan").work_contract, "contract");
+  assert.deepEqual(parsedSourceNumberTokens(contract, parsed.numbers), [
+    [["1"], "2.0"],
+    [["measurements", 0], "1.0"], [["measurements", 1], "-0.0"],
+    [["measurements", 2], "1152921504606846977"],
+  ]);
+  assert.deepEqual(parsedSourceNumberTokens(contract), []);
+  assert.deepEqual(parsedSourceNumberTokens(null, parsed.numbers), []);
+  assert.throws(() => parseJsonSource('{"plan":'), SyntaxError);
+});
 
 test("runtime decoder accepts valid primitive boundary values", () => {
   const source = { nested: true };
@@ -45,6 +69,20 @@ test("runtime decoder rejects malformed primitive boundary values", () => {
     () => requireStringArray(["ok", 1], "value"),
     /value must be an array of strings/,
   );
+});
+
+test("internal exhaustiveness assertions do not become request rejection", () => {
+  let caught: unknown;
+  try {
+    assertNever("unexpected" as never, "internal assertion failed");
+  } catch (error) {
+    caught = error;
+  }
+  assert.deepEqual(effectRuntimeErrorPayload(caught), {
+    kind: "internal_failure",
+    code: "unexpected_handler_error",
+    message: "Effect runtime handler failed unexpectedly",
+  });
 });
 
 test("literal decoder narrows only values present in the runtime allowlist", () => {

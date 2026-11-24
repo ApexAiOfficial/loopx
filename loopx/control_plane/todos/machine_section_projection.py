@@ -1,0 +1,1007 @@
+"""Deterministic active-Todo Markdown projection.
+
+The user/agent Todo sections are machine-owned after authority promotion.
+Everything outside those sections remains opaque human-authored Markdown and
+is preserved byte-for-byte. Canonical provider records remain the truth; the
+readable Markdown syntax is regenerated and then parsed back for parity.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Iterable, cast
+
+import hashlib
+import json
+import re
+import shlex
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+
+from ..coordination.coordination_state_contract import (
+    TODO_CANONICAL_READ_RECORD_FIELDS,
+    TODO_CANONICAL_REQUIRED_READ_FIELDS,
+    TODO_DOMAIN_ITEM_SCHEMA_VERSION,
+    TODO_DOMAIN_RECORD_FIELDS,
+    TODO_DOMAIN_REQUIRED_FIELDS,
+    TODO_ITEM_SCHEMA_VERSION,
+    canonical_record_fields,
+)
+from .active_state_editing import (
+    COMPLETED_WORK_ARCHIVE_HEADING,
+    TODO_SECTION_HEADINGS,
+)
+from .machine_region import todo_region_marker
+from .projection_document import TodoProjectionDocument
+from .todo_block_codec import decode_todo_blocks
+from .completion_validation_projection import (
+    completion_validation_declaration,
+    completion_validation_declaration_sha256,
+    project_completion_validation_authority,
+)
+from .active_state_todo_parser import parse_todo_source
+from .contract import (
+    TODO_DECISION_SCOPE_SCHEMA_VERSION,
+    TODO_METADATA_FIELDS,
+    TODO_STATUS_OPEN,
+    format_todo_metadata_line,
+    normalize_todo_id,
+    normalize_todo_generation,
+    normalize_todo_status,
+    require_todo_decision_scope,
+    todo_marker_for_status,
+)
+from .todo_summary import (
+    canonical_todo_read_record, todo_priority_parts, normalize_todo_text,
+    structured_todo_item,
+)
+from ..content_digest import BARE_SHA256_PATTERN
+
+
+TODO_SECTION_PROJECTION_SCHEMA_VERSION = "loopx_todo_section_projection_v0"
+BOUNDED_ACTIVE_VIEW_MAX_DONE_ITEMS = 5
+_SQLITE_ARCHIVE_POINTER_PREFIX = "<!-- loopx:todo-archive-pointer authority=sqlite_v0 "
+_SQLITE_ARCHIVE_OMITTABLE_FIELDS = (
+    "text", "note", "evidence", "reason", "completion_result", "required_write_scopes",
+)
+SQLITE_ARCHIVE_POINTER_COMMENT = (
+    _SQLITE_ARCHIVE_POINTER_PREFIX
+    + 'query="loopx todo list --goal-id <goal-id> --include-archived" -->'
+)
+
+
+def format_sqlite_archive_pointer_comment(
+    *,
+    archived_count: int,
+    active_done_omitted: int = 0,
+    active_fields_omitted: int = 0,
+    omitted_fields: Sequence[str] = (),
+    omitted_todo_ids: Sequence[str] = (),
+    goal_id: str | None = None,
+) -> str:
+    resolved_goal = (
+        goal_id.strip()
+        if isinstance(goal_id, str) and goal_id.strip()
+        else "<goal-id>"
+    )
+    extra_parts: list[str] = []
+    if active_fields_omitted > 0:
+        extra_parts.append(f"active_fields_omitted={active_fields_omitted}")
+    if omitted_todo_ids:
+        extra_parts.append(f"omitted_todo_ids={','.join(omitted_todo_ids)}")
+    if omitted_fields:
+        extra_parts.append(f"omitted_fields={','.join(omitted_fields)}")
+    if goal_id and isinstance(goal_id, str) and goal_id.strip():
+        extra_parts.append(f"goal_id={resolved_goal}")
+    if omitted_todo_ids:
+        extra_parts.append(
+            f'todo_query="loopx todo list --goal-id {resolved_goal} '
+            f'--todo-id {omitted_todo_ids[0]}"'
+        )
+    extra_suffix = (" " + " ".join(extra_parts)) if extra_parts else ""
+    return (
+        f"{_SQLITE_ARCHIVE_POINTER_PREFIX}archived_count={archived_count} "
+        f"active_done_omitted={active_done_omitted}"
+        f"{extra_suffix} "
+        f'query="loopx todo list --goal-id {resolved_goal} --include-archived" -->'
+    )
+
+
+def is_sqlite_archive_summary_pointer(line: str, *, goal_id: str) -> bool:
+    """Recognize complete generated summaries from the current and older writers."""
+    text = line.rstrip("\r\n")
+    if not text.startswith(_SQLITE_ARCHIVE_POINTER_PREFIX) or not text.endswith(" -->"):
+        return False
+    if text in (
+        SQLITE_ARCHIVE_POINTER_COMMENT,
+        SQLITE_ARCHIVE_POINTER_COMMENT.replace(" --goal-id <goal-id>", ""),
+    ):
+        return True
+
+    try:
+        fields = dict(token.split("=", 1) for token in shlex.split(
+            text[len(_SQLITE_ARCHIVE_POINTER_PREFIX):-4]
+        ))
+        archived_count = int(fields["archived_count"])
+        active_done_omitted = int(fields["active_done_omitted"])
+        active_fields_omitted = int(fields.get("active_fields_omitted", "0"))
+    except (KeyError, ValueError):
+        return False
+
+    pointer_goal = fields.get("goal_id")
+    if pointer_goal is not None and pointer_goal != goal_id:
+        return False
+    todo_ids = tuple(fields["omitted_todo_ids"].split(",")) if "omitted_todo_ids" in fields else ()
+    omitted_fields = tuple(fields["omitted_fields"].split(",")) if "omitted_fields" in fields else ()
+    if (
+        archived_count < 0
+        or active_done_omitted < 0
+        or active_fields_omitted != len(todo_ids)
+        or bool(omitted_fields) != bool(todo_ids)
+        or any(normalize_todo_id(todo_id) != todo_id for todo_id in todo_ids)
+        or tuple(field for field in _SQLITE_ARCHIVE_OMITTABLE_FIELDS if field in omitted_fields) != omitted_fields
+    ):
+        return False
+    generated = format_sqlite_archive_pointer_comment(
+        archived_count=archived_count,
+        active_done_omitted=active_done_omitted,
+        active_fields_omitted=active_fields_omitted,
+        omitted_fields=omitted_fields,
+        omitted_todo_ids=todo_ids,
+        goal_id=pointer_goal,
+    )
+    # The pre-goal-scoped writer used only the two archive counts.
+    return text == generated or (
+        pointer_goal is None and not todo_ids
+        and text == generated.replace(" --goal-id <goal-id>", "")
+    )
+
+
+def format_sqlite_active_omission_pointer_comment(
+    *,
+    goal_id: str | None,
+    role: str,
+    todo_id: str,
+    omitted_fields: Sequence[str],
+) -> str:
+    resolved_goal = (
+        goal_id.strip()
+        if isinstance(goal_id, str) and goal_id.strip()
+        else "<goal-id>"
+    )
+    fields_token = ",".join(omitted_fields)
+    return (
+        f"<!-- loopx:todo-archive-pointer authority=sqlite_v0 "
+        f"scope=active_todo goal_id={resolved_goal} role={role} "
+        f"todo_id={todo_id} omitted_fields={fields_token} "
+        f'query="loopx todo list --goal-id {resolved_goal} --todo-id {todo_id}" -->'
+    )
+
+
+BOUNDED_ACTIVE_VIEW_TEXT_LIMIT = 160
+BOUNDED_ACTIVE_VIEW_MAX_SCOPE_CHARS = 120
+BOUNDED_ACTIVE_VIEW_MAX_ACTIVE_NOTE_CHARS = 512
+BOUNDED_ACTIVE_VIEW_OMITTED_PROSE_FIELDS = frozenset(
+    {"note", "evidence", "reason", "completion_result"}
+)
+_MARKER_PATTERN = re.compile(
+    r"(?m)^<!-- loopx:todo-section-projection-v0 "
+    r"role=(?P<role>user|agent|archive) "
+    r"provider_revision=(?P<revision>[A-Za-z0-9_.:-]+) "
+    r"records_sha256=(?P<digest>[a-f0-9]{64}) -->\r?$"
+)
+
+
+class TodoSectionProjectionError(ValueError):
+    """Canonical records or Markdown violate the projection contract."""
+
+
+@dataclass(frozen=True)
+class TodoSectionProjectionResult:
+    markdown: str
+    changed: bool
+    source_sha256: str
+    rendered_sha256: str
+    narrative_sha256: str
+    provider_revision: str
+    todo_count: int
+    section_record_sha256: dict[str, str]
+    active_fields_omitted: int = 0
+    omitted_active_records: tuple[dict[str, object], ...] = ()
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _canonical_records(records: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    canonical: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for index, value in enumerate(records):
+        native = value.get("schema_version") == TODO_DOMAIN_ITEM_SCHEMA_VERSION
+        record = canonical_record_fields(
+            value,
+            fields=(
+                TODO_DOMAIN_RECORD_FIELDS
+                if native
+                else TODO_CANONICAL_READ_RECORD_FIELDS
+            ),
+            required_fields=(
+                TODO_DOMAIN_REQUIRED_FIELDS
+                if native
+                else TODO_CANONICAL_REQUIRED_READ_FIELDS
+            ),
+            label=f"canonical Todo projection record {index}",
+            reject_unknown=True,
+        )
+        todo_id = str(record.get("todo_id") or "")
+        if todo_id in seen:
+            raise TodoSectionProjectionError(f"duplicate canonical Todo id: {todo_id}")
+        seen.add(todo_id)
+        if record.get("role") not in TODO_SECTION_HEADINGS:
+            raise TodoSectionProjectionError(f"Todo {todo_id!r} has invalid role")
+        if record.get("archive_state") not in {"active", "archive"}:
+            raise TodoSectionProjectionError(
+                f"Todo {todo_id!r} has an unsupported archive state"
+            )
+        _validate_projection_decision_scope(record, todo_id=todo_id)
+        canonical_todo_read_record(
+            {
+                **record,
+                "schema_version": TODO_ITEM_SCHEMA_VERSION,
+                "source_section": (
+                    COMPLETED_WORK_ARCHIVE_HEADING
+                    if record.get("archive_state") == "archive"
+                    else TODO_SECTION_HEADINGS[str(record["role"])]
+                ),
+                "index": record.get("index", index + 1),
+            },
+            reject_unknown=True,
+        )
+        canonical.append(record)
+    return canonical
+
+
+def _validate_projection_decision_scope(
+    record: Mapping[str, object],
+    *,
+    todo_id: str,
+) -> None:
+    """Reject explicit scope data that the Markdown projection cannot preserve."""
+
+    if "decision_scope" not in record:
+        return
+    value = record["decision_scope"]
+    if not isinstance(value, Mapping):
+        raise TodoSectionProjectionError(
+            f"Todo {todo_id!r} decision_scope must be an object"
+        )
+    allowed_fields = {
+        "schema_version",
+        "kind",
+        "granularity",
+        "scope_key",
+        "decision_id",
+    }
+    unknown_fields = sorted(str(field) for field in set(value) - allowed_fields)
+    if unknown_fields:
+        raise TodoSectionProjectionError(
+            f"Todo {todo_id!r} decision_scope has unsupported fields: "
+            + ", ".join(unknown_fields)
+        )
+    if (
+        "schema_version" in value
+        and value["schema_version"] != TODO_DECISION_SCOPE_SCHEMA_VERSION
+    ):
+        raise TodoSectionProjectionError(
+            f"Todo {todo_id!r} decision_scope.schema_version must be "
+            f"{TODO_DECISION_SCOPE_SCHEMA_VERSION!r} when present"
+        )
+    if "decision_id" in value:
+        decision_id = value["decision_id"]
+        if (
+            not isinstance(decision_id, str)
+            or normalize_todo_id(decision_id) != decision_id
+        ):
+            raise TodoSectionProjectionError(
+                f"Todo {todo_id!r} decision_scope.decision_id must be a "
+                "public-safe Todo id"
+            )
+        raise TodoSectionProjectionError(
+            f"Todo {todo_id!r} decision_scope.decision_id cannot be represented "
+            "by the current Markdown projection"
+        )
+    try:
+        require_todo_decision_scope(value)
+    except ValueError as exc:
+        raise TodoSectionProjectionError(
+            f"Todo {todo_id!r} has invalid decision_scope: {exc}"
+        ) from exc
+
+
+def _record_sort_key(record: Mapping[str, object]) -> tuple[int, str]:
+    raw_index = record.get("index")
+    try:
+        index = int(raw_index) if isinstance(raw_index, (str, int)) else 2**31 - 1
+    except (TypeError, ValueError):
+        index = 2**31 - 1
+    return index, str(record.get("todo_id") or "")
+
+
+def _render_record(
+    record: Mapping[str, object],
+    *,
+    include_role: bool = False,
+    private_validation: Mapping[str, object] | None = None,
+) -> list[str]:
+    status = normalize_todo_status(record.get("status")) or TODO_STATUS_OPEN
+    text = " ".join(str(record.get("text") or "").strip().split())
+    if not text:
+        raise TodoSectionProjectionError(
+            f"Todo {record.get('todo_id')!r} has empty projection text"
+        )
+    metadata_values: dict[str, Any] = {
+        field: record[field]
+        for field in TODO_METADATA_FIELDS
+        if field in record and record[field] is not None
+    }
+    if private_validation is not None:
+        metadata_values.update(private_validation)
+    if not include_role:
+        metadata_values.pop("role", None)
+    metadata = format_todo_metadata_line(**metadata_values)
+    return [
+        f"- [{todo_marker_for_status(status)}] {text}",
+        *([metadata] if metadata else []),
+    ]
+
+
+def _render_section(
+    *,
+    role: str,
+    records: list[dict[str, object]],
+    provider_revision: str,
+    newline: str,
+    private_validation: Mapping[str, Mapping[str, object]],
+    archive_pointer_comment: str | None = None,
+    pointer_comments: Sequence[str] = (),
+) -> tuple[str, str]:
+    digest = _sha256_text(_canonical_json(records))
+    heading = (
+        COMPLETED_WORK_ARCHIVE_HEADING
+        if role == "archive"
+        else TODO_SECTION_HEADINGS[role]
+    )
+    comments = [
+        *([archive_pointer_comment] if archive_pointer_comment else []),
+        *[comment for comment in pointer_comments if comment],
+    ]
+    lines = [
+        f"## {heading}",
+        todo_region_marker(role, "begin"),
+        f"<!-- loopx:todo-section-projection-v0 role={role} "
+        f"provider_revision={provider_revision} records_sha256={digest} -->",
+        *comments,
+        "",
+    ]
+    for record in records:
+        lines.extend(_render_record(
+            record,
+            include_role=role == "archive",
+            private_validation=private_validation.get(str(record.get("todo_id") or "")),
+        ))
+    lines.append(todo_region_marker(role, "end"))
+    lines.append("")
+    return newline.join(lines), digest
+
+
+def _parsed_active_records(markdown: str) -> list[dict[str, Any]]:
+    items_by_role, _, source_sections = parse_todo_source(markdown)
+    records: list[dict[str, Any]] = []
+    for role in TODO_SECTION_HEADINGS:
+        for item in sorted(items_by_role[role], key=_record_sort_key):
+            # Display selection/resume evaluation is not source serialization.
+            # Preserve all text and skip attention-policy RPCs during parity.
+            normalized = structured_todo_item(
+                item, role=role, source_section=source_sections[role], text_limit=None,
+            )
+            records.append(canonical_todo_read_record(normalized, reject_unknown=False))
+    return records
+
+
+def _parsed_archive_records(markdown: str) -> list[dict[str, Any]]:
+    _, archived, _ = parse_todo_source(markdown)
+    records: list[dict[str, Any]] = []
+    for item in archived:
+        if item.get("role") not in TODO_SECTION_HEADINGS:
+            raise TodoSectionProjectionError(
+                f"archived Todo {item.get('todo_id')!r} omits its source role"
+            )
+        # Metadata is textual; canonical capture and active reads normalize this
+        # counter. Archive readback must use the same codec, not compare "12" to 12.
+        if "material_change_generation" in item:
+            generation = normalize_todo_generation(item["material_change_generation"])
+            if generation is None:
+                raise TodoSectionProjectionError("invalid archived Monitor material generation")
+            item["material_change_generation"] = generation
+        priority, title = todo_priority_parts(str(item.get("text") or ""))
+        if priority:
+            item.update(priority=priority, title=normalize_todo_text(title, limit=None))
+        records.append(
+            canonical_todo_read_record(
+                project_completion_validation_authority({
+                    **item,
+                    "schema_version": TODO_ITEM_SCHEMA_VERSION,
+                    "archive_state": "archive",
+                    "source_section": COMPLETED_WORK_ARCHIVE_HEADING,
+                }),
+                reject_unknown=False,
+            )
+        )
+    return records
+
+
+def _projection_record(
+    record: Mapping[str, object],
+    *,
+    display_index: int,
+) -> dict[str, object]:
+    projected = dict(canonical_todo_read_record(
+        {
+            **record,
+            "schema_version": TODO_ITEM_SCHEMA_VERSION,
+            "source_section": (
+                COMPLETED_WORK_ARCHIVE_HEADING
+                if record.get("archive_state") == "archive"
+                else TODO_SECTION_HEADINGS[str(record["role"])]
+            ),
+            # Stored import ordinals determine ordering; the new display has its own contiguous ordinals.
+            "index": display_index,
+        },
+        reject_unknown=True,
+    ))
+    if "decision_scope" in projected:
+        # The Markdown codec spells out the optional scope schema version on
+        # readback. Normalize that display representation, never the provider
+        # record or its digest, before comparing the same semantic scope.
+        projected["decision_scope"] = require_todo_decision_scope(projected["decision_scope"])
+    # Native authors may retain only the full text. The permanent Markdown
+    # reader derives its title/priority; compare that same display view without
+    # inventing persisted domain fields or masking an explicit disagreement.
+    priority, title = todo_priority_parts(str(projected.get("text") or ""))
+    if priority:
+        projected.setdefault("priority", priority)
+        projected.setdefault("title", normalize_todo_text(title, limit=None))
+    return projected
+
+
+_DERIVED_READ_MODEL_FIELDS = {
+    "created_by",
+    "last_actor_agent_id",
+    "resume_condition",
+    "resume_ready",
+    "handoff_note",
+    # Result bindings remain in canonical authority and are read via result-read,
+    # not serialized into the readable Markdown projection.
+    "completion_result",
+    # Revision receipts are canonical-provider audit state.  The readable
+    # Markdown projection intentionally carries only the private validation
+    # declaration needed to execute the current validator, so these fields
+    # cannot participate in Markdown parse/render parity.
+    "completion_validation_revision",
+    "completion_validation_revision_history",
+}
+
+
+def _private_validation_metadata(
+    document: TodoProjectionDocument,
+) -> dict[str, tuple[dict[str, Any], dict[str, object]]]:
+    lines = [line.rstrip("\r\n") for line in document.lines]
+    private: dict[str, tuple[dict[str, Any], dict[str, object]]] = {}
+    for region in document.regions:
+        for item in decode_todo_blocks(lines, region.start, region.body_end, visible=document.visible):
+            todo_id = str(item.get("todo_id") or "")
+            declaration = completion_validation_declaration(item)
+            if not todo_id or declaration is None:
+                continue
+            private[todo_id] = _private_validation_entry(declaration)
+    return private
+
+
+def _private_validation_entry(
+    declaration: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, object]]:
+    normalized = completion_validation_declaration(dict(declaration))
+    if normalized is None:
+        raise TodoSectionProjectionError("private validation declaration is empty")
+    metadata: dict[str, object] = {
+        key: value for key, value in normalized.items() if value is not None
+    }
+    argv = metadata.get("validation_command_argv")
+    if isinstance(argv, list):
+        metadata["validation_command_argv"] = json.dumps(
+            argv,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return normalized, metadata
+
+
+def _parity_records(records: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            field: record[field]
+            for field in TODO_CANONICAL_READ_RECORD_FIELDS
+            if field in record
+            and field not in _DERIVED_READ_MODEL_FIELDS
+            and record[field] != []
+        }
+        for record in records
+    ]
+
+
+def _active_referenced_todo_ids(
+    active_records: Sequence[Mapping[str, object]],
+) -> set[str]:
+    referenced: set[str] = set()
+    for record in active_records:
+        raw_resume = record.get("resume_when")
+        if not isinstance(raw_resume, str):
+            continue
+        for clause in re.split(r"[,;]", raw_resume):
+            token = clause.strip()
+            if token.startswith("todo_done:"):
+                target_id = token.partition(":")[2].strip()
+                if target_id:
+                    referenced.add(target_id)
+    return referenced
+
+
+def _select_bounded_active_role_records(
+    records: Sequence[dict[str, object]],
+    *,
+    referenced_ids: set[str],
+    max_done_items: int = BOUNDED_ACTIVE_VIEW_MAX_DONE_ITEMS,
+) -> tuple[list[dict[str, object]], int]:
+    done_records = [
+        record
+        for record in records
+        if normalize_todo_status(record.get("status")) == "done"
+        or record.get("done") is True
+    ]
+    if len(done_records) <= max_done_items:
+        return list(records), 0
+    tail_done_ids = {
+        str(record.get("todo_id") or "")
+        for record in (done_records[-max_done_items:] if max_done_items > 0 else [])
+    }
+    retained_done_ids = tail_done_ids | referenced_ids
+    selected: list[dict[str, object]] = []
+    omitted_done = 0
+    for record in records:
+        is_done = (
+            normalize_todo_status(record.get("status")) == "done"
+            or record.get("done") is True
+        )
+        todo_id = str(record.get("todo_id") or "")
+        if not is_done or todo_id in retained_done_ids:
+            selected.append(record)
+        else:
+            omitted_done += 1
+    return selected, omitted_done
+
+
+def _compact_record_for_bounded_active_view_with_omissions(
+    record: Mapping[str, object],
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    is_done_or_archived = (
+        normalize_todo_status(record.get("status")) == "done"
+        or record.get("done") is True
+        or record.get("archive_state") == "archive"
+    )
+    compacted: dict[str, object] = {}
+    omitted_fields: list[str] = []
+    for key, value in record.items():
+        if key in BOUNDED_ACTIVE_VIEW_OMITTED_PROSE_FIELDS:
+            if (
+                not is_done_or_archived
+                and key == "note"
+                and isinstance(value, str)
+                and len(value) <= BOUNDED_ACTIVE_VIEW_MAX_ACTIVE_NOTE_CHARS
+            ):
+                compacted[key] = value
+            elif value not in (None, "", []):
+                omitted_fields.append(key)
+            continue
+        compacted[key] = value
+    scopes = compacted.get("required_write_scopes")
+    if (
+        isinstance(scopes, list)
+        and sum(len(str(item)) for item in scopes) > BOUNDED_ACTIVE_VIEW_MAX_SCOPE_CHARS
+    ):
+        compacted.pop("required_write_scopes", None)
+        omitted_fields.append("required_write_scopes")
+    raw_text = " ".join(str(compacted.get("text") or "").strip().split())
+    if len(raw_text) > BOUNDED_ACTIVE_VIEW_TEXT_LIMIT:
+        truncated_text = (
+            raw_text[: BOUNDED_ACTIVE_VIEW_TEXT_LIMIT - 3].rstrip() + "..."
+        )
+        compacted["text"] = truncated_text
+        omitted_fields.append("text")
+        priority, title = todo_priority_parts(truncated_text)
+        if priority:
+            compacted["priority"] = priority
+            compacted["title"] = normalize_todo_text(title, limit=None)
+        else:
+            compacted.pop("priority", None)
+            compacted.pop("title", None)
+    ordered_omitted = tuple(
+        field
+        for field in (
+            "text",
+            "note",
+            "evidence",
+            "reason",
+            "completion_result",
+            "required_write_scopes",
+        )
+        if field in omitted_fields
+    )
+    return compacted, ordered_omitted
+
+
+def _compact_record_for_bounded_active_view(
+    record: Mapping[str, object],
+) -> dict[str, object]:
+    compacted, _ = _compact_record_for_bounded_active_view_with_omissions(record)
+    return compacted
+
+
+def _extract_frontmatter_goal_id(markdown: str) -> str | None:
+    lines = markdown.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:40]:
+        stripped = line.strip()
+        if stripped in {"---", "..."}:
+            break
+        for prefix in ("goal_id:", "adapter_id:"):
+            if stripped.startswith(prefix):
+                candidate = stripped.partition(":")[2].strip().strip("\"'")
+                if candidate and re.fullmatch(r"[A-Za-z0-9_.:-]+", candidate):
+                    return candidate
+    return None
+
+
+def _canonical_private_validation(
+    source_document: TodoProjectionDocument,
+    canonical: Sequence[Mapping[str, object]],
+    private_validation_declarations: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, Mapping[str, object]]:
+    """Bind private declarations to canonical digests before rendering any view."""
+    private_source = _private_validation_metadata(source_document)
+    canonical_validation_digests = {
+        str(record.get("todo_id") or ""): record.get("completion_validation_sha256")
+        for record in canonical
+        if record.get("completion_validation_required") is True
+    }
+    for todo_id, declaration in (private_validation_declarations or {}).items():
+        external = _private_validation_entry(declaration)
+        existing = private_source.get(todo_id)
+        external_digest = completion_validation_declaration_sha256(external[0])
+        if existing is not None:
+            existing_digest = completion_validation_declaration_sha256(existing[0])
+            if existing_digest != external_digest:
+                # A successful CAS revision updates provider authority and the
+                # private declaration sidecar before the readable Markdown can
+                # be regenerated.  In that bounded state the old Markdown is
+                # expected to disagree.  Only the declaration selected by the
+                # canonical record may replace it; every other divergence is
+                # still rejected closed.
+                if canonical_validation_digests.get(todo_id) != external_digest:
+                    raise TodoSectionProjectionError(
+                        f"Todo {todo_id!r} has divergent private validation declarations"
+                    )
+        private_source[todo_id] = external
+    private_validation: dict[str, Mapping[str, object]] = {}
+    for record in canonical:
+        todo_id = str(record.get("todo_id") or "")
+        required = record.get("completion_validation_required") is True
+        digest = record.get("completion_validation_sha256")
+        if not required:
+            if digest is not None:
+                raise TodoSectionProjectionError(
+                    f"Todo {todo_id!r} has a validation digest without authority"
+                )
+            continue
+        if not isinstance(digest, str) or not BARE_SHA256_PATTERN.fullmatch(digest):
+            raise TodoSectionProjectionError(
+                f"Todo {todo_id!r} requires validation but omits its declaration digest"
+            )
+        source = private_source.get(todo_id)
+        if (
+            source is None
+            or completion_validation_declaration_sha256(source[0]) != digest
+        ):
+            raise TodoSectionProjectionError(
+                f"Todo {todo_id!r} private validation declaration does not match authority"
+            )
+        private_validation[todo_id] = source[1]
+    return private_validation
+
+
+def render_canonical_todo_sections(
+    markdown: str,
+    records: Sequence[Mapping[str, object]],
+    *,
+    provider_revision: str,
+    private_validation_declarations: Mapping[str, Mapping[str, Any]] | None = None,
+    bounded_active_view: bool = False,
+    goal_id: str | None = None,
+) -> TodoSectionProjectionResult:
+    """Replace only Todo sections and verify deterministic parse/render parity."""
+
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", provider_revision):
+        raise TodoSectionProjectionError("provider_revision must be a public-safe token")
+    canonical = _canonical_records(records)
+    try:
+        source_document = TodoProjectionDocument.parse(markdown)
+    except ValueError as error:
+        raise TodoSectionProjectionError(str(error)) from error
+    private_validation = _canonical_private_validation(
+        source_document, canonical, private_validation_declarations
+    )
+    raw_active_by_role = {
+        role: sorted(
+            [
+                record
+                for record in canonical
+                if record.get("role") == role
+                and record.get("archive_state") == "active"
+            ],
+            key=_record_sort_key,
+        )
+        for role in TODO_SECTION_HEADINGS
+    }
+    raw_all_active = [*raw_active_by_role["user"], *raw_active_by_role["agent"]]
+    referenced_active_ids = _active_referenced_todo_ids(
+        [
+            record
+            for record in raw_all_active
+            if normalize_todo_status(record.get("status")) != "done"
+            and record.get("done") is not True
+        ]
+    )
+    resolved_goal_id = (
+        goal_id.strip()
+        if isinstance(goal_id, str) and goal_id.strip()
+        else _extract_frontmatter_goal_id(markdown)
+    )
+    query_goal_id = resolved_goal_id or "<goal-id>"
+    omitted_done_total = 0
+    by_role: dict[str, list[dict[str, object]]] = {}
+    omitted_active_by_role: dict[str, list[dict[str, object]]] = {
+        role: [] for role in TODO_SECTION_HEADINGS
+    }
+    omitted_active_records: list[dict[str, object]] = []
+    for role in TODO_SECTION_HEADINGS:
+        role_records = raw_active_by_role[role]
+        if bounded_active_view:
+            selected_role_records, omitted_count = _select_bounded_active_role_records(
+                role_records,
+                referenced_ids=referenced_active_ids,
+            )
+            omitted_done_total += omitted_count
+            compacted_role_records: list[dict[str, object]] = []
+            for record in selected_role_records:
+                compacted, omitted_fields = (
+                    _compact_record_for_bounded_active_view_with_omissions(record)
+                )
+                compacted_role_records.append(compacted)
+                if omitted_fields:
+                    todo_id = str(record.get("todo_id") or "")
+                    entry: dict[str, object] = {
+                        "todo_id": todo_id,
+                        "role": role,
+                        "omitted_fields": list(omitted_fields),
+                        "query": (
+                            f"loopx todo list --goal-id {query_goal_id} "
+                            f"--todo-id {todo_id}"
+                        ),
+                    }
+                    omitted_active_by_role[role].append(entry)
+                    omitted_active_records.append(entry)
+            by_role[role] = compacted_role_records
+        else:
+            by_role[role] = role_records
+    canonical_archived = sorted(
+        [
+            record
+            for record in canonical
+            if record.get("archive_state") == "archive"
+        ],
+        key=_record_sort_key,
+    )
+    archived = [] if bounded_active_view else canonical_archived
+    newline = "\r\n" if "\r\n" in markdown else "\n"
+    rendered_sections: dict[str, str] = {}
+    section_digests: dict[str, str] = {}
+    for role in TODO_SECTION_HEADINGS:
+        role_pointer_comments = (
+            [
+                format_sqlite_active_omission_pointer_comment(
+                    goal_id=resolved_goal_id,
+                    role=role,
+                    todo_id=str(item["todo_id"]),
+                    omitted_fields=tuple(str(f) for f in cast(Iterable[object], item["omitted_fields"])),
+                )
+                for item in omitted_active_by_role[role]
+            ]
+            if bounded_active_view
+            else []
+        )
+        rendered_sections[role], section_digests[role] = _render_section(
+            role=role,
+            records=by_role[role],
+            provider_revision=provider_revision,
+            newline=newline,
+            private_validation=private_validation,
+            pointer_comments=role_pointer_comments,
+        )
+    if (
+        archived
+        or "archive" in source_document.spans
+        or (
+            bounded_active_view
+            and (
+                canonical_archived
+                or omitted_done_total > 0
+                or bool(omitted_active_records)
+            )
+        )
+    ):
+        unique_omitted_fields = tuple(
+            field
+            for field in _SQLITE_ARCHIVE_OMITTABLE_FIELDS
+            if any(
+                field in item["omitted_fields"]  # type: ignore[operator]
+                for item in omitted_active_records
+            )
+        )
+        omitted_todo_ids = tuple(
+            str(item["todo_id"]) for item in omitted_active_records
+        )
+        archive_pointer_comments: list[str] = []
+        if bounded_active_view:
+            archive_pointer_comments.append(
+                format_sqlite_archive_pointer_comment(
+                    archived_count=len(canonical_archived),
+                    active_done_omitted=omitted_done_total,
+                )
+            )
+            if omitted_active_records or resolved_goal_id:
+                archive_pointer_comments.append(
+                    format_sqlite_archive_pointer_comment(
+                        archived_count=len(canonical_archived),
+                        active_done_omitted=omitted_done_total,
+                        active_fields_omitted=len(omitted_active_records),
+                        omitted_fields=unique_omitted_fields,
+                        omitted_todo_ids=omitted_todo_ids,
+                        goal_id=resolved_goal_id,
+                    )
+                )
+        rendered_sections["archive"], section_digests["archive"] = _render_section(
+            role="archive",
+            records=archived,
+            provider_revision=provider_revision,
+            newline=newline,
+            private_validation=private_validation,
+            pointer_comments=archive_pointer_comments,
+        )
+
+    try:
+        rendered = source_document.replace(rendered_sections)
+        rendered_document = TodoProjectionDocument.parse(rendered)
+    except ValueError as error:
+        raise TodoSectionProjectionError(str(error)) from error
+    before_narrative = source_document.narrative
+    after_narrative = rendered_document.narrative
+    if before_narrative != after_narrative:
+        raise TodoSectionProjectionError("render changed Markdown outside Todo sections")
+
+    expected_records = [
+        _projection_record(record, display_index=index)
+        for records_for_section in (by_role["user"], by_role["agent"], archived)
+        for index, record in enumerate(records_for_section, 1)
+    ]
+    expected = _parity_records(expected_records)
+    # Validate the generated payload, independently of unrelated document text.
+    rendered_payload = "\n".join(rendered_sections.values())
+    actual = _parity_records(
+        [
+            *_parsed_active_records(rendered_payload),
+            *_parsed_archive_records(rendered_payload),
+        ]
+    )
+    if _canonical_json(actual) != _canonical_json(expected):
+        raise TodoSectionProjectionError("Todo section parse/render parity mismatch")
+    second = rendered_document.replace(rendered_sections)
+    if second != rendered:
+        raise TodoSectionProjectionError("Todo section projection is not idempotent")
+
+    return TodoSectionProjectionResult(
+        markdown=rendered,
+        changed=rendered != markdown,
+        source_sha256=_sha256_text(markdown),
+        rendered_sha256=_sha256_text(rendered),
+        narrative_sha256=_sha256_text(after_narrative),
+        provider_revision=provider_revision,
+        todo_count=len(canonical),
+        section_record_sha256=section_digests,
+        active_fields_omitted=len(omitted_active_records),
+        omitted_active_records=tuple(omitted_active_records),
+    )
+
+
+_ACTIVE_OMISSION_POINTER_PATTERN = re.compile(
+    r"^<!-- loopx:todo-archive-pointer authority=sqlite_v0 "
+    r"scope=active_todo goal_id=(?P<goal_id>[^ ]+) role=(?P<role>user|agent) "
+    r"todo_id=(?P<todo_id>[A-Za-z0-9_.:-]+) "
+    r"omitted_fields=(?P<omitted_fields>[a-z_,]+) "
+    r'query="(?P<query>[^"]+)" -->$'
+)
+
+
+def inspect_todo_section_projection(markdown: str) -> dict[str, object]:
+    """Return compact marker diagnostics without treating Markdown as truth."""
+
+    document = TodoProjectionDocument.parse(markdown)
+    markers = []
+    omitted_active_records: list[dict[str, object]] = []
+    for region in document.regions:
+        for line in document.lines[region.start:region.body_end]:
+            stripped = line.rstrip("\r\n")
+            match = _MARKER_PATTERN.fullmatch(stripped)
+            if match is not None and match["role"] == region.role:
+                markers.append(match.groupdict())
+            omission = _ACTIVE_OMISSION_POINTER_PATTERN.fullmatch(stripped)
+            if omission is not None and omission["role"] == region.role:
+                omitted_active_records.append(
+                    {
+                        "todo_id": omission["todo_id"],
+                        "role": omission["role"],
+                        "goal_id": omission["goal_id"],
+                        "omitted_fields": [
+                            item
+                            for item in omission["omitted_fields"].split(",")
+                            if item
+                        ],
+                        "query": omission["query"],
+                    }
+                )
+    return {
+        "schema_version": TODO_SECTION_PROJECTION_SCHEMA_VERSION,
+        "section_count": len(markers),
+        "sections": markers,
+        "active_fields_omitted": len(omitted_active_records),
+        "omitted_active_records": omitted_active_records,
+    }
+
+
+__all__ = [
+    "BOUNDED_ACTIVE_VIEW_MAX_DONE_ITEMS",
+    "BOUNDED_ACTIVE_VIEW_MAX_SCOPE_CHARS",
+    "BOUNDED_ACTIVE_VIEW_OMITTED_PROSE_FIELDS",
+    "BOUNDED_ACTIVE_VIEW_TEXT_LIMIT",
+    "SQLITE_ARCHIVE_POINTER_COMMENT",
+    "TODO_SECTION_PROJECTION_SCHEMA_VERSION",
+    "TodoSectionProjectionError",
+    "TodoSectionProjectionResult",
+    "format_sqlite_active_omission_pointer_comment",
+    "format_sqlite_archive_pointer_comment",
+    "inspect_todo_section_projection",
+    "render_canonical_todo_sections",
+]

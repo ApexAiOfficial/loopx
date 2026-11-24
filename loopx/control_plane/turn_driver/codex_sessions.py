@@ -1,0 +1,655 @@
+"""Codex transport session persistence; context scope never grants Turn authority."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
+
+from ...boundary_authority import normalize_checkpointed_boundary_authority_entries
+from ...file_lock import exclusive_file_lock
+from ..runtime.private_permissions import protect_private_path
+from ...runtime import validate_goal_id_path_segment
+from ..content_digest import BARE_SHA256_PATTERN
+from ..projects.registry_codec import (
+    load_project_registry,
+    require_runtime_compatible_project_registry,
+)
+from ..goals.first_party_host_admission import FirstPartyHostGoalAdmission
+from .driver import session_identity_fields, turn_host_lineage
+
+CODEX_CLI_SESSION_SCHEMA_VERSION = "loopx_codex_cli_session_v1"
+MANAGED_CLI_SESSION_SCHEMA_VERSION = "loopx_managed_cli_session_v1"
+SESSION_ID_MAX_CHARS = 256
+_UNCHECKED_SESSION_DOCUMENT = object()
+_ABSENT_WORK_CONTRACT = object()
+_ABSENT_EXECUTOR_ADAPTER = object()
+
+
+def _host_session_schema(host: str) -> str:
+    if host == "codex-cli":
+        return CODEX_CLI_SESSION_SCHEMA_VERSION
+    if host == "dsh":
+        return MANAGED_CLI_SESSION_SCHEMA_VERSION
+    raise ValueError("unsupported managed session host")
+
+
+def _lineage(
+    request: Mapping[str, Any], *, session_scope: str | None = None,
+    checked_lineage: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    # Operation preflight may already hold this exact invocation's normalized
+    # source identity. Scope/path checks stay here; standalone and historical
+    # readers retain their own source check. Never retain it across attempts.
+    lineage = turn_host_lineage(request) if checked_lineage is None else dict(checked_lineage)
+    if session_scope is None:
+        session = request.get("session") or {}
+        policy = session.get("context_policy") or {}
+        session_scope = str(policy.get("binding_scope") or "todo")
+    return _checked_session_lineage(lineage, session_scope)
+
+
+def _checked_session_lineage(lineage: dict[str, str], session_scope: str) -> dict[str, str]:
+    if not all(lineage[field] for field in session_identity_fields(session_scope)):
+        raise ValueError("Codex CLI host request has incomplete turn lineage")
+    lineage["goal_id"] = validate_goal_id_path_segment(lineage["goal_id"])
+    return lineage
+
+
+def _session_path(
+    runtime_root: Path,
+    lineage: Mapping[str, str],
+    session_scope: str = "todo",
+) -> Path:
+    fields = session_identity_fields(session_scope)
+    identity = (
+        dict(lineage)
+        if session_scope == "todo"
+        else {
+            **{field: lineage[field] for field in fields},
+            "session_scope": session_scope,
+        }
+    )
+    digest = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    goal_id: str = validate_goal_id_path_segment(lineage["goal_id"])
+    return runtime_root / "goals" / goal_id / "turn-sessions" / f"{digest}.json"
+
+
+def _valid_session_id(value: Any) -> str | None:
+    session_id = str(value or "").strip()
+    if not session_id or len(session_id) > SESSION_ID_MAX_CHARS:
+        return None
+    if any(character in session_id for character in ("\x00", "\r", "\n")):
+        return None
+    return session_id
+
+
+def load_codex_cli_session(
+    runtime_root: Path,
+    *,
+    lineage: Mapping[str, str],
+    session_scope: str = "todo",
+    host: str = "codex-cli",
+) -> dict[str, Any] | None:
+    _host_session_schema(host)
+    return _session_document_value(
+        _read_codex_cli_session_document(runtime_root, lineage=lineage, session_scope=session_scope),
+        lineage=lineage, session_scope=session_scope, host=host,
+    )
+
+
+def _session_document_value(
+    value: object, *, lineage: Mapping[str, str], session_scope: str = "todo",
+    host: str = "codex-cli",
+) -> dict[str, Any] | None:
+    schema = _host_session_schema(host)
+    if not isinstance(value, dict):
+        return None
+    if value.get("schema_version") != schema or value.get("host", "codex-cli") != host:
+        return None
+    if value.get("session_scope", "todo") != session_scope:
+        return None
+    if any(
+        value.get(field) != lineage[field]
+        for field in session_identity_fields(session_scope)
+    ):
+        return None
+    session_id = _valid_session_id(value.get("session_id"))
+    if not session_id:
+        return None
+    return {**value, "session_id": session_id}
+
+
+def _codex_session_goal_ref(
+    value: Mapping[str, Any],
+    *,
+    lineage: Mapping[str, str],
+    session_scope: str = "todo",
+    host: str = "codex-cli",
+) -> object:
+    if (
+        value.get("schema_version") != _host_session_schema(host)
+        or value.get("host", "codex-cli") != host
+        or value.get("session_scope", "todo") != session_scope
+        or any(
+            value.get(field) != lineage[field]
+            for field in session_identity_fields(session_scope)
+        )
+        or _valid_session_id(value.get("session_id")) is None
+    ):
+        return {"malformed": True}
+    goal_ref = value.get("goal_ref")
+    if goal_ref is not None:
+        return goal_ref
+    return {"goal_id": value.get("goal_id")}
+
+
+def _read_codex_cli_session_document(
+    runtime_root: Path,
+    *,
+    lineage: Mapping[str, str],
+    session_scope: str = "todo",
+) -> dict[str, Any] | None:
+    path = _session_path(runtime_root, lineage, session_scope)
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"malformed": True}
+    return value if isinstance(value, dict) else {"malformed": True}
+
+
+def codex_cli_session_binding(
+    runtime_root: Path,
+    turn_envelope: Mapping[str, Any] | object = _ABSENT_EXECUTOR_ADAPTER,
+    *,
+    work_contract: object = _ABSENT_WORK_CONTRACT,
+    goal_admission: FirstPartyHostGoalAdmission | None = None,
+    session_scope: str = "todo",
+    host: str = "codex-cli",
+) -> dict[str, str] | None:
+    """Read the original native session from one complete source.
+
+    Explicit historical adapters keep their existing decoder and, when a
+    complete source accompanies one, its consistency checks. Neither path
+    authorizes a Host launch or changes the session's owner or namespace.
+    """
+    if turn_envelope is _ABSENT_EXECUTOR_ADAPTER:
+        if work_contract is _ABSENT_WORK_CONTRACT:
+            raise ValueError("session binding requires the complete source or historical executor input")
+        from ..quota.turn_envelope import _turn_envelope_result
+
+        lineage = _checked_session_lineage(_turn_envelope_result(
+            "complete_host_lineage", payload=work_contract,
+        ), session_scope)
+    else:
+        request: dict[str, Any] = {"turn_envelope": dict(cast(Mapping[str, Any], turn_envelope))}
+        if work_contract is not _ABSENT_WORK_CONTRACT:
+            request["work_contract"] = work_contract
+        lineage = _lineage(request, session_scope=session_scope)
+    session = select_codex_cli_session(
+        runtime_root,
+        lineage=lineage,
+        session_scope=session_scope,
+        goal_admission=goal_admission,
+        host=host,
+    )
+    if session is None:
+        return None
+    return {
+        "schema_version": "loopx_turn_session_binding_v0",
+        **lineage,
+    }
+
+
+def _store_codex_cli_session(
+    runtime_root: Path,
+    *,
+    lineage: Mapping[str, str],
+    session_scope: str = "todo",
+    host: str = "codex-cli",
+    session_id: str,
+    goal_ref: Mapping[str, Any] | None = None,
+    session_profile_digest: str | None = None,
+    operation_profile_digest: str | None = None,
+    operation_model: str | None = None,
+    operation_reasoning_effort: str | None = None,
+    require_absent: bool = False,
+    checkpoint_artifact_sha256: str | None = None,
+    checkpoint_artifact_root: str | None = None,
+    checkpoint_model_transition: Mapping[str, str] | None = None,
+    expected_document: object = _UNCHECKED_SESSION_DOCUMENT,
+) -> None:
+    if checkpoint_artifact_sha256 is not None and not BARE_SHA256_PATTERN.fullmatch(checkpoint_artifact_sha256):
+        raise ValueError("checkpoint session source digest is invalid")
+    if checkpoint_artifact_root is not None and (
+            checkpoint_artifact_sha256 is None or not Path(checkpoint_artifact_root).is_absolute() or
+            str(Path(checkpoint_artifact_root).resolve()) != checkpoint_artifact_root):
+        raise ValueError("checkpoint session source root must be physical and digest-bound")
+    path = _session_path(runtime_root, lineage, session_scope)
+    with exclusive_file_lock(path):
+        if require_absent and (path.exists() or path.is_symlink()):
+            raise ValueError("session binding already exists; read back the original admission")
+        _host_session_schema(host)
+        current = _read_codex_cli_session_document(runtime_root, lineage=lineage, session_scope=session_scope)
+        if expected_document is not _UNCHECKED_SESSION_DOCUMENT and current != expected_document:
+            raise ValueError("managed session binding changed during native initialization")
+        # Provenance survives ordinary observations of this exact conversation,
+        # but cannot migrate to a replacement session, profile or Goal lifetime.
+        prior = _session_document_value(current, lineage=lineage, session_scope=session_scope, host=host)
+        retained_source = None
+        retained_root = None
+        retained_refresh = None
+        retained_transition = None
+        if prior and (prior.get("session_id"), prior.get("goal_ref"), prior.get("session_profile_digest")) == (
+            session_id, dict(goal_ref) if goal_ref is not None else None, session_profile_digest
+        ):
+            retained_source = prior.get("checkpoint_artifact_sha256")
+            retained_root = prior.get("checkpoint_artifact_root")
+            retained_refresh = prior.get("checkpoint_context_refresh")
+            retained_transition = prior.get("checkpoint_model_transition")
+        if retained_source is not None:
+            if not isinstance(retained_source, str) or not BARE_SHA256_PATTERN.fullmatch(retained_source):
+                raise ValueError("stored checkpoint session source digest is invalid")
+            if checkpoint_artifact_sha256 not in (None, retained_source):
+                raise ValueError("checkpoint session source digest cannot change")
+            if retained_root is not None and (not isinstance(retained_root, str) or
+                    not Path(retained_root).is_absolute() or str(Path(retained_root).resolve()) != retained_root):
+                raise ValueError("stored checkpoint session source root is invalid")
+            if retained_root is not None and checkpoint_artifact_root not in (None, retained_root):
+                raise ValueError("checkpoint session source root cannot change")
+            if retained_transition is not None and checkpoint_model_transition not in (None, retained_transition):
+                raise ValueError("checkpoint model transition cannot change")
+        transition = checkpoint_model_transition if checkpoint_model_transition is not None else retained_transition
+        _write_codex_cli_session(
+            runtime_root,
+            lineage=lineage,
+            session_scope=session_scope,
+            host=host,
+            session_profile_digest=session_profile_digest,
+            session_id=session_id,
+            goal_ref=goal_ref,
+            operation_profile_digest=operation_profile_digest,
+            operation_model=operation_model,
+            operation_reasoning_effort=operation_reasoning_effort,
+            checkpoint_artifact_sha256=checkpoint_artifact_sha256 or retained_source,
+            checkpoint_artifact_root=checkpoint_artifact_root or retained_root,
+            checkpoint_context_refresh=retained_refresh,
+            checkpoint_model_transition=transition,
+        )
+
+
+@dataclass(frozen=True)
+class ManagedOperationSession:
+    """Selected file snapshot and its initialization commit.
+
+    Both transports retain the existing session file/schema. The Goal admission
+    owner checks selection and acceptance; the file lock fences replacement
+    during native initialization. DSH keeps its original replace-only writer;
+    Codex keeps checkpoint provenance for the exact original conversation.
+    """
+
+    runtime_root: Path
+    lineage: Mapping[str, str]
+    host: str
+    binding: dict[str, Any] | None
+    original: dict[str, Any] | None
+    goal_ref: Mapping[str, Any] | None
+    profile_digest: str
+    model: str
+    reasoning_effort: str
+    goal_admission: FirstPartyHostGoalAdmission | None
+
+    def store(self, session_id: str) -> None:
+        def commit() -> None:
+            values: dict[str, Any] = dict(
+                lineage=self.lineage, host=self.host, session_id=session_id,
+                goal_ref=self.goal_ref, operation_profile_digest=self.profile_digest,
+                operation_model=self.model, operation_reasoning_effort=self.reasoning_effort,
+            )
+            if self.host == "dsh":
+                with exclusive_file_lock(_session_path(self.runtime_root, self.lineage)):
+                    if _read_codex_cli_session_document(self.runtime_root, lineage=self.lineage) != self.original:
+                        raise ValueError("DSH binding changed during SDK initialization")
+                    _write_codex_cli_session(self.runtime_root, **values)
+            else:
+                _store_codex_cli_session(self.runtime_root, **values, expected_document=self.original)
+
+        if self.goal_admission is None:
+            commit()
+        else:
+            self.goal_admission.accept_result(commit)
+
+
+def select_managed_operation_session(
+    runtime_root: Path, *, request: Mapping[str, Any], lineage: Mapping[str, str],
+    host: str, transport: str, profile_digest: str, model: str, reasoning_effort: str,
+    goal_admission: FirstPartyHostGoalAdmission | None = None,
+) -> ManagedOperationSession:
+    _host_session_schema(host)
+    # Read Codex's selected document once, through admission when present. The
+    # same snapshot is normalized for legacy loading and compared at commit.
+    # DSH retains its pre-selection snapshot to preserve its initialization fence.
+    if host == "codex-cli":
+        if goal_admission is None:
+            original = _read_codex_cli_session_document(runtime_root, lineage=lineage)
+            binding = _session_document_value(original, lineage=lineage)
+        else:
+            original = goal_admission.select_state(
+                read_state=lambda: _read_codex_cli_session_document(runtime_root, lineage=lineage),
+                goal_ref_of=lambda value: _codex_session_goal_ref(value, lineage=lineage),
+            )
+            binding = dict(original) if original is not None else None
+    else:
+        original = _read_codex_cli_session_document(runtime_root, lineage=lineage)
+        binding = select_codex_cli_session(
+            runtime_root, lineage=lineage, host=host, goal_admission=goal_admission,
+        )
+    session_plan = request.get("session") or {}
+    if (session_plan.get("context_policy") or {}).get("mode") == "fresh":
+        binding = None
+    elif host == "dsh" and original is not None and binding is None:
+        raise ValueError("existing session is not a qualified DSH operation binding; select fresh explicitly")
+    action = session_plan.get("action")
+    has_binding = binding is not None if host == "dsh" else bool(binding)
+    if action not in {"start_new", "resume"} or (action == "resume") != has_binding:
+        raise ValueError(f"managed {'DSH' if host == 'dsh' else 'Codex'} session changed after Turn planning")
+    if binding and (
+        binding.get("operation_transport") != transport
+        or binding.get("operation_profile_digest") != profile_digest
+    ):
+        raise ValueError(
+            "DSH operation profile changed; select fresh and obtain fresh approval" if host == "dsh"
+            else "managed operation profile changed; explicitly select a fresh iteration and obtain fresh approval"
+        )
+    return ManagedOperationSession(
+        runtime_root, dict(lineage), host, binding, original, request.get("goal_ref"),
+        profile_digest, model, reasoning_effort, goal_admission,
+    )
+
+
+def _replace_checkpoint_codex_session(
+    runtime_root: Path, *, lineage: Mapping[str, str], expected: dict[str, Any],
+    session_id: str, refresh: dict[str, Any],
+) -> None:
+    """CAS one provider conversation after explicit controller qualification.
+
+    The caller holds current Goal lifetime admission. The typed checkpoint
+    continuation owner qualifies the completed decision; this is transport IO.
+    Ordinary replacement observations still never transfer provenance.
+    """
+    path = _session_path(runtime_root, lineage, "agent")
+    with exclusive_file_lock(path):
+        current = load_codex_cli_session(runtime_root, lineage=lineage, session_scope="agent")
+        if current != expected or not current.get("checkpoint_artifact_sha256"):
+            raise ValueError("checkpoint context source binding moved before replacement")
+        if session_id == current["session_id"]:
+            raise ValueError("checkpoint context refresh requires a distinct native conversation")
+        _write_codex_cli_session(runtime_root, lineage=lineage, session_scope="agent",
+            session_id=session_id, goal_ref=current.get("goal_ref"),
+            session_profile_digest=current["session_profile_digest"],
+            checkpoint_artifact_sha256=current["checkpoint_artifact_sha256"],
+            checkpoint_artifact_root=current["checkpoint_artifact_root"],
+            checkpoint_context_refresh={**refresh, "session_id": session_id},
+            checkpoint_model_transition=current.get("checkpoint_model_transition"))
+
+
+def _write_codex_cli_session(
+    runtime_root: Path,
+    *,
+    lineage: Mapping[str, str],
+    session_scope: str = "todo",
+    host: str = "codex-cli",
+    session_id: str,
+    goal_ref: Mapping[str, Any] | None = None,
+    session_profile_digest: str | None = None,
+    operation_profile_digest: str | None = None,
+    operation_model: str | None = None,
+    operation_reasoning_effort: str | None = None,
+    checkpoint_artifact_sha256: str | None = None,
+    checkpoint_artifact_root: str | None = None,
+    checkpoint_context_refresh: dict[str, Any] | None = None,
+    checkpoint_model_transition: Mapping[str, str] | None = None,
+) -> None:
+    schema = _host_session_schema(host)
+    if checkpoint_model_transition is not None:
+        validate_checkpoint_model_transition(checkpoint_model_transition)
+        if (not checkpoint_artifact_sha256 or
+                checkpoint_model_transition["destination_profile_digest"] != session_profile_digest):
+            raise ValueError("checkpoint model transition requires its source-bound destination profile")
+    normalized_session_id = _valid_session_id(session_id)
+    if not normalized_session_id:
+        raise ValueError("Codex CLI returned an invalid session id")
+    path = _session_path(runtime_root, lineage, session_scope)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    protect_private_path(path.parent, directory=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        protect_private_path(temporary)
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with handle:
+            payload: dict[str, Any] = {
+                "schema_version": schema,
+                **lineage,
+                "host": host,
+                "session_id": normalized_session_id,
+            }
+            if session_scope != "todo":
+                payload["session_scope"] = session_scope
+            if session_profile_digest is not None:
+                payload["session_profile_digest"] = session_profile_digest
+            if goal_ref is not None:
+                payload["goal_ref"] = dict(goal_ref)
+            if checkpoint_artifact_sha256 is not None:
+                payload["checkpoint_artifact_sha256"] = checkpoint_artifact_sha256
+            if checkpoint_artifact_root is not None:
+                payload["checkpoint_artifact_root"] = checkpoint_artifact_root
+            if checkpoint_context_refresh is not None:
+                payload["checkpoint_context_refresh"] = checkpoint_context_refresh
+            if checkpoint_model_transition is not None:
+                payload["checkpoint_model_transition"] = dict(checkpoint_model_transition)
+            if operation_profile_digest is not None:
+                payload["operation_transport"] = (
+                    "dsh-native-operation-tools-v0" if host == "dsh"
+                    else "app-server-operation-tools-v0"
+                )
+                payload["operation_profile_digest"] = operation_profile_digest
+                payload["operation_model"] = operation_model
+                payload["operation_reasoning_effort"] = operation_reasoning_effort
+            json.dump(
+                payload,
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+            if checkpoint_artifact_sha256 is not None:
+                handle.flush()
+                os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _discard_codex_cli_session(
+    runtime_root: Path,
+    *,
+    lineage: Mapping[str, str],
+    session_scope: str = "todo",
+) -> None:
+    path = _session_path(runtime_root, lineage, session_scope)
+    with exclusive_file_lock(path):
+        path.unlink(missing_ok=True)
+
+
+def select_codex_cli_session(
+    runtime_root: Path,
+    *,
+    lineage: Mapping[str, str],
+    session_scope: str = "todo",
+    host: str = "codex-cli",
+    goal_admission: FirstPartyHostGoalAdmission | None = None,
+) -> dict[str, Any] | None:
+    """Select through the existing Goal lifetime fence, then validate identity.
+
+    A present but invalid agent-scoped record is an error, never permission to
+    silently create a replacement conversation.
+    """
+    session_identity_fields(session_scope)
+    _host_session_schema(host)
+
+    def read() -> dict[str, Any] | None:
+        return _read_codex_cli_session_document(
+            runtime_root,
+            lineage=lineage,
+            session_scope=session_scope,
+        )
+
+    value = (
+        goal_admission.select_state(
+            read_state=read,
+            goal_ref_of=lambda item: _codex_session_goal_ref(
+                item,
+                lineage=lineage,
+                session_scope=session_scope,
+                host=host,
+            ),
+        )
+        if goal_admission is not None
+        else read()
+    )
+    if value is None:
+        return None
+    if _codex_session_goal_ref(value, lineage=lineage, session_scope=session_scope, host=host) == {
+        "malformed": True
+    }:
+        if session_scope == "agent":
+            raise ValueError(
+                "invalid agent session binding; explicitly select fresh to replace it"
+            )
+        return None
+    return dict(value)
+
+
+def validate_checkpoint_model_transition(value: Mapping[str, str]) -> None:
+    """Validate the source/destination facts retained by checkpoint admission."""
+    digests = ("source_config_sha256", "destination_config_sha256",
+               "source_profile_digest", "destination_profile_digest")
+    settings = ("source_model", "source_effort", "destination_model", "destination_effort")
+    if (not isinstance(value, Mapping) or set(value) != {*digests, *settings} or
+            any(not isinstance(value[k], str) or not BARE_SHA256_PATTERN.fullmatch(value[k]) for k in digests) or
+            any(not isinstance(value[k], str) or not value[k].strip() for k in settings)):
+        raise ValueError("checkpoint model transition facts are invalid")
+
+
+def codex_session_profile_digest(
+    *,
+    project: Path,
+    codex_bin: str,
+    home: Path,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    sandbox: str | None = None,
+    mcp_server: Mapping[str, Any] | None = None,
+    config_bytes: bytes | None = None,
+) -> str:
+    """Bind a conversation to its workspace, provider home and settings.
+
+    ``config_bytes`` compares inert captured settings at their qualified guest
+    paths. It does not install them or admit a changed active-session profile.
+    """
+    config = home / "config.toml"
+    profile = {
+        "workspace": str(project.resolve()),
+        "codex_home": str(home.expanduser().resolve()),
+        "codex_bin": str(Path(codex_bin).resolve()),
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "sandbox": sandbox,
+        "mcp_server": mcp_server,
+        "config_digest": hashlib.sha256(
+            config_bytes if config_bytes is not None else
+            config.read_bytes() if config.exists() else b""
+        ).hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest()
+
+
+def require_codex_session_profile(binding: Mapping[str, Any], digest: str) -> None:
+    if binding.get("session_profile_digest") != digest:
+        raise ValueError(
+            "Codex session profile changed; explicitly select fresh or use a new runtime"
+        )
+
+
+def approved_codex_workspace_write_resume(
+    registry_path: Path | None, *, lineage: Mapping[str, str], project: Path,
+) -> bool:
+    """Read current, scoped operator approval; session memory grants nothing.
+
+    workspace-write exposes the whole working directory, so approval for a
+    single file or a sibling directory cannot authorize this transition.
+    """
+    if registry_path is None:
+        return False
+    try:
+        registry = load_project_registry(registry_path)
+        require_runtime_compatible_project_registry(
+            registry, operation="Codex workspace-write session resume"
+        )
+        goals = [goal for goal in registry.get("goals", [])
+                 if goal.get("id") == lineage["goal_id"] and goal.get("status") == "active"]
+        if len(goals) != 1:
+            return False
+        goal = goals[0]
+        coordination = goal.get("coordination") or {}
+        if lineage["agent_id"] not in coordination.get("registered_agents", []):
+            return False
+        raw_authority = coordination.get("checkpointed_boundary_authority")
+        if isinstance(raw_authority, dict):
+            raw_authority = raw_authority.get("entries")
+        entries = normalize_checkpointed_boundary_authority_entries(raw_authority)
+        root = Path(goal.get("repo") or "").expanduser()
+        if not root.is_absolute():
+            return False
+        root = root.resolve()
+        workspace = project.resolve()
+        if not workspace.is_relative_to(root):
+            return False
+        scopes = [scope for entry in entries if entry.get("active") is True
+                  for scope in entry.get("write_scope", [])]
+        for scope in scopes:
+            if scope == "**":
+                return True
+            if not scope.endswith("/**"):
+                continue
+            directory = scope[:-3]
+            if (Path(directory).is_absolute() or ".." in Path(directory).parts
+                    or any(char in directory for char in "*?[]")):
+                continue
+            approved = (root / directory).resolve()
+            if approved.is_relative_to(root) and workspace.is_relative_to(approved):
+                return True
+    except (OSError, TypeError, ValueError, KeyError, AttributeError):
+        return False
+    return False

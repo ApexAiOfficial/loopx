@@ -1,10 +1,24 @@
 from __future__ import annotations
 
+import errno
 import http.client
 import json
+import tempfile
 import threading
+import time
+from pathlib import Path
 
+import pytest
+
+from loopx.chat_action_store import ChatActionStore
+from loopx.chat_actions import ChatActionService
 from loopx.chat_server import ChatHTTPServer, ChatRequestHandler
+from loopx.chat_store import ChatSessionStore
+from loopx.control_plane.effect_runtime import (
+    EffectRuntimePermanentIOError,
+    EffectRuntimeStartupError,
+    EffectRuntimeTransientIOError,
+)
 from loopx.extensions.lark.cli_resolution import LarkCliResolution
 
 
@@ -12,6 +26,14 @@ def _start_server() -> tuple[ChatHTTPServer, threading.Thread]:
     server = ChatHTTPServer(("127.0.0.1", 0), ChatRequestHandler)
     server.verbose = False
     server.selected_goal_id = None
+    server.registry_path = Path("/tmp/loopx-test-registry.json")
+    server.runtime_root_override = None
+    server.runtime_root = Path("/tmp/loopx-test-runtime")
+    # The capabilities readback quotes the steward channel's Session, so a
+    # fixture server carries the store the real startup always installs.
+    server.chat_store = ChatSessionStore(Path(tempfile.mkdtemp()) / "runtime")
+    server.scan_roots = []
+    server.limit = 20
     server.runtime_controller = _RuntimeController()
     server.lark_cli_resolution = LarkCliResolution(
         command=None,
@@ -38,17 +60,21 @@ def _request(
     *,
     method: str,
     origin: str | None,
+    path: str = "/api/chat/capabilities",
+    body: bytes | None = None,
+    headers: dict[str, str] | None = None,
 ) -> http.client.HTTPResponse:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-    headers = {"Origin": origin} if origin else {}
-    connection.request(method, "/api/chat/capabilities", headers=headers)
+    request_headers = {"Origin": origin} if origin is not None else {}
+    request_headers.update(headers or {})
+    connection.request(method, path, body=body, headers=request_headers)
     return connection.getresponse()
 
 
-def test_chat_json_echoes_loopback_cors_origin() -> None:
+def test_chat_json_echoes_same_origin() -> None:
     server, thread = _start_server()
     try:
-        origin = "http://127.0.0.1:49152"
+        origin = f"http://127.0.0.1:{server.server_port}"
         response = _request(
             server.server_address[1],
             method="GET",
@@ -90,17 +116,79 @@ def test_chat_capabilities_expose_public_runtime_identity() -> None:
         server.server_close()
 
 
-def test_chat_json_rejects_foreign_cors_origin() -> None:
+def test_readiness_is_independent_of_blocked_capability_discovery(monkeypatch):
+    from loopx.dashboard_launcher import _probe_existing_chat
+    server, thread = _start_server()
+    entered, release = threading.Event(), threading.Event()
+    requests, results = [], []
+
+    def blocked():
+        requests.append("capabilities")
+        entered.set()
+        assert release.wait(5)
+        return []
+    monkeypatch.setattr(server.runtime_controller, "capabilities", blocked)
+    def full_read():
+        response = _request(server.server_port, method="GET", origin=None)
+        results.append(response.read())
+    reader = threading.Thread(target=full_read)
+    reader.start()
+    try:
+        assert entered.wait(3)
+        start = time.monotonic()
+        assert _probe_existing_chat("127.0.0.1", server.server_port) == "matching"
+        assert time.monotonic() - start < 0.5
+        response = _request(server.server_port, method="GET", origin=None, path="/api/chat/readiness")
+        payload = json.loads(response.read())
+        assert payload == {"ok": True, "schema_version": "loopx_chat_readiness_v1",
+            "state": "ready", "runtime_identity": server.runtime_identity}
+        assert requests == ["capabilities"] and not results
+        denied = _request(server.server_port, method="GET", origin="https://foreign.example", path="/api/chat/readiness")
+        assert denied.status == 403
+        denied.read()
+    finally:
+        release.set()
+        reader.join(5)
+        server.shutdown()
+        thread.join(5)
+        server.server_close()
+    assert len(results) == 1
+
+
+def test_chat_keeps_its_startup_identity_after_package_replacement(monkeypatch: pytest.MonkeyPatch) -> None:
+    current = {"schema_version": "loopx_runtime_identity_v1", "package_fingerprint": "sha256:original"}
+    monkeypatch.setattr("loopx.chat_server.release_runtime_identity", lambda: dict(current))
     server, thread = _start_server()
     try:
+        current["package_fingerprint"] = "sha256:replacement"
+        response = _request(server.server_address[1], method="GET", origin=None)
+        assert json.loads(response.read())["runtime_identity"]["package_fingerprint"] == "sha256:original"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("origin_kind", ["other_port", "other_loopback_name", "https", "foreign", "malformed"])
+def test_chat_json_rejects_other_browser_origins(origin_kind: str) -> None:
+    server, thread = _start_server()
+    try:
+        port = server.server_port
+        origins = {
+            "other_port": f"http://127.0.0.1:{port + 1 if port < 65535 else port - 1}",
+            "other_loopback_name": f"http://localhost:{port}",
+            "https": f"https://127.0.0.1:{port}",
+            "foreign": "https://evil.example",
+            "malformed": f"http://127.0.0.1:{port}/unexpected",
+        }
         response = _request(
-            server.server_address[1],
+            port,
             method="GET",
-            origin="https://evil.example",
+            origin=origins[origin_kind],
         )
         response.read()
 
-        assert response.status == 200
+        assert response.status == 403
         assert response.getheader("Access-Control-Allow-Origin") is None
     finally:
         server.shutdown()
@@ -108,10 +196,10 @@ def test_chat_json_rejects_foreign_cors_origin() -> None:
         server.server_close()
 
 
-def test_chat_options_exposes_loopback_preflight_only() -> None:
+def test_chat_options_exposes_same_origin_preflight_only() -> None:
     server, thread = _start_server()
     try:
-        origin = "http://127.0.0.1:49152"
+        origin = f"http://127.0.0.1:{server.server_port}"
         response = _request(
             server.server_address[1],
             method="OPTIONS",
@@ -124,6 +212,575 @@ def test_chat_options_exposes_loopback_preflight_only() -> None:
         assert response.getheader("Access-Control-Allow-Methods") == (
             "GET, POST, DELETE, OPTIONS"
         )
+        denied = _request(
+            server.server_port,
+            method="OPTIONS",
+            origin="http://127.0.0.1:49152" if server.server_port != 49152 else "http://127.0.0.1:49153",
+        )
+        denied.read()
+        assert denied.status == 403
+        assert denied.getheader("Access-Control-Allow-Origin") is None
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_other_loopback_page_cannot_write_projection_messages() -> None:
+    server, thread = _start_server()
+    try:
+        port = server.server_port
+        body = json.dumps({"context_kind": "manager", "question": "fixture question", "answer": "fixture answer"}).encode()
+        denied = _request(
+            port,
+            method="POST",
+            path="/api/chat/projection-messages",
+            origin=f"http://127.0.0.1:{port + 1 if port < 65535 else port - 1}",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        denied.read()
+        assert denied.status == 403
+        assert server.chat_store.list_sessions() == []
+
+        allowed = _request(
+            port,
+            method="POST",
+            path="/api/chat/projection-messages",
+            origin=f"http://127.0.0.1:{port}",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        allowed.read()
+        assert allowed.status == 201
+        assert len(server.chat_store.list_sessions()) == 1
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("host", ["evil.example", "localhost.evil.example", "127.0.0.1:0", "127.0.0.1:99999"])
+def test_chat_rejects_non_loopback_or_invalid_host(host: str) -> None:
+    server, thread = _start_server()
+    try:
+        response = _request(server.server_port, method="GET", origin=None, headers={"Host": host})
+        response.read()
+        assert response.status == 403
+        assert response.getheader("Access-Control-Allow-Origin") is None
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("header", ["missing_host", "duplicate_host", "duplicate_origin"])
+def test_chat_rejects_missing_or_ambiguous_authority(header: str) -> None:
+    server, thread = _start_server()
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.putrequest("GET", "/api/chat/sessions", skip_host=True)
+        if header != "missing_host":
+            connection.putheader("Host", f"127.0.0.1:{server.server_port}")
+        if header == "duplicate_host":
+            connection.putheader("Host", f"127.0.0.1:{server.server_port}")
+        if header == "duplicate_origin":
+            connection.putheader("Origin", f"http://127.0.0.1:{server.server_port}")
+            connection.putheader("Origin", "http://127.0.0.1:49152")
+        connection.endheaders()
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 403
+        assert response.getheader("Access-Control-Allow-Origin") is None
+        connection.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("origin", ["tauri://localhost", "http://tauri.localhost"])
+def test_chat_rejects_unrelated_desktop_boot_origin(origin: str) -> None:
+    server, thread = _start_server()
+    try:
+        response = _request(server.server_port, method="GET", origin=origin)
+        response.read()
+        assert response.status == 403
+        assert response.getheader("Access-Control-Allow-Origin") is None
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_chat_accepts_forwarded_loopback_authority_when_origin_matches() -> None:
+    server, thread = _start_server()
+    try:
+        forwarded_port = server.server_port + 1 if server.server_port < 65535 else server.server_port - 1
+        origin = f"http://localhost:{forwarded_port}"
+        response = _request(server.server_port, method="GET", origin=origin, headers={"Host": f"localhost:{forwarded_port}"})
+        response.read()
+        assert response.status == 200
+        assert response.getheader("Access-Control-Allow-Origin") == origin
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e309"])
+def test_chat_post_rejects_non_finite_json_numbers(number: str) -> None:
+    server, thread = _start_server()
+    try:
+        response = _request(
+            server.server_address[1],
+            method="POST",
+            origin=None,
+            path="/api/ssh-source/ensure",
+            body=f'{{"host_alias":"","local_port":{number}}}'.encode(),
+        )
+        payload = json.loads(response.read().decode("utf-8"))
+
+        assert response.status == 400
+        assert "request body must be strict JSON" in payload["error"]
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_chat_action_context_cannot_persist_or_emit_overflowed_float(
+    tmp_path: Path,
+) -> None:
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps({"schema_version": "0.1", "goals": [{"id": "goal-one"}]}),
+        encoding="utf-8",
+    )
+    action_store = ChatActionStore(tmp_path / "actions")
+    server, thread = _start_server()
+    server.action_store = action_store
+    server.action_service = ChatActionService(
+        store=action_store,
+        registry_path=registry_path,
+    )
+    try:
+        response = _request(
+            server.server_address[1],
+            method="POST",
+            origin=None,
+            path="/api/actions/preview",
+            body=(
+                b'{"action_kind":"goal.lifecycle","summary":"Stop goal",'
+                b'"normalized_parameters":{"goal_id":"goal-one","operation":"stop"},'
+                b'"context":{"nested":{"overflow":1e309}},'
+                b'"idempotency_key":"stop-goal-one"}'
+            ),
+        )
+        response_body = response.read()
+
+        assert response.status == 400
+        assert b"Infinity" not in response_body
+        assert json.loads(response_body)["error_code"] == "invalid_action_preview"
+        assert action_store.list() == []
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_chat_preview_preserves_canonical_actor_refusal(tmp_path, monkeypatch, provider):
+    from tests.control_plane.canonical_authority_fixture import (
+        initialize_canonical_authority, isolate_sqlite_runtime,
+    )
+    from loopx.control_plane.coordination.local_authority import read_canonical_todos_if_promoted
+    from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
+
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    runtime = tmp_path / "runtime"
+    state = tmp_path / "ACTIVE_GOAL_STATE.md"
+    state.write_text("# Derived display\n", encoding="utf-8")
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"schema_version": 1, "common_runtime_root": str(runtime),
+        "goals": [{"id": "goal-preview", "repo": str(tmp_path), "state_file": state.name,
+            "coordination": {"registered_agents": ["agent-a"]}}]}), encoding="utf-8")
+    projection = build_todo_runtime_shadow_projection(goal_id="goal-preview", handoff_mode="hard_lease", todos=[{
+        "schema_version": "todo_item_v0", "source_section": "Agent Todo", "index": 1,
+        "todo_id": "todo_preview", "text": "Retain original work", "role": "agent", "status": "open",
+        "done": False, "archive_state": "active", "claimed_by": "agent-a", "priority": "P1",
+        "note": "完整来源 " * 3000,
+    }])
+    initialize_canonical_authority(runtime, "goal-preview", projection, state_path=state, provider=provider)
+    before = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id="goal-preview", include_leases=True)
+    server, thread = _start_server()
+    server.action_store = ChatActionStore(tmp_path / "actions")
+    server.action_service = ChatActionService(store=server.action_store, registry_path=registry)
+    try:
+        response = _request(server.server_address[1], method="POST", origin=None,
+            path="/api/actions/preview", body=json.dumps({
+                "action_kind": "todo.update", "summary": "Set priority",
+                "normalized_parameters": {"goal_id": "goal-preview", "todo_id": "todo_preview",
+                    "operation": "edit", "priority": "P2"},
+                "context": {}, "idempotency_key": "priority-without-actor",
+            }).encode())
+        payload = json.loads(response.read())
+        assert response.status == 400
+        assert payload["error_code"] == "actor_required"
+        assert "retry" in payload["error"].lower()
+        assert str(tmp_path) not in json.dumps(payload)
+        assert "完整来源" not in json.dumps(payload, ensure_ascii=False)
+        assert server.action_store.list() == []
+        assert read_canonical_todos_if_promoted(runtime_root=runtime, goal_id="goal-preview", include_leases=True) == before
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    "action", ["snapshot", "apply", "cancel", "regenerate", "reject", "defer"]
+)
+def test_missing_action_returns_the_same_http_error(
+    tmp_path: Path, action: str
+) -> None:
+    server, thread = _start_server()
+    server.action_store = ChatActionStore(tmp_path / "actions")
+    server.action_service = ChatActionService(
+        store=server.action_store, registry_path=tmp_path / "registry.json"
+    )
+    try:
+        response = _request(
+            server.server_address[1],
+            method="GET" if action == "snapshot" else "POST",
+            origin=None,
+            path="/api/actions/missing"
+            + ("" if action == "snapshot" else f"/{action}"),
+            body=None if action == "snapshot" else b"{}",
+        )
+        assert response.status == 404
+        assert json.loads(response.read()) == {
+            "ok": False,
+            "error": "typed Chat action proposal was not found",
+            "error_code": "action_not_found",
+        }
+        assert server.action_store.list() == []
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_chat_status_forwards_valid_goal_activation_scope(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_collect_status(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "scope": kwargs.get("activation_state_filter")}
+
+    monkeypatch.setattr("loopx.chat.status_api.collect_status", fake_collect_status)
+    server, thread = _start_server()
+    server.goal_subagent_configuration_enabled = True
+    try:
+        response = _request(
+            server.server_address[1],
+            method="GET",
+            origin=None,
+            path="/status.json?goal_activation=active",
+        )
+        payload = json.loads(response.read().decode("utf-8"))
+
+        assert response.status == 200
+        api = payload.pop("local_dashboard_api")
+        assert payload == {"ok": True, "scope": "active"}
+        assert api["source"] == "chat"
+        assert api["presentation_surfaces_url"] == "/extension-presentation-surfaces"
+        assert api["presentation_detail_url"] == "/extension-projection"
+        assert calls[0]["activation_state_filter"] == "active"
+        assert calls[0]["include_goal_subagent_configuration"] is True
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_chat_status_rejects_invalid_goal_activation_scope(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "loopx.chat.status_api.collect_status",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must fail before collection")),
+    )
+    server, thread = _start_server()
+    try:
+        response = _request(
+            server.server_address[1],
+            method="GET",
+            origin=None,
+            path="/status.json?goal_activation=active&goal_activation=stopped",
+        )
+        payload = json.loads(response.read().decode("utf-8"))
+
+        assert response.status == 400
+        assert payload["error_code"] == "invalid_goal_activation"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_workspace_directory_reports_a_missing_registry_as_an_empty_workspace(tmp_path) -> None:
+    # A fresh install has no registry until the first Goal is created. The
+    # discovery read must answer with zero registered Goals, not a 500, so the
+    # home page can render its first-Goal state instead of a service failure.
+    server, thread = _start_server()
+    server.registry_path = tmp_path / ".loopx" / "registry.json"
+    try:
+        response = _request(server.server_address[1], method="GET", origin=None, path="/status.json?view=workspace-directory")
+        payload = json.loads(response.read().decode("utf-8"))
+        assert response.status == 200
+        assert payload["ok"] is True
+        assert payload["schema_version"] == "loopx_workspace_directory_v1"
+        assert payload["goals"] == []
+        # The discovery view states the source fact in the full status's own
+        # words, with the registry path redacted, so the first-Goal home can
+        # show why the workspace is empty without a local path.
+        assert payload["contract"]["ok"] is True
+        assert payload["contract"]["warnings"] == ["registry file does not exist: [project]"]
+        assert payload["contract"]["summary"] == {"errors": 0, "warnings": 1, "checks": 0}
+        assert payload["contract"]["errors"] == []
+        assert str(tmp_path) not in json.dumps(payload)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_workspace_directory_still_fails_on_an_unreadable_registry(tmp_path) -> None:
+    # Only absence is an empty workspace; a corrupt registry stays a failure.
+    server, thread = _start_server()
+    registry_path = tmp_path / ".loopx" / "registry.json"
+    registry_path.parent.mkdir(parents=True)
+    registry_path.write_text("{not json", encoding="utf-8")
+    server.registry_path = registry_path
+    try:
+        response = _request(server.server_address[1], method="GET", origin=None, path="/status.json?view=workspace-directory")
+        payload = json.loads(response.read().decode("utf-8"))
+        assert response.status == 500
+        assert payload["ok"] is False
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_workspace_directory_skips_expensive_projection_and_respects_scope(monkeypatch) -> None:
+    registry = {"goals": [{"id": "alpha", "display_name": "Alpha"}, {"id": "beta"}]}
+    monkeypatch.setattr("loopx.chat.status_api.load_project_registry", lambda _: registry)
+    monkeypatch.setattr("loopx.chat.status_api.collect_status", lambda **_: (_ for _ in ()).throw(AssertionError("directory must not collect status")))
+    server, thread = _start_server()
+    server.selected_goal_id = "alpha"
+    try:
+        response = _request(server.server_address[1], method="GET", origin=None, path="/status.json?view=workspace-directory")
+        payload = json.loads(response.read())
+        assert response.status == 200
+        assert [goal["id"] for goal in payload["goals"]] == ["alpha"]
+        assert payload["schema_version"] == "loopx_workspace_directory_v1"
+        for query in ("goal_id=beta", "goal_id=alpha&goal_id=beta", "goal_id=", "view=unknown", "view=workspace-directory&view=workspace-directory"):
+            response = _request(server.server_address[1], method="GET", origin=None, path="/status.json?" + query)
+            response.read()
+            assert response.status == 400
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_workspace_scoped_status_revision_and_membership_fences(monkeypatch) -> None:
+    registry = {"goals": [{"id": "alpha"}, {"id": "beta"}]}
+    monkeypatch.setattr("loopx.chat.status_api.load_registry", lambda _: registry)
+    calls = []
+    def collect(**kwargs):
+        calls.append(kwargs["goal_id"])
+        return {"ok": True}
+    monkeypatch.setattr("loopx.chat.status_api.collect_status", collect)
+    server, thread = _start_server()
+    try:
+        response = _request(server.server_address[1], method="GET", origin=None, path="/status.json?goal_id=alpha")
+        payload = json.loads(response.read())
+        assert response.status == 200
+        assert calls == ["alpha"]
+        assert payload["workspace_registry_revision"]
+        response = _request(server.server_address[1], method="GET", origin=None, path="/status.json?goal_id=missing")
+        response.read()
+        assert response.status == 404
+        assert calls == ["alpha"]
+        def racing_collect(**kwargs):
+            registry["goals"].pop()
+            return {"ok": True}
+        monkeypatch.setattr("loopx.chat.status_api.collect_status", racing_collect)
+        response = _request(server.server_address[1], method="GET", origin=None, path="/status.json?goal_id=alpha")
+        response.read()
+        assert response.status == 409
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def _status_failure(kind: str) -> BaseException:
+    private_detail = "synthetic confidential diagnostic"
+    if kind.startswith("winerror_"):
+        error = PermissionError(errno.EACCES, private_detail)
+        native = kind.removeprefix("winerror_")
+        error.winerror = {"malformed": "5", "bool": True}.get(native, int(native) if native.isdigit() else None)
+        # A non-access native error must not borrow a permission cause.
+        error.__cause__ = PermissionError(private_detail)
+        return error
+    if kind in {"direct", "eperm"}:
+        return PermissionError(errno.EPERM if kind == "eperm" else errno.EACCES, private_detail)
+    if kind in {"remote_access", "remote_other", "remote_wrong_type"}:
+        error_type = EffectRuntimeTransientIOError if kind == "remote_wrong_type" else EffectRuntimePermanentIOError
+        error = error_type(
+            private_detail,
+            diagnostic_code="io_space_exhausted" if kind == "remote_other" else "io_permission_denied",
+        )
+        error.__cause__ = PermissionError(private_detail)
+        return error
+    if kind in {"node_unavailable", "runtime_startup_timeout", "runtime_launch_failed"}:
+        return EffectRuntimeStartupError(private_detail, diagnostic_code=kind)
+    if kind == "os_other":
+        return OSError(errno.ENOSPC, private_detail)
+    if kind in {"wrapped", "implicit", "suppressed", "launch_implicit"}:
+        error = EffectRuntimeStartupError(private_detail, diagnostic_code=(
+            "runtime_launch_failed" if kind == "launch_implicit" else "runtime_request_failed"
+        ))
+    else:
+        error = RuntimeError(private_detail)
+    if kind in {"wrapped", "explicit", "implicit", "suppressed", "unrelated_context", "launch_implicit"}:
+        error.__context__ = PermissionError(private_detail)
+        if kind in {"wrapped", "explicit"}:
+            error.__cause__ = error.__context__
+        error.__suppress_context__ = kind == "suppressed"
+    elif kind == "cause_precedence":
+        error.__cause__ = ValueError(private_detail)
+        error.__context__ = PermissionError(private_detail)
+    elif kind == "forged_code":
+        error.diagnostic_code = "io_permission_denied"
+    elif kind == "cycle":
+        error.__cause__ = error
+    elif kind in {"depth_8", "depth_9"}:
+        error = PermissionError(private_detail)
+        for _ in range(int(kind.split("_")[1]) - 1):
+            wrapper = RuntimeError(private_detail)
+            wrapper.__cause__ = error
+            error = wrapper
+    return error
+
+
+@pytest.mark.parametrize(
+    ("kind", "access"),
+    [(kind, True) for kind in (
+        "direct", "eperm", "wrapped", "explicit", "implicit", "remote_access",
+        "winerror_5", "winerror_65", "winerror_none", "launch_implicit", "depth_8",
+    )] + [(kind, False) for kind in (
+        "node_unavailable", "runtime_startup_timeout", "runtime_launch_failed",
+        "os_other", "remote_other", "remote_wrong_type", "unknown", "forged_code", "suppressed",
+        "unrelated_context", "cause_precedence", "cycle", "depth_9",
+        "winerror_0", "winerror_19", "winerror_32", "winerror_33", "winerror_malformed", "winerror_bool",
+    )],
+)
+def test_workspace_status_access_error_contract(monkeypatch, kind: str, access: bool) -> None:
+    monkeypatch.setattr("loopx.chat.status_api.load_registry", lambda _: {"goals": [{"id": "alpha"}]})
+    failure = _status_failure(kind)
+
+    def fail(**_kwargs):
+        raise failure
+
+    monkeypatch.setattr("loopx.chat.status_api.collect_status", fail)
+    server, thread = _start_server()
+    try:
+        response = _request(server.server_address[1], method="GET", origin=None, path="/status.json?goal_id=alpha")
+        expected = {"ok": False, "error": "LoopX status could not be projected for the workspace."}
+        if access:
+            expected["error_code"] = "workspace_status_access_denied"
+        assert response.status == 500
+        assert json.loads(response.read()) == expected
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("query", ["", "?view=workspace-directory", "?view=workspace-directory&goal_id=alpha"])
+def test_workspace_access_code_does_not_change_other_status_routes(monkeypatch, query: str) -> None:
+    def fail(*_args, **_kwargs):
+        raise PermissionError("synthetic confidential diagnostic")
+
+    monkeypatch.setattr("loopx.chat.status_api.load_registry", fail)
+    monkeypatch.setattr("loopx.chat.status_api.load_project_registry", fail)
+    monkeypatch.setattr("loopx.chat.status_api.collect_status", fail)
+    server, thread = _start_server()
+    try:
+        response = _request(server.server_address[1], method="GET", origin=None, path="/status.json" + query)
+        assert response.status == 500
+        assert json.loads(response.read()) == {
+            "ok": False, "error": "LoopX status could not be projected for the workspace.",
+        }
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_workspace_legacy_storage_refusal_exposes_recovery_without_mutation(tmp_path) -> None:
+    state = tmp_path / "GOAL.md"
+    source = "# Original Goal\n\n## Agent Todo\n\n- [ ] Original private task\n  <!-- loopx:todo todo_id=todo_original role=agent status=open -->\n"
+    state.write_text(source)
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({
+        "schema_version": 1,
+        "common_runtime_root": str(tmp_path / "runtime"),
+        "goals": [{"id": "alpha", "repo": str(tmp_path), "state_file": state.name}],
+    }))
+    server, thread = _start_server()
+    server.registry_path = registry
+    server.runtime_root = tmp_path / "runtime"
+    server.runtime_root.mkdir()
+    server.runtime_root_override = str(server.runtime_root)
+    try:
+        response = _request(server.server_port, method="GET", origin=None, path="/status.json?goal_id=alpha")
+        assert response.status == 503
+        assert json.loads(response.read()) == {
+            "ok": False,
+            "error": "This Goal needs a storage upgrade. Open its storage settings to review recovery.",
+            "error_code": "canonical_authority_required",
+        }
+        response = _request(server.server_port, method="GET", origin=None,
+                            path="/api/chat/goal-storage?goal_id=alpha")
+        observed = json.loads(response.read())
+        assert response.status == 200, observed
+        assert observed["current"]["canonical"] is False
+        assert observed["cold_source"]["active_todo_count"] == 1
+        assert observed["pending_preview"] is None
+        assert state.read_text() == source
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_workspace_directory_states_no_warning_for_a_present_registry(tmp_path) -> None:
+    registry_path = tmp_path / ".loopx" / "registry.json"
+    registry_path.parent.mkdir(parents=True)
+    registry_path.write_text(json.dumps({"goals": []}), encoding="utf-8")
+    server, thread = _start_server()
+    server.registry_path = registry_path
+    try:
+        response = _request(server.server_address[1], method="GET", origin=None, path="/status.json?view=workspace-directory")
+        payload = json.loads(response.read().decode("utf-8"))
+        assert response.status == 200
+        assert payload["goals"] == []
+        assert payload["contract"]["warnings"] == []
+        assert payload["contract"]["summary"]["warnings"] == 0
     finally:
         server.shutdown()
         thread.join(timeout=5)

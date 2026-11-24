@@ -1,0 +1,1073 @@
+"""Per-turn evidence from Core, scoped before any Goal is read."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Callable, Mapping
+import os
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from .chat_manager import manager_model_config
+from .capabilities.steward_executor import load_effective_steward_executor_defaults
+from .chat.manager_details import read_manager_goal_details
+from .chat.manager_history import read_manager_delivery_history
+from .capabilities.manager_context.inspection import agent_work_summary
+from .capabilities.manager_context.turn_context_cache import (
+    clear_manager_turn_context_cache as clear_manager_turn_context_cache,
+    compute_manager_turn_context_fingerprint,
+    get_cached_manager_turn_context,
+    is_manager_turn_context_cache_enabled,
+    put_cached_manager_turn_context,
+)
+from .history import decode_registry_snapshot
+from .goal_portfolio import (
+    build_goal_portfolio,
+    lifecycle_readback_unavailable,
+    registry_semantic_revision,
+)
+from .chat import redact_local_paths
+from .control_plane.collaboration import conversation_scope
+from .control_plane.effect_runtime import effect_runtime_result
+from .control_plane.goals.goal_ref_validation import exact_goal_ref
+from .control_plane.projects.registry_codec import SOURCE_SESSION_PROFILE_ID
+
+
+# A progress question needs a bounded window, not a single day. One day of
+# receipts cannot answer "what happened this week", and an unbounded window
+# would grow the prompt-only managed transport without limit. These bounds are
+# declared in the context so the answer states what it actually read.
+MANAGER_EVIDENCE_WINDOW_DAYS = 7
+MANAGER_EVIDENCE_PER_DAY_LIMIT = 8
+MANAGER_EVIDENCE_TOTAL_LIMIT = 48
+MANAGER_RECEIPT_DETAIL_POLICY = "latest_full_per_goal"
+MANAGER_EVIDENCE_WINDOW_SCHEMA = "manager_evidence_window_v0"
+MANAGER_EVIDENCE_MAX_WINDOW_DAYS = 30
+# The window is an explicit operator decision, not a discovered fact: a wider
+# window is a deliberate trade of prompt size for reach, so it is selected,
+# bounded, and declared with its source instead of following an environment
+# fact the operator never chose.
+MANAGER_EVIDENCE_WINDOW_ENV_VAR = "LOOPX_MANAGER_EVIDENCE_WINDOW_DAYS"
+MANAGER_EVIDENCE_WINDOW_SOURCE_PRODUCT_DEFAULT = "product_default"
+MANAGER_EVIDENCE_WINDOW_SOURCE_EXPLICIT_CONFIG = "explicit_config"
+MANAGER_EVIDENCE_WINDOW_SOURCE_EXPLICIT_ARGUMENT = "explicit_argument"
+MANAGER_EVIDENCE_WINDOW_REASON_INVALID_EXPLICIT = "explicit_window_out_of_bounds"
+# How the declared sources reach the model: an interactive endpoint reads them
+# on demand through the read tool, a prompt-only segment can only receive them.
+MANAGER_REMOTE_READ_INLINE = "inline_in_prompt"
+MANAGER_REMOTE_READ_ON_DEMAND = "on_demand_tool"
+# A declared source that contributed nothing to the window is a coverage fact,
+# not a quiet "no progress" reading. Every declared source therefore carries a
+# typed health row with the same four fields the read refusals already use
+# (source id, typed reason, coverage effect, next action) so the answer can cite
+# a row instead of narrating staleness as a disclaimer. The vocabulary is a
+# closed set: a source is either read in this window, declared but not read, or
+# impossible to reach because its configured alias is missing.
+MANAGER_SOURCE_FRESHNESS_VALUES = ("current", "stale", "unknown")
+MANAGER_SOURCE_READ_FRESHNESS = "current"
+MANAGER_SOURCE_UNREAD_FRESHNESS = "stale"
+MANAGER_SOURCE_UNKNOWN_FRESHNESS = "unknown"
+MANAGER_SOURCE_NOT_READ_REASON = "declared_source_not_read_this_turn"
+MANAGER_SOURCE_NOT_READ_NEXT_ACTION = (
+    "Read this source with the manager evidence read tool, or let the next "
+    "Turn's source rotation dial it."
+)
+MANAGER_SOURCE_UNCONFIGURED_NEXT_ACTION = (
+    "Register an existing SSH alias for this host and retry."
+)
+MANAGER_LOCAL_SOURCE_NOT_READ_REASON = "local_evidence_not_read_this_turn"
+MANAGER_LOCAL_SOURCE_NOT_READ_NEXT_ACTION = (
+    "Collect this window with details enabled, or narrow the evidence window."
+)
+MANAGER_SOURCE_COVERAGE_EFFECT = (
+    "no evidence was read from this source; the answer must not present it as "
+    "no progress"
+)
+
+
+def resolve_evidence_window_days(environ=None) -> tuple[int, str, str]:
+    """Return the selected window, its source and a typed rejection reason.
+
+    An explicit in-bounds value selects the window. A missing value keeps the
+    shipped default, and an out-of-bounds or unreadable explicit value keeps the
+    shipped default too while naming the reason, so a bad setting can never
+    widen the prompt or silently answer a narrower question than declared.
+    """
+
+    values = os.environ if environ is None else environ
+    raw = str(values.get(MANAGER_EVIDENCE_WINDOW_ENV_VAR, "") or "").strip()
+    if not raw:
+        return (
+            MANAGER_EVIDENCE_WINDOW_DAYS,
+            MANAGER_EVIDENCE_WINDOW_SOURCE_PRODUCT_DEFAULT,
+            "",
+        )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = None
+    if value is None or not 1 <= value <= MANAGER_EVIDENCE_MAX_WINDOW_DAYS:
+        return (
+            MANAGER_EVIDENCE_WINDOW_DAYS,
+            MANAGER_EVIDENCE_WINDOW_SOURCE_PRODUCT_DEFAULT,
+            MANAGER_EVIDENCE_WINDOW_REASON_INVALID_EXPLICIT,
+        )
+    return (
+        value,
+        MANAGER_EVIDENCE_WINDOW_SOURCE_EXPLICIT_CONFIG,
+        "",
+    )
+
+
+def _declared_sources(
+    runtime_root, channel_id, owner_scope, config_path=None
+) -> list[dict[str, Any]]:
+    """Declare the evidence sources; declaring a source never reads it.
+
+    The declaration reads the same SSH config the Turn-time source read uses,
+    so one packet cannot declare a host unconfigured and read it in the same
+    Turn.
+    """
+    local = [{"source_id": "local", "source_host": "local", "status": "available"}]
+    try:
+        from .capabilities.manager_context.ssh_evidence import sources
+
+        declared = sources(runtime_root, channel_id, owner_scope, config_path)
+    except (OSError, ValueError, TypeError, RuntimeError, ImportError):
+        return local
+    return declared or local
+
+
+def _source_health_rows(
+    sources: list[dict[str, Any]], *, read_status: str
+) -> list[dict[str, Any]]:
+    """Type what each declared source contributed to this window.
+
+    A source that was declared but read nothing is a coverage fact the answer
+    must name, never evidence that a Goal made no progress. Every row reuses the
+    declaration's own status vocabulary and adds freshness, the typed reason,
+    the coverage effect and the next action, so the packet carries the same four
+    fields the read refusals already use.
+    """
+
+    rows: list[dict[str, Any]] = []
+    for source in sources:
+        source_id = str(source.get("source_id") or "")
+        status = str(source.get("status") or "unknown")
+        read = status == "available" and read_status in {"read", "partial"}
+        if read:
+            freshness = MANAGER_SOURCE_READ_FRESHNESS
+            reason = None
+            coverage_effect = None
+            next_action = None
+        elif status == "available":
+            # Reachable but unread in this window: it cannot support a
+            # progress claim, and the answer has to say so with a row.
+            freshness = MANAGER_SOURCE_UNKNOWN_FRESHNESS
+            reason = MANAGER_LOCAL_SOURCE_NOT_READ_REASON
+            coverage_effect = MANAGER_SOURCE_COVERAGE_EFFECT
+            next_action = MANAGER_LOCAL_SOURCE_NOT_READ_NEXT_ACTION
+        elif status == "not_read":
+            freshness = MANAGER_SOURCE_UNREAD_FRESHNESS
+            reason = MANAGER_SOURCE_NOT_READ_REASON
+            coverage_effect = MANAGER_SOURCE_COVERAGE_EFFECT
+            next_action = MANAGER_SOURCE_NOT_READ_NEXT_ACTION
+        else:
+            # not_configured, and any future non-available declaration: the
+            # source cannot be read at all, which is drift the answer names.
+            freshness = MANAGER_SOURCE_UNKNOWN_FRESHNESS
+            reason = str(source.get("reason") or f"source_status_{status}")
+            coverage_effect = MANAGER_SOURCE_COVERAGE_EFFECT
+            next_action = (
+                MANAGER_SOURCE_UNCONFIGURED_NEXT_ACTION
+                if status == "not_configured"
+                else MANAGER_SOURCE_NOT_READ_NEXT_ACTION
+            )
+        rows.append(
+            {
+                "source_id": source_id,
+                "source_host": source.get("source_host"),
+                "status": status,
+                "freshness": freshness,
+                "reason": reason,
+                "coverage_effect": coverage_effect,
+                "next_action": next_action,
+            }
+        )
+    return rows
+
+
+def _bounded_receipts(history: dict[str, Any]) -> dict[str, Any]:
+    """Keep each Goal's newest receipt whole and compact the older ones."""
+    deliveries = history.get("deliveries")
+    if history.get("status") != "read" or not isinstance(deliveries, list):
+        return history
+    bounded = []
+    for index, row in enumerate(deliveries):
+        if not isinstance(row, dict):
+            continue
+        if index == 0:
+            bounded.append({**row, "receipt_detail": "full"})
+            continue
+        details = row.get("recorded_details")
+        details = details if isinstance(details, dict) else {}
+        bounded.append(
+            {
+                "recorded_at": row.get("recorded_at"),
+                "goal_id": row.get("goal_id"),
+                "agent_id": row.get("agent_id"),
+                "todo_id": row.get("todo_id"),
+                "classification": row.get("classification"),
+                "reported_follow_up": row.get("reported_follow_up"),
+                "outcome": row.get("outcome"),
+                "verification": row.get("verification"),
+                "result_class": details.get("result_class"),
+                "probe_kind": details.get("probe_kind"),
+                "surface_id": details.get("surface_id"),
+                "evidence_count": row.get("evidence_count"),
+                "receipt_detail": "compact",
+            }
+        )
+    return {**history, "deliveries": bounded}
+
+
+def _evidence_window(
+    rows: list[dict[str, Any]],
+    runtime_root,
+    session: dict[str, Any],
+    owner_scope: bool,
+    days: int,
+    include_details: bool,
+    *,
+    days_source: str = MANAGER_EVIDENCE_WINDOW_SOURCE_PRODUCT_DEFAULT,
+    days_reason: str = "",
+    remote_read: str = MANAGER_REMOTE_READ_ON_DEMAND,
+    config_path=None,
+    local_only: bool = False,
+) -> dict[str, Any]:
+    """Declare exactly what the per-turn evidence read covered."""
+    matched_by_day: dict[str, int] = {}
+    matched = included = omitted = invalid = 0
+    full = compact = 0
+    window_start = window_end = observed_at = None
+    limitations: list[str] = []
+    statuses: set[str] = set()
+    for row in rows:
+        history = row.get("recent_delivery_history") or {}
+        if history.get("status"):
+            statuses.add(str(history["status"]))
+        coverage = history.get("coverage") or {}
+        for day, count in (coverage.get("matched_by_day") or {}).items():
+            matched_by_day[str(day)] = matched_by_day.get(str(day), 0) + int(count or 0)
+        matched += int(coverage.get("matched") or 0)
+        included += int(coverage.get("included") or 0)
+        omitted += int(coverage.get("omitted") or 0)
+        invalid += int(coverage.get("invalid_delivery_records") or 0)
+        window_start = window_start or history.get("window_start")
+        window_end = window_end or history.get("window_end")
+        observed_at = observed_at or history.get("observed_at")
+        for delivery in history.get("deliveries") or []:
+            if delivery.get("receipt_detail") == "full":
+                full += 1
+            elif delivery.get("receipt_detail") == "compact":
+                compact += 1
+        for limitation in history.get("limitations") or []:
+            if limitation not in limitations:
+                limitations.append(str(limitation))
+    if window_start is None or window_end is None:
+        now = datetime.now().astimezone()
+        start = (now - timedelta(days=days)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        window_start, window_end = start.isoformat(), now.isoformat()
+    if not include_details:
+        read_status = "not_read"
+    elif "read" in statuses and statuses - {"read"}:
+        read_status = "partial"
+    elif "read" in statuses:
+        read_status = "read"
+    elif statuses:
+        read_status = "unavailable"
+    else:
+        read_status = "not_read"
+    sources = [{"source_id": "local", "source_host": "local", "status": "available"}] if local_only else _declared_sources(
+        runtime_root,
+        str(session.get("channel_id") or "manager"),
+        owner_scope,
+        config_path,
+    )
+    return {
+        "schema_version": MANAGER_EVIDENCE_WINDOW_SCHEMA,
+        "days": days,
+        "days_source": days_source,
+        "days_default": MANAGER_EVIDENCE_WINDOW_DAYS,
+        "days_env_var": MANAGER_EVIDENCE_WINDOW_ENV_VAR,
+        "days_reason": days_reason,
+        "days_bounds": {
+            "min": 1,
+            "max": MANAGER_EVIDENCE_MAX_WINDOW_DAYS,
+        },
+        "window_start": window_start,
+        "window_end": window_end,
+        "observed_at": observed_at or datetime.now(timezone.utc).isoformat(),
+        "applies_to": "recent_delivery_history",
+        "remote_read": remote_read,
+        "read_status": read_status,
+        "per_day_limit": MANAGER_EVIDENCE_PER_DAY_LIMIT,
+        "total_limit": MANAGER_EVIDENCE_TOTAL_LIMIT,
+        "receipt_detail_policy": MANAGER_RECEIPT_DETAIL_POLICY,
+        "receipts_by_detail": {"full": full, "compact": compact},
+        "matched": matched,
+        "included": included,
+        "omitted": omitted,
+        "matched_by_day": matched_by_day,
+        "invalid_delivery_records": invalid,
+        "sources": sources,
+        # Every declared source reports its own health, so an unread or
+        # unreachable source is a typed row rather than a staleness caveat the
+        # answer has to narrate.
+        "source_health": _source_health_rows(sources, read_status=read_status),
+        "declared_unread_sources": [
+            str(source.get("source_id"))
+            for source in sources
+            if source.get("status") != "available"
+        ],
+        "limitations": limitations,
+    }
+
+
+def _remote_evidence(
+    runtime_root: Path,
+    session: dict[str, Any],
+    owner_scope: bool,
+    window_days: int,
+    *,
+    runner=None,
+    scope_valid: Callable[[], bool] | None = None,
+    config_path=None,
+) -> dict[str, Any]:
+    """Read the declared sources inside one Turn budget; never fail the Turn."""
+
+    from .capabilities.manager_context.ssh_evidence import (
+        MANAGER_REMOTE_EVIDENCE_SCHEMA,
+        remote_evidence,
+    )
+
+    kwargs: dict[str, Any] = {}
+    if runner is not None:
+        kwargs["runner"] = runner
+    if config_path is not None:
+        kwargs["config_path"] = config_path
+    try:
+        return remote_evidence(
+            runtime_root,
+            str(session.get("channel_id") or "manager"),
+            owner_scope,
+            window_days=window_days,
+            scope_valid=scope_valid or (lambda: True),
+            **kwargs,
+        )
+    except (OSError, ValueError, TypeError, RuntimeError, ImportError):
+        # A failed source read is a declared coverage gap, never a Turn failure
+        # and never evidence that a remote Goal made no progress.
+        return {
+            "schema_version": MANAGER_REMOTE_EVIDENCE_SCHEMA,
+            "applies_to": "declared_ssh_sources",
+            "window_days": window_days,
+            "read_status": "unavailable",
+            "sources": [],
+            "rows": [],
+            "stale_rows_included": False,
+            "limitations": ["remote_source_read_failed"],
+        }
+
+
+def manager_authorization_scope_id(
+    goal_refs: list[str | Mapping[str, Any]], *, runtime_root=None, channel_id=None
+) -> str:
+    """Opaque identity for the exact external Goal evidence scope."""
+    normalized: dict[tuple[str, str, str], str | dict[str, str]] = {}
+    for value in goal_refs:
+        if isinstance(value, Mapping):
+            goal_id = str(value.get("goal_id") or "")
+            if value.get("goal_instance_id") is not None:
+                identity = exact_goal_ref(
+                    goal_id,
+                    str(value.get("goal_instance_id") or ""),
+                )
+                key = (goal_id, "goal_instance_id", identity["goal_instance_id"])
+            else:
+                operation_id = str(value.get("creation_operation_id") or "").strip()
+                if not goal_id or not operation_id:
+                    raise ValueError("manager Goal identity is incomplete")
+                identity = {
+                    "goal_id": goal_id,
+                    "creation_operation_id": operation_id,
+                }
+                key = (goal_id, "creation_operation_id", operation_id)
+            normalized[key] = identity
+        else:
+            goal_id = str(value)
+            normalized[(goal_id, "legacy", "")] = goal_id
+    encoded_scope = [
+        normalized[key]
+        for key in sorted(normalized)
+    ]
+    if runtime_root is not None and channel_id:
+        from .capabilities.manager_context.ssh_evidence import grants
+        remote = grants(runtime_root, channel_id)
+        if remote:
+            encoded_scope.append("ssh_evidence:" + json.dumps(remote, sort_keys=True))
+    return hashlib.sha256(
+        json.dumps(encoded_scope, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+
+
+def manager_authorization_scope_id_for_registry(
+    registry_path: Path,
+    goal_ids: list[str],
+    *,
+    runtime_root=None,
+    channel_id=None,
+    expected_inventory_revision: str | None = None,
+    expected_inventory_semantic_revision: str | None = None,
+) -> str | None:
+    """Bind authorized aliases to the current canonical Goal instances."""
+
+    try:
+        raw = registry_path.read_bytes()
+        revision = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if (
+            expected_inventory_revision is not None
+            and revision != expected_inventory_revision
+        ):
+            return None
+        if (
+            expected_inventory_semantic_revision is not None
+            and registry_semantic_revision(registry_path, raw)
+            != expected_inventory_semantic_revision
+        ):
+            return None
+        registry = decode_registry_snapshot(registry_path, raw)
+        goals = registry.get("goals")
+        if not isinstance(goals, list):
+            return None
+        refs: list[str | dict[str, str]] = []
+        for goal_id in sorted(set(goal_ids)):
+            matches = [
+                goal
+                for goal in goals
+                if isinstance(goal, dict) and goal.get("id") == goal_id
+            ]
+            if len(matches) != 1:
+                return None
+            instance_id = matches[0].get("goal_instance_id")
+            if instance_id is not None:
+                refs.append(exact_goal_ref(goal_id, str(instance_id)))
+                continue
+            creation_operation_id = str(
+                matches[0].get("creation_operation_id") or ""
+            ).strip()
+            if creation_operation_id:
+                refs.append(
+                    {
+                        "goal_id": goal_id,
+                        "creation_operation_id": creation_operation_id,
+                    }
+                )
+            elif registry.get("profile_id") == SOURCE_SESSION_PROFILE_ID:
+                return None
+            else:
+                refs.append(goal_id)
+        return manager_authorization_scope_id(
+            refs,
+            runtime_root=runtime_root,
+            channel_id=channel_id,
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def manager_authorization_scope_is_current(
+    registry_path: Path | None,
+    scope_resolver: Callable[[dict[str, Any]], Any] | None,
+    session: dict[str, Any],
+    expected_scope_id: Any,
+    *,
+    runtime_root: Path,
+) -> bool:
+    """Re-resolve an external audience against the current Goal instances."""
+
+    if (
+        registry_path is None
+        or scope_resolver is None
+        or not isinstance(expected_scope_id, str)
+    ):
+        return False
+    try:
+        current = scope_resolver(session)
+    except (OSError, ValueError, KeyError, TypeError):
+        # Losing the source or its audience proof holds the existing scope.
+        return False
+    return (
+        isinstance(current, list)
+        and manager_authorization_scope_id_for_registry(
+            registry_path,
+            current,
+            runtime_root=runtime_root,
+            channel_id=session.get("channel_id"),
+        )
+        == expected_scope_id
+    )
+
+
+def _is_steward_background_carrier(session: Mapping[str, Any]) -> bool:
+    bg_ctx = session.get("steward_background_context")
+    if (
+        session.get("goal_id") == "loopx-manager"
+        and session.get("steward_context") is None
+        and session.get("project_context") is None
+        and isinstance(bg_ctx, Mapping)
+    ):
+        binding_id = str(bg_ctx.get("binding_id") or "")
+        return (
+            bool(binding_id)
+            and session.get("session_id") == f"steward.background.{binding_id}"
+            and session.get("channel_id") == f"manager.external.steward.background.{binding_id}"
+        )
+    return False
+
+
+def _is_bound_steward_session(
+    session: Mapping[str, Any], conversation: Mapping[str, Any],
+) -> bool:
+    return conversation.get("bound_steward") is True or _is_steward_background_carrier(session)
+
+
+def manager_turn_context(
+    registry_path: Path | None,
+    session: dict[str, Any],
+    runtime_root: Path,
+    *,
+    authorized_goal_ids: list[str] | None = None,
+    requested_goal_ids: list[str] | None = None,
+    include_stopped: bool = False,
+    include_details: bool = True,
+    read_goal_status: bool = True,
+    evidence_window_days: int | None = None,
+    remote_evidence: bool = False,
+    remote_runner=None,
+    remote_scope_valid: Callable[[], bool] | None = None,
+    remote_config_path=None,
+    ignore_sync_timestamp_churn: bool = False,
+) -> dict[str, Any]:
+    conversation = conversation_scope(session)
+    local_goal = conversation["kind"] == "owner_goal"
+    include_details = include_details and read_goal_status
+    if evidence_window_days is None:
+        evidence_window_days, days_source, days_reason = resolve_evidence_window_days()
+    elif (
+        type(evidence_window_days) is int
+        and 1 <= evidence_window_days <= MANAGER_EVIDENCE_MAX_WINDOW_DAYS
+    ):
+        days_source, days_reason = (
+            MANAGER_EVIDENCE_WINDOW_SOURCE_EXPLICIT_ARGUMENT,
+            "",
+        )
+    else:
+        raise ValueError(
+            f"evidence_window_days must be 1..{MANAGER_EVIDENCE_MAX_WINDOW_DAYS}"
+        )
+    window_kwargs = {
+        "local_only": local_goal,
+        "days_source": days_source,
+        "days_reason": days_reason,
+        "remote_read": (
+            MANAGER_REMOTE_READ_INLINE if remote_evidence else MANAGER_REMOTE_READ_ON_DEMAND
+        ),
+        # One SSH config path for the whole packet: the declaration and the
+        # source read must not disagree about which hosts exist.
+        "config_path": remote_config_path,
+    }
+    owner_scope = conversation["private_conversation"]
+    scope = conversation["goal_ids"] if owner_scope else authorized_goal_ids
+    bound_steward_carrier = _is_bound_steward_session(session, conversation)
+    if not owner_scope and not scope and not (bound_steward_carrier and scope == []):
+        return unavailable_manager_context(
+            "external_authorization_unavailable",
+            evidence_window=_evidence_window(
+                [],
+                runtime_root,
+                session,
+                owner_scope,
+                evidence_window_days,
+                False,
+                **window_kwargs,
+            ),
+        )
+    if registry_path is None:
+        return unavailable_manager_context(
+            "registry_unavailable",
+            evidence_window=_evidence_window(
+                [],
+                runtime_root,
+                session,
+                owner_scope,
+                evidence_window_days,
+                False,
+                **window_kwargs,
+            ),
+        )
+    if requested_goal_ids is not None and scope is not None and not set(requested_goal_ids).issubset(scope):
+        raise ValueError("requested Goals exceed the current evidence grant")
+    portfolio = build_goal_portfolio(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        goal_ids=requested_goal_ids if requested_goal_ids is not None else scope,
+        limit=128,
+        include_stopped=include_stopped,
+        # The steward's answer order names the Goal's milestones and baseline,
+        # so the lifecycle projection the status collector already derived
+        # travels with the row instead of being reconstructed from todos.
+        include_goal_lifecycle=True,
+        include_goal_attention=True,
+        include_goal_instance_id=True,
+        read_status=read_goal_status,
+        ignore_sync_timestamp_churn=ignore_sync_timestamp_churn,
+    )
+    labels: dict[str, str] = {}
+    try:
+        raw = registry_path.read_bytes()
+        expected_semantic = portfolio.get("inventory_semantic_revision")
+        revision_matches = (
+            registry_semantic_revision(registry_path, raw) == expected_semantic
+            if ignore_sync_timestamp_churn and isinstance(expected_semantic, str)
+            else portfolio.get("inventory_revision")
+            == "sha256:" + hashlib.sha256(raw).hexdigest()
+        )
+        if revision_matches:
+            for goal in decode_registry_snapshot(registry_path, raw).get("goals", []):
+                if isinstance(goal, dict) and (
+                    scope is None or goal.get("id") in scope
+                ):
+                    labels[str(goal.get("id"))] = redact_local_paths(
+                        str(
+                            goal.get("display_name")
+                            or goal.get("domain")
+                            or goal.get("id")
+                            or ""
+                        ),
+                        protected_paths=[Path(str(goal.get("repo") or "."))],
+                    )[:100]
+    except (OSError, ValueError, TypeError):
+        pass
+    rows = []
+    for row in portfolio.get("goals", []):
+        read_details = include_details and row.get("activation_state") != "stopped"
+        history = (
+            _bounded_receipts(
+                read_manager_delivery_history(
+                    runtime_root,
+                    row["goal_id"],
+                    lookback_days=evidence_window_days,
+                    limit=MANAGER_EVIDENCE_PER_DAY_LIMIT,
+                    total_limit=MANAGER_EVIDENCE_TOTAL_LIMIT,
+                )
+            )
+            if read_details
+            else {"status": "not_read", "deliveries": []}
+        )
+        rows.append(
+            {
+                "goal_id": row["goal_id"],
+                **(
+                    {"goal_instance_id": row["goal_instance_id"]}
+                    if row.get("goal_instance_id")
+                    else {}
+                ),
+                "activation_state": row.get("activation_state", "unknown"),
+                "host_id": row.get("host_id"),
+                "project_id": row.get("project_id"),
+                "agent_coverage": row.get("agent_coverage"),
+                "description": labels.get(row["goal_id"]),
+                "quality": row.get("quality"),
+                "attention": row.get("attention") or {
+                    "status": "unavailable", "items": [], "reason": "goal_not_read",
+                },
+                "progress": row.get("progress", "unknown"),
+                "source": row.get("source"),
+                "warnings": row.get("warnings", []),
+                # Present for every row this turn's portfolio attempted; the
+                # portfolio already substitutes a typed gap for a Goal it could
+                # not read, and this floor keeps a future portfolio path from
+                # turning that contract back into a silent null.
+                "goal_lifecycle": row.get("goal_lifecycle")
+                or lifecycle_readback_unavailable(
+                    row["goal_id"], "portfolio_row_missing_lifecycle"
+                ),
+                "agents": [
+                    agent_work_summary(a)
+                    for a in row.get("agents", [])
+                ],
+                "deliveries": row.get("deliveries", []),
+                "recent_delivery_history": history,
+                "current_todos": read_manager_goal_details(
+                    registry_path, runtime_root, row["goal_id"], owner_scope=owner_scope,
+                    completed_todo_ids={r["todo_id"] for r in history["deliveries"]},
+                ) if read_details else {"status": "not_read", "todos": []},
+            }
+        )
+    rows = effect_runtime_result("presentation.goal_attention.bound", {"goals": rows})["goals"]
+    result = {
+        "schema_version": "manager_turn_context_v1",
+        "scope": "owner_goal" if local_goal else "owner_global" if owner_scope else "external_goal_scope",
+        **({} if local_goal else {"model_defaults": manager_model_config(
+            machine_defaults=load_effective_steward_executor_defaults(runtime_root)
+        )}),
+        "snapshot_id": portfolio.get("snapshot_id"),
+        "collected_at": portfolio.get("collected_at"),
+        "collection_completed_at": portfolio.get("collection_completed_at"),
+        "coverage": portfolio.get("coverage"),
+        "goals": rows,
+        "warnings": portfolio.get("warnings", []),
+        "limitations": portfolio.get("limitations", []),
+        "evidence_window": _evidence_window(
+            rows,
+            runtime_root,
+            session,
+            owner_scope,
+            evidence_window_days,
+            include_details,
+            **window_kwargs,
+        ),
+    }
+    if remote_evidence and not local_goal:
+        result["remote_evidence"] = _remote_evidence(
+            runtime_root,
+            session,
+            owner_scope,
+            evidence_window_days,
+            runner=remote_runner,
+            scope_valid=remote_scope_valid,
+            config_path=remote_config_path,
+        )
+    result["portfolio_snapshot_id"] = result["snapshot_id"]
+    result["collection_completed_at"] = datetime.now(timezone.utc).isoformat()
+    result["snapshot_id"] = "sha256:" + hashlib.sha256(
+        json.dumps(result, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+    if not owner_scope:
+        if ignore_sync_timestamp_churn:
+            expected_semantic = portfolio.get("inventory_semantic_revision")
+            scope_id = (
+                manager_authorization_scope_id_for_registry(
+                    registry_path,
+                    scope or [],
+                    runtime_root=runtime_root,
+                    channel_id=session.get("channel_id"),
+                    expected_inventory_semantic_revision=expected_semantic,
+                )
+                if isinstance(expected_semantic, str)
+                else None
+            )
+        else:
+            expected_revision = portfolio.get("inventory_revision")
+            scope_id = (
+                manager_authorization_scope_id_for_registry(
+                    registry_path,
+                    scope or [],
+                    runtime_root=runtime_root,
+                    channel_id=session.get("channel_id"),
+                    expected_inventory_revision=expected_revision,
+                )
+                if isinstance(expected_revision, str)
+                else None
+            )
+        if scope_id is None:
+            return unavailable_manager_context("external_authorization_changed")
+        result["authorization_scope_id"] = scope_id
+    if conversation.get("bound_steward") is True:
+        result["bound_steward"] = {"authorized": True, "goal_count": len(scope or []), "empty": scope == []}
+    return result
+
+
+def unavailable_manager_context(
+    reason: str, *, evidence_window: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    return {
+        "schema_version": "manager_turn_context_v1",
+        "coverage": {"discovered": None, "verified": 0, "complete": False},
+        "goals": [],
+        "warnings": [reason],
+        **({"evidence_window": evidence_window} if evidence_window else {}),
+    }
+
+
+def collect_manager_turn_context(
+    registry_path: Path | None,
+    session: dict[str, Any],
+    runtime_root: Path,
+    scope_resolver: Callable[[dict[str, Any]], list[str] | None] | None = None,
+    *,
+    include_details: bool = True,
+    include_stopped: bool = False,
+    read_goal_status: bool = True,
+    remote_evidence: bool = False,
+    remote_runner=None,
+) -> dict[str, Any]:
+    conv = conversation_scope(session)
+    if conv["private_conversation"]:
+        scope_kind = str(conv["kind"])
+        private_goals = list(conv["goal_ids"]) if isinstance(conv["goal_ids"], list) else None
+        cache_enabled = is_manager_turn_context_cache_enabled(
+            registry_path=registry_path,
+            session=session,
+            runtime_root=runtime_root,
+            scope_kind=scope_kind,
+            owner_scope=True,
+            include_details=include_details,
+            include_stopped=include_stopped,
+            read_goal_status=read_goal_status,
+            remote_evidence=remote_evidence,
+            remote_runner=remote_runner,
+        )
+        before_fp = (
+            compute_manager_turn_context_fingerprint(
+                registry_path=registry_path,
+                session=session,
+                runtime_root=runtime_root,
+                scope_kind=scope_kind,
+                authorized_goal_ids=private_goals,
+                bound_steward=False,
+                include_details=include_details,
+                include_stopped=include_stopped,
+                read_goal_status=read_goal_status,
+                remote_evidence=remote_evidence,
+            )
+            if cache_enabled
+            else None
+        )
+        if before_fp is not None:
+            cached = get_cached_manager_turn_context(before_fp)
+            if cached is not None:
+                return cached
+        context = manager_turn_context(
+            registry_path,
+            session,
+            runtime_root,
+            include_details=include_details,
+            include_stopped=include_stopped,
+            read_goal_status=read_goal_status,
+            remote_evidence=remote_evidence,
+            remote_runner=remote_runner,
+        )
+        if cache_enabled and before_fp is not None:
+            after_fp = compute_manager_turn_context_fingerprint(
+                registry_path=registry_path,
+                session=session,
+                runtime_root=runtime_root,
+                scope_kind=scope_kind,
+                authorized_goal_ids=private_goals,
+                bound_steward=False,
+                include_details=include_details,
+                include_stopped=include_stopped,
+                read_goal_status=read_goal_status,
+                remote_evidence=remote_evidence,
+            )
+            if after_fp == before_fp:
+                put_cached_manager_turn_context(before_fp, context)
+        return context
+
+    def resolve() -> list[str] | None:
+        try:
+            scope = scope_resolver(session) if scope_resolver else None
+            if (
+                scope is None
+                and scope_resolver is not None
+                and _is_steward_background_carrier(session)
+            ):
+                bg_ctx = session["steward_background_context"]
+                binding_id = str(bg_ctx.get("binding_id") or "")
+                source_ref = str(bg_ctx.get("source_ref") or "")
+                if binding_id and source_ref:
+                    scope = scope_resolver(
+                        {
+                            **session,
+                            "steward_context": bg_ctx,
+                            "channel_id": f"manager.external.native.{binding_id}.{source_ref}",
+                        }
+                    )
+            if not isinstance(scope, list) or any(
+                not isinstance(g, str) for g in scope
+            ):
+                return None
+            return sorted(set(scope))
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            return None
+
+    before = resolve()
+    before_scope_id = (
+        manager_authorization_scope_id_for_registry(
+            registry_path,
+            before,
+            runtime_root=runtime_root,
+            channel_id=session.get("channel_id"),
+        )
+        if registry_path is not None and before is not None
+        else None
+    )
+
+    def scope_unchanged() -> bool:
+        current = resolve()
+        if before != current:
+            return False
+        if before_scope_id is None:
+            return registry_path is None
+        return (
+            registry_path is not None
+            and current is not None
+            and before_scope_id
+            == manager_authorization_scope_id_for_registry(
+                registry_path,
+                current,
+                runtime_root=runtime_root,
+                channel_id=session.get("channel_id"),
+            )
+        )
+
+    from .capabilities.manager_context.ssh_evidence import grants
+
+    inline_remote = bool(
+        remote_evidence
+        and grants(runtime_root, str(session.get("channel_id") or ""))
+    )
+    bound_steward = _is_bound_steward_session(session, conv)
+    scope_kind = str(conv["kind"])
+    cache_enabled = is_manager_turn_context_cache_enabled(
+        registry_path=registry_path,
+        session=session,
+        runtime_root=runtime_root,
+        scope_kind=scope_kind,
+        owner_scope=False,
+        include_details=include_details,
+        include_stopped=include_stopped,
+        read_goal_status=read_goal_status,
+        remote_evidence=remote_evidence,
+        remote_runner=remote_runner,
+    )
+    if (
+        cache_enabled
+        and before is not None
+        and (bool(before) or bound_steward)
+        and before_scope_id is not None
+    ):
+        before_fp = compute_manager_turn_context_fingerprint(
+            registry_path=registry_path,
+            session=session,
+            runtime_root=runtime_root,
+            scope_kind=scope_kind,
+            authorized_goal_ids=before,
+            bound_steward=bound_steward,
+            include_details=include_details,
+            include_stopped=include_stopped,
+            read_goal_status=read_goal_status,
+            remote_evidence=remote_evidence,
+        )
+        if before_fp is not None:
+            cached = get_cached_manager_turn_context(before_fp)
+            if cached is not None and cached.get("authorization_scope_id") == before_scope_id:
+                return cached
+
+    attempt_fp: str | None = None
+    for attempt in range(2):
+        attempt_fp = (
+            compute_manager_turn_context_fingerprint(
+                registry_path=registry_path,
+                session=session,
+                runtime_root=runtime_root,
+                scope_kind=scope_kind,
+                authorized_goal_ids=before,
+                bound_steward=bound_steward,
+                include_details=include_details,
+                include_stopped=include_stopped,
+                read_goal_status=read_goal_status,
+                remote_evidence=remote_evidence,
+            )
+            if cache_enabled and before is not None and (bool(before) or bound_steward)
+            else None
+        )
+        kwargs: dict[str, Any] = {
+            "authorized_goal_ids": before,
+            "include_details": include_details,
+            "include_stopped": include_stopped,
+            "read_goal_status": read_goal_status,
+            "remote_evidence": remote_evidence,
+            "remote_runner": remote_runner,
+            # Source reads and the Turn owner check the same exact authority.
+            "remote_scope_valid": scope_unchanged,
+        }
+        if attempt > 0 and bound_steward and not inline_remote:
+            kwargs["ignore_sync_timestamp_churn"] = True
+        context = manager_turn_context(
+            registry_path,
+            session,
+            runtime_root,
+            **kwargs,
+        )
+        after = resolve()
+        after_scope_id = (
+            manager_authorization_scope_id_for_registry(
+                registry_path,
+                after,
+                runtime_root=runtime_root,
+                channel_id=session.get("channel_id"),
+            )
+            if registry_path is not None and after is not None
+            else None
+        )
+        if before != after or before_scope_id != after_scope_id:
+            if (
+                attempt == 0
+                and not inline_remote
+                and bound_steward
+                and registry_path is not None
+                and before is not None
+                and after is not None
+                and after_scope_id is not None
+                and set(before).issubset(set(after))
+                and manager_authorization_scope_id_for_registry(
+                    registry_path,
+                    before,
+                    runtime_root=runtime_root,
+                    channel_id=session.get("channel_id"),
+                )
+                == before_scope_id
+            ):
+                before, before_scope_id = after, after_scope_id
+                continue
+            return unavailable_manager_context("external_authorization_changed")
+        # Recollect local, on-demand context once under the original scope.
+        # Inline remote collection owns one dial/Turn budget, including failed
+        # reads; recollecting it would restart that budget.
+        if (attempt == 0 and not inline_remote and before_scope_id is not None
+                and context.get("warnings") == ["external_authorization_changed"]):
+            continue
+        break
+    if cache_enabled and attempt_fp is not None:
+        post_fp = compute_manager_turn_context_fingerprint(
+            registry_path=registry_path,
+            session=session,
+            runtime_root=runtime_root,
+            scope_kind=scope_kind,
+            authorized_goal_ids=before,
+            bound_steward=bound_steward,
+            include_details=include_details,
+            include_stopped=include_stopped,
+            read_goal_status=read_goal_status,
+            remote_evidence=remote_evidence,
+        )
+        if post_fp == attempt_fp:
+            put_cached_manager_turn_context(attempt_fp, context)
+    return context

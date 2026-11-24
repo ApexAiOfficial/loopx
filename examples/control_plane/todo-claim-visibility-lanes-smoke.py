@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -14,14 +15,12 @@ if str(REPO_ROOT) not in sys.path:
 from loopx.control_plane.agents.capability_gate import (  # noqa: E402
     _agent_lane_candidate_sort_key,
 )
-from loopx.control_plane.todos.claim_visibility import (  # noqa: E402
-    TODO_AGENT_CLAIM_SCOPE_SCHEMA_VERSION,
-    build_agent_claim_scoped_open_items,
-    build_todo_claim_visibility_lanes,
-)
+from loopx.control_plane.todos.quota_selection import project_quota_planning  # noqa: E402
 from loopx.control_plane.todos.contract import parse_todo_metadata_line  # noqa: E402
 from loopx.quota import build_quota_should_run  # noqa: E402
-from loopx.todos import apply_todo_update_to_lines  # noqa: E402
+from loopx.control_plane.testing.canary_harness import (  # noqa: E402
+    import_fixture_authority, run_json_cli, run_json_cli_result, write_fixture_registry,
+)
 from work_lane_contract_fixtures import GOAL_ID, status_payload  # noqa: E402
 
 
@@ -90,21 +89,23 @@ def assert_agent_claim_scope_prefers_current_then_unclaimed() -> None:
     )
     open_items = [unclaimed_p0, other_p0, current_p2, current_p0]
 
-    selectable, claim_scope = build_agent_claim_scoped_open_items(
-        open_items,
+    planning = project_quota_planning(
+        {}, all_open_items=open_items, source_open_count=len(open_items),
         agent_identity={
             "agent_id": CURRENT_AGENT,
             "agent_model": "peer_v1",
         },
-        diagnostic_item_limit=3,
+        filter_user_gate_blocks_agent=False, available_capabilities=None,
     )
+    selectable = planning["lanes"]["open_items"]
+    claim_scope = planning["lanes"]["claim_scope"]
     assert [item["todo_id"] for item in selectable] == [
         "todo_current_p0",
         "todo_current_p2",
         "todo_unclaimed_p0",
     ], selectable
     assert claim_scope is not None, claim_scope
-    assert claim_scope["schema_version"] == TODO_AGENT_CLAIM_SCOPE_SCHEMA_VERSION
+    assert claim_scope["schema_version"] == "agent_claim_scope_v0"
     assert claim_scope["agent_id"] == CURRENT_AGENT
     assert claim_scope["agent_model"] == "peer_v1"
     assert "primary_agent" not in claim_scope
@@ -167,8 +168,8 @@ def assert_agent_profile_ranks_only_within_claim_buckets() -> None:
         "agent_model": "peer_v1",
         "agent_profile": profile,
     }
-    selectable, claim_scope = build_agent_claim_scoped_open_items(
-        [
+    planning = project_quota_planning(
+        {}, all_open_items=[
             unclaimed_avoided,
             unclaimed_neutral,
             current_avoided,
@@ -176,8 +177,10 @@ def assert_agent_profile_ranks_only_within_claim_buckets() -> None:
             current_preferred,
         ],
         agent_identity=identity,
-        diagnostic_item_limit=3,
+        source_open_count=5, filter_user_gate_blocks_agent=False, available_capabilities=None,
     )
+    selectable = planning["lanes"]["open_items"]
+    claim_scope = planning["lanes"]["claim_scope"]
     assert [item["todo_id"] for item in selectable] == [
         "todo_current_preferred",
         "todo_current_avoided",
@@ -245,11 +248,13 @@ def assert_executor_exclusion_filters_only_the_named_peer() -> None:
         task_class="advancement_task",
     )
 
-    blocked_selectable, blocked_scope = build_agent_claim_scoped_open_items(
-        [review, fallback],
+    planning = project_quota_planning(
+        {}, all_open_items=[review, fallback], source_open_count=len([review, fallback]),
         agent_identity={"agent_id": CURRENT_AGENT, "agent_model": "peer_v1"},
-        diagnostic_item_limit=3,
+        filter_user_gate_blocks_agent=False, available_capabilities=None,
     )
+    blocked_selectable = planning["lanes"]["open_items"]
+    blocked_scope = planning["lanes"]["claim_scope"]
     assert [item["todo_id"] for item in blocked_selectable] == ["todo_fallback"]
     assert blocked_scope is not None
     assert blocked_scope["executor_excluded_self_count"] == 1
@@ -260,11 +265,13 @@ def assert_executor_exclusion_filters_only_the_named_peer() -> None:
         "excluded_agents_cannot_claim_or_execute"
     )
 
-    reviewer_selectable, reviewer_scope = build_agent_claim_scoped_open_items(
-        [review, fallback],
+    planning = project_quota_planning(
+        {}, all_open_items=[review, fallback], source_open_count=len([review, fallback]),
         agent_identity={"agent_id": OTHER_AGENT, "agent_model": "peer_v1"},
-        diagnostic_item_limit=3,
+        filter_user_gate_blocks_agent=False, available_capabilities=None,
     )
+    reviewer_selectable = planning["lanes"]["open_items"]
+    reviewer_scope = planning["lanes"]["claim_scope"]
     assert [item["todo_id"] for item in reviewer_selectable] == [
         "todo_review",
         "todo_fallback",
@@ -273,11 +280,13 @@ def assert_executor_exclusion_filters_only_the_named_peer() -> None:
     assert reviewer_scope["executor_excluded_self_count"] == 0
 
     invalid_claim = dict(review, claimed_by=CURRENT_AGENT)
-    invalid_selectable, invalid_scope = build_agent_claim_scoped_open_items(
-        [invalid_claim],
+    planning = project_quota_planning(
+        {}, all_open_items=[invalid_claim], source_open_count=len([invalid_claim]),
         agent_identity={"agent_id": CURRENT_AGENT, "agent_model": "peer_v1"},
-        diagnostic_item_limit=3,
+        filter_user_gate_blocks_agent=False, available_capabilities=None,
     )
+    invalid_selectable = planning["lanes"]["open_items"]
+    invalid_scope = planning["lanes"]["claim_scope"]
     assert invalid_selectable == []
     assert invalid_scope is not None
     assert invalid_scope["executor_excluded_self_count"] == 1
@@ -363,11 +372,13 @@ def assert_legacy_review_handoff_fails_closed_until_repaired() -> None:
         item["role"] = "agent"
         item["required_capabilities"] = ["shell"]
 
-    selectable, claim_scope = build_agent_claim_scoped_open_items(
-        [legacy_review, fallback],
+    planning = project_quota_planning(
+        {}, all_open_items=[legacy_review, fallback], source_open_count=len([legacy_review, fallback]),
         agent_identity={"agent_id": CURRENT_AGENT, "agent_model": "peer_v1"},
-        diagnostic_item_limit=3,
+        filter_user_gate_blocks_agent=False, available_capabilities=None,
     )
+    selectable = planning["lanes"]["open_items"]
+    claim_scope = planning["lanes"]["claim_scope"]
     assert [item["todo_id"] for item in selectable] == ["todo_legacy_fallback"]
     assert claim_scope is not None
     assert claim_scope["removed_continuation_blocked_count"] == 1, claim_scope
@@ -393,11 +404,13 @@ def assert_legacy_review_handoff_fails_closed_until_repaired() -> None:
         item["todo_id"] for item in guard["capability_gate"]["runnable_candidates"]
     ] == ["todo_legacy_fallback"], guard
 
-    peer_selectable, peer_scope = build_agent_claim_scoped_open_items(
-        [legacy_review],
+    planning = project_quota_planning(
+        {}, all_open_items=[legacy_review], source_open_count=len([legacy_review]),
         agent_identity={"agent_id": OTHER_AGENT, "agent_model": "peer_v1"},
-        diagnostic_item_limit=3,
+        filter_user_gate_blocks_agent=False, available_capabilities=None,
     )
+    peer_selectable = planning["lanes"]["open_items"]
+    peer_scope = planning["lanes"]["claim_scope"]
     assert peer_selectable == []
     assert peer_scope is not None
     assert peer_scope["removed_continuation_blocked_count"] == 1
@@ -413,40 +426,45 @@ def assert_legacy_review_handoff_write_requires_explicit_repair() -> None:
         "continuation_policy=review_handoff -->",
     ]
 
-    for updates in (
-        {"claimed_by": CURRENT_AGENT, "claim_only": True},
-        {"note": "Keep this legacy review blocked."},
-    ):
-        lines = list(original_lines)
-        try:
-            apply_todo_update_to_lines(
-                lines,
-                todo_id="todo_legacy_write",
-                role="agent",
-                updated_at="2026-07-11T06:00:00+08:00",
-                **updates,
-            )
-        except ValueError as exc:
-            assert "repair it" in str(exc), exc
-        else:
-            raise AssertionError("legacy review writes must fail closed")
-        assert lines == original_lines
-
-    repaired_lines = list(original_lines)
-    repaired = apply_todo_update_to_lines(
-        repaired_lines,
-        todo_id="todo_legacy_write",
-        role="agent",
-        continuation_policy="independent_handoff",
-        excluded_agents=[CURRENT_AGENT],
-        updated_at="2026-07-11T06:00:00+08:00",
-    )
-    assert repaired["continuation_policy"] == "independent_handoff", repaired
-    assert repaired["excluded_agents"] == [CURRENT_AGENT], repaired
-    repaired_text = "\n".join(repaired_lines)
-    assert "continuation_policy=review_handoff" not in repaired_text
-    assert "continuation_policy=independent_handoff" in repaired_text
-    assert f"excluded_agents={CURRENT_AGENT}" in repaired_text
+    with tempfile.TemporaryDirectory(prefix="loopx-claim-repair-") as tmp:
+        root = Path(tmp).resolve()
+        state = root / "ACTIVE_GOAL_STATE.md"
+        state.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+        registry = root / ".loopx/registry.json"
+        write_fixture_registry(
+            project=root, runtime_root=root / "runtime", registry_path=registry,
+            goal_id=GOAL_ID, domain="claim-repair-fixture",
+            adapter_kind="generic_project_goal_v0", state_file=state.name,
+            registered_agents=[CURRENT_AGENT, OTHER_AGENT],
+        )
+        import_fixture_authority(registry, GOAL_ID)
+        before = state.read_bytes()
+        prefix = ("todo", "update", "--goal-id", GOAL_ID,
+                  "--todo-id", "todo_legacy_write", "--agent-id", OTHER_AGENT)
+        revision = run_json_cli("todo", "list", "--goal-id", GOAL_ID,
+                                registry_path=registry)["authority_read"]["provider_revision"]
+        claim = ("todo", "claim", "--goal-id", GOAL_ID,
+                 "--todo-id", "todo_legacy_write", "--agent-id", CURRENT_AGENT,
+                 "--claimed-by", CURRENT_AGENT)
+        for request in (claim, (*prefix, "--note", "Keep this legacy review blocked.")):
+            code, rejected = run_json_cli_result(*request, registry_path=registry)
+            assert code == 1, rejected
+            if request is claim:
+                assert rejected["error_code"] == "removed_continuation_policy", rejected
+            else:
+                assert "repair it" in rejected["error"], rejected
+            assert state.read_bytes() == before
+            assert run_json_cli("todo", "list", "--goal-id", GOAL_ID,
+                                registry_path=registry)["authority_read"]["provider_revision"] == revision
+        repaired = run_json_cli(*prefix, "--continuation-policy", "independent_handoff",
+                                "--excluded-agent", CURRENT_AGENT, registry_path=registry)
+        assert repaired["source_authority"] == "file_v0", repaired
+        current = run_json_cli("todo", "list", "--goal-id", GOAL_ID,
+                               "--todo-id", "todo_legacy_write", registry_path=registry)["todo"]
+        assert current["continuation_policy"] == "independent_handoff", current
+        assert current["excluded_agents"] == [CURRENT_AGENT], current
+        assert not current.get("removed_continuation_policy"), current
+        assert "continuation_policy=review_handoff" not in state.read_text()
 
 
 def assert_claim_visibility_lanes_split_current_other_and_task_class() -> None:
@@ -480,12 +498,12 @@ def assert_claim_visibility_lanes_split_current_other_and_task_class() -> None:
         ),
     ]
 
-    lanes = build_todo_claim_visibility_lanes(
-        open_items,
+    planning = project_quota_planning(
+        {}, all_open_items=open_items, source_open_count=len(open_items),
         agent_identity={"agent_id": CURRENT_AGENT},
-        backlog_item_limit=8,
-        visibility_lane_limit=16,
+        filter_user_gate_blocks_agent=False, available_capabilities=None,
     )
+    lanes = planning["claim_visibility"]
     assert lanes["unclaimed_priority_open_items"][0]["todo_id"] == "todo_unclaimed_p0"
     assert [item["todo_id"] for item in lanes["claimed_open_items"]] == [
         "todo_current_advancement",
@@ -499,7 +517,7 @@ def assert_claim_visibility_lanes_split_current_other_and_task_class() -> None:
     assert lanes["current_agent_claimed_monitor_count"] == 1, lanes
     assert lanes["claimed_by_others_count"] == 1, lanes
     current = lanes["current_agent_claimed_advancement_items"][0]
-    assert current["required_write_scopes"] == ["loopx/**"], current
+    assert "required_write_scopes" not in current, current
     assert current["decision_scope"]["scope_key"] == "claim", current
     assert lanes["claimed_by_others_items"][0]["todo_id"] == "todo_other_advancement"
 

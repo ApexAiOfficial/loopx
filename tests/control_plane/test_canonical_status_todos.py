@@ -1,0 +1,610 @@
+"""Status reads the real promoted provider, not its Markdown display copy."""
+from __future__ import annotations
+
+import json
+import hashlib
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from canonical_authority_fixture import initialize_canonical_authority, isolate_sqlite_runtime
+
+from loopx.contract import check_contract
+from loopx.control_plane.effect_runtime import restart_effect_runtime
+from loopx.control_plane.coordination.local_authority import LocalCoordinationAuthorityUnavailable
+from loopx.control_plane.coordination.coordination_state_contract import (
+    TODO_DOMAIN_READ_RECORD_SCHEMA_VERSION,
+    TODO_DOMAIN_RECORD_FIELDS,
+)
+from loopx.control_plane.coordination.local_authority_shadow_projection import canonical_bytes
+from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
+from loopx.status import active_state_todo_fields
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime(tmp_path, monkeypatch):
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    yield
+    restart_effect_runtime()
+
+
+@pytest.fixture(params=["file", "sqlite"])
+def provider(request):
+    return request.param
+
+
+@pytest.fixture(params=["legacy", "native"])
+def record_format(request):
+    return request.param
+
+
+def _projection(goal_id, records, record_format):
+    projection = build_todo_runtime_shadow_projection(goal_id=goal_id, todos=records)
+    if record_format == "native":
+        for record in projection["todos"]:
+            record["schema_version"] = "todo_domain_record_v0"
+            record.pop("index")
+            record.pop("source_section")
+        projection["todo_read_model"] = {
+            "schema_version": TODO_DOMAIN_READ_RECORD_SCHEMA_VERSION,
+            "contract_fields": list(TODO_DOMAIN_RECORD_FIELDS),
+            "todo_count": len(projection["todos"]),
+            "records_sha256": hashlib.sha256(canonical_bytes(projection["todos"])).hexdigest(),
+        }
+    return projection
+
+
+@pytest.fixture
+def promoted_goal(tmp_path: Path, record_format, provider):
+    state = tmp_path / "ACTIVE_GOAL_STATE.md"
+    state.write_text(
+        "# Goal\n\n## Next Action\n\nKeep the human narrative.\n\n"
+        "## Agent Todo\n\n- [ ] Stale display task\n"
+        "  <!-- loopx:todo todo_id=todo_stale status=open -->\n\n"
+        "## User Todo / Owner Review Reading Queue\n\n- [x] Stale approval\n"
+        "  <!-- loopx:todo todo_id=todo_gate status=done task_class=user_gate "
+        "global_gate=true decision_scope=write_scope:goal:release decision_outcome=approve -->\n",
+        encoding="utf-8",
+    )
+    runtime = tmp_path / "runtime"
+    goal = {
+        "id": "goal-a", "repo": str(tmp_path), "state_file": str(state),
+        "domain": "software", "adapter": {"kind": "read_only_project_map_v0"},
+    }
+    records = [{
+        "schema_version": "todo_item_v0", "todo_id": "todo_canonical",
+        "index": 1, "role": "agent", "status": "open", "done": False,
+        "text": "Canonical work", "priority": "P1", "archive_state": "active",
+        "source_section": "Agent Todo", "claimed_by": "agent-a",
+    }, {
+        "schema_version": "todo_item_v0", "todo_id": "todo_gate",
+        "index": 2, "role": "user", "status": "done", "done": True,
+        "text": "Canonical rejection", "priority": "P1", "archive_state": "active",
+        "source_section": "User Todo / Owner Review Reading Queue",
+        "task_class": "user_gate", "global_gate": True,
+        "decision_scope": {
+            "schema_version": "decision_scope_v0", "kind": "write_scope",
+            "granularity": "goal", "scope_key": "release",
+        },
+        "decision_outcome": "reject",
+    }]
+    projection = _projection(goal["id"], records, record_format)
+    initialize_canonical_authority(runtime, goal["id"], projection, state_path=state, provider=provider)
+    return goal, runtime, state
+
+
+@pytest.mark.parametrize("display", ["stale", "missing", "invalid_utf8", "truncated"])
+def test_status_uses_provider_and_allows_native_monitor_writeback_without_display(promoted_goal, display, monkeypatch):
+    goal, runtime, state = promoted_goal
+    if display == "invalid_utf8":
+        state.write_bytes(b"\xff")
+    elif display == "truncated":
+        state.write_text("# Goal\n\n## Next Action\n\nKeep the human narrative.\n")
+    original = state.read_bytes()
+    if display == "missing":
+        state.unlink()
+    for name in ("parse_active_state_todos",):
+        monkeypatch.setattr(
+            f"loopx.control_plane.todos.active_state_todo_parser.{name}",
+            lambda *_args, **_kwargs: pytest.fail("promoted read must not parse legacy Todos"),
+        )
+    fields = active_state_todo_fields(goal, runtime_root=runtime)
+    items = fields["agent_todos"]["items"]
+    assert [item["todo_id"] for item in items] == ["todo_canonical"]
+    assert items[0]["claimed_by"] == "agent-a"
+    assert fields["standing_decision_authority"]["active_count"] == 0
+    assert fields["standing_decision_authority"]["entries"][0]["outcome"] == "reject"
+    assert "monitor_writeback" not in fields["agent_todos"]  # Native observation owns writeback.
+    if display == "missing":
+        assert not state.exists()  # A read must not recreate the display.
+    else:
+        assert state.read_bytes() == original
+        if display == "stale":
+            assert fields["active_state_next_action"] == "Keep the human narrative."
+
+
+def test_unavailable_provider_does_not_restore_stale_display_tasks(promoted_goal, provider):
+    goal, runtime, state = promoted_goal
+    (runtime / "authority" / f"{provider}-v0").rename(runtime / "unavailable-provider")
+    with pytest.raises(LocalCoordinationAuthorityUnavailable):
+        active_state_todo_fields(goal, runtime_root=runtime)
+    assert "todo_stale" in state.read_text()
+
+
+def test_review_materials_follow_canonical_text_without_rewriting_authority(
+    tmp_path, provider, record_format,
+):
+    from loopx.control_plane.coordination.local_authority import read_canonical_todos_if_promoted
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    material = docs / "review.md"
+    material.write_text("# Review\n\n## Proof\nSynthetic evidence.\n", encoding="utf-8")
+    state = tmp_path / "ACTIVE_GOAL_STATE.md"
+    state.write_text("## User Todo\n- [ ] Read `docs/stale.md`.\n", encoding="utf-8")
+    goal = {"id": "goal-a", "repo": str(tmp_path), "state_file": str(state)}
+    records = [{
+        "schema_version": "todo_item_v0", "todo_id": "todo_review", "index": 1,
+        "role": "user", "status": "open", "done": False, "archive_state": "active",
+        "source_section": "User Todo", "task_class": "user_action",
+        "text": ("Read [Review](docs/review.md#proof) and `../outside.md`. "
+                 f"Private [reference]({tmp_path / 'private.md'})."),
+    }]
+    runtime = tmp_path / "runtime"
+    initialize_canonical_authority(runtime, goal["id"], _projection(goal["id"], records, record_format),
+        state_path=state, provider=provider)
+    # A valid stale projection still must not supply current links.
+    state.write_text("## User Todo\n- [ ] Read `docs/stale.md`.\n", encoding="utf-8")
+    before_state = state.read_bytes()
+    before = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=goal["id"])
+    for exists in (True, False):
+        if not exists:
+            material.unlink()
+        fields = active_state_todo_fields(goal, runtime_root=runtime)
+        [todo] = fields["user_todos"]["items"]
+        review, outside = todo["review_materials"]
+        assert review == {"label": "Review", "path": "docs/review.md#proof", "anchor": "proof", "exists": exists}
+        assert outside["exists"] is False
+        assert "resolved_path" not in json.dumps(fields)
+        assert "docs/stale.md" not in json.dumps(fields)
+        assert str(tmp_path) not in json.dumps(todo["review_materials"])
+        assert state.read_bytes() == before_state
+        assert read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=goal["id"]) == before
+
+
+def test_empty_canonical_collection_is_an_explicit_empty_read_model(tmp_path):
+    state = tmp_path / "state.md"
+    state.write_text("# Goal\n\n## Agent Todo\n\n- [ ] Stale work\n")
+    runtime = tmp_path / "runtime"
+    goal = {"id": "goal-a", "repo": str(tmp_path), "state_file": str(state)}
+    initialize_canonical_authority(
+        runtime, goal["id"],
+        build_todo_runtime_shadow_projection(goal_id=goal["id"], todos=[]),
+        state_path=state,
+    )
+    fields = active_state_todo_fields(goal, runtime_root=runtime)
+    for role in ("user", "agent"):
+        assert fields[f"{role}_todos"]["items"] == []
+        assert fields[f"{role}_todos"]["total_count"] == 0
+
+
+def test_global_status_keeps_unmigrated_goal_visible_without_hiding_canonical_work(
+    promoted_goal, tmp_path,
+):
+    from loopx.status import collect_status
+
+    goal, runtime, _ = promoted_goal
+    old_state = tmp_path / "legacy.md"
+    old_state.write_text("# Goal\n\n## Agent Todo\n\n- [ ] Obsolete work\n")
+    unmigrated = {**goal, "id": "legacy-goal", "state_file": str(old_state)}
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"schema_version": 1, "goals": [goal, unmigrated],
+                                   "common_runtime_root": str(runtime)}))
+    payload = collect_status(registry_path=registry, runtime_root_override=str(runtime), limit=5)
+    items = {item["goal_id"]: item for item in payload["attention_queue"]["items"]}
+    assert items[goal["id"]]["agent_todos"]["items"][0]["todo_id"] == "todo_canonical"
+    refused = items["legacy-goal"]
+    assert refused["error_code"] == "canonical_authority_required"
+    assert refused["todo_source"] == "unavailable"
+    assert refused["authority_read"]["legacy_fallback_used"] is False
+    assert "agent_todos" not in refused
+    assert "Obsolete work" in old_state.read_text()
+
+
+@pytest.mark.parametrize("display_exists", [False, True])
+def test_unmigrated_status_refuses_markdown_before_reading_it(tmp_path, monkeypatch, display_exists):
+    state = tmp_path / "state.md"
+    goal = {"id": "goal-a", "repo": str(tmp_path), "state_file": str(state)}
+    if display_exists:
+        state.write_text("# Goal\n\n## Agent Todo\n\n- [ ] Legacy work\n")
+    original = state.read_bytes() if display_exists else None
+    monkeypatch.setattr(
+        "loopx.control_plane.todos.active_state_todo_parser.parse_active_state_todos",
+        lambda *_args, **_kwargs: pytest.fail("ordinary status must never parse legacy Todos"),
+    )
+    with pytest.raises(LocalCoordinationAuthorityUnavailable) as error:
+        active_state_todo_fields(goal, runtime_root=tmp_path / "runtime")
+    assert error.value.code == "canonical_authority_required"
+    assert error.value.payload["legacy_fallback_used"] is False
+    assert (state.read_bytes() if state.exists() else None) == original
+
+
+@pytest.mark.parametrize(
+    "display", ["missing", "invalid_utf8", "invalid_user_todo", "truncated"]
+)
+def test_public_status_cli_uses_canonical_contract_and_attention(promoted_goal, tmp_path, display):
+    goal, runtime, state = promoted_goal
+    if display == "missing":
+        state.unlink()
+    elif display == "invalid_utf8":
+        state.write_bytes(b"\xff")
+    elif display == "truncated":
+        state.write_text("# Goal\n\n## Next Action\n\nKeep the human narrative.\n")
+    else:
+        state.write_text(
+            "# Goal\n\n## User Todo\n\n- [ ] Obsolete display-only gate\n"
+            "  <!-- loopx:todo todo_id=todo_stale status=open -->\n",
+        )
+    original = state.read_bytes() if state.exists() else None
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({
+        "schema_version": 1, "common_runtime_root": str(runtime), "goals": [goal],
+    }))
+    result = subprocess.run(
+        [sys.executable, "-m", "loopx.cli", "--registry", str(registry),
+         "--format", "json", "status", "--goal-id", goal["id"]],
+        capture_output=True, text=True, timeout=60,
+    )
+    payload = json.loads(result.stdout)
+    assert result.returncode == 0, payload["contract"]
+    assert payload["contract"]["ok"] is True
+    assert "todo_canonical" in json.dumps(payload["attention_queue"])
+    assert "todo_stale" not in json.dumps(payload["attention_queue"])
+    assert (state.read_bytes() if state.exists() else None) == original
+
+
+def test_contract_reports_promoted_failure_without_legacy_rescue(promoted_goal, provider, tmp_path):
+    goal, runtime, state = promoted_goal
+    (runtime / "authority" / f"{provider}-v0").rename(runtime / "unavailable-provider")
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"schema_version": 1, "goals": [goal]}))
+    result = check_contract(
+        registry_path=registry, runtime_root_override=str(runtime), scan_roots=[], limit=3,
+        goal_id_filter=goal["id"], include_public_boundary_scan=False,
+    )
+    assert result["ok"] is False
+    assert result["goal_errors"][goal["id"]]
+    assert any("canonical Todo contract unavailable" in row["message"]
+               for row in result["error_diagnostics"])
+
+
+def test_contract_rejects_corrupt_canonical_read_model_despite_valid_display(tmp_path, provider):
+    state = tmp_path / "state.md"
+    state.write_text("# Goal\n\n## Agent Todo\n\n")
+    runtime = tmp_path / "runtime"
+    goal = {"id": "goal-a", "repo": str(tmp_path), "state_file": str(state),
+            "domain": "software", "adapter": {"kind": "read_only_project_map_v0"}}
+    projection = build_todo_runtime_shadow_projection(goal_id="goal-a", todos=[])
+    projection["todo_read_model"]["records_sha256"] = "0" * 64
+    initialize_canonical_authority(runtime, "goal-a", projection, state_path=state, provider=provider)
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"schema_version": 1, "goals": [goal]}))
+    result = check_contract(
+        registry_path=registry, runtime_root_override=str(runtime), scan_roots=[], limit=3,
+        goal_id_filter="goal-a", include_public_boundary_scan=False,
+    )
+    assert result["ok"] is False
+    assert any("read-model digest mismatch" in row["message"]
+               for row in result["error_diagnostics"])
+
+
+@pytest.mark.parametrize(("fields", "agents", "expected_code"), [
+    ({}, ["agent-a"], "user_todo_task_class_missing"),
+    ({"task_class": "user_action", "global_gate": True}, ["agent-a"], "user_action_blocking_scope_invalid"),
+    ({"task_class": "user_gate", "global_gate": True, "blocks_agent": "agent-a"},
+     ["agent-a"], "user_gate_scope_conflict"),
+    ({"task_class": " user_gate ", "global_gate": True, "blocks_agent": "agent-a"},
+     ["agent-a"], "user_gate_scope_conflict"),
+    ({"task_class": "user_action", "bound_agent": "agent-a", "goal_bound": True},
+     ["agent-a"], "user_todo_response_scope_conflict"),
+    ({"task_class": "user_gate", "global_gate": True, "bound_agent": "agent-a"},
+     ["agent-a"], "goal_user_gate_agent_binding_invalid"),
+    ({"task_class": "user_gate", "blocks_agent": "agent-a", "goal_bound": True},
+     ["agent-a"], "agent_user_gate_goal_binding_invalid"),
+    ({"task_class": "user_gate", "blocks_agent": "agent-a", "bound_agent": "agent-b"},
+     ["agent-a", "agent-b"], "agent_user_gate_response_binding_mismatch"),
+    ({"task_class": "user_action", "bound_agent": "agent-other"}, ["agent-a"], "user_todo_bound_agent_unregistered"),
+    ({"task_class": "user_gate", "blocks_agent": "agent-other"},
+     ["agent-a"], "user_gate_blocks_unregistered_agent"),
+    ({"task_class": "user_gate", "goal_bound": True}, ["agent-a", "agent-b"], "multi_agent_user_gate_missing_scope"),
+    ({"task_class": "user_action"}, ["agent-a", "agent-b"], "multi_agent_user_todo_missing_response_scope"),
+    ({"role": "agent", "blocks_agent": "agent-a"}, ["agent-a"], "agent_todo_blocks_agent_invalid"),
+    ({"role": "agent", "claimed_by": "agent-a", "excluded_agents": ["agent-a"]},
+     ["agent-a"], "todo_claimed_by_excluded_agent"),
+    ({"role": "agent", "excluded_agents": ["agent-other"]}, ["agent-a"], "todo_excludes_unregistered_agent"),
+    ({"role": "agent", "status": "done", "done": True, "archive_state": "archive",
+      "excluded_agents": ["agent-other"]}, ["agent-a"], None),
+    ({"role": "agent", "status": "deferred", "done": True, "archive_state": "archive",
+      "excluded_agents": ["agent-other"]}, ["agent-a"], "todo_excludes_unregistered_agent"),
+    ({"role": "agent", "removed_continuation_policy": "review_handoff"},
+     ["agent-a"], "agent_todo_removed_continuation_policy"),
+    ({"role": "agent", "excluded_agents": ["!"]}, ["agent-a"], "todo_excluded_agents_invalid"),
+    ({"task_class": "user_action", "excluded_agents": ["agent-a"]},
+     ["agent-a"], "todo_executor_exclusion_scope_invalid"),
+    ({"role": "agent", "claimed_by": "agent-a", "excluded_agents": ["agent-b"]},
+     ["agent-a", "agent-b"], None),
+    ({"status": "done", "done": True, "archive_state": "archive", "excluded_agents": ["agent-a"]},
+     ["agent-a"], None),
+    ({"status": "done", "done": True, "excluded_agents": ["agent-a"]},
+     ["agent-a"], "todo_executor_exclusion_scope_invalid"),
+    ({"task_class": "user_action"}, ["agent-a"], None),
+    ({"task_class": "user_gate", "global_gate": True}, ["agent-a", "agent-b"], None),
+    ({"task_class": "user_gate", "blocks_agent": "agent-a"}, ["agent-a", "agent-b"], None),
+    ({"status": "done", "done": True}, ["agent-a", "agent-b"], None),
+    ({"status": "deferred", "done": True, "resume_when": "capacity_available:network"}, ["agent-a", "agent-b"], None),
+])
+def test_canonical_todo_semantics_without_display(tmp_path, provider, record_format, fields, agents, expected_code):
+    state = tmp_path / "state.md"
+    state.write_text("# Goal\n\n## User Todo\n\n")
+    runtime = tmp_path / "runtime"
+    goal = {"id": "goal-a", "repo": str(tmp_path), "state_file": str(state),
+            "domain": "software", "adapter": {"kind": "read_only_project_map_v0"},
+            "coordination": {"registered_agents": agents}}
+    records = [{"schema_version": "todo_item_v0", "todo_id": "todo_checked", "index": 1,
+                "role": "user", "status": "open", "done": False, "text": "Canonical work",
+                "priority": "P1", "archive_state": "active", "source_section": "User Todo", **fields}]
+    initialize_canonical_authority(runtime, goal["id"], _projection(goal["id"], records, record_format),
+                                   state_path=state, provider=provider)
+    state.unlink()  # Canonical semantics must not need the display to exist.
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"schema_version": 1, "common_runtime_root": str(runtime), "goals": [goal]}))
+    result = check_contract(registry_path=registry, runtime_root_override=str(runtime), scan_roots=[], limit=3,
+                            goal_id_filter=goal["id"], include_public_boundary_scan=False)
+    assert result["ok"] is (expected_code is None), result["error_diagnostics"]
+    assert [row["code"] for row in result["error_diagnostics"]] == ([expected_code] if expected_code else [])
+    assert all(row["goal_id"] == goal["id"] for row in result["error_diagnostics"])
+    process = subprocess.run([sys.executable, "-m", "loopx.cli", "--registry", str(registry),
+                              "--format", "json", "status", "--goal-id", goal["id"]],
+                             capture_output=True, text=True, timeout=60)
+    assert process.returncode == (1 if expected_code else 0), process.stdout + process.stderr
+    status_contract = json.loads(process.stdout)["contract"]
+    assert status_contract["ok"] is (expected_code is None)
+    assert status_contract.get("error_diagnostics", []) == result["error_diagnostics"]
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("fields", [{"role": "agent", "status": "bogus"},
+                                  {"role": "user", "task_class": "user_action", "status": "bogus"}])
+def test_legacy_canonical_status_is_validated_without_display(tmp_path, provider, fields):
+    test_canonical_todo_semantics_without_display(
+        tmp_path, provider, "legacy", fields, ["agent-a"], "todo_status_invalid",
+    )
+
+
+@pytest.mark.parametrize("archive_status", ["done", "deferred", "open"])
+def test_archived_executor_exclusion_through_check_status_and_guard(tmp_path, provider, archive_status):
+    from canonical_authority_fixture import read_fixture_todos
+    from test_quota_settlement_cli import AGENT_ID, GOAL_ID, TODO_ID, _run_cli, _write_fixture
+
+    from loopx.control_plane.coordination.local_authority import read_canonical_todos_if_promoted
+    from loopx.control_plane.todos.active_state_todo_parser import parse_todo_source
+    from loopx.control_plane.todos.todo_summary import structured_todo_item
+
+    project, runtime, registry = _write_fixture(tmp_path)
+    state = project / f".codex/goals/{GOAL_ID}/ACTIVE_GOAL_STATE.md"
+    with state.open("a", encoding="utf-8") as source:
+        source.write(
+            "\n## Completed Work Archive\n\n- [x] Historical work\n"
+            "  <!-- loopx:todo todo_id=todo_history role=agent status=done "
+            "task_class=advancement_task excluded_agents=retired-agent -->\n",
+        )
+    original_state = state.read_bytes()
+    _, (history,), _ = parse_todo_source(original_state.decode("utf-8"), state_path=state)
+    assert history["todo_id"] == "todo_history" and history["excluded_agents"] == ["retired-agent"]
+    history.update(status=archive_status, done=archive_status != "open")
+    todos = [*read_fixture_todos(state), structured_todo_item(
+        history, role=history["role"], source_section=history["source_section"],
+        archive_state=history["archive_state"], text_limit=None,
+    )]
+    projection = build_todo_runtime_shadow_projection(goal_id=GOAL_ID, todos=todos, handoff_mode="soft_claim")
+    initialize_canonical_authority(runtime, GOAL_ID, projection, state_path=state, provider=provider)
+    original_authority = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID)
+    assert original_authority is not None
+    public_file = project / "README.md"
+    public_file.write_text("# Fixture\n", encoding="utf-8")
+
+    healthy = archive_status == "done"
+    check_code, check = _run_cli(registry, runtime, "check", "--scan-path", str(public_file), cwd=project)
+    status_code, status = _run_cli(registry, runtime, "status", "--goal-id", GOAL_ID, cwd=project)
+    assert check_code == status_code == (0 if healthy else 1), check["error_diagnostics"]
+    expected = [] if healthy else ["todo_excludes_unregistered_agent"]
+    assert [row["code"] for row in check["error_diagnostics"]] == expected
+    assert status["contract"].get("error_diagnostics", []) == check["error_diagnostics"]
+
+    guard_code, guard = _run_cli(registry, runtime, "quota", "should-run", "--goal-id", GOAL_ID,
+                                 "--agent-id", AGENT_ID, cwd=project)
+    assert guard_code == (0 if healthy else 1), guard
+    assert guard["status_health_ok"] is healthy
+    assert guard["normal_delivery_allowed"] is healthy
+    if healthy:
+        assert guard["should_run"]
+        assert guard["selected_todo"]["todo_id"] == TODO_ID
+    assert state.read_bytes() == original_state
+    assert read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID) == original_authority
+
+
+def test_large_canonical_user_narratives_do_not_enter_diagnostics_rpc(tmp_path, provider, record_format):
+    state = tmp_path / "state.md"
+    state.write_text("# Goal\n\n## User Todo\n\n")
+    runtime = tmp_path / "runtime"
+    goal = {"id": "goal-a", "repo": str(tmp_path), "state_file": str(state),
+            "domain": "software", "adapter": {"kind": "read_only_project_map_v0"}}
+    records = [{"schema_version": "todo_item_v0", "todo_id": f"todo_user_{index:04d}", "index": index + 1,
+                "role": "user", "status": "open", "done": False, "task_class": "user_action",
+                "text": "Synthetic user narrative. " * 100, "priority": "P1", "archive_state": "active",
+                "source_section": "User Todo"} for index in range(1100)]
+    assert len(json.dumps(records).encode()) > 2 * 1024 * 1024
+    initialize_canonical_authority(runtime, goal["id"], _projection(goal["id"], records, record_format),
+                                   state_path=state, provider=provider)
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"schema_version": 1, "common_runtime_root": str(runtime), "goals": [goal]}))
+    result = subprocess.run([sys.executable, "-m", "loopx.cli", "--registry", str(registry),
+                             "--format", "json", "status", "--goal-id", goal["id"]],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["contract"]["ok"] is True
+    assert state.read_text() == "# Goal\n\n## User Todo\n\n"
+
+
+def test_whole_status_reuses_the_contract_snapshot_and_refreshes_next_request(
+    promoted_goal, tmp_path, monkeypatch, provider,
+):
+    """Real provider input is shared, even if it disappears between consumers."""
+    import loopx.status as status_module
+    from loopx.control_plane.coordination import local_authority
+
+    goal, runtime, state = promoted_goal
+    registry = tmp_path / 'registry.json'
+    registry.write_text(json.dumps({'goals': [goal], 'common_runtime_root': str(runtime)}))
+    reads = []
+    original = local_authority.read_canonical_todos_if_promoted
+
+    def observe(**kwargs):
+        result = original(**kwargs)
+        reads.append(result)
+        return result
+
+    monkeypatch.setattr(local_authority, 'read_canonical_todos_if_promoted', observe)
+    # After the contract's complete provider read, make a later provider read
+    # impossible. The current status is a historical observation, not admission.
+    original_queue = status_module.build_attention_queue
+    unavailable = runtime / 'unavailable-provider'
+    provider_path = runtime / 'authority' / f'{provider}-v0'
+
+    def remove_then_project(**kwargs):
+        provider_path.rename(unavailable)
+        return original_queue(**kwargs)
+
+    monkeypatch.setattr(status_module, 'build_attention_queue', remove_then_project)
+    arguments = dict(registry_path=registry, runtime_root_override=str(runtime),
+                     limit=5, goal_id=goal['id'])
+    payload = status_module.collect_status(**arguments)
+    assert len(reads) == 1
+    snapshot = reads[0]
+    assert "todos" not in snapshot and "todo_ids" not in snapshot
+    rows = snapshot["todo_contract_rows"]
+    assert {row["todo_id"] for row in rows} == {"todo_canonical", "todo_gate"}
+    assert all("text" not in row and "decision_scope" not in row for row in rows)
+    assert next(row for row in rows if row["todo_id"] == "todo_gate")["global_gate"] is True
+    queue = next(item for item in payload['attention_queue']['items'] if item['goal_id'] == goal['id'])
+    assert queue['agent_todos']['items'][0]['todo_id'] == 'todo_canonical'
+    assert queue['standing_decision_authority']['entries'][0]['outcome'] == 'reject'
+    monkeypatch.setattr(status_module, 'build_attention_queue', original_queue)
+    # A separate request cannot resurrect the previous successful snapshot.
+    with pytest.raises(local_authority.LocalCoordinationAuthorityUnavailable):
+        status_module.collect_status(**arguments)
+    assert 'todo_stale' in state.read_text()
+
+
+@pytest.mark.parametrize("shared_authority", [False, True])
+def test_global_status_reads_source_authority_and_preserves_explicit_override(
+    promoted_goal, tmp_path, provider, record_format, shared_authority, monkeypatch,
+):
+    import loopx.status as status_module
+    from loopx.control_plane.coordination import local_authority
+
+    goal, source_runtime, state = promoted_goal
+    goal = {**goal, "coordination": {"registered_agents": ["agent-a"]}}
+    source_registry = tmp_path / "source-registry.json"
+    source_registry.write_text(json.dumps({
+        "goals": [goal], "common_runtime_root": str(source_runtime),
+    }))
+    shared_runtime = tmp_path / "shared-runtime"
+    registry = tmp_path / "global-registry.json"
+    registry.write_text(json.dumps({
+        "registry_role": "global-local", "common_runtime_root": str(shared_runtime),
+        "goals": [{**goal, "source_registry": str(source_registry)}],
+    }))
+    if shared_authority:
+        shadow = {
+            "schema_version": "todo_item_v0", "todo_id": "todo_shadow", "index": 1,
+            "role": "agent", "status": "open", "done": False,
+            "text": "Shared projection must not replace source work", "priority": "P1",
+            "archive_state": "active", "source_section": "Agent Todo",
+        }
+        initialize_canonical_authority(shared_runtime, goal["id"],
+            _projection(goal["id"], [shadow], record_format),
+            state_path=state, provider=provider)
+    before = local_authority.read_canonical_todos_if_promoted(
+        runtime_root=source_runtime, goal_id=goal["id"],
+    )
+    state_before = state.read_bytes()
+    reads = []
+    original = local_authority.read_canonical_todos_if_promoted
+
+    def observe(**kwargs):
+        reads.append((kwargs["runtime_root"], kwargs["goal_id"]))
+        return original(**kwargs)
+
+    monkeypatch.setattr(local_authority, "read_canonical_todos_if_promoted", observe)
+    arguments = dict(registry_path=registry, runtime_root_override=None,
+                     limit=5, goal_id=goal["id"])
+    payload = status_module.collect_status(**arguments)
+    work = next(item for item in payload["attention_queue"]["items"]
+                if item["goal_id"] == goal["id"] and item.get("agent_todos"))
+    assert [item["todo_id"] for item in work["agent_todos"]["items"]] == ["todo_canonical"]
+    # Contract and attention consume one request-local source read.
+    assert reads == [(source_runtime.resolve(), goal["id"])]
+    assert not any(error.get("code") == "canonical_authority_required"
+                   for error in payload.get("error_diagnostics", []))
+    if shared_authority:
+        overridden = status_module.collect_status(
+            **{**arguments, "runtime_root_override": str(shared_runtime)},
+        )
+        work = next(item for item in overridden["attention_queue"]["items"]
+                    if item["goal_id"] == goal["id"] and item.get("agent_todos"))
+        assert [item["todo_id"] for item in work["agent_todos"]["items"]] == ["todo_shadow"]
+    else:
+        with pytest.raises(local_authority.LocalCoordinationAuthorityUnavailable) as error:
+            status_module.collect_status(
+                **{**arguments, "runtime_root_override": str(shared_runtime)},
+            )
+        assert error.value.code == "canonical_authority_required"
+    after = original(runtime_root=source_runtime, goal_id=goal["id"])
+    assert after["provider_revision"] == before["provider_revision"]
+    assert after["todos"] == before["todos"]
+    assert state.read_bytes() == state_before
+
+
+@pytest.mark.parametrize("source_failure", ["missing", "invalid", "absent_goal"])
+def test_global_status_never_uses_valid_shared_shadow_when_source_route_fails(
+    promoted_goal, tmp_path, provider, record_format, source_failure,
+):
+    import loopx.status as status_module
+
+    goal, source_runtime, state = promoted_goal
+    source_registry = tmp_path / "source-registry.json"
+    if source_failure == "invalid":
+        source_registry.write_text("{invalid")
+    elif source_failure == "absent_goal":
+        source_registry.write_text(json.dumps({
+            "goals": [], "common_runtime_root": str(source_runtime),
+        }))
+    shared_runtime = tmp_path / "shared-runtime"
+    initialize_canonical_authority(shared_runtime, goal["id"],
+        _projection(goal["id"], [], record_format), state_path=state, provider=provider)
+    registry = tmp_path / "global-registry.json"
+    registry.write_text(json.dumps({
+        "registry_role": "global-local", "common_runtime_root": str(shared_runtime),
+        "goals": [{**goal, "source_registry": str(source_registry)}],
+    }))
+    state_before = state.read_bytes()
+    with pytest.raises(LocalCoordinationAuthorityUnavailable) as error:
+        status_module.collect_status(registry_path=registry, runtime_root_override=None,
+                                     limit=5, goal_id=goal["id"])
+    assert error.value.code == "canonical_todo_contract_diagnostics_unavailable"
+    assert error.value.payload["write_admitted"] is False
+    assert error.value.payload["legacy_fallback_used"] is False
+    assert state.read_bytes() == state_before

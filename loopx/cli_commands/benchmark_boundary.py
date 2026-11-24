@@ -12,12 +12,13 @@ from ..capabilities.benchmark_toolkit import (
     BENCHMARK_FOUR_ARM_CONTRACT_SCHEMA_VERSION,
     BENCHMARK_FOUR_ARM_QUALIFICATION_SCOPE,
     BENCHMARK_INTEGRITY_QUALIFICATION_SCHEMA_VERSION,
-    BENCHMARK_PLAN_FIDELITY_SCHEMA_VERSION,
+    BENCHMARK_MODEL_ROUTE_RECEIPT_SCHEMA_VERSION,
     BENCHMARK_RUNTIME_CONTINUITY_SCHEMA_VERSION,
     BENCHMARK_SOURCE_REVISION_FENCE_SCHEMA_VERSION,
+    BENCHMARK_TREATMENT_CONTINUATION_RECEIPT_SCHEMA_VERSION,
+    TRAE_BENCHMARK_EVIDENCE_SCHEMA_VERSION,
     BenchmarkEventWindowState,
     BenchmarkJobReceiptState,
-    BenchmarkPlanRole,
     BenchmarkRunnerOwnerState,
     BenchmarkRuntimeContinuityClassification,
     BenchmarkRuntimeContinuityTransition,
@@ -25,9 +26,10 @@ from ..capabilities.benchmark_toolkit import (
     build_benchmark_candidate_source_boundary,
     build_benchmark_four_arm_contract_from_spec,
     build_benchmark_integrity_qualification,
-    build_benchmark_plan_fidelity_receipt,
     build_benchmark_runtime_continuity,
     build_benchmark_runtime_observation,
+    build_benchmark_treatment_continuation_receipt,
+    capture_traex_benchmark_evidence,
     compact_benchmark_four_arm_contract,
     compact_benchmark_source_revision_fence_receipt,
     filter_public_benchmark_artifact_paths,
@@ -45,11 +47,12 @@ BENCHMARK_TOOLKIT_COMMANDS = {
     "candidate-source-boundary",
     "classify-artifacts",
     "integrity-qualification",
-    "plan-fidelity",
     "four-arm-contract",
     "runtime-continuity",
     "runtime-observation",
     "source-revision-fence",
+    "traex-evidence",
+    "treatment-continuation-receipt",
     "verify-verifier-reward",
 }
 
@@ -92,55 +95,16 @@ def _render_integrity(payload: dict[str, object]) -> str:
         blocker_text = (
             "- Blockers: " + ", ".join(f"`{item}`" for item in blockers) + "\n"
         )
+    review = payload.get("restricted_access_review")
+    review = review if isinstance(review, dict) else {}
     return (
         "# Benchmark Integrity Qualification\n\n"
         f"- Classification: `{payload.get('classification')}`\n"
         f"- Integrity qualified: `{payload.get('integrity_qualified')}`\n"
         f"- Score claim eligible: `{payload.get('score_claim_eligible')}`\n"
         f"- Cheating detected: `{payload.get('benchmark_cheating_detected')}`\n"
-        + blocker_text
+        f"- Restricted access review: `{review.get('state')}`\n" + blocker_text
     )
-
-
-def _render_plan_fidelity(payload: dict[str, object]) -> str:
-    blockers = payload.get("blockers")
-    blocker_text = ""
-    if isinstance(blockers, list) and blockers:
-        blocker_text = (
-            "- Blockers: " + ", ".join(f"`{item}`" for item in blockers) + "\n"
-        )
-    return (
-        "# Benchmark Treatment Plan Fidelity\n\n"
-        f"- Classification: `{payload.get('classification')}`\n"
-        f"- Qualified: `{payload.get('qualified')}`\n"
-        f"- Classified actions: `{payload.get('classified_action_count')}`\n"
-        f"- Unclassified actions: `{payload.get('unclassified_action_count')}`\n"
-        + blocker_text
-    )
-
-
-def _parse_role_action_kinds(values: list[str]) -> dict[BenchmarkPlanRole, list[str]]:
-    contract: dict[BenchmarkPlanRole, list[str]] = {}
-    for value in values:
-        raw_role, separator, action_kind = value.partition("=")
-        if not separator:
-            raise ValueError("invalid_role_action_kind_assignment")
-        role = BenchmarkPlanRole(raw_role)
-        contract.setdefault(role, []).append(action_kind)
-    return contract
-
-
-def _parse_required_role_counts(values: list[str]) -> dict[BenchmarkPlanRole, int]:
-    required: dict[BenchmarkPlanRole, int] = {}
-    for value in values:
-        raw_role, separator, raw_count = value.partition("=")
-        if not separator:
-            raise ValueError("invalid_required_role_count_assignment")
-        role = BenchmarkPlanRole(raw_role)
-        if role in required:
-            raise ValueError("duplicate_required_benchmark_plan_role")
-        required[role] = int(raw_count)
-    return required
 
 
 def _render_four_arm_contract(payload: dict[str, object]) -> str:
@@ -191,6 +155,31 @@ def _render_runtime_continuity(payload: dict[str, object]) -> str:
         f"- Qualified: `{payload.get('qualified')}`\n"
         f"- Closeout write allowed: `{payload.get('closeout_write_allowed')}`\n"
         f"- Recommended transition: `{payload.get('recommended_transition')}`\n"
+    )
+
+
+def _render_treatment_continuation(payload: dict[str, object]) -> str:
+    return (
+        "# Benchmark Treatment Continuation Receipt\n\n"
+        f"- Classification: `{payload.get('classification')}`\n"
+        f"- Startup: `{payload.get('startup_state')}`\n"
+        "- Post-start control observed: "
+        f"`{payload.get('post_start_control_observed')}`\n"
+        f"- Terminal control: `{payload.get('terminal_control_state')}`\n"
+        "- Score and countability changed: `False`\n"
+    )
+
+
+def _render_traex_evidence(payload: dict[str, object]) -> str:
+    route = payload.get("model_route")
+    route = route if isinstance(route, dict) else {}
+    return (
+        "# TraeX Benchmark Evidence\n\n"
+        f"- Captured: `{payload.get('ok')}`\n"
+        f"- Steps: `{payload.get('step_count')}`\n"
+        f"- Tool calls: `{payload.get('tool_call_count')}`\n"
+        f"- Runtime route: `{route.get('status')}`\n"
+        "- Raw content recorded in receipt: `False`\n"
     )
 
 
@@ -278,26 +267,6 @@ def register_benchmark_boundary_commands(
     )
     continuity_parser.add_argument("--require-qualified", action="store_true")
 
-    plan_parser = benchmark_subparsers.add_parser(
-        "plan-fidelity",
-        help="Reduce exact provider Todo action kinds to stable treatment-plan roles.",
-    )
-    add_subcommand_format(plan_parser)
-    plan_parser.add_argument("--action-kind", action="append", required=True)
-    plan_parser.add_argument(
-        "--role-action-kind",
-        action="append",
-        required=True,
-        metavar="ROLE=ACTION_KIND",
-    )
-    plan_parser.add_argument(
-        "--required-role-count",
-        action="append",
-        required=True,
-        metavar="ROLE=COUNT",
-    )
-    plan_parser.add_argument("--require-qualified", action="store_true")
-
     integrity_parser = benchmark_subparsers.add_parser(
         "integrity-qualification",
         help="Reduce private trajectory and runner attestations to a compact receipt.",
@@ -306,8 +275,52 @@ def register_benchmark_boundary_commands(
     integrity_parser.add_argument("--trajectory-json", required=True)
     integrity_parser.add_argument("--runtime-attestation-json", required=True)
     integrity_parser.add_argument("--policy-json")
+    integrity_parser.add_argument(
+        "--restricted-access-adjudication-json",
+        help=(
+            "Optional compact post-run analyst decision. Suspicion remains "
+            "countable unless this confirms disclosure and causal use."
+        ),
+    )
     integrity_parser.add_argument("--sensitive-value-env", action="append", default=[])
     integrity_parser.add_argument("--require-qualified", action="store_true")
+
+    treatment_continuation_parser = benchmark_subparsers.add_parser(
+        "treatment-continuation-receipt",
+        help=(
+            "Separate treatment control persistence from score and countability."
+        ),
+    )
+    add_subcommand_format(treatment_continuation_parser)
+    treatment_continuation_parser.add_argument(
+        "--observation-json",
+        required=True,
+        help="Compact post-run mechanism observation JSON path, or - for stdin.",
+    )
+
+    traex_parser = benchmark_subparsers.add_parser(
+        "traex-evidence",
+        help="Convert private TraeX JSONL to ATIF and a safe route receipt.",
+    )
+    add_subcommand_format(traex_parser)
+    traex_parser.add_argument("--source-jsonl", required=True)
+    traex_parser.add_argument(
+        "--route-source-jsonl",
+        help=(
+            "Optional archived TraeX JSONL containing runtime token-count route "
+            "events. Stdout JSONL alone normally cannot audit the model route."
+        ),
+    )
+    traex_parser.add_argument("--atif-output", required=True)
+    traex_parser.add_argument("--route-receipt-output", required=True)
+    traex_parser.add_argument("--requested-model", required=True)
+    traex_parser.add_argument("--requested-provider", default="trae")
+    traex_parser.add_argument("--require-runtime-route", action="store_true")
+    traex_parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write the private ATIF and public-safe route receipt.",
+    )
 
     reward_parser = benchmark_subparsers.add_parser(
         "verify-verifier-reward",
@@ -387,24 +400,62 @@ def _invalid_runtime_continuity_input() -> dict[str, object]:
     }
 
 
-def _invalid_plan_fidelity_input() -> dict[str, object]:
+def _invalid_treatment_continuation_input() -> dict[str, object]:
     return {
-        "schema_version": BENCHMARK_PLAN_FIDELITY_SCHEMA_VERSION,
-        "qualified": False,
-        "classification": "plan_fidelity_input_invalid",
-        "observed_role_counts": {role.value: 0 for role in BenchmarkPlanRole},
-        "required_role_counts": {},
-        "classified_action_count": 0,
-        "unclassified_action_count": 0,
-        "blockers": ["plan_fidelity_input_invalid"],
-        "exact_action_kind_matching": True,
+        "schema_version": BENCHMARK_TREATMENT_CONTINUATION_RECEIPT_SCHEMA_VERSION,
+        "ok": False,
+        "classification": "input_invalid",
+        "startup_state": "unknown",
+        "observation_complete": False,
+        "post_start_control_observed": False,
+        "post_start_control_event_count": 0,
+        "terminal_control_state": "unknown",
+        "precommit_validation_state": "unknown",
+        "reason_codes": ["treatment_continuation_input_invalid"],
+        "score_semantics": {
+            "score_countability_unchanged": True,
+            "integrity_qualification_unchanged": True,
+            "treatment_fidelity_unchanged": True,
+            "claim_scope": "post_run_mechanism_analysis_only",
+        },
         "public_boundary": {
-            "todo_text_recorded": False,
-            "raw_action_kinds_recorded": False,
+            "raw_content_recorded": False,
             "path_recorded": False,
-            "trajectory_recorded": False,
+            "run_identity_recorded": False,
         },
         "write_performed": False,
+    }
+
+
+def _invalid_traex_evidence_input() -> dict[str, object]:
+    return {
+        "ok": False,
+        "schema_version": TRAE_BENCHMARK_EVIDENCE_SCHEMA_VERSION,
+        "source_runtime": "traex",
+        "status": "input_invalid",
+        "event_count": 0,
+        "route_event_count": 0,
+        "route_source_bound": False,
+        "step_count": 0,
+        "tool_call_count": 0,
+        "private_atif_written": False,
+        "route_receipt_written": False,
+        "write_performed": False,
+        "model_route": {
+            "schema_version": BENCHMARK_MODEL_ROUTE_RECEIPT_SCHEMA_VERSION,
+            "runtime": "traex",
+            "status": "route_requested_not_runtime_audited",
+            "runtime_audited": False,
+            "matched": False,
+            "observed_route_count": 0,
+            "raw_content_recorded": False,
+            "input_path_recorded": False,
+        },
+        "public_boundary": {
+            "raw_content_recorded": False,
+            "input_path_recorded": False,
+            "output_path_recorded": False,
+        },
     }
 
 
@@ -492,19 +543,17 @@ def handle_benchmark_boundary_command(
         print_payload(payload, output_format(args), _render_runtime_continuity)
         return 1 if args.require_qualified and not payload.get("qualified") else 0
 
-    if args.benchmark_command == "plan-fidelity":
+    if args.benchmark_command == "treatment-continuation-receipt":
         try:
-            payload = build_benchmark_plan_fidelity_receipt(
-                action_kinds=args.action_kind,
-                role_action_kinds=_parse_role_action_kinds(args.role_action_kind),
-                required_role_counts=_parse_required_role_counts(
-                    args.required_role_count
-                ),
+            observation = _read_json_object(
+                args.observation_json,
+                "--observation-json",
             )
-        except (TypeError, ValueError):
-            payload = _invalid_plan_fidelity_input()
-        print_payload(payload, output_format(args), _render_plan_fidelity)
-        return 1 if args.require_qualified and not payload.get("qualified") else 0
+            payload = build_benchmark_treatment_continuation_receipt(observation)
+        except (OSError, UnicodeError, TypeError, ValueError):
+            payload = _invalid_treatment_continuation_input()
+        print_payload(payload, output_format(args), _render_treatment_continuation)
+        return 0 if payload.get("ok") else 1
 
     if args.benchmark_command == "verify-verifier-reward":
         if args.reward_json == "-":
@@ -512,6 +561,31 @@ def handle_benchmark_boundary_command(
         payload = verify_verifier_reward_file(args.reward_json)
         print_payload(payload, output_format(args), _render_reward_contract)
         return 1 if args.require_valid and not payload.get("valid") else 0
+
+    if args.benchmark_command == "traex-evidence":
+        try:
+            payload = capture_traex_benchmark_evidence(
+                source_jsonl=args.source_jsonl,
+                atif_output=args.atif_output,
+                route_receipt_output=args.route_receipt_output,
+                requested_model=args.requested_model,
+                requested_provider=args.requested_provider,
+                route_source_jsonl=args.route_source_jsonl,
+                execute=args.execute,
+            )
+        except (OSError, UnicodeError, TypeError, ValueError):
+            payload = _invalid_traex_evidence_input()
+        print_payload(payload, output_format(args), _render_traex_evidence)
+        if not payload.get("ok"):
+            return 1
+        route = payload.get("model_route")
+        route = route if isinstance(route, dict) else {}
+        if (
+            args.require_runtime_route
+            and route.get("status") != "runtime_route_verified"
+        ):
+            return 1
+        return 0
 
     try:
         trajectory = _read_json_object(args.trajectory_json, "--trajectory-json")
@@ -522,6 +596,14 @@ def handle_benchmark_boundary_command(
         policy = (
             _read_json_object(args.policy_json, "--policy-json")
             if args.policy_json
+            else None
+        )
+        restricted_access_adjudication = (
+            _read_json_object(
+                args.restricted_access_adjudication_json,
+                "--restricted-access-adjudication-json",
+            )
+            if args.restricted_access_adjudication_json
             else None
         )
         sensitive_values: list[str] = []
@@ -536,6 +618,7 @@ def handle_benchmark_boundary_command(
             trajectory=trajectory,
             runtime_attestation=attestation,
             policy=policy,
+            restricted_access_adjudication=restricted_access_adjudication,
             sensitive_values=sensitive_values,
         )
     except (OSError, UnicodeError, TypeError, ValueError):

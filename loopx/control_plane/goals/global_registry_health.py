@@ -31,6 +31,58 @@ def global_registry_finding(
     return finding
 
 
+def _multi_goal_source_entry_unchanged(
+    goal: dict[str, Any],
+    *,
+    goal_id: str,
+    source_path: Path,
+    source_goals_cache: dict[str, list[dict[str, Any]] | None],
+    load_registry: Callable[[Path], dict[str, Any]],
+    registry_goals: Callable[[dict[str, Any]], list[dict[str, Any]]],
+) -> bool:
+    cache_key = str(source_path)
+    if cache_key not in source_goals_cache:
+        try:
+            source_goals_cache[cache_key] = registry_goals(load_registry(source_path))
+        except Exception:  # noqa: BLE001
+            source_goals_cache[cache_key] = None
+    source_goals = source_goals_cache[cache_key]
+    if not source_goals:
+        return False
+    candidates = [
+        row for row in source_goals if str(row.get("id") or "") == goal_id
+    ]
+    if len(candidates) != 1:
+        return False
+    source_goal = candidates[0]
+    if source_goal.get("source_registry"):
+        return False
+    try:
+        from ...global_registry import (
+            preserve_attention_override,
+            sanitize_goal_for_global,
+        )
+
+        resolved_source = source_path.expanduser().resolve()
+        expected = preserve_attention_override(
+            {},
+            sanitize_goal_for_global(
+                source_goal, source_registry=resolved_source, synced_at=""
+            ),
+        )
+        observed = preserve_attention_override(
+            {},
+            {
+                **goal,
+                "source_registry": str(resolved_source),
+                "synced_at": "",
+            },
+        )
+        return observed == expected
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def collect_global_registry_health(
     *,
     registry_path: Path,
@@ -44,27 +96,69 @@ def collect_global_registry_health(
     parse_timestamp: Callable[[Any], datetime | None],
 ) -> dict[str, Any]:
     global_path = global_registry_path(runtime_root)
+    current_goals = registry_goals(current_registry)
+    current_state_findings: list[dict[str, Any]] = []
+    declared_state_count = 0
+    for goal in current_goals:
+        state_path = resolve_goal_local_path(
+            goal.get("state_file"), goal, fallback_base=registry_path.parent,
+        )
+        if state_path is None:
+            # Initial setup without a declared state has no missing-state fact.
+            continue
+        declared_state_count += 1
+        if not state_path.exists():
+            goal_id = str(goal.get("id") or "unknown-goal")
+            current_state_findings.append(global_registry_finding(
+                kind="state_file_missing", severity="action", goal_id=goal_id,
+                path=state_path, message=f"`{goal_id}` active state file is missing",
+                recommended_action=f"repair `{goal_id}` state_file or reconnect the project",
+            ))
+    current_checks = (
+        [f"current registry active state files checked: {declared_state_count}"]
+        if declared_state_count else []
+    )
     if not global_path.exists():
         return {
             "available": False,
+            "read_status": "missing",
             "ok": True,
             "registry": str(global_path),
             "current_registry": str(registry_path),
             "current_registry_is_global": False,
-            "summary": {"high": 0, "action": 0, "info": 0, "checks": 0, "findings": 0},
-            "findings": [],
-            "checks": [],
+            "summary": {"high": 0, "action": len(current_state_findings), "info": 0,
+                        "checks": len(current_checks), "findings": len(current_state_findings)},
+            "findings": current_state_findings,
+            "checks": current_checks,
         }
 
-    global_registry = load_registry(global_path)
+    try:
+        global_registry = load_registry(global_path)
+    except (OSError, ValueError):
+        return {
+            "available": False,
+            "read_status": "unreadable",
+            "ok": False,
+            "registry": str(global_path),
+            "current_registry": str(registry_path),
+            "current_registry_is_global": False,
+            "summary": {"high": 1, "action": len(current_state_findings), "info": 0,
+                        "checks": len(current_checks) + 1, "findings": len(current_state_findings) + 1},
+            "findings": [global_registry_finding(
+                kind="global_registry_unreadable", severity="high",
+                message="global membership could not be read",
+                recommended_action="repair the global registry source and retry the projection",
+            ), *current_state_findings],
+            "checks": ["global registry readability", *current_checks],
+        }
     global_goals = registry_goals(global_registry)
-    current_goals = registry_goals(current_registry)
     current_ids = {str(goal.get("id")) for goal in current_goals if goal.get("id")}
     global_ids = [str(goal.get("id")) for goal in global_goals if goal.get("id")]
     global_id_set = set(global_ids)
     source_registries: set[str] = set()
+    source_goals_cache: dict[str, list[dict[str, Any]] | None] = {}
     findings: list[dict[str, Any]] = []
-    checks: list[str] = []
+    checks: list[str] = list(current_checks)
 
     current_is_global = same_path(registry_path, global_path)
     id_counts = Counter(global_ids)
@@ -120,7 +214,17 @@ def collect_global_registry_health(
                 synced_at = parse_timestamp(goal.get("synced_at"))
                 if synced_at:
                     source_mtime = datetime.fromtimestamp(source_path.stat().st_mtime, tz=timezone.utc)
-                    if source_mtime > synced_at.astimezone(timezone.utc) + timedelta(seconds=5):
+                    if (
+                        source_mtime > synced_at.astimezone(timezone.utc) + timedelta(seconds=5)
+                        and not _multi_goal_source_entry_unchanged(
+                            goal,
+                            goal_id=goal_id,
+                            source_path=source_path,
+                            source_goals_cache=source_goals_cache,
+                            load_registry=load_registry,
+                            registry_goals=registry_goals,
+                        )
+                    ):
                         findings.append(
                             global_registry_finding(
                                 kind="stale_source_registry",
@@ -159,6 +263,18 @@ def collect_global_registry_health(
                 )
             )
 
+    # Keep global diagnostics (including orphan guidance) when the same state
+    # is represented in both views. A current-only or changed path is still a
+    # local health fact, independent of global membership or sync freshness.
+    for finding in current_state_findings:
+        if not any(
+            existing.get("kind") == "state_file_missing"
+            and existing.get("goal_id") == finding["goal_id"]
+            and same_path(Path(existing["path"]), Path(finding["path"]))
+            for existing in findings
+        ):
+            findings.append(finding)
+
     missing_from_current = sorted(global_id_set - current_ids)
     if not current_is_global and missing_from_current:
         shown = missing_from_current[:8]
@@ -186,6 +302,8 @@ def collect_global_registry_health(
         "current_registry_is_global": current_is_global,
         "global_goal_count": len(global_goals),
         "current_goal_count": len(current_goals),
+        "current_registry_excluded_goal_count": 0 if current_is_global else len(missing_from_current),
+        "current_registry_excluded_goal_ids": [] if current_is_global else missing_from_current[:8],
         "source_registry_count": len(source_registries),
         "summary": {
             "high": severity_counts.get("high", 0),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -12,6 +13,11 @@ from ..bootstrap_command_pack import (
     build_start_goal_host_surface_selection_packet,
     render_start_goal_guided_markdown,
 )
+from ..control_plane.effect_runtime import (
+    EffectRuntimeStartupError,
+    MINIMUM_NODE_VERSION_TEXT,
+)
+from ..control_plane.runtime.node_probe import node_probe_remediation
 from ._host_thread import current_host_thread_id
 
 PrintPayload = Callable[
@@ -21,11 +27,144 @@ PrintPayload = Callable[
 
 _CAPABILITY_ROUTE_SWITCH = "--capability-route"
 _FINE_GRAINED_SWITCH = "--fine-grained"
+_NEW_PEER_SWITCH = "--new-peer"
 _CAPABILITY_ROUTE_PREFIX = re.compile(
     r"\A--capability-route(?:=(?P<equals>\S+)|\s+(?P<spaced>\S+))"
     r"(?P<remainder>[\s\S]*)\Z"
 )
 _FINE_GRAINED_PREFIX = re.compile(r"\A--fine-grained(?P<remainder>(?:\s[\s\S]*)?)\Z")
+_NEW_PEER_PREFIX = re.compile(r"\A--new-peer(?P<remainder>(?:\s[\s\S]*)?)\Z")
+_CODEX_APP_SSH_HOST_SURFACE = "codex-app-ssh"
+_SSH_TRANSPORT_ENV_VARS = ("SSH_CONNECTION", "SSH_CLIENT")
+
+_EFFECT_RUNTIME_STARTUP_REMEDIATION_BY_CODE = {
+    "startup_lock_timeout": (
+        "Another LoopX TypeScript control-plane runtime may be starting. Run "
+        "`loopx doctor --deep`, wait for the active startup to settle, and retry "
+        "`loopx start-goal --guided`."
+    ),
+    "runtime_launch_failed": (
+        "Run `loopx doctor --deep` and retry `loopx start-goal --guided`. If the "
+        "runtime still cannot start, repair or reinstall LoopX."
+    ),
+    "runtime_exited_before_ready": (
+        "Run `loopx doctor --deep` and retry `loopx start-goal --guided`. If the "
+        "runtime exits again, repair or reinstall LoopX."
+    ),
+    "runtime_startup_timeout": (
+        "Run `loopx doctor --deep` and retry `loopx start-goal --guided`. If "
+        "startup continues to time out, repair or reinstall LoopX."
+    ),
+    "runtime_request_failed": (
+        "Run `loopx doctor --deep` and retry `loopx start-goal --guided`. If "
+        "requests continue to fail, repair or reinstall LoopX."
+    ),
+}
+_EFFECT_RUNTIME_STARTUP_DEFAULT_REMEDIATION = (
+    "Run `loopx doctor --deep` and retry `loopx start-goal --guided`. If the "
+    "TypeScript control-plane runtime remains unavailable, repair or reinstall LoopX."
+)
+
+
+def _effect_runtime_startup_recommended_action(
+    diagnostic_code: str,
+    message: str,
+) -> str:
+    node_action = node_probe_remediation(diagnostic_code)
+    if node_action is not None:
+        return f"{node_action} Then retry `loopx start-goal --guided`."
+    if diagnostic_code == "invalid_idle_timeout":
+        # The TypeScript runtime owns the idle-timeout validation rules and
+        # publishes them as the typed startup message, so the projection must
+        # reuse that message rather than restate the accepted range here.
+        return f"{message} Then retry `loopx start-goal --guided`."
+    return _EFFECT_RUNTIME_STARTUP_REMEDIATION_BY_CODE.get(
+        diagnostic_code,
+        _EFFECT_RUNTIME_STARTUP_DEFAULT_REMEDIATION,
+    )
+
+
+def _effect_runtime_startup_failure_payload(
+    exc: EffectRuntimeStartupError,
+) -> dict[str, object]:
+    diagnostic_code = getattr(exc, "diagnostic_code", "runtime_startup_failed")
+    return {
+        "ok": False,
+        "schema_version": "loopx_start_goal_guided_v0",
+        "error": "LoopX TypeScript control-plane runtime is unavailable",
+        "diagnostic_code": diagnostic_code,
+        "runtime_requirement": {
+            "runtime": "node",
+            "minimum_node_version": MINIMUM_NODE_VERSION_TEXT,
+            "required_for": ["start-goal", "control_plane"],
+        },
+        "recommended_action": _effect_runtime_startup_recommended_action(
+            diagnostic_code,
+            str(exc),
+        ),
+    }
+
+
+def _render_start_goal_markdown(payload: dict[str, object]) -> str:
+    if payload.get("ok") is not False:
+        message = payload.get("message")
+        if isinstance(message, str):
+            return message
+        return render_start_goal_guided_markdown(payload)
+    lines = ["# Guided Start Goal", "", f"- error: `{payload.get('error')}`"]
+    for field in (
+        "error_code",
+        "diagnostic_code",
+        "recommended_action",
+        "suggested_command",
+    ):
+        value = payload.get(field)
+        if not value:
+            continue
+        rendered = value if field == "recommended_action" else f"`{value}`"
+        lines.append(f"- {field}: {rendered}")
+    return "\n".join(lines) + "\n"
+
+
+def _host_surface_environment_mismatch_payload(
+    *,
+    host_surface: str | None,
+    cli_bin: str,
+) -> dict[str, object] | None:
+    if host_surface != "codex-app" or not os.environ.get("CODEX_THREAD_ID"):
+        return None
+    ssh_evidence = [
+        variable for variable in _SSH_TRANSPORT_ENV_VARS if os.environ.get(variable)
+    ]
+    if not ssh_evidence:
+        return None
+    return {
+        "ok": False,
+        "schema_version": "loopx_start_goal_guided_v0",
+        "error_code": "host_surface_environment_mismatch",
+        "error": "Selected Codex App host surface conflicts with the detected SSH runtime",
+        "blocked_by": "host_surface_environment_mismatch",
+        "host_surface_environment_gate": {
+            "schema_version": "loopx_host_surface_environment_gate_v0",
+            "state": "blocked",
+            "requested_host_surface": host_surface,
+            "detected_runtime": "codex-app-over-ssh",
+            "required_host_surface": _CODEX_APP_SSH_HOST_SURFACE,
+            "evidence_env_vars": ["CODEX_THREAD_ID", *ssh_evidence],
+        },
+        "recommended_action": (
+            "Rerun the same command with `--host-surface codex-app-ssh`. "
+            "That profile emits the visible Goal task body through "
+            "`codex_app_ssh_goal` instead of requesting desktop heartbeat automation."
+        ),
+        "suggested_command": (
+            f"{cli_bin} start-goal --guided --host-surface codex-app-ssh ..."
+        ),
+        "safety_contract": {
+            "writes_registry": False,
+            "activates_host_loop": False,
+        },
+    }
 
 
 def add_capability_route_argument(parser: argparse.ArgumentParser) -> None:
@@ -52,6 +191,13 @@ def register_start_goal_command(subparsers: argparse._SubParsersAction) -> None:
     start_goal_parser.add_argument("--project", default=".", help="Project directory to inspect.")
     start_goal_parser.add_argument("--goal-id", help="Goal id. Defaults to <project-name>-goal.")
     start_goal_parser.add_argument(
+        "--display-name",
+        help=(
+            "Public display title for the goal. When omitted, a public-safe title "
+            "is derived from the goal text; the project name only remains as a fallback."
+        ),
+    )
+    start_goal_parser.add_argument(
         "--agent-id",
         help=(
             "Explicit registered LoopX identity for an ongoing session or exact "
@@ -63,7 +209,9 @@ def register_start_goal_command(subparsers: argparse._SubParsersAction) -> None:
         "--thread-id",
         help=(
             "Stable opaque host thread id used to reuse the bound agent lane. "
-            "Codex App defaults to the ambient CODEX_THREAD_ID when available."
+            "Codex App defaults to CODEX_THREAD_ID, Trae App to "
+            "TRAECLI_THREAD_ID, and Antigravity to ANTIGRAVITY_CONVERSATION_ID "
+            "(or <user_information> Conversation ID) when available."
         ),
     )
     start_goal_parser.add_argument(
@@ -107,9 +255,9 @@ def register_start_goal_command(subparsers: argparse._SubParsersAction) -> None:
     goal_input_group.add_argument(
         "--slash-command-arguments",
         help=(
-            "Complete visible /loopx arguments. The CLI consumes only an optional "
-            "leading --fine-grained and --capability-route switches and treats the "
-            "remainder as goal text. "
+            "Complete visible /loopx arguments. The CLI consumes optional leading "
+            "--fine-grained, --new-peer and --capability-route switches and treats "
+            "the remainder as goal text. "
             "Use --slash-command-arguments='<arguments>' when the value begins with --."
         ),
     )
@@ -123,12 +271,15 @@ def register_start_goal_command(subparsers: argparse._SubParsersAction) -> None:
     )
 
 
-def _resolve_start_goal_input(args: argparse.Namespace) -> tuple[str, str | None, bool]:
+def _resolve_start_goal_input(
+    args: argparse.Namespace,
+) -> tuple[str, str | None, bool, bool]:
     raw_arguments = getattr(args, "slash_command_arguments", None)
     capability_route = getattr(args, "capability_route", None)
     fine_grained = bool(getattr(args, "fine_grained", False))
+    new_peer = bool(getattr(args, "new_peer", False))
     if raw_arguments is None:
-        return str(args.goal_text), capability_route, fine_grained
+        return str(args.goal_text), capability_route, fine_grained, new_peer
     if capability_route is not None:
         raise ValueError(
             "--slash-command-arguments cannot be combined with --capability-route; "
@@ -139,12 +290,12 @@ def _resolve_start_goal_input(args: argparse.Namespace) -> tuple[str, str | None
             "--slash-command-arguments cannot be combined with --fine-grained; "
             "the raw argument string already owns leading switches"
         )
-
     normalized = str(raw_arguments).strip()
     if not normalized:
         raise ValueError("--slash-command-arguments must contain goal text")
     route = None
     parsed_fine_grained = False
+    parsed_new_peer = new_peer
     last_switch = None
     remainder = normalized
     while True:
@@ -158,6 +309,18 @@ def _resolve_start_goal_input(args: argparse.Namespace) -> tuple[str, str | None
                 raise ValueError("duplicate leading --fine-grained switch")
             parsed_fine_grained = True
             last_switch = _FINE_GRAINED_SWITCH
+            remainder = str(match.group("remainder") or "").strip()
+            continue
+        if remainder.startswith(_NEW_PEER_SWITCH):
+            match = _NEW_PEER_PREFIX.fullmatch(remainder)
+            if match is None:
+                raise ValueError(
+                    "malformed leading --new-peer in --slash-command-arguments"
+                )
+            if parsed_new_peer:
+                raise ValueError("duplicate leading --new-peer switch")
+            parsed_new_peer = True
+            last_switch = _NEW_PEER_SWITCH
             remainder = str(match.group("remainder") or "").strip()
             continue
         if remainder.startswith(_CAPABILITY_ROUTE_SWITCH):
@@ -184,15 +347,21 @@ def _resolve_start_goal_input(args: argparse.Namespace) -> tuple[str, str | None
             raise ValueError(
                 "--slash-command-arguments must contain goal text after --capability-route"
             )
+        if last_switch == _NEW_PEER_SWITCH:
+            raise ValueError(
+                "--slash-command-arguments must contain goal text after --new-peer"
+            )
         raise ValueError(
             "--slash-command-arguments must contain goal text after --fine-grained"
         )
-    return goal_text, route, parsed_fine_grained
+    return goal_text, route, parsed_fine_grained, parsed_new_peer
 
 
 def handle_start_goal_command(
     args: argparse.Namespace,
     print_payload: PrintPayload,
+    *,
+    runtime_root_arg: str | None = None,
 ) -> int:
     if not bool(getattr(args, "guided", False)):
         payload = {
@@ -201,10 +370,12 @@ def handle_start_goal_command(
             "error": "`loopx start-goal` currently requires --guided",
             "suggested_command": "loopx start-goal --guided --goal-text '<goal text>'",
         }
-        print_payload(payload, args.format, render_start_goal_guided_markdown)
+        print_payload(payload, args.format, _render_start_goal_markdown)
         return 2
     try:
-        goal_text, capability_route, fine_grained = _resolve_start_goal_input(args)
+        goal_text, capability_route, fine_grained, new_peer = _resolve_start_goal_input(
+            args
+        )
     except ValueError as exc:
         payload = {
             "ok": False,
@@ -215,37 +386,59 @@ def handle_start_goal_command(
                 "--slash-command-arguments='<exact /loopx arguments>'"
             ),
         }
-        print_payload(payload, args.format, render_start_goal_guided_markdown)
+        print_payload(payload, args.format, _render_start_goal_markdown)
         return 2
+    host_surface_mismatch = _host_surface_environment_mismatch_payload(
+        host_surface=args.host_surface,
+        cli_bin=args.cli_bin,
+    )
+    if host_surface_mismatch is not None:
+        print_payload(host_surface_mismatch, args.format, _render_start_goal_markdown)
+        return 2
+    display_name = args.display_name
     if not args.host_surface:
-        payload = build_start_goal_host_surface_selection_packet(
+        try:
+            payload = build_start_goal_host_surface_selection_packet(
+                project=Path(args.project),
+                goal_id=args.goal_id,
+                agent_id=args.agent_id,
+                thread_id=current_host_thread_id(args),
+                new_peer=new_peer,
+                cli_bin=args.cli_bin,
+                goal_text=goal_text,
+                available_capabilities=args.available_capabilities,
+                capability_route=capability_route,
+                fine_grained=fine_grained,
+                include_command_pack_detail=bool(args.include_command_pack_detail),
+                display_name=display_name,
+                runtime_root_arg=runtime_root_arg,
+            )
+        except EffectRuntimeStartupError as exc:
+            payload = _effect_runtime_startup_failure_payload(exc)
+            print_payload(payload, args.format, _render_start_goal_markdown)
+            return 1
+        print_payload(payload, args.format, _render_start_goal_markdown)
+        return 0
+    try:
+        payload = build_start_goal_guided_packet(
             project=Path(args.project),
             goal_id=args.goal_id,
             agent_id=args.agent_id,
             thread_id=current_host_thread_id(args),
-            new_peer=bool(getattr(args, "new_peer", False)),
+            new_peer=new_peer,
             cli_bin=args.cli_bin,
+            host_surface=args.host_surface,
             goal_text=goal_text,
             available_capabilities=args.available_capabilities,
             capability_route=capability_route,
             fine_grained=fine_grained,
             include_command_pack_detail=bool(args.include_command_pack_detail),
+            runtime_root_arg=runtime_root_arg,
+            display_name=display_name,
         )
-        print_payload(payload, args.format, render_start_goal_guided_markdown)
-        return 0
-    payload = build_start_goal_guided_packet(
-        project=Path(args.project),
-        goal_id=args.goal_id,
-        agent_id=args.agent_id,
-        thread_id=current_host_thread_id(args),
-        new_peer=bool(getattr(args, "new_peer", False)),
-        cli_bin=args.cli_bin,
-        host_surface=args.host_surface,
-        goal_text=goal_text,
-        available_capabilities=args.available_capabilities,
-        capability_route=capability_route,
-        fine_grained=fine_grained,
-        include_command_pack_detail=bool(args.include_command_pack_detail),
-    )
-    print_payload(payload, args.format, render_start_goal_guided_markdown)
+    except EffectRuntimeStartupError as exc:
+        payload = _effect_runtime_startup_failure_payload(exc)
+        print_payload(payload, args.format, _render_start_goal_markdown)
+        return 1
+    print_payload(payload, args.format, _render_start_goal_markdown)
     return 0

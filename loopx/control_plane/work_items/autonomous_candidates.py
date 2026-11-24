@@ -1,30 +1,21 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Callable
 
+from ..todos.todo_semantics import todo_priority_label, todo_priority_rank
 from ..todos.contract import normalize_todo_action_kind, normalize_todo_task_class
 
 
-AUTONOMOUS_PRIORITY_PATTERN = re.compile(r"^\s*\[(P[0-4][^\]]*)\]\s*(.+)$", re.I)
 MAX_AUTONOMOUS_TODO_CANDIDATES = 6
 MAX_AUTONOMOUS_BACKLOG_CANDIDATES = MAX_AUTONOMOUS_TODO_CANDIDATES
 
 
 def autonomous_priority_label(text: str) -> str | None:
-    match = AUTONOMOUS_PRIORITY_PATTERN.match(text)
-    if not match:
-        return None
-    return match.group(1).strip().upper()
+    return todo_priority_label({"text": text})
 
 
 def autonomous_priority_rank(priority: str | None) -> int:
-    if not priority:
-        return 50
-    match = re.match(r"P([0-4])", priority)
-    if not match:
-        return 50
-    return int(match.group(1))
+    return todo_priority_rank(priority)
 
 
 def autonomous_todo_candidates(

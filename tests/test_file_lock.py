@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
+import loopx.file_lock as file_lock
 from loopx.file_lock import (
     LOCK_ACQUIRE_TIMEOUT_ERROR_CODE,
     LockAcquireTimeoutError,
+    _safe_label,
+    exclusive_cross_runtime_file_lock,
     exclusive_file_lock,
+    exclusive_mutation_file_lock,
     fcntl,
     lock_holder_path,
     lock_incident_path,
     msvcrt,
+    process_is_alive,
     try_exclusive_file_lock,
 )
 from loopx.presentation.markdown import append_operator_action_markdown
@@ -26,8 +34,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _start_stalled_holder(target: Path) -> subprocess.Popen[str]:
+def _start_stalled_holder(
+    target: Path,
+) -> tuple[subprocess.Popen[str], int, int]:
+    """Start a holder and report the pid and parent pid the holder runs as.
+
+    On Windows a virtual-environment ``python.exe`` is a redirector that starts
+    the real interpreter as its child, so ``Popen.pid`` names the redirector and
+    not the pid the holder writes. The holder reports both its own pid and its
+    parent, which keeps the launched-process channel for the assertions.
+    """
     script = """
+import os
 import sys
 import time
 from pathlib import Path
@@ -39,7 +57,7 @@ with exclusive_file_lock(
     agent_id="holder-agent",
     operation="stalled-holder",
 ):
-    print("ready", flush=True)
+    print(f"ready {os.getpid()} {os.getppid()}", flush=True)
     time.sleep(30)
 """
     process = subprocess.Popen(
@@ -49,8 +67,10 @@ with exclusive_file_lock(
         text=True,
     )
     assert process.stdout is not None
-    assert process.stdout.readline().strip() == "ready"
-    return process
+    ready = process.stdout.readline().strip().split()
+    assert len(ready) == 3 and ready[0] == "ready"
+    assert ready[1].isdigit() and ready[2].isdigit()
+    return process, int(ready[1]), int(ready[2])
 
 
 def _stop(process: subprocess.Popen[str]) -> None:
@@ -60,6 +80,20 @@ def _stop(process: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=3)
+
+
+def _acquire_and_release_cross_runtime_lock(
+    target: Path,
+    *,
+    timeout_seconds: float | None = None,
+    operation: str | None = None,
+) -> None:
+    with exclusive_cross_runtime_file_lock(
+        target,
+        timeout_seconds=timeout_seconds,
+        operation=operation,
+    ):
+        pass
 
 
 def test_exclusive_lock_persists_public_safe_holder_metadata(tmp_path: Path) -> None:
@@ -73,6 +107,9 @@ def test_exclusive_lock_persists_public_safe_holder_metadata(tmp_path: Path) -> 
         holder_path = lock_holder_path(target)
         holder = json.loads(holder_path.read_text(encoding="utf-8"))
         assert holder["pid"] > 0
+        # The record names its own machine, so a reader on another host that
+        # shares this runtime root never treats the pid as local.
+        assert holder["host"] == _safe_label(socket.gethostname(), fallback="unknown")
         assert holder["agent_id"] == "agent-a"
         assert holder["operation"] == "todo-update"
         assert holder["acquired_at"].endswith("Z")
@@ -84,9 +121,36 @@ def test_exclusive_lock_persists_public_safe_holder_metadata(tmp_path: Path) -> 
     assert holder_path.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires privileges")
+def test_exclusive_lock_rejects_a_symlinked_lock_file(tmp_path: Path) -> None:
+    target = tmp_path / "state.json"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("unchanged\n", encoding="utf-8")
+    target.with_name(f"{target.name}.lock").symlink_to(victim)
+
+    with pytest.raises(OSError):
+        with exclusive_file_lock(target):
+            pytest.fail("symlinked lock file was accepted")
+
+    assert victim.read_text(encoding="utf-8") == "unchanged\n"
+
+
+def test_exclusive_lock_rejects_a_hard_linked_lock_file(tmp_path: Path) -> None:
+    target = tmp_path / "state.json"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("unchanged\n", encoding="utf-8")
+    os.link(victim, target.with_name(f"{target.name}.lock"))
+
+    with pytest.raises(OSError):
+        with exclusive_file_lock(target):
+            pytest.fail("hard-linked lock file was accepted")
+
+    assert victim.read_text(encoding="utf-8") == "unchanged\n"
+
+
 def test_stalled_holder_times_out_and_records_independent_incident(tmp_path: Path) -> None:
     target = tmp_path / "todos.md"
-    process = _start_stalled_holder(target)
+    process, holder_pid, holder_parent_pid = _start_stalled_holder(target)
     try:
         with pytest.raises(LockAcquireTimeoutError) as raised:
             with exclusive_file_lock(
@@ -103,10 +167,27 @@ def test_stalled_holder_times_out_and_records_independent_incident(tmp_path: Pat
         assert payload["error_code"] == LOCK_ACQUIRE_TIMEOUT_ERROR_CODE
         assert payload["incident_recorded"] is True
         incident = payload["lock_timeout"]
-        assert incident["holder"]["pid"] == process.pid
+        assert incident["holder"]["pid"] == holder_pid
+        # The named pid must belong to the process this test launched, or to
+        # the interpreter that process launched directly. A pid from anywhere
+        # else sends the operator to an unrelated process.
+        assert process.pid in {holder_pid, holder_parent_pid}
+        # The waiter must never record itself, and the named pid must be a live
+        # process on this host rather than a stale or fabricated value.
+        assert holder_pid != os.getpid()
+        assert process_is_alive(holder_pid)
+        assert incident["holder"]["host"] == _safe_label(
+            socket.gethostname(), fallback="unknown"
+        )
         assert incident["holder"]["agent_id"] == "holder-agent"
         assert incident["waiter"]["agent_id"] == "waiter-agent"
         assert incident["waiter"]["waited_seconds"] >= 0.1
+        # The refused waiter learns which machine holds the pid, so the operator
+        # looks for it on the right host instead of assuming it is local.
+        assert (
+            incident["operator_action"]["holder_host"]
+            == incident["holder"]["host"]
+        )
         assert incident["operator_action"]["retry_mode"] == (
             "manual_after_holder_inspection"
         )
@@ -114,7 +195,7 @@ def test_stalled_holder_times_out_and_records_independent_incident(tmp_path: Pat
         append_operator_action_markdown(markdown_lines, payload)
         markdown = "\n".join(markdown_lines)
         assert "error_code: `lock_acquire_timeout`" in markdown
-        assert f"holder_pid={process.pid}" in markdown
+        assert f"holder_pid={holder_pid}" in markdown
         assert "Do not delete the lock file" in markdown
 
         rows = lock_incident_path(target).read_text(encoding="utf-8").splitlines()
@@ -128,12 +209,545 @@ def test_stalled_holder_times_out_and_records_independent_incident(tmp_path: Pat
     assert target.with_name(f"{target.name}.lock").exists()
 
 
+def test_marker_timeout_keeps_a_live_kernel_holder_out_of_operator_action(tmp_path: Path) -> None:
+    target = tmp_path / "state.json"
+    process, holder_pid, _ = _start_stalled_holder(target)
+    try:
+        with exclusive_mutation_file_lock(target) as marker:
+            token = json.loads(marker.read_text(encoding="utf-8"))["token"]
+            with pytest.raises(LockAcquireTimeoutError) as raised:
+                with exclusive_mutation_file_lock(target, timeout_seconds=0):
+                    pytest.fail("waiter entered while the mutation marker was owned")
+        payload = raised.value.to_payload()
+        incident = payload["lock_timeout"]
+        assert incident["holder"] == {}
+        assert incident["last_kernel_holder"]["pid"] == holder_pid
+        assert payload["operator_action"]["holder_pid"] is None
+        assert "mutation marker" in payload["operator_action"]["steps"][0]
+        assert "current holder unknown" in str(raised.value)
+        assert token not in json.dumps(payload)
+        assert process.poll() is None
+    finally:
+        _stop(process)
+
+
+def test_kernel_timeout_ignores_an_out_of_range_pid_in_the_record(tmp_path: Path) -> None:
+    target = tmp_path / "state.json"
+    process, _, _ = _start_stalled_holder(target)
+    try:
+        holder_path = lock_holder_path(target)
+        holder = json.loads(holder_path.read_text(encoding="utf-8"))
+        holder["pid"] = 1 << 64
+        holder_path.write_text(json.dumps(holder), encoding="utf-8")
+        with pytest.raises(LockAcquireTimeoutError) as raised:
+            with exclusive_file_lock(target, timeout_seconds=0):
+                pytest.fail("waiter entered while the kernel lock was owned")
+        assert raised.value.incident["holder"] == {}
+        assert raised.value.incident["last_kernel_holder"] == holder
+        assert "current holder unknown" in str(raised.value)
+    finally:
+        _stop(process)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires privileges")
+def test_lock_timeout_does_not_follow_a_symlinked_incident_file(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "todos.md"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("unchanged\n", encoding="utf-8")
+    process, _, _ = _start_stalled_holder(target)
+    try:
+        lock_incident_path(target).symlink_to(victim)
+        with pytest.raises(LockAcquireTimeoutError) as raised:
+            with exclusive_file_lock(
+                target,
+                timeout_seconds=0.05,
+                poll_interval_seconds=0.01,
+            ):
+                pytest.fail("waiter unexpectedly acquired the stalled lock")
+
+        assert raised.value.incident_recorded is False
+        assert victim.read_text(encoding="utf-8") == "unchanged\n"
+    finally:
+        _stop(process)
+
+
 def test_single_flight_returns_none_without_timeout_incident(tmp_path: Path) -> None:
     target = tmp_path / "sync.json"
-    process = _start_stalled_holder(target)
+    process, _, _ = _start_stalled_holder(target)
     try:
         with try_exclusive_file_lock(target, operation="duplicate-sync") as lock_path:
             assert lock_path is None
         assert not lock_incident_path(target).exists()
     finally:
         _stop(process)
+
+
+def test_cross_runtime_lock_publishes_the_typescript_owner_file(tmp_path: Path) -> None:
+    target = tmp_path / ".task-leases"
+    effect_lock = Path(f"{target}.ts-effect.lock")
+
+    with exclusive_cross_runtime_file_lock(target, operation="task-lease-renew"):
+        owner = json.loads(effect_lock.read_text(encoding="utf-8"))
+        assert owner["pid"] == os.getpid()
+        assert isinstance(owner["token"], str)
+        assert target.with_name(f"{target.name}.lock").exists()
+
+    assert not effect_lock.exists()
+
+
+def test_cross_runtime_lock_respects_a_live_typescript_holder(tmp_path: Path) -> None:
+    target = tmp_path / ".task-leases"
+    effect_lock = Path(f"{target}.ts-effect.lock")
+    effect_lock.write_text(
+        json.dumps({"pid": os.getpid(), "token": "typescript-holder"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LockAcquireTimeoutError):
+        _acquire_and_release_cross_runtime_lock(
+            target,
+            timeout_seconds=0,
+            operation="task-lease-release",
+        )
+
+
+def test_cross_runtime_windows_pid_probe_is_non_signaling(monkeypatch) -> None:
+    calls: list[int] = []
+
+    def probe(pid: int) -> bool:
+        calls.append(pid)
+        return True
+
+    monkeypatch.setattr(file_lock, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(file_lock, "_windows_process_is_alive", probe)
+
+    assert file_lock._effect_mutation_process_is_alive(1234) is True
+    assert calls == [1234]
+
+
+def test_cross_runtime_lock_reclaims_a_dead_typescript_holder(tmp_path: Path) -> None:
+    target = tmp_path / ".task-leases"
+    effect_lock = Path(f"{target}.ts-effect.lock")
+    effect_lock.write_text(
+        json.dumps({"pid": 2_147_483_647, "token": "dead-holder"}),
+        encoding="utf-8",
+    )
+
+    with exclusive_cross_runtime_file_lock(
+        target,
+        timeout_seconds=0.2,
+        operation="task-lease-transfer",
+    ):
+        owner = json.loads(effect_lock.read_text(encoding="utf-8"))
+        assert owner["pid"] == os.getpid()
+
+    assert not effect_lock.exists()
+
+
+def test_cross_runtime_lock_reclaims_a_stale_malformed_holder(tmp_path: Path) -> None:
+    target = tmp_path / ".task-leases"
+    effect_lock = Path(f"{target}.ts-effect.lock")
+    effect_lock.write_text(
+        json.dumps({"pid": os.getpid(), "token": "   "}),
+        encoding="utf-8",
+    )
+    stale = effect_lock.stat().st_mtime - 60.0
+    os.utime(effect_lock, (stale, stale))
+
+    with exclusive_cross_runtime_file_lock(
+        target,
+        timeout_seconds=0.2,
+        operation="task-lease-release",
+    ):
+        owner = json.loads(effect_lock.read_text(encoding="utf-8"))
+        assert owner["pid"] == os.getpid()
+        assert owner["token"] != "   "
+
+    assert not effect_lock.exists()
+
+
+def test_cross_runtime_release_does_not_remove_a_replacement_token(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / ".task-leases"
+    effect_lock = Path(f"{target}.ts-effect.lock")
+    effect_lock.parent.mkdir(parents=True, exist_ok=True)
+    effect_lock.write_text(
+        json.dumps({"pid": os.getpid(), "token": "replacement-token"}),
+        encoding="utf-8",
+    )
+
+    assert file_lock._release_effect_mutation_lock(
+        effect_lock,
+        "old-token",
+    ) is False
+    assert effect_lock.exists()
+    assert json.loads(effect_lock.read_text(encoding="utf-8"))["token"] == (
+        "replacement-token"
+    )
+    effect_lock.unlink()
+
+
+def test_cross_runtime_recovery_releases_only_the_owned_token(tmp_path: Path) -> None:
+    target = tmp_path / ".task-leases"
+    effect_lock = Path(f"{target}.ts-effect.lock")
+    effect_lock.write_text(
+        json.dumps({"pid": os.getpid(), "token": "held-token"}),
+        encoding="utf-8",
+    )
+
+    assert not file_lock.release_cross_runtime_mutation_lock(
+        target,
+        **{"token": "replacement-token"},
+    )
+    assert effect_lock.exists()
+    assert file_lock.release_cross_runtime_mutation_lock(
+        target,
+        **{"token": "held-token"},
+    )
+    assert not effect_lock.exists()
+
+
+def test_cross_runtime_lock_cleans_up_a_failed_owner_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / ".task-leases"
+    effect_lock = Path(f"{target}.ts-effect.lock")
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError("simulated owner publication failure")
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+    with pytest.raises(OSError, match="owner publication failure"):
+        _acquire_and_release_cross_runtime_lock(target)
+
+    assert not effect_lock.exists()
+
+
+def test_cross_runtime_identity_fails_closed_for_ambiguous_or_reused_files() -> None:
+    assert not file_lock._same_effect_file_identity(
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    )
+    assert not file_lock._same_effect_file_identity(
+        (7, 11, 100, 200),
+        (7, 11, 101, 200),
+    )
+    assert file_lock._same_effect_file_identity(
+        (7, 11, 100, 200),
+        (7, 11, 100, 999),
+    )
+    assert file_lock._same_effect_file_identity(
+        (7, 11, 0, 200),
+        (7, 11, 0, 201),
+    )
+
+
+@pytest.mark.parametrize("contents", [b"not-json", b"\xff"])
+def test_cross_runtime_claim_cleanup_removes_own_corrupted_claim(
+    tmp_path: Path,
+    contents: bytes,
+) -> None:
+    target = tmp_path / ".task-leases"
+    claim = file_lock._claim_effect_mutation_lock(target, "claim-token")
+    assert claim is not None
+    claim.path.write_bytes(contents)
+
+    file_lock._release_effect_mutation_claim(claim)
+
+    assert not claim.path.exists()
+
+
+def test_cross_runtime_claim_cleanup_keeps_a_replacement_inode(tmp_path: Path) -> None:
+    target = tmp_path / ".task-leases"
+    claim = file_lock._claim_effect_mutation_lock(target, "claim-token")
+    assert claim is not None
+    replacement = tmp_path / "replacement"
+    contents = claim.path.read_bytes()
+    replacement.write_bytes(contents)
+    replacement.replace(claim.path)
+
+    file_lock._release_effect_mutation_claim(claim)
+
+    assert claim.path.read_bytes() == contents
+
+
+@pytest.mark.parametrize("part", ["claim", "released"])
+def test_cross_runtime_release_retries_transient_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    part: str,
+) -> None:
+    target = tmp_path / ".task-leases"
+    effect_lock = Path(f"{target}.ts-effect.lock")
+    unlink = Path.unlink
+    attempts = 0
+
+    def unlink_with_one_failure(path: Path, missing_ok: bool = False) -> None:
+        nonlocal attempts
+        if path.name.startswith(f"{effect_lock.name}.{part}."):
+            attempts += 1
+            if attempts == 1:
+                raise OSError("simulated marker cleanup failure")
+        unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink_with_one_failure)
+    with exclusive_cross_runtime_file_lock(target):
+        assert effect_lock.exists()
+
+    assert attempts == 2
+    assert not effect_lock.exists()
+    assert not list(tmp_path.glob(f"{effect_lock.name}.{part}.*"))
+
+
+def test_cross_runtime_cleanup_failure_cannot_replace_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / ".task-leases"
+    calls: list[bool] = []
+
+    def fake_release(*args: object, **kwargs: object) -> bool:
+        calls.append(kwargs.get("suppress_errors") is True)
+        return False
+
+    monkeypatch.setattr(file_lock, "_release_effect_mutation_lock", fake_release)
+    with exclusive_cross_runtime_file_lock(target, timeout_seconds=0.2):
+        pass
+
+    assert calls == [True, True]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 extended path regression")
+def test_long_lock_paths_release_and_keep_one_identity(tmp_path):
+    from loopx.control_plane.runtime.file_paths import windows_extended_path
+
+    target = tmp_path / ("nested-" * 12) / ("a" * 64 + ".json")
+    extended = windows_extended_path(target)
+    assert file_lock._lock_id(target) == file_lock._lock_id(extended)
+    with exclusive_cross_runtime_file_lock(target):
+        assert file_lock.cross_runtime_lock_witness(target)["token"]
+    # Long claim-file cleanup must succeed while this process is still alive.
+    with exclusive_cross_runtime_file_lock(extended, timeout_seconds=0):
+        with pytest.raises(LockAcquireTimeoutError):
+            with exclusive_cross_runtime_file_lock(target, timeout_seconds=0):
+                pytest.fail("normal and extended addresses acquired two locks")
+    assert not file_lock._effect_mutation_lock_path(target).exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 extended path regression")
+def test_long_lock_paths_exclude_other_process_and_release_while_holder_alive(tmp_path):
+    from loopx.control_plane.runtime.file_paths import windows_extended_path
+
+    target = tmp_path / ("nested-" * 24) / ("a" * 64 + ".json")
+    assert len(str(target)) > 260
+    extended = windows_extended_path(target)
+    script = """
+import sys
+from pathlib import Path
+from loopx.file_lock import exclusive_cross_runtime_file_lock
+with exclusive_cross_runtime_file_lock(Path(sys.argv[1])):
+    print("ready", flush=True)
+    sys.stdin.readline()
+print("released", flush=True)
+sys.stdin.readline()
+"""
+    holder = subprocess.Popen([sys.executable, "-c", script, str(target)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout is not None and holder.stdin is not None
+        assert holder.stdout.readline().strip() == "ready"
+        with pytest.raises(LockAcquireTimeoutError):
+            with exclusive_cross_runtime_file_lock(extended, timeout_seconds=0):
+                pytest.fail("extended address bypassed another process's lock")
+        holder.stdin.write("release\n")
+        holder.stdin.flush()
+        assert holder.stdout.readline().strip() == "released"
+        assert holder.poll() is None
+        with exclusive_cross_runtime_file_lock(extended, timeout_seconds=0):
+            assert file_lock._lock_id(target) == file_lock._lock_id(extended)
+        assert not file_lock._effect_mutation_lock_path(target).exists()
+    finally:
+        _stop(holder)
+
+
+class _WindowsNamedOs:
+    """The real ``os`` module reporting Windows, so any CI host can exercise
+    the Windows holder layout. Kernel locking still uses the host backend."""
+
+    name = "nt"
+
+    def __getattr__(self, attribute: str) -> object:
+        return getattr(os, attribute)
+
+
+@pytest.fixture
+def windows_holder_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(file_lock, "os", _WindowsNamedOs())
+    monkeypatch.setattr(
+        file_lock, "_windows_process_is_alive", lambda pid: pid == os.getpid()
+    )
+
+
+def _holder_fields(**fields: object) -> dict[str, object]:
+    return {
+        "schema_version": file_lock.LOCK_HOLDER_SCHEMA_VERSION,
+        "lock_id": "0" * 16,
+        "policy": "mutation",
+        "host": file_lock.lock_holder_host_label(),
+        "pid": os.getpid(),
+        "agent_id": "agent-a",
+        "operation": "todo-update",
+        **fields,
+    }
+
+
+def test_posix_holder_liveness_reads_the_lock_file_record(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX keeps the holder record inside the lock file")
+    target = tmp_path / "state.json"
+    assert file_lock.lock_holder_paths(target) == (lock_holder_path(target),)
+    assert file_lock.lock_holder_liveness(target) == (file_lock.LOCK_HOLDER_ABSENT, {})
+
+    with exclusive_file_lock(target, agent_id="agent-a"):
+        state, record = file_lock.lock_holder_liveness(target)
+        assert state == file_lock.LOCK_HOLDER_LIVE
+        assert record["agent_id"] == "agent-a"
+    assert file_lock.lock_holder_liveness(target)[0] == file_lock.LOCK_HOLDER_RELEASED
+
+    lock_holder_path(target).write_text("not json", encoding="utf-8")
+    assert file_lock.lock_holder_liveness(target) == (
+        file_lock.LOCK_HOLDER_UNREADABLE,
+        {},
+    )
+
+
+def test_windows_holder_sidecar_is_not_a_json_state_file(
+    tmp_path: Path, windows_holder_layout: None
+) -> None:
+    target = tmp_path / "state.json"
+    target.write_text("{}", encoding="utf-8")
+
+    with exclusive_file_lock(target, agent_id="agent-a"):
+        assert lock_holder_path(target).name == "state.json.lock.holder"
+        assert sorted(path.name for path in tmp_path.glob("*.json")) == ["state.json"]
+        assert file_lock.lock_holder_liveness(target)[0] == file_lock.LOCK_HOLDER_LIVE
+
+    # The released record persists, and still must not look like state.
+    assert lock_holder_path(target).exists()
+    assert sorted(path.name for path in tmp_path.glob("*.json")) == ["state.json"]
+    assert file_lock.lock_holder_liveness(target)[0] == file_lock.LOCK_HOLDER_RELEASED
+
+
+def test_windows_holder_removes_a_legacy_json_sidecar_on_acquire(
+    tmp_path: Path, windows_holder_layout: None
+) -> None:
+    target = tmp_path / "state.json"
+    legacy = tmp_path / "state.json.lock.holder.json"
+    legacy.write_text(
+        json.dumps(_holder_fields(acquired_at="2026-01-01T00:00:00Z")),
+        encoding="utf-8",
+    )
+    # An older release holding the lock stays visible until a new holder runs.
+    assert file_lock.lock_holder_liveness(target)[0] == file_lock.LOCK_HOLDER_LIVE
+
+    with try_exclusive_file_lock(target) as acquired:
+        assert acquired is not None
+        assert not legacy.exists()
+    assert list(tmp_path.glob("*.json")) == []
+    assert file_lock.lock_holder_liveness(target)[0] == file_lock.LOCK_HOLDER_RELEASED
+
+
+def test_windows_holder_reader_prefers_the_latest_acquisition(
+    tmp_path: Path, windows_holder_layout: None
+) -> None:
+    # Upgrade window: a newer release left a released record, then an older
+    # process acquired the same lock and wrote the legacy name.
+    target = tmp_path / "state.json"
+    (tmp_path / "state.json.lock.holder").write_text(
+        json.dumps(
+            _holder_fields(
+                acquired_at="2026-01-01T00:00:00Z",
+                released_at="2026-01-01T00:00:01Z",
+            )
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "state.json.lock.holder.json").write_text(
+        json.dumps(_holder_fields(acquired_at="2026-01-01T00:00:02Z")),
+        encoding="utf-8",
+    )
+
+    state, record = file_lock.lock_holder_liveness(target)
+    assert state == file_lock.LOCK_HOLDER_LIVE
+    assert record["acquired_at"] == "2026-01-01T00:00:02Z"
+
+
+@pytest.mark.parametrize("payload", [b"\xff\xfe", b'{"pid": "\xe2\x82'])
+def test_holder_liveness_treats_invalid_utf8_as_unreadable(
+    tmp_path: Path, payload: bytes
+) -> None:
+    target = tmp_path / "state.json"
+    holder = lock_holder_path(target)
+    holder.write_bytes(payload)
+
+    assert file_lock.lock_holder_liveness(target) == (
+        file_lock.LOCK_HOLDER_UNREADABLE,
+        {},
+    )
+    assert holder.read_bytes() == payload
+
+
+@pytest.mark.parametrize("corrupt_current", [True, False])
+def test_windows_holder_reader_keeps_valid_record_when_other_name_is_invalid_utf8(
+    tmp_path: Path, windows_holder_layout: None, corrupt_current: bool
+) -> None:
+    target = tmp_path / "state.json"
+    current, legacy = file_lock.lock_holder_paths(target)
+    corrupt, valid = (current, legacy) if corrupt_current else (legacy, current)
+    corrupt.write_bytes(b"\xff\xfe")
+    expected = _holder_fields(acquired_at="2026-01-01T00:00:00Z")
+    valid.write_text(json.dumps(expected), encoding="utf-8")
+
+    assert file_lock.lock_holder_liveness(target) == (
+        file_lock.LOCK_HOLDER_LIVE,
+        expected,
+    )
+    assert corrupt.read_bytes() == b"\xff\xfe"
+
+
+def test_invalid_utf8_holder_preserves_timeout_incident_and_lock_recovery(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "state.json"
+    target.write_text("{}", encoding="utf-8")
+    process, _, _ = _start_stalled_holder(target)
+    holder = lock_holder_path(target)
+    try:
+        # Only corrupt disposable advisory metadata, never a live user lock.
+        holder.write_bytes(b"\xff\xfe")
+        with pytest.raises(LockAcquireTimeoutError) as raised:
+            with exclusive_file_lock(target, timeout_seconds=0):
+                pytest.fail("corrupt metadata bypassed the held kernel lock")
+
+        payload = raised.value.to_payload()
+        assert payload["error_code"] == LOCK_ACQUIRE_TIMEOUT_ERROR_CODE
+        assert payload["incident_recorded"] is True
+        assert payload["lock_timeout"]["holder"] == {}
+        assert payload["operator_action"]["action"] == "inspect_lock_holder"
+        incidents = lock_incident_path(target).read_text(encoding="utf-8").splitlines()
+        assert len(incidents) == 1
+        assert json.loads(incidents[0]) == payload["lock_timeout"]
+        assert holder.read_bytes() == b"\xff\xfe"
+        assert process.poll() is None
+        assert target.read_text(encoding="utf-8") == "{}"
+    finally:
+        _stop(process)
+
+    # Once the real holder exits, normal acquisition replaces corrupt metadata.
+    with exclusive_file_lock(target, timeout_seconds=0):
+        assert file_lock.lock_holder_liveness(target)[0] == file_lock.LOCK_HOLDER_LIVE
+    assert file_lock.lock_holder_liveness(target)[0] == file_lock.LOCK_HOLDER_RELEASED

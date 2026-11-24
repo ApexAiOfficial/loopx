@@ -13,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from loopx.quota import build_quota_should_run, build_quota_slot_preview  # noqa: E402
+from loopx.control_plane.testing.quota_fixtures import quota_todo_summary  # noqa: E402
 from loopx.control_plane.scheduler.execution_context import (  # noqa: E402
     GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
 )
@@ -57,18 +58,8 @@ def status_payload(
     available_capabilities: list[str] | None = None,
     registered_agent: str | None = None,
 ) -> dict[str, Any]:
-    summary = {
-        "schema_version": "todo_summary_v0",
-        "source_section": "Agent Todo",
-        "total_count": len(items),
-        "open_count": len(items),
-        "done_count": 0,
-        "first_open_items": items[:3],
-        "first_executable_items": items[:3],
-        "backlog_items": items[:8],
-        "executable_backlog_items": items[:8],
-        "monitor_open_items": [],
-    }
+    summary = quota_todo_summary(items)
+
     quota = {
         "compute": 1.0,
         "window_hours": 24,
@@ -187,7 +178,8 @@ def main() -> int:
         "primary_blocked_todo_id"
     ] == "todo_capability_1", p0_fallback
     assert p0_fallback["recommended_action"] == p0_validate["text"], p0_fallback
-    assert "choose one of 2 capability-runnable todo(s)" in p0_fallback["protocol_action_packet"]["summary"], p0_fallback
+    assert "choose one of 2 capability-runnable todo(s)" in p0_fallback["interaction_contract"]["agent_channel"]["primary_action"], p0_fallback
+    assert "protocol_action_packet" not in p0_fallback, p0_fallback
 
     fallback = build_quota_should_run(
         status_payload([p0_benchmark, p0_network, p1_gpu, p1_docs]),
@@ -210,7 +202,8 @@ def main() -> int:
     assert fallback["capability_gate"]["blocked_candidates"][1]["missing_capabilities"] == ["network"], fallback
     assert fallback["capability_gate"]["blocked_candidates"][2]["missing_capabilities"] == ["gpu_runner"], fallback
     assert fallback["recommended_action"] == p1_docs["text"], fallback
-    assert "choose one of 1 capability-runnable todo(s)" in fallback["protocol_action_packet"]["summary"], fallback
+    assert "choose one of 1 capability-runnable todo(s)" in fallback["interaction_contract"]["agent_channel"]["primary_action"], fallback
+    assert "protocol_action_packet" not in fallback, fallback
 
     repair_candidate = build_quota_should_run(
         status_payload([p0_repair_benchmark_bridge, p0_benchmark, p1_docs]),
@@ -374,15 +367,38 @@ def main() -> int:
         "provide or authorize the missing owner-held capability: credentials "
         "for todo_capability_9"
     ], owner_with_fallback
+    # A runnable recommendation is not a Turn binding. Keep the owner notice,
+    # but require explicit selection before projecting write/spend commands.
+    unbound = owner_with_fallback["interaction_contract"]
+    assert unbound["agent_channel"]["delivery_allowed"] is False, unbound
+    assert unbound["cli_channel"]["selection_required"] is True, unbound
+    assert unbound["cli_channel"]["next_cli_actions"] == [], unbound
+    assert unbound["cli_channel"]["spend_after_validation"] is False, unbound
+    assert "--todo-id '{todo_id}'" in unbound["cli_channel"][
+        "selection_command"
+    ]["command_args_template"], unbound
+
+    # This pure projection receives an already-bound receipt as input; real
+    # receipt acquisition and canonical recovery are covered by CLI smokes.
+    bound_fallback = build_quota_should_run(
+        status_payload([credentials_todo, p1_docs], registered_agent=AGENT_ID),
+        goal_id=GOAL_ID,
+        agent_id=AGENT_ID,
+        available_capabilities=["shell", "filesystem_write"],
+        scheduler_execution_context=SCHEDULER_CONTEXT,
+        receipt_bound_todo_id=p1_docs["todo_id"],
+    )
+    bound = bound_fallback["interaction_contract"]
+    assert bound["agent_channel"]["delivery_allowed"] is True, bound
+    assert bound["cli_channel"]["spend_after_validation"] is True, bound
+    assert bound["user_channel"] == unbound["user_channel"], bound
     assert any(
         "--task-class user_gate" in action
         and "--target-capability credentials" in action
         and f"--blocks-agent {AGENT_ID}" in action
         and "--unblocks-todo-id todo_capability_9" in action
-        for action in owner_with_fallback["interaction_contract"]["cli_channel"][
-            "next_cli_actions"
-        ]
-    ), owner_with_fallback
+        for action in bound["cli_channel"]["next_cli_actions"]
+    ), bound_fallback
 
     mixed_capability_todo = todo(
         8,
@@ -394,6 +410,7 @@ def main() -> int:
         status_payload([mixed_capability_todo]),
         goal_id=GOAL_ID,
         available_capabilities=["shell", "filesystem_write"],
+        scheduler_execution_context=SCHEDULER_CONTEXT,
     )
     mixed_gate = mixed_owner_gate["capability_gate"]
     assert mixed_gate["action"] == "ask_owner", mixed_owner_gate
@@ -424,6 +441,7 @@ def main() -> int:
             "credentials",
             "external_evidence_poll",
         ],
+        scheduler_execution_context=SCHEDULER_CONTEXT,
     )
     assert mixed_ready["capability_gate"]["action"] == "run", mixed_ready
     assert mixed_ready["interaction_contract"]["user_channel"]["action_required"] is False

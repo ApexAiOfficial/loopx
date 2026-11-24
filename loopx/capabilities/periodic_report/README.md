@@ -6,9 +6,15 @@ presentation, and destinations to profiles and adapters.
 
 | Surface | Value |
 | --- | --- |
-| CLI | `loopx periodic-report inspect-profile --preset weekly`, custom `--profile-json <path>`, `evaluate-trigger`, `compose-run`, and optional `archive-openviking` |
+| CLI | `loopx periodic-report inspect-profile --preset weekly`, `request`, `consume-pending`, custom `--profile-json <path>`, `evaluate-trigger`, `evaluate-runtime-trigger`, `compose-run`, and optional `archive-openviking` |
 | Protocol | [`periodic_report_v0`](../../../docs/reference/protocols/periodic-report-v0.md) |
 | Smokes | `python3 examples/periodic-report-smoke.py`, `periodic-report-profile-smoke.py`, `periodic-report-html-smoke.py`, `periodic-report-bindings-smoke.py`, and `openviking-periodic-report-extension-smoke.py` |
+
+Reports can explicitly request human review through `request-review`. The
+original managed Session calendar can opt in with `review_required: true`.
+Both use canonical User Todos for per-edition handling, with a Home reminder
+and a reader in App results. See [review work materials](../../../docs/guides/review-materials.md).
+Generation, reading, human handling and whole-Goal acceptance remain distinct.
 
 ## Generate this week's report
 
@@ -56,6 +62,93 @@ research, operations, and other domains may supply peer source adapters when
 their richer semantics are useful; none is required by the built-in weekly
 profile.
 
+## Request from a Goal Channel
+
+After an Agent reads one addressed Goal Channel item and semantically decides
+that the user is asking it for a report, it records that decision explicitly:
+
+```bash
+loopx periodic-report request \
+  --goal-id <goal-id> \
+  --agent-id <agent-id> \
+  --source-ref <message-id> \
+  --execute
+```
+
+When exactly one complete source adapter is active, the command selects it
+automatically. With multiple active providers, the Agent selects the provider
+explicitly with `--source-adapter-id <adapter-id>`. The journal retains that
+adapter identity, and later settlement resolves only that owner regardless of
+extension discovery order. A temporarily unavailable owner leaves the request
+pending; LoopX never falls through to another provider. A declared adapter
+that was not activated is reported by adapter id with a content-free code and
+the `loopx extension doctor` next step instead of being silently dropped:
+`extension_disabled` or `extension_doctor_not_ready` for a disabled or
+doctor-stale extension, whose factory is never imported, and
+`extension_hook_adapter_unavailable` (or an incomplete/ambiguous port code)
+when a ready extension fails its permission check, factory import or port
+contract. An unreadable extension state is reported as
+`extension_state_unavailable`, with or without `--source-adapter-id`, rather
+than as "no provider installed".
+
+The adapter id is part of the request idempotency namespace together with the
+Goal, Agent, and provider-local source reference. Two providers may therefore
+use the same opaque source reference without collapsing distinct requests.
+Replay without a selector remains valid when exactly one matching journal entry
+exists; if the same source reference is already owned by multiple providers,
+the Agent must select the intended adapter explicitly.
+
+There is no keyword or regular-expression classifier. The provider adapter
+binds only the exact source selected by the Agent and checks authorship,
+addressing, Goal/Agent connection, target, and inbox identity. A manifest-
+discovered `capability_action` hook supplies the content-free bind and settle
+ports, so this capability and quota import no Lark implementation.
+
+The command persists a replay-safe typed request journal. `consume-pending`
+uses the normal manual trigger, editorial, frozen artifact, Workspace, and
+delivery-Todo pipeline. It acknowledges the provider source only after
+`delivery_ready` durability; failed ACKs become settlement-only retries and do
+not duplicate delivery work.
+
+## Todo authority and report retries
+
+Stage-boundary frontier evaluation and project-progress selection share one
+complete evaluated Todo snapshot. After Goal promotion, File/SQLite authority
+owns those facts even when the Markdown display is stale, absent or malformed.
+An empty canonical graph is empty; a failed canonical read remains a failed
+observation and never falls back to Markdown. Reading does not repair the display.
+Before promotion, the existing Markdown source remains in use.
+
+The TS report selector consumes bounded decision fields, not report prose. It
+keeps the reporter's outcomes before peer outcomes, excludes unowned work, and
+uses the existing resume/acceptance evaluation for the next action. Report
+consumption and all report-repair actions are excluded from next-action facts.
+Publication-history filtering still runs before the six-outcome cap so already
+published facts do not hide an unseen seventh outcome.
+
+Completion and retry ordering compares offset-aware instants at microsecond
+precision, rather than timestamp strings. Invalid/naive completion timestamps
+are not reportable; an invalid stage timestamp is an error. A retained canonical
+User rejection/cancellation can supersede an approval-pending receipt after
+archival. It must match the exact decision scope and addressed Agent; this is
+permission to reconsider that pending attempt, not approval to publish. Existing
+retry-key bytes remain unchanged for the same selected decision.
+
+Use the existing local command to consume pending work:
+
+```bash
+loopx periodic-report consume-pending --goal-id <goal-id> --agent-id <agent-id> --execute --format json
+```
+
+An explicit global `--runtime-root` routes both intent state and Todo reads.
+When the result is `editorial_required`, inspect its local editorial-request
+artifact: facts identify their source Todos. An identical retry reuses the
+frozen editorial input; it does not rebuild it from newer Todo state. Provider
+outages leave the intent for retry after authority recovery. Keep existing
+editorial artifacts and receipts when rolling back; do not delete them to force
+re-generation. No provider default, subscription, scheduler, external-delivery
+permission or publication cursor is changed by this read-path refactor.
+
 ## Customize or schedule
 
 The capability remains **inactive for background work and external writes by
@@ -66,10 +159,18 @@ recurring report: the host schedule should match that custom profile's RRULE.
 Pausing the Automation or setting the profile to `enabled: false` stops that
 scheduled path.
 
-External delivery and archival are separate opt-ins. Adding a sink binding
-does not grant authority by itself; the selected extension, runtime capability,
-execution decision, and exact readback must still pass their own gates. A
-normal in-session weekly report has no sink and performs no external write.
+External delivery and archival are separate opt-ins. A normal in-session weekly
+report has no sink and performs no external write. For the machine/Goal
+`periodic_report` subscription, however, `enabled: true` together with an
+explicit `route_ref` is standing authority to deliver reports produced at
+validated stage boundaries. The selected extension, runtime capability,
+configured route, sender identity, and exact readback must still pass their
+own fail-closed gates.
+
+An explicit Goal override is authoritative and must be complete; LoopX never
+fills its missing fields from machine defaults. `plan-goal-delivery` reports an
+invalid override with a typed field list, its configuration source, and the
+choice to complete or clear the override. This diagnostic path is read-only.
 
 The capability is intentionally effect-free. It first evaluates scheduled or
 material progress facts into a deterministic trigger receipt, then composes a
@@ -86,6 +187,100 @@ Profiles can enable trigger kinds and set a minimum interval; urgent outcome,
 closure, blocker, and manual triggers may bypass that interval. Concurrent
 material facts are coalesced into one report and previously covered trigger
 ids are deduplicated.
+
+Incremental reports advance from an exact, readback-verified publication
+cursor rather than from generated prose. The cursor keeps cumulative trigger
+ids and semantic fingerprints keyed by each fact's stable `source_ref`. A
+later stage includes only new facts and facts whose fingerprint changed;
+changed facts carry their prior status and kind so the editorial step can
+render a transition instead of repeating the old item. If no supplied fact is
+new or changed, the post-writeback producer emits no report intent. Local
+generation and failed or partial delivery never advance this cursor. A
+successful Goal Channel delivery records the predecessor
+publication identity for the next report.
+
+An enabled custom profile may also declare `trigger_policy.aggregation` with a
+bounded `window_seconds` and `stage_completion_required=true`. Stage completion
+reuses the existing goal-vision, outcome-checkpoint, and frontier-replan facts:
+the current vision must close through an evidence-linked material checkpoint,
+and the Goal must either become terminal or durably settle the existing
+`vision_successor_required` transition into a successor vision and owned
+frontier. The `evaluate-runtime-trigger` command promotes only that derived
+success-path receipt into `bounded_segment_milestone`.
+
+No Todo predeclaration or separate Stage lifecycle is required. Todo count,
+elapsed time, ordinary completion, and blocker/stall/long-chain/monitor replans
+remain context and never produce a report by themselves. The producer performs
+no provider call or external write; an eligible receipt continues through the
+existing `compose-run`, renderer, standing subscription authority, and sink
+readback boundaries.
+The CLI streams the append-only log and applies the 4,096-row capacity limit
+only after goal, segment-window, and relevant-kind filtering. Malformed durable
+rows and an oversized relevant window fail closed.
+
+Every `--*-json` input, from a file or `-` for stdin, is refused before parsing
+when it exceeds 16 MiB (16,777,216 bytes). Pass `--max-input-bytes N` on the
+subcommand to set a different positive limit for a legitimately larger or
+deliberately smaller request; there is no unlimited setting. The limit counts
+input bytes, not total process memory. Request files stay strict UTF-8.
+
+### Automatic post-writeback intent
+
+Automatic milestone evaluation is default-off. A project may opt the built-in
+weekly profile into the generic post-writeback hook at its local registry
+composition boundary:
+
+```json
+{
+  "control_plane": {
+    "periodic_report": {
+      "enabled": true,
+      "profile_preset": "weekly"
+    }
+  }
+}
+```
+
+After a committed `refresh-state` writeback with complete
+Goal/Agent/Turn/effect identity, core dispatches the TypeScript-validated
+`post_writeback` hook outside the primary transaction. The capability receives
+only a bounded stage-completion projection and its public-safe progress
+snapshot, both captured at the writeback boundary. It may propose one
+idempotent `periodic_report.trigger_evaluation` intent. Core checkpoints that
+proposal in a replay-safe sidecar. A transient failure is durably recorded as
+`retryable_failure`; the next exact replay advances its attempt and may replace
+it with `intent_recorded` or `not_applicable`, while terminal replay returns the
+original receipt without invoking the provider again. Todo-bound settlements
+carry a non-empty Todo id, while Todo-less autonomous replans carry an explicit
+`null` Todo id. Disabled profiles, incomplete settlement identity, ordinary
+Todo completion, and generic replan produce no trigger intent.
+
+If the Python bridge cannot complete the TypeScript hook transaction, the
+isolated failure includes only a typed runtime phase, error kind, and diagnostic
+code. It does not expose raw provider output or private state, and it does not
+change the committed primary writeback.
+
+The intent is not a report and grants no generation, publication, connector,
+network, credential, or sink authority. A separate governed executor may
+evaluate it into the normal trigger decision. At consumption time LoopX reads
+the current effective subscription again: a disabled subscription suppresses
+the action, while an enabled subscription with an explicit route supplies the
+standing delivery authority. Report composition, Miaoda HTML, content checks,
+provider readiness, and group-message readback remain later independent gates.
+
+`quota should-run` reads eligible `intent_recorded` sidecars for the exact Goal
+and Agent. A pending intent takes precedence over monitor-quiet and terminal
+no-follow-up projection and returns one TypeScript-validated governed command.
+That command may render provider-free local HTML and Markdown, run content
+checks, persist the normalized generation bundle, and create one runnable
+delivery successor bound to the frozen generation digest and current effective
+subscription. Exact replay does not rerender or duplicate the Todo. The delivery
+request carries that subscription's Goal, source, effective revision, and route;
+the Lark provider revalidates it immediately before each message write. Normal
+Todo/quota selection can therefore continue into Miaoda publication, Lark
+document creation, and Goal Channel delivery without another per-report owner
+gate. Disabling the subscription revokes pending automatic delivery; route,
+provider, sender-identity, or readback drift still fails closed.
 
 Project-specific scheduled reports should be layered as profiles and adapters.
 For example, a maintenance profile may choose a local timezone and weekly
@@ -117,6 +312,24 @@ those verified `<at>` elements before the report. A match without a renderer,
 a mismatched document/artifact digest, or provider mention markup embedded in
 the artifact, title, or footer fails before send. The core therefore owns
 relevance while the Lark extension owns provider identity and wire rendering.
+
+The bundled execution command is `periodic-report deliver-goal-channel`. It
+derives the destination and sender exclusively from the current Goal's enabled
+Goal Channel binding. Only a verified `project_bot` profile is valid; the
+request cannot provide a chat id, profile, Bot App id, display name, or sender
+identity. The intent instead supplies exactly two ordered HTTPS entries—the
+hosted report and the Lark document. Execution sends two independent messages,
+verifies the bound Bot and chat before send, then requires exact
+interactive-card, chat, and Bot-identity readback for both. Missing or drifted
+identity or subscription authority, either missing message, or a partial readback
+fails closed without a user/default-Bot fallback. Retries first scan the complete
+Goal Channel history from the frozen generation time and reuse only an exact card,
+chat, and Bot-sender match. Incomplete history fails closed instead of risking a
+duplicate; the stable provider idempotency key closes the concurrent-send race.
+When the normalized report contains a primary typed `next_action`, the hosted
+report announcement also carries its public-safe summary as a compact `下一步`
+prompt. The hosted artifact remains authoritative, while the Channel card gives
+an immediate direction and the same exact-card readback verifies that prompt.
 
 This is a built-in capability, not an extension: callers need the trigger,
 idempotency, retry, and receipt contract even when no provider is installed.
@@ -172,8 +385,7 @@ leak into the capability core.
 ## Optional OpenViking archive extension
 
 `openviking-periodic-report` is a bundled **LoopX extension** that implements
-the capability's `periodic_report_sink_v0` archive port. It is not an
-OpenViking extension and it adds no OpenViking runtime ABI. The dependency
+the capability's `periodic_report_sink_v0` archive port. The dependency
 direction is:
 
 ```text
@@ -303,7 +515,7 @@ external writes remain disabled by default:
   },
   "extension": {
     "extension_id": "loopx-lark",
-    "extension_version": "1.5.0",
+    "extension_version": "1.6.0",
     "protocol": "periodic_report_sink_v0"
   }
 }
@@ -421,3 +633,13 @@ artifact's primary/supporting visibility policy and validate direct section
 hashes after dynamic content is mounted.
 Project profiles still own language, layout policy, audience, cadence, and
 selection rules.
+
+## Personal Workspace readback
+
+After the Goal Channel sink has verified delivery and committed the publication cursor, the
+local status server can expose the latest report as a typed, content-addressed
+milestone projection. Its compact index deliberately omits report prose; the
+full projection is fetched over the loopback-only cold path and is accepted
+only when its generation id and digest match the current publication cursor.
+Pending delivery work and generation-only artifacts remain invisible. The view
+is informational and has no browser write authority.

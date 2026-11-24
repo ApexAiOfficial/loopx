@@ -1,0 +1,366 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from loopx.capabilities.explore.research_evidence import append_research_observation
+from loopx.capabilities.explore.result_log import (
+    append_explore_result_event, append_explore_result_events, build_explore_edge_event, build_explore_finding_event, build_explore_node_event,
+    build_explore_result_projection, explore_result_log_path, load_explore_result_events_strict,
+)
+from loopx.extensions.lark.presentation.explore_results import _node_record_values
+from loopx.control_plane.todos.mutation_api import add_goal_todo, update_goal_todo
+
+
+GOAL = "research-fixture"
+
+
+def observation(node: str, *, target: str | None = None) -> dict:
+    return {
+        "schema_version": "typed_research_observation_v0", "explore_node_id": node,
+        "progress": {"schema_version": "typed_progress_observation_v0", "work_item_id": f"todo-{node}",
+                     "result_class": "exploration_exhausted", "coverage_scope_id": f"scope-{node}",
+                     "coverage_complete": True, "evidence_ids": [f"ev-{node}"]},
+        "closure_basis": {"schema_version": "research_closure_basis_v0", "disposition": "bounded",
+                          "constraints": [{"kind": "invariant", "id": "boundary", "role": "decisive"}],
+                          "evidence_ids": [f"ev-{node}"]},
+        "composition_candidates": [{"target_node_id": target, "basis": "explicit",
+                                    "interaction_kind": "state_interference", "evidence_ids": ["ev-a", "ev-b"]}] if target else [],
+    }
+
+
+def node(path: Path, name: str, *, kind: str = "hypothesis", status: str = "resolved") -> None:
+    append_explore_result_event(path, build_explore_node_event(
+        goal_id=GOAL, node_id=name, title=f"Research {name}", node_kind=kind,
+        status=status, evidence_refs=[f"ev-{name}"],
+    ))
+
+
+def projection(path: Path) -> dict:
+    return build_explore_result_projection(load_explore_result_events_strict(path, goal_id=GOAL), goal_id=GOAL)
+
+
+def test_real_append_replay_projection_and_lark_consumer(tmp_path: Path) -> None:
+    path = explore_result_log_path(tmp_path, GOAL)
+    node(path, "a")
+    node(path, "b")
+    legacy = projection(path)
+    assert "research_frontier" not in legacy
+    assert all("research_summary" not in node for node in legacy["nodes"])
+    append_research_observation(path, goal_id=GOAL, observation=observation("b"))
+    raw = observation("a", target="b")
+    assert append_research_observation(path, goal_id=GOAL, observation=raw)["written"]
+    before = path.read_bytes()
+    assert append_research_observation(path, goal_id=GOAL, observation=raw)["replayed"]
+    assert path.read_bytes() == before
+    view = projection(path)
+    assert view["research_frontier"]["candidate_count"] == 1
+    assert view["research_frontier"]["pending_count"] == 1
+    row = _node_record_values(view["nodes"][0], goal_id=GOAL, source_id="fixture")
+    assert "composition 1 pending" in row["Summary"]
+    assert "closure bounded" in row["Summary"]
+    # The existing recovery path imports latest node snapshots as a batch,
+    # which may reference a sibling later in that same atomic batch.
+    snapshots = {event["result_id"]: event for event in load_explore_result_events_strict(path, goal_id=GOAL)}
+    restored = tmp_path / "restored.jsonl"
+    append_explore_result_events(restored, list(snapshots.values()), expected_goal_id=GOAL)
+    assert projection(restored)["research_frontier"] == view["research_frontier"]
+
+
+def test_result_requires_current_exact_input_lineage_and_survives_invalidation(tmp_path: Path) -> None:
+    path = explore_result_log_path(tmp_path, GOAL)
+    for name in ["a", "b"]:
+        node(path, name)
+    append_research_observation(path, goal_id=GOAL, observation=observation("b"))
+    append_research_observation(path, goal_id=GOAL, observation=observation("a", target="b"))
+    node(path, "joint", kind="experiment")
+    for name in ["a", "b"]:
+        append_explore_result_event(path, build_explore_edge_event(
+            goal_id=GOAL, from_node="joint", to_node=name, edge_type="depends_on"))
+    result = observation("joint")
+    with pytest.raises(ValueError, match="exact current input"):
+        append_research_observation(path, goal_id=GOAL, observation=result)
+    result["input_observations"] = projection(path)["research_frontier"]["gaps"][0]["input_observations"]
+    append_research_observation(path, goal_id=GOAL, observation=result)
+    assert projection(path)["research_frontier"]["observed_count"] == 1
+    node(path, "a", status="open")
+    invalidated = projection(path)["research_frontier"]
+    assert invalidated["candidate_count"] == 1
+    assert invalidated["ineligible_count"] == 1
+    before = path.read_bytes()
+    assert append_research_observation(path, goal_id=GOAL, observation=result)["replayed"]
+    assert path.read_bytes() == before
+    revised = observation("a")
+    node(path, "a")
+    revised["progress"]["evidence_ids"] = ["ev-a-new"]
+    revised["closure_basis"]["evidence_ids"] = ["ev-a-new"]
+    append_research_observation(path, goal_id=GOAL, observation=revised)
+    assert projection(path)["research_frontier"]["observed_count"] == 0
+
+
+def test_nested_result_history_and_explicit_revalidation(tmp_path: Path) -> None:
+    path = explore_result_log_path(tmp_path, GOAL)
+    for name in ["a", "b", "c"]:
+        node(path, name)
+    for name in ["b", "c", "a"]:
+        append_research_observation(path, goal_id=GOAL, observation=observation(name, target="b" if name == "a" else None))
+
+    def current_inputs(*names):
+        by_id = {row["node_id"]: row for row in projection(path)["nodes"]}
+        return [{"node_id": name, "fingerprint": by_id[name]["research_observation"]["fingerprint"]} for name in names]
+
+    results = {}
+    for name, inputs in [("joint", ["a", "b"]), ("outer", ["joint", "c"])]:
+        node(path, name, kind="experiment")
+        for upstream in inputs:
+            append_explore_result_event(path, build_explore_edge_event(
+                goal_id=GOAL, from_node=name, to_node=upstream, edge_type="depends_on"))
+        result = observation(name)
+        result["input_observations"] = current_inputs(*inputs)
+        if name == "joint":
+            result["composition_candidates"] = [{"target_node_id": "c", "basis": "explicit",
+                "interaction_kind": "producer_consumer", "evidence_ids": ["ev-joint", "ev-c"]}]
+        append_research_observation(path, goal_id=GOAL, observation=result)
+        results[name] = result
+    assert projection(path)["research_frontier"]["observed_count"] == 2
+    append_explore_result_event(path, build_explore_finding_event(
+        goal_id=GOAL, node_id="a", title="An additional research note"))
+    assert projection(path)["research_frontier"]["observed_count"] == 2
+    recorded = path.read_bytes()
+    node(path, "a", status="open")
+    assert path.read_bytes().startswith(recorded)
+    view = projection(path)
+    assert view["research_frontier"]["ineligible_count"] == 2
+    joint = next(row for row in view["nodes"] if row["node_id"] == "joint")
+    assert "ineligible" in _node_record_values(joint, goal_id=GOAL, source_id="fixture")["Summary"]
+    for raw in [observation("a", target="b"), results["joint"], results["outer"]]:
+        before = path.read_bytes()
+        assert append_research_observation(path, goal_id=GOAL, observation=raw)["replayed"]
+        assert path.read_bytes() == before
+    assert "research_observation" not in next(row for row in projection(path)["nodes"] if row["node_id"] == "a")
+    # Intermediate diagnostic evidence remains recordable without certifying closure.
+    progress = observation("a")
+    progress["progress"].update(result_class="advanced", coverage_complete=False)
+    assert append_research_observation(path, goal_id=GOAL, observation=progress)["written"]
+    assert projection(path)["research_frontier"]["ineligible_count"] == 2
+    # Revalidate each changed link through ordinary writes; replay alone cannot
+    # refresh old evidence. No automatic re-execution or deletion is involved.
+    node(path, "a")
+    revised = observation("a", target="b")
+    revised["progress"]["evidence_ids"].append("ev-a-revalidated")
+    append_research_observation(path, goal_id=GOAL, observation=revised)
+    assert projection(path)["research_frontier"]["ineligible_count"] == 1
+    results["joint"]["input_observations"] = current_inputs("a", "b")
+    append_research_observation(path, goal_id=GOAL, observation=results["joint"])
+    assert projection(path)["research_frontier"]["pending_count"] == 1
+    results["outer"]["input_observations"] = current_inputs("joint", "c")
+    append_research_observation(path, goal_id=GOAL, observation=results["outer"])
+    assert projection(path)["research_frontier"]["observed_count"] == 2
+    assert path.read_bytes().startswith(recorded)
+
+
+@pytest.mark.parametrize("patch", [
+    {"explore_node_id": "missing"}, {"explore_node_id": "/Users/example/private"},
+    {"closure_basis": None}, {"raw_prompt": "should never persist"},
+])
+def test_invalid_observation_never_appends(tmp_path: Path, patch: dict) -> None:
+    path = explore_result_log_path(tmp_path, GOAL)
+    node(path, "a")
+    before = path.read_bytes()
+    with pytest.raises(ValueError):
+        append_research_observation(path, goal_id=GOAL, observation={**observation("a"), **patch})
+    assert path.read_bytes() == before
+
+
+def test_unknown_and_unattributed_candidate_rejected(tmp_path: Path) -> None:
+    path = explore_result_log_path(tmp_path, GOAL)
+    node(path, "a")
+    with pytest.raises(ValueError, match="existing same-goal"):
+        append_research_observation(path, goal_id=GOAL, observation=observation("a", target="b"))
+    node(path, "b")
+    raw = observation("a", target="b")
+    raw["composition_candidates"][0]["evidence_ids"] = ["ev-a", "unattributed"]
+    with pytest.raises(ValueError, match="attributable to both"):
+        append_research_observation(path, goal_id=GOAL, observation=raw)
+
+
+@pytest.mark.parametrize("patch", [{"schema_version": None}, {"evidence_ids": {"ev-a": "wrong shape"}}])
+def test_research_transport_does_not_coerce_malformed_progress(tmp_path: Path, patch: dict) -> None:
+    path = explore_result_log_path(tmp_path, GOAL)
+    node(path, "a")
+    raw = observation("a")
+    raw["progress"].update(patch)
+    before = path.read_bytes()
+    with pytest.raises(ValueError):
+        append_research_observation(path, goal_id=GOAL, observation=raw)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_generic_writers_cannot_bypass_attribution(tmp_path: Path, batch: bool) -> None:
+    path = explore_result_log_path(tmp_path, GOAL)
+    node(path, "a")
+    forged = build_explore_node_event(goal_id=GOAL, node_id="a", title="Research a",
+        status="resolved", research_observation=observation("a", target="missing"))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="existing same-goal"):
+        if batch:
+            append_explore_result_events(path, [forged], expected_goal_id=GOAL)
+        else:
+            append_explore_result_event(path, forged)
+    assert path.read_bytes() == before
+
+
+def test_real_cli_uses_synthetic_source_runtime_and_readback(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    registry = tmp_path / "registry.json"
+    runtime = tmp_path / "runtime"
+    registry.write_text(json.dumps({"schema_version": "loopx_registry_v1", "runtime_root": str(runtime), "goals": []}))
+    path = explore_result_log_path(runtime, GOAL)
+    node(path, "a")
+    packet = tmp_path / "observation.json"
+    packet.write_text(json.dumps(observation("a")))
+
+    def command(*args: str) -> dict:
+        completed = subprocess.run([sys.executable, "-m", "loopx.cli", "--registry", str(registry),
+            "--runtime-root", str(runtime), "--format", "json", "explore", *args], cwd=root, text=True,
+            capture_output=True, check=False)
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        return json.loads(completed.stdout)
+
+    result = command("observe", "--goal-id", GOAL, "--observation-json", str(packet))
+    assert result["ok"] and result["written"]
+    assert command("observe", "--goal-id", GOAL, "--observation-json", str(packet))["replayed"]
+    view = command("summary", "--goal-id", GOAL)
+    assert view["nodes"][0]["research_observation"] == result["observation"]
+    assert view["research_frontier"]["mode"] == "read_only_shadow"
+
+
+def execution_fixture(
+    tmp_path: Path,
+    *,
+    provider: str = "file",
+) -> tuple[Path, Path, Path, dict]:
+    from loopx.control_plane.coordination.runtime_shadow import (
+        build_todo_runtime_shadow_projection,
+    )
+    from tests.control_plane.canonical_authority_fixture import (
+        initialize_canonical_authority,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    state = project / "ACTIVE_GOAL_STATE.md"
+    state.write_text(f"---\ngoal_id: {GOAL}\n---\n\n## Agent Todo\n\n")
+    runtime = tmp_path / "runtime"
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"common_runtime_root": str(runtime), "goals": [{
+        "id": GOAL, "repo": str(project), "state_file": state.name, "status": "active",
+        "coordination": {"agent_model": "peer_v1", "registered_agents": ["fixture-agent"]},
+    }]}))
+    initialize_canonical_authority(
+        runtime,
+        GOAL,
+        build_todo_runtime_shadow_projection(
+            goal_id=GOAL, todos=[], handoff_mode="soft_claim"
+        ),
+        state_path=state,
+        provider=provider,
+    )
+    path = explore_result_log_path(runtime, GOAL)
+    for name in ["a", "b"]:
+        node(path, name)
+    append_research_observation(path, goal_id=GOAL, observation=observation("b"))
+    append_research_observation(path, goal_id=GOAL, observation=observation("a", target="b"))
+    node(path, "joint", kind="experiment")
+    for name in ["a", "b"]:
+        append_explore_result_event(path, build_explore_edge_event(
+            goal_id=GOAL, from_node="joint", to_node=name, edge_type="depends_on"))
+    todo = add_goal_todo(
+        registry_path=registry, goal_id=GOAL, role="agent", text="Run the bounded joint experiment.",
+        task_class="advancement_task", action_kind="joint_probe", claimed_by="fixture-agent",
+        explore_result_node_refs=["joint"], monitor_metadata={"target_key": "joint"},
+        replan_obligation_id="replan-0123456789abcdef",
+    )
+    gap = projection(path)["research_frontier"]["gaps"][0]
+    raw = observation("joint")
+    raw["progress"]["work_item_id"] = todo["todo_id"]
+    raw["input_observations"] = gap["input_observations"]
+    raw["execution_lineage"] = {
+        "schema_version": "research_execution_lineage_v0", "goal_id": GOAL,
+        "gap_id": gap["gap_id"], "replan_obligation_id": "replan-0123456789abcdef",
+        "successor_todo_id": todo["todo_id"], "agent_id": "fixture-agent",
+    }
+    return registry, runtime, path, raw
+
+
+def test_real_execution_writer_reads_todo_and_replay_does_not_rebind(tmp_path: Path) -> None:
+    registry, runtime, path, raw = execution_fixture(tmp_path)
+    update_goal_todo(
+        registry_path=registry, goal_id=GOAL, todo_id=raw["execution_lineage"]["successor_todo_id"],
+        agent_id="fixture-agent", status="deferred", reason="await-synthetic-capacity",
+        resume_when="capacity_available:fixture",
+    )
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="runnable joint-probe"):
+        append_research_observation(path, goal_id=GOAL, observation=raw, agent_id="fixture-agent",
+                                   registry_path=registry, runtime_root=runtime)
+    assert path.read_bytes() == before
+    update_goal_todo(
+        registry_path=registry, goal_id=GOAL, todo_id=raw["execution_lineage"]["successor_todo_id"],
+        agent_id="fixture-agent", status="open", clear_resume_when=True,
+    )
+    result = append_research_observation(path, goal_id=GOAL, observation=raw, agent_id="fixture-agent",
+                                        registry_path=registry, runtime_root=runtime)
+    assert result["written"]
+    assert result["observation"]["execution_lineage"] == raw["execution_lineage"]
+    # A historical receipt remains read-only if current task or input authority
+    # changes. It cannot be refreshed into a new execution claim.
+    update_goal_todo(
+        registry_path=registry, goal_id=GOAL, todo_id=raw["execution_lineage"]["successor_todo_id"],
+        agent_id="fixture-agent", action_kind="inspect",
+    )
+    node(path, "a", status="open")
+    before = path.read_bytes()
+    assert append_research_observation(path, goal_id=GOAL, observation=raw)["replayed"]
+    assert path.read_bytes() == before
+    assert projection(path)["research_frontier"]["observed_count"] == 0
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_generic_writers_cannot_forge_new_execution_lineage(tmp_path: Path, batch: bool) -> None:
+    _registry, _runtime, path, raw = execution_fixture(tmp_path)
+    event = build_explore_node_event(goal_id=GOAL, node_id="joint", title="Research joint",
+                                    node_kind="experiment", status="resolved", research_observation=raw)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="requires explore observe"):
+        if batch:
+            append_explore_result_events(path, [event], expected_goal_id=GOAL)
+        else:
+            append_explore_result_event(path, event)
+    assert path.read_bytes() == before
+
+
+def test_cli_execution_requires_actor_and_preserves_lineage_in_readback(tmp_path: Path) -> None:
+    registry, runtime, path, raw = execution_fixture(tmp_path)
+    packet = tmp_path / "execution.json"
+    packet.write_text(json.dumps(raw))
+    command = [sys.executable, "-m", "loopx.cli", "--registry", str(registry), "--format", "json",
+               "explore", "observe", "--goal-id", GOAL, "--observation-json", str(packet)]
+    before = path.read_bytes()
+    missing = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert missing.returncode != 0
+    assert "actor differs" in missing.stdout
+    assert path.read_bytes() == before
+    accepted = subprocess.run([*command, "--agent-id", "fixture-agent"], capture_output=True, text=True, check=False)
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    result = json.loads(accepted.stdout)
+    assert result["observation"]["execution_lineage"] == raw["execution_lineage"]
+    readback = projection(path)
+    joint = next(row for row in readback["nodes"] if row["node_id"] == "joint")
+    assert joint["research_observation"] == result["observation"]
+    assert readback["research_frontier"]["observed_count"] == 1

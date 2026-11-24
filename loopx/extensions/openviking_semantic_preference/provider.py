@@ -10,11 +10,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from ...capabilities.semantic_preference.contract import REQUEST_SCHEMA, RESPONSE_SCHEMA
+from ...entrypoint import pin_utf8_stdio
 from .project_peer import ProjectPeerScope, resolve_project_peer_scope
 
 
-REQUEST_SCHEMA = "semantic_preference_provider_request_v0"
-RESPONSE_SCHEMA = "semantic_preference_provider_response_v0"
 SCOPE_SCHEMA = "openviking_project_peer_scope_v0"
 PREFERENCE_PATH_MARKER = "/memories/preferences/"
 MAX_FIND_CALLS = 3
@@ -57,7 +57,7 @@ def _run_ov(
             capture_output=True,
             check=False,
             env=_environment(cli_config),
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=timeout_seconds,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -298,6 +298,7 @@ def handle_openviking_provider(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    pin_utf8_stdio()
     try:
         return run()
     except Exception as exc:  # Provider stderr is reduced by the outer hook.

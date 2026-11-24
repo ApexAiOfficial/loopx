@@ -2,21 +2,21 @@ name: Python Tests
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/python-tests.yml"
-      - "loopx/**"
-      - "scripts/**"
-      - "tests/**"
-      - "examples/**"
-      - "package.json"
-      - "package-lock.json"
-      - "pyproject.toml"
-      - "tsconfig.control-plane.json"
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, closed]
+  # Inert until the main ruleset enables a merge queue; queue runs are full.
+  merge_group:
+  workflow_dispatch:
+  schedule:
+    # Complete default-branch qualification and next-Node probe, independent of pushes.
+    - cron: "17 20 * * *"
   push:
     branches:
       - main
     paths:
       - ".github/workflows/python-tests.yml"
+      - ".github/workflows/sonarcloud.yml"
+      - "sonar-project.properties"
+      - "apps/**"
       - "loopx/**"
       - "scripts/**"
       - "tests/**"
@@ -24,24 +24,222 @@ on:
       - "package.json"
       - "package-lock.json"
       - "pyproject.toml"
+      - "setup.py"
+      - "MANIFEST.in"
       - "tsconfig.control-plane.json"
 
 permissions:
   contents: read
 
 concurrency:
-  group: python-tests-${{ github.ref }}
-  cancel-in-progress: true
+  # A merged PR's closed event uses main as github.ref; keep its original PR lane.
+  group: python-tests-${{ github.event_name }}-${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && format('pr-{0}', github.event.number) || github.ref }}
+  # Let active main qualification finish; the default single pending slot keeps
+  # only its latest successor. PR updates still retire that PR's obsolete head.
+  queue: single
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+
+env:
+  LOOPX_USAGE_PING: "0"
 
 jobs:
-  pytest:
+  changes:
+    # Closed events cancel the old lane without starting another qualification.
+    if: github.event_name != 'pull_request_target' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      core_tests: ${{ steps.classify.outputs.core_tests }}
+      backend_tests: ${{ steps.classify.outputs.backend_tests }}
+      change_kind: ${{ steps.classify.outputs.change_kind }}
+      python_tests: ${{ steps.classify.outputs.python_tests }}
+      stage2c_tests: ${{ steps.classify.outputs.stage2c_tests }}
+      presentation_tests: ${{ steps.classify.outputs.presentation_tests }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Install workflow contract parser
+        run: python -m pip install --disable-pip-version-check 'pyyaml>=6,<7'
+      - name: Validate merge gate semantics
+        run: |
+          python -m unittest discover -s scripts/ci -p 'test_*.py'
+          node --test scripts/ci/qualification_summary.test.ts
+      - name: Classify the exact pull-request change
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CHECKOUT_SHA: ${{ github.sha }}
+          FORCE_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          extra=()
+          if [[ "$FORCE_FULL" == true ]]; then extra+=(--force-full); fi
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            python scripts/ci/review_gate.py classify --base "$BASE_SHA" --head "$HEAD_SHA" --plan impact-plan.json "${extra[@]}" >> "$GITHUB_OUTPUT"
+          else
+            python scripts/ci/review_gate.py classify --base "$CHECKOUT_SHA" --head "$CHECKOUT_SHA" --non-pr --plan impact-plan.json >> "$GITHUB_OUTPUT"
+          fi
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          plan = json.loads(Path("impact-plan.json").read_text())
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("## CI job exemptions\n\n")
+              summary.write(f"Change kind: **{plan['change_kind']}**; Python shards: **{plan['python_shards']}**.\n\n")
+              summary.write(plan['reason'] + ".\n\n")
+              summary.write(f"Backend: {plan['backend_tests']}; Python: {plan['python_tests']}; Stage2c: {plan['stage2c_tests']}; frontend: {plan['core_tests']}; freshness: {plan['presentation_tests']}.\n\n")
+              summary.write(plan["coverage_scope"] + ". Unknown/mixed changes and main run full. Label ci:full forces full qualification.\n")
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-impact-plan
+          path: impact-plan.json
+          if-no-files-found: error
+          retention-days: 7
+
+  chat-bundle:
+    needs: [changes, kernel-static-checks]
+    # This is the sole admission path to expensive qualification. A client-only
+    # exemption requires the static lane to be skipped; failed full candidates
+    # continue only in the existing scheduled/manual diagnostic runs.
+    if: >-
+      ${{ !cancelled() && needs.changes.result == 'success' &&
+          (needs.changes.outputs.core_tests == 'true' ||
+           needs.changes.outputs.python_tests == 'true' ||
+           needs.changes.outputs.presentation_tests == 'true') &&
+          ((needs.changes.outputs.backend_tests == 'false' && needs.kernel-static-checks.result == 'skipped') ||
+           (needs.changes.outputs.backend_tests == 'true' &&
+            (needs.kernel-static-checks.result == 'success' ||
+             ((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+              needs.kernel-static-checks.result == 'failure')))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/presentation/dashboard/package-lock.json
+      - run: python scripts/chat_bundle.py build --install
+      - run: python scripts/chat_bundle.py verify --source
+      # Publish as soon as the bundle is built and verified so consumers start
+      # in parallel with browser qualification; `checks` still requires it.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+          if-no-files-found: error
+          retention-days: 7
+
+  chat-bundle-browser:
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.core_tests == 'true' && !cancelled() && needs.chat-bundle.result == 'success'
+    runs-on: ubuntu-latest
+    # The packaged scenario catalog outgrew one 15-minute runner, so the
+    # catalog is partitioned like dashboard-browser and the companion smokes
+    # are spread across the shards. The aggregate needs every shard to pass.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install checkout for Python-backed browser scenarios
+        run: |
+          python -m pip install --disable-pip-version-check -e .
+          echo "LOOPX_TEST_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/presentation/dashboard/package-lock.json
+      - name: Qualify the actual compiled UI
+        working-directory: apps/presentation/dashboard
+        env:
+          LOOPX_PERSONAL_WORKSPACE_SHARD: "${{ matrix.shard }}/3"
+        run: |
+          npm ci --ignore-scripts
+          ./node_modules/.bin/playwright install --with-deps chromium
+          node ../../../examples/personal-workspace-browser/shard.test.mjs
+          npm run smoke:personal-workspace-packaged:catalog
+      - name: Qualify turn acceptance retry and the upgrade window
+        if: matrix.shard == 1
+        working-directory: apps/presentation/dashboard
+        run: |
+          npm run smoke:chat-turn-acceptance-retry
+          npm run smoke:chat-upgrade
+          npm run smoke:delegation-search
+          npm run smoke:task-inspector-route
+          npm run smoke:explore-timeline-scan
+          npm run smoke:conversation-find
+      - name: Qualify packaged team evidence and feedback recovery
+        if: matrix.shard == 2
+        working-directory: apps/presentation/dashboard
+        run: npm run smoke:personal-workspace-packaged:team
+      - name: Qualify original-task revalidation with the real worker
+        if: matrix.shard == 2
+        env:
+          LOOPX_PLAYWRIGHT_PACKAGE: ${{ github.workspace }}/apps/presentation/dashboard/node_modules/playwright
+          LOOPX_USAGE_PING: "0"
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[test]"
+          node apps/presentation/dashboard/smoke/team-task-revalidation-smoke.mjs
+      - name: Preserve synthetic original-task recovery views
+        if: always() && matrix.shard == 2
+        uses: actions/upload-artifact@v7
+        with:
+          name: task-revalidation-${{ github.sha }}
+          path: |
+            output/playwright/personal-workspace/team-original-worker-finishing-mobile.png
+            output/playwright/personal-workspace/team-original-worker-finishing-desktop.png
+            output/playwright/personal-workspace/team-original-recovery-mobile.png
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Qualify the Goal workspace craft composition
+        if: matrix.shard == 3
+        working-directory: apps/presentation/dashboard
+        run: npm run smoke:personal-workspace-packaged:craft
+      - name: Qualify packaged ZCode recovery against its persistent owner
+        if: matrix.shard == 3
+        env:
+          LOOPX_USAGE_PING: "0"
+          DO_NOT_TRACK: "1"
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[test]"
+          npm ci --ignore-scripts
+          node examples/zcode-persistent-browser-smoke.mjs
+
+  kernel-static-checks:
+    # Reject cheap repository failures before any frontend build or test matrix.
+    needs: changes
+    if: needs.changes.outputs.backend_tests == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
       - name: Check out repository
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -49,21 +247,14 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Set up the TypeScript Effect runtime
-        uses: actions/setup-node@v6
-        with:
-          node-version: "22.6"
-          cache: npm
-          cache-dependency-path: package-lock.json
-
       - name: Install test dependencies
         run: python -m pip install --disable-pip-version-check -e ".[test]"
 
-      - name: Qualify the TypeScript Effect core
-        run: |
-          npm ci --ignore-scripts
-          npm run typecheck:control-plane
-          npm run test:control-plane
+      - name: Check repository invariants before long tests
+        run: >-
+          python -m pytest -q --no-cov
+          tests/test_stage2c_dependency_lock.py
+          tests/architecture/test_top_level_module_budget.py
 
       - name: Lint test suite
         run: >-
@@ -74,29 +265,21 @@ jobs:
           loopx/domain_packs
           loopx/presentation
 
-      - name: Type-check kernel contracts
-        run: python -m mypy
-
-      - name: Qualify agent-facing CLI output
-        env:
-          LOOPX_CLI_OUTPUT_BASE_REF: origin/${{ github.event.pull_request.base.ref || 'main' }}
-        run: python examples/control_plane/cli-output-budget-regression-smoke.py
-
-      - name: Run fast tests
-        run: >-
-          python -m pytest -q -n 2
-          --cov=loopx
-          --cov-report=term
-          --cov-fail-under=19.6
-
-  windows-powershell:
-    runs-on: windows-latest
-    timeout-minutes: 20
+  kernel-contracts:
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.backend_tests == 'true' && !cancelled() && needs.chat-bundle.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -107,18 +290,891 @@ jobs:
       - name: Set up the TypeScript Effect runtime
         uses: actions/setup-node@v6
         with:
-          node-version: "22.6"
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - name: Install test dependencies
         run: python -m pip install --disable-pip-version-check -e ".[test]"
 
+      - name: Verify file authority on the core runtime
+        run: >-
+          node --no-warnings --experimental-strip-types --test
+          tests/control_plane_ts/authority_store.test.ts
+          tests/control_plane_ts/local_authority_runtime.test.ts
+          tests/control_plane_ts/sqlite_runtime_admission.test.ts
+
+      - name: Type-check kernel contracts
+        run: python -m mypy
+
+      # Preserve the kernel gate above, including its import traversal. This
+      # additive boundary checks the adapters strictly and analyzes legacy
+      # imports for types without claiming their implementations are qualified.
+      - name: Type-check Todo CLI adapters
+        run: >-
+          python -m mypy --no-incremental --follow-imports=silent
+          loopx/cli_commands/todo_event.py
+          loopx/control_plane/todos/markdown.py
+
+      - name: Qualify agent-facing CLI output
+        env:
+          # Compare the tested revision to its event base, even after main moves
+          # while this run is queued. Pin the selector's main ref as well.
+          LOOPX_CLI_OUTPUT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.sha }}
+          LOOPX_CLI_OUTPUT_MAIN_REF: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.sha }}
+        run: python examples/control_plane/cli-output-budget-regression-smoke.py
+
+  typescript-core:
+    name: typescript-core (${{ matrix.shard }}/3)
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.backend_tests == 'true' && !cancelled() && needs.chat-bundle.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up the qualified SQLite runtime
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[test]"
+          npm ci --ignore-scripts
+
+      - name: Type-check the TypeScript Effect core
+        if: matrix.shard == 1
+        run: npm run typecheck:control-plane
+
+      - name: Qualify the TypeScript Effect core
+        env:
+          LOOPX_TEST_REQUIRE_SQLITE_QUALIFIED: "1"
+        run: |
+          mapfile -t files < <(python -m scripts.ci.ts_test_shard --shards 3 --shard ${{ matrix.shard }})
+          test "${#files[@]}" -gt 0
+          NODE_V8_COVERAGE="$PWD/coverage/v8" node --no-warnings --experimental-sqlite \
+            --experimental-strip-types --test "${files[@]}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: typescript-v8-coverage-${{ matrix.shard }}
+          path: coverage/v8/
+          if-no-files-found: error
+          retention-days: 1
+
+  typescript-coverage:
+    needs: [changes, typescript-core]
+    if: needs.changes.outputs.backend_tests == 'true' && !cancelled() && needs.typescript-core.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: typescript-v8-coverage-*
+          path: coverage/shards
+      - name: Report complete TypeScript control-plane coverage
+        run: |
+          mkdir -p coverage/v8
+          for shard in 1 2 3; do
+            dir="coverage/shards/typescript-v8-coverage-${shard}"
+            compgen -G "${dir}/*.json" > /dev/null
+            for file in "${dir}"/*.json; do
+              cp "$file" "coverage/v8/${shard}-$(basename "$file")"
+            done
+          done
+          npx c8 report --temp-directory=coverage/v8 --all \
+            --include='loopx/control_plane/**/*.ts' \
+            --exclude='loopx/control_plane/**/*.generated.ts' \
+            --reporter=lcov --reporter=text --reports-dir=coverage/control-plane
+      - name: Upload TypeScript control-plane coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: typescript-control-plane-coverage
+          path: coverage/control-plane/lcov.info
+          if-no-files-found: error
+          retention-days: 3
+
+  dashboard-browser:
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.core_tests == 'true' && !cancelled() && needs.chat-bundle.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install checkout for Python-backed browser scenarios
+        run: |
+          python -m pip install --disable-pip-version-check -e .
+          echo "LOOPX_TEST_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+
+      - name: Set up the qualified Node.js runtime
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/presentation/dashboard/package-lock.json
+
+      - name: Install Dashboard and coverage dependencies
+        run: |
+          npm ci --ignore-scripts
+          npm ci --ignore-scripts --prefix apps/presentation/dashboard
+
+      - name: Check the CSS custom-property classifier contract
+        run: node scripts/check-css-custom-properties.test.mjs
+
+      - name: Reject undefined CSS custom properties
+        run: node scripts/check-css-custom-properties.mjs dashboard
+
+      # The coverage merger consumes the unit report from shard 1 only.
+      - name: Check Dashboard startup ownership and measure unit coverage once
+        if: matrix.shard == 1
+        run: |
+          node --test examples/personal-workspace-browser/server-startup.test.mjs
+          npm run test:dashboard:coverage
+
+      - name: Measure Dashboard browser interactions
+        env:
+          LOOPX_PERSONAL_WORKSPACE_SHARD: "${{ matrix.shard }}/3"
+          LOOPX_DASHBOARD_COVERAGE: "1"
+          LOOPX_PLAYWRIGHT_PACKAGE: ${{ github.workspace }}/apps/presentation/dashboard/node_modules/playwright
+        run: |
+          node --test examples/personal-workspace-browser/shard.test.mjs examples/personal-workspace-browser/goal-workspace-m2.test.mjs
+          cd apps/presentation/dashboard
+          npx playwright install --with-deps chromium --only-shell
+          node ../../../examples/personal-workspace-browser-smoke.mjs
+          cp ../../../output/playwright/personal-workspace/acceptance-results.json ../../../coverage/dashboard/acceptance-results.json
+
+      - name: Upload Dashboard coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: dashboard-coverage-${{ matrix.shard }}
+          path: |
+            coverage/dashboard/lcov.info
+            coverage/dashboard/browser-coverage.json
+            coverage/dashboard/acceptance-results.json
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload text document visual evidence
+        if: always() && hashFiles('output/playwright/personal-workspace/document-*.png') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: text-document-evidence-${{ matrix.shard }}
+          path: output/playwright/personal-workspace/document-*.png
+          if-no-files-found: error
+          retention-days: 14
+
+  dashboard-acceptance:
+    needs: [changes, dashboard-browser]
+    if: needs.changes.outputs.core_tests == 'true' && !cancelled() && needs.dashboard-browser.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+      - run: npm ci --ignore-scripts
+      - run: node --test scripts/ci/merge-dashboard-coverage.test.mjs
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: dashboard-coverage-*
+          path: coverage/dashboard-shards
+      - name: Require every acceptance shard and merge source coverage
+        run: node scripts/ci/merge-dashboard-coverage.mjs coverage/dashboard-shards coverage/dashboard
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dashboard-coverage
+          path: coverage/dashboard/*.info
+          if-no-files-found: error
+          retention-days: 3
+
+  checks:
+    # Preserve the required check name while exposing independent failure lanes.
+    # Cancelled main pushes must not retain runner-backed aggregate work.
+    if: always() && needs.changes.outputs.core_tests == 'true' && (github.event_name != 'push' || !cancelled())
+    needs: [changes, kernel-static-checks, kernel-contracts, typescript-coverage, dashboard-acceptance, chat-bundle-browser]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Require the planned backend and Dashboard qualification
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python scripts/ci/review_gate.py verify-core
+
+  node-minimum-compatibility:
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.backend_tests == 'true' && !cancelled() && needs.chat-bundle.result == 'success'
+    runs-on: ubuntu-latest
+    # The full suite runs under this exact Node version in typescript-core.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Qualify the public minimum Node.js runtime
+        env:
+          LOOPX_TEST_REQUIRE_SQLITE_QUALIFIED: "1"
+        run: |
+          npm ci --ignore-scripts
+          npm run typecheck:control-plane
+          # Prove the minimum itself admits SQLite and executes both provider
+          # lifecycle rows. The qualified core lane runs the complete suite.
+          node --no-warnings --experimental-sqlite --experimental-strip-types --test \
+            tests/control_plane_ts/sqlite_runtime_admission.test.ts \
+            tests/control_plane_ts/deferred_hard_lease_lifecycle.test.ts
+
+  node-forward-compatibility:
+    needs: [changes, chat-bundle]
+    # Probe the future runtime once per night or on demand, outside the PR/main
+    # critical path. The supported runtime still runs on every full candidate.
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.backend_tests == 'true' && !cancelled() && needs.chat-bundle.result == 'success'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    # This runs the full core conformance suite. Allow forward-runtime/runner
+    # variance without dropping cases or changing individual test deadlines.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Probe the next Node.js runtime
+        run: |
+          npm ci --ignore-scripts
+          npm run typecheck:control-plane
+          npm run test:control-plane
+
+  test-shard:
+    # The bundle admits only statically qualified candidates or explicit
+    # diagnostics. Python can now overlap TS/browser qualification while its
+    # six repository-wide slots still bound long-test concurrency.
+    needs: [changes, chat-bundle]
+    if: >-
+      ${{ !cancelled() && needs.changes.result == 'success' &&
+          needs.changes.outputs.python_tests == 'true' &&
+          needs.chat-bundle.result == 'success' }}
+    runs-on: ubuntu-latest
+    # Share six long-test lanes across current PRs and other workflow runs.
+    # Do not replace another candidate's pending shard or cancel its active head.
+    # Workflow-level concurrency still retires obsolete heads of the same PR.
+    concurrency:
+      group: loopx-python-test-shard-${{ matrix.shard }}
+      queue: max
+      cancel-in-progress: false
+    # All shards were still progressing at 83-94% when the 45m job
+    # deadline cancelled run 37916979857. Reserve setup/reporting headroom
+    # without changing test-level deadlines, collection or worker count.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[test]"
+          npm ci --ignore-scripts
+      - name: Prepare native shell isolation
+        # Ubuntu 24.04 may need an executable-scoped userns profile for bwrap.
+        # Do not disable AppArmor or the system-wide unprivileged-userns guard.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if ! bwrap --unshare-all --ro-bind / / /bin/true; then
+            sudo tee /etc/apparmor.d/loopx-qualification-bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile loopx-qualification-bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+            sudo apparmor_parser -r /etc/apparmor.d/loopx-qualification-bwrap
+          fi
+          bwrap --unshare-all --ro-bind / / /bin/true
+      - name: Run test shard
+        # Split the whole collection, not a hand-maintained list of directories.
+        # Without timing history least_duration alternates equal-weight tests.
+        # Each runner retains the measured two-worker pool.
+        # Cooperative per-test Python stacks diagnose stalls without terminating tests.
+        run: >-
+          python -m pytest -v -n 2 -m "not stage2c_e2e"
+          -p scripts.ci.pytest_timing
+          --ci-stall-after 120
+          --splits 6 --group ${{ matrix.shard }}
+          --splitting-algorithm least_duration
+          --durations=25 --durations-min=1
+          --junitxml=junit.xml
+          --cov=loopx
+          --cov-report=term
+      - name: Upload full-shard outcomes for selection audit
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-junit-${{ matrix.shard }}
+          path: junit.xml
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload shard coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-coverage-${{ matrix.shard }}
+          path: .coverage
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  pytest:
+    # Keep the required check name; a skipped/failed shard must not turn it green.
+    if: always() && needs.changes.outputs.python_tests == 'true' && (github.event_name != 'push' || !cancelled())
+    needs: [changes, checks, test-shard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require every upstream check
+        env:
+          CHECKS_RESULT: ${{ needs.checks.result }}
+          SHARDS_RESULT: ${{ needs.test-shard.result }}
+        run: |
+          test "$CHECKS_RESULT" = success
+          test "$SHARDS_RESULT" = success
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --disable-pip-version-check -e ".[test]"
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: python-coverage-*
+          path: coverage-shards
+      - name: Combine complete coverage and enforce the existing floor
+        run: |
+          shards=()
+          for shard in 1 2 3 4 5 6; do
+            path="coverage-shards/python-coverage-${shard}/.coverage"
+            test -s "$path"
+            shards+=("$path")
+          done
+          python -m coverage combine "${shards[@]}"
+          python -m coverage report --fail-under=19.6
+          python -m coverage xml -o coverage.xml
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-coverage-xml
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 3
+
+  sonar:
+    needs: pytest
+    # Queue refs are temporary; analyse PRs and main, not gh-readonly-queue/*.
+    if: github.event_name != 'merge_group'
+    uses: ./.github/workflows/sonarcloud.yml
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  stage2c-suite:
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.stage2c_tests == 'true' && !cancelled() && needs.chat-bundle.result == 'success'
+    name: stage2c (${{ matrix.suite }} ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {suite: e2e, shard: 1}
+          - {suite: e2e, shard: 2}
+          - {suite: mutants, shard: 0}
+          - {suite: installed, shard: 0}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tests/requirements-stage2c-linux-py311.txt
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install locked test and package build tools
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r tests/requirements-stage2c-linux-py311.txt
+          npm ci --ignore-scripts
+      - name: Build and verify the checked-out source package
+        run: |
+          python -m build --no-isolation --wheel --outdir .local/stage2c-source-install
+          python - <<'PYTHON'
+          import hashlib
+          from pathlib import Path
+
+          directory = Path(".local/stage2c-source-install").resolve()
+          wheels = list(directory.glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit("Expected exactly one wheel from the checked-out source")
+          wheel = wheels[0]
+          digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+          (directory / "requirements.txt").write_text(
+              f"loopx @ {wheel.as_uri()} --hash=sha256:{digest}\n", encoding="utf-8"
+          )
+          PYTHON
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps --no-index -r .local/stage2c-source-install/requirements.txt
+          python -m pip check
+          # Remove the generated source copy before pytest's normal discovery.
+          python -c "import shutil; shutil.rmtree('build')"
+      - name: Qualify real CLI, mixed writers, process death, and recovery
+        if: matrix.suite == 'e2e'
+        env:
+          LOOPX_SHADOW_COMPARISON_OUTPUT: .local/stage2c-observables
+        # Keep each module's shared workspace and ordered parity rows on one worker.
+        run: python -m pytest -q -n 2 --dist loadfile -m stage2c_e2e -p scripts.ci.module_shard --ci-module-shards 2 --ci-module-shard ${{ matrix.shard }} --durations=20 --junitxml=stage2c-e2e.xml
+      - name: Reject deliberate correctness regressions
+        if: matrix.suite == 'mutants'
+        run: python examples/shared-goal-authority-e2e/mutants.py --output .local/stage2c-mutants
+      - name: Build independently installed distributions
+        if: matrix.suite == 'installed'
+        run: python -m build --no-isolation
+      - name: Qualify wheel outside the repository
+        if: matrix.suite == 'installed'
+        run: python examples/shared-goal-authority-e2e/installed.py --artifact dist/*.whl --report-json installed-wheel.json
+      - name: Qualify sdist outside the repository
+        if: matrix.suite == 'installed'
+        run: python examples/shared-goal-authority-e2e/installed.py --artifact dist/*.tar.gz --report-json installed-sdist.json
+      - name: Retain bounded acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stage2c-correctness-evidence-${{ matrix.suite }}-${{ matrix.shard }}
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            stage2c-e2e.xml
+            .local/stage2c-observables/
+            installed-wheel.json
+            installed-sdist.json
+            .local/stage2c-mutants/
+
+  stage2c-correctness-e2e:
+    # Preserve the public check name and reject failed, cancelled or skipped lanes.
+    if: always() && needs.changes.outputs.stage2c_tests == 'true' && (github.event_name != 'push' || !cancelled())
+    needs: [changes, stage2c-suite]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every Stage 2C lane
+        env:
+          STAGE2C_RESULT: ${{ needs.stage2c-suite.result }}
+        run: test "$STAGE2C_RESULT" = success
+
+  windows-powershell:
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.python_tests == 'true' && !cancelled() && needs.chat-bundle.result == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up the TypeScript Effect runtime
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/presentation/dashboard/package-lock.json
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check -e ".[test]"
+
+      - name: Verify native Windows test Python discovery
+        run: node --no-warnings --experimental-strip-types --test tests/control_plane_ts/test_python_runtime.test.ts
+
+      - name: Qualify named report timezones on Windows
+        run: >-
+          python -m pytest -q tests/capabilities/test_periodic_report_cadence.py
+          tests/capabilities/test_periodic_report_machine_defaults.py
+
+      - name: Qualify captured research fixture integrity on Windows
+        env:
+          PYTHONUTF8: "0"
+        run: python -m pytest -q tests/presentation/test_research_history_fixture.py
+
+      - name: Qualify local research HTTP lifecycle on Windows
+        env:
+          PYTHONUTF8: "0"
+        run: >-
+          python -m pytest -q tests/presentation/test_research_analysis_api.py
+          -k "not source_goal and not source_analysis and not source_execution"
+
+      - name: Qualify live pytest worker diagnostics on Windows
+        run: >-
+          python -m pytest -q tests/test_ci_pytest_timing.py
+          -k stall_snapshot_is_visible_before_the_blocked_test_returns
+
+      - name: Qualify the canary plan's repository path rendering
+        run: >-
+          python -m pytest -q
+          tests/canary/test_repository_root.py::test_plan_renders_repository_paths_in_canonical_posix_form
+
+      - name: Qualify native Windows quota settlement Turn rendering
+        # The settlement plan renders the Turn reference for the host shell, so
+        # only a native Windows host can check that the generated command
+        # forwards $LOOPX_TURN instead of the POSIX-only ${LOOPX_TURN:?}.
+        run: >-
+          python -m pytest -q
+          tests/control_plane/test_quota_settlement.py::test_codex_app_windows_settlement_command_substitutes_powershell_turn
+
+      - name: Set up the qualified SQLite runtime for settlement recovery
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+
+      - name: Qualify native PowerShell settlement recovery and its immutable baseline
+        run: >-
+          python -m pytest -q --basetemp "${{ runner.temp }}/lxs-${{ github.run_id }}-${{ github.run_attempt }}"
+          tests/control_plane/test_refresh_settle_turn.py::test_wrong_or_missing_child_workspace_retains_owed_command_for_exact_recovery
+          tests/control_plane/test_refresh_settle_turn.py::test_legacy_posix_quoted_powershell_launcher_fails_before_settlement
+          tests/control_plane/test_refresh_settle_turn.py::test_pinned_powershell_launcher_settles_original_turn_once
+
+      - name: Restore the primary Windows Node runtime
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/presentation/dashboard/package-lock.json
+
+      - name: Qualify TypeScript shard paths on native Windows
+        run: python -m pytest -q tests/test_python_ci_workflow.py::test_typescript_shards_select_every_test_file_exactly_once
+
+      - name: Qualify read-only Codex rollout rotation on native Windows
+        run: >-
+          python -m pytest -q
+          tests/test_codex_rollout_file.py
+          tests/test_codex_rollout_cursor.py
+
+      - name: Qualify the canary premerge contract smoke on native Windows
+        run: python examples/canary/premerge-validation-gate-smoke.py
+
+      - name: Qualify original-task recovery and interactive input on Windows
+        # These are process/authority cases; dedicated long-path cases remain below.
+        run: >-
+          python -m pytest -q --basetemp .t
+          tests/test_delegation_task_revalidation.py
+          tests/control_plane/test_validation_process_cleanup.py
+          -k "active_rejected_worker or preserves_an_internal_lock_timeout or original_task_revalidation_repairs or validation_process_cleanup"
+
+      - name: Qualify native CLI output fixture and diagnostic boundaries
+        run: >-
+          python -m pytest -q
+          --basetemp "${{ runner.temp }}/lxb-${{ github.run_id }}-${{ github.run_attempt }}"
+          tests/control_plane/test_cli_output_budget.py
+          tests/control_plane/test_cli_output_differential.py
+          -k "stable_budget_fixture or long_path_budget or probe_process_failure_preserves_utf8_diagnostics or pinned_reader_follows"
+
+      - name: Qualify the native Windows CLI output differential
+        timeout-minutes: 12
+        run: python examples/control_plane/cli-output-budget-regression-smoke.py
+
       - name: Run native Windows lifecycle tests
         run: >-
           python -m pytest -q
+          tests/test_chat_manager_inspection.py
           tests/test_command_invocation.py
+          tests/test_context_provider_service_ownership.py
+          tests/test_doctor_git_encoding.py
           tests/test_doctor_install_freshness.py
           tests/test_file_lock.py
           tests/test_file_lock_cross_process.py
+          tests/test_host_thread_activity.py
           tests/control_plane/test_effect_runtime_integration.py
+          tests/control_plane/test_turn_instance_arg.py
+          tests/control_plane/test_shadow_observation_retirement.py
+          tests/test_python_install_owner_platform.py
           tests/test_self_update_runtime_activation.py
+          tests/test_self_update_download.py
+          tests/test_windows_atomic_writes.py
           tests/test_windows_install.py
+
+      - name: Qualify private IO on native Windows
+        run: >-
+          python -m pytest -q --basetemp .t-private-io
+          tests/control_plane/test_windows_snapshot_privacy.py
+          tests/test_file_lock_windows_atomic.py
+          tests/control_plane/test_document_io.py::test_ordinary_windows_long_path_publish_preserves_bytes_and_create_only
+          tests/control_plane/test_todo_completion_validation.py::test_private_validation_store_is_owner_only_and_detects_tampering
+
+      - name: Qualify portable file-flag probes on native Windows
+        # read_native_trace_file, the recovery readback and checkpoint retention
+        # used to reference os.O_NOFOLLOW, os.O_DIRECTORY and os.getuid
+        # directly, so a host that does not define one raised AttributeError
+        # before the reader could refuse. Only a native Windows host takes that
+        # branch for real; the simulated cases cover it on POSIX.
+        run: >-
+          python -m pytest -q
+          tests/architecture/test_posix_flag_portability.py
+          tests/control_plane/test_posix_flag_fallback.py
+
+      - name: Check Windows collaboration lock sidecars
+        run: python -m pytest -q --basetemp .t tests/test_collaboration_sidecar_scan.py
+
+      - name: Qualify the read-only fixture teardown on native Windows
+        # Windows refuses to unlink a read-only file and git marks every loose
+        # object read-only, so these suites fail on the pre-fix teardown with
+        # PermissionError [WinError 5] and cannot discriminate on POSIX.
+        run: >-
+          python -m pytest -q
+          tests/canary/test_smoke_fixture_cleanup.py
+          tests/extensions/test_process_runtime.py
+          tests/capabilities/test_issue_fix_temporary_workspace.py
+
+      - name: Qualify mocked GitHub metadata on native Windows
+        run: python examples/content-ops-issue-fix-metadata-preview-smoke.py
+
+      - name: Qualify mocked GitHub replies on native Windows
+        run: python examples/value-connectors-github-public-probe-smoke.py
+
+      - name: Qualify native Windows peer reads and long-path inputs
+        run: >-
+          python -m pytest -q
+          tests/test_peer_collaboration.py::test_peer_cli_preserves_unicode_request_and_reply
+          tests/test_peer_collaboration.py::test_peer_exchange_survives_long_private_store_paths
+          tests/test_peer_collaboration.py::test_peer_binary_artifact_preserves_crlf_and_ctrl_z_digest
+          tests/test_peer_collaboration.py::test_peer_read_qualifies_long_workspace_input
+
+      - name: Validate local-state routing and interruption recovery on Windows
+        run: >-
+          python -m pytest -q
+          tests/test_local_state_migration.py::test_windows_junction_goal_source_never_reads_or_moves_outside_project
+          tests/test_local_state_migration.py::test_windows_junction_rollback_destination_never_writes_outside_project
+          tests/test_local_state_migration.py::test_windows_junction_goal_destination_never_writes_outside_project
+          tests/test_local_state_migration.py::test_extension_cli_keeps_legacy_machine_state_without_a_global_registry
+          tests/test_local_state_migration.py::test_first_global_registration_keeps_legacy_machine_state
+          tests/test_local_state_migration.py::test_rollback_io_failure_can_retry_to_consistent_original_routes
+          tests/test_local_state_migration.py::test_hard_interruption_has_a_recoverable_receipt
+          tests/test_local_state_migration.py::test_partial_rollback_rejects_subsequent_work_and_keeps_it
+          tests/test_local_state_migration.py::test_home_project_metadata_does_not_claim_the_machine_runtime
+          tests/test_local_state_migration.py::test_registry_writes_pin_bytes_across_host_newline_translation
+          tests/test_local_state_migration.py::test_earlier_v1_windows_registry_bytes_remain_recoverable
+          tests/test_local_state_migration.py::test_new_operation_does_not_accept_unrecorded_registry_newlines
+
+      - name: Set up the qualified SQLite runtime
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+
+      - name: Run SQLite CLI integration
+        run: python -m pytest -q tests/control_plane/test_sqlite_authority_cli.py
+
+      - name: Run native scheduler and SQLite authority tests
+        run: >-
+          node --no-warnings --experimental-sqlite --experimental-strip-types --test
+          tests/control_plane_ts/scheduler_heartbeat_commit.test.ts
+          tests/control_plane_ts/scheduler_heartbeat_commit_cli.test.ts
+          tests/control_plane_ts/sqlite_authority_store.test.ts
+          tests/control_plane_ts/local_authority_provider.test.ts
+          tests/control_plane_ts/sqlite_runtime_admission.test.ts
+
+      - name: Install the TypeScript suite dependencies
+        # The host-qualified suites import real packages (for example the
+        # skipped PostgreSQL provider still imports `pg`), and this lane never
+        # installed the root dependencies before.
+        run: npm ci --ignore-scripts
+
+      - name: Qualify host-hardened control-plane suites on native Windows
+        # These suites carry the native Windows branches, durability flushes and
+        # host-independent path assertions written by #6258, #6356 and #6562:
+        # the curated lane omitted them, so a Windows-only regression in their
+        # behavior could pass qualification.
+        run: >-
+          node --no-warnings --experimental-sqlite --experimental-strip-types --test
+          tests/control_plane_ts/agent_preferences.test.ts
+          tests/control_plane_ts/authority_archive.test.ts
+          tests/control_plane_ts/canonical_task_lease_renew.test.ts
+          tests/control_plane_ts/checkpoint_artifacts.test.ts
+          tests/control_plane_ts/cold_source_import.test.ts
+          tests/control_plane_ts/coordination_runtime_shadow.test.ts
+          tests/control_plane_ts/effect_runtime_snapshot.test.ts
+          tests/control_plane_ts/goal_acceptance_authority.test.ts
+          tests/control_plane_ts/quota_void_commit.test.ts
+          tests/control_plane_ts/shadow_entry_delivery.test.ts
+          tests/control_plane_ts/sqlite_backup.test.ts
+          tests/control_plane_ts/task_lease_workspace.test.ts
+
+      - name: Install the frontend dependencies for a source rebuild
+        working-directory: apps/presentation/dashboard
+        run: npm ci --ignore-scripts
+
+      - name: Rebuild the Chat bundle where only python.exe is usable
+        working-directory: apps/presentation/dashboard
+        shell: pwsh
+        run: |
+          $shadow = Join-Path $env:RUNNER_TEMP "python-exe-only"
+          New-Item -ItemType Directory -Force -Path $shadow | Out-Null
+          # Supported Windows installs may expose python.exe alone, and a
+          # python3.exe App Execution Alias stub is not runnable. The npm entry
+          # must resolve a real 3.11+ interpreter either way.
+          Set-Content -Path (Join-Path $shadow "python3.exe") `
+            -Value "unusable python3 stand-in" -Encoding ascii
+          $env:PATH = "$shadow;$env:PATH"
+          npm run build:chat
+
+      - name: Verify the Windows-built Chat bundle
+        run: python scripts/chat_bundle.py verify --source
+
+  presentation:
+    needs: [changes, chat-bundle]
+    if: needs.changes.outputs.presentation_tests == 'true' && !cancelled() && needs.chat-bundle.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: chat-bundle-${{ github.sha }}
+          path: loopx/web/chat/
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Verify the source-bound Dashboard artifact
+        run: python scripts/chat_bundle.py verify --source
+
+  merge-gate:
+    permissions:
+      contents: read
+      actions: read
+    # Open PRs always receive an outcome; closed PRs only cancel their old lane.
+    if: always() && github.event_name != 'pull_request_target' && (github.event_name != 'pull_request' || github.event.action != 'closed') && (github.event_name != 'push' || !cancelled())
+    needs: [changes, checks, pytest, node-minimum-compatibility, stage2c-correctness-e2e, windows-powershell, presentation]
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Reject incomplete or unsuccessful qualification
+        id: verdict
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python scripts/ci/review_gate.py verify
+      - name: Explain qualification with current-attempt job evidence
+        if: always()
+        # Reporting failure cannot change the preceding gate's verdict.
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: actions/github-script@v8
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          GATE_RESULT: ${{ steps.verdict.outcome }}
+        with:
+          script: |
+            const {pathToFileURL} = await import('node:url');
+            const {renderQualificationSummary} = await import(pathToFileURL(
+              `${process.env.GITHUB_WORKSPACE}/scripts/ci/qualification_summary.ts`).href);
+            let jobs = null;
+            try {
+              jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+                ...context.repo, run_id: context.runId,
+                attempt_number: Number(process.env.GITHUB_RUN_ATTEMPT), per_page: 100,
+                request: {signal: AbortSignal.timeout(10000)},
+              });
+            } catch {
+              core.warning('Job evidence unavailable; the qualification verdict is unchanged.');
+            }
+            await core.summary.addRaw(renderQualificationSummary({
+              repository: `${context.repo.owner}/${context.repo.repo}`,
+              serverUrl: process.env.GITHUB_SERVER_URL,
+              runId: context.runId, runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+              sourceSha: context.payload.pull_request?.head.sha || context.sha,
+              checkoutSha: context.sha,
+              baseSha: context.payload.pull_request?.base.sha || context.payload.merge_group?.base_sha || '',
+              gateResult: process.env.GATE_RESULT,
+              needs: JSON.parse(process.env.NEEDS_JSON), jobs,
+            })).write();

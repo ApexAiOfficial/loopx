@@ -32,6 +32,7 @@ from loopx.control_plane.turn_driver.loop_controller import (
     BoundedTurnBudget,
     ValidatedTurnReceipt,
 )
+from loopx.control_plane.turn_driver.host_failure import build_host_failure_record
 from loopx.control_plane.turn_driver.loop_controller import (
     decide_loop_disposition as _decide_loop_disposition,
 )
@@ -103,7 +104,11 @@ _FAILURE_PHASES = {
         "quota_spend",
     ),
 }
-_STOP_KINDS = {LoopXTurnResultKind.WAIT, LoopXTurnResultKind.USER_ACTION_REQUIRED}
+_STOP_KINDS = {
+    LoopXTurnResultKind.WAIT,
+    LoopXTurnResultKind.USER_ACTION_REQUIRED,
+    LoopXTurnResultKind.ITERATION_FAILED,
+}
 
 
 def _validated_receipt(
@@ -114,6 +119,7 @@ def _validated_receipt(
     failed_phase: str | None = None,
     continuation: str = "active_goal",
     successor_todo_ids: list[str] | None = None,
+    host_failure: dict[str, object] | None = None,
 ) -> ValidatedTurnReceipt:
     return ValidatedTurnReceipt.from_execution(
         _execution(
@@ -123,6 +129,7 @@ def _validated_receipt(
             failed_phase=failed_phase,
             continuation=continuation,
             successor_todo_ids=successor_todo_ids,
+            host_failure=host_failure,
         )
     )
 
@@ -135,6 +142,7 @@ def _execution(
     failed_phase: str | None = None,
     continuation: str = "active_goal",
     successor_todo_ids: list[str] | None = None,
+    host_failure: dict[str, object] | None = None,
 ) -> dict[str, object]:
     plan = _plan(lineage=lineage)
     if completed_phases is None and result_kind in _FAILURE_PHASES:
@@ -189,6 +197,8 @@ def _execution(
                 else {}
             ),
         }
+    if host_failure is not None:
+        execution["host_failure"] = host_failure
     return execution
 
 
@@ -259,6 +269,26 @@ def _budget(
     )
 
 
+def test_capability_handoff_after_progress_keeps_predecessor_and_actor_binding() -> None:
+    receipt = _validated_receipt(result_kind=LoopXTurnResultKind.VALIDATED_PROGRESS)
+    envelope = _envelope(should_run=True, effective_action="governed_capability_intent",
+                         selected_todo_id=None, predecessor_turn_key=receipt.turn_key)
+    envelope["action"]["capability_intent"] = {
+        "schema_version": "pending_capability_intent_projection_v0",
+        "goal_id": envelope["goal_id"], "agent_id": envelope["agent_id"],
+        "command": "fixture capability command",
+    }
+    result = decide_loop_disposition(turn_receipt=receipt, quota_decision=envelope)
+    _assert_markers(result, "capability_action_required")
+    envelope["predecessor_turn_key"] = "stale-predecessor"
+    with pytest.raises(ValueError):
+        decide_loop_disposition(turn_receipt=receipt, quota_decision=envelope)
+    envelope["predecessor_turn_key"] = receipt.turn_key
+    envelope["action"]["capability_intent"]["agent_id"] = "another-agent"
+    with pytest.raises(ValueError):
+        decide_loop_disposition(turn_receipt=receipt, quota_decision=envelope)
+
+
 def decide_loop_disposition(
     *,
     turn_receipt: ValidatedTurnReceipt | None,
@@ -290,6 +320,100 @@ def test_no_receipt_with_delivery_decision_runs_now() -> None:
         quota_decision=_envelope(should_run=True),
     )
     _assert_markers(payload, "run_now")
+
+
+@pytest.mark.parametrize("complete", [False, True], ids=["historical", "current"])
+@pytest.mark.parametrize("unit,repeats", [("G", 128), ("G", 2_420_000), ("界😀", 180_000)],
+                         ids=["small", "large", "escaped-unicode"])
+def test_controller_preserves_complete_goal_over_the_real_transport(
+    complete, unit, repeats,
+) -> None:
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from loopx.control_plane.quota.turn_envelope import build_turn_envelope, compose_turn_decision
+    from loopx.control_plane.turn_driver import build_loopx_turn_plan
+    from tests.test_turn_envelope import _full_decision
+
+    source = _full_decision()
+    snapshot_root = Path(tempfile.gettempdir())
+    original_text = unit * repeats
+    source["interaction_contract"]["agent_channel"]["work_context"] = {
+        "complete": True,
+        "sources": [{"source": "goal_state", "content": {"text": original_text}}],
+    }
+    envelope = compose_turn_decision(source) if complete else build_turn_envelope(source)
+    before = set(snapshot_root.glob("loopx-effect-*"))
+    context = (envelope["interaction_contract"]["agent_channel"]["work_context"]
+        if complete else envelope["work_context"])
+    assert context["sources"][0]["content"]["text"] == original_text
+    if not complete:
+        assert envelope["action_signature"]["matches"] is True
+    assert (len(json.dumps(envelope).encode()) > 2 * 1024 * 1024) == (repeats > 128)
+    if unit != "G":
+        assert len(json.dumps(envelope, ensure_ascii=False).encode()) < 2 * 1024 * 1024
+    plan = build_loopx_turn_plan(envelope, host="codex-cli", execution_mode="interactive-visible")
+    assert plan["route"]["kind"] == "ready_for_host"
+    result = _decide_loop_disposition(
+        turn_receipt=None, quota_decision=envelope,
+    )
+    _assert_markers(result, "run_now")
+    assert context["sources"][0]["content"]["text"] == original_text
+    assert set(snapshot_root.glob("loopx-effect-*")) == before
+
+
+def test_large_controller_decision_keeps_signature_rejection() -> None:
+    envelope = _envelope(should_run=True, signature_matches=False)
+    envelope["work_context"] = {"text": "G" * 2_420_000}
+    with pytest.raises(ValueError, match="envelope contract"):
+        _decide_loop_disposition(turn_receipt=None, quota_decision=envelope)
+
+
+@pytest.mark.parametrize("qualified", [False, True], ids=["mapping", "producer"])
+def test_controller_snapshot_limit_rejects_before_sending(monkeypatch, qualified) -> None:
+    from loopx.control_plane import effect_runtime
+    from loopx.control_plane.quota.turn_envelope import compose_turn_decision
+    from tests.test_turn_envelope import _full_decision
+
+    effect_runtime.effect_runtime_result("runtime.ping", {})
+    # Exercise the actual 64 MiB bound, including JSON overhead, without
+    # admitting a Host, changing a Goal or dispatching an oversized request.
+    text = "G" * effect_runtime.MAX_LOCAL_SNAPSHOT_BYTES
+    with monkeypatch.context() as patch:
+        patch.setattr(effect_runtime.socket, "create_connection",
+                      lambda *_args, **_kwargs: pytest.fail("oversized request was sent"))
+        with pytest.raises(effect_runtime.EffectRuntimeRejected) as error:
+            if qualified:
+                source = _full_decision()
+                source["interaction_contract"]["agent_channel"]["work_context"] = {
+                    "complete": True, "sources": [{"source": "goal_state", "content": {"text": text}}],
+                }
+                decision = compose_turn_decision(source)
+            else:
+                decision = _envelope(should_run=True)
+                decision["work_context"] = {"text": text}
+            _decide_loop_disposition(turn_receipt=None, quota_decision=decision)
+    assert error.value.diagnostic_code == "request_too_large"
+
+
+@pytest.mark.parametrize("rejection", ["invalid_request", "ambiguous"])
+def test_controller_does_not_retry_other_transport_failures(monkeypatch, rejection) -> None:
+    from loopx.control_plane import effect_runtime
+
+    failure = (effect_runtime.EffectRuntimeResponseAmbiguous("turn.controller", timeout=1)
+               if rejection == "ambiguous" else effect_runtime.EffectRuntimeRejected("rejected"))
+    calls = []
+
+    def reject(method, params, **kwargs):
+        calls.append((method, kwargs))
+        raise failure
+
+    monkeypatch.setattr(effect_runtime, "effect_runtime_result", reject)
+    with pytest.raises(type(failure)) as error:
+        _decide_loop_disposition(turn_receipt=None, quota_decision=_envelope(should_run=True))
+    assert error.value is failure
+    assert calls == [("turn.controller", {})]
 
 
 def test_no_receipt_with_quiet_decision_waits_no_spend() -> None:
@@ -590,6 +714,23 @@ def test_wait_receipt_waits() -> None:
     _assert_markers(payload, "wait")
 
 
+def test_iteration_failure_stops_without_retry_or_successor() -> None:
+    receipt = _validated_receipt(result_kind=LoopXTurnResultKind.ITERATION_FAILED)
+    payload = decide_loop_disposition(
+        turn_receipt=receipt,
+        quota_decision=_envelope(
+            should_run=True, predecessor_turn_key=receipt.turn_key
+        ),
+    )
+
+    _assert_markers(payload, "stop")
+    assert payload["stop_scope"] == "iteration"
+    assert payload["goal_terminal"] is False
+    assert payload["continuation_required"] is False
+    assert "retry_continuation" not in payload
+    assert "replan_continuation" not in payload
+
+
 @pytest.mark.parametrize(
     "failure_kind",
     ["host_failure", "validation_failed", "writeback_failed", "quota_spend_failed"],
@@ -605,6 +746,103 @@ def test_failure_receipts_route_to_repair(failure_kind: str) -> None:
     )
     _assert_markers(payload, "repair")
     assert failure_kind in str(payload["reason"])
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "backoff_seconds"),
+    [
+        ("provider_capacity", 30),
+        ("provider_overloaded", 30),
+        ("rate_limited", 60),
+    ],
+)
+def test_retryable_host_failure_waits_with_same_turn_backoff(
+    failure_kind: str,
+    backoff_seconds: int,
+) -> None:
+    receipt = _validated_receipt(
+        result_kind=LoopXTurnResultKind.HOST_FAILURE,
+        host_failure=build_host_failure_record(failure_kind, attempt=1),
+    )
+    payload = decide_loop_disposition(
+        turn_receipt=receipt,
+        quota_decision=_envelope(
+            should_run=True, predecessor_turn_key=receipt.turn_key
+        ),
+    )
+
+    _assert_markers(payload, "wait")
+    assert payload["retry_continuation"] == {
+        "same_turn": True,
+        "retry_failed_turn": True,
+        "strategy": "same_configuration",
+        "retry_after_seconds": backoff_seconds,
+        "attempt": 1,
+        "max_attempts": 3,
+        "fresh_envelope_required": True,
+        "model_fallback_allowed": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["provider_capacity", "provider_overloaded", "rate_limited"],
+)
+def test_exhausted_host_retry_budget_routes_to_repair(failure_kind: str) -> None:
+    receipt = _validated_receipt(
+        result_kind=LoopXTurnResultKind.HOST_FAILURE,
+        host_failure=build_host_failure_record(failure_kind, attempt=3),
+    )
+    payload = decide_loop_disposition(
+        turn_receipt=receipt,
+        quota_decision=_envelope(
+            should_run=True, predecessor_turn_key=receipt.turn_key
+        ),
+    )
+
+    _assert_markers(payload, "repair")
+    assert "exhausted" in str(payload["reason"])
+
+
+def test_exhausted_quota_failure_routes_to_repair_without_retry_metadata() -> None:
+    receipt = _validated_receipt(
+        result_kind=LoopXTurnResultKind.HOST_FAILURE,
+        host_failure={
+            "schema_version": "loopx_turn_host_failure_v0",
+            "kind": "quota_exhausted",
+            "attempt": 1,
+            "retryable": False,
+        },
+    )
+    payload = decide_loop_disposition(
+        turn_receipt=receipt,
+        quota_decision=_envelope(
+            should_run=True, predecessor_turn_key=receipt.turn_key
+        ),
+    )
+
+    _assert_markers(payload, "repair")
+    assert "retry_continuation" not in payload
+
+
+def test_output_budget_failure_routes_to_repair_without_retry_metadata() -> None:
+    receipt = _validated_receipt(
+        result_kind=LoopXTurnResultKind.HOST_FAILURE,
+        host_failure=build_host_failure_record(
+            "output_budget_exhausted",
+            attempt=1,
+        ),
+    )
+    payload = decide_loop_disposition(
+        turn_receipt=receipt,
+        quota_decision=_envelope(
+            should_run=True,
+            predecessor_turn_key=receipt.turn_key,
+        ),
+    )
+
+    _assert_markers(payload, "repair")
+    assert "retry_continuation" not in payload
 
 
 def test_stale_todo_receipt_raises_not_terminal() -> None:
@@ -835,11 +1073,11 @@ def test_mismatched_signature_hashes_raise() -> None:
         decide_loop_disposition(turn_receipt=None, quota_decision=envelope)
 
 
-def test_over_budget_compaction_raises() -> None:
+def test_over_budget_compaction_preserves_disposition() -> None:
     envelope = _envelope(should_run=True)
     envelope["compaction"] = {"within_budget": False}
-    with pytest.raises(ValueError, match="envelope contract"):
-        decide_loop_disposition(turn_receipt=None, quota_decision=envelope)
+    result = decide_loop_disposition(turn_receipt=None, quota_decision=envelope)
+    _assert_markers(result, "run_now")
 
 
 def test_mismatched_signature_raises() -> None:
@@ -853,7 +1091,9 @@ def test_mismatched_signature_raises() -> None:
 def test_repair_decision_routes_to_repair() -> None:
     payload = decide_loop_disposition(
         turn_receipt=None,
-        quota_decision=_envelope(should_run=True, effective_action="workspace_repair"),
+        quota_decision=_envelope(
+            should_run=True, effective_action="agent_workspace_repair"
+        ),
     )
     _assert_markers(payload, "repair")
 
@@ -866,12 +1106,14 @@ def test_delivery_blocked_decision_waits() -> None:
     _assert_markers(payload, "wait")
 
 
-def test_disposition_enum_has_exactly_six_values() -> None:
+def test_disposition_enum_includes_explicit_capability_adapter_handoff() -> None:
     from loopx.control_plane.turn_driver.loop_controller import LoopDisposition
 
     assert {d.value for d in LoopDisposition} == {
         "run_now",
+        "capability_action_required",
         "wait",
+        "stop",
         "user_action_required",
         "repair",
         "replan",
@@ -930,7 +1172,9 @@ def test_validated_receipt_carries_turn_key() -> None:
 
 
 def test_budget_schema_version() -> None:
-    assert _budget().to_mapping()["schema_version"] == BOUNDED_TURN_BUDGET_SCHEMA_VERSION
+    assert (
+        _budget().to_mapping()["schema_version"] == BOUNDED_TURN_BUDGET_SCHEMA_VERSION
+    )
 
 
 def test_validated_receipt_schema_version() -> None:
@@ -938,3 +1182,305 @@ def test_validated_receipt_schema_version() -> None:
         _validated_receipt().to_mapping()["schema_version"]
         == VALIDATED_TURN_RECEIPT_SCHEMA_VERSION
     )
+
+
+# These expectations come from the continuation invariants, independently of
+# the controller table: a user gate blocks work; causal/actor identity must be
+# proved first; completion cannot manufacture a successor; exhaustion replans.
+@pytest.mark.parametrize("kind", list(LoopXTurnResultKind))
+def test_fresh_user_gate_outranks_every_nonterminal_result(kind) -> None:
+    kwargs = {}
+    if kind is LoopXTurnResultKind.TERMINAL_CLOSEOUT_FAILED:
+        kwargs = {
+            "completed_phases": _ALL_PHASES[:5],
+            "failed_phase": "terminal_closeout",
+        }
+    receipt = _validated_receipt(result_kind=kind, **kwargs)
+    # Completion needs a different Todo even when the fresh decision is a gate.
+    todo = "todo-next" if kind is LoopXTurnResultKind.VALIDATED_COMPLETION else "todo-1"
+    envelope = _envelope(
+        should_run=True,
+        selected_todo_id=todo,
+        user_action_required=True,
+        predecessor_turn_key=receipt.turn_key,
+    )
+    result = decide_loop_disposition(turn_receipt=receipt, quota_decision=envelope)
+    _assert_markers(result, "user_action_required")
+    assert "retry_continuation" not in result
+    assert "replan_continuation" not in result
+
+
+@pytest.mark.parametrize(
+    "action,should_run,quiet",
+    [
+        ("deliver", True, False),
+        ("agent_workspace_repair", True, False),
+        ("autonomous_replan", True, False),
+        ("deliver", False, True),
+        ("deliver", False, False),
+    ],
+)
+def test_progress_exhaustion_outranks_fresh_work_and_wait(
+    action, should_run, quiet
+) -> None:
+    receipt = _validated_receipt()
+    result = decide_loop_disposition(
+        turn_receipt=receipt,
+        quota_decision=_envelope(
+            should_run=should_run,
+            effective_action=action,
+            quiet_noop_allowed=quiet,
+            predecessor_turn_key=receipt.turn_key,
+        ),
+        bounded_turn_budget=_budget(max_turns=1, completed_turns=1),
+    )
+    _assert_markers(result, "replan")
+    assert "exhausted" in result["reason"]
+
+
+@pytest.mark.parametrize(
+    "action,expected",
+    [
+        ("deliver", "wait"),
+        ("agent_workspace_repair", "repair"),
+        ("autonomous_replan", "replan"),
+    ],
+)
+def test_host_failure_recovery_route_outranks_available_retry(action, expected) -> None:
+    receipt = _validated_receipt(
+        result_kind=LoopXTurnResultKind.HOST_FAILURE,
+        host_failure=build_host_failure_record("provider_capacity", attempt=1),
+    )
+    result = decide_loop_disposition(
+        turn_receipt=receipt,
+        quota_decision=_envelope(
+            should_run=True,
+            effective_action=action,
+            predecessor_turn_key=receipt.turn_key,
+        ),
+    )
+    _assert_markers(result, expected)
+    assert ("retry_continuation" in result) == (expected == "wait")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        None,
+        LoopXTurnResultKind.VALIDATED_PROGRESS,
+        LoopXTurnResultKind.VALIDATED_COMPLETION,
+    ],
+)
+def test_capability_handoff_needs_no_todo_or_progress_budget(kind) -> None:
+    receipt = (
+        None
+        if kind is None
+        else _validated_receipt(result_kind=kind, continuation="no_followup")
+    )
+    envelope = _envelope(
+        should_run=True,
+        effective_action="governed_capability_intent",
+        selected_todo_id=None,
+        predecessor_turn_key=receipt.turn_key if receipt else None,
+    )
+    envelope["action"]["capability_intent"] = {
+        "schema_version": "pending_capability_intent_projection_v0",
+        "goal_id": "goal-1",
+        "agent_id": "agent-1",
+        "command": "fixture command",
+    }
+    result = decide_loop_disposition(turn_receipt=receipt, quota_decision=envelope)
+    _assert_markers(result, "capability_action_required")
+    assert result["lineage"]["todo_id"] == ""
+
+
+@pytest.mark.parametrize(
+    "mutation,expected",
+    [
+        ("signature", "envelope contract"),
+        ("actor_missing", "missing goal/agent"),
+        ("predecessor_missing", "missing predecessor_turn_key"),
+        ("predecessor_stale", "does not match the receipt turn_key"),
+        ("actor_stale", "on agent_id"),
+        ("todo_stale", "receipt Todo"),
+    ],
+)
+def test_rejection_precedence_before_user_gate_and_missing_budget(
+    mutation, expected
+) -> None:
+    receipt = _validated_receipt()
+    envelope = _envelope(
+        should_run=True,
+        user_action_required=True,
+        predecessor_turn_key=receipt.turn_key,
+    )
+    if mutation == "signature":
+        envelope["action_signature"] = {}
+        envelope["agent_id"] = ""
+        envelope.pop("predecessor_turn_key")
+    elif mutation == "actor_missing":
+        envelope["agent_id"] = ""
+        envelope.pop("predecessor_turn_key")
+    elif mutation == "predecessor_missing":
+        envelope.pop("predecessor_turn_key")
+        envelope["agent_id"] = "stale-agent"
+    elif mutation == "predecessor_stale":
+        envelope["predecessor_turn_key"] = "stale-turn"
+        envelope["agent_id"] = "stale-agent"
+    elif mutation == "actor_stale":
+        envelope["agent_id"] = "stale-agent"
+        envelope["action"]["selected_todo"] = {"todo_id": "stale-todo"}
+    else:
+        envelope["action"]["selected_todo"] = {"todo_id": "stale-todo"}
+    with pytest.raises(ValueError, match=expected):
+        decide_loop_disposition(turn_receipt=receipt, quota_decision=envelope)
+
+
+@pytest.mark.parametrize(
+    "continuation,todo,match",
+    [
+        ("no_followup", None, "terminal Goal frontier evidence"),
+        ("successor", None, "fresh selected Todo"),
+        ("successor", "undeclared", "declared completion successor"),
+        ("active_goal", "todo-1", "reselected the completed Todo"),
+    ],
+)
+def test_completion_admission_precedes_user_gate(continuation, todo, match) -> None:
+    receipt = _validated_receipt(
+        result_kind=LoopXTurnResultKind.VALIDATED_COMPLETION,
+        continuation=continuation,
+        successor_todo_ids=["todo-next"],
+    )
+    with pytest.raises(ValueError, match=match):
+        decide_loop_disposition(
+            turn_receipt=receipt,
+            quota_decision=_envelope(
+                should_run=True,
+                selected_todo_id=todo,
+                user_action_required=True,
+                predecessor_turn_key=receipt.turn_key,
+            ),
+        )
+
+
+def test_wait_and_blocked_differ_for_missing_progress_todo() -> None:
+    receipt = _validated_receipt()
+    for quiet in (True, False):
+        envelope = _envelope(
+            should_run=False,
+            quiet_noop_allowed=quiet,
+            selected_todo_id=None,
+            predecessor_turn_key=receipt.turn_key,
+        )
+        if quiet:
+            result = decide_loop_disposition(
+                turn_receipt=receipt,
+                quota_decision=envelope,
+                bounded_turn_budget=_budget(),
+            )
+            _assert_markers(result, "wait")
+            assert result["lineage"] == receipt.lineage
+        else:
+            with pytest.raises(ValueError, match="receipt-backed executable"):
+                decide_loop_disposition(
+                    turn_receipt=receipt,
+                    quota_decision=envelope,
+                    bounded_turn_budget=_budget(),
+                )
+
+
+def test_completion_terminal_evidence_accepts_the_string_enum_owner() -> None:
+    from loopx.control_plane.quota.effective_action import EffectiveAction
+
+    receipt = _validated_receipt(
+        result_kind=LoopXTurnResultKind.VALIDATED_COMPLETION,
+        continuation="no_followup",
+    )
+    result = decide_loop_disposition(
+        turn_receipt=receipt,
+        quota_decision=_envelope(
+            should_run=False,
+            effective_action=EffectiveAction.TERMINAL_NO_FOLLOWUP,
+            state="terminal_no_followup",
+            predecessor_turn_key=receipt.turn_key,
+        ),
+    )
+    _assert_markers(result, "terminal")
+
+
+def test_independent_validation_replan_is_preserved_and_legacy_failure_repairs():
+    execution = _execution(result_kind=LoopXTurnResultKind.VALIDATION_FAILED)
+    execution.update(validation_stage="task_postcondition", validation={
+        "schema_version": "loopx_turn_task_validation_v0", "ok": False, "status": "failed",
+        "validator_kind": "fixture", "summary": "Declared postcondition absent",
+        "recovery_kind": "replan_required", "errors": [],
+    })
+    receipt = ValidatedTurnReceipt.from_execution(execution)
+    assert receipt.task_failure["recovery_kind"] == "replan_required"
+    decision = _envelope(should_run=True, predecessor_turn_key=receipt.turn_key)
+    actual = decide_loop_disposition(turn_receipt=receipt, quota_decision=decision, bounded_turn_budget=None)
+    assert actual["disposition"] == "replan"
+    execution.pop("validation_stage")
+    legacy = ValidatedTurnReceipt.from_execution(execution)
+    actual = decide_loop_disposition(turn_receipt=legacy, quota_decision=decision, bounded_turn_budget=None)
+    assert actual["disposition"] == "repair"
+
+
+def test_committed_replay_requires_original_complete_settlement_receipts():
+    import copy
+    payload = _execution()
+    payload.update(replayed=True, dry_run=False, quota_slot_spend_count=1,
+        effects={"host_invoked": False, "state_written": False, "quota_spent": False})
+    assert ValidatedTurnReceipt.from_execution(payload).result_kind is LoopXTurnResultKind.VALIDATED_PROGRESS
+    for corrupt in ("effect_id", "receipt_status", "receipt_missing", "preview", "spend_missing"):
+        invalid = copy.deepcopy(payload)
+        if corrupt == "effect_id":
+            invalid["settlement_result"]["receipts"][0]["effect_id"] = "different"
+        elif corrupt == "receipt_status":
+            invalid["settlement_result"]["receipts"][0]["status"] = "prepared"
+        elif corrupt == "receipt_missing":
+            invalid["settlement_result"]["receipts"].pop()
+        elif corrupt == "preview":
+            invalid["dry_run"] = True
+        else:
+            invalid["quota_slot_spend_count"] = 0
+        with pytest.raises((ValueError, TypeError)):
+            ValidatedTurnReceipt.from_execution(invalid)
+
+
+def test_request_receipt_keeps_its_exact_subject_without_granting_todo_lineage():
+    import copy
+
+    from loopx.control_plane.effect_program import SettlementIdentity
+
+    identity = SettlementIdentity(goal_id="request-goal", agent_id="request-agent", todo_id=None,
+        turn_instance_id="request-turn", request_subject={"request_id": "a" * 64,
+            "request_revision": 1, "request_digest": "b" * 64, "execution_scope_sha256": "c" * 64})
+    execution = _execution()
+    expected = {"goal_id": "request-goal", "agent_id": "request-agent", "todo_id": "",
+                "request_binding_id": identity.binding_id}
+    execution["receipt"]["lineage"] = expected
+    execution["receipt"]["settlement_effect_id"] = identity.effect_id
+    for receipt in execution["settlement_result"]["receipts"]:
+        receipt["effect_id"] = identity.effect_id
+
+    with pytest.raises(ValueError, match="goal/agent/todo lineage"):
+        ValidatedTurnReceipt.from_execution(execution)
+    assert ValidatedTurnReceipt.from_execution(execution, request_identity=identity).to_mapping()["lineage"] == expected
+    for field in ["goal_id", "agent_id", "todo_id", "request_binding_id", "extra"]:
+        invalid = copy.deepcopy(execution)
+        invalid["receipt"]["lineage"][field] = "foreign"
+        with pytest.raises(ValueError, match="original request identity"):
+            ValidatedTurnReceipt.from_execution(invalid, request_identity=identity)
+    invalid = copy.deepcopy(execution)
+    invalid["receipt"]["settlement_effect_id"] = "foreign"
+    with pytest.raises(ValueError, match="original request identity"):
+        ValidatedTurnReceipt.from_execution(invalid, request_identity=identity)
+    invalid = copy.deepcopy(execution)
+    invalid["settlement_result"]["receipts"].pop()
+    with pytest.raises((ValueError, TypeError), match="ordered validation/writeback/spend"):
+        ValidatedTurnReceipt.from_execution(invalid, request_identity=identity)
+    todo_identity = SettlementIdentity(goal_id="request-goal", agent_id="request-agent",
+        todo_id="todo-existing", turn_instance_id="request-turn")
+    with pytest.raises(ValueError, match="original request identity"):
+        ValidatedTurnReceipt.from_execution(execution, request_identity=todo_identity)

@@ -272,7 +272,7 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
                 "reason": "samples project-local uninstall safety with isolated fixture registries",
             },
             {
-                "command": "python3 examples/worker-bridge-install-contract-smoke.py",
+                "command": "python3 examples/cli-worker-bridge-command-modularization-smoke.py",
                 "tier": "deep",
                 "reason": "checks generic worker bridge install contracts without exposing private runtime material",
             },
@@ -301,7 +301,10 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
             "loopx/control_plane/scheduler/monitor_todo.py",
             "loopx/control_plane/scheduler/monitor_wait.py",
             "loopx/control_plane/scheduler/monitor_poll_writeback.py",
-            "loopx/control_plane/scheduler/monitor_target.py",
+            "loopx/control_plane/quota/monitor_poll_commit.ts",
+            "loopx/control_plane/quota/monitor_poll_codec.ts",
+            "loopx/control_plane/quota/monitor_poll_admission.ts",
+            "loopx/control_plane/quota/monitor_poll_provider.ts",
             "loopx/control_plane/scheduler/scheduler_hint.py",
             "loopx/control_plane/quota/stall_repair.py",
             "loopx/control_plane/scheduler/arbitration.py",
@@ -311,9 +314,9 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
             "loopx/control_plane/todos/handoff_gate.py",
             "loopx/control_plane/work_items/execution_obligation.py",
             "loopx/control_plane/work_items/goal_route_hint.py",
-            "loopx/control_plane/work_items/outcome_followthrough.py",
+            "loopx/control_plane/work_items/delivery_history.py",
+            "loopx/control_plane/work_items/delivery_history.ts",
             "loopx/control_plane/work_items/work_lane.py",
-            "loopx/control_plane/runtime/event_store_migration_bridge.py",
         ),
         "checks": [
             {
@@ -383,6 +386,15 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
                     "underlying debt has been retired"
                 ),
             },
+            {
+                "command": "python3 examples/semantic-vocabulary-drift-smoke.py",
+                "tier": "default",
+                "reason": (
+                    "fails on an unregistered vocabulary value, a forked owner symbol, "
+                    "unclassified project-registry I/O or stale classifications, "
+                    "or a raised collision or retirement budget"
+                ),
+            },
         ],
     },
     *CONTROL_PLANE_QUALIFICATION_PROFILES,
@@ -423,9 +435,9 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
                 ),
             },
             {
-                "command": "python3 examples/control_plane/run-compaction-readmodel-smoke.py",
+                "command": "python3 examples/control_plane/run-history-readmodel-smoke.py",
                 "tier": "default",
-                "reason": "guards status wrapper parity for compact run read-model and summary projection attachment",
+                "reason": "guards status run-history parity, compact reward/gate privacy, and bounded history projection",
             },
             {
                 "command": "python3 examples/control_plane/goal-channel-readmodel-smoke.py",
@@ -511,57 +523,12 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
             {
                 "command": "python3 examples/control_plane/control-plane-integrated-canary-smoke.py",
                 "tier": "deep",
-                "reason": "samples the bounded status -> quota -> review-packet event read path",
+                "reason": "samples the bounded status -> quota -> review-packet Todo read path",
             },
             {
                 "command": "python3 examples/control_plane/hot-path-interface-budget-smoke.py",
                 "tier": "deep",
                 "reason": "checks review-packet handoff interface budgets after hot-path changes",
-            },
-        ],
-    },
-    {
-        "id": "event-sourced-read-path",
-        "title": "Event-sourced read-path contract",
-        "purpose": "Check event projection, status read path, downstream read surfaces, and migration gates before event-store/read-path changes ship.",
-        "catalog_families": ["Work Routing", "State And Boundary", "Planning Governance"],
-        "trigger_hints": (
-            "event-sourced",
-            "event sourced",
-            "event projection",
-            "event read-path",
-            "downstream read",
-            "event-store",
-            "event store",
-            "loopx/event_sourced_state.py",
-            "loopx/rollout_event_log.py",
-            "docs/reference/protocols/event-store-migration-bridge-v0.md",
-        ),
-        "checks": [
-            {
-                "command": "python3 examples/control_plane/event-sourced-state-api-smoke.py",
-                "tier": "default",
-                "reason": "guards event append/replay API behavior used by read-path projections",
-            },
-            {
-                "command": "python3 examples/control_plane/event-sourced-status-read-path-smoke.py",
-                "tier": "default",
-                "reason": "checks status consumption of event projection with Markdown fallback",
-            },
-            {
-                "command": "python3 examples/control_plane/event-sourced-downstream-read-path-smoke.py",
-                "tier": "default",
-                "reason": "checks downstream read surfaces consume event projection without private state",
-            },
-            {
-                "command": "python3 examples/control_plane/event-store-migration-bridge-smoke.py",
-                "tier": "deep",
-                "reason": "samples the migration bridge gates before bounded event read-path canaries",
-            },
-            {
-                "command": "python3 examples/control_plane/event-sourced-replay-compaction-smoke.py",
-                "tier": "deep",
-                "reason": "checks replay compaction when broader event-store changes are promoted",
             },
         ],
     },
@@ -581,7 +548,7 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
             {
                 "command": "python3 examples/cli-version-command-modularization-smoke.py",
                 "tier": "default",
-                "reason": "guards a low-risk command migration plus old version invocations",
+                "reason": "guards version output parity and both JSON format option placements",
             },
             {
                 "command": "python3 examples/cli-control-plane-command-modularization-smoke.py",
@@ -630,19 +597,9 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
                 "reason": "guards deferred writes, fail-closed resume kinds, and runtime capacity resume routing",
             },
             {
-                "command": "python3 examples/control_plane/todo-list-event-projection-smoke.py",
-                "tier": "default",
-                "reason": "guards event-sourced todo list projection with Markdown fallback",
-            },
-            {
                 "command": "python3 examples/control_plane/todo-concurrent-write-lock-smoke.py",
                 "tier": "deep",
                 "reason": "samples lock behavior for concurrent todo writes",
-            },
-            {
-                "command": "python3 examples/control_plane/todo-detail-cold-path-contract-smoke.py",
-                "tier": "deep",
-                "reason": "checks the cold-path todo detail contract when detail surfaces are promoted",
             },
         ],
     },
@@ -812,6 +769,8 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
             "examples/issue-fix-capability-guide-smoke.py",
             "examples/issue-fix-reviewer-recommendation-smoke.py",
             "examples/issue-fix-reviewer-request-smoke.py",
+            "examples/issue-fix-reviewer-notification-drain-postwrite-smoke.py",
+            "loopx/capabilities/issue_fix/reviewer_notification_drain.py",
             "examples/issue-fix-json-input-boundary-smoke.py",
             "examples/issue-fix-reviewer-notification-sink-smoke.py",
             "loopx/capabilities/issue_fix/cli.py",
@@ -839,6 +798,11 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
                 "command": "python3 examples/issue-fix-reviewer-request-smoke.py",
                 "tier": "default",
                 "reason": "guards author exclusion, formal-request-first notification, permission-only comment fallback, idempotency, blockers, and post-write verification",
+            },
+            {
+                "command": "python3 examples/issue-fix-reviewer-notification-drain-postwrite-smoke.py",
+                "tier": "default",
+                "reason": "guards restart-safe drain writeback, unverified-send suppression, and semantic notification deduplication",
             },
             {
                 "command": "python3 examples/issue-fix-reviewer-notification-sink-smoke.py",
@@ -968,19 +932,18 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
         ],
     },
     {
-        "id": "new-user-onboarding-lifecycle",
-        "title": "New-user onboarding lifecycle",
+        "id": "first-connect-contract",
+        "title": "First-connect contract",
         "quality_risk": "high",
         "purpose": (
-            "Check fresh no-scan connection, structured todo projection, "
+            "Check fresh connection state, absence of first-connect todos, "
             "state-gap detection, and domain-adapter routing ownership."
         ),
         "catalog_families": ["Work Routing", "State And Boundary"],
         "trigger_hints": (
             "new user onboarding",
-            "onboarding lifecycle",
-            "no-onboarding-scan",
-            "onboarding_connection_validation",
+            "first connect",
+            "first-connect contract",
             "state projection gap",
             "start-goal",
             "loopx/bootstrap.py",
@@ -993,11 +956,11 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
         ),
         "checks": [
             {
-                "command": "python3 examples/project/onboarding-no-scan-projection-smoke.py",
+                "command": "python3 examples/project/first-connect-contract-smoke.py",
                 "tier": "default",
                 "reason": (
-                    "guards fresh connection-to-todo parity, state-gap warnings, "
-                    "and domain-adapter routing ownership"
+                    "guards fresh connection state, first-connect todo absence, "
+                    "state-gap warnings, and domain-adapter routing ownership"
                 ),
             },
         ],
@@ -1042,9 +1005,9 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
                 "reason": "guards Codex App heartbeat identity, scheduler hints, and no-spend cadence behavior",
             },
             {
-                "command": "python3 examples/codex-cli-tui-bootstrap-smoke-bundle-smoke.py",
+                "command": "python3 examples/codex-cli-bootstrap-message-smoke.py",
                 "tier": "default",
-                "reason": "checks Codex CLI TUI bootstrap bundle and scoped LoopX command contract",
+                "reason": "checks Codex CLI TUI bootstrap message and scoped LoopX command contract",
             },
             {
                 "command": "python3 examples/claude-goalmode-lifecycle-smoke.py",
@@ -1052,9 +1015,9 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
                 "reason": "checks the Claude Code goal-mode loop lifecycle without production actions",
             },
             {
-                "command": "python3 examples/worker-bridge-install-contract-smoke.py",
+                "command": "python3 examples/cli-worker-bridge-command-modularization-smoke.py",
                 "tier": "default",
-                "reason": "checks generic worker bridge install/status contracts without private runtime material",
+                "reason": "checks the worker bridge install and active-user observation contracts without private runtime material",
             },
             {
                 "command": "python3 examples/computer-use-runtime-contract-smoke.py",
@@ -1089,52 +1052,6 @@ CURRENT_REPO_PROFILES: tuple[dict[str, Any], ...] = (
                 "command": "node examples/dashboard-frontstage-browser-smoke.mjs",
                 "tier": "deep",
                 "reason": "runs browser-level visual route validation when UI is promoted",
-            },
-        ],
-    },
-    {
-        "id": "auto-research-demo",
-        "title": "Auto-research demo and frontier route",
-        "purpose": (
-            "Check the minimal auto-research kernel and shared frontier projection; "
-            "keep legacy visible/demo wrappers out of the default canary path."
-        ),
-        "catalog_families": ["Work Routing", "Evidence Lifecycle", "State And Boundary", "Human Decision"],
-        "trigger_hints": (
-            "auto-research",
-            "auto research",
-            "demo-supervisor",
-            "demo e2e",
-            "frontier",
-            "visible launcher",
-            "loopx/capabilities/auto_research",
-            "loopx/cli_commands/auto_research",
-        ),
-        "checks": [
-            {
-                "command": "python3 examples/auto-research-minimal-kernel-smoke.py",
-                "tier": "default",
-                "reason": "checks the minimal evaluator-agnostic kernel and rejects public shortcut replay paths",
-            },
-            {
-                "command": "python3 examples/decentralized-auto-research-frontier-smoke.py",
-                "tier": "default",
-                "reason": "checks shared frontier, evidence graph, and public boundary fixtures",
-            },
-            {
-                "command": "python3 examples/auto-research-demo-supervisor-smoke.py",
-                "tier": "deep",
-                "reason": "samples the full dry-run supervisor packet and lane bootstrap contract",
-            },
-            {
-                "command": "python3 examples/auto-research-rollout-readpath-smoke.py",
-                "tier": "deep",
-                "reason": "checks rollout event read-path projection into live evidence graphs",
-            },
-            {
-                "command": "python3 examples/auto-research-live-evidence-capture-smoke.py",
-                "tier": "deep",
-                "reason": "checks compact live evidence capture fixtures for visible lanes",
             },
         ],
     },
@@ -1407,14 +1324,30 @@ def _split_semicolon(value: str) -> list[str]:
     return [item.strip() for item in value.split(";") if item.strip()]
 
 
+def resolve_canary_catalog_path(
+    catalog_path: Path | None = None, *, repo_root: Path | None = None,
+) -> Path:
+    """Resolve development inputs without treating an installed wheel as a checkout."""
+    path = (catalog_path or (
+        repo_root / "docs/concepts/interaction-pattern-catalog.md"
+        if repo_root is not None else DEFAULT_CATALOG_PATH
+    )).expanduser()
+    if not path.is_file():
+        raise ValueError(
+            f"canary catalog is missing: {path}; run from a complete LoopX source "
+            "checkout or supply --catalog PATH. The wheel does not bundle development inputs."
+        )
+    return path
+
+
 def _read_catalog(catalog_path: Path | None = None) -> tuple[Path, str]:
-    path = (catalog_path or DEFAULT_CATALOG_PATH).expanduser()
+    path = resolve_canary_catalog_path(catalog_path)
     return path, path.read_text(encoding="utf-8")
 
 
 def _display_path(path: Path) -> str:
     try:
-        return str(path.relative_to(REPO_ROOT))
+        return path.relative_to(REPO_ROOT).as_posix()
     except ValueError:
         return str(path)
 
@@ -1875,7 +1808,8 @@ def render_catalog_canary_profiles_markdown(payload: dict[str, Any]) -> str:
 
 
 def render_catalog_canary_plan_markdown(payload: dict[str, Any]) -> str:
-    inputs = payload.get("selection_inputs") if isinstance(payload.get("selection_inputs"), dict) else {}
+    inputs_value = payload.get('selection_inputs')
+    inputs = inputs_value if isinstance(inputs_value, dict) else {}
     lines = [
         "# Catalog Canary Plan",
         "",

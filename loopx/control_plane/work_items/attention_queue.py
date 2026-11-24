@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AbstractSet, Any, Callable, Optional
 
+from .replan_history_codec import effective_turn_cadence_context
+
+from ..goals.legacy_event_source import RetiredTodoEventSourceError
+from ..coordination.local_authority import LocalCoordinationAuthorityUnavailable
+from ..effect_runtime import effect_runtime_result
+
 
 AttentionItemBuilder = Callable[..., dict[str, Any]]
 GlobalRegistryShadowAttacher = Callable[[dict[str, Any], dict[str, Any]], None]
@@ -22,11 +28,11 @@ class AttentionQueueContext:
     latest_autonomous_replan_ack_for_projection: Callable[[list[dict[str, Any]] | None], dict[str, Any] | None]
     compact_control_plane_policy: Callable[[Any], dict[str, Any]]
     subagent_activity_for_goal: Callable[[dict[str, Any]], dict[str, Any] | None]
-    interface_budget_cadence_for_runs: Callable[[list[dict[str, Any]]], dict[str, Any]]
+    interface_budget_cadence_for_runs: Callable[[list[dict[str, Any]]], dict[str, Any] | None]
     active_state_projection_warning: Callable[[dict[str, Any], dict[str, Any] | None], dict[str, Any] | None]
     enrich_project_asset: Callable[..., None]
     project_asset_latest_validation: Callable[[dict[str, Any] | None], dict[str, Any] | None]
-    attach_active_state_project_asset_fields: Callable[..., None]
+    attach_active_state_project_asset_fields: Callable[..., object]
     sync_connected_attention_action_from_todos: Callable[[dict[str, Any]], None]
     quota_status: Callable[..., dict[str, Any]]
     quota_with_handoff_outcome_floor: Callable[..., dict[str, Any]]
@@ -42,6 +48,9 @@ class AttentionQueueContext:
     autonomous_replan_obligation_from_runs: Callable[..., dict[str, Any] | None]
     source_registry_shadow_findings: AbstractSet[str]
     monitor_signal_waiting_on: str
+    registry_path: Path | None = None
+    external_progress_review_context: Optional[Callable[..., dict[str, Any] | None]] = None
+    tolerate_malformed_settlement_history: bool = False
 
 
 def merge_global_registry_findings(
@@ -120,6 +129,57 @@ def build_attention_queue_projection(
     return queue
 
 
+def _reconcile_active_state_item(
+    goal: dict[str, Any],
+    current_run: dict[str, Any] | None,
+    item: dict[str, Any],
+    active_state_item: dict[str, Any] | None,
+    context: AttentionQueueContext,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    warning = context.active_state_projection_warning(goal, current_run)
+    if not warning:
+        return item, None
+    reconciled = effect_runtime_result("presentation.goal_attention.reconcile", {
+        "item": item, "active_state_item": active_state_item,
+        "warning": warning, "historical_run": current_run,
+    })
+    return reconciled["item"], reconciled["warning"]
+
+
+def _active_state_goal_context(
+    goal: dict[str, Any],
+    current_run: dict[str, Any] | None,
+    context: AttentionQueueContext,
+    runtime_root: Path | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    fields = context.active_state_todo_fields(goal, runtime_root=runtime_root)
+    # Goal content survives even when no work creates an attention item.
+    goal["goal_objective"] = fields.get("goal_objective")
+    return fields, context.active_state_todo_attention_item(goal, fields, current_run)
+
+
+def _unavailable_todo_source_item(
+    goal: dict[str, Any],
+    error: RetiredTodoEventSourceError | LocalCoordinationAuthorityUnavailable,
+    context: AttentionQueueContext,
+) -> dict[str, Any]:
+    item = context.attention_item(
+        goal_id=str(goal.get("id") or ""),
+        status=(error.code if isinstance(error, LocalCoordinationAuthorityUnavailable)
+                else error.reason_code),
+        waiting_on="user_or_controller",
+        severity="high",
+        recommended_action=str(error),
+        source="active_state",
+    )
+    item["todo_source"] = "unavailable"
+    if isinstance(error, LocalCoordinationAuthorityUnavailable):
+        item["error_code"] = error.code
+        item["authority_read"] = error.payload
+    item["activation_state"] = str(goal.get("activation_state") or "active")
+    return item
+
+
 def build_attention_queue(
     *,
     contract: dict[str, Any],
@@ -129,7 +189,17 @@ def build_attention_queue(
     runtime_root: Path | None = None,
     include_task_graph: bool = False,
     goal_id_filter: str | None = None,
+    include_stopped_goal_context: bool = False,
+    include_goal_channel_projection: bool = True,
+    agent_lane_id: str | None = None,
 ) -> dict[str, Any]:
+    """Build the executable attention queue or a stopped-Goal archive view.
+
+    Normal callers omit stopped Goals because they must never become runnable
+    attention. The scoped Dashboard archive opts into their already-persisted
+    Todo and run context so opening a stopped Goal remains informative; that
+    opt-in does not change lifecycle authority or make the Goal executable.
+    """
     health_items: list[dict[str, Any]] = []
     history_items: list[dict[str, Any]] = []
     if contract.get("ok") is False:
@@ -147,26 +217,41 @@ def build_attention_queue(
     for goal in history.get("goals") or []:
         if not isinstance(goal, dict):
             continue
-        if goal.get("activation_state") == "stopped":
+        if (
+            goal.get("activation_state") == "stopped"
+            and not include_stopped_goal_context
+        ):
             continue
         active_state_fields: dict[str, Any] | None = None
         active_state_item: dict[str, Any] | None = None
         current_status_run = context.latest_run(goal)
         goal_latest_runs = goal.get("latest_runs") if isinstance(goal.get("latest_runs"), list) else []
         if goal.get("registry_member"):
-            active_state_fields = context.active_state_todo_fields(goal, runtime_root=runtime_root)
-            active_state_item = context.active_state_todo_attention_item(
-                goal,
-                active_state_fields,
-                current_status_run,
-            )
+            try:
+                active_state_fields, active_state_item = _active_state_goal_context(
+                    goal, current_status_run, context, runtime_root,
+                )
+            except (RetiredTodoEventSourceError, LocalCoordinationAuthorityUnavailable) as error:
+                if isinstance(error, LocalCoordinationAuthorityUnavailable) and goal_id_filter:
+                    raise
+                # Refuse this source without hiding independent Goals or turning
+                # stale Todo/run projections into executable fallback work.
+                history_items.append(_unavailable_todo_source_item(goal, error, context))
+                continue
         if active_state_item and active_state_item.get("waiting_on") in {"controller", "user_or_controller"}:
             item = active_state_item
         else:
             item = context.goal_attention(goal)
-            if not item:
+            if not item or (
+                current_status_run is None
+                and item.get("status") == "unknown"
+                and active_state_item
+            ):
                 item = active_state_item
         if item:
+            item, projection_warning = _reconcile_active_state_item(
+                goal, current_status_run, item, active_state_item, context,
+            )
             item["activation_state"] = str(
                 goal.get("activation_state") or "active"
             )
@@ -210,7 +295,6 @@ def build_attention_queue(
                 item["agent_lane_recommendation"] = agent_lane_recommendation
             subagent_activity = context.subagent_activity_for_goal(goal)
             interface_budget_cadence = context.interface_budget_cadence_for_runs(goal_latest_runs)
-            projection_warning = context.active_state_projection_warning(goal, context.latest_run(goal))
             context.enrich_project_asset(
                 item,
                 latest_validation=context.project_asset_latest_validation(context.latest_run(goal)),
@@ -239,13 +323,29 @@ def build_attention_queue(
             if goal.get("registry_member"):
                 if active_state_fields is None:
                     active_state_fields = context.active_state_todo_fields(goal, runtime_root=runtime_root)
-                item.update(active_state_fields)
+                item.update({key: value for key, value in active_state_fields.items()
+                             if key != "goal_objective"})
                 context.sync_connected_attention_action_from_todos(item)
+                external_progress_review = (
+                    context.external_progress_review_context(goal, runtime_root)
+                    if context.external_progress_review_context is not None
+                    else None
+                )
                 context.attach_active_state_project_asset_fields(
                     item,
                     latest_runs=goal_latest_runs,
                     next_action_projection_warning=context.next_action_projection_warning,
                     autonomous_replan_obligation_from_runs=context.autonomous_replan_obligation_from_runs,
+                    external_progress_review=external_progress_review,
+                    effective_turn_cadence=effective_turn_cadence_context(
+                        goal,
+                        runtime_root,
+                        registry_path=context.registry_path,
+                        tolerate_malformed_history=(
+                            context.tolerate_malformed_settlement_history
+                        ),
+                    ),
+                    agent_lane_id=agent_lane_id,
                 )
                 item["quota"] = context.quota_status(
                     goal,
@@ -295,12 +395,13 @@ def build_attention_queue(
                 )
                 if task_graph_projection:
                     item["task_graph_projection"] = task_graph_projection
-            context.attach_goal_channel_projection(
-                item,
-                goal=goal,
-                goal_latest_runs=goal_latest_runs,
-                runtime_root=runtime_root,
-            )
+            if include_goal_channel_projection:
+                context.attach_goal_channel_projection(
+                    item,
+                    goal=goal,
+                    goal_latest_runs=goal_latest_runs,
+                    runtime_root=runtime_root,
+                )
             history_items.append(item)
 
     merge_global_registry_findings(

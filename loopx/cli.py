@@ -1,12 +1,29 @@
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import sys
-from pathlib import Path
+# Source-tree invocations must use the same bounded entrypoint as the console
+# script. Keep the full parser below importable for compatibility callers; the
+# entrypoint can still import this module by name when a full-parser fallback is
+# required, without executing this module-entry branch a second time.
+if __name__ == "__main__":
+    from .entrypoint import main as _entrypoint_main
 
-from . import __version__
+    raise SystemExit(_entrypoint_main())
+
+from .cli_commands.automation_cadence import (
+    register_automation_cadence_command, handle_automation_cadence_command,
+)
+
+import sys
+
+from .cli_commands.agent_capabilities import register_agent_capabilities
+from .cli_commands.agent_directory import register_agent_directory
+from .cli_commands.agent_context import register_agent_context
+from .capabilities.multi_subagent.cli import (
+    register_native_child_commands, handle_native_child_command,
+)
+from .cli_commands.todo_continuation import register_todo_continuation
+from .cli_commands.manager_inbox import register_manager_inbox
+from .cli_commands.delegation import register_delegation
 from .capabilities.content_ops.cli import (
     handle_content_ops_command,
     register_content_ops_commands,
@@ -24,7 +41,6 @@ from .capabilities.integration_branch.cli import (
     register_integration_branch_commands,
 )
 from .capabilities.repository_change_window.cli import (
-    handle_repository_change_window_command,
     register_repository_change_window_commands,
 )
 from .capabilities.decision_context.cli import (
@@ -47,14 +63,16 @@ from .capabilities.periodic_report.cli import (
     handle_periodic_report_command,
     register_periodic_report_commands,
 )
+from .capabilities.machine_configuration.cli import (
+    handle_machine_configuration_command,
+    register_machine_configuration_commands,
+)
+from .paths import (
+    effective_runtime_root,
+)
 from .capabilities.semantic_preference.cli import (
     handle_semantic_preference_command,
     register_semantic_preference_commands,
-)
-from .capabilities.auto_research.cli import (
-    handle_auto_research_command,
-    register_auto_research_commands,
-    rewrite_auto_research_question_argv,
 )
 from .capabilities.value_connectors.cli import (
     handle_value_connector_command,
@@ -64,18 +82,18 @@ from .capabilities.connector_registry.cli import (
     handle_connector_command,
     register_connector_commands,
 )
+from .capabilities.external_research.cli import (
+    handle_external_evidence_command,
+    register_external_evidence_commands,
+)
+from .capabilities.performance_diagnosis.cli import (
+    register_performance_diagnosis_commands,
+)
 from .cli_commands import (
-    handle_turn_command,
     handle_benchmark_command,
-    handle_bootstrap_connect_command,
     handle_canary_command,
     handle_capability_command,
-    handle_check_command,
-    handle_diagnose_command,
-    handle_doctor_command,
     handle_dreaming_command,
-    handle_evidence_log_command,
-    handle_extension_command,
     handle_explore_command,
     handle_first_run_report_command,
     handle_goal_channel_command,
@@ -83,38 +101,32 @@ from .cli_commands import (
     handle_lark_inbox_command,
     handle_lark_kanban_command,
     handle_ml_experiment_command,
-    handle_multi_agent_command,
     handle_preset_command,
     handle_presentation_command,
     handle_dash_command,
     handle_project_command,
-    handle_project_lifecycle_command,
     handle_pr_review_command,
-    handle_quota_command,
+    handle_deepresearch_command,
     handle_ready_score_command,
     handle_review_batch_command,
     handle_registry_admin_command,
-    handle_review_packet_command,
-    handle_slash_commands_command,
-    handle_status_command,
     handle_starter_command,
-    handle_summary_all_command,
     handle_support_control_command,
-    handle_handoff_mode_command,
-    handle_task_lease_command,
-    handle_todo_command,
+    handle_authority_shadow_command,
     handle_version_command,
-    handle_host_mode_plan_command,
+    handle_usage_ping_command,
     handle_worker_bridge_command,
     handle_workflow_skills_command,
     register_benchmark_command_group,
     register_turn_commands,
     register_bootstrap_connect_command,
     register_canary_commands,
+    register_coordination_shadow_command,
+    register_authority_archive_command,
+    register_postgres_commands,
     register_capability_commands,
     register_doctor_command,
     register_dreaming_commands,
-    register_evidence_log_command,
     register_extension_commands,
     register_explore_commands,
     register_goal_channel_commands,
@@ -124,13 +136,13 @@ from .cli_commands import (
     build_lark_issue_fix_reviewer_provider_hooks,
     register_lark_kanban_commands,
     register_ml_experiment_commands,
-    register_multi_agent_commands,
     register_preset_commands,
     register_presentation_commands,
     register_dash_commands,
     register_project_commands,
     register_project_lifecycle_commands,
     register_pr_review_command,
+    register_deepresearch_command,
     register_quota_command,
     register_ready_score_command,
     register_review_batch_commands,
@@ -142,17 +154,37 @@ from .cli_commands import (
     register_support_control_commands,
     register_handoff_mode_command,
     register_task_lease_command,
+    register_authority_shadow_command,
     register_todo_command,
     register_version_command,
+    register_usage_ping_command,
     register_host_mode_plan_command,
     register_worker_bridge_commands,
     register_workflow_skills_command,
 )
+from .cli_commands.zcode_goal import handle_zcode_goal_command, register_zcode_goal_command
 from .cli_commands.opencode2_goal_worker import (
     handle_opencode2_goal_worker_command,
     register_opencode2_goal_worker_command,
 )
-from .cli_rollout import append_cli_rollout_event
+from .cli_commands.shared_goal_alignment import (
+    handle_shared_goal_alignment_command,
+    register_shared_goal_alignment_command,
+)
+from .cli_commands.goal_acceptance import register_goal_acceptance_command
+from .cli_commands.goal_direction import register_goal_direction, handle_goal_direction
+from .cli_commands.goal_amendment_proposal import (
+    handle_goal_amendment_proposal_command,
+    register_goal_amendment_proposal_command,
+)
+from .cli_commands.anti_entropy import (
+    handle_anti_entropy_command,
+    register_anti_entropy_commands,
+)
+from .cli_commands.reliability_diagnostics import (
+    handle_reliability_diagnostics_command,
+    register_reliability_diagnostics_commands,
+)
 from .capabilities.project_skill_delivery.cli import (
     handle_project_skill_command,
     register_project_skill_commands,
@@ -162,84 +194,45 @@ from .extensions.lark.periodic_report_cli import (
     register_lark_periodic_report_commands,
 )
 from .help_surface import (
-    build_command_reference_payload,
-    render_command_reference_markdown,
+    register_command_reference,
     render_concise_help,
     top_level_help_requested,
 )
-from .paths import DEFAULT_RUNTIME_ROOT, default_registry_path, global_registry_path
-
-
-class LoopXArgumentParser(argparse.ArgumentParser):
-    """Require complete option names across the automation-facing CLI."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        kwargs.setdefault("allow_abbrev", False)
-        super().__init__(*args, **kwargs)
-
-
-def print_payload(payload: dict[str, object], fmt: str, markdown_renderer) -> None:
-    if fmt == "json":
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        print(markdown_renderer(payload))
-
-
-def add_subcommand_format(arg_parser: argparse.ArgumentParser) -> None:
-    arg_parser.add_argument(
-        "--format",
-        dest="subcommand_format",
-        choices=["markdown", "json"],
-        help="Output format for this subcommand. Equivalent to global --format before the command.",
-    )
-
-
-def output_format(args: argparse.Namespace, *local_dests: str) -> str:
-    for dest in (*local_dests, "subcommand_format"):
-        value = getattr(args, dest, None)
-        if value:
-            return str(value)
-    return str(getattr(args, "format", None) or "markdown")
-
-
-def resolve_global_output_format(args: argparse.Namespace) -> str:
-    if getattr(args, "format", None):
-        return str(args.format)
-    if args.command == "quota" and getattr(args, "quota_command", None) == "should-run":
-        return "json"
-    return "markdown"
-
-
-def user_supplied_registry(argv: list[str] | None) -> bool:
-    values = sys.argv[1:] if argv is None else argv
-    return any(value == "--registry" or value.startswith("--registry=") for value in values)
+from .cli_runtime import (
+    LoopXArgumentParser,
+    add_subcommand_format,
+    build_cli_parser,
+    cli_invocation_route,
+    dispatch_common_command,
+    enforce_native_controller_guard,
+    output_format,
+    parse_cli_args,
+    print_payload,
+    resolve_cli_registry,
+    resolve_global_output_format,
+    user_supplied_registry,
+)
 
 
 def build_parser() -> LoopXArgumentParser:
-    parser = LoopXArgumentParser(description="LoopX control-plane helper.")
-    parser.add_argument("--version", action="version", version=f"loopx {__version__}")
-    parser.add_argument("--registry", default=str(default_registry_path()), help="Path to a project-local registry.")
-    parser.add_argument("--runtime-root", help="Override registry common_runtime_root.")
-    parser.add_argument("--format", choices=["markdown", "json"])
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser, sub = build_cli_parser()
 
     register_version_command(sub, add_subcommand_format)
 
-    commands_parser = sub.add_parser(
-        "commands",
-        help="Show grouped LoopX command reference for operators and contributors.",
-    )
-    add_subcommand_format(commands_parser)
+    register_command_reference(sub)
 
     register_bootstrap_connect_command(sub)
 
     register_starter_commands(sub)
 
-    register_doctor_command(sub)
+    register_doctor_command(sub, add_subcommand_format)
 
     register_first_run_report_command(sub)
 
+    register_usage_ping_command(sub, add_subcommand_format)
+
     register_opencode2_goal_worker_command(sub)
+    register_zcode_goal_command(sub, add_subcommand_format)
 
     register_worker_bridge_commands(sub, add_subcommand_format)
 
@@ -248,6 +241,10 @@ def build_parser() -> LoopXArgumentParser:
     register_canary_commands(sub, add_subcommand_format)
 
     register_capability_commands(sub, add_subcommand_format)
+
+    register_anti_entropy_commands(sub, add_subcommand_format)
+
+    register_reliability_diagnostics_commands(sub, add_subcommand_format)
 
     register_extension_commands(sub, add_subcommand_format)
 
@@ -279,17 +276,19 @@ def build_parser() -> LoopXArgumentParser:
         provider_command_registrars=(register_lark_periodic_report_commands,),
     )
 
+    register_machine_configuration_commands(sub, add_subcommand_format)
+
     register_semantic_preference_commands(sub, add_subcommand_format)
 
     register_value_connector_commands(sub, add_subcommand_format)
 
     register_connector_commands(sub, add_subcommand_format)
 
+    register_external_evidence_commands(sub, add_subcommand_format)
+    register_performance_diagnosis_commands(sub, add_subcommand_format)
+
     register_ml_experiment_commands(sub, add_subcommand_format)
 
-    register_auto_research_commands(sub, add_subcommand_format)
-
-    register_multi_agent_commands(sub, add_subcommand_format)
     register_turn_commands(sub, add_subcommand_format)
     register_host_mode_plan_command(sub, add_subcommand_format)
     register_preset_commands(sub, add_subcommand_format)
@@ -306,20 +305,36 @@ def build_parser() -> LoopXArgumentParser:
 
     register_project_lifecycle_commands(sub, add_subcommand_format)
     register_goal_channel_commands(sub, add_subcommand_format)
+    register_manager_inbox(sub, add_subcommand_format)
+    register_delegation(sub, add_subcommand_format)
+    register_agent_capabilities(sub, add_subcommand_format)
+    register_agent_context(sub, add_subcommand_format)
+    register_native_child_commands(sub, add_subcommand_format)
+    register_agent_directory(sub, add_subcommand_format)
     register_lark_inbox_commands(sub, add_subcommand_format)
     register_lark_kanban_commands(sub, add_subcommand_format)
 
     register_status_commands(sub, add_subcommand_format)
     register_summary_all_command(sub, add_subcommand_format)
     register_pr_review_command(sub, add_subcommand_format)
+    register_deepresearch_command(sub, add_subcommand_format)
     register_slash_commands_command(sub, add_subcommand_format)
     register_workflow_skills_command(sub, add_subcommand_format)
     register_dreaming_commands(sub, add_subcommand_format)
-    register_evidence_log_command(sub, add_subcommand_format)
     register_explore_commands(sub, add_subcommand_format)
     register_todo_command(sub, add_subcommand_format)
+    register_coordination_shadow_command(sub, add_subcommand_format)
+    register_automation_cadence_command(sub, add_subcommand_format)
+    register_authority_archive_command(sub, add_subcommand_format)
+    register_postgres_commands(sub, add_subcommand_format)
     register_task_lease_command(sub, add_subcommand_format)
+    register_authority_shadow_command(sub, add_subcommand_format)
+    register_todo_continuation(sub, add_subcommand_format)
     register_handoff_mode_command(sub, add_subcommand_format)
+    register_shared_goal_alignment_command(sub, add_subcommand_format)
+    register_goal_acceptance_command(sub, add_subcommand_format)
+    register_goal_amendment_proposal_command(sub, add_subcommand_format)
+    register_goal_direction(sub, add_subcommand_format)
     register_quota_command(sub)
 
     return parser
@@ -327,111 +342,41 @@ def build_parser() -> LoopXArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else list(argv)
+    with cli_invocation_route(raw_argv):
+        return _main(argv)
+
+
+def _main(argv: list[str] | None = None) -> int:
+    raw_argv = sys.argv[1:] if argv is None else list(argv)
     if top_level_help_requested(raw_argv):
         print(render_concise_help(sys.argv[0] if argv is None else "loopx"), end="")
         return 0
-    raw_argv = rewrite_auto_research_question_argv(raw_argv)
-
     parser = build_parser()
-    args = parser.parse_args(raw_argv)
+    args = parse_cli_args(parser, raw_argv)
+    from .usage_ping import select_operation
+    select_operation(args)
     args.format = resolve_global_output_format(args)
-    if os.environ.get("LOOPX_KUNLUNCODE_OUTER_CONTROLLER") == "1":
-        from .kunluncode_goal_mode.guards import native_controller_cli_write_block
+    guard_result = enforce_native_controller_guard(args)
+    if guard_result is not None:
+        return guard_result
+    registry_path, registry_was_configured = resolve_cli_registry(args, raw_argv)
 
-        native_write_block = native_controller_cli_write_block(args)
-        if native_write_block is not None:
-            print(
-                json.dumps(native_write_block, ensure_ascii=False, indent=2),
-                file=sys.stderr,
-            )
-            return 2
-    registry_path = Path(args.registry).expanduser()
-    registry_was_configured = user_supplied_registry(raw_argv) or bool(
-        os.environ.get("LOOPX_REGISTRY")
+    common_command_result = dispatch_common_command(
+        args,
+        registry_path=registry_path,
+        allow_missing_registry=not user_supplied_registry(raw_argv),
+        registry_was_configured=registry_was_configured,
     )
-    project_register_uses_default_registry = (
-        args.command == "project"
-        and args.project_command == "register"
-        and not registry_was_configured
-    )
-    if project_register_uses_default_registry:
-        registry_path = (
-            Path(args.knowledge_root).expanduser() / ".loopx" / "registry.json"
-        )
-    if (
-        args.command
-        not in {
-            "bootstrap",
-            "bootstrap-command-pack",
-            "agent-onboard",
-            "connect",
-            "codex-cli-bootstrap-message",
-            "codex-cli-bounded-visible-pilot-adapter",
-            "codex-cli-exec-handoff",
-            "codex-cli-visible-first-response-capture-plan",
-            "codex-cli-local-driver-plan",
-            "codex-cli-local-scheduler-exec",
-            "codex-cli-local-scheduler-tick",
-            "codex-cli-one-message-loop-pilot",
-            "codex-cli-runtime-idle-detector",
-            "codex-cli-session-probe",
-            "codex-cli-visible-attach-acceptance",
-            "codex-cli-visible-local-driver-pilot",
-            "codex-cli-visible-driver-run",
-            "codex-cli-visible-driver-plan",
-            "codex-cli-visible-session-proof",
-            "demo",
-            "doctor",
-            "first-run-report",
-            "new-project-prompt",
-            "resolve-agent-thread",
-            "start-goal",
-            "slash-commands",
-            "workflow-skills",
-            "heartbeat-prompt",
-            "supervisor-event",
-            "supervisor-observe",
-            "supervisor-prompt",
-            "sync-global",
-            "uninstall-project",
-            "version",
-            "host-mode-plan",
-        }
-        and not project_register_uses_default_registry
-        and not registry_was_configured
-        and not registry_path.exists()
-    ):
-        runtime_root = Path(args.runtime_root).expanduser() if args.runtime_root else DEFAULT_RUNTIME_ROOT
-        fallback_registry = global_registry_path(runtime_root)
-        if fallback_registry.exists():
-            registry_path = fallback_registry
+    if common_command_result is not None:
+        return common_command_result
 
     version_result = handle_version_command(args, output_format=output_format, print_payload=print_payload)
     if version_result is not None:
         return version_result
 
-    if args.command == "commands":
-        print_payload(
-            build_command_reference_payload(),
-            output_format(args),
-            render_command_reference_markdown,
-        )
-        return 0
-
-    bootstrap_connect_result = handle_bootstrap_connect_command(
-        args,
-        registry_path=registry_path,
-        print_payload=print_payload,
-    )
-    if bootstrap_connect_result is not None:
-        return bootstrap_connect_result
-
     starter_result = handle_starter_command(args, print_payload)
     if starter_result is not None:
         return starter_result
-
-    if args.command == "doctor":
-        return handle_doctor_command(args, print_payload)
 
     workflow_skills_result = handle_workflow_skills_command(
         args,
@@ -443,6 +388,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "first-run-report":
         return handle_first_run_report_command(args, print_payload)
+
+    if args.command == "usage-ping":
+        return handle_usage_ping_command(args, print_payload)
+
+    if args.command == "zcode-goal":
+        return handle_zcode_goal_command(args, registry_path=registry_path, print_payload=print_payload, output_format=output_format)
 
     if args.command == "opencode2-goal-worker":
         return handle_opencode2_goal_worker_command(args, print_payload)
@@ -486,14 +437,25 @@ def main(argv: list[str] | None = None) -> int:
     if capability_result is not None:
         return capability_result
 
-    extension_result = handle_extension_command(
+    anti_entropy_result = handle_anti_entropy_command(
         args,
+        registry_path=registry_path,
         runtime_root_arg=args.runtime_root,
         output_format=output_format,
         print_payload=print_payload,
     )
-    if extension_result is not None:
-        return extension_result
+    if anti_entropy_result is not None:
+        return anti_entropy_result
+
+    reliability_diagnostics_result = handle_reliability_diagnostics_command(
+        args,
+        registry_path=registry_path,
+        runtime_root_arg=args.runtime_root,
+        output_format=output_format,
+        print_payload=print_payload,
+    )
+    if reliability_diagnostics_result is not None:
+        return reliability_diagnostics_result
 
     change_quality_result = handle_change_quality_command(
         args,
@@ -513,55 +475,8 @@ def main(argv: list[str] | None = None) -> int:
     if integration_branch_result is not None:
         return integration_branch_result
 
-    repository_change_window_result = handle_repository_change_window_command(
-        args,
-        registry_path=registry_path,
-        runtime_root_arg=args.runtime_root,
-        output_format=output_format,
-        print_payload=print_payload,
-    )
-    if repository_change_window_result is not None:
-        return repository_change_window_result
-
     if args.command == "ml-experiment":
         return handle_ml_experiment_command(args, output_format=output_format, print_payload=print_payload)
-
-    if args.command == "auto-research":
-        return handle_auto_research_command(
-            args,
-            registry_path=registry_path,
-            runtime_root_arg=args.runtime_root,
-            output_format=output_format,
-            print_payload=print_payload,
-        )
-
-    multi_agent_result = handle_multi_agent_command(
-        args,
-        registry_path=registry_path,
-        runtime_root_arg=args.runtime_root,
-        output_format=output_format,
-        print_payload=print_payload,
-    )
-    if multi_agent_result is not None:
-        return multi_agent_result
-
-    turn_result = handle_turn_command(
-        args,
-        registry_path=registry_path,
-        runtime_root_arg=args.runtime_root,
-        output_format=output_format,
-        print_payload=print_payload,
-    )
-    if turn_result is not None:
-        return turn_result
-
-    host_mode_plan_result = handle_host_mode_plan_command(
-        args,
-        output_format=output_format,
-        print_payload=print_payload,
-    )
-    if host_mode_plan_result is not None:
-        return host_mode_plan_result
 
     preset_result = handle_preset_command(
         args,
@@ -646,6 +561,13 @@ def main(argv: list[str] | None = None) -> int:
 
     decision_context_result = handle_decision_context_command(
         args,
+        runtime_root=(
+            effective_runtime_root(registry_path, args.runtime_root)
+            if args.command == "decision-context"
+            and args.decision_context_command
+            in {"recall-context", "prepare-evidence", "prepare-review", "capture"}
+            else None
+        ),
         output_format=output_format,
         print_payload=print_payload,
     )
@@ -679,6 +601,7 @@ def main(argv: list[str] | None = None) -> int:
     periodic_report_result = handle_periodic_report_command(
         args,
         runtime_root_arg=args.runtime_root,
+        registry_path=registry_path,
         output_format=output_format,
         print_payload=print_payload,
         provider_command_handlers=(handle_lark_periodic_report_command,),
@@ -686,8 +609,19 @@ def main(argv: list[str] | None = None) -> int:
     if periodic_report_result is not None:
         return periodic_report_result
 
+    machine_configuration_result = handle_machine_configuration_command(
+        args,
+        runtime_root_arg=args.runtime_root,
+        registry_path=registry_path,
+        output_format=output_format,
+        print_payload=print_payload,
+    )
+    if machine_configuration_result is not None:
+        return machine_configuration_result
+
     semantic_preference_result = handle_semantic_preference_command(
         args,
+        registry_path=registry_path,
         runtime_root_arg=args.runtime_root,
         output_format=output_format,
         print_payload=print_payload,
@@ -703,6 +637,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     if connector_result is not None:
         return connector_result
+
+    external_evidence_result = handle_external_evidence_command(
+        args, output_format=output_format, print_payload=print_payload,
+    )
+    if external_evidence_result is not None:
+        return external_evidence_result
 
     registry_admin_result = handle_registry_admin_command(
         args,
@@ -728,16 +668,6 @@ def main(argv: list[str] | None = None) -> int:
             print_payload=print_payload,
         )
 
-    project_lifecycle_result = handle_project_lifecycle_command(
-        args,
-        registry_path=registry_path,
-        print_payload=print_payload,
-        output_format=output_format,
-        append_cli_rollout_event=append_cli_rollout_event,
-    )
-    if project_lifecycle_result is not None:
-        return project_lifecycle_result
-
     goal_channel_result = handle_goal_channel_command(
         args,
         registry_path=registry_path,
@@ -758,6 +688,12 @@ def main(argv: list[str] | None = None) -> int:
     if lark_kanban_result is not None:
         return lark_kanban_result
 
+    if args.command == "native-child":
+        return handle_native_child_command(
+            args, registry_path, effective_runtime_root(registry_path, args.runtime_root),
+            print_payload, output_format,
+        )
+
     lark_inbox_result = handle_lark_inbox_command(
         args,
         registry_path=registry_path,
@@ -768,67 +704,27 @@ def main(argv: list[str] | None = None) -> int:
     if lark_inbox_result is not None:
         return lark_inbox_result
 
-    if args.command == "check":
-        return handle_check_command(
-            args,
-            registry_path=registry_path,
-            runtime_root_arg=args.runtime_root,
-            allow_missing_registry=not user_supplied_registry(raw_argv),
-            print_payload=print_payload,
-        )
-
-    if args.command == "status":
-        return handle_status_command(
-            args,
-            registry_path=registry_path,
-            runtime_root_arg=args.runtime_root,
-            output_format=output_format,
-            print_payload=print_payload,
-        )
-
-    if args.command == "diagnose":
-        return handle_diagnose_command(
-            args,
-            registry_path=registry_path,
-            runtime_root_arg=args.runtime_root,
-            output_format=output_format,
-            print_payload=print_payload,
-        )
-
-    if args.command == "review-packet":
-        return handle_review_packet_command(
-            args,
-            registry_path=registry_path,
-            runtime_root_arg=args.runtime_root,
-            output_format=output_format,
-            print_payload=print_payload,
-        )
-
-    summary_all_result = handle_summary_all_command(
-        args,
-        registry_path=registry_path,
-        runtime_root_arg=args.runtime_root,
-        output_format=output_format,
-        print_payload=print_payload,
-    )
-    if summary_all_result is not None:
-        return summary_all_result
-
     pr_review_result = handle_pr_review_command(
         args,
+        registry_path=registry_path,
         output_format=output_format,
         print_payload=print_payload,
+        runtime_root=(
+            effective_runtime_root(registry_path, args.runtime_root)
+            if args.command == "pr-review" and registry_path.exists()
+            else None
+        ),
     )
     if pr_review_result is not None:
         return pr_review_result
 
-    slash_commands_result = handle_slash_commands_command(
+    deepresearch_result = handle_deepresearch_command(
         args,
         output_format=output_format,
         print_payload=print_payload,
     )
-    if slash_commands_result is not None:
-        return slash_commands_result
+    if deepresearch_result is not None:
+        return deepresearch_result
 
     if args.command == "dreaming":
         return handle_dreaming_command(
@@ -838,17 +734,6 @@ def main(argv: list[str] | None = None) -> int:
             output_format=output_format,
             print_payload=print_payload,
         )
-
-    evidence_log_result = handle_evidence_log_command(
-        args,
-        registry_path=registry_path,
-        runtime_root_arg=args.runtime_root,
-        output_format=output_format,
-        print_payload=print_payload,
-        append_cli_rollout_event=append_cli_rollout_event,
-    )
-    if evidence_log_result is not None:
-        return evidence_log_result
 
     explore_result = handle_explore_command(
         args,
@@ -860,46 +745,44 @@ def main(argv: list[str] | None = None) -> int:
     if explore_result is not None:
         return explore_result
 
-    if args.command == "todo":
-        return handle_todo_command(
-            args,
-            registry_path=registry_path,
-            runtime_root_arg=args.runtime_root,
-            format_name=output_format(args),
-            print_payload=print_payload,
-            append_cli_rollout_event=append_cli_rollout_event,
-        )
+    cadence_result = handle_automation_cadence_command(
+        args, registry_path=registry_path, runtime_root_arg=args.runtime_root,
+        print_payload=print_payload, output_format=output_format,
+    )
+    if cadence_result is not None:
+        return cadence_result
 
-    task_lease_result = handle_task_lease_command(
+    authority_shadow_result = handle_authority_shadow_command(
         args,
         registry_path=registry_path,
         runtime_root_arg=args.runtime_root,
         output_format=output_format,
         print_payload=print_payload,
     )
-    if task_lease_result is not None:
-        return task_lease_result
+    if authority_shadow_result is not None:
+        return authority_shadow_result
 
-    handoff_mode_result = handle_handoff_mode_command(
+    shared_goal_alignment_result = handle_shared_goal_alignment_command(
         args,
         registry_path=registry_path,
+        runtime_root_arg=args.runtime_root,
         output_format=output_format,
         print_payload=print_payload,
     )
-    if handoff_mode_result is not None:
-        return handoff_mode_result
+    if shared_goal_alignment_result is not None:
+        return shared_goal_alignment_result
 
-    if args.command == "quota":
-        return handle_quota_command(
-            args,
-            registry_path=registry_path,
-            runtime_root_arg=args.runtime_root,
-            print_payload=print_payload,
-            append_cli_rollout_event=append_cli_rollout_event,
-        )
+    direction_result = handle_goal_direction(args, registry_path=registry_path, output_format=output_format, print_payload=print_payload)
+    if direction_result is not None:
+        return direction_result
+    goal_amendment_proposal_result = handle_goal_amendment_proposal_command(
+        args,
+        registry_path=registry_path,
+        runtime_root_arg=args.runtime_root,
+        output_format=output_format,
+        print_payload=print_payload,
+    )
+    if goal_amendment_proposal_result is not None:
+        return goal_amendment_proposal_result
 
     return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

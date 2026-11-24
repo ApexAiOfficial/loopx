@@ -1,0 +1,293 @@
+import {ContextHelp} from "./context-help";
+import {ArrowRight, ChevronDown, Circle, CircleAlert, CircleCheck, CircleHelp, Clock, Hand, Info, List, Play, Plus, Search} from "lucide-react";
+import {Component, createRef, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode} from "react";
+import type {GoalWorkDisplayClass, GoalWorkspaceDigest} from "../../../../../../loopx/control_plane/presentation/goal_workspace_digest.js";
+import type {WorkspaceActionPreview, WorkspaceActionPreviewRequest, WorkspaceDrawerSelection, WorkspaceGoal, WorkspaceModel, WorkspaceTimelineItem} from "./personal-workspace-model";
+import {localizedSessionStatus, useWorkspaceI18n} from "./i18n";
+import {CompletedTaskLane} from "./completed-task-lane";
+import {boundedLength, todoCreateRequest, todoTextLimit} from "./workspace-action-form";
+import {useGoalWorkBrowse} from "./goal-work-browse";
+import "./goal-workspace-work.css";
+
+const glyphs = {running_observed: Play, needs_you: Hand, open: Circle, waiting_dependency: Clock, blocked: CircleAlert, deferred: Clock, done: CircleCheck};
+export function goalWorkClassLabel(state: GoalWorkDisplayClass, zh: boolean) {
+  return (zh ? {running_observed: "执行中", needs_you: "等待决定", open: "待处理", waiting_dependency: "等待前置任务", blocked: "受阻", deferred: "已延期", done: "已完成"}
+    : {running_observed: "Running", needs_you: "Needs a decision", open: "Open", waiting_dependency: "Waiting on work", blocked: "Blocked", deferred: "Deferred", done: "Done"})[state];
+}
+
+function AddTask({goal, proposals, onPreview, onSelect}: {
+  goal: WorkspaceGoal; proposals: Record<string, WorkspaceActionPreview>;
+  onPreview: (request: WorkspaceActionPreviewRequest) => Promise<WorkspaceActionPreview>;
+  onSelect: (selection: WorkspaceDrawerSelection) => void;
+}) {
+  const {locale} = useWorkspaceI18n();
+  const zh = locale === "zh-CN";
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submitting = useRef(false);
+  const [reviewed, setReviewed] = useState<{text: string; id: string} | null>(null);
+  const proposal = reviewed ? proposals[reviewed.id] : undefined;
+  useEffect(() => {
+    if (!reviewed || proposal) return;
+    const successor = Object.values(proposals).find(item => item.regeneratedFrom === reviewed.id);
+    if (successor) setReviewed({...reviewed, id: successor.previewId});
+  }, [reviewed, proposal, proposals]);
+  useEffect(() => {
+    if (proposal?.status !== "applied") return;
+    setText(current => current === reviewed?.text ? "" : current);
+    setReviewed(null);
+  }, [proposal?.status, reviewed]);
+  const textLength = boundedLength(text);
+  const tooLong = textLength > todoTextLimit;
+  return <div className="goal-inline-create">
+    <button aria-expanded={open} type="button" onClick={() => setOpen(value => !value)}><Plus size={15} aria-hidden/>{zh ? "添加任务" : "Add task"}</button>
+    {open ? <form onSubmit={async event => {
+      event.preventDefault();
+      if (submitting.current || textLength === 0 || tooLong) return;
+      if (proposal && reviewed?.text === text) {onSelect({kind: "proposal", item: proposal}); return;}
+      submitting.current = true;
+      setBusy(true); setError("");
+      try {
+        const result = await onPreview(todoCreateRequest(text, goal.goalId, zh ? "创建任务" : "Create task"));
+        setReviewed({text, id: result.previewId});
+      } catch (failure) {setError(failure instanceof Error ? failure.message : String(failure));}
+      finally {submitting.current = false; setBusy(false);}
+    }}>
+      <label>{zh ? "任务内容" : "Task"}<textarea autoFocus aria-label={zh ? "任务内容" : "Task"} value={text} onChange={event => setText(event.target.value)} disabled={busy}/></label>
+      {tooLong ? <p role="status">{zh ? `请将任务精简至 ${todoTextLimit} 字以内。` : `Shorten the task to ${todoTextLimit} characters.`}</p> : null}
+      {error ? <p role="alert">{error}</p> : null}
+      {proposal?.status === "error" || proposal?.status === "stale" ? <p role="status">{zh ? "任务尚未确认创建，草稿已保留。" : "Creation is not confirmed; your draft is retained."}</p> : null}
+      <button disabled={busy || textLength === 0 || tooLong} type="submit">{busy ? (zh ? "正在检查…" : "Reviewing…") : (zh ? "检查任务" : "Review task")}</button>
+    </form> : null}
+  </div>;
+}
+
+export function GoalWorkspaceWork({goal, digest, items, userTodos, selectedTodoId, onSelect, board, map, brief, attention: attentionContent,
+  readOnly, active, historyRefreshRevision, proposals, onPreview, railOpen, onCloseRail, onOpenAgentConversation, prioritizeAttention = false}: {
+  brief: ReactNode; attention: ReactNode;
+  onOpenAgentConversation?: (agentId: string) => void;
+  prioritizeAttention?: boolean;
+  railOpen: boolean; onCloseRail: () => void;
+  goal: WorkspaceGoal; digest: GoalWorkspaceDigest; items: WorkspaceTimelineItem[]; userTodos: WorkspaceModel["userTodos"];
+  selectedTodoId: string | null; onSelect: (selection: WorkspaceDrawerSelection) => void;
+  board: ReactNode; map: ReactNode; readOnly: boolean; active: boolean; historyRefreshRevision: number;
+  proposals: Record<string, WorkspaceActionPreview>; onPreview: (request: WorkspaceActionPreviewRequest) => Promise<WorkspaceActionPreview>;
+}) {
+  const {locale, t} = useWorkspaceI18n();
+  const zh = locale === "zh-CN";
+  const [browse, changeBrowse] = useGoalWorkBrowse();
+  const {lens, filter, query, owner} = browse;
+  const composition = useRef<HTMLDivElement>(null);
+  const readingDocument = useRef<HTMLDivElement>(null);
+  const [narrow, setNarrow] = useState(false);
+  const narrowRef = useRef(false);
+  const layoutFocus = useRef<HTMLElement | null>(null);
+  const attentionFirst = narrow && prioritizeAttention && Boolean(attentionContent);
+  const previousOrder = useRef(attentionFirst);
+  if (previousOrder.current !== attentionFirst) {
+    previousOrder.current = attentionFirst;
+    const focused = window.document.activeElement;
+    layoutFocus.current = focused instanceof HTMLElement && composition.current?.contains(focused) ? focused : null;
+  }
+  useLayoutEffect(() => {
+    const node = composition.current, body = readingDocument.current;
+    if (!node || !body) return;
+    const measure = () => {
+      const next = getComputedStyle(body).display === "contents";
+      if (next === narrowRef.current) return;
+      narrowRef.current = next;
+      setNarrow(next);
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    measure();
+    return () => observer.disconnect();
+  }, []);
+  useLayoutEffect(() => {
+    const focused = layoutFocus.current;
+    layoutFocus.current = null;
+    if (!focused) return;
+    const target = focused.isConnected && focused.getClientRects().length ? focused
+      : composition.current?.closest(".personal-workspace-main")?.querySelector<HTMLElement>(".goal-all-work-trigger");
+    target?.focus({preventScroll: true});
+  }, [attentionFirst]);
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const node = dialog.current;
+    if (railOpen && active) node?.showModal(); else node?.close();
+    return () => node?.close();
+  }, [railOpen, active]);
+  const select = (selection: WorkspaceDrawerSelection) => {
+    if (railOpen) {dialog.current?.close(); onCloseRail();}
+    onSelect(selection);
+  };
+  const [visited, setVisited] = useState(() => new Set([lens]));
+  useEffect(() => setVisited(current => current.has(lens) ? current : new Set([...current, lens])), [lens]);
+  const [inventoryOpen, setInventoryOpen] = useState(Boolean(query || filter !== "all" || owner !== "all"));
+  const [inventoryAvailable, setInventoryAvailable] = useState(false);
+  const inventory = useRef<HTMLDetailsElement>(null);
+  const [railTab, setRailTab] = useState<"work" | "activity">("work");
+  const todos = useMemo(() => new Map(goal.agentTodos.map(todo => [todo.todoId, todo])), [goal.agentTodos]);
+  const rows = useMemo(() => new Map(digest.work.rows.map(row => [row.todoId, row])), [digest]);
+  const attention = userTodos.filter(todo => todo.goalId === goal.goalId);
+  const ownerName = (id: string | null) => id === null ? (zh ? "未分配" : "Unassigned") : goal.agentLanes?.find(lane => lane.agentId === id)?.label ?? id;
+  const owners = [...new Set([...(goal.agentLanes ?? []).map(lane => lane.agentId), ...digest.work.rows.flatMap(row => row.ownerId ?? [])])];
+  const matchesOwner = (id: string) => owner === "all" || (rows.get(id)?.ownerId ?? "") === owner;
+  const matches = (id: string) => matchesOwner(id)
+    && (todos.get(id)?.text ?? "").toLocaleLowerCase(locale).includes(query.trim().toLocaleLowerCase(locale));
+  function task(id: string, compact = false) {
+    const todo = todos.get(id), row = rows.get(id);
+    if (!todo || !row) return null;
+    const Glyph = glyphs[row.displayClass];
+    const dependency = row.prerequisiteIds.map(ref => todos.get(ref)?.text ?? attention.find(item => item.todoId === ref)?.text).find(Boolean);
+    const run = items.find(item => item.kind === "run" && item.run.todoId === id && item.run.goalId === goal.goalId);
+    const reason = row.displayClass === "blocked" ? todo.blockedReason
+      : row.displayClass === "deferred" ? todo.resumeWhen
+        : row.displayClass === "waiting_dependency" || row.displayClass === "needs_you" ? (dependency ? `${zh ? "需要" : "Requires"}: ${dependency}` : null)
+          : row.displayClass === "running_observed" && run?.kind === "run" ? run.run.title : null;
+    return <button className={`goal-work-row${compact ? " is-compact" : ""}`} data-todo-id={id} data-work-class={row.displayClass}
+      aria-pressed={selectedTodoId === id} key={id} type="button" onClick={event => {
+        event.currentTarget.focus({preventScroll: true});
+        select({kind: "todo", item: {...todo, goalId: goal.goalId, goalTitle: goal.title, ownerLabel: todo.claimedBy}});
+      }}>
+      <Glyph size={16} aria-hidden/>
+      <span className="goal-work-row-text"><strong>{todo.text}</strong>{reason ? <small>{reason}</small> : null}</span>
+      <span className={`goal-work-badge is-${row.displayClass}`}>{goalWorkClassLabel(row.displayClass, zh)}</span>
+      {!compact ? <time dateTime={todo.completedAt ?? undefined}>{todo.completedAt ? new Date(todo.completedAt).toLocaleDateString(locale) : "—"}</time> : null}
+    </button>;
+  }
+  const quietWork = digest.work.coverage === "complete" && digest.work.total === 0
+    && digest.needsYou.availability === "ok" && digest.needsYou.blocking === 0
+    && digest.needsYou.optional === 0 && !attention.length;
+  const hasRail = Boolean(attentionContent) || !quietWork;
+  useEffect(() => {
+    const node = inventory.current;
+    if (!node) {setInventoryAvailable(false); return;}
+    // Follow the rendered CSS layout, including container-driven reflow, rather
+    // than duplicating its breakpoints in JavaScript. Hidden history must not read.
+    const measure = () => setInventoryAvailable(node.getClientRects().length > 0);
+    const observer = new ResizeObserver(measure);
+    measure();
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [quietWork]);
+  const sectionLabels = {needsYou: zh ? "等待决定" : "Needs a decision", open: zh ? "未完成" : "Open", blocked: zh ? "受阻与延后" : "Blocked and deferred", done: zh ? "已完成" : "Done"};
+  const activity = items.filter(item => (item.kind === "run" && item.run.goalId === goal.goalId && ["completed", "failed", "interrupted"].includes(item.run.status))
+    || (item.kind === "output" && item.output.goalId === goal.goalId)
+    || (item.kind === "proposal" && item.proposal.goalId === goal.goalId && item.proposal.status === "applied"
+      && item.proposal.actionKind === "gate.resolve"));
+  const rail = (placement: "inline" | "dialog") => <aside className={`goal-all-work is-${placement}`} aria-label={zh ? "全部工作" : "All work"}>
+      <div role="group" aria-label={zh ? "工作侧栏" : "Work rail"}>{(["work", "activity"] as const).map(value => <button type="button" key={value} aria-pressed={railTab === value} onClick={() => setRailTab(value)}>{value === "work" ? (zh ? "全部工作" : "All work") : (zh ? "活动" : "Activity")}</button>)}</div>
+      {railTab === "work" ? <>
+        <label className="goal-work-search"><Search size={14} aria-hidden/><input type="search" maxLength={256} aria-label={zh ? "搜索当前已列出的任务" : "Search listed tasks"} value={query} onChange={event => changeBrowse({query: event.target.value}, true)} placeholder={zh ? "搜索任务" : "Search tasks"}/></label>
+        <label className="goal-work-owner"><span>{zh ? "负责人" : "Owner"}</span><select aria-label={zh ? "筛选任务负责人" : "Filter task owner"} value={owner} onChange={event => changeBrowse({owner: event.target.value})}>
+          <option value="all">{zh ? "全部负责人" : "All owners"}</option><option value="">{zh ? "未分配" : "Unassigned"}</option>
+          {owners.map(id => <option key={id} value={id}>{ownerName(id)}</option>)}
+          {owner && owner !== "all" && !owners.includes(owner) ? <option value={owner}>{owner} · {zh ? "当前未列出" : "Not currently listed"}</option> : null}
+        </select></label>
+        <div className="goal-work-filters" role="group" aria-label={zh ? "工作筛选" : "Work filters"}>
+          <button type="button" aria-pressed={filter === "all"} onClick={() => changeBrowse({filter: "all"})}>{zh ? "全部" : "All"} · {digest.work.total ?? "—"}</button>
+          {(["needsYou", "open", "blocked", "done"] as const).map(section => <button key={section} type="button" aria-pressed={filter === section} onClick={() => changeBrowse({filter: section})}>{sectionLabels[section]} · {section === "done" ? digest.work.done ?? "—" : digest.work.rail[section].length}</button>)}
+        </div>
+        {placement === "dialog" && filter === "all" && attention.length ? <section className="goal-rail-section goal-rail-attention"><h3>{zh ? "需要你" : "Needs you"}</h3>{attention.filter(item => item.text.toLocaleLowerCase(locale).includes(query.trim().toLocaleLowerCase(locale))).map(item => <button type="button" key={item.todoId} data-attention-id={item.todoId} onClick={() => select({kind: "attention", item})}><Hand size={17} aria-hidden/><span>{item.text}</span><ArrowRight size={14} aria-hidden/></button>)}</section> : null}
+        {(["needsYou", "open", "blocked"] as const).filter(section => filter === "all" || filter === section).map(section => {
+          const ids = digest.work.rail[section].filter(matches);
+          return ids.length ? <section className="goal-rail-section" key={section}>
+            <h3>{sectionLabels[section]}</h3>{ids.map(id => task(id, true))}
+          </section> : null;
+        })}
+        {filter === "all" || filter === "done" ? <CompletedTaskLane key={`${goal.goalId}:${readOnly}:${placement}:${owner}`} goal={goal} agentId={owner || "all"} unassignedOnly={owner === ""} seed={digest.work.rail.done.flatMap(id => matchesOwner(id) ? todos.get(id) ?? [] : [])}
+          enabled={(!readOnly || Boolean(goal.sourceAccess)) && active && (placement === "inline" ? inventoryOpen && !railOpen : railOpen)} refreshRevision={historyRefreshRevision} listView onSelect={select} selectedTodoId={selectedTodoId} query={query}/> : null}
+      </> : <div className="goal-material-activity">
+        {activity.length ? activity.map(item => <button type="button" key={item.id} onClick={() => item.kind === "run" ? select({kind: "run", item: item.run}) : item.kind === "output" ? select({kind: "output", item: item.output}) : item.kind === "proposal" ? select({kind: "proposal", item: item.proposal}) : undefined}>
+          {item.kind === "run" ? <>{item.run.status === "completed" ? <CircleCheck size={14} aria-hidden/> : <CircleAlert size={14} aria-hidden/>}<span>{item.run.title}<small>{localizedSessionStatus(item.run.status, t)}</small></span></> : item.kind === "output" ? <><CircleCheck size={14} aria-hidden/><span>{item.output.title}<small>{zh ? "成果返回" : "Result returned"}</small></span></> : item.kind === "proposal" ? <><Hand size={14} aria-hidden/><span>{item.proposal.title}<small>{zh ? "决定已记录" : "Decision recorded"}</small></span></> : null}
+        </button>) : <p>{zh ? "当前时间线尚无已完成或返回的记录。" : "No completed work or returned results in this timeline."}</p>}
+      </div>}
+      <footer className="goal-work-scope"><time dateTime={digest.observedAt}>{new Date(digest.observedAt).toLocaleTimeString(locale)}</time><ContextHelp label={zh ? "工作统计范围" : "Work count scope"}><p>{zh ? "统计仅覆盖此 Goal；任务与历史可能分批载入。" : "Counts cover this Goal; tasks and history may be loaded in bounded pages."}</p>{railTab === "activity" && !activity.length ? <p>{zh ? "当前时间线尚无已完成或返回的记录。" : "No completed work or returned results in this timeline."}</p> : null}</ContextHelp></footer>
+    </aside>;
+  const documentContent = <div className="goal-workspace-document" ref={readingDocument} key="document">
+      {brief}
+      <section className="goal-now" aria-label={zh ? "当前工作" : "Now"}>
+        <header className="goal-now-header"><h2>{zh ? "当前工作" : "Now"}</h2>
+          {digest.work.coverage !== "complete" || !digest.work.groups.length ? <ContextHelp icon={digest.work.coverage !== "complete" ? CircleHelp : Info}
+            label={zh ? (digest.work.coverage !== "complete" ? "工作覆盖未确认" : "暂无当前工作") : (digest.work.coverage !== "complete" ? "Work coverage unconfirmed" : "No current work")}>
+            <p>{digest.work.coverage !== "complete" ? (zh ? `已列出 ${digest.work.listedOpen} 项，当前快照的总数或覆盖范围不完整。` : `${digest.work.listedOpen} items listed; the snapshot's total or coverage is incomplete.`)
+              : (zh ? "当前没有进行中任务；延后与完成记录可在全部工作中读取。" : "No current tasks. Deferred and completed records remain in All work.")}</p>
+          </ContextHelp> : null}
+          {!quietWork ? <div role="group" aria-label={zh ? "工作视图" : "Work view"} className="goal-work-lenses">
+            {(["owner", "board", "map"] as const).map(value => <button key={value} type="button" aria-pressed={lens === value} onClick={() => {setVisited(current => new Set([...current, value])); changeBrowse({lens: value});}}>
+              {value === "owner" ? (zh ? "按负责人" : "By owner") : value === "board" ? (zh ? "看板" : "Board") : (zh ? "关系图" : "Map")}
+            </button>)}
+          </div> : null}
+          {!readOnly ? <AddTask goal={goal} proposals={proposals} onPreview={onPreview} onSelect={select}/> : null}
+        </header>
+        <OwnerWorkGroups hidden={lens !== "owner"}>{digest.work.groups.map(group => <section className="goal-owner-group" key={group.ownerId ?? ""} data-owner-id={group.ownerId ?? ""}>
+          <header><h3>{ownerName(group.ownerId)}</h3><span>{group.todoIds.length} {zh ? "项任务" : "tasks"} · {group.todoIds.filter(id => rows.get(id)?.displayClass === group.displayClass).length} {goalWorkClassLabel(group.displayClass, zh)}</span>
+            {!readOnly && group.ownerId && onOpenAgentConversation ? <button type="button" className="goal-owner-conversation" data-agent-id={group.ownerId} aria-label={zh ? `与 ${ownerName(group.ownerId)} 对话` : `Talk to ${ownerName(group.ownerId)}`} onClick={() => onOpenAgentConversation(group.ownerId!)}>{zh ? "工作记录" : "Work conversation"}</button> : null}
+          </header>
+          {group.todoIds.slice(0, 3).map(id => task(id))}
+          {group.todoIds.length > 3 ? <RemainingWork key={group.ownerId ?? ""} selectedTodoId={group.todoIds.slice(3).includes(selectedTodoId ?? "") ? selectedTodoId : null}
+            label={zh ? `其余 ${group.todoIds.length - 3} 项任务` : `${group.todoIds.length - 3} more tasks`}>
+            {group.todoIds.slice(3).map(id => task(id))}
+          </RemainingWork> : null}
+        </section>)}
+        </OwnerWorkGroups>
+        {visited.has("board") || lens === "board" ? <div hidden={lens !== "board"}>{board}</div> : null}
+        {visited.has("map") || lens === "map" ? <div hidden={lens !== "map"}>{map}</div> : null}
+      </section>
+    </div>;
+  const railContent = hasRail ? <div className="goal-workspace-rail" data-testid="goal-workspace-inline-rail" key="rail">
+      {attentionContent}
+      {!quietWork ? <details className="goal-workspace-inventory" ref={inventory} open={inventoryOpen} onToggle={event => setInventoryOpen(event.currentTarget.open)}>
+        <summary><List size={17} aria-hidden/><span>{zh ? "全部工作" : "All work"}</span><ChevronDown size={15} aria-hidden/></summary>
+        {inventoryAvailable && inventoryOpen && !railOpen ? rail("inline") : null}
+      </details> : null}
+    </div> : null;
+  return <div className={`goal-workspace-composition${hasRail ? " has-rail" : ""}${attentionFirst ? " is-attention-first" : ""}`} ref={composition}>
+    {attentionFirst ? [railContent, documentContent] : [documentContent, railContent]}
+    <dialog className="goal-work-rail-dialog" aria-label={zh ? "全部工作" : "All work"} ref={dialog} onCancel={event => {event.preventDefault(); onCloseRail();}}>
+      <button type="button" className="goal-work-rail-close" onClick={onCloseRail}>{zh ? "关闭全部工作" : "Close all work"}</button>
+      {railOpen && active ? rail("dialog") : null}
+    </dialog>
+  </div>;
+}
+
+type OwnerWorkGroupsProps = {hidden: boolean; children: ReactNode};
+
+class OwnerWorkGroups extends Component<OwnerWorkGroupsProps, object, string | null> {
+  private readonly groups = createRef<HTMLDivElement>();
+
+  getSnapshotBeforeUpdate(): string | null {
+    const groups = this.groups.current;
+    const focused = groups?.ownerDocument.activeElement;
+    return focused instanceof HTMLButtonElement && groups?.contains(focused)
+      ? focused.dataset.todoId ?? null : null;
+  }
+
+  componentDidUpdate(_previousProps: OwnerWorkGroupsProps, _previousState: object, todoId: string | null) {
+    // Crossing the summary boundary replaces the button. Restore its focus if
+    // the browser dropped it during this commit and the same task is still here.
+    const groups = this.groups.current;
+    if (!todoId || !groups || groups.closest("[hidden]") || groups.ownerDocument.activeElement !== groups.ownerDocument.body) return;
+    const row = groups.querySelector<HTMLButtonElement>(`button[data-todo-id="${CSS.escape(todoId)}"]`);
+    if (!row) return;
+    const disclosure = row.closest<HTMLDetailsElement>("details.goal-work-more");
+    if (disclosure) disclosure.open = true;
+    row.focus();
+  }
+
+  render() {
+    return <div className="goal-owner-groups" hidden={this.props.hidden} ref={this.groups}>{this.props.children}</div>;
+  }
+}
+
+function RemainingWork({selectedTodoId, label, children}: {selectedTodoId: string | null; label: string; children: ReactNode}) {
+  const disclosure = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {if (selectedTodoId && disclosure.current) disclosure.current.open = true;}, [selectedTodoId]);
+  return <details className="goal-work-more" ref={disclosure}>
+    <summary>{label}</summary>
+    <div>{children}</div>
+  </details>;
+}

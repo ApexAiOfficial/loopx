@@ -4,7 +4,15 @@ import ast
 import importlib
 from importlib.util import resolve_name
 from pathlib import Path
+import subprocess
+import sys
 
+import pytest
+
+from loopx.canary.maintainability_ratchet import (
+    REVIEWED_MAINTAINABILITY_EXCEPTIONS,
+    evaluate_maintainability_findings,
+)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = REPOSITORY_ROOT / "loopx"
@@ -29,6 +37,10 @@ OPERATOR_INBOX_MODULE = CONTROL_PLANE_ROOT / "work_items" / "operator_inbox.py"
 QUOTA_CLI_MODULE = PACKAGE_ROOT / "cli_commands" / "quota.py"
 TURN_CLI_MODULE = PACKAGE_ROOT / "cli_commands" / "turn.py"
 LARK_INBOX_CLI_MODULE = PACKAGE_ROOT / "cli_commands" / "lark_inbox.py"
+PERIODIC_REPORT_REQUEST_ACTION_MODULE = (
+    PACKAGE_ROOT / "capabilities" / "periodic_report" / "request_action.py"
+)
+EXTENSION_HOOK_ADAPTERS_MODULE = PACKAGE_ROOT / "extensions" / "hook_adapters.py"
 ISSUE_FIX_REVIEWER_CLI_MODULE = (
     PACKAGE_ROOT / "capabilities" / "issue_fix" / "reviewer_cli.py"
 )
@@ -49,7 +61,6 @@ STATUS_FORBIDDEN_DEPENDENCY_PREFIXES = (
     "loopx.benchmark_adapters",
     "loopx.presentation",
 )
-STATUS_OUTWARD_DEPENDENCY_DEBT: set[tuple[str, str]] = set()
 
 
 def _module_name(path: Path) -> str:
@@ -63,7 +74,7 @@ def _module_name(path: Path) -> str:
 def _resolved_imports(path: Path) -> set[str]:
     module_name = _module_name(path)
     package_name = module_name if path.name == "__init__.py" else module_name.rpartition(".")[0]
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = ast.parse(path.read_bytes(), filename=str(path))
     imports: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -81,7 +92,7 @@ def _resolved_from_imports(path: Path) -> dict[str, set[str]]:
     if path.is_relative_to(PACKAGE_ROOT):
         module_name = _module_name(path)
         package_name = module_name if path.name == "__init__.py" else module_name.rpartition(".")[0]
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = ast.parse(path.read_bytes(), filename=str(path))
     imports: dict[str, set[str]] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.ImportFrom):
@@ -96,7 +107,7 @@ def _resolved_from_imports(path: Path) -> dict[str, set[str]]:
 
 
 def _top_level_imported_names(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = ast.parse(path.read_bytes(), filename=str(path))
     return {
         alias.asname or alias.name
         for node in tree.body
@@ -106,7 +117,7 @@ def _top_level_imported_names(path: Path) -> set[str]:
 
 
 def _top_level_function_names(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = ast.parse(path.read_bytes(), filename=str(path))
     return {
         node.name
         for node in tree.body
@@ -117,7 +128,7 @@ def _top_level_function_names(path: Path) -> set[str]:
 def _top_level_import_bindings(path: Path) -> dict[str, str]:
     module_name = _module_name(path)
     package_name = module_name.rpartition(".")[0]
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = ast.parse(path.read_bytes(), filename=str(path))
     bindings: dict[str, str] = {}
     for node in tree.body:
         if isinstance(node, ast.Import):
@@ -133,7 +144,7 @@ def _top_level_import_bindings(path: Path) -> dict[str, str]:
 
 
 def _public_import_only_bindings(path: Path) -> dict[str, str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = ast.parse(path.read_bytes(), filename=str(path))
     loaded_names = {
         node.id
         for node in ast.walk(tree)
@@ -150,14 +161,35 @@ def _public_contract_evidence() -> dict[tuple[str, str], set[str]]:
     evidence: dict[tuple[str, str], set[str]] = {}
     for root in PUBLIC_CONTRACT_ROOTS:
         for path in root.rglob("*.py"):
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            tree = ast.parse(path.read_bytes(), filename=str(path))
+            # Aliases such as ``from loopx import status as status_module`` are a
+            # real consumer of a facade export, reached by attribute access
+            # rather than a from-import. Without this map the audit would report
+            # a live consumer as missing evidence.
+            module_aliases: dict[str, str] = {}
             for node in ast.walk(tree):
-                if not isinstance(node, ast.ImportFrom):
+                if not isinstance(node, ast.ImportFrom) or node.level:
                     continue
-                if node.module not in PUBLIC_COMPAT_FACADES:
-                    continue
+                module = node.module or ""
                 for alias in node.names:
-                    evidence.setdefault((node.module, alias.name), set()).add(
+                    # ``from loopx import status`` binds the facade itself; a
+                    # from-import of a facade also binds the facade's exports.
+                    candidate = alias.name if not module else f"{module}.{alias.name}"
+                    if candidate in PUBLIC_COMPAT_FACADES:
+                        module_aliases[alias.asname or alias.name] = candidate
+                        continue
+                    if module in PUBLIC_COMPAT_FACADES:
+                        evidence.setdefault((module, alias.name), set()).add(
+                            str(path.relative_to(REPOSITORY_ROOT))
+                        )
+            if not module_aliases:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load):
+                    continue
+                facade_name = module_aliases.get(getattr(node.value, "id", ""))
+                if facade_name is not None:
+                    evidence.setdefault((facade_name, node.attr), set()).add(
                         str(path.relative_to(REPOSITORY_ROOT))
                     )
     for path in (REPOSITORY_ROOT / "docs").rglob("*.md"):
@@ -175,7 +207,18 @@ def _public_contract_evidence() -> dict[tuple[str, str], set[str]]:
     return evidence
 
 
-def test_control_plane_does_not_gain_outward_dependencies() -> None:
+def _review_outward_dependencies(edges, *, reviewed=REVIEWED_MAINTAINABILITY_EXCEPTIONS):
+    # Review exact edges: one exception must never waive a module prefix.
+    findings = [
+        {"id": f"dependency_debt:{source}->{target}", "category": "dependency_debt"}
+        for source, target in sorted(edges)
+    ]
+    return evaluate_maintainability_findings(findings, reviewed_exceptions={
+        key: value for key, value in reviewed.items() if key.startswith("dependency_debt:")
+    })
+
+
+def test_control_plane_has_no_unreviewed_outward_dependencies() -> None:
     outward_dependencies = {
         (_module_name(path), dependency)
         for path in CONTROL_PLANE_ROOT.rglob("*.py")
@@ -186,10 +229,333 @@ def test_control_plane_does_not_gain_outward_dependencies() -> None:
         )
     }
 
-    assert not outward_dependencies, (
-        "control-plane code must not depend on presentation, CLI, capability, or "
-        f"benchmark-adapter layers; unexpected edges: {sorted(outward_dependencies)}"
+    report = _review_outward_dependencies(outward_dependencies)
+    assert report["ok"], (
+        "control-plane outward dependencies require an exact reviewed exception "
+        f"with its retirement plan: {report}"
     )
+
+
+@pytest.fixture
+def reviewed_outward_edge():
+    # Synthetic review evidence keeps the checker covered after real debt exits.
+    edge = ("loopx.control_plane.fixture_bridge", "loopx.capabilities.fixture_owner")
+    key = f"dependency_debt:{edge[0]}->{edge[1]}"
+    return edge, key, {
+        key: {
+            "reason": "The fixture bridge retains its existing owner during migration.",
+            "retirement_plan": "Remove the bridge after migrating its final caller.",
+        },
+    }
+
+
+@pytest.mark.parametrize("edge", [
+    ("loopx.control_plane.other_bridge", "loopx.capabilities.fixture_owner"),
+    ("loopx.control_plane.fixture_bridge_copy", "loopx.capabilities.fixture_owner"),
+    ("loopx.control_plane.fixture_bridge", "loopx.capabilities.fixture_owner_extra"),
+    ("loopx.control_plane.fixture_bridge", "loopx.capabilities.fixture_owner.child"),
+    ("loopx.control_plane.fixture_bridge", "loopx.capabilities.other_owner"),
+])
+def test_reviewed_bridge_never_allows_another_outward_edge(edge, reviewed_outward_edge):
+    allowed, _, reviewed = reviewed_outward_edge
+    assert _review_outward_dependencies({allowed}, reviewed=reviewed)["ok"]
+    report = _review_outward_dependencies({allowed, edge}, reviewed=reviewed)
+    assert not report["ok"] and report["unreviewed_count"] == 1
+    assert report["unreviewed_findings"][0]["id"] == f"dependency_debt:{edge[0]}->{edge[1]}"
+
+
+@pytest.mark.parametrize("field", ["reason", "retirement_plan"])
+def test_outward_dependency_exception_requires_its_review_evidence(field, reviewed_outward_edge):
+    edge, key, reviewed = reviewed_outward_edge
+    reviewed[key][field] = ""
+    report = _review_outward_dependencies({edge}, reviewed=reviewed)
+    assert not report["ok"] and report["invalid_exception_count"] == 1
+
+
+def test_retired_outward_dependency_cannot_keep_a_stale_exception(reviewed_outward_edge):
+    _, _, reviewed = reviewed_outward_edge
+    report = _review_outward_dependencies(set(), reviewed=reviewed)
+    assert not report["ok"] and report["stale_exception_count"] == 1
+
+
+def test_periodic_report_hook_does_not_break_cold_imports() -> None:
+    periodic_report_facade = (
+        PACKAGE_ROOT / "capabilities" / "periodic_report" / "__init__.py"
+    )
+    facade_imports = _resolved_imports(periodic_report_facade)
+    assert not {
+        "loopx.capabilities.periodic_report.post_writeback_hook",
+        "loopx.capabilities.periodic_report.stage_completion",
+    } & facade_imports
+
+    import_statements = (
+        "import loopx.quota",
+        (
+            "from loopx.control_plane.turn_driver.turn_journal_runtime "
+            "import interpret_turn_journal_projection"
+        ),
+    )
+
+    for statement in import_statements:
+        completed = subprocess.run(
+            [sys.executable, "-c", statement],
+            cwd=REPOSITORY_ROOT,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+
+def test_captured_vision_audit_read_does_not_load_the_work_scheduler() -> None:
+    # Exercise the first selected read in a fresh interpreter, as a native hook does.
+    script = """
+import sys
+from loopx.control_plane.turn_driver.decision_capture import (
+    COMPLETE_TURN_DECISION_VERSION, context_vision_audit_view,
+)
+
+reference = {"projection_ref": "$.vision_continuation_audit", "projection_view": "cli_channel", "required": True}
+capture = {
+    "schema_version": COMPLETE_TURN_DECISION_VERSION,
+    "interaction_contract": {"cli_channel": {"vision_continuation_audit": reference}},
+    "vision_continuation_audit": {
+        "schema_version": "vision_continuation_audit_v0", "required": True,
+        "recommended_action": "inspect", "required_before_closeout": ["read"],
+    },
+}
+restored = context_vision_audit_view(capture)
+assert restored["interaction_contract"]["cli_channel"]["vision_continuation_audit"] == {
+    "required": True, "recommended_action": "inspect", "required_before_closeout": ["read"],
+}
+assert "loopx.control_plane.quota.execution_preparation" not in sys.modules
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script], cwd=REPOSITORY_ROOT, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_read_adapters_do_not_load_writeback_facades_for_leaf_helpers() -> None:
+    # Run independently: an earlier test importing a writer must not hide an
+    # accidental cold-start dependency of a read-only entrypoint.
+    for module, unrelated in (
+        ("loopx.control_plane.coordination.local_authority", "loopx.history"),
+        ("loopx.cli_commands.status", "loopx.state_refresh"),
+        ("loopx.cli_commands.quota_registration", "loopx.control_plane.quota.effect_program"),
+    ):
+        completed = subprocess.run(
+            [sys.executable, "-c", (
+                f"import sys; import {module}; "
+                f"assert {unrelated!r} not in sys.modules, {unrelated!r}"
+            )],
+            cwd=REPOSITORY_ROOT, capture_output=True, check=False, text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+
+def test_turn_run_once_defers_dsh_builders_and_preserves_exports() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+import loopx.cli_commands.turn_run_once as command
+assert 'loopx.cli_commands.turn_dsh_host' not in sys.modules
+assert 'loopx.dsh_goal_mode.turn_host_adapter' not in sys.modules
+names = {'build_dsh_host_runner', 'build_dsh_operation_host_runner'}
+assert names <= set(dir(command))
+assert not hasattr(command, 'unknown_host_builder')
+from loopx.cli_commands.turn_run_once import build_dsh_host_runner, build_dsh_operation_host_runner
+from loopx.cli_commands import turn_dsh_host
+assert build_dsh_host_runner is turn_dsh_host.build_dsh_host_runner
+assert build_dsh_operation_host_runner is turn_dsh_host.build_dsh_operation_host_runner
+exports = {}
+exec('from loopx.cli_commands.turn_run_once import *', exports)
+assert exports['build_dsh_host_runner'] is build_dsh_host_runner
+assert exports['build_dsh_operation_host_runner'] is build_dsh_operation_host_runner
+assert exports['execute_turn_run_once'] is command.execute_turn_run_once
+"""],
+        cwd=REPOSITORY_ROOT, capture_output=True, check=False, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_settlement_plan_import_does_not_load_native_capture_io() -> None:
+    # A command template needs the native output profile, not capture binding
+    # or the complete quota/Goal routing graph. Keep the typed kernel usable
+    # independently of those orchestration owners.
+    completed = subprocess.run(
+        [sys.executable, "-c", (
+            "import sys; import loopx.control_plane.quota.effect_program; "
+            "assert 'loopx.control_plane.turn_driver.decision_capture' not in sys.modules"
+        )],
+        cwd=REPOSITORY_ROOT, capture_output=True, check=False, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_turn_preview_import_does_not_select_report_delivery_or_lark_hosts() -> None:
+    # A fresh process detects eager package facades and command-only imports;
+    # the in-process test suite may already have selected these real owners.
+    completed = subprocess.run(
+        [sys.executable, "-c", "\n".join((
+            "import sys",
+            "import loopx.cli_commands.turn_decision",
+            "unselected = (",
+            " 'loopx.capabilities.periodic_report.archive',",
+            " 'loopx.capabilities.periodic_report.workspace',",
+            " 'loopx.presentation.renderers.periodic_report_html',",
+            " 'loopx.presentation.renderers.periodic_report_markdown',",
+            " 'loopx.extensions.hook_adapters',",
+            " 'loopx.extensions.lark.presentation.periodic_report',",
+            " 'loopx.extensions.lark.event_collector_runtime',",
+            " 'loopx.extensions.lark.event_collector_routes',",
+            " 'loopx.extensions.lark.group_history',",
+            " 'loopx.extensions.lark.inbox_reactions',",
+            " 'loopx.extensions.lark.inbox_reply',",
+            " 'loopx.extensions.lark.turn_start_sync',",
+            " 'loopx.extensions.lark.event_collector',",
+            " 'loopx.extensions.lark.routed_inbox',",
+            " 'loopx.extensions.runtime',",
+            " 'loopx.extensions.manifest',",
+            " 'loopx.extensions.process_runtime',",
+            " 'loopx.extensions.runtime_location',",
+            ")",
+            "assert not set(unselected) & sys.modules.keys(), "
+            "set(unselected) & sys.modules.keys()",
+        ))],
+        cwd=REPOSITORY_ROOT, capture_output=True, check=False, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_host_bridge_defers_process_helpers_and_preserves_exports() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+import loopx.control_plane.turn_driver.host_bridge_transport as bridge
+assert 'loopx.extensions.process_runtime' not in sys.modules
+names = {'force_terminate_process', 'write_process_stdin_before_deadline'}
+assert names <= set(dir(bridge))
+assert not hasattr(bridge, 'unknown_process_helper')
+from loopx.control_plane.turn_driver.host_bridge_transport import force_terminate_process, write_process_stdin_before_deadline
+from loopx.extensions import process_runtime
+assert force_terminate_process is process_runtime.force_terminate_process
+assert write_process_stdin_before_deadline is process_runtime.write_process_stdin_before_deadline
+exports = {}
+exec('from loopx.control_plane.turn_driver.host_bridge_transport import *', exports)
+assert exports['force_terminate_process'] is force_terminate_process
+assert exports['write_process_stdin_before_deadline'] is write_process_stdin_before_deadline
+assert exports['GuardedHostBridge'] is bridge.GuardedHostBridge
+"""],
+        cwd=REPOSITORY_ROOT, capture_output=True, check=False, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_doctor_git_defers_cleanup_and_preserves_exports() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+from pathlib import Path
+from loopx import doctor_git
+assert 'loopx.extensions.process_runtime' not in sys.modules
+assert doctor_git._run_git(Path.cwd(), 'rev-parse', '--show-toplevel').returncode == 0
+assert 'loopx.extensions.process_runtime' not in sys.modules
+assert 'terminate_process_tree' in dir(doctor_git)
+assert not hasattr(doctor_git, 'unknown_process_helper')
+from loopx.doctor_git import terminate_process_tree
+from loopx.extensions import process_runtime
+assert terminate_process_tree is process_runtime.terminate_process_tree
+exports = {}
+exec('from loopx.doctor_git import *', exports)
+assert exports['terminate_process_tree'] is terminate_process_tree
+assert exports['git_source_metadata'] is doctor_git.git_source_metadata
+"""],
+        cwd=REPOSITORY_ROOT, capture_output=True, check=False, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_lazy_report_and_lark_exports_preserve_original_owner_identity() -> None:
+    # Compatibility includes from-imports, attribute access, dir(), star
+    # exports for report facades, and the existing Lark command patch seam.
+    reports = importlib.import_module("loopx.capabilities.periodic_report")
+    renderers = importlib.import_module("loopx.presentation.renderers")
+    lark_reports = importlib.import_module("loopx.extensions.lark.presentation")
+    lark_commands = importlib.import_module("loopx.cli_commands.lark_inbox")
+    report_requests = importlib.import_module("loopx.capabilities.periodic_report.request_action")
+    assert set(reports._EXPORTS) == set(reports.__all__)
+    assert set(renderers._EXPORTS) == set(renderers.__all__)
+    # Independently pin the former eager exports, rather than allowing a
+    # missing compatibility name to disappear from a self-reported map.
+    for owner, names in (
+        ("loopx.extensions.lark.event_inbox", (
+            "acknowledge_lark_event_inbox", "inspect_lark_event_inbox",
+            "lark_event_inbox_contains_text",
+        )),
+        ("loopx.extensions.lark.routed_inbox", (
+            "acknowledge_routed_lark_event_inbox", "ingest_routed_lark_event_inbox",
+            "inspect_routed_lark_event_inbox", "project_routed_lark_event_inbox_urgency",
+            "resolve_routed_lark_inbox_config", "resolve_routed_lark_inbox_route",
+            "settle_routed_lark_event_inbox_material_review",
+        )),
+        ("loopx.extensions.runtime", (
+            "default_extension_state_file", "resolve_extension_activation",
+        )),
+    ):
+        for name in names:
+            assert lark_commands._LAZY_HOST_EXPORTS[name] == owner
+    for facade, exports, package in (
+        (reports, reports._EXPORTS, reports.__name__),
+        (renderers, renderers._EXPORTS, renderers.__name__),
+        (lark_reports, dict.fromkeys(lark_reports.__all__, "periodic_report"),
+         lark_reports.__name__),
+        (lark_commands, lark_commands._LAZY_HOST_EXPORTS, ""),
+        (report_requests, {
+            "discover_extension_hook_adapters": "loopx.extensions.hook_adapters",
+            "default_extension_state_file": "loopx.extensions.runtime",
+        }, ""),
+    ):
+        assert set(exports) <= set(dir(facade))
+        for name, owner in exports.items():
+            module = f"{package}.{owner}" if package else owner
+            original = getattr(importlib.import_module(module), name)
+            assert getattr(facade, name) is original
+        try:
+            getattr(facade, "not_a_report_or_lark_export")
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError("unknown exports must retain AttributeError")
+    star_exports: dict[str, object] = {}
+    exec("from loopx.capabilities.periodic_report import *", star_exports)
+    for name in reports.__all__:
+        assert star_exports[name] is getattr(reports, name)
+
+
+def test_inert_lark_projector_does_not_load_routes_before_activation(tmp_path) -> None:
+    completed = subprocess.run(
+        [sys.executable, "-c", "\n".join((
+            "import sys",
+            "from loopx.cli_commands.lark_inbox import "
+            "build_lark_operator_inbox_urgency_projector",
+            "projector = build_lark_operator_inbox_urgency_projector("
+            "runtime_root_arg=sys.argv[1])",
+            "assert 'loopx.extensions.runtime' not in sys.modules",
+            "assert 'loopx.extensions.lark.routed_inbox' not in sys.modules",
+            "try:",
+            " projector(project=sys.argv[1], config_path='unreadable-private.json')",
+            "except ValueError as error:",
+            " assert 'not installed' in str(error), str(error)",
+            "else:",
+            " raise AssertionError('uninstalled extension must still refuse')",
+            "assert 'loopx.extensions.runtime' in sys.modules",
+            "assert 'loopx.extensions.lark.routed_inbox' not in sys.modules",
+            "assert 'loopx.extensions.lark.event_collector' not in sys.modules",
+        )), str(tmp_path)],
+        cwd=REPOSITORY_ROOT, capture_output=True, check=False, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_core_does_not_import_experiments() -> None:
@@ -211,12 +577,15 @@ def test_core_does_not_import_experiments() -> None:
 def test_quota_markdown_is_owned_by_the_presentation_layer() -> None:
     legacy_renderer = CONTROL_PLANE_ROOT / "quota" / "markdown.py"
     imports = _resolved_imports(QUOTA_MODULE)
-    cli_imports = _resolved_from_imports(QUOTA_CLI_MODULE)
+    cli_imports = _resolved_from_imports(QUOTA_CLI_MODULE.with_name("quota_presentation.py"))
     presentation_renderers = cli_imports.get(
         "loopx.presentation.renderers.quota_event_markdown", set()
     )
 
     assert not legacy_renderer.exists()
+    assert {"_quota_renderer", "_project_quota_cli_payload"} <= _resolved_from_imports(
+        QUOTA_CLI_MODULE
+    ).get("loopx.cli_commands.quota_presentation", set())
     assert "loopx.presentation.renderers.quota_markdown" in imports
     assert {
         "render_quota_monitor_poll_markdown",
@@ -261,10 +630,14 @@ def test_public_facade_import_only_reexports_match_the_audited_allowlist() -> No
         facade = importlib.import_module(facade_name)
         allowlist = getattr(facade, "_PUBLIC_COMPAT_REEXPORTS")
         import_only_bindings = _public_import_only_bindings(source_path)
+        lazy_exports = getattr(facade, "_LAZY_PUBLIC_COMPAT_REEXPORTS", frozenset())
+        assert lazy_exports <= allowlist.keys()
+        assert not lazy_exports & import_only_bindings.keys()
 
         assert import_only_bindings == {
             export_name: f"{canonical_module}.{export_name}"
             for export_name, canonical_module in allowlist.items()
+            if export_name not in lazy_exports
         }
         for export_name, canonical_module_name in allowlist.items():
             canonical_module = importlib.import_module(canonical_module_name)
@@ -288,7 +661,7 @@ def test_public_facade_compatibility_entries_have_contract_evidence() -> None:
     )
 
 
-def test_status_outward_dependency_debt_only_shrinks() -> None:
+def test_status_has_no_forbidden_outward_dependencies() -> None:
     outward_dependencies = {
         (_module_name(STATUS_MODULE), dependency)
         for dependency in _resolved_imports(STATUS_MODULE)
@@ -298,15 +671,9 @@ def test_status_outward_dependency_debt_only_shrinks() -> None:
         )
     }
 
-    unexpected = outward_dependencies - STATUS_OUTWARD_DEPENDENCY_DEBT
-    stale_debt = STATUS_OUTWARD_DEPENDENCY_DEBT - outward_dependencies
-    assert not unexpected, (
-        "loopx.status must not gain new benchmark-adapter or presentation dependencies; "
-        f"unexpected edges: {sorted(unexpected)}"
-    )
-    assert not stale_debt, (
-        "remove resolved loopx.status edges from STATUS_OUTWARD_DEPENDENCY_DEBT; "
-        f"stale entries: {sorted(stale_debt)}"
+    assert not outward_dependencies, (
+        "loopx.status must not depend on benchmark-adapter or presentation layers; "
+        f"unexpected edges: {sorted(outward_dependencies)}"
     )
 
 
@@ -321,6 +688,25 @@ def test_quota_receives_lark_urgency_only_through_cli_composition() -> None:
 
     assert "loopx.cli_commands.lark_inbox" in _resolved_imports(QUOTA_CLI_MODULE)
     assert "loopx.cli_commands.lark_inbox" in _resolved_imports(TURN_CLI_MODULE)
+
+
+def test_periodic_report_request_ports_are_manifest_discovered_outside_kernel() -> None:
+    generic_modules = (
+        PERIODIC_REPORT_REQUEST_ACTION_MODULE,
+        EXTENSION_HOOK_ADAPTERS_MODULE,
+        QUOTA_CLI_MODULE,
+    )
+    for module in generic_modules:
+        assert not any(
+            dependency == "loopx.extensions.lark"
+            or dependency.startswith("loopx.extensions.lark.")
+            for dependency in _resolved_imports(module)
+        )
+    assert not any(
+        dependency == "loopx.control_plane"
+        or dependency.startswith("loopx.control_plane.")
+        for dependency in _resolved_imports(EXTENSION_HOOK_ADAPTERS_MODULE)
+    )
 
 
 def test_lark_operator_inbox_contract_is_extension_owned() -> None:
@@ -359,13 +745,15 @@ def test_lark_inbox_provider_is_owned_by_the_extension_layer() -> None:
     assert not remaining_legacy_imports
 
     imports = _resolved_imports(LARK_INBOX_CLI_MODULE)
+    lark_commands = importlib.import_module("loopx.cli_commands.lark_inbox")
+    delayed_owner_imports = set(lark_commands._LAZY_HOST_EXPORTS.values())
     assert {
         "loopx.extensions.lark.event_collector",
         "loopx.extensions.lark.event_collector_runtime",
         "loopx.extensions.lark.event_inbox",
         "loopx.extensions.lark.inbox_reply",
         "loopx.extensions.runtime",
-    } <= imports
+    } <= imports | delayed_owner_imports
     assert (LARK_EXTENSION_ROOT / "extension.toml").is_file()
     assert (LARK_EXTENSION_ROOT / "provider.py").is_file()
 

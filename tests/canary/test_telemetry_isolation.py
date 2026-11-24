@@ -1,0 +1,353 @@
+"""The smoke runner owns its isolated environment and child lifecycle."""
+import json
+import runpy
+import subprocess
+import os
+import signal
+import shutil
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from loopx.canary import runner
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX owned process-group regression")
+@pytest.mark.parametrize("outcome", ["timeout", "exited_leader", "cancelled"])
+def test_smoke_failure_reaps_children_before_cleaning_fixture(tmp_path, monkeypatch, outcome):
+    ready, release, effect = (tmp_path / name for name in ("ready", "release", "effect"))
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    child = (
+        "import os,time; from pathlib import Path\n"
+        f"Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+        f"while not Path({str(release)!r}).exists(): time.sleep(.01)\n"
+        f"Path({str(effect)!r}).write_text('late effect')\n"
+    )
+    script = examples / "owned.py"
+    script.write_text(
+        "import subprocess,sys,time\n"
+        f"subprocess.Popen([sys.executable,'-c',{child!r}]"
+        + (",stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL" if outcome != "exited_leader" else "")
+        + ")\n"
+        + ("time.sleep(60)\n" if outcome != "exited_leader" else ""),
+        encoding="utf-8",
+    )
+    real_popen = subprocess.Popen
+
+    def spawn(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        if str(script) not in args[0]:
+            return process
+        # Synchronize real child startup before exercising the communicate
+        # deadline; this tests cleanup rather than machine scheduling speed.
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert ready.exists(), "fixture child did not reach its startup barrier"
+        if outcome == "exited_leader":
+            original_kill = process.kill
+            def kill_leader():
+                original_kill()
+                # The old leader-only fallback releases the still-live child,
+                # preventing a hanging baseline without a sleep-based oracle.
+                release.write_text("release")
+            process.kill = kill_leader
+        if outcome == "cancelled":
+            def cancelled(*_, **__):
+                raise KeyboardInterrupt
+            process.communicate = cancelled
+        return process
+
+    monkeypatch.setattr(runner, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    with real_popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True) as unrelated:
+        try:
+            if outcome == "cancelled":
+                with pytest.raises(KeyboardInterrupt):
+                    runner._run_check({"command": "python examples/owned.py"}, timeout_seconds=.1)
+            else:
+                result = runner._run_check({"command": "python examples/owned.py"}, timeout_seconds=.1)
+                assert result['status'] == 'timed_out' and not result['ok']
+            assert unrelated.poll() is None
+            child_pid = int(ready.read_text())
+            status = subprocess.run(["ps", "-p", str(child_pid), "-o", "stat="], capture_output=True, text=True).stdout.strip()
+            assert not status or status.startswith("Z"), "owned child survived cleanup"
+            assert not effect.exists(), "child performed a late effect before cleanup returned"
+        finally:
+            if ready.exists():
+                try:
+                    os.kill(int(ready.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            unrelated.kill()
+            unrelated.wait()
+
+
+def test_smoke_subprocess_overrides_parent_telemetry_enable(tmp_path, monkeypatch):
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    (examples / "environment.py").write_text(
+        "import json,os\nprint(json.dumps({k:os.environ.get(k) for k in "
+        "['LOOPX_USAGE_PING','CI','SYNTHETIC_VALUE']}))\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(runner, "REPO_ROOT", tmp_path)
+    monkeypatch.setenv("LOOPX_USAGE_PING", "1")
+    monkeypatch.setenv("SYNTHETIC_VALUE", "preserved")
+    monkeypatch.delenv("CI", raising=False)
+    result = runner._run_check({"command": "python examples/environment.py"}, timeout_seconds=10)
+    assert result["ok"], result
+    assert json.loads(result["stdout_tail"]) == {
+        "LOOPX_USAGE_PING": "0", "CI": None, "SYNTHETIC_VALUE": "preserved",
+    }
+
+
+def test_update_smoke_minimal_environment_keeps_opt_out(monkeypatch):
+    smoke = runpy.run_path(str(Path(__file__).parents[2] / 'examples/loopx-update-smoke.py'))
+    original_run = subprocess.run
+    environments = []
+
+    def actual_run(*args, **kwargs):
+        if 'env' in kwargs:
+            environments.append(kwargs['env'])
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', actual_run)
+    monkeypatch.setenv('LOOPX_USAGE_PING', '1')
+    smoke['test_cli_rollback_previous_with_temp_home']()
+    assert environments and all(env.get('LOOPX_USAGE_PING') == '0' for env in environments)
+
+
+def test_smokes_isolate_routes_and_home_in_serial_and_parallel(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    (examples / "environment.py").write_text(
+        "import json,os,pathlib\n"
+        "home=pathlib.Path.home(); assert not (home/'previous-smoke').exists()\n"
+        "(home/'previous-smoke').write_text('synthetic')\n"
+        "print(json.dumps({**{k:os.environ.get(k) for k in "
+        "['HOME','CODEX_HOME','LOOPX_REGISTRY','LOOPX_RUNTIME_ROOT']}, "
+        "'temp_equal':os.environ['TMPDIR']==os.environ['TEMP']==os.environ['TMP'], "
+        "'path_digest':__import__('hashlib').sha256(os.environ['PATH'].encode()).hexdigest()}))\n",
+        encoding="utf-8",
+    )
+    owner_home = tmp_path / "owner-home"
+    owner_home.mkdir()
+    marker = owner_home / "previous-smoke"
+    marker.write_text("owner data")
+    monkeypatch.setattr(runner, "REPO_ROOT", tmp_path)
+    monkeypatch.setenv("HOME", str(owner_home))
+    monkeypatch.setenv("CODEX_HOME", str(owner_home / ".custom-host"))
+    monkeypatch.setenv("LOOPX_REGISTRY", str(owner_home / "registry.json"))
+    monkeypatch.setenv("LOOPX_RUNTIME_ROOT", str(owner_home / "runtime"))
+    command = {"command": "python examples/environment.py"}
+    def execute(_):
+        result = runner._run_check(command, timeout_seconds=10)
+        assert result["ok"], result
+        return json.loads(result["stdout_tail"])
+    values = [execute(0), execute(1)]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        values.extend(pool.map(execute, range(2)))
+    assert len({value["HOME"] for value in values}) == 4
+    for value in values:
+        assert value["HOME"] != str(owner_home)
+        assert value["CODEX_HOME"] == value["HOME"] + "/.codex"
+        assert value["temp_equal"] is True
+        assert value["LOOPX_REGISTRY"] is value["LOOPX_RUNTIME_ROOT"] is None
+        assert value["path_digest"] == __import__("hashlib").sha256(__import__("os").environ["PATH"].encode()).hexdigest()
+        assert not Path(value["HOME"]).exists()
+    assert marker.read_text() == "owner data"
+
+
+def test_grouped_canary_preserves_explicit_path_priority(monkeypatch):
+    import os
+    smoke = runpy.run_path(str(Path(__file__).parents[2] / "examples/canary/canary-promotion-readiness-smoke.py"))
+    monkeypatch.setenv("PATH", "/qualified/toolchain/bin")
+    environment = smoke["build_env"]()
+    assert environment["PATH"].split(os.pathsep)[0] == "/qualified/toolchain/bin"
+
+
+@pytest.mark.parametrize("delayed_exit", [False, True])
+def test_runtime_started_by_smoke_is_stopped_before_fixture_cleanup(tmp_path, monkeypatch, delayed_exit):
+    import os
+    import sys
+    import tempfile
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    (examples / "runtime.py").write_text(
+        "import json,os\nfrom loopx.control_plane.effect_runtime import collect_effect_runtime_readiness\n"
+        "r=collect_effect_runtime_readiness(deep=True); assert r['ready'], r\n"
+        "print(json.dumps({'temp':os.environ['TMPDIR']}))\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(runner, "REPO_ROOT", tmp_path)
+    with tempfile.TemporaryDirectory(prefix="loopx-owner-runtime-") as owner:
+        env = {**os.environ, 'TMPDIR': owner, 'TEMP': owner, 'TMP': owner}
+        subprocess.run([sys.executable, '-c',
+            "from loopx.control_plane.effect_runtime import collect_effect_runtime_readiness; "
+            "r=collect_effect_runtime_readiness(deep=True); assert r['ready'], r"],
+            env=env,check=True,capture_output=True,text=True)
+        try:
+            if delayed_exit:
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError
+                ready, release, exited = (tmp_path / name for name in ("retired", "release", "exited"))
+                preload = tmp_path / "delayed-exit.mjs"
+                preload.write_text(
+                    "import { existsSync, writeFileSync } from 'node:fs';\n"
+                    "const exit = process.exit.bind(process);\n"
+                    f"process.exit = code => {{ writeFileSync({json.dumps(str(ready))}, process.env.TMPDIR);\n"
+                    f"const poll = setInterval(() => {{ if (existsSync({json.dumps(str(release))})) {{\n"
+                    f"clearInterval(poll); writeFileSync({json.dumps(str(exited))}, 'exit'); exit(code); }} }}, 10); }};\n",
+                    encoding="utf-8",
+                )
+                monkeypatch.setenv("NODE_OPTIONS", "--import=" + preload.as_uri())
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(runner._run_check,
+                        {"command": "python examples/runtime.py"}, timeout_seconds=30)
+                    try:
+                        deadline = time.monotonic() + 10
+                        while not ready.exists() and time.monotonic() < deadline:
+                            time.sleep(.01)
+                        assert ready.exists(), "owned runtime did not reach its exit barrier"
+                        with pytest.raises(TimeoutError):
+                            future.result(timeout=.2)
+                        assert Path(ready.read_text()).exists(), "cleanup preceded actual exit"
+                    finally:
+                        release.touch()
+                    result = future.result(timeout=10)
+                assert exited.exists(), "runner returned before its runtime's exit hook"
+            else:
+                result = runner._run_check({"command": "python examples/runtime.py"}, timeout_seconds=30)
+            assert result['ok'], result
+            isolated_temp = Path(json.loads(result['stdout_tail'])['temp'])
+            assert str(isolated_temp) != owner and not isolated_temp.exists()
+            # The independently scoped owner's process still serves requests.
+            probe = subprocess.run([sys.executable, '-c',
+                "import json; from loopx.control_plane.effect_runtime import collect_effect_runtime_readiness; "
+                "print(json.dumps(collect_effect_runtime_readiness()))"],
+                env=env,check=True,capture_output=True,text=True)
+            assert json.loads(probe.stdout)['runtime_lifecycle']['state'] == 'running'
+        finally:
+            subprocess.run([sys.executable, '-c',
+                "from loopx.control_plane.effect_runtime import restart_effect_runtime; "
+                "r=restart_effect_runtime(); assert r['status'] != 'shutdown_pending', r"],
+                env=env,check=True,capture_output=True,text=True)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process exit observation")
+@pytest.mark.parametrize("outcome", ["passed", "failed", "timed_out"])
+def test_smoke_retires_every_owned_runtime_revision(tmp_path, monkeypatch, outcome):
+    from loopx.control_plane import effect_runtime
+
+    marker = tmp_path / "owned-runtimes.json"
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    script = examples / "revisions.py"
+    script.write_text(
+        "import json,os,time\nfrom pathlib import Path\n"
+        "from loopx.control_plane import effect_runtime as r\n"
+        "infos=[]\n"
+        "for fingerprint in (r._runtime_fingerprint(), 'f'*64):\n"
+        " infos.append(r._start_runtime(fingerprint=fingerprint, info_path=r._runtime_info_path(fingerprint)))\n"
+        f"Path({str(marker)!r}).write_text(json.dumps({{'root':os.environ['TMPDIR'],'infos':infos}}))\n"
+        + ("time.sleep(60)\n" if outcome == "timed_out" else "")
+        + f"raise SystemExit({3 if outcome == 'failed' else 0})\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner, "REPO_ROOT", tmp_path)
+    real_popen = subprocess.Popen
+
+    def spawn(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        if str(script) in args[0] and outcome == "timed_out":
+            deadline = time.monotonic() + 20
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            assert marker.exists(), "both owned runtimes must be ready before the deadline"
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    try:
+        result = runner._run_check(
+            {"command": "python examples/revisions.py"},
+            timeout_seconds=.1 if outcome == "timed_out" else 30,
+        )
+        assert result["status"] == outcome, result
+        recorded = json.loads(marker.read_text())
+        assert not Path(recorded["root"]).exists()
+        for info in recorded["infos"]:
+            status = subprocess.run(
+                ["ps", "-p", str(info["pid"]), "-o", "stat="],
+                capture_output=True, text=True, check=False,
+            ).stdout.strip()
+            assert not status or status.startswith("Z"), "runtime survived its fixture"
+    finally:
+        # Baseline failures must not leave the regression's own daemons alive.
+        if marker.exists():
+            recorded = json.loads(marker.read_text())
+            for info in recorded["infos"]:
+                try:
+                    effect_runtime._request_with_info(
+                        info, request_id="fixture-cleanup", method="runtime.shutdown",
+                        params={}, timeout=1,
+                    )
+                except (effect_runtime.EffectRuntimeRemoteError,
+                        effect_runtime.EffectRuntimeResponseAmbiguous, OSError):
+                    pass
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                states = [subprocess.run(
+                    ["ps", "-p", str(info["pid"]), "-o", "stat="],
+                    capture_output=True, text=True, check=False,
+                ).stdout.strip() for info in recorded["infos"]]
+                if all(not state or state.startswith("Z") for state in states):
+                    break
+                time.sleep(.05)
+            else:
+                pytest.fail("owned regression runtime did not exit")
+            if Path(recorded["root"]).exists():
+                shutil.rmtree(recorded["root"])
+
+
+def test_smoke_reports_cleanup_failure_and_retains_the_owned_fixture(tmp_path, monkeypatch):
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    (examples / "output.py").write_text("print('original check output')\n")
+    monkeypatch.setattr(runner, "REPO_ROOT", tmp_path)
+    retained = []
+
+    def pending(root):
+        retained.append(root)
+        raise RuntimeError("runtime shutdown remains pending")
+
+    monkeypatch.setattr(runner, "_retire_fixture_runtimes", pending)
+    try:
+        result = runner._run_check({"command": "python examples/output.py"}, timeout_seconds=5)
+        assert not result["ok"] and result["status"] == "failed"
+        assert result["returncode"] == 0 and "original check output" in result["stdout_tail"]
+        assert "runtime shutdown remains pending" in result["reason"]
+        assert len(retained) == 1 and retained[0].is_dir()
+    finally:
+        for root in retained:
+            shutil.rmtree(root)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink fixture")
+def test_fixture_retirement_does_not_follow_runtime_namespace_links(tmp_path, monkeypatch):
+    from loopx.control_plane import effect_runtime
+
+    external = tmp_path / "outside"
+    external.mkdir()
+    locator = external / ("runtime-" + "f" * 16 + ".json")
+    locator.write_text("external runtime metadata")
+    root = tmp_path / "fixture"
+    root.mkdir()
+    (root / "loopx-effect-runtime-linked").symlink_to(external, target_is_directory=True)
+    namespace = root / "loopx-effect-runtime-local"
+    namespace.mkdir()
+    (namespace / locator.name).symlink_to(locator)
+    monkeypatch.setattr(effect_runtime, "_read_info", lambda *a, **kw: pytest.fail("followed external locator"))
+    runner._retire_fixture_runtimes(root)
+    assert locator.read_text() == "external runtime metadata"

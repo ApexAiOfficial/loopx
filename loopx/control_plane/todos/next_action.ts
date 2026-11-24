@@ -1,4 +1,6 @@
+import {readTodoPriority, todoPriorityRank as priorityRank, type TodoPriority} from "./priority.ts";
 import type { JsonObject } from "../effect_program.ts";
+import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
 import {
   optionalNonEmptyString as optionalString,
   requireJsonObject as requiredObject,
@@ -16,15 +18,13 @@ const TODO_ID_PATTERN = /^todo_[a-z0-9_-]{3,64}$/;
 const NEXT_ACTION_BINDING_PATTERN =
   /^\s*<!--\s*loopx:next-action\s+schema=([A-Za-z0-9_-]+)\s+todo_id=(todo_[A-Za-z0-9_-]+)\s*-->\s*$/;
 const TODO_STATUSES = new Set(["open", "done", "blocked", "deferred"]);
-const TODO_PRIORITY_PATTERN = /^P([0-4])/;
-const TODO_MISSING_PRIORITY_RANK = 50;
 const CONTROL_TASK_CLASSES = new Set([
   "continuous_monitor",
   "user_gate",
   "blocker",
 ]);
 
-export type TodoPriority = `P${0 | 1 | 2 | 3 | 4}${string}`;
+export type {TodoPriority} from "./priority.ts";
 
 export interface TodoNextActionSnapshot {
   todo_id: string;
@@ -86,17 +86,16 @@ function nullableTodoPriority(
   label: string,
 ): TodoPriority | null {
   if (value === null) return null;
-  const priority = requiredString(value, label).trim().toUpperCase();
-  if (!TODO_PRIORITY_PATTERN.test(priority)) {
-    throw new Error(`${label} must start with P0, P1, P2, P3, or P4`);
-  }
-  return priority as TodoPriority;
+  // Snapshot input is a read compatibility boundary, unlike new priority intent.
+  const priority = readTodoPriority({priority: requiredString(value, label)});
+  if (priority === null) throw new EffectRuntimeRequestError(`${label} must be a supported Todo priority`);
+  return priority;
 }
 
 function normalizedTodoId(value: unknown, label: string): string {
   const candidate = requiredString(value, label).trim().toLowerCase();
   if (!TODO_ID_PATTERN.test(candidate)) {
-    throw new Error(`${label} must be a valid todo_id`);
+    throw new EffectRuntimeRequestError(`${label} must be a valid todo_id`);
   }
   return candidate;
 }
@@ -106,10 +105,10 @@ function todoSnapshot(value: unknown, index: number): TodoNextActionSnapshot {
   const item = requiredObject(value, label);
   const status = requiredString(item.status, `${label}.status`).trim().toLowerCase();
   if (!TODO_STATUSES.has(status)) {
-    throw new Error(`${label}.status is unsupported`);
+    throw new EffectRuntimeRequestError(`${label}.status is unsupported`);
   }
   if (!Number.isSafeInteger(item.index) || Number(item.index) < 1) {
-    throw new Error(`${label}.index must be a positive integer`);
+    throw new EffectRuntimeRequestError(`${label}.index must be a positive integer`);
   }
   return {
     todo_id: normalizedTodoId(item.todo_id, `${label}.todo_id`),
@@ -137,7 +136,7 @@ export function decodeTodoNextActionRequest(
 ): TodoNextActionRequest {
   const request = requiredObject(value, "todo.next_action params");
   if (request.schema_version !== TODO_NEXT_ACTION_REQUEST_SCHEMA) {
-    throw new Error("Todo Next Action request schema mismatch");
+    throw new EffectRuntimeRequestError("Todo Next Action request schema mismatch");
   }
   const operation = requiredString(
     request.operation,
@@ -154,10 +153,10 @@ export function decodeTodoNextActionRequest(
     };
   }
   if (operation !== "reconcile_added" && operation !== "settle_completion") {
-    throw new Error("Todo Next Action operation is unsupported");
+    throw new EffectRuntimeRequestError("Todo Next Action operation is unsupported");
   }
   if (!Array.isArray(request.agent_todos)) {
-    throw new Error("todo.next_action agent_todos must be an array");
+    throw new EffectRuntimeRequestError("todo.next_action agent_todos must be an array");
   }
   if (operation === "reconcile_added") {
     return {
@@ -268,6 +267,15 @@ function bindingMatches(lines: readonly string[]): BindingMatch[] {
   return matches;
 }
 
+/** Decode the existing typed breadcrumb; arbitrary prose cannot select work. */
+export function projectNextActionBinding(value: unknown): JsonObject {
+  const request = requiredObject(value, "next action binding");
+  const lines = stringArray(request.lines, "next action binding lines");
+  const matches = bindingMatches(lines);
+  return {todo_id: matches.length === 1 && matches[0].schema === NEXT_ACTION_BINDING_SCHEMA &&
+    visibleNextActionEntries(lines).length === 1 ? matches[0].todoId : null};
+}
+
 function hasBindingDirective(lines: readonly string[]): boolean {
   const bounds = headingBounds(lines, "Next Action");
   if (!bounds) return false;
@@ -328,11 +336,6 @@ function bindNextAction(
     matched: true,
     lines: updated,
   };
-}
-
-function priorityRank(priority: TodoPriority | null): number {
-  const match = priority ? TODO_PRIORITY_PATTERN.exec(priority) : null;
-  return match ? Number(match[1]) : TODO_MISSING_PRIORITY_RANK;
 }
 
 function nextOpenAgentTodo(
@@ -432,7 +435,7 @@ function settleCompletedTodo(
     (todo) => todo.todo_id === request.todo_id,
   );
   if (!completed) {
-    throw new Error("completed Todo is absent from the Agent Todo projection");
+    throw new EffectRuntimeRequestError("completed Todo is absent from the Agent Todo projection");
   }
   if (completed.status !== "done") {
     return unchangedResult(

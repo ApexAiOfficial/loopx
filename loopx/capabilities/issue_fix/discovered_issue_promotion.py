@@ -136,7 +136,7 @@ def build_discovered_issue_promotion_from_cli_args(
 def _default_runner(args: Sequence[str]) -> Mapping[str, Any]:
     result = subprocess.run(
         list(args),
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=30,
@@ -501,7 +501,7 @@ def _find_domain_row(
     if not path.is_file():
         return None
     match = None
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8").split("\n"):
         if not line.strip():
             continue
         row = json.loads(line)

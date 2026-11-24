@@ -16,6 +16,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from loopx.cli import main as cli_main  # noqa: E402
+from loopx.control_plane.coordination.local_authority import (  # noqa: E402
+    read_canonical_todos_if_promoted, CanonicalAuthorityRequired,
+)
+from loopx.control_plane.testing.canary_harness import import_fixture_authority  # noqa: E402
 
 
 GOAL_ID = "loopx-turn-path-delta-fixture"
@@ -27,7 +31,7 @@ MARKER = "docs/path-delta-route.txt"
 def _write_fixture(root: Path) -> tuple[Path, Path, Path, Path]:
     project = root / "project"
     runtime = root / "runtime"
-    workspace = root / "workspace"
+    workspace = project
     runtime.mkdir(parents=True)
     (workspace / "docs").mkdir(parents=True)
 
@@ -112,6 +116,8 @@ request = json.load(sys.stdin)
 mode = sys.argv[1]
 marker = pathlib.Path({MARKER!r})
 marker.write_text(mode, encoding="utf-8")
+with marker.with_suffix(".calls").open("a", encoding="utf-8") as calls:
+    calls.write(mode + "\\n")
 material_packet = {{
     "agent_id": {AGENT_ID!r},
     "state": "active",
@@ -181,6 +187,7 @@ def _run_turn(
     workspace: Path,
     host: Path,
     mode: str,
+    resume_turn_key: str | None = None,
 ) -> dict[str, Any]:
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
@@ -194,20 +201,23 @@ def _run_turn(
                 "json",
                 "turn",
                 "run-once",
+                "--host",
+                "generic-cli",
                 "--goal-id",
                 GOAL_ID,
                 "--agent-id",
                 AGENT_ID,
-                "--turn-instance-id",
-                f"path-delta-{mode}",
+                *(
+                    ["--resume-turn-key", resume_turn_key]
+                    if resume_turn_key else ["--turn-instance-id", f"path-delta-{mode}"]
+                ),
                 "--project",
                 str(workspace),
+                "--host-adapter-request-schema", "loopx_turn_host_request_v1",
                 "--host-adapter-command-json",
                 json.dumps(_host_command(host, mode)),
                 "--validation-command-json",
                 json.dumps(_validator_command(mode)),
-                "--scan-root",
-                str(project),
                 "--no-global-sync",
                 "--execute",
             ]
@@ -224,12 +234,45 @@ def _run_records(runtime: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in index.read_text(encoding="utf-8").splitlines()]
 
 
-def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="loopx-turn-path-delta-") as directory:
+def assert_unpromoted_replan_preserves_todo_authority() -> None:
+    with tempfile.TemporaryDirectory(prefix="loopx-turn-unpromoted-replan-") as directory:
+        root = Path(directory)
+        project, runtime, workspace, registry = _write_fixture(root)
+        state = project / ".codex" / "goals" / GOAL_ID / "ACTIVE_GOAL_STATE.md"
+        original_state = state.read_bytes()
+        try:
+            read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID)
+        except CanonicalAuthorityRequired as error:
+            assert error.payload["write_admitted"] is False
+            assert error.payload["legacy_fallback_used"] is False
+        else:
+            raise AssertionError("Unmigrated authority must refuse ordinary reads")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            code = cli_main(["--registry", str(registry), "--runtime-root", str(runtime),
+                "--format", "json", "quota", "should-run", "--goal-id", GOAL_ID,
+                "--agent-id", AGENT_ID])
+        refusal = json.loads(output.getvalue())
+        assert code == 1 and refusal["error_code"] == "canonical_authority_required", refusal
+        assert refusal["write_admitted"] is False and refusal["legacy_fallback_used"] is False
+        assert state.read_bytes() == original_state
+        assert not (project / MARKER).with_suffix(".calls").exists()
+
+
+def assert_canonical_turn_path_delta(provider: str) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"loopx-turn-path-delta-{provider}-") as directory:
         root = Path(directory)
         project, runtime, workspace, registry = _write_fixture(root)
         host = _write_host(root)
-        _run_turn(
+        # Select the provider explicitly to test canonical Todo preservation.
+        # The separate unmigrated case proves explicit refusal without effects.
+        calls = (project / MARKER).with_suffix(".calls")
+        assert not calls.exists()
+        import_fixture_authority(registry, GOAL_ID, provider=provider)
+        original = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID)
+        assert original is not None
+        assert original["source_authority"] == f"{provider}_v0", original
+        assert {item["todo_id"] for item in original["todos"]} == {TODO_ID}, original
+        committed = _run_turn(
             registry=registry,
             runtime=runtime,
             project=project,
@@ -237,6 +280,17 @@ def main() -> int:
             host=host,
             mode="material",
         )
+        recovered = _run_turn(
+            registry=registry,
+            runtime=runtime,
+            project=project,
+            workspace=workspace,
+            host=host,
+            mode="material",
+            resume_turn_key=committed["resume_turn_key"],
+        )
+        assert recovered["resume_turn_key"] == committed["resume_turn_key"], recovered
+        assert calls.read_text(encoding="utf-8").splitlines() == ["material"]
         _run_turn(
             registry=registry,
             runtime=runtime,
@@ -245,6 +299,19 @@ def main() -> int:
             host=host,
             mode="routine",
         )
+        assert calls.read_text(encoding="utf-8").splitlines() == ["material", "routine"]
+        canonical = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID)
+        assert canonical is not None
+        assert canonical["source_authority"] == f"{provider}_v0", canonical
+        assert {item["todo_id"] for item in canonical["todos"]} == {TODO_ID}, canonical
+        before, after = original["todos"][0], canonical["todos"][0]
+        for field in ("todo_id", "text", "role", "status", "claimed_by",
+                      "task_class", "action_kind", "priority", "successor_todo_ids"):
+            assert after.get(field) == before.get(field), (field, before, after)
+        mutable_result_fields = {"note", "evidence", "updated_at", "last_actor_agent_id"}
+        assert {k: v for k, v in after.items() if k not in mutable_result_fields} == {
+            k: v for k, v in before.items() if k not in mutable_result_fields
+        }, (before, after)
 
         records = _run_records(runtime)
         material = next(
@@ -255,7 +322,7 @@ def main() -> int:
         routine = next(
             record
             for record in records
-            if record.get("classification") == "fixture_routine_replan"
+            if record.get("classification") == "replan_noop"
         )
         path_delta = material["agent_vision"]["path_delta"]
         assert path_delta["schema_version"] == "goal_path_delta_v0", path_delta
@@ -264,6 +331,11 @@ def main() -> int:
         assert "agent_vision" not in routine, routine
         assert routine["vision_checkpoint"]["decision"] == "unchanged_with_reason", routine
 
+
+def main() -> int:
+    assert_unpromoted_replan_preserves_todo_authority()
+    for provider in ("file", "sqlite"):
+        assert_canonical_turn_path_delta(provider)
     print("loopx-turn-path-delta-acceptance-smoke ok")
     return 0
 

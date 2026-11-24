@@ -3,42 +3,30 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from canonical_authority_fixture import initialize_canonical_authority
 from loopx.bootstrap import render_state_markdown
-from loopx.control_plane.effect_runtime import MAX_REQUEST_BYTES
-from loopx.control_plane.todos.next_action_runtime import (
-    _agent_todo_snapshots,
-    apply_added_todo_next_action,
-    reconcile_added_todo_next_action,
+from loopx.control_plane.coordination.runtime_shadow import (
+    build_todo_runtime_shadow_projection,
 )
-from loopx.control_plane.todos.projection import TODO_MISSING_PRIORITY_RANK, todo_priority_rank
 from loopx.state_projection import active_state_next_action_entries
 from loopx.state_refresh import build_state_refresh_record
-from loopx.todos import add_goal_todo, complete_goal_todo, supersede_goal_todo
+from loopx.todos import add_goal_todo, complete_goal_todo
 
 GOAL_ID = "todo-next-action-settlement"
 AGENT_ID = "codex-next-action"
 
 
-def test_agent_todo_snapshot_uses_structured_prefix_priority() -> None:
-    snapshots = _agent_todo_snapshots(
-        [
-            "## Agent Todo",
-            "",
-            "- [ ] [P2-review] Validate the typed priority contract.",
-            "  <!-- loopx:todo todo_id=todo_typed task_class=advancement_task -->",
-            "- [ ] Explain why a P0 mention in prose is not priority metadata.",
-            "  <!-- loopx:todo todo_id=todo_untyped task_class=advancement_task -->",
-            "",
-            "## Next Action",
-            "",
-        ]
+def _initialize_canonical(tmp_path: Path, state: Path) -> None:
+    initialize_canonical_authority(
+        tmp_path / "runtime",
+        GOAL_ID,
+        build_todo_runtime_shadow_projection(
+            goal_id=GOAL_ID,
+            todos=[],
+            handoff_mode="soft_claim",
+        ),
+        state_path=state,
     )
-
-    assert [snapshot["priority"] for snapshot in snapshots] == ["P2-REVIEW", None]
-    assert [todo_priority_rank(snapshot["priority"]) for snapshot in snapshots] == [
-        2,
-        TODO_MISSING_PRIORITY_RANK,
-    ]
 
 
 def _write_fixture(tmp_path: Path, *, next_action: str) -> tuple[Path, Path]:
@@ -86,10 +74,11 @@ def _write_fixture(tmp_path: Path, *, next_action: str) -> tuple[Path, Path]:
         ),
         encoding="utf-8",
     )
+    _initialize_canonical(tmp_path, state)
     return registry, state
 
 
-def test_bootstrap_binds_generated_connection_validation_next_action(
+def test_bootstrap_renders_no_first_connect_todo_or_next_action_binding(
     tmp_path: Path,
 ) -> None:
     state_text = render_state_markdown(
@@ -102,13 +91,10 @@ def test_bootstrap_binds_generated_connection_validation_next_action(
         execution_profile=None,
     )
 
-    assert "<!-- loopx:next-action schema=loopx_next_action_binding_v0" in state_text
-    assert "todo_id=todo_" in state_text
+    assert "loopx:next-action" not in state_text
+    assert "loopx:todo todo_id=" not in state_text
     assert active_state_next_action_entries(state_text) == [
-        (
-            "[P1] Run `loopx check` against the project registry and record the first "
-            "project-specific adapter signal or an explicit no-follow-up rationale."
-        )
+        "Initial routing is owned by the connected domain adapter."
     ]
     record = build_state_refresh_record(
         goal_id=GOAL_ID,
@@ -126,7 +112,7 @@ def test_bootstrap_binds_generated_connection_validation_next_action(
     assert "loopx:next-action" not in json.dumps(record)
 
 
-def test_higher_priority_agent_todo_rebinds_generated_onboarding_next_action(
+def test_agent_todo_add_after_bootstrap_keeps_default_next_action(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "repo"
@@ -167,6 +153,7 @@ def test_higher_priority_agent_todo_rebinds_generated_onboarding_next_action(
         ),
         encoding="utf-8",
     )
+    _initialize_canonical(tmp_path, state)
 
     added = add_goal_todo(
         registry_path=registry,
@@ -181,9 +168,10 @@ def test_higher_priority_agent_todo_rebinds_generated_onboarding_next_action(
     state_text = state.read_text(encoding="utf-8")
     assert added["todo_id"]
     assert active_state_next_action_entries(state_text) == [
-        "[P0] Implement and validate the requested behavior."
+        "Initial routing is owned by the connected domain adapter."
     ]
-    assert f"todo_id={added['todo_id']} -->" in state_text
+    assert "loopx:next-action" not in state_text
+    assert f"todo_id={added['todo_id']}" in state_text
 
 
 def test_agent_todo_add_preserves_same_priority_and_manual_next_actions(
@@ -278,60 +266,6 @@ def test_higher_priority_todo_does_not_take_over_another_claimed_lane(
     ]
 
 
-def test_higher_priority_todo_preserves_multi_entry_operator_route() -> None:
-    lines = [
-        "## Agent Todo",
-        "",
-        "- [ ] [P1] Run the generated startup check.",
-        "  <!-- loopx:todo todo_id=todo_startup task_class=advancement_task -->",
-        "- [ ] [P0] Implement the requested behavior.",
-        "  <!-- loopx:todo todo_id=todo_task task_class=advancement_task claimed_by=codex -->",
-        "",
-        "## Next Action",
-        "",
-        "- [P1] Run the generated startup check.",
-        "<!-- loopx:next-action schema=loopx_next_action_binding_v0 todo_id=todo_startup -->",
-        "- Preserve this operator-authored route.",
-        "",
-    ]
-
-    assert reconcile_added_todo_next_action(lines, added_todo_id="todo_task") is False
-    assert "- Preserve this operator-authored route." in lines
-    assert "todo_id=todo_startup" in "\n".join(lines)
-
-
-def test_unchanged_and_non_advancement_adds_skip_the_ts_transition(
-    monkeypatch,
-) -> None:
-    def reject_unexpected_transition(*_args, **_kwargs):
-        raise AssertionError("non-candidate Todo addition crossed the TS boundary")
-
-    monkeypatch.setattr(
-        "loopx.control_plane.todos.next_action_runtime.effect_runtime_result",
-        reject_unexpected_transition,
-    )
-    lines = ["## Next Action", "", "- Preserve the existing route.", ""]
-
-    assert apply_added_todo_next_action(
-        lines,
-        role="agent",
-        add_result={
-            "changed": False,
-            "todo_id": "todo_existing",
-            "task_class": "advancement_task",
-        },
-    ) is False
-    assert apply_added_todo_next_action(
-        lines,
-        role="agent",
-        add_result={
-            "changed": True,
-            "todo_id": "todo_monitor",
-            "task_class": "continuous_monitor",
-        },
-    ) is True
-
-
 def test_refresh_record_preserves_a_long_wrapped_next_action_losslessly(
     tmp_path: Path,
 ) -> None:
@@ -367,152 +301,6 @@ def test_refresh_record_preserves_a_long_wrapped_next_action_losslessly(
     assert "…" not in record["state"]["next_action"][0]
 
 
-def test_complete_reprojects_typed_next_action_to_open_successor(
-    tmp_path: Path,
-) -> None:
-    completed_text = "[P1] Validate the project connection."
-    registry, state = _write_fixture(tmp_path, next_action=completed_text)
-    completed = add_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        role="agent",
-        text=completed_text,
-        task_class="advancement_task",
-        action_kind="onboarding_connection_validation",
-        claimed_by=AGENT_ID,
-    )
-    successor = add_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        role="agent",
-        text="[P0] Implement and validate the requested behavior.",
-        task_class="advancement_task",
-        action_kind="implementation",
-        claimed_by=AGENT_ID,
-    )
-    state.write_text(
-        state.read_text(encoding="utf-8").replace(
-            f"- {completed_text}\n",
-            f"- {completed_text}\n"
-            "<!-- loopx:next-action schema=loopx_next_action_binding_v0 "
-            f"todo_id={completed['todo_id']} -->\n",
-            1,
-        ),
-        encoding="utf-8",
-    )
-
-    result = complete_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        todo_id=str(completed["todo_id"]),
-        successor_todo_ids=[str(successor["todo_id"])],
-        agent_id=AGENT_ID,
-        evidence="connection preflight passed",
-    )
-
-    assert result["changed"] is True
-    assert active_state_next_action_entries(state.read_text(encoding="utf-8")) == [
-        "[P0] Implement and validate the requested behavior."
-    ]
-
-
-def test_complete_projects_next_action_when_archived_state_exceeds_runtime_limit(
-    tmp_path: Path,
-) -> None:
-    completed_text = "[P1] Finish the bounded implementation."
-    registry, state = _write_fixture(tmp_path, next_action=completed_text)
-    completed = add_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        role="agent",
-        text=completed_text,
-        task_class="advancement_task",
-        action_kind="implementation",
-        claimed_by=AGENT_ID,
-    )
-    successor = add_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        role="agent",
-        text="[P1] Validate the bounded implementation.",
-        task_class="advancement_task",
-        action_kind="validation_review",
-        claimed_by=AGENT_ID,
-    )
-    archived_evidence = "x" * (MAX_REQUEST_BYTES + 1024)
-    state_text = state.read_text(encoding="utf-8").replace(
-        f"- {completed_text}\n",
-        f"- {completed_text}\n"
-        "<!-- loopx:next-action schema=loopx_next_action_binding_v0 "
-        f"todo_id={completed['todo_id']} -->\n",
-        1,
-    )
-    state.write_text(
-        f"{state_text}\n## Completed Work Archive\n\n{archived_evidence}\n",
-        encoding="utf-8",
-    )
-
-    result = complete_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        todo_id=str(completed["todo_id"]),
-        successor_todo_ids=[str(successor["todo_id"])],
-        agent_id=AGENT_ID,
-        evidence="implementation completed",
-    )
-
-    final_text = state.read_text(encoding="utf-8")
-    assert result["changed"] is True
-    assert active_state_next_action_entries(final_text) == [
-        "[P1] Validate the bounded implementation."
-    ]
-    assert archived_evidence in final_text
-
-
-def test_supersede_reprojects_after_generated_successor_is_materialized(
-    tmp_path: Path,
-) -> None:
-    completed_text = "[P1] Replace the obsolete implementation."
-    registry, state = _write_fixture(tmp_path, next_action=completed_text)
-    completed = add_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        role="agent",
-        text=completed_text,
-        task_class="advancement_task",
-        action_kind="implementation",
-        claimed_by=AGENT_ID,
-    )
-    state.write_text(
-        state.read_text(encoding="utf-8").replace(
-            f"- {completed_text}\n",
-            f"- {completed_text}\n"
-            "<!-- loopx:next-action schema=loopx_next_action_binding_v0 "
-            f"todo_id={completed['todo_id']} -->\n",
-            1,
-        ),
-        encoding="utf-8",
-    )
-
-    result = supersede_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        todo_id=str(completed["todo_id"]),
-        reason="replace the obsolete route",
-        next_agent_todo="[P1] Implement the corrected route.",
-        next_action_kind="implementation",
-        next_claimed_by=AGENT_ID,
-        agent_id=AGENT_ID,
-    )
-
-    successor_id = result["next_todos"][0]["todo_id"]
-    state_text = state.read_text(encoding="utf-8")
-    assert active_state_next_action_entries(state_text) == [
-        "[P1] Implement the corrected route."
-    ]
-    assert f"todo_id={successor_id} -->" in state_text
-
-
 def test_complete_preserves_unrelated_owner_next_action(tmp_path: Path) -> None:
     registry, state = _write_fixture(
         tmp_path,
@@ -524,7 +312,7 @@ def test_complete_preserves_unrelated_owner_next_action(tmp_path: Path) -> None:
         role="agent",
         text="[P1] Validate the project connection.",
         task_class="advancement_task",
-        action_kind="onboarding_connection_validation",
+        action_kind="project_connection_review",
         claimed_by=AGENT_ID,
     )
 
@@ -541,121 +329,3 @@ def test_complete_preserves_unrelated_owner_next_action(tmp_path: Path) -> None:
     assert active_state_next_action_entries(state.read_text(encoding="utf-8")) == [
         "Keep the owner-approved release route unchanged."
     ]
-
-
-def test_complete_waits_for_generated_successor_before_reprojecting(
-    tmp_path: Path,
-) -> None:
-    completed_text = "[P0] Finish the bounded implementation."
-    registry, state = _write_fixture(tmp_path, next_action=completed_text)
-    completed = add_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        role="agent",
-        text=completed_text,
-        task_class="advancement_task",
-        action_kind="implementation",
-        claimed_by=AGENT_ID,
-    )
-    state.write_text(
-        state.read_text(encoding="utf-8").replace(
-            f"- {completed_text}\n",
-            f"- {completed_text}\n"
-            "<!-- loopx:next-action schema=loopx_next_action_binding_v0 "
-            f"todo_id={completed['todo_id']} -->\n",
-            1,
-        ),
-        encoding="utf-8",
-    )
-
-    result = complete_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        todo_id=str(completed["todo_id"]),
-        next_agent_todo="[P1] Review and validate the implementation.",
-        next_action_kind="validation_review",
-        next_claimed_by=AGENT_ID,
-        agent_id=AGENT_ID,
-        evidence="implementation completed",
-    )
-
-    successor_id = result["next_todos"][0]["todo_id"]
-    state_text = state.read_text(encoding="utf-8")
-    assert active_state_next_action_entries(state_text) == [
-        "[P1] Review and validate the implementation."
-    ]
-    assert f"todo_id={successor_id} -->" in state_text
-
-
-def test_complete_migrates_legacy_exact_text_next_action(tmp_path: Path) -> None:
-    completed_text = "[P1] Validate the legacy project connection."
-    registry, state = _write_fixture(tmp_path, next_action=completed_text)
-    completed = add_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        role="agent",
-        text=completed_text,
-        task_class="advancement_task",
-        action_kind="onboarding_connection_validation",
-        claimed_by=AGENT_ID,
-    )
-
-    result = complete_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        todo_id=str(completed["todo_id"]),
-        no_followup=True,
-        agent_id=AGENT_ID,
-        evidence="legacy connection preflight passed",
-    )
-
-    assert result["changed"] is True
-    assert active_state_next_action_entries(state.read_text(encoding="utf-8")) == []
-
-
-def test_complete_upgrades_legacy_open_todo_to_typed_binding(
-    tmp_path: Path,
-) -> None:
-    completed_text = "[P0] Finish the bound implementation."
-    registry, state = _write_fixture(tmp_path, next_action=completed_text)
-    completed = add_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        role="agent",
-        text=completed_text,
-        task_class="advancement_task",
-        action_kind="implementation",
-        claimed_by=AGENT_ID,
-    )
-    state_text = state.read_text(encoding="utf-8")
-    state_text = state_text.replace(
-        "## Next Action",
-        "- [ ] [P1] Legacy open work without metadata.\n\n## Next Action",
-        1,
-    ).replace(
-        f"- {completed_text}\n",
-        f"- {completed_text}\n"
-        "<!-- loopx:next-action schema=loopx_next_action_binding_v0 "
-        f"todo_id={completed['todo_id']} -->\n",
-        1,
-    )
-    state.write_text(state_text, encoding="utf-8")
-
-    complete_goal_todo(
-        registry_path=registry,
-        goal_id=GOAL_ID,
-        todo_id=str(completed["todo_id"]),
-        no_followup=True,
-        agent_id=AGENT_ID,
-        evidence="implementation completed",
-    )
-
-    final_text = state.read_text(encoding="utf-8")
-    assert active_state_next_action_entries(final_text) == [
-        "[P1] Legacy open work without metadata."
-    ]
-    assert (
-        "<!-- loopx:next-action schema=loopx_next_action_binding_v0 todo_id=todo_"
-        in final_text
-    )
-    assert "todo_id=None" not in final_text

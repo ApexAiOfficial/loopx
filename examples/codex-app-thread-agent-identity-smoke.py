@@ -16,8 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from loopx.bootstrap_command_pack import build_start_goal_guided_packet
-from loopx.cli import main as cli_main
+from loopx.bootstrap_command_pack import (  # noqa: E402
+    build_start_goal_guided_packet,
+)
+from loopx.cli import main as cli_main  # noqa: E402
 
 
 def main() -> None:
@@ -52,6 +54,11 @@ def main() -> None:
         )
         runtime = root / "runtime"
         runtime.mkdir()
+        from loopx.control_plane.testing.canary_harness import import_fixture_authority
+        config = json.loads(registry.read_text(encoding="utf-8"))
+        config["common_runtime_root"] = str(runtime)
+        registry.write_text(json.dumps(config), encoding="utf-8")
+        import_fixture_authority(registry, "goal", provider="sqlite")
         global_payload = json.loads(registry.read_text(encoding="utf-8"))
         global_payload["registry_role"] = "global-local"
         global_payload["goals"][0]["source_registry"] = str(registry)
@@ -125,6 +132,32 @@ def main() -> None:
         assert "--agent-id codex-a" in commands["goal_start_quota_should_run"], commands
         assert "--agent-id codex-a" in commands["goal_start_refresh_state"], commands
 
+        deep_link_output = io.StringIO()
+        with contextlib.redirect_stdout(deep_link_output):
+            deep_link_exit = cli_main(
+                [
+                    "--registry",
+                    str(registry),
+                    "--format",
+                    "json",
+                    "resolve-agent-thread",
+                    "--thread-link",
+                    "codex://threads/thread-a",
+                ]
+            )
+        assert deep_link_exit == 0, deep_link_output.getvalue()
+        deep_link_resolution = json.loads(deep_link_output.getvalue())
+        assert deep_link_resolution["goal_id"] == "goal", deep_link_resolution
+        assert deep_link_resolution["agent_id"] == "codex-a", deep_link_resolution
+        assert deep_link_resolution["host_surface"] is None, deep_link_resolution
+        assert deep_link_resolution["host_family"] == "codex", deep_link_resolution
+        assert deep_link_resolution["matched_host_surfaces"] == ["codex-app"], (
+            deep_link_resolution
+        )
+        assert deep_link_resolution["session_locator"]["authority"] == "locator_only", (
+            deep_link_resolution
+        )
+
         unbound = build_start_goal_guided_packet(
             project=project,
             goal_id="goal",
@@ -135,8 +168,15 @@ def main() -> None:
             goal_text="start another task",
         )
         gate = unbound["guided_transaction"]["identity_selection_gate"]
-        assert gate["default_action"] == "select_agent_identity", gate
-        assert gate["fresh_agent_registration"] is None, gate
+        assert gate["default_action"] == "register_fresh_agent", gate
+        registration = gate["fresh_agent_registration"]
+        assert registration["mode"] == "register_fresh_agent"
+        assert registration["recommended"] is True
+        assert registration["continuation_contract"]["requires_execute_result"] is True
+        assert registration["continuation_contract"]["required_result"] == {
+            "ok": True, "changed": True, "written": True,
+            "global_sync": {"ok": True}, "registration_readback": {"verified": True},
+        }
         assert {choice["agent_id"] for choice in gate["choices"]} == {
             "codex-a",
             "codex-b",
@@ -266,9 +306,9 @@ def main() -> None:
             "host_surface": "codex-app",
             "agent_id": "codex-b",
         } in bindings_after, bindings_after
-        assert "codex-c" in source_after["goals"][0]["coordination"][
-            "registered_agents"
-        ], source_after
+        assert (
+            "codex-c" in source_after["goals"][0]["coordination"]["registered_agents"]
+        ), source_after
 
         fresh = build_start_goal_guided_packet(
             project=project,

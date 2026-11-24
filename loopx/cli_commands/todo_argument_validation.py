@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 from collections.abc import Iterable
+from pathlib import Path
 
+from ..command_invocation import cli_option_args, loopx_cli_argv
 from ..control_plane.todos.contract import TODO_CONTINUATION_POLICY_VALUES
 
 TODO_OPTION_FIELDS = (
     ("--role", "role"),
     ("--text", "text"),
-    ("--follow-up", "followups"),
+    ("--priority", "priority"),
+    ("--clear-priority", "clear_priority"),
     ("--todo-id", "todo_id"),
+    ("--operation-id", "operation_id"),
+    ("--claim-operation-id", "claim_operation_id"),
+    ("--recover-execution", "recover_execution"),
+    ("--update-operation-id", "update_operation_id"),
+    ("--update-expected-provider-revision", "update_expected_provider_revision"),
     ("--turn-instance-id", "turn_instance_id"),
+    ("--goal-instance-id", "goal_instance_id"),
     ("--completion-identity-key", "completion_identity_key"),
     ("--replan-obligation-id", "replan_obligation_id"),
     ("--status", "status"),
@@ -36,6 +46,7 @@ TODO_OPTION_FIELDS = (
     ("--claimed-by", "claimed_by"),
     ("--task-lease-idempotency-key", "task_lease_idempotency_key"),
     ("--task-lease-expected-version", "task_lease_expected_version"),
+    ("--ttl-seconds", "ttl_seconds"),
     ("--bound-agent", "bound_agent"),
     ("--goal-bound", "goal_bound"),
     ("--blocks-agent", "blocks_agent"),
@@ -71,15 +82,17 @@ TODO_OPTION_FIELDS = (
     ("--next-excluded-agent", "next_excluded_agents"),
     ("--self-merged", "self_merged"),
     ("--agent-id", "agent_id"),
-    ("--from", "suggestion_sources"),
     ("--limit", "todo_limit"),
-    ("--trigger", "suggestion_trigger"),
+    ("--thin", "todo_thin"),
+    ("--summary", "todo_summary"),
+    ("--include-archived", "include_archived"),
     ("--state-file", "state_file"),
     ("--execute", "execute"),
+    ("--provider-revision", "provider_revision"),
 )
 
 _TODO_UPDATE_MUTABLE_FIELDS = (
-    "text", "followups", "status", "note", "evidence", "reason", "task_class",
+    "text", "priority", "clear_priority", "status", "note", "evidence", "reason", "task_class",
     "action_kind", "task_domain", "task_repository", "continuation_policy", "required_write_scopes",
     "required_capabilities", "target_capabilities", "capability_gap_status",
     "explore_result_node_refs", "clear_explore_result_node_refs", "decision_scope",
@@ -88,16 +101,14 @@ _TODO_UPDATE_MUTABLE_FIELDS = (
     "global_gate", "clear_global_gate", "unblocks_todo_id", "successor_todo_ids",
     "resume_when", "clear_resume_when", "no_follow_up", "monitor_target_key",
     "cadence", "next_due_at", "expires_at", "watch_only", "clear_claim",
+    "validation_command", "validation_command_json", "validation_label",
+    "validation_timeout_seconds",
 )
 
 _TODO_UPDATE_UNSUPPORTED_FIELDS = (
     (
         "decision_outcome",
         "todo update does not accept --decision-outcome; use todo complete",
-    ),
-    (
-        "followups",
-        "todo update does not support --follow-up; use `todo capture-followups`",
     ),
     ("next_claimed_by", "todo update does not support --next-claimed-by"),
     (
@@ -118,7 +129,6 @@ _TODO_UPDATE_UNSUPPORTED_FIELDS = (
 
 _TODO_ADD_INITIAL_RULES = (
     ("decision_outcome", True, "does not accept --decision-outcome; record it on completion"),
-    ("followups", True, "does not support --follow-up; use `todo capture-followups`"),
     ("role", False, "requires --role"),
     ("text", False, "requires --text"),
     ("clear_claim", True, "accepts --claimed-by but not --clear-claim"),
@@ -131,9 +141,27 @@ _TODO_ADD_INITIAL_RULES = (
 _TODO_ADD_UNSUPPORTED_FIELDS = (
     "next_claimed_by", "next_task_repository", "next_required_capabilities",
     "next_continuation_policy", "next_excluded_agents", "clear_excluded_agents",
-    "clear_blocks_agent", "self_merged", "no_follow_up",
+    "clear_blocks_agent", "self_merged", "no_follow_up", "clear_priority",
 )
 _TODO_OPTION_FLAGS = {field: flag for flag, field in TODO_OPTION_FIELDS}
+
+# Read/claim subsets share validation and help. Update help reuses the mutable
+# field owner; other lifecycle commands retain full help until centralized.
+TODO_ACTION_FIELDS = {
+    "list": frozenset({"role", "todo_id", "status", "agent_id", "todo_limit", "todo_thin", "todo_summary", "include_archived", "state_file", "project", "dry_run"}),
+    "receipt": frozenset({"operation_id"}),
+    "result-read": frozenset({"todo_id"}),
+    "plan": frozenset({"text", "agent_id", "project"}),
+    "project-markdown": frozenset({"state_file", "execute", "provider_revision", "project"}),
+    "claim": frozenset({"role", "todo_id", "claimed_by", "agent_id", "state_file",
+                        "claim_operation_id", "ttl_seconds", "task_lease_idempotency_key",
+                        "task_lease_expected_version", "project", "dry_run", "todo_thin"}),
+    "update": frozenset(_TODO_UPDATE_MUTABLE_FIELDS) | frozenset({
+        "role", "todo_id", "agent_id", "state_file", "project", "dry_run", "authority_reason",
+        "claim_operation_id", "update_operation_id", "update_expected_provider_revision",
+        "recover_execution",
+    }),
+}
 
 
 def register_todo_linkage_arguments(
@@ -152,17 +180,27 @@ def register_todo_linkage_arguments(
         dest="successor_todo_ids",
         action="append",
         help=(
-            "For todo update/complete, link an existing successor todo to the "
-            "current todo. Repeat for multiple successors."
+            "For todo update/complete, or canonical supersede, link an existing "
+            "successor todo to the current todo. Supersede links and retires "
+            "atomically. Repeat for multiple successors."
         ),
     )
     todo_parser.add_argument(
         "--resume-when",
         help=(
-            "For deferred todo add/update, declare a machine-readable resume condition "
-            "such as todo_done:todo_ab12cd34ef56, pr_merged:#532, or "
-            "capacity_available:short_pool. Capacity keys are resolved from quota "
-            "--available-capability declarations."
+            "For deferred todo add/update, or for an open advancement todo update "
+            "paired with --successor-todo-id, declare a machine-readable resume "
+            "condition such as todo_done:todo_ab12cd34ef56, "
+            "monitor_changed:todo_monitor123, "
+            "monitor_changed:todo_monitor123@case-a/run-1, pr_merged:#532, or "
+            "capacity_available:short_pool; use "
+            "resume_at:2026-09-14T09:30:00+08:00 for an exact dated wakeup. "
+            "resume_at requires an RFC3339 timezone and is normalized to UTC. "
+            "monitor_changed binds the monitor's current material-change generation; "
+            "an optional @scope binds that scope's generation and ignores unrelated changes. "
+            "The Todo resumes only after its bound generation advances; "
+            "the waiting advancement todo must remain status=open and pair with an "
+            "independent runnable --successor-todo-id."
         ),
     )
     todo_parser.add_argument(
@@ -276,10 +314,50 @@ def _validate_todo_option_subset(args: argparse.Namespace, allowed_fields: Itera
 def validate_todo_list_options(args: argparse.Namespace) -> None:
     _validate_todo_option_subset(
         args,
-        {"role", "todo_id", "status", "agent_id", "todo_limit", "state_file"},
+        TODO_ACTION_FIELDS["list"],
         "todo list only accepts --goal-id, optional --role, --status, --todo-id, "
-        "--agent-id, --limit, --project, --state-file, --dry-run, and --format; "
+        "--agent-id, --limit, --thin, --summary, --include-archived, --project, "
+        "--state-file, --dry-run, and --format; "
         "unsupported: ",
+    )
+
+
+def validate_todo_receipt_options(args: argparse.Namespace) -> None:
+    _validate_todo_option_subset(
+        args, TODO_ACTION_FIELDS["receipt"],
+        "todo receipt only accepts --goal-id, --operation-id, and --format; unsupported: ",
+    )
+    if not args.operation_id:
+        raise ValueError("todo receipt requires --operation-id")
+
+
+def validate_todo_result_read_options(args: argparse.Namespace) -> None:
+    if not args.todo_id:
+        raise ValueError("todo result-read requires --todo-id")
+    _validate_todo_option_subset(
+        args, TODO_ACTION_FIELDS["result-read"],
+        "todo result-read only accepts --goal-id, --todo-id, and --format; unsupported: ",
+    )
+
+
+def validate_todo_plan_options(args: argparse.Namespace) -> None:
+    _validate_todo_option_subset(
+        args, TODO_ACTION_FIELDS["plan"],
+        "todo plan only accepts --goal-id, --agent-id, --text, --project and --format; unsupported: ",
+    )
+    if not args.text or not args.agent_id:
+        raise ValueError("todo plan requires --text and a registered --agent-id")
+
+
+def validate_todo_project_markdown_options(args: argparse.Namespace) -> None:
+    if not getattr(args, "provider_revision", None):
+        raise ValueError("todo project-markdown requires --provider-revision")
+    _validate_todo_option_subset(
+        args,
+        TODO_ACTION_FIELDS["project-markdown"],
+        "todo project-markdown only accepts --goal-id, --provider-revision, "
+        "--project, --state-file, --execute, and "
+        "--format; unsupported: ",
     )
 
 
@@ -294,21 +372,90 @@ def validate_todo_add_options(args: argparse.Namespace) -> None:
         raise ValueError("todo add does not support --successor-todo-id; use todo update/complete to link existing successor work")
 
 
+_TODO_CLAIM_FIELDS = TODO_ACTION_FIELDS["claim"]
+
+
+class TodoClaimArgumentError(ValueError):
+    """CLI grammar rejection; does not decide whether a claim is authorized."""
+
+    def recovery(
+        self, args: argparse.Namespace, *, registry_path: Path,
+        runtime_root_arg: str | None,
+    ) -> dict[str, object]:
+        missing = [
+            flag for flag, field in (("--todo-id", "todo_id"), ("--claimed-by", "claimed_by"))
+            if not getattr(args, field, None)
+        ]
+        if args.task_lease_expected_version is not None and not args.task_lease_idempotency_key:
+            missing.append("--task-lease-idempotency-key")
+        route = loopx_cli_argv()
+        cli_args = [*route[1:], *cli_option_args("--registry", registry_path), "--format", "json"]
+        if runtime_root_arg is not None:
+            cli_args.extend(cli_option_args("--runtime-root", runtime_root_arg))
+        cli_args.extend(["todo", "claim", *cli_option_args("--goal-id", args.goal_id)])
+        # Omit inputs the caller must supply. Preserve other explicit values for
+        # the authority owner to validate, including an empty operation ID.
+        for flag, field in TODO_OPTION_FIELDS:
+            if field not in _TODO_CLAIM_FIELDS or flag in missing:
+                continue
+            value = getattr(args, field, None)
+            if value is None or value is False:
+                continue
+            if value is True:
+                cli_args.append(flag)
+            else:
+                cli_args.extend(cli_option_args(flag, value))
+        if args.project is not None:
+            cli_args.extend(cli_option_args("--project", args.project))
+        if args.dry_run:
+            cli_args.append("--dry-run")
+        return {
+            "command": shlex.join([*route, "todo", "claim"]),
+            "cli_args": cli_args,
+            "requires_flags": missing,
+            "remove_flags": unsupported_todo_options(args, allowed_fields=_TODO_CLAIM_FIELDS),
+            "reason": (
+                "Review removed flags, append missing flags with explicit values, then retry. "
+                "Claim authority and canonical lease checks still apply; this is not an admission."
+            ),
+        }
+
+
 def validate_todo_claim_options(args: argparse.Namespace) -> None:
+    if getattr(args, "turn_instance_id", None):
+        raise TodoClaimArgumentError(
+            "--turn-instance-id is supported only by todo complete/supersede settlement"
+        )
     if not args.todo_id:
-        raise ValueError("todo claim requires --todo-id")
+        raise TodoClaimArgumentError("todo claim requires --todo-id")
     if not args.claimed_by:
-        raise ValueError("todo claim requires --claimed-by")
+        raise TodoClaimArgumentError("todo claim requires --claimed-by")
     if args.clear_claim:
-        raise ValueError(
+        raise TodoClaimArgumentError(
             "todo claim requires --claimed-by and does not support --clear-claim"
         )
-    _validate_todo_option_subset(
-        args,
-        {"role", "todo_id", "claimed_by", "agent_id", "state_file"},
-        "todo claim only accepts --todo-id, --claimed-by, --agent-id, optional --role, "
-        "--project, --state-file, and --dry-run; unsupported: ",
-    )
+    unsupported = unsupported_todo_options(args, allowed_fields=_TODO_CLAIM_FIELDS)
+    if unsupported:
+        raise TodoClaimArgumentError(
+            "todo claim only accepts --todo-id, --claimed-by, --agent-id, optional --role, "
+            "--claim-operation-id, --ttl-seconds, --task-lease-idempotency-key, "
+            "--task-lease-expected-version, --project, --state-file, --dry-run, and --thin; unsupported: "
+            + ", ".join(unsupported)
+        )
+    if args.task_lease_expected_version is not None and not args.task_lease_idempotency_key:
+        raise TodoClaimArgumentError(
+            "--task-lease-expected-version requires --task-lease-idempotency-key"
+        )
+    if args.ttl_seconds is not None:
+        if args.ttl_seconds <= 0 or args.ttl_seconds > 86400:
+            raise ValueError("ttl seconds must be between 1 and 86400")
+        if args.task_lease_idempotency_key is None and (
+            args.agent_id is None or args.agent_id != args.claimed_by
+        ):
+            raise ValueError(
+                "--ttl-seconds requires managed execution (--agent-id matching --claimed-by) "
+                "or --task-lease-idempotency-key"
+            )
 
 
 def validate_todo_update_options(args: argparse.Namespace) -> None:
@@ -325,6 +472,52 @@ def validate_todo_update_options(args: argparse.Namespace) -> None:
         )
     if not any(getattr(args, field) for field in _TODO_UPDATE_MUTABLE_FIELDS):
         raise ValueError("todo update requires at least one mutable todo field")
+    if args.status == "deferred" and args.recover_execution:
+        missing = [
+            flag
+            for flag, value in (
+                ("--reason", args.reason),
+                ("--resume-when", args.resume_when),
+            )
+            if not str(value or "").strip()
+        ]
+        if missing:
+            raise ValueError(
+                "todo update --status deferred requires --reason and "
+                "--resume-when; missing: " + ", ".join(missing)
+            )
+    validation_fields = (
+        args.validation_command,
+        args.validation_command_json,
+        args.validation_label,
+        args.validation_timeout_seconds,
+    )
+    if any(value is not None for value in validation_fields):
+        if bool(args.validation_command) == bool(args.validation_command_json):
+            raise ValueError(
+                "todo update validation revision requires exactly one of "
+                "--validation-command or --validation-command-json"
+            )
+        if not args.update_operation_id or not args.update_expected_provider_revision:
+            raise ValueError(
+                "todo update validation revision requires --update-operation-id "
+                "and --update-expected-provider-revision"
+            )
+        if not args.agent_id:
+            raise ValueError(
+                "todo update validation revision requires a registered --agent-id"
+            )
+        other_fields = tuple(
+            field for field in _TODO_UPDATE_MUTABLE_FIELDS
+            if field not in {
+                "validation_command", "validation_command_json",
+                "validation_label", "validation_timeout_seconds",
+            }
+        )
+        if any(getattr(args, field) for field in other_fields):
+            raise ValueError(
+                "todo update validation revision cannot be combined with another Todo edit"
+            )
     if args.no_follow_up and not (args.note or args.reason or args.evidence):
         raise ValueError("--no-follow-up requires --note, --reason, or --evidence")
     for field, message in _TODO_UPDATE_UNSUPPORTED_FIELDS:
@@ -335,6 +528,8 @@ def validate_todo_update_options(args: argparse.Namespace) -> None:
 def validate_todo_complete_options(args: argparse.Namespace) -> None:
     if not args.todo_id:
         raise ValueError("todo complete requires --todo-id")
+    if args.result_file and args.role == "user":
+        raise ValueError("--result-file requires an Agent Todo")
     if args.explore_result_node_refs or args.clear_explore_result_node_refs:
         raise ValueError("todo complete does not update --explore-result-node-ref; use todo update first")
     if args.claimed_by and args.clear_claim:
@@ -350,6 +545,10 @@ def validate_todo_complete_options(args: argparse.Namespace) -> None:
         )
     if args.completion_identity_key and not args.no_follow_up:
         raise ValueError("--completion-identity-key is only valid with --no-follow-up")
+    if args.completion_identity_key and (args.note or args.evidence):
+        raise ValueError(
+            "--completion-identity-key reentry preserves the original note and evidence"
+        )
     if any(getattr(args, field) for field in ("task_repository", "bound_agent", "goal_bound", "blocks_agent", "clear_blocks_agent", "excluded_agents", "clear_excluded_agents", "global_gate", "clear_global_gate", "unblocks_todo_id", "resume_when")):
         raise ValueError("todo complete does not update current todo routing metadata; use todo update first")
     if any(getattr(args, field) for field in ("monitor_target_key", "cadence", "next_due_at", "expires_at")):
@@ -360,13 +559,59 @@ def validate_todo_complete_options(args: argparse.Namespace) -> None:
         raise ValueError("--no-follow-up cannot be combined with successor todos")
     if args.successor_todo_ids and (args.next_agent_todo or args.next_user_todo):
         raise ValueError("--successor-todo-id links existing work and cannot be combined with --next-agent-todo or --next-user-todo")
-    if args.no_follow_up and not (args.note or args.evidence):
+    if (
+        args.no_follow_up
+        and not args.completion_identity_key
+        and not (args.note or args.evidence)
+    ):
         raise ValueError("--no-follow-up requires --note or --evidence")
-    if args.followups:
-        raise ValueError("todo complete does not support --follow-up; use `todo capture-followups`")
     if args.continuation_policy:
         raise ValueError("todo complete does not update --continuation-policy; use todo update first")
     validate_successor_routing_options(args)
+
+
+def validate_todo_execution_recovery_options(args: argparse.Namespace) -> None:
+    """Keep the one-command helper narrower than the typed recovery owner."""
+    if not getattr(args, "recover_execution", False):
+        return
+    if args.todo_command not in {"update", "complete"}:
+        raise ValueError(
+            "--recover-execution is supported only by todo update/complete"
+        )
+    if not args.agent_id:
+        raise ValueError("--recover-execution requires a registered --agent-id")
+    if args.dry_run:
+        raise ValueError(
+            "--recover-execution cannot be combined with --dry-run because the "
+            "retry requires a committed claim reference"
+        )
+    supplied_proof = [
+        flag
+        for flag, present in (
+            ("--claim-operation-id", args.claim_operation_id is not None),
+            (
+                "--task-lease-idempotency-key",
+                args.task_lease_idempotency_key is not None,
+            ),
+            (
+                "--task-lease-expected-version",
+                args.task_lease_expected_version is not None,
+            ),
+        )
+        if present
+    ]
+    if supplied_proof:
+        raise ValueError(
+            "--recover-execution accepts only omitted execution proof; inspect "
+            "and retry explicit stale proof unchanged instead of replacing: "
+            + ", ".join(supplied_proof)
+        )
+    if args.todo_command == "update" and args.update_expected_provider_revision:
+        raise ValueError(
+            "--recover-execution cannot silently rebase "
+            "--update-expected-provider-revision; claim, inspect the same Todo, "
+            "then retry with the reconciled provider revision"
+        )
 
 
 def validate_todo_supersede_options(args: argparse.Namespace) -> None:
@@ -388,15 +633,13 @@ def validate_todo_supersede_options(args: argparse.Namespace) -> None:
         raise ValueError("todo supersede does not support --self-merged")
     if args.no_follow_up:
         raise ValueError("todo supersede does not support --no-follow-up")
-    if args.followups:
-        raise ValueError("todo supersede does not support --follow-up; use `todo capture-followups`")
     if args.continuation_policy:
         raise ValueError("todo supersede does not update --continuation-policy; use todo update first")
     validate_successor_routing_options(args)
     if any(getattr(args, field) for field in ("blocks_agent", "clear_blocks_agent", "excluded_agents", "clear_excluded_agents", "global_gate", "clear_global_gate", "unblocks_todo_id", "resume_when")):
         raise ValueError("todo supersede does not update current todo routing metadata; use todo update first")
-    if args.successor_todo_ids:
-        raise ValueError("todo supersede does not support --successor-todo-id; use --next-agent-todo or update the source todo before supersede")
+    if args.successor_todo_ids and (args.next_agent_todo or args.next_user_todo):
+        raise ValueError("--successor-todo-id links existing work and cannot be combined with --next-agent-todo or --next-user-todo")
     if any(getattr(args, field) for field in ("monitor_target_key", "cadence", "next_due_at", "expires_at")):
         raise ValueError("todo supersede does not update target or monitor schedule metadata; use todo update before supersede")
 
@@ -410,7 +653,6 @@ def validate_todo_archive_completed_options(args: argparse.Namespace) -> None:
         (args.next_task_repository or args.next_required_capabilities, "todo archive-completed does not support successor routing metadata"),
         (args.self_merged, "todo archive-completed does not support --self-merged"),
         (args.no_follow_up, "todo archive-completed does not support --no-follow-up"),
-        (args.followups, "todo archive-completed does not support --follow-up; use `todo capture-followups`"),
         (args.successor_todo_ids, "todo archive-completed does not support --successor-todo-id"),
     )
     for triggered, message in checks:
@@ -418,37 +660,11 @@ def validate_todo_archive_completed_options(args: argparse.Namespace) -> None:
             raise ValueError(message)
 
 
-def validate_todo_suggest_options(args: argparse.Namespace) -> None:
-    _validate_todo_option_subset(
-        args,
-        {"agent_id", "suggestion_sources", "todo_limit", "suggestion_trigger"},
-        "todo suggest only accepts --goal-id, optional --project, --agent-id, "
-        "--from, --limit, --trigger, --dry-run, and --format; unsupported: ",
-    )
-
-
-def validate_todo_capture_followups_options(args: argparse.Namespace) -> None:
-    checks = (
-        (args.role, "todo capture-followups always records agent todos; do not pass --role"),
-        (args.claimed_by, "todo capture-followups writes unclaimed todos; do not pass --claimed-by"),
-    )
-    for triggered, message in checks:
-        if triggered:
-            raise ValueError(message)
-    _validate_todo_option_subset(
-        args,
-        {
-            "text", "followups", "evidence", "task_class", "action_kind",
-            "continuation_policy", "required_write_scopes", "required_capabilities",
-            "target_capabilities", "required_decision_scopes", "state_file",
-        },
-        "todo capture-followups only accepts --goal-id, --follow-up, optional "
-        "--text shorthand, --evidence, routing metadata, --project, --state-file, "
-        "and --dry-run; unsupported: ",
-    )
-
-
 def validate_shared_todo_options(args: argparse.Namespace) -> None:
+    if getattr(args, "operation_id", None) and args.todo_command not in {"receipt", "add"}:
+        raise ValueError("--operation-id is supported only by todo receipt and canonical todo add")
+    if args.result_file and args.todo_command != "complete":
+        raise ValueError("--result-file is supported only by todo complete")
     agent_id_allowed_for_user_authoring = (
         args.todo_command == "add"
         and args.role == "user"
@@ -468,10 +684,26 @@ def validate_shared_todo_options(args: argparse.Namespace) -> None:
         "complete",
         "supersede",
     }
-    if getattr(args, "turn_instance_id", None) and args.todo_command != "complete":
+    if (getattr(args, "turn_instance_id", None) and args.todo_command not in {"complete", "supersede"}
+            and not (args.todo_command == "add" and getattr(args, "replan_obligation_id", None))):
         raise ValueError(
-            "--turn-instance-id is supported only by todo complete settlement"
+            "--turn-instance-id is supported only by todo complete/supersede settlement"
         )
+    if getattr(args, "goal_instance_id", None) and (
+        (args.todo_command not in {"complete", "supersede"}
+         and not (args.todo_command == "add" and getattr(args, "replan_obligation_id", None)))
+        or not getattr(args, "turn_instance_id", None)
+    ):
+        raise ValueError(
+            "--goal-instance-id is supported only by turn-scoped todo "
+            "complete/supersede settlement"
+        )
+    if getattr(args, "update_operation_id", None) is not None and args.todo_command != "update":
+        raise ValueError("--update-operation-id is supported only by todo update")
+    if getattr(args, "update_expected_provider_revision", None) is not None and args.todo_command != "update":
+        raise ValueError("--update-expected-provider-revision is supported only by todo update")
+    if getattr(args, "claim_operation_id", None) is not None and args.todo_command not in {"claim", "update", "complete", "supersede"}:
+        raise ValueError("--claim-operation-id is supported only by todo claim/update/complete/supersede")
     if (
         getattr(args, "completion_identity_key", None)
         and args.todo_command != "complete"
@@ -487,7 +719,7 @@ def validate_shared_todo_options(args: argparse.Namespace) -> None:
             "--replan-obligation-id is supported only by todo add"
         )
     if (
-        args.todo_command not in {"complete", "supersede"}
+        args.todo_command not in {"claim", "update", "complete", "supersede"}
         and (
             args.task_lease_idempotency_key
             or args.task_lease_expected_version is not None
@@ -495,8 +727,10 @@ def validate_shared_todo_options(args: argparse.Namespace) -> None:
     ):
         raise ValueError(
             "--task-lease-idempotency-key and --task-lease-expected-version "
-            "are supported only by todo complete and todo supersede"
+            "are supported only by todo claim, todo update, todo complete, and todo supersede"
         )
+    if args.todo_command != "claim" and getattr(args, "ttl_seconds", None) is not None:
+        raise ValueError("--ttl-seconds is supported only by todo claim")
     if args.capability_binding_ref and args.todo_command != "add":
         raise ValueError(
             "--capability-binding-ref is immutable and supported only by todo add"
@@ -506,7 +740,7 @@ def validate_shared_todo_options(args: argparse.Namespace) -> None:
             "--authority-reason is supported only by todo update/complete/supersede"
         )
     if (
-        args.todo_command not in {"suggest", "capture-followups"}
+        args.todo_command != "plan"
         and args.agent_id
         and not agent_id_allowed_for_user_authoring
         and not agent_id_allowed_for_read
@@ -521,7 +755,7 @@ def validate_shared_todo_options(args: argparse.Namespace) -> None:
             )
         raise ValueError(
             f"todo {args.todo_command} does not support --agent-id; --agent-id "
-            "scopes todo list/suggest, user-todo authoring, and lifecycle actor "
+            "scopes todo list, user-todo authoring, and lifecycle actor "
             "attribution only."
         )
     if args.global_gate and not global_gate_allowed:
@@ -539,17 +773,24 @@ def validate_shared_todo_options(args: argparse.Namespace) -> None:
             "todo update accepts either --resume-when or --clear-resume-when, not both"
         )
     if (
-        args.todo_command not in {"suggest", "capture-followups"}
-        and (args.suggestion_sources or args.suggestion_trigger)
-    ):
-        raise ValueError("--from and --trigger are supported only by todo suggest")
-    if (
-        args.todo_command not in {"suggest", "list", "capture-followups"}
+        args.todo_command != "list"
         and args.todo_limit is not None
     ):
         raise ValueError(
-            "--limit is supported only by todo suggest and todo list"
+            "--limit is supported only by todo list"
         )
+    if args.todo_thin and "todo_thin" not in TODO_ACTION_FIELDS.get(args.todo_command, ()):
+        supported = ", ".join(
+            f"todo {action}" for action, fields in TODO_ACTION_FIELDS.items() if "todo_thin" in fields
+        )
+        raise ValueError(f"--thin is supported only by {supported}")
+    if getattr(args, "todo_summary", False):
+        if args.todo_command != "list":
+            raise ValueError("--summary is supported only by todo list")
+        if args.todo_thin:
+            raise ValueError("todo list accepts either --summary or --thin")
+        if args.todo_id:
+            raise ValueError("Exact Todo reads return full requirements; remove --summary or omit --todo-id for a queue overview")
 
 
 def validate_capability_gap_options(args: argparse.Namespace) -> None:

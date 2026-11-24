@@ -9,12 +9,16 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from contextlib import ExitStack
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "tests"))
+
+from managed_effect_runtime_fixture import stop_disposable_effect_runtimes  # noqa: E402
 
 from loopx import __version__  # noqa: E402
 from loopx.cli import build_parser  # noqa: E402
@@ -26,7 +30,7 @@ from loopx.help_surface import (  # noqa: E402
 )
 
 
-LONG_TAIL_COMMAND = "codex-cli-visible-first-response-capture-plan"
+LONG_TAIL_COMMAND = "configuration-backup"
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -49,7 +53,8 @@ def assert_concise_default_help(output: str) -> None:
     assert "Codex App" in output, output
     assert "Claude Code" in output, output
     assert "loopx commands" in output, output
-    assert "evidence-log --goal-id ID --agent-id AGENT --thin" in output, output
+    assert "evidence-log" not in output, output
+    assert "Read this agent's thin ledger" not in output, output
     assert "man loopx" in output, output
     assert LONG_TAIL_COMMAND not in output, output
     assert len(output.splitlines()) <= 39, output
@@ -72,8 +77,8 @@ def assert_command_reference_surface() -> None:
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
     assert "LoopX command reference" in result.stdout, result.stdout
     assert "Daily operator commands" in result.stdout, result.stdout
-    assert "required evidence-log reads" in result.stdout, result.stdout
-    assert "before replan or handoff" in result.stdout, result.stdout
+    assert "host-projected replan context" in result.stdout, result.stdout
+    assert "evidence-log" not in result.stdout, result.stdout
     assert "Loop driver hints" in result.stdout, result.stdout
     assert "Claude Code /loop" in result.stdout, result.stdout
     assert "Maintainer and adapter commands" in result.stdout, result.stdout
@@ -150,8 +155,11 @@ def assert_installer_manpage_surface() -> None:
     script = REPO_ROOT / "scripts" / "install-local.sh"
     subprocess.run(["bash", "-n", str(script)], check=True)
 
-    with tempfile.TemporaryDirectory(prefix="loopx-help-manpage-smoke-") as raw_tmp:
+    with tempfile.TemporaryDirectory(prefix="loopx-help-manpage-smoke-") as raw_tmp, ExitStack() as cleanup:
         tmp = Path(raw_tmp)
+        temporary = tmp / "temporary"
+        temporary.mkdir()
+        cleanup.callback(stop_disposable_effect_runtimes, tmp)
         home = tmp / "home"
         bin_dir = home / ".local" / "bin"
         man_root = home / ".local" / "share" / "man"
@@ -171,6 +179,9 @@ def assert_installer_manpage_surface() -> None:
             "LOOPX_RELEASE_ID": "help-manpage-smoke-release",
             "PATH": os.environ.get("PATH", ""),
             "SHELL": "/bin/zsh",
+            "TMPDIR": str(temporary),
+            "TEMP": str(temporary),
+            "TMP": str(temporary),
         }
 
         help_result = subprocess.run(
@@ -248,8 +259,8 @@ def assert_installer_manpage_surface() -> None:
         assert "Codex App automation" in man_text, man_text
         assert "loopx commands" in man_text, man_text
         assert "loopx extension" in man_text, man_text
-        assert r"loopx evidence\-log \-\-goal\-id" in man_text, man_text
-        assert "before replan or handoff" in compact_man_text, man_text
+        assert r"loopx evidence\-log" not in man_text, man_text
+        assert r"host\-projected replan context" in compact_man_text, man_text
         assert r"loopx COMMAND \-\-help" in man_text, man_text
 
         profile_text = profile.read_text(encoding="utf-8")

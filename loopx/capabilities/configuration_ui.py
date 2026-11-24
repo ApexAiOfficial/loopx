@@ -1,0 +1,825 @@
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from typing import Any
+
+from ..configuration_transaction import configuration_payload_revision
+from ..control_plane.goals.goal_vision_policy import DEFAULT_PLANNING_HORIZON_GOAL, MAX_EFFECTIVE_TURN_REPLAN_THRESHOLD
+
+from .progress_review.policy import (
+    PROGRESS_REVIEW_MAX_DRIFT_THRESHOLD,
+    PROGRESS_REVIEW_MIN_DRIFT_THRESHOLD,
+    PROGRESS_REVIEW_MODES,
+    PROGRESS_REVIEW_SIGNALS,
+)
+
+CAPABILITY_CONFIGURATION_CATALOG_SCHEMA = "capability_configuration_catalog_v0"
+CAPABILITY_CONFIGURATION_EDITOR_SCHEMA = "capability_configuration_editor_v0"
+CAPABILITY_CONFIGURATION_RESOLUTION_SCHEMA = "capability_configuration_resolution_v0"
+
+
+def _configuration_value(
+    value: Mapping[str, Any] | None,
+    *,
+    label: str,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be an object or null")
+    return deepcopy({str(key): item for key, item in value.items()})
+
+
+def _steward_executor_editor_options() -> tuple[list[str], list[str]]:
+    """Return the steward editor's option lists from their owning namespace."""
+
+    from .steward_executor.machine_defaults import (
+        steward_executor_endpoints,
+        steward_reasoning_efforts,
+    )
+
+    return sorted(steward_executor_endpoints()), list(steward_reasoning_efforts())
+
+
+def _field(
+    key: str,
+    label: str,
+    input_kind: str,
+    *,
+    description: str = "",
+    required: bool = False,
+    nullable: bool = False,
+    minimum: int | None = None,
+    maximum: int | None = None,
+    options: Sequence[str] = (),
+) -> dict[str, Any]:
+    field: dict[str, Any] = {
+        "key": key,
+        "label": label,
+        "description": description,
+        "input_kind": input_kind,
+        "required": required,
+    }
+    if minimum is not None:
+        field["minimum"] = minimum
+    if maximum is not None:
+        field["maximum"] = maximum
+    if options:
+        field["options"] = list(options)
+    if nullable:
+        field["nullable"] = True
+    return field
+
+
+def capability_configuration_editor(
+    capability_id: str,
+    *,
+    explore_harness_profiles: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Return the provider-neutral editor contract consumed by every UI scope."""
+
+    # The steward namespace owns its closed vocabulary, so the editor offers the
+    # same values instead of restating them: a form cannot submit an executor or
+    # effort the owning namespace would reject.
+    steward_endpoints, steward_efforts = (
+        _steward_executor_editor_options()
+        if capability_id in ("codex_chat", "steward_executor") else ([], [])
+    )
+    codex_profiles: list[str] = []
+    if capability_id == "codex_chat":
+        from .native_chat.machine_defaults import codex_profile_options
+
+        codex_profiles = codex_profile_options()
+    definitions: dict[str, dict[str, Any]] = {
+        "context_delivery": {
+            "supported_scopes": ["machine"], "writable_scopes": ["machine"],
+            "fields": [
+                _field("mode", "Context presentation", "select",
+                    options=("off", "on"), required=True,
+                    description="Present current requirements before expandable supporting material on every host. Off keeps complete inline delivery."),
+                _field("delta_delivery", "Cross-Turn Delta", "select", options=("off", "auto"), required=True,
+                    description="Auto reuses exact saved captures only on supported continuity hosts. Off leaves progressive presentation enabled. Neither choice proves retained model input."),
+            ],
+        },
+        "codex_chat": {
+            "supported_scopes": ["machine"], "writable_scopes": ["machine"],
+            "fields": [
+                _field("codex_profile", "Codex configuration profile", "select", nullable=True,
+                       options=codex_profiles, description="Existing native account/configuration home; credentials are not copied."),
+                _field("model", "Conversation model", "text", nullable=True,
+                       description="For example gpt-6.1-sol. Blank inherits this Codex profile's default."),
+                _field("reasoning_effort", "Reasoning effort", "select", nullable=True,
+                       options=list(steward_efforts)),
+                _field("service_tier", "Service tier", "text", nullable=True,
+                       description="For example fast. This is independent of the model and reasoning effort; the native provider validates support."),
+            ],
+        },
+        "goal_capability_organization": {
+            "supported_scopes": ["goal"], "writable_scopes": ["goal"],
+            "fields": [
+                _field("mode", "Improvement intent", "select", options=["off", "bounded"], required=True,
+                       description="Advisory discovery only; individual capability owners still decide enablement and admission."),
+                _field("discovery_budget_minutes", "Discovery budget (minutes)", "number", minimum=1, maximum=30, required=True),
+                _field("max_trials", "Maximum proposed trials", "number", minimum=0, maximum=2, required=True),
+            ],
+        },
+        "goal_closeout": {
+            "supported_scopes": ["machine"], "writable_scopes": ["machine"],
+            "fields": [
+                _field("timeout_seconds", "Closeout timeout (seconds)", "number",
+                       minimum=1, maximum=600, required=True,
+                       description="Bounds one terminal hook invocation. The command itself is local-private: configure it with the machine-config CLI, never through the Dashboard."),
+            ],
+        },
+        "goal_storage": {
+            "supported_scopes": ["machine"], "writable_scopes": ["machine"],
+            "fields": [_field("new_goal_provider", "New Goal storage provider", "select",
+                              options=["file", "sqlite"], required=True,
+                              description="Fixed at creation. Existing Goals need a separate backed-up migration."),
+                       _field("canonical_creation", "Create canonical authority", "boolean", required=True,
+                              description="Required for new Goals in 2.0. Enable before creating a Goal; import existing Markdown Goals separately."),
+                       _field("new_goal_handoff_mode", "New Goal execution policy", "select",
+                              options=["soft_claim", "hard_lease"], required=True,
+                              description="Used only with canonical creation. Agents inherit the Goal policy; this grants no tool permissions.")],
+        },
+        "todo_replan_cadence": {
+            "supported_scopes": ["machine", "goal"],
+            "writable_scopes": ["machine", "goal"],
+            "fields": [
+                _field("count_unit", "Count between reviews", "select",
+                       options=["completed_todos", "effective_turns"], required=True,
+                       description="Existing completed-Todo values keep their units until explicitly changed."),
+                _field("count", "Review interval", "number", minimum=1,
+                       maximum=MAX_EFFECTIVE_TURN_REPLAN_THRESHOLD, required=True,
+                       description="Effective Turns: 1–6; completed Todos: 1–5. Effective Turns require accepted work settlement. Retries and observation-only polls do not count."),
+                _field("planning_horizon_goal", "Show Goal in planning horizon", "boolean",
+                       description="Default on. Include the original Goal and acceptance before choosing work. Advanced opt-out for rollback or comparisons; does not change replan, stride or execution authority."),
+                _field("yardstick_enabled", "Review measurement criteria", "boolean",
+                       description="Default off. Use available Explore evidence to review measurement scope and feedback before choosing work. Requires Explore evidence; does not enable it or authorize execution."),
+            ],
+        },
+        "periodic_report": {
+            "supported_scopes": ["machine", "goal"],
+            "writable_scopes": ["machine", "goal"],
+            "fields": [
+                _field("enabled", "Enabled", "boolean"),
+                _field("review_required", "Request owner review", "boolean",
+                       description="For an original managed Session report, also put each edition in App results and keep a Home reminder until the owner handles its review."),
+                _field(
+                    "profile_preset",
+                    "Profile preset",
+                    "text",
+                    description="Capability-owned report profile, such as weekly-progress.",
+                ),
+                _field(
+                    "route_ref",
+                    "Goal Channel route",
+                    "text",
+                    description="Public route alias only; credentials stay outside this form.",
+                ),
+                _field(
+                    "timezone",
+                    "Timezone",
+                    "text",
+                    description="IANA timezone, for example Asia/Shanghai.",
+                    required=True,
+                ),
+                _field(
+                    "schedule",
+                    "Calendar reports",
+                    "periodic_report_schedule",
+                    nullable=True,
+                    description="Optional daily or weekly schedule. Unset preserves stage-only reports.",
+                ),
+            ],
+        },
+        "manager_runtime": {
+            "supported_scopes": ["machine"],
+            "writable_scopes": ["machine"],
+            "fields": [
+                _field(
+                    "runtime_profile",
+                    "Runtime profile",
+                    "select",
+                    options=["restricted", "trusted_owner"],
+                    required=True,
+                    description=(
+                        "Restricted uses only the scoped LoopX read model. Trusted owner "
+                        "enables normal host tools under this persistent machine grant; "
+                        "protected operations keep their own authority checks."
+                    ),
+                ),
+            ],
+        },
+        "steward_executor": {
+            "supported_scopes": ["machine"],
+            "writable_scopes": ["machine"],
+            "fields": [
+                _field(
+                    "selection_policy",
+                    "Selection policy",
+                    "select",
+                    options=["preferred", "pinned", "flexible"],
+                    required=True,
+                    description=(
+                        "Preferred supplies a default and permits an explicit user "
+                        "choice. Pinned rejects another executor. Flexible permits "
+                        "automatic fallback only inside the eligible pool."
+                    ),
+                ),
+                _field(
+                    "executor_endpoint",
+                    "Primary steward executor",
+                    "select",
+                    options=steward_endpoints,
+                    required=True,
+                    description=(
+                        "The executor this machine's steward channel answers on: the "
+                        "interactive CLI login, or the operator-billed managed host. "
+                        "The choice outranks the Chat service environment."
+                    ),
+                ),
+                _field(
+                    "eligible_endpoints",
+                    "Flexible eligible executors",
+                    "string_list",
+                    description=(
+                        "One authorized executor id per line. Required only for "
+                        "flexible selection; include the primary executor. "
+                        "Optional per-endpoint model and reasoning effort overrides "
+                        "(endpoint_models) are authored in JSON mode and preserved "
+                        "by guided saves."
+                    ),
+                ),
+                _field(
+                    "executor_model",
+                    "Model",
+                    "text",
+                    nullable=True,
+                    description=(
+                        "Optional model for the selected executor. Leave blank to keep "
+                        "the executor's own default. Configure per-endpoint overrides "
+                        "(endpoint_models: {\"<endpoint>\": {\"model\": ..., "
+                        "\"reasoning_effort\": ...}}) in JSON mode."
+                    ),
+                ),
+                _field(
+                    "executor_reasoning_effort",
+                    "Reasoning effort",
+                    "select",
+                    options=steward_efforts,
+                    nullable=True,
+                    description=(
+                        "Optional reasoning effort for the selected executor. Leave "
+                        "blank to keep the executor's own default."
+                    ),
+                ),
+            ],
+        },
+        "steward_memory": {
+            "supported_scopes": ["machine"],
+            "writable_scopes": ["machine"],
+            "fields": [
+                _field(
+                    "enabled",
+                    "Enabled",
+                    "boolean",
+                    required=True,
+                    description=(
+                        "Enable isolated OpenViking long-term memory for owner "
+                        "private steward conversations."
+                    ),
+                ),
+                _field(
+                    "user_space",
+                    "User space",
+                    "text",
+                    required=True,
+                    description=(
+                        "OpenViking user space isolating steward memory on this machine."
+                    ),
+                ),
+                _field(
+                    "auto_recall",
+                    "Auto recall history",
+                    "boolean",
+                    required=True,
+                    description=(
+                        "Run one bounded search across past steward exchanges for "
+                        "substantive private messages."
+                    ),
+                ),
+                _field(
+                    "recall_timeout_seconds",
+                    "Recall timeout (seconds)",
+                    "number",
+                    minimum=1,
+                    maximum=15,
+                    required=True,
+                    description=(
+                        "Maximum wait before continuing normal replies without memory recall."
+                    ),
+                ),
+            ],
+        },
+        "multi_subagent": {
+            "supported_scopes": ["goal"],
+            "writable_scopes": ["goal"],
+            "fields": [
+                _field("enabled", "Enabled", "boolean"),
+                _field(
+                    "model",
+                    "Child model",
+                    "text",
+                    description="For example gpt-5.6-luna. Blank clears the child model preference.",
+                ),
+                _field(
+                    "reasoning_effort",
+                    "Child reasoning effort",
+                    "text",
+                    description="For example max. Host support is checked at launch; requires a child model.",
+                ),
+                _field(
+                    "max_children",
+                    "Maximum children",
+                    "number",
+                    minimum=1,
+                    maximum=32,
+                ),
+                _field(
+                    "allowed_domains",
+                    "Allowed responsibility domains",
+                    "string_list",
+                    description="One bounded, public-safe domain per line.",
+                ),
+                _field(
+                    "execution_config",
+                    "Delegation bindings",
+                    "text",
+                    nullable=True,
+                    description=(
+                        "Repo-relative ignored JSON under .loopx/config/. It exposes "
+                        "only authorized, public-safe route status to planning; it "
+                        "does not grant a binding."
+                    ),
+                ),
+            ],
+        },
+        "peer_task_coordination": {
+            "supported_scopes": ["goal"],
+            "writable_scopes": ["goal"],
+            "fields": [
+                _field(
+                    "coordinator_agent_id",
+                    "Coordinator Agent",
+                    "text",
+                    description="An already registered Agent id; blank disables coordination.",
+                )
+            ],
+        },
+        "explore_graph": {
+            "supported_scopes": ["goal"],
+            "writable_scopes": ["goal"],
+            "fields": [_field("enabled", "Enabled", "boolean")],
+        },
+        "explore_harness": {
+            "supported_scopes": ["machine", "goal"],
+            "writable_scopes": ["machine", "goal"],
+            "fields": [
+                _field("mode", "Exploration mode", "select", options=("off", "evidence", "planning"),
+                       description="Evidence only, or evidence with planning. Spawn authority is separate."),
+                _field(
+                    "profile",
+                    "Planner profile",
+                    "select",
+                    options=explore_harness_profiles,
+                ),
+                _field("composition_mode", "Composition policy", "select", options=["disabled", "explicit_only"],
+                       description="Replan requires an exact experiment successor or typed result; it grants no execution authority."),
+                _field("composition_scope_id", "Research coverage scope", "text", nullable=True,
+                       description="An opaque scope id required by the explicit-only composition policy."),
+            ],
+        },
+        "change_quality_qualification": {
+            "supported_scopes": ["machine", "goal"],
+            "writable_scopes": ["machine", "goal"],
+            "fields": [
+                _field("enabled", "Enabled", "boolean"),
+                _field("safe_fix", "Allow one bounded safe-fix pass", "boolean"),
+                _field("strict_receipt", "Require an exact-diff receipt", "boolean"),
+            ],
+        },
+        "progress_review": {
+            "supported_scopes": ["goal"],
+            "writable_scopes": ["goal"],
+            "fields": [
+                _field(
+                    "mode",
+                    "Mode",
+                    "select",
+                    options=PROGRESS_REVIEW_MODES,
+                    required=True,
+                    description=(
+                        "off records nothing; shadow records typed receipts only; "
+                        "assist lets consecutive drift receipts raise the existing "
+                        "autonomous replan obligation. No pause or gate authority."
+                    ),
+                ),
+                _field(
+                    "signal",
+                    "Drift signal",
+                    "select",
+                    options=PROGRESS_REVIEW_SIGNALS,
+                    description=(
+                        "Which receipt judgment counts as drift: the Noul behavior/"
+                        "acceptance pair or the Choice relation/increment pair."
+                    ),
+                ),
+                _field(
+                    "drift_threshold",
+                    "Consecutive drift receipts before an obligation",
+                    "number",
+                    minimum=PROGRESS_REVIEW_MIN_DRIFT_THRESHOLD,
+                    maximum=PROGRESS_REVIEW_MAX_DRIFT_THRESHOLD,
+                ),
+                _field(
+                    "contract_revision",
+                    "Pinned goal contract revision",
+                    "text",
+                    nullable=True,
+                    description=(
+                        "sha256 of the observer basis the receipts must be bound to; "
+                        "printed by `loopx-jev drift init`. assist raises nothing "
+                        "without it, and receipts for other revisions are stale."
+                    ),
+                ),
+            ],
+        },
+        "pull_request_review": {
+            "supported_scopes": ["machine", "goal"],
+            "writable_scopes": ["machine", "goal"],
+            "fields": [
+                _field("wait_for_ci", "Wait for CI", "boolean", description="When disabled, use local validation without querying or waiting for CI. This grants no merge authority."),
+                _field("owner_logins", "Additional owner accounts", "string_list", description="One GitHub login per line, in addition to the authenticated reviewer. Controls queue grouping only; does not infer membership or grant review/merge authority."),
+                _field(
+                    "review_order",
+                    "Review direction",
+                    "select",
+                    options=("forward", "reverse"),
+                    required=True,
+                    description=(
+                        "Forward ranks other authors first, oldest first within tiers. "
+                        "Reverse inverts the whole actionable queue before the batch limit."
+                    ),
+                ),
+            ],
+        },
+        "local_authority_shadow": {
+            "supported_scopes": ["goal"],
+            "writable_scopes": [],
+            "fields": [],
+        },
+        "coordination_runtime_shadow": {
+            "supported_scopes": ["goal"],
+            "writable_scopes": ["goal"],
+            "fields": [_field("enabled", "Enabled", "boolean")],
+        },
+        "lark_kanban_heartbeat_sync": {
+            "supported_scopes": ["goal"],
+            "writable_scopes": ["goal"],
+            "fields": [_field("enabled", "Enabled", "boolean")],
+        },
+        "reward_memory": {
+            "supported_scopes": ["goal"],
+            "writable_scopes": ["goal"],
+            "fields": [
+                _field(
+                    "agent_id", "Independent Agent binding", "text",
+                    description=(
+                        "Select one registered Goal Agent to change only its route. "
+                        "Leave blank to edit the legacy shared binding."
+                    ),
+                ),
+                _field(
+                    "enabled", "Enable this Agent binding", "boolean",
+                    description="Disabling one Agent preserves all shared and sibling bindings.",
+                ),
+                _field(
+                    "config_path",
+                    "Local-private configuration path",
+                    "text",
+                    description=(
+                        "Repo-relative ignored JSON under .loopx/config/. The path "
+                        "is accepted only as write input and is never returned. Leave "
+                        "blank to retain an existing binding."
+                    ),
+                ),
+                _field(
+                    "enabled_agents",
+                    "Enabled Goal Agents",
+                    "string_list",
+                    description=(
+                        "One already registered Goal-local Agent id per line. Private "
+                        "bindings accept exactly one Agent. Used only when editing the shared binding."
+                    ),
+                ),
+            ],
+        },
+        "lark_event_inbox": {
+            "supported_scopes": ["goal"],
+            "writable_scopes": [],
+            "fields": [],
+            "read_only_reason": (
+                "This capability requires a local-private inbox binding. Manage the "
+                "binding in Lark settings or through the capability CLI."
+            ),
+        },
+    }
+    definition = definitions.get(capability_id)
+    if definition is None:
+        return {
+            "schema_version": CAPABILITY_CONFIGURATION_EDITOR_SCHEMA,
+            "editable": False,
+            "supported_scopes": [],
+            "writable_scopes": [],
+            "fields": [],
+            "read_only_reason": "No Dashboard editor is registered for this capability.",
+        }
+    fields = deepcopy(definition["fields"])
+    return {
+        "schema_version": CAPABILITY_CONFIGURATION_EDITOR_SCHEMA,
+        "editable": bool(fields),
+        "supported_scopes": list(definition["supported_scopes"]),
+        "writable_scopes": list(definition.get("writable_scopes") or []),
+        "fields": fields,
+        **(
+            {"read_only_reason": definition["read_only_reason"]}
+            if definition.get("read_only_reason")
+            else {}
+        ),
+    }
+
+
+def resolve_capability_configuration(
+    capability_id: str,
+    *,
+    goal_override: Mapping[str, Any] | None = None,
+    machine_default: Mapping[str, Any] | None = None,
+    capability_default: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve one already-normalized capability value without mutating a source.
+
+    Capability owners remain responsible for schema normalization.  This shared
+    kernel owns only precedence and provenance, so machine and Goal editors can
+    use the same fail-closed rule without learning about each other's stores.
+    A Goal override is deliberately atomic: when present, it wins as a complete
+    value and is never field-merged with a machine default.
+    """
+
+    normalized_capability_id = str(capability_id or "").strip()
+    if not normalized_capability_id:
+        raise ValueError("capability_id is required")
+    editor = capability_configuration_editor(normalized_capability_id)
+    supported_scopes = set(editor["supported_scopes"])
+    goal_value = _configuration_value(goal_override, label="goal_override")
+    machine_value = _configuration_value(machine_default, label="machine_default")
+    default_value = _configuration_value(
+        capability_default,
+        label="capability_default",
+    )
+    if goal_value is not None and "goal" not in supported_scopes:
+        raise ValueError(
+            f"capability does not support Goal configuration: {normalized_capability_id}"
+        )
+    if machine_value is not None and "machine" not in supported_scopes:
+        raise ValueError(
+            "capability does not support machine configuration: "
+            + normalized_capability_id
+        )
+
+    if goal_value is not None:
+        value, source = goal_value, "goal_override"
+    elif machine_value is not None:
+        value, source = machine_value, "machine_default"
+    elif default_value is not None:
+        value, source = default_value, "capability_default"
+    else:
+        value, source = None, "not_configured"
+    resolution_identity = {
+        "capability_id": normalized_capability_id,
+        "source": source,
+        "configuration": value,
+    }
+    return {
+        "schema_version": CAPABILITY_CONFIGURATION_RESOLUTION_SCHEMA,
+        **resolution_identity,
+        "inherited": source == "machine_default",
+        "goal_override_present": goal_value is not None,
+        "machine_default_present": machine_value is not None,
+        "effective_revision": configuration_payload_revision(resolution_identity),
+    }
+
+
+def _machine_catalog_entry(
+    namespace: Mapping[str, Any],
+    *,
+    explore_harness_profiles: Sequence[str],
+) -> tuple[str, dict[str, Any]]:
+    capability_id = str(
+        namespace.get("capability_id") or namespace.get("namespace") or ""
+    ).strip()
+    if not capability_id:
+        raise ValueError("machine capability descriptor requires a namespace")
+    entry: dict[str, Any] = {
+        "capability_id": capability_id,
+        "display_name": str(namespace.get("title") or capability_id),
+        "description": str(namespace.get("description") or ""),
+        "available_scopes": ["machine"],
+        "machine_namespace": str(namespace.get("namespace") or capability_id),
+        "configuration_editor": capability_configuration_editor(
+            capability_id,
+            explore_harness_profiles=explore_harness_profiles,
+        ),
+    }
+    if capability_id == "explore_harness":
+        # Machine preference owns only the mode; profiles and research scope
+        # stay on each Goal. Reuse the existing mode field and generic editor.
+        editor = entry["configuration_editor"]
+        editor["fields"] = [field for field in editor["fields"] if field["key"] == "mode"]
+    if isinstance(namespace.get("current"), Mapping):
+        entry["machine_current"] = deepcopy(namespace["current"])
+    if isinstance(namespace.get("configuration_template"), Mapping):
+        entry["default"] = deepcopy(namespace["configuration_template"])
+    if isinstance(namespace.get("documentation"), Mapping):
+        entry["documentation"] = deepcopy(namespace["documentation"])
+    return capability_id, entry
+
+
+def _merge_goal_feature(
+    entries: dict[str, dict[str, Any]],
+    feature: Mapping[str, Any],
+    *,
+    explore_harness_profiles: Sequence[str],
+) -> None:
+    capability_id = str(feature.get("feature_id") or "").strip()
+    if not capability_id:
+        raise ValueError("Goal capability descriptor requires a feature_id")
+    entry = entries.setdefault(
+        capability_id,
+        {
+            "capability_id": capability_id,
+            "display_name": str(feature.get("display_name") or capability_id),
+            "description": str(
+                feature.get("effect") or feature.get("consider_when") or ""
+            ),
+            "available_scopes": [],
+        },
+    )
+    if "goal_feature_id" in entry:
+        raise ValueError(f"duplicate Goal capability descriptor: {capability_id}")
+    entry["available_scopes"] = [*entry["available_scopes"], "goal"]
+    entry["goal_feature_id"] = capability_id
+    entry["availability"] = feature.get("availability")
+    for field in ("default", "current", "documentation", "context_contribution"):
+        if isinstance(feature.get(field), Mapping):
+            entry[field] = deepcopy(feature[field])
+    previous_editor = entry.get("configuration_editor")
+    entry["configuration_editor"] = capability_configuration_editor(
+        capability_id,
+        explore_harness_profiles=feature.get("profiles") or explore_harness_profiles,
+    )
+    if capability_id == "explore_harness" and "default" not in feature and previous_editor:
+        entry["configuration_editor"] = previous_editor
+    if capability_id == "reward_memory":
+        for field in entry["configuration_editor"]["fields"]:
+            if field["key"] == "agent_id":
+                field["input_kind"] = "select"
+                field["options"] = list((entry.get("current") or {}).get("registered_agents") or [])
+    if "machine" in entry["available_scopes"]:
+        entry["effective_value_policy"] = "goal_override_over_live_machine_default"
+
+
+def _attach_effective_configuration(entry: dict[str, Any]) -> None:
+    available_scopes = entry["available_scopes"]
+    goal_override = (
+        entry.get("current")
+        if "goal" in available_scopes and isinstance(entry.get("current"), Mapping)
+        else None
+    )
+    machine_default = (
+        entry.get("machine_current")
+        if isinstance(entry.get("machine_current"), Mapping)
+        else None
+    )
+    capability_default = (
+        entry.get("default") if isinstance(entry.get("default"), Mapping) else None
+    )
+    if (
+        entry["capability_id"] == "todo_replan_cadence"
+        and goal_override is not None
+        and bool(goal_override)
+        and set(goal_override) <= {"planning_horizon_goal", "yardstick_enabled"}
+    ):
+        from .todo_replan_cadence.machine_defaults import (
+            cadence_configuration_value,
+            default_replan_cadence_configuration,
+        )
+
+        # The Goal chooses horizon/Yardstick while the existing review cadence
+        # stays live. Keep `current` sparse so readback does not claim a pinned count.
+        inherited_cadence = (
+            cadence_configuration_value(machine_default)
+            if machine_default is not None
+            else default_replan_cadence_configuration()
+        )
+        goal_override = {
+            **inherited_cadence,
+            **goal_override,
+        }
+        entry["effective_value_policy"] = "goal_stride_over_live_review_cadence"
+    if entry["capability_id"] == "todo_replan_cadence":
+        # Resolve the new default in the read model, including legacy machine
+        # values and atomic Goal cadence overrides. Keep stored/current values
+        # sparse: reading Settings must never pin or migrate an override.
+        goal_override = None if goal_override is None else {
+            "planning_horizon_goal": DEFAULT_PLANNING_HORIZON_GOAL,
+            "yardstick_enabled": (machine_default or {}).get("yardstick_enabled", False),
+            **goal_override}
+        machine_default = None if machine_default is None else {
+            "planning_horizon_goal": DEFAULT_PLANNING_HORIZON_GOAL,
+            "yardstick_enabled": False, **machine_default}
+    if entry["capability_id"] == "explore_harness":
+        from .explore.machine_defaults import resolve_explore_configuration
+        from ..explore_graph import plan_explore_configuration
+
+        raw = dict(goal_override or {})
+        graph = {}
+        if "mode" in raw:
+            planned = plan_explore_configuration({}, {"mode": raw.pop("mode")})
+            graph["enabled"] = planned["evidence_enabled"]
+            raw["enabled"] = planned["planning_enabled"]
+        resolved = resolve_explore_configuration(
+            {"explore_graph": graph, "spawn_policy": {"explore_harness": raw}},
+            machine_default.get("mode") if machine_default is not None else None,
+        )
+        value = resolved["configuration"]
+        source = resolved["mode_source"]
+        entry["effective_configuration"] = {
+            "schema_version": CAPABILITY_CONFIGURATION_RESOLUTION_SCHEMA,
+            "capability_id": "explore_harness", "configuration": value,
+            "source": source, "inherited": source == "machine_default",
+            "goal_override_present": goal_override is not None,
+            "machine_default_present": machine_default is not None,
+            "effective_revision": configuration_payload_revision({"source": source, "configuration": value}),
+        }
+        return
+    entry["effective_configuration"] = resolve_capability_configuration(
+        str(entry["capability_id"]),
+        goal_override=goal_override,
+        machine_default=machine_default,
+        capability_default=capability_default,
+    )
+
+
+def build_capability_configuration_catalog(
+    *,
+    machine_namespaces: Sequence[Mapping[str, Any]] = (),
+    goal_features: Sequence[Mapping[str, Any]] = (),
+    explore_harness_profiles: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Merge machine and Goal descriptors into one stable public catalog."""
+
+    entries: dict[str, dict[str, Any]] = {}
+    for namespace in machine_namespaces:
+        capability_id, entry = _machine_catalog_entry(
+            namespace,
+            explore_harness_profiles=explore_harness_profiles,
+        )
+        if capability_id in entries:
+            raise ValueError(
+                f"duplicate machine capability descriptor: {capability_id}"
+            )
+        entries[capability_id] = entry
+    for feature in goal_features:
+        _merge_goal_feature(
+            entries,
+            feature,
+            explore_harness_profiles=explore_harness_profiles,
+        )
+    for entry in entries.values():
+        _attach_effective_configuration(entry)
+    return {
+        "schema_version": CAPABILITY_CONFIGURATION_CATALOG_SCHEMA,
+        "capabilities": [entries[key] for key in sorted(entries)],
+    }
+
+
+__all__ = [
+    "CAPABILITY_CONFIGURATION_CATALOG_SCHEMA",
+    "CAPABILITY_CONFIGURATION_EDITOR_SCHEMA",
+    "CAPABILITY_CONFIGURATION_RESOLUTION_SCHEMA",
+    "build_capability_configuration_catalog",
+    "capability_configuration_editor",
+    "resolve_capability_configuration",
+]

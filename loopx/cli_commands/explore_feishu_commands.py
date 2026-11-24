@@ -25,7 +25,8 @@ from ..extensions.lark.presentation.explore_singleflight import (
     explore_feishu_sync_busy_packet,
     explore_feishu_sync_singleflight,
 )
-from ..extensions.lark.presentation.kanban import DEFAULT_CLI_BIN
+from ..extensions.lark.cli_transport import DEFAULT_CLI_BIN
+from ..extensions.lark.presentation.sink_visibility import SINK_VISIBILITY_OWNER_ONLY, SINK_VISIBILITIES
 
 
 SubcommandArg = Callable[[argparse.ArgumentParser], None]
@@ -141,6 +142,7 @@ def register_explore_feishu_commands(
     add_subcommand_format(sync)
     add_config_path_arg(sync)
     sync.add_argument("--goal-id", required=True)
+    sync.add_argument("--agent-id", help="Registered agent whose live research lineage is displayed.")
     add_projection_limit_args(sync)
     sync.add_argument("--base-token")
     for table_key in EXPLORE_TABLE_KEYS:
@@ -149,8 +151,8 @@ def register_explore_feishu_commands(
     sync.add_argument("--as", dest="identity", default="user", choices=["bot", "user", "auto"])
     sync.add_argument(
         "--sink-visibility",
-        choices=["owner-only", "shared"],
-        default="owner-only",
+        choices=sorted(SINK_VISIBILITIES),
+        default=SINK_VISIBILITY_OWNER_ONLY,
         help="Use shared to redact private links and external ids before writing rows.",
     )
     sync.add_argument(
@@ -166,6 +168,7 @@ def register_explore_feishu_commands(
     add_subcommand_format(card)
     add_config_path_arg(card)
     card.add_argument("--goal-id", required=True)
+    card.add_argument("--agent-id", help="Registered agent whose live research lineage is displayed.")
     add_projection_limit_args(card)
     card.add_argument("--title")
     card.add_argument("--template", default="blue")
@@ -271,6 +274,7 @@ def handle_explore_feishu_command(
                     projection=visual_projection,
                     visual_sinks=visual_sinks,
                     config_path=config_path,
+                    sink_visibility=args.sink_visibility,
                     execute=bool(args.execute),
                 )
             else:
@@ -282,6 +286,7 @@ def handle_explore_feishu_command(
                     else None,
                     config_path=config_path,
                     semantic_digest=explore_visual_semantic_digest(projection),
+                    sink_visibility=args.sink_visibility,
                     execute=bool(args.execute),
                 )
             payload["ok"] = bool(payload.get("ok")) and bool(

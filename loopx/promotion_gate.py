@@ -143,8 +143,10 @@ def build_promotion_gate(
     *,
     registry_path: Path,
     runtime_root_override: str | None,
+    registry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    registry = load_registry(registry_path)
+    if registry is None:
+        registry = load_registry(registry_path)
     runtime_root = resolve_runtime_root(
         registry,
         runtime_root_override,

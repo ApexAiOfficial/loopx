@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
+import select
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -11,7 +15,14 @@ import pytest
 
 from loopx import global_registry
 from loopx import project_uninstall as project_uninstall_module
-from loopx.file_lock import fcntl
+from loopx.control_plane.coordination.shadow_management import (
+    shadow_maintenance_lock_target,
+)
+from loopx.file_lock import (
+    LockAcquireTimeoutError,
+    exclusive_cross_runtime_file_lock,
+    fcntl,
+)
 from loopx.global_registry import (
     global_registry_path,
     retire_global_registry_goals,
@@ -64,6 +75,17 @@ def _project_registry(root: Path, name: str, runtime_root: Path) -> Path:
     return registry_path
 
 
+def _configure_archivable_state(registry_path: Path) -> Path:
+    project_root = registry_path.parents[1]
+    state_file = project_root / "goal-state" / "ACTIVE_GOAL_STATE.md"
+    state_file.parent.mkdir()
+    state_file.write_text("# state\n", encoding="utf-8")
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["goals"][0]["state_file"] = "goal-state/ACTIVE_GOAL_STATE.md"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    return state_file
+
+
 def test_sync_reads_and_writes_inside_the_global_registry_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -80,7 +102,7 @@ def test_sync_reads_and_writes_inside_the_global_registry_lock(
     held: list[Path] = []
     locked_paths: list[Path] = []
     events: list[str] = []
-    real_load = global_registry.load_registry
+    real_load = global_registry._load_global_registry
     real_write = global_registry.write_json
 
     @contextmanager
@@ -104,8 +126,10 @@ def test_sync_reads_and_writes_inside_the_global_registry_lock(
             events.append(f"write:{'locked' if held else 'unlocked'}")
         real_write(path, payload)
 
-    monkeypatch.setattr(global_registry, "exclusive_file_lock", recording_lock)
-    monkeypatch.setattr(global_registry, "load_registry", recording_load)
+    monkeypatch.setattr(
+        global_registry, "exclusive_cross_runtime_file_lock", recording_lock
+    )
+    monkeypatch.setattr(global_registry, "_load_global_registry", recording_load)
     monkeypatch.setattr(global_registry, "write_json", recording_write)
 
     result = sync_project_registry_to_global(
@@ -127,6 +151,62 @@ def test_sync_reads_and_writes_inside_the_global_registry_lock(
     assert events.index("read:locked") < events.index("write:locked"), events
 
 
+@pytest.mark.parametrize("denied_errno", [errno.EACCES, errno.EPERM, errno.EROFS])
+def test_sync_lock_write_denial_is_terminal_even_when_probe_is_writable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, denied_errno: int
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    registry_path = _project_registry(tmp_path, "alpha", runtime_root)
+    original = registry_path.read_bytes()
+    failure = OSError(denied_errno, "lock write denied")
+
+    @contextmanager
+    def denied_lock(path: Path, **kwargs: Any) -> Iterator[Path]:
+        raise failure
+        yield path
+
+    monkeypatch.setattr(
+        global_registry, "exclusive_cross_runtime_file_lock", denied_lock
+    )
+    result = sync_project_registry_to_global(
+        registry_path=registry_path, runtime_root_override=str(runtime_root)
+    )
+
+    assert result["ok"] is False
+    assert result["error_kind"] == "global_registry_write_denied"
+    assert result["errno"] == denied_errno
+    assert result["wrote"] is False
+    assert result["synced_goal_ids"] == []
+    assert result["requires_global_registry_repair"] is True
+    assert result["requires_host_permission"] is True
+    assert result["global_registry_writability"]["ok"] is True
+    assert registry_path.read_bytes() == original
+    assert not global_registry_path(runtime_root).exists()
+
+
+def test_sync_lock_other_io_error_is_not_permission_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    registry_path = _project_registry(tmp_path, "alpha", runtime_root)
+    failure = OSError(errno.ENOSPC, "device full")
+
+    @contextmanager
+    def failed_lock(path: Path, **kwargs: Any) -> Iterator[Path]:
+        raise failure
+        yield path
+
+    monkeypatch.setattr(
+        global_registry, "exclusive_cross_runtime_file_lock", failed_lock
+    )
+    with pytest.raises(OSError) as caught:
+        sync_project_registry_to_global(
+            registry_path=registry_path, runtime_root_override=str(runtime_root)
+        )
+    assert caught.value is failure
+    assert not global_registry_path(runtime_root).exists()
+
+
 def test_dry_run_sync_does_not_take_the_write_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -140,7 +220,9 @@ def test_dry_run_sync_does_not_take_the_write_lock(
         acquired.append(path)
         yield path
 
-    monkeypatch.setattr(global_registry, "exclusive_file_lock", recording_lock)
+    monkeypatch.setattr(
+        global_registry, "exclusive_cross_runtime_file_lock", recording_lock
+    )
 
     result = sync_project_registry_to_global(
         registry_path=registry_path,
@@ -171,13 +253,15 @@ def test_retire_reads_and_writes_inside_the_global_registry_lock(
         path.unlink()
 
     held: list[Path] = []
+    acquired: list[Path] = []
     events: list[str] = []
     real_write = global_registry.write_json
-    real_load = global_registry.load_registry
+    real_load = global_registry._load_global_registry
 
     @contextmanager
     def recording_lock(path: Path, **kwargs: Any) -> Iterator[Path]:
         held.append(path)
+        acquired.append(path)
         try:
             yield path
         finally:
@@ -195,8 +279,10 @@ def test_retire_reads_and_writes_inside_the_global_registry_lock(
             events.append(f"backup:{'locked' if held else 'unlocked'}")
         real_write(path, payload)
 
-    monkeypatch.setattr(global_registry, "exclusive_file_lock", recording_lock)
-    monkeypatch.setattr(global_registry, "load_registry", recording_load)
+    monkeypatch.setattr(
+        global_registry, "exclusive_cross_runtime_file_lock", recording_lock
+    )
+    monkeypatch.setattr(global_registry, "_load_global_registry", recording_load)
     monkeypatch.setattr(global_registry, "write_json", recording_write)
 
     result = retire_global_registry_goals(
@@ -208,6 +294,13 @@ def test_retire_reads_and_writes_inside_the_global_registry_lock(
     assert result["ok"] is True, result
     assert result["wrote"] is True, result
     assert held == []
+    assert acquired == [
+        shadow_maintenance_lock_target(
+            runtime_root,
+            "goal-alpha",
+        ),
+        global_path,
+    ]
     assert "read:locked" in events, events
     assert "backup:locked" in events, events
     assert "write:locked" in events, events
@@ -231,7 +324,7 @@ def test_retire_rechecks_live_route_inside_the_global_registry_lock(
     registry_path.unlink()
     state_path.unlink()
     global_path = global_registry_path(runtime_root)
-    real_lock = global_registry.exclusive_file_lock
+    real_lock = global_registry.exclusive_cross_runtime_file_lock
     restored: list[Path] = []
 
     @contextmanager
@@ -247,7 +340,7 @@ def test_retire_rechecks_live_route_inside_the_global_registry_lock(
 
     monkeypatch.setattr(
         global_registry,
-        "exclusive_file_lock",
+        "exclusive_cross_runtime_file_lock",
         restore_live_route_before_lock,
     )
 
@@ -324,6 +417,69 @@ def test_sync_preserves_a_goal_committed_between_preview_and_write(
     )
 
 
+def test_queued_sync_refreshes_source_after_acquiring_global_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    registry_path = _project_registry(tmp_path, "alpha", runtime_root)
+    global_path = global_registry_path(runtime_root)
+    sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+
+    worker_loaded_source = threading.Event()
+    worker_results: list[dict[str, Any]] = []
+    worker_errors: list[BaseException] = []
+    worker: threading.Thread
+    real_load_registry = global_registry.load_registry
+
+    def recording_load_registry(path: Path) -> dict[str, Any]:
+        payload = real_load_registry(path)
+        if threading.current_thread() is worker and path == registry_path:
+            worker_loaded_source.set()
+        return payload
+
+    monkeypatch.setattr(global_registry, "load_registry", recording_load_registry)
+
+    def queued_sync() -> None:
+        try:
+            worker_results.append(
+                sync_project_registry_to_global(
+                    registry_path=registry_path,
+                    runtime_root_override=str(runtime_root),
+                    dry_run=False,
+                )
+            )
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    worker = threading.Thread(target=queued_sync)
+    with exclusive_cross_runtime_file_lock(
+        global_path,
+        operation="test_queued_sync_refreshes_source",
+    ):
+        worker.start()
+        assert worker_loaded_source.wait(timeout=2)
+        source_payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        source_payload["goals"][0]["objective"] = "new source value"
+        registry_path.write_text(json.dumps(source_payload), encoding="utf-8")
+        sync_project_registry_to_global(
+            registry_path=registry_path,
+            runtime_root_override=str(runtime_root),
+            dry_run=False,
+            _global_registry_lock_held=True,
+        )
+
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert worker_errors == []
+    assert worker_results and worker_results[0]["ok"] is True
+    projected_goal = json.loads(global_path.read_text(encoding="utf-8"))["goals"][0]
+    assert projected_goal["objective"] == "new source value"
+
+
 def test_project_uninstall_preserves_a_goal_committed_after_preview(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -380,6 +536,574 @@ def test_project_uninstall_preserves_a_goal_committed_after_preview(
     assert result["global_registry_goal_count_after"] == 1
     remaining = json.loads(global_path.read_text(encoding="utf-8"))["goals"]
     assert [goal.get("id") for goal in remaining] == ["goal-beta"]
+
+
+@pytest.mark.parametrize(
+    "state_file_record",
+    ["ACTIVE_GOAL_STATE.md", ".loopx/ACTIVE_GOAL_STATE.md"],
+)
+def test_project_uninstall_archives_only_the_state_file_when_archive_is_nested(
+    tmp_path: Path,
+    state_file_record: str,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    registry_path = _project_registry(tmp_path, "alpha", runtime_root)
+    project_root = registry_path.parents[1]
+    original_state_file = project_root / "ACTIVE_GOAL_STATE.md"
+    state_file = project_root / state_file_record
+    if state_file != original_state_file:
+        original_state_file.replace(state_file)
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry["goals"][0]["state_file"] = state_file_record
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    sentinel = project_root / "project-sentinel.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+
+    preview = uninstall_project(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        goal_ids=["goal-alpha"],
+        archive_state=True,
+        remove_empty_registry=False,
+        execute=False,
+    )
+
+    preview_action = preview["state_actions"][0]
+    assert preview_action["action"] == "would-move-state-file"
+    assert "only the recorded state file" in preview_action["warning"]
+    assert state_file.read_text(encoding="utf-8") == "# state\n"
+    assert not (registry_path.parent / "archived-project-state").exists()
+
+    result = uninstall_project(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        goal_ids=["goal-alpha"],
+        archive_state=True,
+        remove_empty_registry=False,
+        execute=True,
+    )
+
+    action = result["state_actions"][0]
+    archive_path = Path(action["archive_path"])
+    assert action["action"] == "moved-state-file"
+    assert "only the recorded state file" in action["warning"]
+    assert [path.relative_to(archive_path) for path in archive_path.rglob("*")] == [
+        Path("ACTIVE_GOAL_STATE.md")
+    ]
+    assert not state_file.exists()
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert json.loads(registry_path.read_text(encoding="utf-8"))["goals"] == []
+
+
+@pytest.mark.parametrize(
+    "state_file_record",
+    ["ACTIVE_GOAL_STATE.md", ".loopx/ACTIVE_GOAL_STATE.md"],
+)
+def test_project_uninstall_archives_only_state_through_outbound_archive_symlink(
+    tmp_path: Path,
+    state_file_record: str,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    registry_path = _project_registry(tmp_path, "alpha", runtime_root)
+    project_root = registry_path.parents[1]
+    original_state_file = project_root / "ACTIVE_GOAL_STATE.md"
+    state_file = project_root / state_file_record
+    if state_file != original_state_file:
+        original_state_file.replace(state_file)
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry["goals"][0]["state_file"] = state_file_record
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    sentinel = project_root / "project-sentinel.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+    global_path = global_registry_path(runtime_root)
+    external_archive = tmp_path / "external-archive"
+    external_archive.mkdir()
+    archive_link = registry_path.parent / "archived-project-state"
+    try:
+        archive_link.symlink_to(external_archive, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    registry_before = registry_path.read_bytes()
+    global_before = global_path.read_bytes()
+
+    def run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "loopx.cli",
+                "--format",
+                "json",
+                "--registry",
+                str(registry_path),
+                "--runtime-root",
+                str(runtime_root),
+                "uninstall-project",
+                "--goal-id",
+                "goal-alpha",
+                "--archive-state",
+                *arguments,
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env={**os.environ, "LOOPX_USAGE_PING": "0"},
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+    preview = run_cli()
+    assert preview.returncode == 0, preview.stderr
+    preview_payload = json.loads(preview.stdout)
+    assert registry_path.read_bytes() == registry_before
+    assert global_path.read_bytes() == global_before
+
+    execute = run_cli("--execute")
+    assert execute.returncode == 0, execute.stdout + execute.stderr
+    result = json.loads(execute.stdout)
+
+    preview_action = preview_payload["state_actions"][0]
+    assert preview_action["action"] == "would-move-state-file"
+    assert "only the recorded state file" in preview_action["warning"]
+    action = result["state_actions"][0]
+    archive_path = Path(action["archive_path"])
+    assert action["action"] == "moved-state-file"
+    assert "only the recorded state file" in action["warning"]
+    assert archive_path.is_relative_to(archive_link)
+    assert archive_path.resolve().is_relative_to(external_archive.resolve())
+    assert (archive_path / state_file.name).read_text(encoding="utf-8") == "# state\n"
+    assert archive_link.is_symlink()
+    assert not state_file.exists()
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert json.loads(registry_path.read_text(encoding="utf-8"))["goals"] == []
+    assert json.loads(global_path.read_text(encoding="utf-8"))["goals"] == []
+
+
+_HOLD_CANONICAL_WRITER_GUARD = """
+import {once} from "node:events";
+import {mkdir} from "node:fs/promises";
+import {dirname} from "node:path";
+
+const input = JSON.parse(process.argv[1]);
+const {withFileMutationLock} = await import(input.lock_module);
+await mkdir(dirname(input.lock_path), {recursive: true});
+await withFileMutationLock(input.lock_path, async () => {
+  process.stdout.write("BARRIER lock-held\\n");
+  await once(process.stdin, "data");
+});
+"""
+
+
+@contextmanager
+def _held_canonical_writer_guard(
+    lock_path: Path,
+) -> Iterator[subprocess.Popen[str]]:
+    holder = subprocess.Popen(
+        [
+            "node",
+            "--no-warnings",
+            "--experimental-strip-types",
+            "--input-type=module",
+            "-e",
+            _HOLD_CANONICAL_WRITER_GUARD,
+            json.dumps(
+                {
+                    "lock_module": (
+                        Path("loopx/control_plane/effect_runtime_io.ts")
+                        .resolve()
+                        .as_uri()
+                    ),
+                    "lock_path": str(lock_path),
+                }
+            ),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        ready, _, _ = select.select([holder.stdout], [], [], 10)
+        assert ready and holder.stdout.readline().strip() == "BARRIER lock-held"
+        yield holder
+    finally:
+        if holder.poll() is None:
+            holder.terminate()
+            holder.communicate(timeout=5)
+
+
+def _release_canonical_writer_guard(holder: subprocess.Popen[str]) -> None:
+    stdout, stderr = holder.communicate("continue\n", timeout=10)
+    assert holder.returncode == 0, stdout + stderr
+
+
+@pytest.mark.parametrize(
+    "retained_relative",
+    [Path("goal-beta.md"), Path("nested/goal-beta.md")],
+)
+def test_project_uninstall_archives_only_selected_state_in_a_shared_directory(
+    tmp_path: Path,
+    retained_relative: Path,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    registry_path = _project_registry(tmp_path, "alpha", runtime_root)
+    project_root = registry_path.parents[1]
+    state_dir = project_root / "shared-state"
+    state_dir.mkdir()
+    selected_state = state_dir / "goal-alpha.md"
+    retained_state = state_dir / retained_relative
+    retained_state.parent.mkdir(parents=True, exist_ok=True)
+    selected_state.write_text("# alpha state\n", encoding="utf-8")
+    retained_state.write_text("# beta state\n", encoding="utf-8")
+
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["goals"][0]["state_file"] = "shared-state/goal-alpha.md"
+    registry["goals"].append(
+        {
+            **registry["goals"][0],
+            "id": "goal-beta",
+            "state_file": str(Path("shared-state") / retained_relative),
+        }
+    )
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+
+    preview = uninstall_project(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        goal_ids=["goal-alpha"],
+        archive_state=True,
+        remove_empty_registry=False,
+        execute=False,
+    )
+
+    assert preview["dry_run"] is True
+    assert preview["state_actions"][0]["action"] == "would-move-state-file"
+    assert preview["state_actions"][0]["retained_goal_ids"] == ["goal-beta"]
+    assert selected_state.read_text(encoding="utf-8") == "# alpha state\n"
+    assert retained_state.read_text(encoding="utf-8") == "# beta state\n"
+
+    result = uninstall_project(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        goal_ids=["goal-alpha"],
+        archive_state=True,
+        remove_empty_registry=False,
+        execute=True,
+    )
+
+    state_action = result["state_actions"][0]
+    assert state_action["action"] == "moved-state-file"
+    assert state_action["retained_goal_ids"] == ["goal-beta"]
+    archived = Path(state_action["archive_path"])
+    assert not selected_state.exists()
+    assert (archived / selected_state.name).read_text(
+        encoding="utf-8"
+    ) == "# alpha state\n"
+    assert retained_state.read_text(encoding="utf-8") == "# beta state\n"
+    assert not (archived / retained_state.name).exists()
+    local_goals = json.loads(registry_path.read_text(encoding="utf-8"))["goals"]
+    assert [goal["id"] for goal in local_goals] == ["goal-beta"]
+    global_goals = json.loads(
+        global_registry_path(runtime_root).read_text(encoding="utf-8")
+    )["goals"]
+    assert [goal["id"] for goal in global_goals] == ["goal-beta"]
+
+
+@pytest.mark.parametrize("shared_target", [False, True])
+def test_project_uninstall_preserves_retained_state_through_an_external_symlink(
+    tmp_path: Path,
+    shared_target: bool,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    registry_path = _project_registry(tmp_path, "alpha", runtime_root)
+    project_root = registry_path.parents[1]
+    state_dir = project_root / "selected-state"
+    alias_dir = project_root / "aliases"
+    state_dir.mkdir()
+    alias_dir.mkdir()
+    selected_state = state_dir / "goal-alpha.md"
+    selected_state.write_text("# alpha state\n", encoding="utf-8")
+    retained_target = selected_state if shared_target else state_dir / "goal-beta.md"
+    if not shared_target:
+        retained_target.write_text("# beta state\n", encoding="utf-8")
+    retained_alias = alias_dir / "goal-beta.md"
+    try:
+        retained_alias.symlink_to(Path("..") / state_dir.name / retained_target.name)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["goals"][0]["state_file"] = "selected-state/goal-alpha.md"
+    registry["goals"].append(
+        {
+            **registry["goals"][0],
+            "id": "goal-beta",
+            "state_file": "aliases/goal-beta.md",
+        }
+    )
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+    global_path = global_registry_path(runtime_root)
+    registry_before_preview = registry_path.read_bytes()
+    global_before_preview = global_path.read_bytes()
+    expected_retained = retained_alias.read_bytes()
+
+    def run_cli(*arguments: str) -> dict[str, Any]:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "loopx.cli",
+                "--format",
+                "json",
+                "--registry",
+                str(registry_path),
+                "--runtime-root",
+                str(runtime_root),
+                "uninstall-project",
+                "--goal-id",
+                "goal-alpha",
+                "--archive-state",
+                *arguments,
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env={**os.environ, "LOOPX_USAGE_PING": "0"},
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return json.loads(completed.stdout)
+
+    preview = run_cli()
+
+    expected_preview_action = (
+        "kept-shared-state-file" if shared_target else "would-move-state-file"
+    )
+    assert preview["state_actions"][0]["action"] == expected_preview_action
+    assert preview["state_actions"][0]["retained_goal_ids"] == ["goal-beta"]
+    assert registry_path.read_bytes() == registry_before_preview
+    assert global_path.read_bytes() == global_before_preview
+    assert retained_alias.is_symlink()
+    assert retained_alias.read_bytes() == expected_retained
+
+    result = run_cli("--execute")
+
+    expected_action = "kept-shared-state-file" if shared_target else "moved-state-file"
+    state_action = result["state_actions"][0]
+    assert state_action["action"] == expected_action
+    assert state_action["retained_goal_ids"] == ["goal-beta"]
+    assert retained_alias.is_symlink()
+    assert retained_alias.read_bytes() == expected_retained
+    if shared_target:
+        assert selected_state.read_bytes() == expected_retained
+    else:
+        assert not selected_state.exists()
+        archived = Path(state_action["archive_path"])
+        assert (archived / selected_state.name).read_text(
+            encoding="utf-8"
+        ) == "# alpha state\n"
+    local_goals = json.loads(registry_path.read_text(encoding="utf-8"))["goals"]
+    assert [goal["id"] for goal in local_goals] == ["goal-beta"]
+    global_goals = json.loads(global_path.read_text(encoding="utf-8"))["goals"]
+    assert [goal["id"] for goal in global_goals] == ["goal-beta"]
+
+
+def test_project_uninstall_keeps_a_state_file_registered_by_a_retained_goal(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    registry_path = _project_registry(tmp_path, "alpha", runtime_root)
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["goals"].append(
+        {
+            **registry["goals"][0],
+            "id": "goal-beta",
+        }
+    )
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+    state_file = registry_path.parents[1] / "ACTIVE_GOAL_STATE.md"
+
+    result = uninstall_project(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        goal_ids=["goal-alpha"],
+        archive_state=True,
+        remove_empty_registry=False,
+        execute=True,
+    )
+
+    assert state_file.read_text(encoding="utf-8") == "# state\n"
+    assert result["state_actions"] == [
+        {
+            "goal_id": "goal-alpha",
+            "state_file": str(state_file),
+            "state_dir": str(state_file.parent),
+            "action": "kept-shared-state-file",
+            "archived": False,
+            "retained_goal_ids": ["goal-beta"],
+            "warning": (
+                "state file is still registered by a retained goal; kept in place"
+            ),
+        }
+    ]
+    local_goals = json.loads(registry_path.read_text(encoding="utf-8"))["goals"]
+    assert [goal["id"] for goal in local_goals] == ["goal-beta"]
+    global_goals = json.loads(
+        global_registry_path(runtime_root).read_text(encoding="utf-8")
+    )["goals"]
+    assert [goal["id"] for goal in global_goals] == ["goal-beta"]
+
+
+def test_project_uninstall_archive_waits_for_canonical_writer_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    registry_path = _project_registry(tmp_path, "alpha", runtime_root)
+    state_file = _configure_archivable_state(registry_path)
+    sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+    global_path = global_registry_path(runtime_root)
+    original_local_registry = registry_path.read_bytes()
+    original_global_registry = global_path.read_bytes()
+    lock_path = shadow_maintenance_lock_target(runtime_root, "goal-alpha")
+    lock_attempted = threading.Event()
+    uninstall_finished = threading.Event()
+    results: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
+    actual_lock = project_uninstall_module.exclusive_cross_runtime_file_lock
+
+    @contextmanager
+    def observed_lock(
+        path: Path,
+        **kwargs: Any,
+    ) -> Iterator[Path]:
+        if path == lock_path:
+            lock_attempted.set()
+        with actual_lock(path, **kwargs) as acquired:
+            yield acquired
+
+    monkeypatch.setattr(
+        project_uninstall_module,
+        "exclusive_cross_runtime_file_lock",
+        observed_lock,
+    )
+
+    def uninstall() -> None:
+        try:
+            results.append(
+                uninstall_project(
+                    registry_path=registry_path,
+                    runtime_root_override=str(runtime_root),
+                    goal_ids=["goal-alpha"],
+                    archive_state=True,
+                    remove_empty_registry=False,
+                    execute=True,
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            uninstall_finished.set()
+
+    worker = threading.Thread(target=uninstall)
+    try:
+        with _held_canonical_writer_guard(lock_path) as holder:
+            worker.start()
+            assert lock_attempted.wait(timeout=5)
+            assert not uninstall_finished.wait(timeout=0.2), (
+                "project uninstall completed while the canonical writer guard was held"
+            )
+            assert state_file.read_text(encoding="utf-8") == "# state\n"
+            assert registry_path.read_bytes() == original_local_registry
+            assert global_path.read_bytes() == original_global_registry
+            assert not (registry_path.parent / "archived-project-state").exists()
+            _release_canonical_writer_guard(holder)
+            worker.join(timeout=10)
+            assert not worker.is_alive()
+            assert errors == []
+            assert results and results[0]["ok"] is True
+            archived = Path(results[0]["state_actions"][0]["archive_path"])
+            assert (archived / "ACTIVE_GOAL_STATE.md").read_text(
+                encoding="utf-8"
+            ) == "# state\n"
+            assert not state_file.exists()
+            assert json.loads(registry_path.read_text(encoding="utf-8"))["goals"] == []
+            assert json.loads(global_path.read_text(encoding="utf-8"))["goals"] == []
+    finally:
+        if worker.ident is not None:
+            worker.join(timeout=10)
+
+
+def test_project_uninstall_archive_timeout_has_no_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    registry_path = _project_registry(tmp_path, "alpha", runtime_root)
+    state_file = _configure_archivable_state(registry_path)
+    sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+    global_path = global_registry_path(runtime_root)
+    original_local_registry = registry_path.read_bytes()
+    original_global_registry = global_path.read_bytes()
+    lock_path = shadow_maintenance_lock_target(runtime_root, "goal-alpha")
+    monkeypatch.setattr(
+        project_uninstall_module,
+        "CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS",
+        0.05,
+    )
+
+    with _held_canonical_writer_guard(lock_path):
+        with pytest.raises(LockAcquireTimeoutError):
+            uninstall_project(
+                registry_path=registry_path,
+                runtime_root_override=str(runtime_root),
+                goal_ids=["goal-alpha"],
+                archive_state=True,
+                remove_empty_registry=False,
+                execute=True,
+            )
+
+    assert state_file.read_text(encoding="utf-8") == "# state\n"
+    assert registry_path.read_bytes() == original_local_registry
+    assert global_path.read_bytes() == original_global_registry
+    assert not (registry_path.parent / "archived-project-state").exists()
+    assert list(tmp_path.rglob("*.bak")) == []
 
 
 _CONCURRENT_SYNC_SCRIPT = """
@@ -446,3 +1170,222 @@ def test_concurrent_project_syncs_do_not_drop_goals(tmp_path: Path) -> None:
     assert {
         str(goal.get("id")): str(goal.get("project_id")) for goal in payload["goals"]
     } == {f"goal-{name}": f"project-{name}" for name in names}
+
+
+def test_redundant_sync_does_not_rewrite_unchanged_global_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Routine refresh-state syncs must not churn global registry timestamps when nothing changed."""
+    runtime_root = tmp_path / "runtime"
+    registry_path = _project_registry(tmp_path, "alpha", runtime_root)
+    global_path = global_registry_path(runtime_root)
+
+    ticks = iter(["2026-11-02T07:41:00+00:00", "2026-11-02T07:41:53+00:00", "2026-11-02T07:42:10+00:00"])
+    monkeypatch.setattr(global_registry, "now_local", lambda: next(ticks))
+
+    first = sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+    assert first["ok"] is True
+    before_bytes = global_path.read_bytes()
+
+    writes: list[Path] = []
+    real_write = global_registry.write_json
+
+    def tracking_write(path: Path, payload: dict[str, Any]) -> None:
+        writes.append(path)
+        real_write(path, payload)
+
+    monkeypatch.setattr(global_registry, "write_json", tracking_write)
+
+    second = sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+    assert second["ok"] is True
+    assert writes == []
+    assert global_path.read_bytes() == before_bytes
+
+    source_payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    source_payload["goals"][0]["objective"] = "updated objective"
+    registry_path.write_text(json.dumps(source_payload), encoding="utf-8")
+
+    third = sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+    assert third["ok"] is True
+    assert writes == [global_path]
+    assert global_path.read_bytes() != before_bytes
+
+
+def test_cross_project_redundant_syncs_preserve_order_and_do_not_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Alternating project syncs must update in-place instead of churning list order."""
+    runtime_root = tmp_path / "runtime"
+    alpha_registry = _project_registry(tmp_path, "alpha", runtime_root)
+    beta_registry = _project_registry(tmp_path, "beta", runtime_root)
+    global_path = global_registry_path(runtime_root)
+
+    ticks = iter(
+        [
+            "2026-11-02T18:20:00+00:00",
+            "2026-11-02T18:20:10+00:00",
+            "2026-11-02T18:21:00+00:00",
+            "2026-11-02T18:21:10+00:00",
+            "2026-11-02T18:21:27+00:00",
+        ]
+    )
+    monkeypatch.setattr(global_registry, "now_local", lambda: next(ticks))
+
+    assert sync_project_registry_to_global(
+        registry_path=alpha_registry,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )["ok"]
+    assert sync_project_registry_to_global(
+        registry_path=beta_registry,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )["ok"]
+
+    before_bytes = global_path.read_bytes()
+    before_payload = json.loads(before_bytes.decode("utf-8"))
+    assert [g["id"] for g in before_payload["goals"]] == ["goal-alpha", "goal-beta"]
+    assert [p["project_id"] for p in before_payload["projects"]] == [
+        "project-alpha",
+        "project-beta",
+    ]
+
+    writes: list[Path] = []
+    real_write = global_registry.write_json
+
+    def tracking_write(path: Path, payload: dict[str, Any]) -> None:
+        writes.append(path)
+        real_write(path, payload)
+
+    monkeypatch.setattr(global_registry, "write_json", tracking_write)
+
+    assert sync_project_registry_to_global(
+        registry_path=alpha_registry,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )["ok"]
+    assert sync_project_registry_to_global(
+        registry_path=beta_registry,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )["ok"]
+    assert writes == []
+    assert global_path.read_bytes() == before_bytes
+
+    alpha_payload = json.loads(alpha_registry.read_text(encoding="utf-8"))
+    alpha_payload["goals"][0]["objective"] = "updated alpha objective"
+    alpha_registry.write_text(json.dumps(alpha_payload), encoding="utf-8")
+
+    assert sync_project_registry_to_global(
+        registry_path=alpha_registry,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )["ok"]
+    assert writes == [global_path]
+    after_payload = json.loads(global_path.read_text(encoding="utf-8"))
+    assert [g["id"] for g in after_payload["goals"]] == ["goal-alpha", "goal-beta"]
+    assert [p["project_id"] for p in after_payload["projects"]] == [
+        "project-alpha",
+        "project-beta",
+    ]
+    assert after_payload["goals"][0]["objective"] == "updated alpha objective"
+
+
+def test_single_goal_sync_with_unchanged_siblings_skips_redundant_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    project = tmp_path / "multi"
+    (project / ".loopx").mkdir(parents=True, exist_ok=True)
+    (project / "GOAL_A.md").write_text("# A\n", encoding="utf-8")
+    (project / "GOAL_B.md").write_text("# B\n", encoding="utf-8")
+    registry_path = project / ".loopx" / "registry.json"
+    registry_payload = {
+        "schema_version": "0.1",
+        "common_runtime_root": str(runtime_root),
+        "goals": [
+            {
+                "id": "goal-a",
+                "domain": "multi-fixture",
+                "status": "active",
+                "repo": str(project),
+                "state_file": "GOAL_A.md",
+                "adapter": {"kind": "fixture", "status": "connected-read-only"},
+                "objective": "goal a objective",
+            },
+            {
+                "id": "goal-b",
+                "domain": "multi-fixture",
+                "status": "active",
+                "repo": str(project),
+                "state_file": "GOAL_B.md",
+                "adapter": {"kind": "fixture", "status": "connected-read-only"},
+                "objective": "goal b objective",
+            },
+        ],
+    }
+    registry_path.write_text(json.dumps(registry_payload), encoding="utf-8")
+    global_path = global_registry_path(runtime_root)
+
+    ticks = iter(
+        [
+            "2026-11-22T18:00:00+00:00",
+            "2026-11-22T18:01:00+00:00",
+            "2026-11-22T18:02:00+00:00",
+        ]
+    )
+    monkeypatch.setattr(global_registry, "now_local", lambda: next(ticks))
+
+    first = sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        dry_run=False,
+    )
+    assert first["ok"] is True and first["wrote"] is True
+    before_bytes = global_path.read_bytes()
+
+    writes: list[Path] = []
+    real_write = global_registry.write_json
+
+    def tracking_write(path: Path, payload: dict[str, Any]) -> None:
+        writes.append(path)
+        real_write(path, payload)
+
+    monkeypatch.setattr(global_registry, "write_json", tracking_write)
+
+    noop = sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        goal_id="goal-a",
+        dry_run=False,
+    )
+    assert noop["ok"] is True
+    assert writes == []
+    assert global_path.read_bytes() == before_bytes
+
+    registry_payload["goals"][0]["objective"] = "goal a updated objective"
+    registry_path.write_text(json.dumps(registry_payload), encoding="utf-8")
+    changed = sync_project_registry_to_global(
+        registry_path=registry_path,
+        runtime_root_override=str(runtime_root),
+        goal_id="goal-a",
+        dry_run=False,
+    )
+    assert changed["ok"] is True and changed["wrote"] is True
+    assert writes == [global_path]
+    after_payload = json.loads(global_path.read_text(encoding="utf-8"))
+    by_id = {goal["id"]: goal for goal in after_payload["goals"]}
+    assert by_id["goal-a"]["synced_at"] == "2026-11-22T18:02:00+00:00"
+    assert by_id["goal-b"]["synced_at"] == "2026-11-22T18:02:00+00:00"

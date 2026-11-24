@@ -6,7 +6,6 @@ from __future__ import annotations
 import runpy
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 
@@ -26,17 +25,10 @@ DIFFERENTIAL_SMOKE = (
 def _run_budget_checks() -> None:
     tests = runpy.run_path(str(TEST_PATH))
     tests["test_manifest_covers_the_declared_agent_facing_surface_set"]()
-    with tempfile.TemporaryDirectory(prefix="loopx-cli-output-budget-") as temp_dir:
-        root = Path(temp_dir)
-        tests["test_real_cli_output_stays_inside_the_characterized_baseline"](
-            root / "scenarios"
-        )
-        tests["test_collection_growth_and_bootstrap_duplication_are_explicit"](
-            root / "growth"
-        )
-        tests["test_explicit_compact_and_detail_modes_are_characterized"](
-            root / "mode-variants"
-        )
+    tests["test_brief_budget_retains_full_commands_on_real_long_paths"]()
+    # The differential probe runs all default and mode-variant assertions on
+    # its candidate observations, including growth/duplication. Repeating the
+    # candidate matrix here adds real CLI work without another contract.
 
 
 def main() -> int:
@@ -50,9 +42,13 @@ def main() -> int:
         cwd=REPO_ROOT,
         check=False,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=300,
+        # The child runs two separately bounded 240-second probes, plus
+        # checkout/cleanup. Do not cut off a valid second native Windows probe.
+        timeout=600,
     )
     if completed.returncode != 0:
         raise AssertionError(

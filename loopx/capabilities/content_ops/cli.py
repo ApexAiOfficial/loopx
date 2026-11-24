@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import sys
 from collections.abc import Callable
@@ -25,6 +26,8 @@ from .layout import (
     check_layout_packet,
     render_layout_packet_markdown,
 )
+from .reference import content_reference_operation, inspect_reference_materials, write_reference_artifact
+from .media_cli import handle_media_command, register_media_commands
 from .surface import (
     build_content_ops_chatview_report_packet,
     build_content_ops_exploration_plan_packet,
@@ -42,6 +45,49 @@ from .surface import (
     render_content_ops_walkthrough_artifact_markdown,
 )
 
+MAX_INPUT_BYTES = 16 * 1024 * 1024
+
+
+def _input_byte_limit(text: str) -> int:
+    # An explicit, positive byte count; there is no unbounded setting.
+    if not text.isdecimal() or int(text) < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive whole number of bytes, got {text!r}")
+    return int(text)
+
+
+def _add_input_limit(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--max-input-bytes",
+        type=_input_byte_limit,
+        default=MAX_INPUT_BYTES,
+        help=(
+            "Refuse JSON read from stdin ('-') larger than this many bytes before "
+            f"parsing (default {MAX_INPUT_BYTES}). Bounds input size, not process memory."
+        ),
+    )
+
+
+def _read_stdin_text(limit: int, label: str) -> str:
+    # Read through the text stream so stdin keeps its decoding, but charge each
+    # chunk by its encoded size: one character can take up to four bytes. One
+    # incremental encoder spans all chunks, so a BOM is charged only once.
+    encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
+    errors = getattr(sys.stdin, "errors", None) or "surrogatepass"
+    encoder = codecs.getincrementalencoder(encoding)(errors)
+    chunks: list[str] = []
+    consumed = 0
+    while consumed <= limit:
+        chunk = sys.stdin.read(max(1, (limit + 1 - consumed) // 4))
+        if not chunk:
+            consumed += len(encoder.encode("", final=True))
+            break
+        chunks.append(chunk)
+        consumed += len(encoder.encode(chunk))
+    if consumed > limit:
+        raise ValueError(f"{label} exceeds the {limit}-byte limit")
+    return "".join(chunks)
+
+
 PrintPayload = Callable[
     [dict[str, object], str, Callable[[dict[str, object]], str]],
     None,
@@ -50,9 +96,9 @@ FormatSelector = Callable[..., str]
 AddFormat = Callable[[argparse.ArgumentParser], None]
 
 
-def _load_json_object(path_text: str) -> dict[str, Any]:
+def _load_json_object(path_text: str, limit: int) -> dict[str, Any]:
     if path_text == "-":
-        payload = json.loads(sys.stdin.read())
+        payload = json.loads(_read_stdin_text(limit, "content-ops stdin JSON input"))
     else:
         payload = json.loads(Path(path_text).expanduser().read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -95,6 +141,21 @@ def register_content_ops_commands(
         dest="content_ops_command",
         required=True,
     )
+    register_media_commands(content_ops_sub, add_subcommand_format)
+    reference_parser = content_ops_sub.add_parser(
+        "reference", help="Search, capture or prepare an attributed outline from a caller-owned private catalog.",
+    )
+    reference_parser.add_argument("operation", choices=("search", "capture", "draft", "inventory"))
+    reference_parser.add_argument("--library-json", required=True)
+    reference_parser.add_argument("--input-json", help="Capture or draft request JSON (library is supplied separately).")
+    reference_parser.add_argument("--query", default="")
+    reference_parser.add_argument("--structure", default="")
+    reference_parser.add_argument("--goal-id")
+    reference_parser.add_argument("--store-id", help="Existing owner-local material store identity for inventory.")
+    reference_parser.add_argument("--observed-at")
+    reference_parser.add_argument("--output-json", help="Create a new mode-0600 private result artifact; never overwrite an existing catalog.")
+    add_subcommand_format(reference_parser)
+    _add_input_limit(reference_parser)
     preview_parser = content_ops_sub.add_parser(
         "preview",
         help="Preview metadata-only connector trials and content-ops projection.",
@@ -220,6 +281,7 @@ def register_content_ops_commands(
         ),
     )
     add_subcommand_format(aggregate_parser)
+    _add_input_limit(aggregate_parser)
     aggregate_parser.add_argument(
         "--public-packet-json",
         action="append",
@@ -245,8 +307,7 @@ def register_content_ops_commands(
     )
     aggregate_parser.add_argument(
         "--generated-at",
-        default="2026-06-23T00:00:00Z",
-        help="Public-safe generated_at timestamp for the aggregate surface.",
+        help="Public-safe generated_at timestamp for the aggregate surface (default: current UTC).",
     )
     chatview_parser = content_ops_sub.add_parser(
         "project-chatview-report",
@@ -303,8 +364,7 @@ def register_content_ops_commands(
     )
     chatview_parser.add_argument(
         "--generated-at",
-        default="2026-06-23T00:00:00Z",
-        help="Public-safe generated_at timestamp for the ChatView report.",
+        help="Public-safe generated_at timestamp for the ChatView report (default: current UTC).",
     )
     walkthrough_parser = content_ops_sub.add_parser(
         "walkthrough-artifact",
@@ -373,8 +433,7 @@ def register_content_ops_commands(
     )
     walkthrough_parser.add_argument(
         "--generated-at",
-        default="2026-06-23T00:00:00Z",
-        help="Public-safe generated_at timestamp for the walkthrough artifact.",
+        help="Public-safe generated_at timestamp for the walkthrough artifact (default: current UTC).",
     )
     item_create_parser = content_ops_sub.add_parser(
         "item-create",
@@ -400,6 +459,7 @@ def register_content_ops_commands(
         ),
     )
     add_subcommand_format(item_transition_parser)
+    _add_input_limit(item_transition_parser)
     item_transition_parser.add_argument(
         "--item-json",
         required=True,
@@ -418,6 +478,7 @@ def register_content_ops_commands(
         ),
     )
     add_subcommand_format(queue_parser)
+    _add_input_limit(queue_parser)
     queue_parser.add_argument(
         "--item-json",
         action="append",
@@ -478,6 +539,7 @@ def register_content_ops_commands(
         help="Check rendered-page measurements against a typed layout plan.",
     )
     add_subcommand_format(layout_check_parser)
+    _add_input_limit(layout_check_parser)
     layout_check_parser.add_argument(
         "--plan-json",
         required=True,
@@ -490,16 +552,60 @@ def register_content_ops_commands(
     )
 
 
+def _render_pretty_json(value: dict[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+
+
+def _render_content_ops_error_markdown(payload: dict[str, Any]) -> str:
+    lines = [
+        "# LoopX Content-Ops",
+        "",
+        f"- ok: `{payload.get('ok')}`",
+    ]
+    if payload.get("error"):
+        lines.extend(["", "## Error", "", str(payload.get("error"))])
+    return "\n".join(lines) + "\n"
+
+
 def handle_content_ops_command(
     args: argparse.Namespace,
     *,
     output_format: FormatSelector,
     print_payload: PrintPayload,
 ) -> int:
+    stdin_used = False
+
+    def read_json(path_text: str) -> dict[str, Any]:
+        nonlocal stdin_used
+        if path_text == "-":
+            if stdin_used:
+                raise ValueError("stdin ('-') can only be used for one JSON input argument per command")
+            stdin_used = True
+        return _load_json_object(path_text, args.max_input_bytes)
+
     try:
         issue_fix_result = handle_content_ops_issue_fix_command(args)
         if issue_fix_result is not None:
             payload, renderer = issue_fix_result
+        elif args.content_ops_command in {"media", "generation", "image"}:
+            payload = handle_media_command(args)
+            renderer = _render_pretty_json
+        elif args.content_ops_command == "reference":
+            if args.operation == "inventory":
+                if not args.goal_id or not args.store_id or not args.observed_at or args.library_json == "-":
+                    raise ValueError("inventory requires a catalog file, --goal-id, --store-id and --observed-at")
+                payload = inspect_reference_materials(library_path=Path(args.library_json).expanduser(), goal_id=args.goal_id, store_id=args.store_id, observed_at=args.observed_at)
+            else:
+                request = read_json(args.input_json) if args.input_json else {}
+                if args.operation in {"capture", "draft"} and not args.input_json:
+                    raise ValueError("capture/draft require --input-json")
+                request["library"] = read_json(args.library_json)
+                if args.operation == "search":
+                    request.update(query=args.query, structure=args.structure)
+                payload = content_reference_operation(args.operation, request)
+            if args.output_json:
+                write_reference_artifact(Path(args.output_json).expanduser(), payload)
+            renderer = _render_pretty_json
         elif args.content_ops_command == "preview":
             payload = build_content_ops_preview_packet(generated_at=args.generated_at)
             renderer = render_content_ops_preview_markdown
@@ -535,10 +641,10 @@ def handle_content_ops_command(
         elif args.content_ops_command == "aggregate-packets":
             payload = build_content_ops_packet_aggregation_packet(
                 public_handle_packets=[
-                    _load_json_object(path) for path in args.public_packet_json
+                    read_json(path) for path in args.public_packet_json
                 ],
                 private_connector_gate_packets=[
-                    _load_json_object(path) for path in args.private_gate_packet_json
+                    read_json(path) for path in args.private_gate_packet_json
                 ],
                 surface_id=args.surface_id,
                 generated_at=args.generated_at,
@@ -585,14 +691,14 @@ def handle_content_ops_command(
             renderer = render_content_ops_item_packet_markdown
         elif args.content_ops_command == "item-transition":
             payload = apply_content_ops_item_event(
-                _load_json_object(args.item_json),
-                _load_json_object(args.event_json),
+                read_json(args.item_json),
+                read_json(args.event_json),
             )
             renderer = render_content_ops_item_packet_markdown
         elif args.content_ops_command == "queue-status":
             payload = build_content_ops_queue_status_packet(
                 items=[
-                    _load_json_object(path) for path in args.item_json
+                    read_json(path) for path in args.item_json
                 ],
                 queue_id=args.queue_id,
                 generated_at=args.generated_at,
@@ -616,19 +722,19 @@ def handle_content_ops_command(
             renderer = render_layout_packet_markdown
         elif args.content_ops_command == "layout-check":
             payload = check_layout_packet(
-                _load_json_object(args.plan_json),
-                _load_json_object(args.measurement_json),
+                read_json(args.plan_json),
+                read_json(args.measurement_json),
             )
             renderer = render_layout_packet_markdown
         else:
             raise ValueError(
-                "content-ops requires `preview`, `exploration-plan`, "
-                "`issue-fix-intake`, `issue-fix-metadata-preview`, "
-                "`observe-public-handle`, `project-private-connector-gate`, "
-                "`aggregate-packets`, `project-chatview-report`, or "
-                "`walkthrough-artifact`, `item-create`, `item-transition`, "
-                "`queue-status`, `template-list`, `template-show`, "
-                "`layout-plan`, or `layout-check`"
+                "content-ops requires `media`, `generation`, `image`, `reference`, "
+                "`preview`, `exploration-plan`, `issue-fix-intake`, "
+                "`issue-fix-metadata-preview`, `observe-public-handle`, "
+                "`project-private-connector-gate`, `aggregate-packets`, "
+                "`project-chatview-report`, `walkthrough-artifact`, "
+                "`item-create`, `item-transition`, `queue-status`, "
+                "`template-list`, `template-show`, `layout-plan`, or `layout-check`"
             )
     except Exception as exc:
         payload = {
@@ -643,7 +749,9 @@ def handle_content_ops_command(
             "layout-check",
         }:
             renderer = render_layout_packet_markdown
-        else:
+        elif args.content_ops_command == "project-private-connector-gate":
             renderer = render_content_ops_private_connector_gate_markdown
+        else:
+            renderer = _render_content_ops_error_markdown
     print_payload(payload, output_format(args), renderer)
     return 0 if payload.get("ok") else 1

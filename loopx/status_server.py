@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,18 @@ from urllib.parse import parse_qs, urlparse
 
 from .control_plane.goals.configure_goal_service import (
     configure_goal_with_global_sync,
+)
+from .capabilities.multi_subagent import (
+    apply_codex_subagent_capacity,
+    plan_codex_subagent_capacity,
+    public_codex_host_capacity,
+)
+from .capabilities.periodic_report.workspace import (
+    DEFAULT_WORKSPACE_INDEX_LIMIT,
+    MAX_WORKSPACE_INDEX_LIMIT,
+    MAX_WORKSPACE_INDEX_OFFSET,
+    collect_periodic_report_workspace_index,
+    read_published_periodic_report_workspace_projection,
 )
 from .control_plane.status.ssh_host_catalog import (
     SSH_HOST_CATALOG_PATH,
@@ -37,6 +50,8 @@ DEFAULT_CONFIGURE_GOAL_APPLY_PATH = "/control-plane/configure-goal/apply"
 DEFAULT_REVIEW_MATERIAL_PATH = "/review-material"
 DEFAULT_EXTENSION_PRESENTATION_SURFACES_PATH = "/extension-presentation-surfaces"
 DEFAULT_EXTENSION_PROJECTION_PATH = "/extension-projection"
+DEFAULT_PERIODIC_REPORT_INDEX_PATH = "/periodic-report-workspace"
+DEFAULT_PERIODIC_REPORT_PROJECTION_PATH = "/periodic-report-workspace-projection"
 DEFAULT_SSH_HOSTS_PATH = SSH_HOST_CATALOG_PATH
 
 REWARD_REQUEST_FIELDS = {
@@ -67,6 +82,7 @@ CONFIGURE_GOAL_REQUEST_FIELDS = {
     "orchestration_mode",
     "spawn_allowed",
     "max_children",
+    "align_codex_subagent_capacity",
     "allowed_domains",
     "clear_allowed_domains",
     "registered_agents",
@@ -94,6 +110,56 @@ CONFIGURE_GOAL_REQUEST_FIELDS = {
     "clear_boundary_authority",
 }
 CONFIGURE_GOAL_APPLY_FIELDS = CONFIGURE_GOAL_REQUEST_FIELDS | {"preview_id"}
+
+
+def _reject_non_standard_json_constant(value: str) -> None:
+    raise ValueError(
+        f"request body must be strict JSON; non-standard constant {value} is not allowed"
+    )
+
+
+def _require_finite_json_numbers(value: Any) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("request body must be strict JSON; non-finite numbers are not allowed")
+    if isinstance(value, dict):
+        for item in value.values():
+            _require_finite_json_numbers(item)
+    elif isinstance(value, list):
+        for item in value:
+            _require_finite_json_numbers(item)
+
+
+def parse_strict_json_object(raw: bytes) -> dict[str, Any]:
+    payload = json.loads(
+        raw.decode("utf-8"),
+        parse_constant=_reject_non_standard_json_constant,
+    )
+    _require_finite_json_numbers(payload)
+    if not isinstance(payload, dict):
+        raise ValueError("request body must be a JSON object")
+    return payload
+
+
+def parse_goal_activation_filter(query: dict[str, list[str]]) -> str | None:
+    """Parse the shared scoped-status query without accepting ambiguous input."""
+
+    values = query.get("goal_activation", [])
+    if len(values) > 1 or (values and values[0] not in {"active", "stopped"}):
+        raise ValueError("goal_activation must be active or stopped")
+    return values[0] if values else None
+
+
+def _json_boolean(body: dict[str, Any], field: str, *, default: bool = False) -> bool:
+    if field not in body:
+        return default
+    value = body[field]
+    if type(value) is not bool:
+        raise ValueError(f"{field} must be a JSON boolean")
+    return value
+
+
+def _optional_json_boolean(body: dict[str, Any], field: str) -> bool | None:
+    return _json_boolean(body, field) if field in body else None
 
 
 def is_loopback_host(host: str) -> bool:
@@ -136,12 +202,18 @@ def reward_preview_id(payload: dict[str, Any]) -> str:
 
 
 def configure_goal_preview_id(payload: dict[str, Any]) -> str:
+    codex_host_capacity = payload.get("codex_host_capacity")
+    if isinstance(codex_host_capacity, dict) and isinstance(
+        codex_host_capacity.get("plan_before_apply"), dict
+    ):
+        codex_host_capacity = codex_host_capacity["plan_before_apply"]
     stable_payload = {
         "goal_id": payload.get("goal_id"),
         "changed": payload.get("changed"),
         "changed_fields": payload.get("changed_fields"),
         "before": payload.get("before"),
         "after": payload.get("after"),
+        "codex_host_capacity": codex_host_capacity,
     }
     stable = json.dumps(stable_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:24]
@@ -161,11 +233,133 @@ class StatusHTTPServer(ThreadingHTTPServer):
     configure_goal_dry_run_path: str
     configure_goal_apply_path: str
     control_plane_write_enabled: bool
+    goal_subagent_configuration_enabled: bool
     ssh_config_path: Path | None
     verbose: bool
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.runtime_identity = release_runtime_identity()
+        super().__init__(*args, **kwargs)
 
-class StatusRequestHandler(BaseHTTPRequestHandler):
+
+class ExtensionPresentationRequestMixin:
+    """Shared read-only extension routes for loopback status and Chat surfaces."""
+
+    server: Any
+
+    def _send_json(self, payload: dict[str, Any], *, status: int = 200) -> None:
+        raise NotImplementedError
+
+    def _handle_extension_projection(self, query: dict[str, list[str]]) -> None:
+        if not is_loopback_host(str(self.server.server_address[0])):
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "extension projection reads require a loopback status server",
+                },
+                status=403,
+            )
+            return
+        if not is_loopback_origin(self.headers.get("Origin")):
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "extension projection reads only accept loopback browser origins",
+                },
+                status=403,
+            )
+            return
+        extension_id = (query.get("extension_id") or [""])[0].strip()
+        surface_id = (query.get("surface_id") or [""])[0].strip()
+        extension_revision = (query.get("extension_revision") or [""])[0].strip()
+        payload_sha256 = (query.get("payload_sha256") or [""])[0].strip()
+        if not (extension_id and surface_id and extension_revision and payload_sha256):
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": (
+                        "extension_id, surface_id, extension_revision, and "
+                        "payload_sha256 are required"
+                    ),
+                },
+                status=400,
+            )
+            return
+        try:
+            registry = load_registry(self.server.registry_path)
+            runtime_root = resolve_runtime_root(
+                registry,
+                self.server.runtime_root_override,
+                registry_path=self.server.registry_path,
+            )
+            envelope = read_extension_projection(
+                state_file=default_extension_state_file(runtime_root),
+                extension_id=extension_id,
+                surface_id=surface_id,
+                extension_revision=extension_revision,
+                payload_sha256=payload_sha256,
+            )
+        except Exception as exc:  # noqa: BLE001 - local UI needs the read failure.
+            self._send_json(
+                {
+                    "ok": False,
+                    "extension_id": extension_id,
+                    "surface_id": surface_id,
+                    "error": str(exc),
+                },
+                status=400,
+            )
+            return
+        self._send_json({"ok": True, "projection": envelope})
+
+    def _handle_extension_presentation_surfaces(self) -> None:
+        if not is_loopback_host(str(self.server.server_address[0])):
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": (
+                        "extension presentation surfaces require a loopback "
+                        "status server"
+                    ),
+                },
+                status=403,
+            )
+            return
+        if not is_loopback_origin(self.headers.get("Origin")):
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": (
+                        "extension presentation surfaces only accept loopback "
+                        "browser origins"
+                    ),
+                },
+                status=403,
+            )
+            return
+        try:
+            registry = load_registry(self.server.registry_path)
+            runtime_root = resolve_runtime_root(
+                registry,
+                self.server.runtime_root_override,
+                registry_path=self.server.registry_path,
+            )
+            surfaces = collect_active_extension_presentation_surfaces(
+                state_file=default_extension_state_file(runtime_root),
+            )
+        except Exception as exc:  # noqa: BLE001 - local UI needs the read failure.
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                },
+                status=400,
+            )
+            return
+        self._send_json({"ok": True, "presentation_surfaces": surfaces})
+
+
+class StatusRequestHandler(ExtensionPresentationRequestMixin, BaseHTTPRequestHandler):
     server: StatusHTTPServer
 
     def _send_json(self, payload: dict[str, Any], *, status: int = 200) -> None:
@@ -191,11 +385,7 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("request body is empty")
         if content_length > 64_000:
             raise ValueError("request body is too large")
-        raw = self.rfile.read(content_length)
-        payload = json.loads(raw.decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("request body must be a JSON object")
-        return payload
+        return parse_strict_json_object(self.rfile.read(content_length))
 
     def _parse_reward_body(self, body: dict[str, Any], *, append: bool) -> tuple[str, str | None, dict[str, Any]]:
         allowed = REWARD_APPEND_FIELDS if append else REWARD_REQUEST_FIELDS
@@ -279,8 +469,13 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             goal_id=goal_id,
             run_generated_at=run_generated_at,
             reward=reward,
+            actor_kind="owner",
             dry_run=True,
-            write_active_state_summary=bool(body.get("write_active_state_summary")) if append else False,
+            write_active_state_summary=(
+                _json_boolean(body, "write_active_state_summary", default=True)
+                if append
+                else False
+            ),
         )
 
     def _handle_reward_dry_run(self) -> None:
@@ -355,8 +550,11 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 goal_id=goal_id,
                 run_generated_at=run_generated_at,
                 reward=reward,
+                actor_kind="owner",
                 dry_run=False,
-                write_active_state_summary=bool(body.get("write_active_state_summary", True)),
+                write_active_state_summary=_json_boolean(
+                    body, "write_active_state_summary", default=True
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - preserve validation diagnostics for the local UI.
             self._send_json(
@@ -365,6 +563,7 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                     "dry_run": False,
                     "appended": False,
                     "error": str(exc),
+                    **({"error_code": exc.code, **getattr(exc, "payload", {})} if isinstance(getattr(exc, "code", None), str) else {}),
                 },
                 status=400,
             )
@@ -430,20 +629,25 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             "goal_id": goal_id,
             "quota_compute": body.get("quota_compute"),
             "quota_window_hours": body.get("quota_window_hours"),
-            "self_repair_enabled": body.get("self_repair_enabled"),
-            "self_repair_health": body.get("self_repair_health"),
-            "self_repair_waiting_projection": body.get("self_repair_waiting_projection"),
+            "self_repair_enabled": _optional_json_boolean(body, "self_repair_enabled"),
+            "self_repair_health": _optional_json_boolean(body, "self_repair_health"),
+            "self_repair_waiting_projection": _optional_json_boolean(
+                body, "self_repair_waiting_projection"
+            ),
             "multi_subagent_feature": body.get("multi_subagent_feature"),
             "orchestration_mode": body.get("orchestration_mode"),
-            "spawn_allowed": body.get("spawn_allowed"),
+            "spawn_allowed": _optional_json_boolean(body, "spawn_allowed"),
             "max_children": body.get("max_children"),
+            "align_codex_subagent_capacity": _json_boolean(
+                body, "align_codex_subagent_capacity"
+            ),
             "allowed_domains": [str(item) for item in allowed_domains] if allowed_domains is not None else None,
-            "clear_allowed_domains": bool(body.get("clear_allowed_domains", False)),
+            "clear_allowed_domains": _json_boolean(body, "clear_allowed_domains"),
             "registered_agents": [str(item) for item in registered_agents] if registered_agents is not None else None,
-            "clear_registered_agents": bool(body.get("clear_registered_agents", False)),
+            "clear_registered_agents": _json_boolean(body, "clear_registered_agents"),
             "peer_task_coordinator": body.get("peer_task_coordinator"),
-            "clear_peer_task_coordinator": bool(
-                body.get("clear_peer_task_coordinator", False)
+            "clear_peer_task_coordinator": _json_boolean(
+                body, "clear_peer_task_coordinator"
             ),
             "agent_profiles": agent_profiles,
             "clear_agent_profiles": (
@@ -470,10 +674,10 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 if supervised_agents is not None
                 else None
             ),
-            "clear_supervisor": bool(body.get("clear_supervisor", False)),
+            "clear_supervisor": _json_boolean(body, "clear_supervisor"),
             "write_scope": [str(item) for item in write_scope] if write_scope is not None else None,
-            "replace_write_scope": bool(body.get("replace_write_scope", False)),
-            "clear_write_scope": bool(body.get("clear_write_scope", False)),
+            "replace_write_scope": _json_boolean(body, "replace_write_scope"),
+            "clear_write_scope": _json_boolean(body, "clear_write_scope"),
             "boundary_authority_scopes": (
                 [str(item) for item in boundary_authority_scopes]
                 if boundary_authority_scopes is not None
@@ -483,7 +687,7 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             "boundary_authority_decision_id": body.get("boundary_authority_decision_id"),
             "boundary_authority_recorded_at": body.get("boundary_authority_recorded_at"),
             "boundary_authority_expires_at": body.get("boundary_authority_expires_at"),
-            "clear_boundary_authority": bool(body.get("clear_boundary_authority", False)),
+            "clear_boundary_authority": _json_boolean(body, "clear_boundary_authority"),
         }
 
     def _configure_goal_payload(self, body: dict[str, Any], *, apply: bool, execute: bool) -> dict[str, Any]:
@@ -501,6 +705,11 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             orchestration_mode=values["orchestration_mode"],
             spawn_allowed=values["spawn_allowed"],
             max_children=values["max_children"],
+            align_codex_subagent_capacity=values[
+                "align_codex_subagent_capacity"
+            ],
+            codex_host_capacity_planner=plan_codex_subagent_capacity,
+            codex_host_capacity_applier=apply_codex_subagent_capacity,
             allowed_domains=values["allowed_domains"],
             clear_allowed_domains=values["clear_allowed_domains"],
             registered_agents=values["registered_agents"],
@@ -548,6 +757,10 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             "control_plane_summary": payload.get("control_plane_summary"),
             "orchestration_summary": payload.get("orchestration_summary"),
             "feature_summary": payload.get("feature_summary"),
+            "goal_configuration_changed": payload.get(
+                "goal_configuration_changed"
+            ),
+            "codex_host_capacity": public_codex_host_capacity(payload),
             "heartbeat_prompt_migration": payload.get("heartbeat_prompt_migration"),
             "supervisor_prompt": payload.get("supervisor_prompt"),
             "global_sync": payload.get("global_sync"),
@@ -671,39 +884,13 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json(payload)
 
-    def _handle_extension_projection(self, query: dict[str, list[str]]) -> None:
-        if not is_loopback_host(str(self.server.server_address[0])):
+    def _handle_periodic_report_index(self, query: dict[str, list[str]]) -> None:
+        if not is_loopback_host(
+            str(self.server.server_address[0])
+        ) or not is_loopback_origin(self.headers.get("Origin")):
             self._send_json(
-                {
-                    "ok": False,
-                    "error": "extension projection reads require a loopback status server",
-                },
+                {"ok": False, "error": "periodic report reads require loopback access"},
                 status=403,
-            )
-            return
-        if not is_loopback_origin(self.headers.get("Origin")):
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": "extension projection reads only accept loopback browser origins",
-                },
-                status=403,
-            )
-            return
-        extension_id = (query.get("extension_id") or [""])[0].strip()
-        surface_id = (query.get("surface_id") or [""])[0].strip()
-        extension_revision = (query.get("extension_revision") or [""])[0].strip()
-        payload_sha256 = (query.get("payload_sha256") or [""])[0].strip()
-        if not (extension_id and surface_id and extension_revision and payload_sha256):
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": (
-                        "extension_id, surface_id, extension_revision, and "
-                        "payload_sha256 are required"
-                    ),
-                },
-                status=400,
             )
             return
         try:
@@ -713,71 +900,77 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 self.server.runtime_root_override,
                 registry_path=self.server.registry_path,
             )
-            envelope = read_extension_projection(
-                state_file=default_extension_state_file(runtime_root),
-                extension_id=extension_id,
-                surface_id=surface_id,
-                extension_revision=extension_revision,
-                payload_sha256=payload_sha256,
+            goal_id = (query.get("goal_id") or [""])[0].strip() or None
+            limit_text = (query.get("limit") or [""])[0].strip()
+            offset_text = (query.get("offset") or [""])[0].strip()
+            window_requested = "limit" in query or "offset" in query
+            limit = DEFAULT_WORKSPACE_INDEX_LIMIT if not limit_text else int(limit_text)
+            offset = 0 if not offset_text else int(offset_text)
+            if limit < 0 or limit > MAX_WORKSPACE_INDEX_LIMIT:
+                raise ValueError(
+                    "periodic report index limit must be between 0 and "
+                    f"{MAX_WORKSPACE_INDEX_LIMIT}"
+                )
+            if offset < 0 or offset > MAX_WORKSPACE_INDEX_OFFSET:
+                raise ValueError(
+                    "periodic report index offset must be between 0 and "
+                    f"{MAX_WORKSPACE_INDEX_OFFSET}"
+                )
+            index = collect_periodic_report_workspace_index(
+                runtime_root=runtime_root,
+                goal_id=goal_id,
+                limit=limit,
+                offset=offset,
             )
+            if not window_requested:
+                index = {
+                    "schema_version": index["schema_version"],
+                    "count": index["count"],
+                    "items": index["items"],
+                }
         except Exception as exc:  # noqa: BLE001 - local UI needs the read failure.
-            self._send_json(
-                {
-                    "ok": False,
-                    "extension_id": extension_id,
-                    "surface_id": surface_id,
-                    "error": str(exc),
-                },
-                status=400,
-            )
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
             return
-        self._send_json({"ok": True, "projection": envelope})
+        self._send_json({"ok": True, "periodic_reports": index})
 
-    def _handle_extension_presentation_surfaces(self) -> None:
-        if not is_loopback_host(str(self.server.server_address[0])):
+    def _handle_periodic_report_projection(self, query: dict[str, list[str]]) -> None:
+        if not is_loopback_host(
+            str(self.server.server_address[0])
+        ) or not is_loopback_origin(self.headers.get("Origin")):
             self._send_json(
-                {
-                    "ok": False,
-                    "error": (
-                        "extension presentation surfaces require a loopback "
-                        "status server"
-                    ),
-                },
+                {"ok": False, "error": "periodic report reads require loopback access"},
                 status=403,
             )
             return
-        if not is_loopback_origin(self.headers.get("Origin")):
+        values = {
+            key: (query.get(key) or [""])[0].strip()
+            for key in (
+                "goal_id",
+                "agent_id",
+                "generation_id",
+                "content_sha256",
+            )
+        }
+        if not all(values.values()):
             self._send_json(
-                {
-                    "ok": False,
-                    "error": (
-                        "extension presentation surfaces only accept loopback "
-                        "browser origins"
-                    ),
-                },
-                status=403,
+                {"ok": False, "error": "exact periodic report ref is required"},
+                status=400,
             )
             return
         try:
             registry = load_registry(self.server.registry_path)
-            runtime_root = resolve_runtime_root(
-                registry,
-                self.server.runtime_root_override,
-                registry_path=self.server.registry_path,
-            )
-            surfaces = collect_active_extension_presentation_surfaces(
-                state_file=default_extension_state_file(runtime_root),
+            projection = read_published_periodic_report_workspace_projection(
+                runtime_root=resolve_runtime_root(
+                    registry,
+                    self.server.runtime_root_override,
+                    registry_path=self.server.registry_path,
+                ),
+                **values,
             )
         except Exception as exc:  # noqa: BLE001 - local UI needs the read failure.
-            self._send_json(
-                {
-                    "ok": False,
-                    "error": str(exc),
-                },
-                status=400,
-            )
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
             return
-        self._send_json({"ok": True, "presentation_surfaces": surfaces})
+        self._send_json({"ok": True, "projection": projection})
 
     def _handle_ssh_hosts(self) -> None:
         if not is_loopback_host(str(self.server.server_address[0])):
@@ -805,14 +998,17 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
     def _local_dashboard_api_payload(self) -> dict[str, Any]:
         return {
             "source": "serve-status",
-            "runtime_identity": release_runtime_identity(),
+            "runtime_identity": self.server.runtime_identity,
             "status_url": self.server.status_path,
             "health_url": "/healthz",
+            "readiness_url": "/?readiness=1",
             "review_material_url": DEFAULT_REVIEW_MATERIAL_PATH,
             "presentation_surfaces_url": (
                 DEFAULT_EXTENSION_PRESENTATION_SURFACES_PATH
             ),
             "presentation_detail_url": DEFAULT_EXTENSION_PROJECTION_PATH,
+            "periodic_report_index_url": DEFAULT_PERIODIC_REPORT_INDEX_PATH,
+            "periodic_report_detail_url": DEFAULT_PERIODIC_REPORT_PROJECTION_PATH,
             "ssh_hosts_url": DEFAULT_SSH_HOSTS_PATH,
             "reward_dry_run_url": self.server.reward_dry_run_path,
             "reward_append_url": self.server.reward_append_path if self.server.reward_write_enabled else None,
@@ -824,29 +1020,75 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             "control_plane_write_enabled": self.server.control_plane_write_enabled,
         }
 
+    def _status_readiness(self) -> dict[str, str]:
+        # Read only the existing configuration boundary, not Goal projections,
+        # provider health, or repository scans. An absent registry is a valid
+        # empty installation under load_registry's existing contract.
+        reason = "registry_readable"
+        try:
+            registry = load_registry(self.server.registry_path)
+            if not isinstance(registry, dict):
+                reason = "registry_invalid"
+        except (ValueError, UnicodeError):
+            reason = "registry_invalid"
+        except OSError:
+            reason = "registry_unavailable"
+        return {
+            "schema_version": "loopx_status_readiness_v0",
+            "state": "ready" if reason == "registry_readable" else "failed",
+            "reason": reason,
+        }
+
     def do_GET(self) -> None:
         parsed_url = urlparse(self.path)
         path = parsed_url.path
+        # Keep blank values so `?goal_activation=` and repeated values like
+        # `?goal_activation=active&goal_activation=` fail closed with HTTP 400
+        # instead of being silently dropped by the default parse_qs behavior.
+        query = parse_qs(parsed_url.query, keep_blank_values=True)
         if path == "/healthz":
             self._send_json({"ok": True})
             return
         if path == DEFAULT_REVIEW_MATERIAL_PATH:
-            self._handle_review_material(parse_qs(parsed_url.query))
+            self._handle_review_material(query)
             return
         if path == DEFAULT_EXTENSION_PRESENTATION_SURFACES_PATH:
             self._handle_extension_presentation_surfaces()
             return
         if path == DEFAULT_EXTENSION_PROJECTION_PATH:
-            self._handle_extension_projection(parse_qs(parsed_url.query))
+            self._handle_extension_projection(query)
+            return
+        if path == DEFAULT_PERIODIC_REPORT_INDEX_PATH:
+            self._handle_periodic_report_index(query)
+            return
+        if path == DEFAULT_PERIODIC_REPORT_PROJECTION_PATH:
+            self._handle_periodic_report_projection(query)
             return
         if path == DEFAULT_SSH_HOSTS_PATH:
             self._handle_ssh_hosts()
             return
         if path in {"", "/"}:
+            readiness = query.get("readiness")
+            if readiness is not None and readiness != ["1"]:
+                self._send_json(
+                    {"ok": False, "error": "readiness must be specified once as 1"},
+                    status=400,
+                )
+                return
+            if readiness is not None and (
+                not is_loopback_host(str(self.server.server_address[0]))
+                or not is_loopback_origin(self.headers.get("Origin"))
+            ):
+                self._send_json(
+                    {"ok": False, "error": "readiness requires loopback access"},
+                    status=403,
+                )
+                return
             self._send_json(
                 {
                     "ok": True,
                     **self._local_dashboard_api_payload(),
+                    **({"readiness": self._status_readiness()} if readiness is not None else {}),
                 }
             )
             return
@@ -862,12 +1104,30 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            activation_state_filter = parse_goal_activation_filter(query)
+        except ValueError as exc:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                },
+                status=400,
+            )
+            return
+
+        try:
             payload = collect_status(
                 registry_path=self.server.registry_path,
                 runtime_root_override=self.server.runtime_root_override,
-                scan_roots=self.server.scan_roots,
                 limit=self.server.limit,
-                include_public_boundary_scan=False,
+                include_goal_subagent_configuration=(
+                    getattr(
+                        self.server,
+                        "goal_subagent_configuration_enabled",
+                        False,
+                    )
+                ),
+                activation_state_filter=activation_state_filter,
             )
             payload["local_dashboard_api"] = self._local_dashboard_api_payload()
         except Exception as exc:  # noqa: BLE001 - the HTTP layer should preserve diagnostics.
@@ -936,6 +1196,7 @@ def serve_status(
     enable_reward_write_api: bool,
     enable_control_plane_write_api: bool,
     verbose: bool,
+    enable_goal_subagent_configuration: bool = False,
 ) -> None:
     normalized_path = normalize_status_path(status_path)
     if enable_reward_write_api and not is_loopback_host(host):
@@ -954,6 +1215,9 @@ def serve_status(
     server.configure_goal_dry_run_path = DEFAULT_CONFIGURE_GOAL_DRY_RUN_PATH
     server.configure_goal_apply_path = DEFAULT_CONFIGURE_GOAL_APPLY_PATH
     server.control_plane_write_enabled = enable_control_plane_write_api
+    server.goal_subagent_configuration_enabled = (
+        enable_goal_subagent_configuration
+    )
     server.ssh_config_path = None
     server.verbose = verbose
     print(f"Serving LoopX status at http://{host}:{port}{normalized_path}", flush=True)

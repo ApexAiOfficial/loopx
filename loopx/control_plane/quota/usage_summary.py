@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import math
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Callable
 
+from ...paths import validate_goal_id_path_segment
+from .ledger_readback import net_quota_slot_spend, quota_slot_observation
 from .spend_sources import VISIBLE_GOAL_SLOT_SPEND_SOURCE
-from .usage_collector import UsageSample, collect_usage_for_run
+from .usage_collector import UsageRowError, UsageSample, collect_usage_for_run
 from ..runtime.time import now_utc
 
 USAGE_PROXY_NOTE = (
@@ -13,6 +17,7 @@ USAGE_PROXY_NOTE = (
 )
 
 ParseTimestamp = Callable[[Any], Any]
+SlotContribution = tuple[tuple[str, str], str, int]
 USAGE_METRIC_NAMES = (
     "input_tokens",
     "output_tokens",
@@ -22,19 +27,21 @@ USAGE_METRIC_NAMES = (
 )
 
 
-def quota_spend_slots(run: dict[str, Any]) -> int:
-    classification = str(run.get("classification") or "")
-    if classification not in {"quota_slot_spent", "quota_slot_voided"}:
-        return 0
-    quota_event = run.get("quota_event") if isinstance(run.get("quota_event"), dict) else {}
-    raw_slots = quota_event.get("slots", 1)
-    try:
-        slots = max(0, int(raw_slots))
-    except (TypeError, ValueError):
-        slots = 1
-    if classification == "quota_slot_voided" or str(quota_event.get("event_type") or "") == "quota_slot_voided":
-        return -slots
-    return slots
+def _goal_quota_spend_slots(
+    contributions: list[SlotContribution],
+) -> tuple[dict[str, int], int]:
+    """Fold each run's slot contribution into per-goal window spend.
+
+    Buckets are keyed by ``(goal_id, run key)`` and clamped by the shared
+    ledger rule, so a goal only ever loses the spend a void actually targets.
+    """
+
+    per_goal: dict[str, int] = {}
+    total = 0
+    for (goal_id, _run_key), slots in net_quota_slot_spend(contributions).items():
+        per_goal[goal_id] = per_goal.get(goal_id, 0) + slots
+        total += slots
+    return per_goal, total
 
 
 def is_automation_run(run: dict[str, Any]) -> bool:
@@ -79,36 +86,75 @@ def blank_usage_goal(goal_id: str) -> dict[str, Any]:
     }
 
 
-def _accumulate_usage(bucket: dict[str, Any], sample: UsageSample, suffix: str) -> None:
-    bucket[f"input_tokens_{suffix}"] += sample.input_tokens
-    bucket[f"output_tokens_{suffix}"] += sample.output_tokens
-    bucket[f"cache_tokens_{suffix}"] += sample.cache_tokens
-    bucket[f"cost_usd_{suffix}"] += sample.cost_usd
-    bucket[f"duration_ms_{suffix}"] += sample.duration_ms
+def _accumulate_usage(
+    bucket: dict[str, Any],
+    sample: UsageSample,
+    suffix: str,
+    observed_metrics: set[str],
+) -> None:
+    bucket[f"input_tokens_{suffix}"] = (
+        int(bucket.get(f"input_tokens_{suffix}") or 0) + sample.input_tokens
+    )
+    bucket[f"output_tokens_{suffix}"] = (
+        int(bucket.get(f"output_tokens_{suffix}") or 0) + sample.output_tokens
+    )
+    observed_metrics.add(f"input_tokens_{suffix}")
+    observed_metrics.add(f"output_tokens_{suffix}")
+    if sample.cache_tokens is not None:
+        bucket[f"cache_tokens_{suffix}"] = (
+            int(bucket.get(f"cache_tokens_{suffix}") or 0) + sample.cache_tokens
+        )
+        observed_metrics.add(f"cache_tokens_{suffix}")
+    if sample.cost_usd is not None:
+        key = f"cost_usd_{suffix}"
+        accumulated_cost = float(bucket.get(key) or 0.0) + sample.cost_usd
+        if not math.isfinite(accumulated_cost):
+            raise UsageRowError(f"usage summary {key} must be finite")
+        bucket[key] = accumulated_cost
+        observed_metrics.add(key)
+    if sample.duration_ms is not None:
+        bucket[f"duration_ms_{suffix}"] = (
+            int(bucket.get(f"duration_ms_{suffix}") or 0) + sample.duration_ms
+        )
+        observed_metrics.add(f"duration_ms_{suffix}")
 
 
 def _round_cost(bucket: dict[str, Any]) -> None:
     for suffix in ("24h", "7d"):
         key = f"cost_usd_{suffix}"
         if key in bucket:
-            bucket[key] = round(float(bucket[key]), 6)
+            rounded_cost = round(float(bucket[key]), 6)
+            if not math.isfinite(rounded_cost):
+                raise UsageRowError(f"usage summary {key} must be finite")
+            bucket[key] = rounded_cost
 
 
-def _strip_unobserved_usage_windows(
+def _strip_unobserved_usage_metrics(
     bucket: dict[str, Any],
-    observed_windows: set[str],
+    observed_metrics: set[str],
 ) -> None:
     for suffix in ("24h", "7d"):
-        if suffix in observed_windows:
-            continue
         for metric_name in USAGE_METRIC_NAMES:
-            bucket.pop(f"{metric_name}_{suffix}", None)
+            key = f"{metric_name}_{suffix}"
+            if key not in observed_metrics:
+                bucket.pop(key, None)
+
+
+def _usage_runs_dir(runtime_root: Path | None, goal_id: str) -> Path | None:
+    if runtime_root is None or not goal_id:
+        return None
+    try:
+        safe_goal_id = validate_goal_id_path_segment(goal_id)
+    except ValueError:
+        return None
+    return Path(runtime_root).expanduser() / "goals" / safe_goal_id / "runs"
 
 
 def build_usage_summary(
     history: dict[str, Any],
     *,
     parse_timestamp: ParseTimestamp,
+    runtime_root: Path | None = None,
 ) -> dict[str, Any]:
     now = now_utc()
     cutoff_24h = now - timedelta(hours=24)
@@ -134,8 +180,10 @@ def build_usage_summary(
         "duration_ms_7d": 0,
     }
     goals: dict[str, dict[str, Any]] = {}
-    observed_usage_windows: set[str] = set()
-    goal_usage_windows: dict[str, set[str]] = {}
+    observed_usage_metrics: set[str] = set()
+    goal_usage_metrics: dict[str, set[str]] = {}
+    slot_contributions_24h: list[SlotContribution] = []
+    slot_contributions_7d: list[SlotContribution] = []
     sample_count = 0
 
     for run in history.get("runs") or []:
@@ -147,16 +195,29 @@ def build_usage_summary(
             continue
         goal_id = str(run.get("goal_id") or "unknown-goal")
         goal = goals.setdefault(goal_id, blank_usage_goal(goal_id))
-        slots = quota_spend_slots(run)
+        slot_contribution, unreadable_reason = quota_slot_observation(
+            run,
+            runs_dir=_usage_runs_dir(runtime_root, str(run.get("goal_id") or "")),
+            goal_id=str(run.get("goal_id") or "") or None,
+        )
         automation_event = is_automation_run(run)
         progress_signal = is_progress_signal_run(run)
+        # Present-but-illegal usage fails closed inside collect_usage_for_run.
         usage_sample = collect_usage_for_run(run)
+        goal_metrics = goal_usage_metrics.setdefault(goal_id, set())
 
         if generated_at >= cutoff_7d:
             totals["runs_7d"] += 1
             goal["runs_7d"] += 1
-            totals["quota_spend_slots_7d"] += slots
-            goal["quota_spend_slots_7d"] += slots
+            if unreadable_reason is not None:
+                # The summary must not report a spend it cannot read back as a
+                # zero-spend run; the integrity failure is reported next to
+                # the slots that were readable.
+                totals["unreadable_event_count_7d"] = totals.get("unreadable_event_count_7d", 0) + 1
+                goal["unreadable_event_count_7d"] = goal.get("unreadable_event_count_7d", 0) + 1
+            elif slot_contribution is not None:
+                kind, run_key, slots = slot_contribution
+                slot_contributions_7d.append(((goal_id, run_key), kind, slots))
             if automation_event:
                 totals["automation_run_count_7d"] += 1
                 goal["automation_run_count_7d"] += 1
@@ -164,15 +225,17 @@ def build_usage_summary(
                 totals["progress_signal_run_count_7d"] += 1
                 goal["progress_signal_run_count_7d"] += 1
             if usage_sample is not None:
-                _accumulate_usage(totals, usage_sample, "7d")
-                _accumulate_usage(goal, usage_sample, "7d")
-                observed_usage_windows.add("7d")
-                goal_usage_windows.setdefault(goal_id, set()).add("7d")
+                _accumulate_usage(totals, usage_sample, "7d", observed_usage_metrics)
+                _accumulate_usage(goal, usage_sample, "7d", goal_metrics)
         if generated_at >= cutoff_24h:
             totals["runs_24h"] += 1
             goal["runs_24h"] += 1
-            totals["quota_spend_slots_24h"] += slots
-            goal["quota_spend_slots_24h"] += slots
+            if unreadable_reason is not None:
+                totals["unreadable_event_count_24h"] = totals.get("unreadable_event_count_24h", 0) + 1
+                goal["unreadable_event_count_24h"] = goal.get("unreadable_event_count_24h", 0) + 1
+            elif slot_contribution is not None:
+                kind, run_key, slots = slot_contribution
+                slot_contributions_24h.append(((goal_id, run_key), kind, slots))
             if automation_event:
                 totals["automation_run_count_24h"] += 1
                 goal["automation_run_count_24h"] += 1
@@ -180,10 +243,16 @@ def build_usage_summary(
                 totals["progress_signal_run_count_24h"] += 1
                 goal["progress_signal_run_count_24h"] += 1
             if usage_sample is not None:
-                _accumulate_usage(totals, usage_sample, "24h")
-                _accumulate_usage(goal, usage_sample, "24h")
-                observed_usage_windows.add("24h")
-                goal_usage_windows.setdefault(goal_id, set()).add("24h")
+                _accumulate_usage(totals, usage_sample, "24h", observed_usage_metrics)
+                _accumulate_usage(goal, usage_sample, "24h", goal_metrics)
+
+    goal_slots_24h, total_slots_24h = _goal_quota_spend_slots(slot_contributions_24h)
+    goal_slots_7d, total_slots_7d = _goal_quota_spend_slots(slot_contributions_7d)
+    totals["quota_spend_slots_24h"] = total_slots_24h
+    totals["quota_spend_slots_7d"] = total_slots_7d
+    for goal_id, goal in goals.items():
+        goal["quota_spend_slots_24h"] = goal_slots_24h.get(goal_id, 0)
+        goal["quota_spend_slots_7d"] = goal_slots_7d.get(goal_id, 0)
 
     if totals["runs_24h"]:
         for goal in goals.values():
@@ -198,18 +267,18 @@ def build_usage_summary(
         key=lambda item: (
             item["runs_24h"],
             item["quota_spend_slots_24h"],
-            item["cost_usd_24h"],
-            item["input_tokens_24h"],
+            float(item.get("cost_usd_24h") or 0.0),
+            int(item.get("input_tokens_24h") or 0),
             item["runs_7d"],
             item["goal_id"],
         ),
         reverse=True,
     )
-    _strip_unobserved_usage_windows(totals, observed_usage_windows)
+    _strip_unobserved_usage_metrics(totals, observed_usage_metrics)
     for goal in goal_rows:
-        _strip_unobserved_usage_windows(
+        _strip_unobserved_usage_metrics(
             goal,
-            goal_usage_windows.get(str(goal.get("goal_id") or ""), set()),
+            goal_usage_metrics.get(str(goal.get("goal_id") or ""), set()),
         )
     return {
         "available": True,

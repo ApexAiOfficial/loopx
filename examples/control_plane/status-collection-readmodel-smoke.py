@@ -7,7 +7,9 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -15,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from loopx import status as status_module  # noqa: E402
+from loopx.control_plane.goals import coordination_observation  # noqa: E402
 from loopx.control_plane.status import collection as collection_read_model  # noqa: E402
 
 
@@ -53,6 +56,8 @@ def write_registry(root: Path) -> Path:
                     {
                         "id": GOAL_ID,
                         "domain": "loopx-platform",
+                        "coordination": {"agent_model": "peer_v1",
+                            "registered_agents": ["codex-product-capability"]},
                         "status": "active",
                         "repo": str(project),
                         "state_file": state_file,
@@ -73,6 +78,8 @@ def write_registry(root: Path) -> Path:
         + "\n",
         encoding="utf-8",
     )
+    from loopx.control_plane.testing.canary_harness import import_fixture_authority
+    import_fixture_authority(registry_path, GOAL_ID, provider="sqlite")
     return registry_path
 
 
@@ -89,21 +96,30 @@ def scrub_volatile(value: Any) -> Any:
     return value
 
 
-def assert_wrapper_parity(registry_path: Path, runtime_root: Path, scan_root: Path) -> None:
+def assert_wrapper_parity(registry_path: Path, runtime_root: Path) -> None:
     kwargs: dict[str, Any] = {
         "registry_path": registry_path,
         "runtime_root_override": str(runtime_root),
-        "scan_roots": [scan_root],
         "limit": 3,
         "include_task_graph": True,
         "goal_id": GOAL_ID,
         "available_capabilities": ["network", "material_lifecycle"],
     }
-    wrapper = status_module.collect_status(**kwargs)
-    direct = collection_read_model.collect_status(
-        **kwargs,
-        context=status_module.build_status_collection_context(),
-    )
+    # Both adapters sample time independently; keep complete freshness/provider
+    # comparisons deterministic even when the two reads cross a wall-clock second.
+    with (
+        patch.object(
+            collection_read_model, "now_utc_iso", return_value="2026-01-01T00:00:00Z"
+        ),
+        patch.object(
+            coordination_observation, "now_local_iso", return_value="2026-01-01T00:00:00Z"
+        ),
+    ):
+        wrapper = status_module.collect_status(**kwargs)
+        direct = collection_read_model.collect_status(
+            **kwargs,
+            context=status_module.build_status_collection_context(),
+        )
 
     assert scrub_volatile(wrapper) == scrub_volatile(direct), (wrapper, direct)
     assert wrapper["ok"] is True, wrapper
@@ -117,6 +133,7 @@ def assert_wrapper_parity(registry_path: Path, runtime_root: Path, scan_root: Pa
 def assert_context_orchestration() -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
     runtime_root = Path("/tmp/status-collection-runtime")
+    history_audit = object()
 
     def record(name: str, value: Any) -> Any:
         calls.append((name, value if isinstance(value, dict) else {"value": value}))
@@ -136,21 +153,53 @@ def assert_context_orchestration() -> None:
         assert registry_path == Path("registry.json"), registry_path
         return runtime_root
 
-    def collect_history(**kwargs: Any) -> dict[str, Any]:
+    def collect_status_history(**kwargs: Any) -> SimpleNamespace:
         assert kwargs["limit"] == 20, kwargs
         assert kwargs["goal_id"] == GOAL_ID, kwargs
-        assert kwargs["include_runtime_goals"] is True, kwargs
-        return record("collect_history", {"goal_count": 1, "run_count": 0, "goals": []})
+        assert kwargs["status_include_runtime_goals"] is True, kwargs
+        history = record(
+            "collect_status_history",
+            {
+                "goal_count": 1,
+                "run_count": 0,
+                "goals": [],
+                "activation_state_filter": kwargs.get("activation_state_filter"),
+            },
+        )
+        return SimpleNamespace(
+            status_history=history,
+            contract_audit=history_audit,
+        )
 
     def check_contract(**kwargs: Any) -> dict[str, Any]:
         assert kwargs["limit"] == 2, kwargs
         assert kwargs["goal_id_filter"] == GOAL_ID, kwargs
-        return record("check_contract", {"ok": True, "summary": "ok", "warnings": [], "errors": [], "checks": []})
+        assert kwargs["history_audit"] is history_audit, kwargs
+        return record(
+            "check_contract",
+            {
+                "ok": True,
+                "summary": "ok",
+                "warnings": [],
+                "errors": [],
+                "checks": [],
+                "activation_state_filter": kwargs.get("activation_state_filter"),
+            },
+        )
 
     def build_attention_queue(**kwargs: Any) -> dict[str, Any]:
         assert kwargs["include_task_graph"] is False, kwargs
         assert kwargs["goal_id_filter"] == GOAL_ID, kwargs
-        return record("build_attention_queue", {"items": [], "item_count": 0})
+        return record(
+            "build_attention_queue",
+            {
+                "items": [],
+                "item_count": 0,
+                "include_stopped_goal_context": kwargs.get(
+                    "include_stopped_goal_context"
+                ),
+            },
+        )
 
     context = collection_read_model.StatusCollectionContext(
         load_registry=load_registry,
@@ -159,7 +208,7 @@ def assert_context_orchestration() -> None:
             "collect_global_registry_health",
             {"ok": True, "current_registry_is_global": True},
         ),
-        collect_history=collect_history,
+        collect_status_history=collect_status_history,
         check_contract=check_contract,
         build_attention_queue=build_attention_queue,
         build_runtime_summaries=lambda **kwargs: record(
@@ -194,13 +243,22 @@ def assert_context_orchestration() -> None:
     payload = collection_read_model.collect_status(
         registry_path=Path("registry.json"),
         runtime_root_override="runtime-override",
-        scan_roots=[Path("project")],
         limit=2,
         goal_id=GOAL_ID,
         available_capabilities=["network", "material_lifecycle"],
+        activation_state_filter="active",
         context=context,
     )
 
+    history_call = next(
+        call for call in calls if call[0] == "collect_status_history"
+    )
+    assert history_call[1]["activation_state_filter"] == "active", history_call
+    contract_call = next(call for call in calls if call[0] == "check_contract")
+    assert contract_call[1]["activation_state_filter"] == "active", contract_call
+    assert payload["goal_projection"]["scope"] == "active", payload["goal_projection"]
+    assert payload["goal_projection"]["complete"] is False, payload["goal_projection"]
+    assert payload["attention_queue"]["include_stopped_goal_context"] is False, payload
     assert payload["runtime_root"] == str(runtime_root), payload
     assert payload["run_history"]["display_limit"] == 2, payload
     assert payload["todo_index"]["limit"] == 240, payload
@@ -222,7 +280,7 @@ def assert_context_orchestration() -> None:
     assert [name for name, _ in calls][:4] == [
         "load_registry",
         "collect_global_registry_health",
-        "collect_history",
+        "collect_status_history",
         "check_contract",
     ], calls
 
@@ -231,7 +289,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as raw_root:
         root = Path(raw_root)
         registry_path = write_registry(root)
-        assert_wrapper_parity(registry_path, root / "runtime", root / "project")
+        assert_wrapper_parity(registry_path, root / "runtime")
     assert_context_orchestration()
     print("status-collection-readmodel-smoke ok")
 

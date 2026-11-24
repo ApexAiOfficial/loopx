@@ -1,6 +1,6 @@
 # 商业化与 SaaS 机会评估
 
-状态：评估目标。本文是战略评估，不是建设承诺。它讨论 LoopX 如何通过 Enterprise Harness、产品化交付、BYOC、托管运维或 SaaS，把控制面技术变成可重复的客户价值，同时不削弱 LoopX 赖以成立的 local-first、provider-neutral 契约。
+状态：评估目标。它讨论 LoopX 如何通过 Enterprise Harness、产品化交付、BYOC、托管运维或 SaaS，把控制面技术变成可重复的客户价值，同时不削弱 LoopX 赖以成立的 local-first、provider-neutral 契约。
 
 ## 商业判断
 
@@ -14,7 +14,7 @@ Managed Semantic Control Plane 仍然是长期商业复利的核心，但不必�
 
 这个位置接近两种已经公开商业化的相邻模式。Letta 将持久、有状态的 Agent 包装成托管服务，按 active agent 与执行量计费；Mastra 在开源 Agent 框架之上销售托管运行、留存、团队协作和企业治理。LoopX 不需要复制二者的产品边界。它的差异化位置是跨异构 Agent runtime 的 provider-neutral 语义控制层：完备的状态管理、规划与监督，基于证据的恢复，以及能够跨 run、跨 Agent 继承的人类 authority。
 
-这是产品定位假设，不是收入结论。它仍然需要重复生产使用、交付复用和付费意愿验证。
+这是产品定位假设。它仍然需要重复生产使用、交付复用和付费意愿验证。
 
 ## 核心张力
 
@@ -47,15 +47,15 @@ Discovery、集成、评测与上线可能需要 FDE 进入客户 workflow。协
 1. **结果证明**：一个有边界的 workflow 达到客户验收，并在周期、质量、产能、恢复或合规成本上有可测改善。
 2. **持续使用**：operator 与 Agent team 在一周工作过程中持续使用，而不是装一次就结束。
 3. **托管优势**：集成、协作、可用性、恢复、留存或治理让产品显著优于单机脚本与文件。
-4. **交付复用**：客户工作沉淀为 adapter、pack、eval 或核心改进，降低下一次部署成本，而不是形成永久客户分叉。
+4. **交付复用**：客户工作沉淀为 adapter、pack、eval 或核心改进，降低下一次部署成本。
 5. **自然扩张**：收入随授权环境、workspace、active managed agent、留存、Supervisor work 或企业控制扩张，而不只随工程师天数增长。
 6. **控制面效果**：客户可以测量人工协调减少、恢复加快、非法 continuation 下降，或 review 与 audit 成本下降。
 
-结果证明与交付复用应当早于 SaaS 形态。无法改善长程工作的 dashboard 只是界面 feature；没有产生可复用资产的成功部署只是服务项目。两者都还不是耐久的软件生意。
+结果证明与交付复用应当早于 SaaS 形态。无法改善长程工作的 dashboard 只是界面 feature；没有产生可复用资产的成功部署只是服务项目。
 
 ## 商业对标：看价值捕获，不只看 Star
 
-截至 2026-08-15 的公开证据表明，这四个项目代表四种不同的价值捕获模式，并不是四家可直接横向比较的创业公司。GitHub Star 能证明分发和类别关注，不能证明收入、留存、毛利或企业付费意愿。
+截至 2026-08-15 的公开证据表明，这四个项目代表四种不同的价值捕获模式，并不是四家可直接横向比较的创业公司。GitHub Star 能证明分发和类别关注。
 
 | 项目 | 公开商业证据 | 价值捕获路径 | 当前判断 | 对 LoopX 的启示 |
 | --- | --- | --- | --- | --- |
@@ -68,9 +68,9 @@ Discovery、集成、评测与上线可能需要 FDE 进入客户 workflow。协
 
 第一，商业价值并不按 Star 排名。Mastra 当前拥有最强的资本与平台 packaging 信号；Letta 拿出了最清楚的 stateful agent 生产案例；AgentScope 可能创造很大的云平台内嵌价值，却不必成为独立公司；CAMEL 则通过独立应用承接研究影响力。
 
-第二，反复出现的路径是“开源分发 + 稀缺付费面”：有人卖托管状态，有人卖观测与部署，有人拉动云消费，也有人销售垂域应用和私有化。开源并不妨碍收入，前提是付费产品消除真实的运行与组织负担，而不是把协议藏起来。
+第二，反复出现的路径是“开源分发 + 稀缺付费面”：有人卖托管状态，有人卖观测与部署，有人拉动云消费，也有人销售垂域应用和私有化。开源并不妨碍收入，前提是付费产品消除真实的运行与组织负担。
 
-第三，LoopX 的架构位置是前两种模式的上层组合：Letta 式 durable state + Mastra 式 managed operations，并把它泛化到异构 runtime。差异化产品不是一个功能更多的 Agent 框架，而是让 goal、authority、规划、监督、evidence、recovery 与 handoff 跨 Agent、跨 run 保持一致的语义控制面。这些对标验证了变现形态，但 LoopX 仍需要验证客户是否会为这一独立层持续付费。
+第三，LoopX 的架构位置是前两种模式的上层组合：Letta 式 durable state + Mastra 式 managed operations，并把它泛化到异构 runtime。差异化产品是让 goal、authority、规划、监督、evidence、recovery 与 handoff 跨 Agent、跨 run 保持一致的语义控制面。这些对标验证了变现形态，但 LoopX 仍需要验证客户是否会为这一独立层持续付费。
 
 ## 中国市场：先产品化交付，再验证纯 SaaS
 
@@ -92,11 +92,11 @@ Discovery、集成、评测与上线可能需要 FDE 进入客户 workflow。协
 | 大型或强监管企业 | Enterprise Harness、FDE、托管运维、治理与 SLA | 私有/BYOC，包含安全、审计和采购工作 | 高客单价可以覆盖集成与控制要求，但销售周期和服务负担明显更高 |
 | 海外开发者团队 | Team Cloud 或 Managed Control Plane | 产品试用 + 远程 solution engineering | 对公有云和软件订阅的接受度更高，纯 SaaS 路径更成立 |
 
-这是一种先后顺序，不是放弃 recurring revenue。国内的第一收入形态更可能是“软件许可 + 有边界交付 + 年度托管运维”；SaaS 更适合低摩擦团队、海外客户，以及多次交付后被证明共性的运行面。
+这是一种先后顺序。国内的第一收入形态更可能是“软件许可 + 有边界交付 + 年度托管运维”；SaaS 更适合低摩擦团队、海外客户，以及多次交付后被证明共性的运行面。
 
 ### 成熟 Harness 是第一个付费产品
 
-成熟 Agent harness 的公开实践说明，客户购买的是一套完整可运行的产品，而不是协议图。OpenAI 称 Codex 已有超过 200 万周活开发者，并通过[按用量计费](https://openai.com/index/codex-flexible-pricing-for-teams/)服务团队；Anthropic 为 Claude Code 打包了[统一账单、支出控制、用量分析、tool / MCP 策略和 Compliance API](https://www.anthropic.com/news/claude-code-on-team-and-enterprise)，也[支持通过现有 Bedrock 或 Vertex AI 基础设施做企业部署](https://docs.anthropic.com/en/docs/claude-code/getting-started)。这些数据不证明 LoopX 已经有需求，但证明了企业对 harness 的完整度预期：安装、执行、策略、观测、管理与支持必须组成一个可运维产品。
+成熟 Agent harness 的公开实践说明，客户购买的是一套完整可运行的产品。OpenAI 称 Codex 已有超过 200 万周活开发者，并通过[按用量计费](https://openai.com/index/codex-flexible-pricing-for-teams/)服务团队；Anthropic 为 Claude Code 打包了[统一账单、支出控制、用量分析、tool / MCP 策略和 Compliance API](https://www.anthropic.com/news/claude-code-on-team-and-enterprise)，也[支持通过现有 Bedrock 或 Vertex AI 基础设施做企业部署](https://docs.anthropic.com/en/docs/claude-code/getting-started)。这些数据不证明 LoopX 已经有需求，但证明了企业对 harness 的完整度预期：安装、执行、策略、观测、管理与支持必须组成一个可运维产品。
 
 LoopX 的第一个付费产品因此应当是 **LoopX Enterprise Agent Harness**，而不是一组 schema，也不是另一个模型或 IDE。它应当包含：
 
@@ -107,7 +107,7 @@ LoopX 的第一个付费产品因此应当是 **LoopX Enterprise Agent Harness**
 - 部署自动化、升级、备份恢复、默认 policy 与诊断支持包；
 - 承载 tool、eval、role contract 与客户系统集成的 domain-pack 边界，不分叉 Kernel。
 
-客户购买的是一套能把一个 workflow 推到验收的系统。Semantic Control Plane 是其中的产品脊柱，而不是留给客户自行拼装的基础设施抽象。
+客户购买的是一套能把一个 workflow 推到验收的系统。Semantic Control Plane 是其中的产品脊柱。
 
 ### FDE 是产品发现与生产化机制
 
@@ -150,7 +150,7 @@ FDE 的价值，是补齐成熟 Harness 与混乱生产 workflow 之间的最后
 
 ### 应用前景与切入顺序
 
-下表是基于上述公开证据得出的战略判断，不是市场规模预测。
+下表是基于上述公开证据得出的战略判断。
 
 | Workflow | 市场成熟度 | LoopX 适配度 | 付费逻辑 | 主要门槛 | 建议位置 |
 | --- | --- | --- | --- | --- | --- |
@@ -163,15 +163,15 @@ FDE 的价值，是补齐成熟 Harness 与混乱生产 workflow 之间的最后
 
 因此，近期销售话术应当是**为一个高价值 workflow 提供可治理的新增产能**，而不是“用 AI 替换一个部门”。初始合同可以组合 workspace / workflow 费用、active managed employee、evidence retention、Supervisor work 与 enterprise delivery；只有当结果可归因、可审计时，才适合增加 outcome-linked pricing。
 
-顺序同样重要。软件、SRE、科研与技术运营最接近 LoopX 当前社区，也最直接暴露控制面要解决的长程失败。后台与强监管 workflow 可能带来更高客单价，但应在 authority、evidence、deletion 与 recovery 得到证明后，通过 BYOC 和领域伙伴进入。数字团队是扩张路径，不是第一个 SKU。
+顺序同样重要。软件、SRE、科研与技术运营最接近 LoopX 当前社区，也最直接暴露控制面要解决的长程失败。后台与强监管 workflow 可能带来更高客单价，但应在 authority、evidence、deletion 与 recovery 得到证明后，通过 BYOC 和领域伙伴进入。数字团队是扩张路径。
 
 ## 产品阶梯
 
-下面是产品与收入阶梯，不是五个独立 SaaS。每一步都必须留下可复用产品，并让下一步更容易出售。
+下面是产品与收入阶梯。每一步都必须留下可复用产品，并让下一步更容易出售。
 
 ### 1. Enterprise Agent Harness
 
-第一个可销售产品，是一套支持 local、private 与 BYOC profile 的统一版本 LoopX 发行物。它打包 runtime adapter、语义状态、Supervisor、恢复、验收、评测、部署升级、备份诊断与 operator console。验收单位是一个有边界 workflow 到达生产，而不是软件成功安装。
+第一个可销售产品，是一套支持 local、private 与 BYOC profile 的统一版本 LoopX 发行物。它打包 runtime adapter、语义状态、Supervisor、恢复、验收、评测、部署升级、备份诊断与 operator console。验收单位是一个有边界 workflow 到达生产。
 
 ### 2. FDE 驱动的 Design Partner 交付
 
@@ -185,11 +185,11 @@ FDE 的价值，是补齐成熟 Harness 与混乱生产 workflow 之间的最后
 
 长期终局是一个持续运行的控制面：本地或第三方 runtime 执行 bounded work，Managed Semantic Control Plane 维护完备且一致的 semantic execution state。它负责权威且可识别冲突的状态、Supervisor 调度、stalled-loop 检测、恢复、handoff、governed replan，以及跨 runtime 的 identity、claim、quota、evidence 与 acceptance 连续性。
 
-Supervisor 不是隐藏的自治管理者，托管不会自动赋予它人类 authority。BYOC 与 managed private 是风险更低的第一形态；完整多租户托管要等隔离、删除、备份、支持和 on-call 经济性得到证明。
+BYOC 与 managed private 是风险更低的第一形态；完整多租户托管要等隔离、删除、备份、支持和 on-call 经济性得到证明。
 
 ### 5. Domain Packs 与伙伴生态
 
-Domain capability packs（`docs/product/domain-capability-packs.md`）包装 tool、role contract、eval、review rule 与集成，同时保持 Kernel 通用。LoopX 或认证伙伴可以交付它们。Marketplace 是更晚的分发与收入面，不是第一门生意；领域 authority 仍然不能进入通用 Kernel。
+Domain capability packs（`docs/product/domain-capability-packs.md`）包装 tool、role contract、eval、review rule 与集成，同时保持 Kernel 通用。LoopX 或认证伙伴可以交付它们。Marketplace 是更晚的分发与收入面；领域 authority 仍然不能进入通用 Kernel。
 
 ## 计费单位与产品分层
 
@@ -214,11 +214,11 @@ Domain capability packs（`docs/product/domain-capability-packs.md`）包装 too
 - **Managed / BYOC**：durable semantic state、Supervisor 运维、恢复、治理、审计、数据驻留、迁移、SLA 与支持；
 - **Team Cloud**：在多租户经济性得到证明后，面向低摩擦或海外团队提供共享 workspace、留存、审批、告警和 review。
 
-这是 packaging model，不是公开价格表。定价前需要先获得 active agent、event volume、retention、Supervisor execution、交付工作量和支持成本的真实分布。合同应当区分软件许可、有边界交付和 recurring managed operation。FDE 离场后 Harness 必须仍有独立价值；Agent 与其 goal 不能作为同一活动被重复计费。
+这是 packaging model。定价前需要先获得 active agent、event volume、retention、Supervisor execution、交付工作量和支持成本的真实分布。合同应当区分软件许可、有边界交付和 recurring managed operation。FDE 离场后 Harness 必须仍有独立价值；Agent 与其 goal 不能作为同一活动被重复计费。
 
 ## 什么不该成为生意
 
-- **封闭的语义状态格式**：goal、evidence、authority 和 handoff 必须保持可检查、可导出。产品粘性应来自运行质量，而不是状态绑架。
+- **封闭的语义状态格式**：goal、evidence、authority 和 handoff 必须保持可检查、可导出。产品粘性应来自运行质量。
 - **把通用执行托管当核心产品**：LoopX 可以编排外部 runtime，也可以运行 bounded Supervisor work；但转售模型 token 与 sandbox 会让项目在算力毛利上竞争，并模糊“控制面不拥有 domain 行为”的边界。
 - **把托管 CLI 文件当产品**：没人会为把本地文件搬到别人的磁盘付费。Managed 层必须增加协作、可靠性、恢复或治理价值。
 - **客户专属 Kernel 分叉或无限 FDE 驻场**：客户差异必须进入受支持扩展点和有边界交付。永久分叉与工程师天数依赖会摧毁复用。
@@ -244,7 +244,7 @@ Domain capability packs（`docs/product/domain-capability-packs.md`）包装 too
 1. 多个客户为有明确 outcome owner 与验收标准的有边界 workflow 付费；
 2. 周期、质量、产能、恢复、review 或合规成本相对 baseline 有可测改善；
 3. 部署使用同一版本 Harness 与受支持扩展点，同一 pack 第二次部署明显减少 FDE 工作量；
-4. 初次交付后仍然存在许可、续费、托管运维或扩张收入，而不是收入只跟随人力；
+4. 初次交付后仍然存在许可、续费、托管运维或扩张收入
 5. 独立团队在数周级工作中反复使用 state、supervision、recovery、evidence 与 handoff；
 6. Managed authority 扩张前，export、restore、deletion、tenancy、backup 与 public/private boundary 行为得到验证；
 7. 交付、留存、Supervisor work、支持、销售周期与客户集中度可以维持可接受的单位经济性。
@@ -267,9 +267,42 @@ Phase 4 —— 通过 BYOC 或 managed private 运行 Managed Semantic Control P
 
 ## 证据边界
 
-本文刻意区分不同类型的公开证据：融资只能证明投资判断与 runway，不能证明留存或收入；公开价格只能证明存在变现面，不能证明付费客户数；厂商案例证明的是厂商与客户共同披露的部署，不是独立审计 ROI；企业调查证明关注和自报采用，不能证明客户已经需要 LoopX 独特的 semantic control-plane contract。
+本文刻意区分不同类型的公开证据：融资只能证明投资判断与 runway；公开价格只能证明存在变现面；厂商案例证明的是厂商与客户共同披露的部署；企业调查证明关注和自报采用，不能证明客户已经需要 LoopX 独特的 semantic control-plane contract。
 
 现有证据足以支持 design partner 与有节制的商业假设，但不足以跳过 LoopX 自身对复用频率、业务结果、付费意愿和单位经济性的验证。
+
+## 开闭源商业协同与 Plan B 物理分界
+
+为了消除“开源协议扩散”与“商业 SaaS 变现”之间的结构张力，LoopX 将商业化路径直接锚定到四态全局指挥官评估体系（[evaluations/horizon.md](../releases/evaluations/horizon.md)）与仓库许可边界（[licensing.md](../../project/licensing.md)）之上，执行明确的 **Plan B Open-Core 物理拆分**：
+
+- **开源主仓（`loopx-project/loopx`，Apache-2.0）**：永久拥有全部语义状态契约、单机 File / SQLite `AuthorityStore`、宿主/模型中立适配器、全部验证门禁、`openPostgresqlStore` SPI 与线级中立的出站 `RemoteAuthority` 客户端（已由 PR `#9223` 推进解耦，不在 OSS 仓内保留半托管服务端代码）。
+- **私有商业仓（`loopx-project/loopx-cloud`）**：承载多租户 PostgreSQL RLS 服务、托管 `RemoteAuthority` 服务端、组织治理、计量计费与弹性编队调度。
+
+### 四项永久 Apache-2.0 开源基线
+
+1. **单机持久控制面内核**：File / SQLite `AuthorityStore`、`EffectTurn`、条件 CAS、硬租约与代数围栏、无损 `authority-archive` 导入导出（保证用户语义状态永久可迁移、无锁定）。
+2. **运行时 / 模型 / 沙箱双中立与 `L1-L4` 渐进接入**：覆盖主流编码宿主的 CLI / ACP 适配器、`dsh-loopx-plugin` 与本地 worktree 沙箱隔离。
+3. **跨主机与验证开放协议族（`open_protocol_core`）**：`StorageConfig` + `openPostgresqlStore` SPI、出站 `RemoteAuthority` 线级协议、管家移交/租约契约、`tau_B` + Stop-Hook 反混杂基准套件、`pr-review` / `canary` 及 `a+b` 发版评估门禁。
+4. **本地全渠道工作台与社区领域包契约**：CLI、本地 Desktop / LooChat 工作台与 `domain_pack_contract_v0` 人工确认门模板。
+
+### 六项闭源商业 Cloud / BYOC 护城河
+
+1. **托管多租户 PostgreSQL 与 `RemoteAuthority` 服务端**：连接池、租户 RLS 隔离、高可用 WAL/PITR 容灾与跨区状态复制。
+2. **企业级身份认证、组织治理与合规平面**：SSO / SCIM、细粒度 RBAC、集中凭证代理与不可篡改审计存证。
+3. **跨机弹性智能体编队与百 Agent 调度器**：托管 10→100+ 协作编队、跨团队预算围栏、公平队列与防死循环 fleet 调度（承接 `4.5` / `4.6` 企业运行时）。
+4. **企业级基准回放集群与回归智能中心**：机密代码库隔离回放舱、车队遥测聚合及组织级 Kendall `tau_b` 发布看板。
+5. **托管全渠道网关与企业连接器枢纽**：多工作区飞书/Slack/Webhook 桥接与私有 VPC 中继通道。
+6. **用量计量、计费、SLA 与行业认证商业包**：席位 + 控制面执行计量账单、合同级 SLA 保障与合规垂直行业能力包。
+
+### 三层变现飞轮与代际演化联动
+
+| 交付形态 | 控制面托管方 | 代码与执行位置 | 核心收入与增长飞轮 |
+|---|---|---|---|
+| **Tier 1 — Team Cloud（托管 SaaS）** | 托管 `loopx-cloud` | 云端托管工作区 + GitHub / 飞书协同 | 零运维团队开箱即用；席位费 + 控制面用量计费 |
+| **Tier 2 — Hybrid BYOC（控制面托管 / 数据面留客户 VPC）** | 托管控制面或自建企业服务端 | 客户 VPC 内通过 SPI 与出站 `RemoteAuthority` 执行 | 满足合规与代码不出域诉求，同时保留云端协同、审计与回归遥测 |
+| **Tier 3 — Enterprise Harness + 有界产品化 FDE** | 专属 `loopx-cloud` 集群 | 客户私有网络与内部 CI | 有界前线部署工程（FDE）：通用内核改进回流 OSS，客户专有连接器与高 SLA 转为年度平台经常性收入（ARR） |
+
+所有来自 Tier 2-3 的通用状态机与协议改进均回流 Apache-2.0 `open_protocol_core` 战线（对应 [horizon.md](../releases/evaluations/horizon.md) 中的 `1.5`、`4.5`、`4.6`、`7.3`、`8.4`），形成 `2.x -> 3.0 -> 4.0` “开源协议建立标准 + Cloud/BYOC 承接规模组织护城河”的正向飞轮。
 
 ## 与现有文档的关系
 

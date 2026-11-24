@@ -47,6 +47,12 @@ try {
     $env:PYTHONPATH = $previousPythonPath
 }
 
+$loopxLauncher = Join-Path $BinDir "loopx.ps1"
+& $loopxLauncher --format json extension doctor --all-enabled --execute *> $null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "One or more enabled extensions failed post-install doctor revalidation. Run 'loopx extension doctor --all-enabled --execute' after repairing the provider."
+}
+
 if ($AddToUserPath) {
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $entries = @($userPath -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -60,5 +66,5 @@ if ($AddToUserPath) {
     if (-not (($env:Path -split ";") -contains $BinDir)) {
         $env:Path = "$BinDir;$env:Path"
     }
-    Write-Output "LoopX Windows user PATH includes: $BinDir"
+    [Console]::Error.WriteLine("LoopX Windows user PATH includes: $BinDir")
 }

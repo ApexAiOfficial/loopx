@@ -1,0 +1,137 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { fetchChatHistory, type ChatHistory, type BoundConversationTarget, type ManagedConversationTarget } from "./chat";
+
+type HistoryState = {
+  scope: string;
+  history: ChatHistory | null;
+  reading: boolean;
+  failed: boolean;
+};
+
+export type ConversationHistoryStatus = Pick<ReturnType<typeof useConversationHistory>, "phase" | "reading" | "sendBlocked" | "retry">;
+
+/** Closed Sessions remain history, but cannot own a channel's current controls. */
+export function currentChannelSession(history: Pick<ChatHistory, "sessions"> | null, agentId: string) {
+  return history?.sessions.find((session) => session.agent_id === agentId && session.status !== "closed") ?? null;
+}
+
+/** Read recovery shared by steward and Goal conversations; never executes a Turn. */
+export function useConversationHistory({ agentId, currentAgentId, channelId, goalId, enabled, bound, managed }: {
+  agentId?: string;
+  currentAgentId: string;
+  channelId: string;
+  goalId?: string;
+  enabled: boolean;
+  bound?: BoundConversationTarget;
+  managed?: ManagedConversationTarget;
+}) {
+  const bindingId = bound?.bindingId, sessionId = bound?.sessionId;
+  const managedGoal = managed?.goalId, managedAgent = managed?.agentId, managedSession = managed?.sessionId;
+  const exact = Boolean(bound || managed);
+  const scope = JSON.stringify([agentId ?? null, currentAgentId, channelId, goalId ?? null, bindingId, sessionId, managedGoal, managedAgent, managedSession]);
+  const [state, setState] = useState<HistoryState | null>(null);
+  const retryRead = useRef<(() => void) | null>(null);
+  const cached = useRef<{ scope: string; history: ChatHistory } | null>(null);
+  const refreshGeneration = useRef(0);
+  const cachedHistory = (forScope: string) => cached.current?.scope === forScope ? cached.current.history : null;
+  const params = useRef({ agentId, channelId, goalId, scope, bound, managed });
+  params.current = { agentId, channelId, goalId, scope, bound, managed };
+  // A caller that learned of a Turn the cached read cannot show -- the service
+  // refused a send because that Turn is running -- needs what the Session looks
+  // like now, not what this hook read earlier. The re-read stays here so the
+  // conversation keeps a single history owner.
+  const refresh = useCallback(async () => {
+    const { agentId, channelId, goalId, scope, bound, managed } = params.current;
+    const generation = ++refreshGeneration.current;
+    let loaded: ChatHistory;
+    try {
+      loaded = await fetchChatHistory({ agentId, channelId, goalId, bound, managed });
+    } catch (error) {
+      if (params.current.scope === scope && generation === refreshGeneration.current) {
+        setState({ scope, history: cachedHistory(scope), reading: false, failed: true });
+      }
+      throw error;
+    }
+    // The caller may still need its completed read, but a conversation that
+    // was left while it waited no longer owns this hook's visible history.
+    if (params.current.scope !== scope || generation !== refreshGeneration.current) return loaded;
+    cached.current = { scope, history: loaded };
+    setState({ scope, history: loaded, reading: false, failed: false });
+    return loaded;
+  }, []);
+  const retry = useCallback(() => {
+    if (state?.scope === params.current.scope && state.failed) {
+      // A failed refresh may hide new records in an already cached Session.
+      // Re-read that snapshot rather than retrying only missing older history.
+      setState({ ...state, reading: true });
+      void refresh().catch(() => {});
+    } else retryRead.current?.();
+  }, [state, refresh]);
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    let reading = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let attempts = 0;
+    async function read() {
+      if (cancelled || reading) return;
+      clearTimeout(retryTimer);
+      reading = true;
+      const generation = refreshGeneration.current;
+      const previous = cachedHistory(scope);
+      // A retry can start during a refresh but still carry the older cached snapshot.
+      const isCurrentRead = () => !cancelled && params.current.scope === scope
+        && generation === refreshGeneration.current && cachedHistory(scope) === previous;
+      setState(current => ({ scope, history: previous, reading: true,
+        failed: exact && current?.scope === scope && current.failed }));
+      try {
+        const loaded = await fetchChatHistory({ agentId, channelId, goalId,
+          bound: bindingId === undefined ? undefined : { bindingId, sessionId: sessionId ?? "" },
+          managed: managedGoal === undefined ? undefined : {goalId: managedGoal, agentId: managedAgent ?? "", sessionId: managedSession ?? ""} }, previous ?? undefined);
+        if (!isCurrentRead()) return;
+        cached.current = { scope, history: loaded };
+        setState({ scope, history: loaded, reading: false, failed: false });
+      } catch {
+        if (!isCurrentRead()) return;
+        setState({ scope, history: cachedHistory(scope), reading: false, failed: true });
+      } finally {
+        reading = false;
+        const known = cachedHistory(scope);
+        if (!cancelled && (exact || !known || known.unavailableSessionIds.length > 0)) {
+          // Back off sustained transport failures; a user can retry immediately.
+          retryTimer = setTimeout(() => void read(), known && !known.unavailableSessionIds.length
+            ? 5000 : Math.min(3000 * 2 ** attempts++, 30_000));
+        }
+      }
+    }
+    retryRead.current = () => void read();
+    void read();
+    return () => {
+      cancelled = true;
+      refreshGeneration.current += 1;
+      clearTimeout(retryTimer);
+      retryRead.current = null;
+    };
+  }, [agentId, channelId, goalId, enabled, scope, bindingId, sessionId, managedGoal, managedAgent, managedSession, exact]);
+  const current = enabled && state?.scope === scope ? state : null;
+  const history = current?.history ?? null;
+  // A channel transcript spans executors; readability of another executor's
+  // latest session cannot authorize sending into the selected one.
+  const latest = currentChannelSession(history, currentAgentId);
+  const currentSessionReadable = history !== null && (!latest || history.snapshots.some((snapshot) => snapshot.session.session_id === latest.session_id));
+  return {
+    history,
+    currentSession: latest,
+    refresh,
+    phase: !enabled ? "ready" as const : !current ? "loading" as const
+      : current.failed ? "unavailable" as const
+      : history?.unavailableSessionIds.length ? (history.snapshots.length ? "partial" as const : "unavailable" as const)
+      : current.reading ? "loading" as const : "ready" as const,
+    reading: current?.reading ?? enabled,
+    sendBlocked: enabled && (!currentSessionReadable || (exact && current?.failed === true)),
+    // Missing older history must not restart a recovered current stream.
+    connectionKey: currentSessionReadable && !(exact && current?.failed)
+      ? `${scope}:${latest?.session_id ?? "empty"}${exact ? `:${latest?.active_turn_id ?? "idle"}` : ""}` : null,
+    retry,
+  };
+}

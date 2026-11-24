@@ -2,12 +2,13 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft, research proposal |
+| Status | Accepted |
+| Supersedes / closes | none |
 | Date | 2026-08-15 |
 | Authors | LoopX maintainers |
-| Scope | Effect feedback, bounded delivery, authority escalation, model qualification, and long-horizon efficiency |
+| Scope | Effect feedback, bounded delivery, research scope, authority escalation, and long-horizon outcome/cost |
 | Tracking issue | [#3203](https://github.com/huangruiteng/loopx/issues/3203) |
-| Source baseline | LoopX `8b8e7b248` |
+| Source baseline | LoopX `d03863fd0`; source-level decision followthrough refinement below |
 
 > Language note: the
 > [Chinese version](./hierarchical-agent-stride-control-v0.zh-CN.md) and this
@@ -38,11 +39,22 @@ gate, and human authority. An inner result may force an early delivery
 settlement; a delivery result may force an early authority escalation. A
 scheduler tick alone must not manufacture either semantic transition.
 
-This RFC proposes a measurement-first program. The smallest useful slice is a
-read-only, provider-neutral stride observation derived from existing receipts.
-It should characterize current standard and fine-grained execution before any
-runtime automatically widens or narrows a stride. Adaptive control begins in
-shadow mode and is promoted only after repeated, stable qualification.
+Research makes delivery stride a **vector**: work-slice size, distance from the
+current mechanism, and validation breadth. These coordinates can move
+independently. A long
+slice can perform many correct local checks without obtaining new information
+about the remaining goal gap. Fewer control events cannot fix that failure.
+Conversely, a small late gain near a task's attainable limit may be useful;
+elapsed time or a flat score alone cannot select a larger experiment.
+
+The delivery controller therefore closes **decision -> actual work -> evidence
+-> next decision**, while the existing owners retain execution and settlement.
+The current bounded implementation returns the previous accepted Vision path
+and subsequent recorded progress to replan, with goal gain explicitly unknown.
+This is decision input and Agent guidance, not adaptive scheduling, a result
+adoption gate or proof of research utility. Automatic policies remain opt-in
+proposals requiring repeated qualification. Research-state branches provide the
+counterfactual test without discarding the accumulated work.
 
 The core judgment is:
 
@@ -161,6 +173,7 @@ the research direction.
 | Delivery | Execution profiles distinguish standard and fine-grained Todo contracts; fine-grained mode uses a coherent-slice turn budget and evidence-sensitive successor creation. Every admitted heartbeat still performs full durable settlement. |
 | Continuation | In addition to same-Turn controller dispositions, a typed delivery-continuity reducer can preserve the latest accountable `outcome_progress` Todo across heartbeat wakes while that same Todo remains open, actionable, capability-ready, and owned by the same agent. |
 | Progress | Typed progress observations, repeat detection, semantic replan closure, and evidence projections can distinguish material delta from maintenance. |
+| Review feedback | The replan context source implementation can return the last accepted evidence-linked Vision path and subsequent recorded progress references. History append order and Goal/Agent/Turn lineage bind this input; missing execution and goal gains remain unknown. It does not certify that a proposed intervention ran. |
 | Research | The [Research Exploration Control Plane RFC](./research-exploration-control-plane-v0.md) defines an optional typed knowledge frontier and composition experiments. |
 | Authority | Goal vision, user gates, permission policy, and peer/supervisor boundaries remain separate from execution and scheduling. |
 
@@ -168,12 +181,13 @@ the research direction.
 
 | Gap | Consequence |
 |---|---|
-| No shared stride vocabulary | Host, Todo, scheduler, and human-attention changes are discussed as one generic "turn length" problem. |
-| No cross-layer observation | LoopX cannot tell whether low throughput came from model/tool roundtrips, over-frequent settlement, or authority churn. |
+| Incomplete outcome-linked observations | Read-only M1 counts and review followthrough exist, but they cannot explain task gains, model/tool cost, settlement cost or authority churn without provider evidence. |
+| No qualified research-scope policy | Continued local tuning can be mistaken for broad exploration; generic progress identifiers do not establish mechanism novelty or useful information. |
 | No model capability profile for stride | A fast tool-using model and a slower protocol-reliable model receive mostly static execution contracts. |
 | No semantic split/merge qualification | Todo granularity is configured or prompted, but not evaluated against observed decision changes and settlement cost. |
 | No interruption-value model | Periodic reports and genuine authority changes are not measured separately. |
-| No adaptive promotion path | There is no shadow recommendation -> bounded experiment -> promoted policy lifecycle for stride tuning. |
+| No qualified adaptive promotion path | Shadow input does not yet establish model adoption, matched continuation benefit or a promoted model/work-class policy. |
+| No qualified research-state branch | Code snapshots alone cannot preserve conversation, accumulated evidence and evaluation opportunities for a fair continuation comparison. |
 
 ## 5. The Three-Layer Model
 
@@ -338,6 +352,13 @@ that a new Todo is needed, that a coherence slice ended, or that human
 attention is warranted. Missed and duplicate wakes should be recoverable from
 durable state.
 
+Observation delivery, direction review and candidate acceptance have different
+triggers. Stable continuation does not require another planner/evaluator model
+after every tool effect. Event coalescing and unchanged-result suppression must
+preserve due periodic reviews, changed authority and outstanding settlement.
+A review may retain the current route, but still records the owning obligation's
+legal disposition. This refinement changes neither cadence nor discharge rules.
+
 ### 6.5 A stronger model does not widen every layer
 
 Model capability is multidimensional:
@@ -392,6 +413,13 @@ Todo owns the bounded postcondition. Replan owns direction change. A stride
 controller may recommend split, merge, continue, settle, or escalate, but it
 must not close a Todo, fabricate evidence, or clear a replan obligation.
 
+The [wake/context/correction chain](agent-session-execution-modes-v0.md#wake-current-context-and-correction-form-one-chain)
+keeps prompt prose subordinate to these owners. Local correction preserves
+unaffected work; widening requires relevant current evidence. A due review may
+retain the path, and later work/outcome readback qualifies correction benefit.
+Heartbeat templates no longer add independent two-stall replan/self-pause rules.
+This does not remove Core stall triggers or change configured review cadence.
+
 Research goals may also consume the typed frontier defined by the Research
 Exploration RFC. A composition experiment can be one delivery slice; the
 stride model does not create another research graph.
@@ -402,6 +430,1245 @@ Goal and vision state remain authoritative for acceptance. User gates and
 protected-operation policy remain authoritative for permission. Supervisors,
 dashboards, and scheduler projections may recommend intervention but cannot
 silently convert a proposal into authority.
+
+### 7.5 Long-running work and decision checkpoints (proposed refinement)
+
+Pause and wake eligibility precede this observation loop. Follow the
+[session pause/resume boundary](agent-session-execution-modes-v0.md#pause-resume-and-automatic-dispatch-boundaries):
+explicit stops disarm continuation; dependency waits retain bounded observation;
+validated no-follow-up ends polling. A result event or scheduler timer cannot
+clear a stop, and a pre-pause admission cannot survive resume. Qualify actual
+request/timer readback separately from prompt guidance and in-flight settlement.
+
+This 2026-10-04 refinement is a proposal for M3/M5, not shipped adaptive
+scheduling. It separates an **experiment boundary**, a **model decision
+checkpoint**, and an **accountable Turn boundary**. One experiment can span
+several Turns; every admitted accountable Turn still validates, writes back,
+and settles its own identity. Waiting for the experiment does not defer an
+owed debit, keep a Turn open indefinitely, or make earlier work free.
+
+The nearest owning capability/provider must define, before launch:
+
+- the question, candidate revision, comparison and bounded postcondition;
+- the authorized job identity, resource/time limits and recovery owner;
+- which observable result can change the next decision, and how to validate
+  that result; a training checkpoint, evaluation or build is meaningful only
+  under this declared contract;
+- the last consumed result revision, next observation time/deadline and
+  stop/cancel behavior; elapsed time and log growth alone are not evidence.
+
+These are capability/provider data. The kernel consumes identity, readiness,
+freshness and existing effect/settlement facts; it does not interpret epochs,
+benchmark scores, proof counts or process log prose. No generic job scheduler,
+worker launcher or new built-in capability is needed for this proposal.
+
+The proposed handoff is:
+
+| Phase | Owner and required behavior |
+|---|---|
+| Start bounded work | A normal selected Todo/Turn admits the effect. The provider persists job/candidate identity and an operational receipt. Settle that Turn truthfully: accepted launch proves launch, not the final experiment outcome. |
+| Observe while waiting | The existing host/runtime or capability observer checks the exact job without a reasoning-model call. Reuse one due monitor or existing observation channel; do not create a Todo per poll. Record observer CPU/IO cost even when no agent slot is spent. |
+| Return a decision checkpoint | The provider validates a new result against the declared postcondition, binds its revision/artifact digest and emits a compact observation. Failure, cancellation and deadline expiry must also produce actionable observations. |
+| Admit a decision | The existing scheduler/Turn path rechecks Goal lifetime, ownership, quota, capabilities and authority. A ready observation is input, not execution permission. Other runnable work can proceed while this experiment waits. |
+| Consume and continue | In the accountable consuming Turn, commit result adoption and the next step through the normal writeback before acknowledging consumption. Replayed/duplicate delivery recovers that receipt without duplicating launch or adoption. Settlement replay is idempotent for the same Turn identity; a newly admitted recovery Turn still settles normally. |
+
+Receipt, pending delivery, context admission and adopted action remain distinct.
+Qualify corrections and results arriving during tools, context preparation and
+the last intake/idle transition through the existing
+[Host consumption boundary](agent-session-execution-modes-v0.md#reusable-agent-operations-and-continuation-ownership)
+and [ingress/wake policy](desktop-execution-frontends-v0.md#delivery-intent-does-not-choose-the-wake-policy).
+Cancellation before admission preserves recoverable input. A late exact-Turn
+steer is not silently retargeted; fallback requires its already permitted policy
+or an explicit new delivery choice. A coalesced notification can disappear only
+when the durable work remains discoverable. Neither a transport ACK nor entry
+into model context proves that later work adopted the result.
+
+Current Todo resume conditions include `monitor_changed` and `resume_at`; an
+implementation should use the existing typed monitor generation and timeout
+fallback where sufficient. **The missing integration is the provider-result
+binding and material-generation update**, not a new arbitrary `job_done` token.
+Only a validated decision checkpoint may advance that generation. The monitor
+must name the exact job/result source and bound Todo; unrelated log changes
+cannot release it. A safety observation deadline catches a lost notification
+or crashed process; it is not a periodic request to reinterpret unchanged work.
+Unsupported hosts retain current execution and show unavailable readiness,
+rather than silently claiming model-wake suppression.
+
+Identity must survive host/Agent restart: Goal lifetime, owning Agent/Todo,
+provider/run id, attempt or job generation, candidate revision, result revision
+and evidence/artifact refs. Keep raw logs and native job handles with the
+provider; expose only bounded authorized references. A PID alone is not a
+recoverable identity. Provider absence or an ambiguous external effect remains
+unknown under existing recovery rules; it cannot justify an automatic relaunch.
+The consumed cursor advances only with validated durable adoption, so a crash
+after result delivery re-offers the result. Stopped/revoked Goals and expired
+claims fence late results; replacement attempts cannot consume old results.
+
+Persist the incumbent artifact reference and its qualifying result separately
+from the running candidate. The provider updates it only after a comparable
+valid result satisfies its declared constraints. Recovery verifies reference
+availability and content before reuse; a missing candidate artifact does not
+silently replace the incumbent or authorize another launch.
+
+The first experiment is a **shadow observation** over one real capability
+runtime: report unchanged polls, decision checkpoints, result-to-decision
+latency, native outcome and total model/observer cost. Then qualify opt-in
+model-admission suppression only for that supported provider/host combination.
+Do not change the generic heartbeat prompt or all scheduler defaults. Turning
+the policy off restores fixed admission while retaining job/evidence history;
+it neither kills work implicitly nor changes acceptance or accounting.
+
+Measure observation cadence, admission latency, user stop-request queueing,
+native cancellation acceptance and confirmed drain separately. A polling
+interval is not an end-to-end stop deadline. The existing managed ZCode broker
+is a concrete measurement candidate: active checks serialize native readback
+with validation, Core quota and validation, then schedule another check after
+the delay. Slow checks can also delay a queued pause. The
+[provider analysis](../long-running-execution-exploration-and-correction.md#loopx-an-existing-native-goal-provider-and-its-recovery-boundary)
+records the current caller and timeout boundaries; it does not establish a
+performance regression. Coalesce unchanged reads only within a demonstrated
+snapshot boundary, preserving fresh admission, due review and revocation checks.
+
+Report each native execution deadline separately from the Goal's cumulative
+budget, recovery-attempt limits and evaluator/exploration/child-work costs.
+ZCode's one-hour timer requests pause after each explicit start/resume and
+shares the operation queue; it is neither a hard end-to-end stop bound nor a
+Goal-wide budget reset. Missing native usage remains unknown, not zero. Shared
+reads or event-driven observation need same-workload measurements before any
+cost or latency benefit is claimed.
+
+Acceptance requires real controlled process execution and recovery, not just
+serialized events: duplicate and out-of-order results, changed candidates,
+restart, missed notification, deadline, cancellation, unknown effect, competing
+claim and owner stop. A packaged frontend journey must show the bound work,
+waiting reason, last/next observation, result and stale/unavailable recovery
+through existing task/capability surfaces. CLI readback alone is a partial
+slice. Scientific usefulness follows the independent qualification in
+[research decisions](research-exploration-control-plane-v0.md#115-evidence-conditioned-experiment-decisions-proposed-refinement).
+
+### 7.6 Research scope and evidence-conditioned control
+
+For remaining-budget and multi-step choice, use
+[joint decisions §5.8](target-yardstick-stride-decisions-v0.md#budgeted-planning).
+`next_probe` is the first bounded slice of a revisable continuation, whose value
+can include prerequisites, information and later confirmation. Immediate gain
+alone does not rank that continuation. This interpretation preserves the v2
+contract, due reviews and existing decision owner; the
+[EdgeBench pilot](long-horizon-harness-benchmark-research-program-v0.md#edgebench-budgeted-planning)
+tests its incremental benefit before wider policy adoption.
+
+The [execution, exploration and correction integration guide](../long-running-execution-exploration-and-correction.md)
+maps this boundary to Host continuation, Explore writeback, recovery and product
+readback. It provides source comparisons and one connected qualification episode;
+the contracts and milestones in this RFC retain their authority.
+
+Work and research stride have three independently chosen coordinates. The first two are
+the main controls; the third bounds the evidence and cost needed to act:
+
+- **Work-slice size:** the coherent outcome, scope and cost admitted before the
+  next decision. This includes Todo granularity, splitting a broad experiment
+  and continuing a supported route across a larger slice. Todo text length or
+  number of files is not size; a larger slice must retain an observable
+  postcondition and normal per-Turn settlement.
+
+- **Mechanism distance:** local parameter/implementation tuning versus a
+  materially different representation, model, search neighborhood or causal
+  explanation. A renamed hypothesis, a new file or more tests is not distance.
+- **Evidence breadth:** a cheap discriminating probe, a comparable pilot, then
+  the validation needed for actual adoption. More coverage is useful only when
+  it resolves an uncertainty that matters to the next decision.
+
+Replan reviews this vector without becoming another authority owner.
+Changing an agent-created method or provisional candidate rule inside the
+authorized goal is an ordinary research decision. Changing the task, acceptance,
+feedback protocol, budget, permission or stop conditions requires its existing
+owner. A request to explore more broadly never grants access to hidden data or
+permits rewriting the metric after failure.
+
+| Observed basis | Next decision to compare |
+|---|---|
+| A new result is missing, invalid or incomparable | Repair the observation or choose a probe with known coverage; keep utility unknown. |
+| One valid candidate loses or results conflict within uncertainty | Protect the incumbent; scope the negative evidence and compare replication, another uncovered condition and a different mechanism. Do not retire a family from one loss. |
+| Local checks succeed but do not explain the authoritative goal gap | Compare a bounded mechanism-changing probe with continued tuning. Name the distinguishing prediction and how it reaches the executed candidate. |
+| Known headroom is small or variance dominates the expected effect | Prefer a justified uncertainty reduction or a low-cost improvement; require evidence before spending a large new search budget. A theoretical ceiling is not a feasible optimum. |
+| No reasonable in-scope probe remains under the current evidence and stops | Record scoped exhaustion or a concrete hold through the existing owner; do not manufacture activity or claim the goal achieved. |
+
+The model chooses; generic code must not derive these scientific rows from prose
+substrings, a score slope, elapsed hours or a fixed failure count. The provider
+owns metric meaning, comparison validity, noise and task-specific headroom.
+Explore retains explicitly declared mechanism relations and scoped findings.
+The existing typed replan owner delivers the goal, evidence and prior path;
+ordinary task/successor and Vision writeback own the decision and its adoption.
+
+At each decision boundary:
+
+1. Reconcile the prior path with subsequent work, current artifact and
+   authoritative outcomes. Identify what actually ran, what changed knowledge,
+   what was adopted and what remains unknown. A progress receipt is insufficient.
+2. Compare continuation, a discriminating alternative and justified replication
+   when relevant. Rank expected goal/information gain against complete marginal
+   cost: model input/output, tool work, validation, control and opportunity cost.
+3. Choose one bounded next probe with its distinguishing prediction, comparison,
+   incumbent protection, adoption criterion and cost/stop bounds. A larger
+   mechanism change can start with a small pilot; it need not start with a large
+   validation sweep.
+4. Execute through the normal admitted task. Bind evidence to the tested input
+   and exact candidate; retain failed, negative and uncertain results distinctly.
+5. At the next review, use the new observation to retain, revise or stop the
+   scoped route. State why a repeat can resolve a new uncertainty. Do not reset
+   other trigger counters merely because the prompt was read.
+
+The source-level `replan_context.decision_followthrough` is the first reusable
+feedback slice. It references the last accepted evidence-linked Vision path and
+at most six later distinct progress fingerprints, retaining complete recorded
+counts and omissions. It uses immutable append order rather than timestamps,
+excludes other agents and explicitly retired Goal instances, and resolves refs
+through the existing history read. An absent or corrupt basis is not replaced
+with invented evidence. The field never qualifies execution, scientific novelty,
+utility, effective-Turn counts or acceptance; these remain independent checks.
+No new scheduler, selection rule, quota debit or per-result settlement is added.
+
+The history reader covers both legacy Todo-bound decisions and autonomous
+replan decisions. For an autonomous decision, the recorded Goal, Agent, Turn,
+obligation, settlement identity and accepted acknowledgement must agree; the
+derived decision reference includes that obligation instead of inventing a
+Todo. The existing settlement owner defines the binding, while the Python
+codec only transports its facts. Enabled reviews therefore receive the prior
+decision through the same `previous_review` requirement. Feature-off context
+and legacy decision references remain unchanged. This repairs feedback
+delivery; execution quality and goal benefit still require separate evidence.
+
+<a id="work-meta-goal"></a>
+
+#### Meta-goals and single-Todo acceptance (proposal)
+
+A **meta-goal** is a planning objective for pursuing one or more existing goals.
+It specifies what should be true of a plan, a choice among candidate plans, or
+the relationship between plans, and how to tell when that condition is met.
+A decision question identifies an uncertainty that could change the choice.
+The same meta-goal can span Turns as questions and actions change.
+[Wilensky, §2.2](https://www2.eecs.berkeley.edu/Pubs/TechRpts/1980/Archive/ERL-m-80-33.pdf)
+
+| Meta-goal | Example and success condition | Possible Stride action |
+|---|---|---|
+| Resolve a conflict between goals | Two Goals may need the same limited test window. Find an order or alternative route that meets both sets of acceptance criteria and deadlines. If the commitments cannot both be met, the authorized Goal owners decide the trade-off. | `verify` whether the windows overlap, or `switch` to test a mechanism that can run independently. |
+| Combine overlapping plans | Two plans require equivalent validation against the same input revision. Run it once with coverage for both sets of criteria, and let each acceptance decision reference the shared result. | `verify` coverage if it is uncertain. Confirmed coverage can support `grow` on the shared route within its validated scope. |
+| Choose the highest-value feasible continuation | Compare expected goal value within the same acceptance, deadline, authority and resource constraints. When expected outcomes, risks and later options are equivalent, prefer the lower full cost. | Compare `grow` on a supported route with a `switch` experiment. Use `verify` when the evidence could improve that choice enough to justify the probe. |
+
+Stride chooses the next action in pursuit of the meta-goal. `verify` gathers
+evidence that can change the choice at a justified cost. `grow` expands work on
+a supported route. `switch` tests a materially different mechanism. The same
+meta-goal can call for different actions as evidence arrives. Plan changes
+such as reordering work or sharing a dependency use the existing Todo paths.
+Goal commitments, acceptance, budget and authority remain with their owners.
+
+**Value of a continuation.** Compare the incremental utility delivered by the
+current slice and the expected additional utility from later choices. One
+Bellman-style expression for this comparison is
+
+$$
+Q(s,b,a)=\mathbb E\!\left[\Delta U_{\mathrm{now}}+
+D(\Delta t)V_{\mathrm{future}}(S',b-K)\mid s,b,a\right].
+$$
+
+Here `s` and `b` are the current state and remaining resources. An action
+uses resources `K` and leads to state `S'` with updated results and evidence.
+`D(Δt)` discounts utility over the time until the next decision. Use one when
+time is governed solely by the deadline. Define utility from the Goal's
+acceptance criteria. The future term counts the additional utility available
+from feasible choices after the current slice.
+
+Information has value through better later choices. Estimate that value by
+comparing the later decision with and without the new observation at the same
+time and resource point. Count it once in the evidence-conditioned future
+term. An action can deliver utility and informative evidence together.
+When comparing a probe with acting directly, include the probe's resource
+use and delay. Terminal-outcome objectives and stopping follow the existing
+[budgeted planning model](target-yardstick-stride-decisions-v0.md#budgeted-planning).
+
+**First acceptance trial.** Use one Todo to deliver a faster scheduler under
+its existing correctness and budget constraints. The meta-goal is to select
+the optimization route that warrants further investment. The decision
+question is whether the candidate's gains carry over to peak load. Compare
+tuning immediately with spending part of the same budget on a peak-load
+probe that could change which route to scale. State the objective and choice
+in the existing Stride plan and reasons. For the probe path, choose `verify`
+and use `next_probe` to compare the candidate and incumbent under matched peak
+conditions, with a prediction, minimum evidence, adoption criterion and cost bound.
+
+**Worked scheduler example.** Give the Todo 10 budget units and a hard
+deadline, with $D=1$. In this example, a 10% accepted peak-throughput gain
+over the incumbent is worth 10 utility points. The prior probability that
+the current mechanism's gain transfers to peak load is $P(T)=0.60$.
+At remaining budget $r$, `grow` earns $r$ points if $T$ holds and retains the
+incumbent at 0 points otherwise. `switch` earns $r/2$ points in either state.
+Both payoffs assume $r$ covers implementation, any switch, and final
+validation under the same acceptance criteria.
+
+The probe costs 1 unit, leaves 9 for either route, and delivers 0 immediate
+throughput points. Assume the matched peak comparison passes its correctness
+checks and returns one of two valid results. A $+$ means the candidate reaches
+at least the declared 5% gain, and a $-$ means it falls below it. Assume
+symmetric sensitivity and specificity $P(+\mid T)=P(-\mid \neg T)=q=0.90$.
+Let $p$ be the transfer probability given the evidence so far. At any
+positive remaining budget $r$, `grow` beats `switch` when $p>0.50$, since
+their expected values are $rp$ and $r/2$.
+
+| Valid probe result | Probability | Transfer probability after the result | Next choice |
+|---|---:|---:|---|
+| $+$ | 0.58 | $0.54/0.58 \approx 93.1\%$ | `grow` |
+| $-$ | 0.42 | $0.06/0.42 \approx 14.3\%$ | `switch` |
+
+| Continuation | Total budget | Expected accepted gain (points) |
+|---|---:|---:|
+| Direct `grow` | 10 | $0.60\times10=6.00$ |
+| Direct `switch` | 10 | $10/2=5.00$ |
+| `verify`, then choose | $1+9=10$ | $0.54\times9+0.42\times4.5=6.75$ |
+
+In the last row, 0.54 is the joint probability of transfer and a positive
+signal. The alternative earns 4.5 points in either state after a negative
+signal. Using prior evidence with the same 9 units gives
+$\max(0.60\times9,4.5)=5.40$. The information is worth $6.75-5.40=1.35$
+points, the budget it consumes costs $6.00-5.40=0.60$ in foregone utility,
+and the net gain over direct `grow` is 0.75 points.
+
+For symmetric accuracy $0.50\le q\le0.60$, `grow` remains optimal after
+either result, giving the information zero decision value. When $q>0.60$,
+the results fall on opposite sides of the 50% decision threshold.
+For probe cost $k$, the probabilities $P(T,+)=0.60q$ and $P(-)=0.60-0.20q$
+give expected value $(10-k)[0.60q+(0.60-0.20q)/2]=(10-k)(0.30+0.50q)$.
+With feasible follow-up work, probe when this exceeds 6.00. At $q=0.90$,
+this requires $k<2$ units. At $k=1$, it requires $q>11/15$ (about 73.3%).
+Equality gives the same expected value as direct `grow`. If a probe can
+return an inconclusive result, include that outcome's probability and its
+continuation value at the remaining budget in the comparison.
+
+**Estimate the inputs before choosing.** Fix the incumbent, peak workload
+and scale, evaluation horizon, and acceptance criteria for the comparison.
+In the actual Todo, $T$ means the current mechanism meets the declared useful
+peak gain at that scale under the existing correctness constraints.
+
+- **Transfer prior.** Use the closest comparable independent evaluations
+  available before the probe, matched by mechanism, workload, scale and
+  acceptance. Report verified transfers over resolved cases, alongside
+  missing labels and uncertainty. Repeated timings can refine a case's
+  noise estimate and share one transfer label.
+- **Probe accuracy.** Use cases with a quick result and an independent
+  reference verdict for the same candidate revision and workload scope.
+  Within each reference state ($T$ or $\neg T$), divide positive, negative
+  and inconclusive counts by the paired-case count to estimate the
+  likelihoods of each result. The two error rates can differ. A state
+  without pairs remains unknown. Report which probe results obtained
+  reference labels and scope the estimates to that coverage. Where useful
+  within budget, check some probe-negative cases for missed transfers.
+- **Route utility.** For `grow` and `switch`, use comparable runs to estimate
+  the possible accepted gains over the same incumbent at the same remaining
+  budget and horizon. Weight the outcomes by their likelihood, including
+  fallback after failure. Include implementation, switching, recovery and
+  final verification in the resource estimates. Use ranges supported by
+  comparable runs or the mechanism's limits, and retain unknowns for
+  quantities those sources cannot bound.
+
+Before results arrive, use the existing Stride plan and probe to record or
+reference the estimates, scope, evidence and what observation could change
+the choice.
+
+**Choose with sparse evidence.** Compare feasible choices across plausible
+ranges for the prior, probe likelihoods, gains and costs. Use the preferred
+route if the ordering is stable. If it can flip, identify the assumption
+that changes the choice. Favor a bounded probe when the expected improvement
+justifies its cost and delay and leaves time and resources for final
+confirmation. Otherwise favor a supported, reversible next slice, or retain
+the incumbent and record the question as unresolved through the existing
+stop or wait conditions.
+
+In a later authorized Turn, use `decision_followthrough` and `previous_review`
+to tie the next choice to the exact candidate, workload and observed result.
+Read back all three outcomes across the trial cases.
+
+- The evidence favors expanding the current route and shows useful headroom.
+  Choose `grow` and execute a larger coherent slice within the remaining budget.
+- The evidence favors testing a different mechanism. Choose `switch` and run a
+  bounded test of that mechanism.
+- The cost bound is reached with insufficient evidence. Record the choice as
+  unresolved and handle settlement or waiting through the existing owner.
+
+Use the existing Todo, Turn admission and settlement paths. Independently
+verify the action taken. For executed follow-up work, check whether it
+followed the decision and how its result compares with the original acceptance
+criteria. Record complete costs, including inconclusive probes, in all three cases.
+
+**Calibrate from verified outcomes.** Link the original forecast to the
+observed probe result, the route actually executed, the independent verdict
+and full observed cost. Update transfer counts with resolved reference
+labels, probe likelihoods with paired results and labels, and route payoff
+estimates with the executed route's verified outcomes and cost. For example,
+a negative probe followed by an accepted `switch` outcome updates the
+`switch` estimate. The original mechanism's transfer and the probe's
+classification error remain unknown until independently checked.
+
+Keep the original forecast and the evidence for the update. Report unresolved
+labels and unchosen outcomes as unknown. As comparable cases accumulate,
+compare prior and posterior forecasts against verified frequencies separately,
+and check gain and cost ranges against realized results. Keep comparisons
+scoped to the mechanism, workload, horizon, and probe and reference versions.
+Check revised estimates on later comparable cases.
+
+**Follow-up work.** For cross-Todo planning, start with two Todos within one
+Goal. Check that shared validation covers each Todo's acceptance criteria and
+read back both consumers' use. Cross-Goal changes follow the authority of the
+affected Goals.
+
+For cross-task strategy evolution, use verified decision episodes to propose a
+bounded, versioned Stride strategy change through its owner. An independent
+evaluator compares it with the current version on held-out tasks under the same
+model, starting conditions and budget. Read back actual adoption and outcomes
+in later authorized work. Use those observations and the evaluation verdict to
+decide whether to revise, retain or withdraw the candidate and what to try next.
+[Capability evolution research](frontier-science-research-program-v0.md#t07-diversity-preserving-capability-evolution)
+
+#### An iterative strategy and engineering boundary
+
+The first strategy is **model-guided, evidence-conditioned work planning**.
+It explicitly chooses `grow` (expand a supported route), `switch` (test a
+different mechanism) or `verify` (resolve a specific grow-or-switch question),
+then describes a concrete plan and reason for each coordinate and a falsifiable
+next work slice. It does not optimize a universal novelty score:
+mechanism distance is relative to a declared reference method and goal, while
+slice size is relative to the next useful postcondition and decision risk.
+
+| Basis | Work slice | Mechanism distance | Evidence breadth |
+|---|---|---|---|
+| A supported method yields repeatable useful progress | Increase coherent work when decision risk permits | Retain unless a remaining gap justifies alternatives | Keep required checks; avoid redundant sweeps |
+| Current method leaves a substantive gap under applicable evidence | Choose a complete experiment that can distinguish routes | Compare a larger departure with continuation | Cover the evidence needed to distinguish and adopt routes |
+| Results conflict or expected gains are below uncertainty | Retain or enlarge coherent work needed to resolve uncertainty | Retain or compare alternatives without declaring refutation | Increase only a justified replication/uncertainty probe |
+| A larger departure produces attributable useful results | Expand the adopted method's next slice | Retain the useful departure, not novelty for its own sake | Expand validation needed for adoption |
+| Decision-relevant failure or an authority boundary appears | End/split the current slice through its owner | Reassess within the existing goal | Validate the specific failure; never widen authority |
+
+This table guides a model decision; it is not a prose classifier or a fixed
+numeric policy. The engineering design has four replaceable boundaries:
+
+1. **Observation adapters** produce exact candidate/result, validity/uncertainty,
+   coverage and cost facts. Domain providers own their meanings; they cannot
+   write generic policy or confer execution permission.
+2. **Strategy** consumes one source-bound review basis and proposes the stride
+   vector, next probe and expected benefit/cost. Version and record the strategy
+   with the experiment. Start with the table above; deterministic heuristics or
+   a learned strategy can later replace this function under the same inputs.
+   Do not build a plugin registry or train a controller before a second real
+   qualified strategy needs that seam.
+3. **Admission/adoption** validates the proposal through existing Todo, Vision,
+   replan, budget and authority owners. Work-slice changes use normal split/
+   continuation/successor operations. A route decision cannot execute a
+   successor during an original Turn's outstanding settlement.
+4. **Feedback** returns actual execution, results, retained artifact and complete
+   cost to the next review. Proposal, adoption and utility remain separately
+   replayable; missing feedback never becomes success.
+
+Candidate review may add a critic when the owning capability has a concrete
+evidence gap; it is not a mandatory model on every Turn. A verdict, confidence
+score or majority vote remains an assessment until the existing acceptance owner
+checks the relevant criterion against current attributable evidence. Missing
+tools, invalid output or failed review transport remain unavailable, not passed
+acceptance or scientific refutation. Preserve unresolved gaps and bind any new
+blocker to a current criterion; strategy advice cannot weaken acceptance, and
+repeated review cannot invent unrelated requirements or hide a new defect.
+
+The initial TypeScript component remains one selectable strategy,
+`evidence_conditioned_v1`, plus `off`. Its current implementation replaces fixed
+basis-to-vector mappings with an explicit `grow | switch | verify` action and
+three independently declared concrete plans and reasons. There is no `shrink`
+or idle `hold` decision option. A route switch names the reference method and changed mechanism;
+more tuning cannot establish that change. Basis records the Agent's interpretation,
+not a command to resize work. Verification must resolve a named next decision;
+repeating unchanged checks is not a default policy. The next probe declares
+minimum evidence for a coherent accepted deliverable or interpretable experiment, its prediction, adoption criterion and full cost.
+
+The enabled review now supplies `decision_value_review` questions for the three
+existing axes. It separately considers first-deliverable quality and later gain
+beyond the retained best: recovery from an avoidably weak initial artifact does
+not establish additional capability. Compare attributable artifact versions,
+input conditions and original budgets, retaining submission and feedback-arrival
+times separately. Check whether later work implemented the proposed mechanism;
+a decision record, saved snapshot or new identifier alone does not establish
+adoption, restoration or improved results. These are refinements of the existing
+Agent questions, not new decision fields, score thresholds or settlement gates;
+the strategy applies to live reviews. Identify the remaining authoritative goal gap, its limiting
+component and plausible headroom before choosing the next mechanism. Compare
+continuation with plausible alternatives that change the limiting assumption or
+mechanism, including complete cost. A stalled route calls for a discriminating
+experiment across those explanations, not only more local parameter changes.
+Distinguish an unexecuted intervention, failed transfer and insufficient tested
+route potential; each calls for different evidence. A changed auxiliary mechanism can be useful,
+but its novelty does not establish that it addresses the remaining gap. Local or
+synthetic improvement needs applicable transfer evidence; repeated identical
+outcomes are not new information. Prefer the smallest coverage that resolves the
+choice to another broad sweep, while preserving relevant failure evidence.
+
+Before a local check vetoes further work, identify its source and the goal it
+protects. Original constraints and frozen study criteria retain their authority.
+An agent-proposed candidate heuristic may be revised prospectively with an
+explicit rationale and retained counterevidence; the previous failed result
+stays failed. Compare incumbent behavior under the same relevant control and
+measure or bound the discrepancy's effect on the goal, reusing applicable
+evidence before spending on a finite diagnosis. Readiness for an authorized
+informative evaluation differs from evidence sufficient to replace the
+incumbent. Both decisions retain budget, feedback and permission limits and
+account for full marginal and opportunity cost.
+
+| Evidence at the decision | Appropriate interpretation |
+|---|---|
+| An output violates the task interface or uses forbidden information | Preserve the constraint and repair or reject; heuristic revision cannot waive it. |
+| A candidate misses an agent-chosen numerical tolerance, with task impact unknown | Compare the incumbent and task impact; declare any prospective replacement criterion. Do not claim either safety or harm from the threshold alone. |
+| A frozen comparison criterion fails | Retain that verdict; a revised experiment is separately declared, not a retroactive pass. |
+| A valid candidate regresses on the authoritative objective | Preserve the incumbent and scoped regression, even if local proxies improve. |
+| A synthetic probe improves | Transfer remains unknown; weigh an eligible informative evaluation against its cost, without automatic submission or adoption. |
+
+These questions guide existing axis plans/reasons and `next_probe`; they add no
+decision field, settlement gate, automatic pivot, family ban or strategy version.
+Missing headroom remains unknown. Transport and proposal validation establish
+delivery of this advice; model adoption, stronger results and net efficiency
+still require same-state continuation and full-cost qualification.
+
+Ordinary engineering, organizing and maintenance use the same strategy and
+existing Todo/Next Action. `grow` may complete related implementation,
+integration, validation and readback as one useful delivery slice, reducing
+repeated planning, source reads and control overhead. Size means accepted scope,
+not Todo prose, file count or tool calls. Do not bundle independent commitments,
+ignore a dependency, widen authority or defer a required settlement merely to
+make work larger. Missing evidence can justify a complete verification; it does
+not mechanically require finer tasks. Stop or split at real risk, dependency
+and authority boundaries through their existing owners.
+
+Qualify ordinary-work adoption with an admitted delivery and subsequent review
+of actual artifact, quality and complete marginal cost. Synthetic CLI journeys
+prove transport and settlement, not model choice or efficiency improvement.
+Measure comparable completed work and repeated control/read overhead before
+claiming a gain; keep unavailable measurements unknown.
+
+The existing replan context returns the prior accepted decision and later work.
+A fresh proposal explicitly reviews actual adoption, new information and goal
+gain against that decision and delivered evidence, retaining unknowns. Co-enabled
+Explore contributes references into its existing scoped findings/planner and
+omitted-result reads; the proposal binds the revision and considered findings
+with an applicability/disposition reason. Typed validation rejects missing
+reviews, wrong decision/finding references and stale or unavailable bases.
+Revision-bound global result pages can extend considered findings through the
+optional v2 `explore_review.result_pages` coordinates. The existing Explore
+owner replays at most three pages from its current source before writeback;
+these facts do not change the admitted context/basis identity. Changed source
+requires rereading within the original Turn. Page coordinates persist with the
+decision into subsequent review; node-filtered/planner detail routes remain
+outside this bounded citation path. No separate receipt store is introduced.
+The replan context also carries the prior decision's existing `todo_delta`
+targets in `decision_followthrough.planned_work`: current canonical status and
+claim, plus references to causally later observations of that exact work item.
+Legacy descriptive Todo deltas remain readable with unresolved linkage; an
+overlong reference is never truncated into a different Todo identity.
+Missing Todo sources and omitted work remain explicit; a missing observation
+does not prove non-execution, and Todo completion does not prove objective gain.
+Related observations survive unrelated recent activity in the bounded window.
+Generic followthrough is available with stride off as well: `result_counts`
+separates advanced, unchanged, blocked and terminal observations, while visible
+rows retain their result class and delivery outcome. The compatibility
+`recorded_progress_count` is an observation count, never successful work.
+Historical decision identities and stride admission/settlement gates remain
+unchanged; off-mode context now includes this feedback without enabling stride.
+
+Ordinary replan already reviews the goal, unmet requirements, actual work and
+evidence to choose continuation or adjustment. Stride adds the source-bound
+structured decision, next probe and applicable previous-decision review, with
+the existing typed settlement requirements. Shared planning guidance applies
+independently of the Stride setting. The captured
+reader below serves both off and enabled modes. Keep its delivery/settlement
+benefit separate from strategy adoption and outcome benefit; an off-mode reader
+comparison cannot establish a Stride effect. See the
+[shared guidance and contract boundaries](../../reference/protocols/goal-vision-replan-contract-v0.md#replan-planning-guidance).
+
+The [captured replan reader](../../reference/protocols/turn-envelope-v0.md#captured-replan-reads--捕获后的重规划读取)
+separates state review from authoring on one immutable decision snapshot.
+Cumulative acceptance uses lossless content-bound detail reads, and Explore
+receives a separate context increment. Existing uncaptured callers retain their
+full delivery. File/SQLite source tests and populated packet budgets qualify
+transport and writer continuity; installed adoption, real model decisions and
+matched outcome/cost benefit remain unqualified. This introduces no new planning
+receipt, model checkpoint or requirement to change direction.
+The reader replaces repeated method guidance with compact semantic boundaries
+and the existing stride format. Benchmark preflight captures the original
+decision through the CLI and delivers its staged view even with TurnEnvelope
+off; retaining a full checkpoint packet alone does not qualify model exposure.
+Captured CLI and Turn entries now share delayed settlement-format delivery;
+new native journals deliver the same reader through actual Codex/structured
+Host inputs. The executor retains its signed identity and full source. Core Goal
+and the current horizon stay explicit each Turn, with only cumulative acceptance
+detail indexed. Legacy journals and uncaptured Host requests keep their original
+fallback until they possess the same immutable source/reader binding. No new
+cache, acknowledgement or planning owner is introduced. Qualification must count
+entry, applicable acceptance/evidence, writeback and recovery together; successful
+reader routing is not model adoption, scientific benefit or a total-cost pass.
+
+The next-review input also exposes causally later ordinary writebacks for the
+declared work in `ordinary_work`, with per-Todo `ordinary_evidence_refs`. Its
+six-record detail window retains total/omitted counts and stable history reads;
+it does not fabricate a typed-progress fingerprint or increase progress counts.
+This closes a source-readback gap where legal evidence could qualify a writeback
+but was absent from the decision-followthrough input. Real File/SQLite CLI
+coverage uses the returned reference to read a worse candidate result, retain
+the incumbent, and author the next comparison through the existing Todo/replan
+owners. Late corrections, replay, scope and negative outcomes remain separate
+from model judgment. This is not complete M3 provider/product qualification or
+evidence of research utility; the §11 actual-provider/adoption journey remains.
+
+The same source now retains unresolved declared-work evidence across later
+reviews. A citation becomes a recorded followthrough relation only after its
+decision's declared Todo has a subsequent material writeback; citations or Todo
+creation alone do not consume the result. Replay and replaced unexecuted plans
+preserve the original evidence without a second ledger. Real File/SQLite CLI
+coverage executes isolated candidate/probe processes, reads their artifacts,
+authors the next comparison, and reads that relation at another review. The
+consumer is scripted: native Host/model adoption, candidate applicability and
+scientific utility remain independent, unqualified parts of §11.
+
+Outcome claims require at least one subsequent observation; earlier evidence
+can still be cited for comparison. Writeback replays up to three cited references
+against the complete scoped history through the existing typed replan owner.
+Neither the six-row followthrough display nor the main evidence display limits
+eligibility. Ordinary work rows remain usable without optional typed-progress
+attachments, while accounting-only rows cannot establish execution. Execution
+or gain claims for declared work must cite that work's subsequent observation,
+not another Todo's activity. This
+is a provenance check, not a quality threshold or an automatic truth verdict.
+An executed negative experiment remains a legal outcome. Planning guidance uses
+existing `todo_delta` action/id entries to connect `next_probe` with real Todo
+work, preserves unfinished useful experiments and separates informative
+evaluation from adopting a replacement artifact. No mandatory new proposal
+field, acceptance document, spawn permission or score gate is introduced.
+Ordinary Todo/Next Action still carries admitted work. Real File/SQLite CLI
+qualification covers a decision, selected successor execution, negative evidence,
+next-review readback and rejection/recovery of a claim citing only old evidence;
+model adoption and score or cost benefits remain unqualified.
+
+The benchmark's explicit `loopx-planned` provider adds assumption checks and
+incumbent/negative-experiment guidance around the unchanged planning packet.
+Generic Goal/CLI first-delivery guidance remains the mainline contract; these
+benchmark-specific additions are not installed as Core defaults or checkpoint
+requirements. This provider treatment must be revision-pinned in comparisons;
+it does not establish initial-quality parity or long-horizon research gain.
+
+Evidence-conditioned stride governs every live review. The Goal/device editor
+configures cadence and planning preferences. Both historical v1 decision shapes
+remain readable. Fresh reviews use v2 proposals. Frozen workers retain
+their exact source. Pin implementation revisions for comparisons; do not
+reinterpret old decisions. The policy seam can evolve when evidence warrants it, without maintaining speculative variants.
+For a periodic review or an existing observed-stall review
+(`typed_progress_repeat`, `no_progress_streak`, `repeated_action_loop`,
+`external_progress_review_drift`), every settlement path requires a current,
+source-bound stride decision. Typed progress, successor and terminal results
+remain valid evidence/outcomes, while a bare Todo successor transition cannot
+stand in for the review. An evidenced path decision can retain unfinished useful
+work without a fabricated new progress identifier or Todo. Explicit acceptance
+and capability outcome restrictions still apply. Other sources use their
+existing exit policies.
+
+The frozen [EdgeBench diagnostic window](https://huggingface.co/datasets/songwells/loopxbench/blob/c5dd30bfaa2f5af42ccd7d0ca9ed59b865a81d42/public/edgebench-20261018-v1/diagnostic_windows.csv)
+reports 902 completed native turns and no submissions over one post-hoc selected
+230-minute window. This motivates checking whether review changes subsequent
+work, but does not identify the cause or establish a general stagnation rate;
+zero `apply_patch` calls cannot exclude writes through shell commands.
+
+Real File/SQLite CLI coverage now takes an existing typed-progress stall through
+decision rejection/recovery, an executed comparison of local choice, reverse
+priority and joint assignment under one fixed objective, result readback and the
+next executable transfer-validation Todo. The current decision can retain the
+original Todo; comparison results, not a new label, choose the next mechanism.
+This proves the scripted control path, not model adoption or EdgeBench score gain.
+Existing negative-result and later-work followthrough coverage remains necessary.
+The effective review cadence remains owned by the
+[Goal Vision/replan contract](../../reference/protocols/goal-vision-replan-contract-v0.md#default-review-cadence)
+and Goal/device configuration; six effective work Turns is the default. Stride
+no longer maps grow/verify to fixed cadence multipliers. It governs work shape:
+apply the three independent plans to actual Todo scope and acceptance through
+existing authoring/update commands, record verified IDs in `todo_delta`, and
+execute the retained or revised work under normal admission. Supported grow
+consolidates fragmented setup, implementation, integration and decisive validation
+into a coherent accepted deliverable or complete interpretable experiment.
+Keep dependencies, acceptance, risk, authority and per-Turn settlement boundaries.
+The next review must distinguish declared scope from actual execution, outcome
+quality and full cost; preserving a plan is not adoption or benefit.
+
+Evidence-conditioned stride applies to reviews with inherited or explicitly
+configured cadence. After upgrading, pending writebacks use the current policy.
+A pending writeback for a qualifying review needs a current stride decision.
+Historical records and frozen workers keep their original interpretation.
+Device v2 files retain their stored strategy field for earlier runtimes to read
+after rollback. Review questions and syntax examples remain together.
+Matched continuation must still
+qualify target benefit and full cost before promotion or synergy claims.
+
+Exploratory iteration may run only strategy-enabled test arms and reuse historical
+baselines as descriptive references. A fresh concurrent baseline is not required
+for every iteration; such runs establish route adoption and useful iteration
+signals, not an isolated causal effect or promotion qualification. Reserve
+matched continuation and replication for decisions that need those claims.
+
+<a id="matched-research-continuation"></a>
+
+### 7.7 Research-state branching and matched continuation
+
+Ordinary compaction and session recovery first follow the
+[current work/Goal basis contract](shared-goal-alignment-and-governed-amendment-v0.md#37-current-work-and-goal-requirements).
+Rebuilding context is not effective work, result adoption or permission to clear
+a due review. Preserve the original recovery operation and settlement identity;
+fresh work re-enters its current admission boundary. The research-state capture
+below adds requirements for a fair comparison, not prerequisites for ordinary
+recovery or a second source of execution authority.
+
+A restorable research point combines **conversation position, research evidence,
+code/candidate artifacts and observation opportunities**. A code archive or
+trajectory prefix alone is not that point. Capture and verification reuse the
+existing [backup/recovery owners](complete-state-recovery-v0.md), Host session
+owner and artifact provider. This RFC supplies the research experiment's
+consistency and comparison requirements, not a second restore authority.
+
+Before capture, declare the point by elapsed research budget or a semantic event;
+do not choose it retrospectively for a favorable score. A later point such as
+ten hours is an experiment setting, not a product default or automatic pivot.
+
+The proposed automatic capture policy is **off by default; when explicitly
+enabled, capture at each fresh replan node before its strategy decision**. Reuse
+the canonical replan obligation identity: repeated context reads or retries of
+that node do not create another point. Ordinary work Turns do not automatically
+trigger a full capture. A successful point records the replan identity, the completed Host
+cursor, source revisions and current strategy version; these are evidence
+bindings, not authority. Branches can then compare different replan decisions
+from the same retained research state, including a decision to keep the route.
+
+The trigger still waits for the settled boundary below and must precede the
+replan decision and its new work. A replan can occur inside one Host wake, so an
+after-wake hook alone cannot implement this ordering. The replan and Host owners
+must provide that handoff without an extra model call or work settlement. If the
+boundary cannot be qualified, record the missed point and continue under the
+existing execution contract; do not substitute a later state for that node.
+The benchmark handoff consumes the bounded request before validating the physical
+capture root. A missing or aliased root closes that connection, allowing the same
+source to correct its path and continue without replaying or capturing the refused
+packet. Real socket/process cases cover present, missing and symlinked roots;
+they do not qualify a complete research checkpoint or extend the original deadline.
+Measure capture time and storage per node before choosing compression, shared
+immutable members or retention limits. Retention must preserve declared study
+points and their branches rather than silently selecting favorable outcomes.
+
+An explicitly requested full benchmark capture can also use the existing
+completed-wake boundary: omit the declaration's `trigger` and supply native
+session, canonical research state, evaluation opportunity and controller handoff
+together. The original work must already be settled and its native turn completed;
+no synthetic replan, extra guard or work-slot spend is introduced. The same
+controller writer barrier, participant rereads and fresh destination admission
+apply. File-loaded and preloaded full declarations share the original 90-second
+capture window, capped by the source phase, plus the existing bounded sealing
+allowance after writer release. Ordinary file-only captures keep their 30-second
+window. A missed point continues the source and does not authorize a signal-based
+handoff or relabel a later state. The Host retains the first attempt per declared
+destination, even on failure or a lost reply; replay cannot replace its original
+settled source. The original wake retains its declaration before the optional
+artifact-side index is written; index permission recovery cannot admit later
+state at the missed point. An exhausted phase performs no declaration/source reads.
+The joint native qualification has an explicit
+`settled_work` variant; deterministic inference qualifies mechanical adoption,
+not a scientific advantage or live rollout.
+
+Record the actual boundary and any skew:
+
+- native conversation cursor and a Host-qualified export/fork path, including
+  compaction records, paginated history and the session index needed for native
+  readback; copied log text does not establish a resumable session;
+- settled LoopX research evidence, original goal/priorities, prior decisions,
+  scoped negative results and unresolved questions;
+- exact working code, necessary authorized untracked files, incumbent artifact
+  and its qualifying result, kept separately from unmeasured candidates;
+- source/model/tool/evaluator pins and solver-visible feedback already consumed;
+- remaining total budget, accepted submission history and next feedback
+  opportunity under the original protocol.
+
+Capture belongs at the existing **settled work-Turn boundary**, before the next
+work admission. A time-based request waits for that boundary and records its
+actual elapsed budget; it cannot interrupt an arbitrary tool operation and
+label the resulting files consistent. The runner/Host owns this barrier, while
+each existing participant owns its snapshot:
+
+1. Finish owed Turn settlement and reconcile outstanding tool, child-work and
+   evaluator effects by their original identities. Unresolved effects make the
+   point unqualified; copying their journals does not resolve them.
+2. Capture the native completed-turn cursor, canonical research-state revision,
+   working-artifact manifest and evaluator opportunity state at that barrier.
+   Use the existing SQLite snapshot owner where applicable, not a live database
+   file copy. Keep code and incumbent/result bindings independently verifiable.
+3. Recheck each participant's revision/cursor and artifact digests before
+   publishing one immutable verification unit. Any movement, missing member or
+   interrupted capture leaves an incomplete unit, never a usable point. This
+   establishes the declared barrier's consistency, not a cross-owner transaction.
+4. Restore into an isolated destination, verify its contents, then use the
+   existing owners to admit fresh sessions and research work. Restore alone
+   cannot start a model, claim work, register a timer or submit a candidate.
+
+The Host adapter must qualify native history reconstruction at its pinned
+version, including compaction and paginated storage. For example, Codex's
+[native fork protocol](https://learn.chatgpt.com/docs/app-server)
+can bound a branch by a completed turn. An exported file still needs the native
+store's import/readback path; an arbitrary file path or successful log parse is
+insufficient. Compare the reconstructed prefixes and excluded later history,
+not just returned session identifiers. Keep provider-specific migration and
+storage handling outside the generic consistency decision.
+
+Live native forks need a different qualification from completed-cursor forks.
+The real Codex `0.162.0-alpha.2` characterization in
+`benchmark/tests/test_native_checkpoint_handoff.py` rejects an explicit
+`lastTurnId` while that turn is active. Omitting it can retain the current prefix
+as an interrupted branch while the source tool keeps running. Resuming that
+branch exposes an aborted tool result; it does not replay the tool automatically.
+This avoids requiring a source interruption merely to investigate a fork, but
+neither the returned branch nor its history proves source quiescence. The next
+joint handoff must bind the withheld original guard and pending tool identity,
+reconcile any admitted effects, and verify frozen participant bytes before
+qualifying that cursor. Keep the completed-final-cursor production check until
+this separate path is implemented and qualified; do not silently drop the active
+turn or classify every interrupted session as resumable research state.
+
+The quota transport now has an explicit local pre-output rendezvous. Its real
+native/CLI qualification binds a pending command event and the saved original
+guard digest, forks without another model call, and releases that same response
+without another guard receipt. Lost acknowledgement and altered bytes fail
+without manufacturing another point. This closes the response-ordering gap only:
+work-subprocess yielding can still return control to the model, so source writer
+quiescence, effect reconciliation, automatic worker/controller connection and
+isolated useful continuation remain required. The completed-cursor acceptance
+check remains unchanged.
+
+The existing CLI execution path now has an explicit interruption/recovery
+adapter at the rendezvous: it closes the owned native process group before
+selection and capture, requires graceful leader exit, reaps descendants, and
+returns the retained original guard only after successful context exit. A real
+CLI test exceeds the tool-yield interval and resumes the same source session
+without another quota receipt. The aborted tool remains visible; this is a new
+native turn, not transparent live-stack recovery. The adapter does not yet prove
+that no model action preceded its interruption. The actual heartbeat worker now
+installs the rendezvous for an explicit fresh-replan request, deduplicates the
+original obligation, and resumes the same source session with the original guard
+and remaining wake budget. Ordinary/duplicate guards do not restart the native
+CLI. Declared file capture and failed optional capture use this real entrypoint;
+full-state mid-wake requests remain explicitly unqualified. The native participant
+now binds an explicit interrupted final guard, its parsed routes/Turn identity and
+original packet digest, rejects released output/later visible items or duplicate
+matching calls, and preserves the full prefix in a native fork. Completed-cursor
+checks stay strict. The integrated controller/receiver qualification below now
+covers the joined source and isolated destination path; participant reconstruction
+by itself still grants no work or destination authority.
+
+The Host profile must also declare path portability. A native index can retain
+absolute guest paths: qualification must either preserve those paths inside a
+fresh isolated environment or use the Host's supported import/rebinding API.
+Editing native database rows by hand does not qualify import. Bind the effective
+Host configuration and installed tool/skill versions separately from credentials;
+reauthentication remains with the existing owner. Full research state means the
+declared participants needed to resume useful work, not a copy of every file or
+the model's unobservable internal state.
+
+The optional POSIX heartbeat CLI entry now disables only its worker process's
+soft core-dump limit before launching the native Host and tools. It preserves
+the hard limit, parent launcher and feature-off behavior. Existing declared
+files are still captured exactly; diagnostic retention or relocation is an
+explicit operator action, never a filename filter in the artifact owner.
+This prevents one source of later snapshot growth, but neither qualifies the
+capture deadline for arbitrary inputs nor provides process-memory recovery.
+
+Historical conversation truncation cannot reconstruct earlier code, research
+state or feedback consumption from their terminal versions. Without a qualified
+contemporaneous capture of those participants, such a probe establishes Host
+feasibility only and must not enter a same-state intervention comparison.
+
+The initial implementation slice is [inert artifact capture](../../../benchmark/README.md#inert-checkpoint-capture).
+The benchmark adapter requests it after the existing Turn settlement; the typed
+artifact owner seals explicit files/directories and committed SQLite snapshots,
+rechecks source witnesses and verifies an isolated materialization. Its manifest
+always declares the research point unqualified. The heartbeat adapter also accepts
+an explicit fresh-replan trigger: it preloads the original quota guard and captures
+an admitted replan projected at wake start before invoking the model, deduplicated
+by the existing obligation. It does not cover replans first created inside a running
+Host wake. The optional native participant reads complete history through Codex,
+checks the session's actual workspace and current source binding/profile, and rechecks them after the byte
+probe. A later source Turn in the read-to-probe gap is rejected; the artifact
+owner's witness checks cover subsequent writes. It seals rollout/index/paged
+stores and verifies native forks at fixed guest paths. These source-basis checks
+are qualified separately from research utility.
+
+Both completed-wake and interrupted-replan benchmark capture reuse the existing
+native inspection process across the two full reads and keep it open through
+artifact sealing or controller handoff. Native shutdown can checkpoint SQLite;
+closing it between the byte probe and sealing can invalidate the source witness.
+This changes inspection lifetime only: history pagination, cursor/profile
+freshness, byte witnesses, optional activation and the original capture/phase
+deadlines remain unchanged. Reduced preflight cost does not establish sustained
+capture reliability for growing histories or qualify a later receiver point.
+
+An explicit source-checkout controller now prepares a verified fork through the
+existing registry/session
+owners, with distinct registered Goal/Agent identities and a matching captured
+session profile. The registry fence guards configuration through the binding write;
+existing lifetime semantics remain. The lifecycle-only source-session profile
+cannot run governed work and is rejected rather than used as a benchmark surrogate.
+Replacement, changed configuration/profile and native automatic Goal activation
+are refused. Real native CLI/resume qualification uses a local static provider
+to carry retained conversation into a new Turn, verify materialized code/negative
+evidence and settle the original LoopX guard/writeback/spend. The quiesced fixture
+swaps fixed guest paths; the newer joint receiver fixture below uses a fresh Linux
+guest instead. This earlier test proves
+the conversation participant's adoption and synthetic continuation, not full research/effect adoption, remaining
+whole-trial budget, installed frontend recovery or scientific benefit.
+An explicit checkpoint-aware native judge also exports released public result
+details, accepted counters/clock, remaining cooldown and original trial deadline,
+plus the opaque native-selected incumbent archive bound to its released result.
+The incumbent can precede the working candidate; native ranking remains the owner.
+Missing bytes, changed capture bindings or mismatched file witnesses reject before
+publication, without grading or refilling admission; pending or unreconciled grades reject.
+The opt-in LoopX-state participant additionally seals a complete paged canonical
+Todo read at one promoted provider revision, with byte/revision rechecks. It
+retains complete Explore events and indexed vision/checkpoint history, including
+stride decisions, as historical context. The source owner validates Explore rows;
+framing, source-file digests and absence are checked against the sealed inventory.
+Malformed or moved history rejects the optional capture. These retained records
+do not activate a destination graph, old vision or historical effects.
+Unpromoted coordination retains its previous inert inventory only, explicitly
+without canonical context adoption. A controller can
+attach this retained context to an already owned destination Todo through the
+existing leased continuation prepare/adopt owner and canonical projection
+readback. The source population, notes and original negative evidence are
+available as private context; current requirements, status, claims and leases
+remain current authority. Native profile and complete-history readback precede
+both preparation and adoption. A real native fork/resume plus CLI and canonical
+owner fixture consumes the captured candidate, negative Todo/Explore evidence and vision, excludes
+later source evidence, and settles governed work. Its local deterministic provider
+qualifies transport/adoption and mechanical use, not research judgment or benefit;
+context-command retries now reuse the original prepare/adopt identities and
+revision after lost responses or projection failure, while changed authority,
+notes, artifacts and advanced native history still refuse recovery. Canonical
+graph/vision/effect activation, full native/Host/evaluator consistency, joint
+participant recovery, packaged delivery and useful continued research remain open. Participant/effect reconciliation and complete fresh research-state
+adoption cannot be certified by operator metadata or native history equality.
+
+The explicit Docker controller now offers a bounded writer barrier: pause the
+owned running worker, archive declared files and its phase clock through the
+daemon, capture the native evaluator capsule, then unpause before publishing an
+inert joint unit. A live-writer/native-HTTP qualification proves file stability
+and original opportunity retention. Standalone SQLite participants also transport
+their WAL and rollback journal under that same pause, then use the existing
+SQLite snapshot owner: a valid main database alone can omit committed research.
+Committed WAL rows survive, uncommitted rows stay excluded, and unavailable or
+linked companions reject capture before native publication. Cancellation, lost
+pause responses and failed capture exercise cleanup. An existing pause is not
+owned or released, and failed
+resume prevents publication. This closes the manual provider's file-writer
+barrier gap only. No process memory, native cursor eligibility, external writers,
+automatic pre-decision handoff or isolated continuation are qualified by it.
+
+The automatic supervisor keeps the prepared deadline for the live-source
+barrier and native capture. After successful source release it seals only its
+private exported files under the captured original Host phase deadline, which
+also bounds typed artifact publication. Later source work cannot enter that
+point. The worker reply wait and controller publication share a completion
+deadline of the original capture deadline plus at most 30 seconds, capped by
+that phase. This closes the mismatch where the controller sealed successfully
+after release but the worker already reported capture failure. It also bounds
+an absent controller or stalled sealing without waiting out the whole trial.
+The original 30-second preparation/live-capture deadline is unchanged; the
+extra allowance never admits a late source/native capture. This grants no trial
+time, cooldown or opportunities. Direct callers retain their total timeout.
+
+Warm continuation preserves its captured remaining phase by default. An
+explicit operator-authorized phase extension defines a new study condition,
+bound to its first destination activation and included in recovery identity.
+Recovery cannot change that grant or restart its clock. The extension changes
+neither native cooldown nor accepted round limits, history or scoring. A matched
+strategy comparison declares the same extension on both arms and reports the
+shared prefix separately; it is not a matched-total-budget comparison with the
+original source. See the warm-entry options below for activation and rollback.
+
+The warm receiver now places the admitted continuation intent on its existing
+preparation Todo, distinguishing historical Host phase messages from current
+Goal authority without reintroducing a countdown. Before reporting preparation
+ready, it reads the live Todo and quota/interaction owner within the unchanged
+phase. This qualifies current preparation or review readiness only; native work,
+current semantic replan and research benefit retain their separate acceptance.
+Unqualified terminal archives and historical source authority remain inert.
+
+The ordinary SForge worker's explicit warm entry composes these
+owners. It uses a fresh current preparation Todo with full retained evidence,
+then requires an accepted current replan before restoring the normal cadence.
+Its installed-worker path has passed synthetic joint continuation through
+current preparation/replan, candidate work and released native feedback using
+real native processes and deterministic local inference. Scientific utility,
+actual task/profile admission and the frontend journey remain unqualified.
+See the [warm entry contract](../../../benchmark/README.md#explicit-warm-worker-composition-qualification-in-progress).
+
+The [generic research checkpoint entry](../../reference/research-checkpoint.md)
+now composes the existing artifact, session and Todo/Explore owners for ordinary
+Goals. Codex storage and fork IO live in its Host provider; benchmark adapters
+call inward and add evaluator/budget participants. Capture and adoption are
+separate explicit operations. This CLI/Host stage does not complete the packaged
+frontend or disaster-replacement acceptance.
+
+File coverage and knowledge adoption are separate acceptance dimensions. An
+integrity-verified archive proves its declared roots, not the availability of
+every candidate, data file or report mentioned in native history. The SForge
+receiver now offers explicit selection of captured research components outside
+the workspace, with fresh data destinations and post-copy byte/mode verification.
+Source capture still requires explicit roots; neither path inference nor later
+salvage completes an earlier point. Validate a retained experiment requiring
+those files before claiming usable research-state continuity. Existing points,
+active runs, default workspace-only restoration, budgets and feedback are
+unchanged. This closes a provider transport omission; automatic dependency
+coverage and the generic frontend remain open.
+
+Retaining historical research files alone does not deliver them to a current
+typed review. Explicit warm-context adoption now seeds the fresh Goal's Explore
+knowledge log from the verified source, preserving scoped findings, counterevidence
+and topology with checkpoint/event provenance. The existing result-log owner
+guards ordered-prefix recovery; newer destination evidence is never overwritten.
+Historical research-observation execution lineage remains inert in the archive.
+The synthetic joined receiver exercises a current review citing a retained
+counterexample. Scientific continuation still needs actual first/next review
+readback and prior-decision followthrough; importing facts cannot certify model
+judgment or revive source decision authority. An empty destination projection
+cannot establish that retained research is absent. The strategy's
+existing three-axis guidance now asks for a discriminating observation, checks
+that an intervention actually changes relevant behavior, and distinguishes
+non-execution from failed transfer or limited route potential. These questions
+guide judgment; they neither force a route switch nor certify research benefit.
+
+A native fresh registration is not restored admission. In the controlled native
+Docker qualification, one of twelve source submissions was consumed and its
+cooldown remained active. A same-limit fresh registration admitted `agent-1`
+immediately with twelve unused rounds. Regrading the retained archive created a
+new result, without restoring the source history or opportunity state. This is
+valid new-trial behavior; it cannot substitute for a same-point continuation.
+The evaluator owner must separately qualify destination initialization from the
+bound history/counters and remaining cooldown duration, together with the Host's
+remaining total budget. Copying captured token rows is not admission proof.
+
+The [controller-only native capsule transport](../../../benchmark/README.md#controller-only-native-capsule-transport)
+now connects the proposed native initializer to the existing typed artifact owner:
+explicit controller authority captures/imports a sealed native bank and requests
+fresh native registration. Controller configuration stays out of solver payloads
+and exported participants; opaque data remains private and uncertified. This slice preserves native history, selected
+archive, counters and cooldown; it does not yet qualify the joint replan barrier,
+model/LoopX state adoption or useful research. Its explicit SForge phase-file
+participant also seals the declared Host deadline against the native capture
+timestamp. Restore recomputes the remaining duration and anchors a new Host phase
+file at activation, charging transport rather than offline time or a fresh trial.
+The existing work reserve and native opportunity owner remain unchanged. An
+uncertain response leaves an unusable phase reservation, not a fresh-budget
+fallback. Explicit controller recovery now reads the original native activation
+and retains the destination deadline durably bound before the first admission.
+Lost replies and partial phase writes recover without a new registration,
+round, cooldown or budget reset; exhausted or mismatched attempts refuse.
+An isolated real native HTTP/Docker journey verifies recovery, the ordinary
+Linux phase-entry shell, candidate production and the next accepted grade.
+Model inference is excluded. Full Host provenance/clock alignment and joint
+session/research/effect recovery still need their profile's qualification;
+this participant transport cannot certify them.
+
+The automatic source-capture boundary composes the held fresh-replan decision,
+native cursor and canonical research inventory under the controller Docker writer
+barrier. It verifies the exact pending request and prepared source witness before
+sealing incumbent, opportunity and remaining phase budget. A changed or expired
+boundary is missed, never recaptured after source continuation.
+
+The joint receiver qualification now consumes an actual controller-captured
+interrupted point in a fresh Linux guest with no mounted source authority.
+Explicit native binding and leased Todo-context adoption retain the pending call
+as history; a fresh destination guard owns subsequent work. The same nested
+native capsule supplies opportunities and the Host phase deadline. A resumed
+native tool reads retained context/code, creates a synthetic candidate and receives
+its next grade under that deadline, followed by exactly-once destination settlement.
+Lost binding acknowledgment and activation readback reuse their committed identities;
+wrong source/digest and advanced history reject. This closes the joined mechanical
+continuation gap for the tested profile, not installed campaign admission, packaged
+recovery UX, autonomous research quality or a stride-effect claim.
+
+The completed-cursor path is also exercised through the real worker, native Host,
+SQLite inventory and Docker controller before the model sees a fresh replan.
+Its committed guard may still owe work selection: inert capture preserves that
+prohibition instead of fabricating a causal settlement binding. An isolated
+receiver resumes the retained code/context under fresh authority. When the sealed
+cooldown outlasts its work window, local candidate work succeeds while native
+submission returns 429 without consuming a round or invoking a grader. The
+separate eligible-cursor fixture receives its next grade. These two lawful states
+must remain distinct; restoring a point does not make its next submission eligible.
+
+The completed-source fixture now reaches that review through six actual native
+work wakes and exactly-once CLI settlements rather than inserted history rows.
+Stride is enabled with Explore planning separately off/on. Capture precedes the
+decision; the source records grow with independent axis plans and completes its
+larger synthetic next slice. Fresh isolated receivers consume the sealed code and
+context while preserving pending cooldown. This qualifies mechanical composition,
+not model judgment, automatic destination graph/policy adoption or utility.
+The tested Darwin native Host can omit the pending command after interruption;
+delayed reads and leader-only signalling do not repair it. That profile refuses
+mid-wake native capture before signalling and releases the original tool response.
+Linux interrupted and completed-wake capture retain their separate qualification;
+strict history, ambiguity, source and deadline predicates remain unchanged.
+
+An explicit destination preparation can reuse the existing cadence owner for
+its first review: configure `--execution-replan-after-turns 1`, perform and settle
+one actual restoration check, then admit the newly due periodic review. That
+check reads retained research/code and public opportunity without changing the
+candidate or submitting it. The review uses current Goal/Todo/lease and fresh
+context identities; source settlements remain historical evidence. After the
+review settles, restore the preregistered normal cadence through
+`configure-goal` before admitting research work. The isolated native receiver
+qualification records independent grow axes, adopts one two-candidate complete
+slice and verifies unchanged deadline, pending cooldown, consumed rounds and
+incumbent. The default receiver path is exercised separately. The public
+[`qualify_checkpoint_joint.py`](../../../benchmark/tests/qualify_checkpoint_joint.py)
+entry reproduces the six-work-wake source with a non-root controller, then runs
+ordinary and stride receivers in separate fresh guests; the
+[benchmark procedure](../../../benchmark/README.md#controller-only-native-capsule-transport)
+pins the checkpoint provider, prepares guest dependencies and lists explicit
+native CLI/Node inputs. Missing prerequisites fail rather than skip qualification.
+Its private receipt and logs retain input provenance; read-only Git members
+exercise the controller boundary. The source now declares its whole workspace
+directory with a caller-owned component ID. Non-root receivers select that
+directory by the sealed original workspace path and use the typed materialization
+owner; retained source registry/state files remain historical beside a fresh
+external registry/runtime. Admission of the source Goal through the fresh registry
+is rejected, while retained evidence and actual candidate writes remain usable.
+This qualifies the directory/writer seam, not a real task dataset or scientific
+continuation result. This is an
+explicit tested composition, not an automatic restore hook or a new default.
+A Todo-successor repair alone is not a spendable periodic strategy review.
+Matched branches must declare the same preparation/cadence transition and charge
+its full cost. Scripted native-provider execution qualifies transport and
+mechanical adoption, not model judgment, restored Explore graph authority or
+scientific benefit; later-point selection and real branch admission remain open.
+
+Re-enabling capture on a restored conversation requires a destination decision,
+not merely a new Goal/Agent or a locally unseen replan ID. Both pre-model and
+mid-wake hooks refuse capture until the canonical current-Goal settlement
+contains an accepted semantic replan whose Vision evidence references
+`checkpoint:<artifact-sha256>`, and the destination native history has completed
+a continuation with the original full history prefix intact. For declarations
+that include the native participant, preflight checks the bound workspace/session
+and reads only the latest Turn without its items. This provisional cursor must
+be completed and absent from the retained source; it is not proof of full history.
+Both actual capture observations must verify the original full prefix and that
+completed cursor before sealing. A changed source/session, missing cursor or
+changed prefix rejects capture. Preparation and declarations without a native
+participant retain full-history preflight. The consumed
+obligation itself remains ineligible; a subsequent genuinely new node can be
+captured. Retry, restart and a lost admission response preserve the original
+source-root/digest binding. This is a machine-enforced capture barrier, not
+additional execution or budget authority.
+
+A replayed guard can expose the next replan while the current Turn still owes
+its original Todo closeout. The checkpoint selector validates that original
+settlement identity and releases the response without capture or interruption;
+it must not treat the visible next obligation as this Turn's admitted capture
+boundary. The later properly bound replan remains eligible. The Unix transport
+and typed-owner regression cover this distinction; successful restoration alone
+still does not qualify an end-to-end research continuation.
+
+The same boundary covers the replan owner's `settlement_only` follow-through:
+recording a successor, writing its required vision or spending the original
+receipt does not admit another capture. Selection verifies the original
+settlement identity and semantic obligation, then releases the exact response
+without native interruption. The existing settlement owner still decides the
+remaining step; capture neither performs it nor grants a fresh work budget.
+
+Completed pre-model points now retain the original pending guard as a sealed
+participant, as interrupted points already do. The pending packet is read as
+historical decision evidence under the destination's current guard; source
+commands, claims, identities and effects must not execute again. Older pending
+points without that participant cannot re-enable capture. After consumption the
+Host stops repeating this context. Continuation reads the digest-bound manifest
+basis and verifies the particular pending packet and native history it uses;
+it does not rehash large code/incumbent archives every work wake or claim that
+this limited read is fresh full-member verification. Native admission still
+requires full artifact verification. Capture alone never automatically restores
+a branch. An external restore-every-new-point orchestrator must exercise the same
+barrier and current admission; its existence or successful scientific outcome
+does not follow from this receiver qualification.
+
+The artifact copy also preserves read-only file modes without requesting write
+access merely to sync the copied bytes. A non-root controller capture of a
+`0444` participant failed before this fix and now succeeds; Git object stores
+are an ordinary source of such members. Root-only container qualification was
+insufficient for this Host boundary. Source permissions and bytes remain unchanged.
+
+Committed native session admission now retains the captured artifact digest in
+the original atomic session binding. Exact controller retries after a lost binding
+reply verify that receipt, current Goal/Agent/profile and unchanged complete
+native history, then return the same session without a fork or model call.
+Ordinary subsequent observations preserve provenance only for that conversation;
+replacement identity drops it. Unmarked/foreign bindings and advanced native
+history reject old-point admission. Before native fork dispatch, a private
+transport attempt retains the source artifact/destination basis and native
+identity inventory under the existing process lock. A lost pre-binding reply can
+recover the unique new native child, after native parent/workspace and complete
+history verification, without dispatching another fork. Missing or ambiguous
+outcomes stay unresolved. The pinned native index supplies only opaque lookup
+IDs because the interactive listing hides unused forks; native APIs verify their
+meaning, and no native rows are rewritten. Tests inject pre- and post-binding
+reply loss, recover through the CLI and continue real native governed work with
+a deterministic local provider; absent/multiple outcomes and foreign destination
+attempts reject. The controller participant recovery above does not yet qualify
+automatic joint session/research/evaluator/Host activation recovery.
+
+By default, warm-worker continuation keeps the admitted native conversation across
+the current semantic replan and later work. An explicit `--restore-fresh-replan`
+treatment instead starts a fresh conversation before preparation and the first
+current replan from a verified pending-decision checkpoint. The original objective,
+retained research evidence, code and incumbent remain the decision basis; no
+post-checkpoint decision is inherited. Preparation uses the original deadline. The post-replan context-reset option
+has been removed. Existing refresh provenance remains readable for previously
+captured artifacts; ordinary replacement still cannot inherit provenance.
+This removal does not qualify scientific benefit, a new study cell or hot updates.
+
+The joined qualification must distinguish a manual partial artifact from a
+new automatic full point after useful destination work. The retained-history
+receiver uses its synthetic profile's explicitly selected cadence to reach that
+new periodic review and the actual controller/native opportunity barrier to seal
+code/research/native/phase state, then sends that point to another isolated receiver for real
+work. Source-prefix verification preserves the complete admitted native history. The
+completed cursor and both full history/source observations remain mandatory. Reusing a
+verified synthetic source point skips only source generation, never counts a
+prior source test as passed, and still exercises every receiver. This closes a
+mechanical composition seam when qualification passes; sustained large-point
+capacity, packaged restoration and scientific evidence use remain separate.
+
+An inert verification unit grants no execution authority. The destination uses
+fresh experiment/Host identities and the existing Goal/session/state admission
+paths. Historical leases, quota, timers, pending effects and submission tokens
+cannot become destination authority. Reconcile unknown effects by original
+identity before any replay. A Host without a qualified fork reports that gap;
+an evidence-summary restart is a different treatment, not exact continuation.
+
+Validate digest/cursor/artifact consistency, partial capture, missing files,
+changed inputs, duplicate restore, conflicting writer, stopped source and lost
+result delivery before running a matched study. Resume must demonstrate actual
+use of the captured evidence and code, then useful new work. Successful tar
+verification or session opening alone is not acceptance.
+
+For the research ablation, branch the **same** qualified point into unchanged
+continuation and evidence-conditioned scope review, with equal continuation
+budgets and resources. Change one control factor; preserve feedback opportunity
+counts and cooldown timing through the evaluator owner. Label session restart,
+summary replacement, source upgrades or policy bundles as additional factors.
+The evaluator carries the remaining cooldown and consumed opportunities into
+each newly authorized branch; a fresh identity must not create an extra immediate
+submission. Wall-clock waiting between capture and admission does not replenish
+the checkpoint's opportunity allowance or extend the continuation budget.
+Keep all branches and invalid/negative results; compare adopted native outcomes,
+information gained and full continuation cost. The result qualifies the scoped
+intervention, not all LoopX behavior or an optimal universal stride.
 
 ## 8. Measurement Model
 
@@ -594,6 +1861,18 @@ The first study should avoid a full three-dimensional combinatorial grid.
 - event-driven authority escalation;
 - identical effect and delivery contracts.
 
+**Stage E: compare research scope from the same captured state**
+
+- unchanged continuation versus the §7.6 evidence-conditioned scope review;
+- the same qualified §7.7 conversation/evidence/code point and feedback history;
+- equal continuation resources, budget and evaluation opportunities;
+- distinct native outcome, information/adoption and complete-cost measures;
+- a small recovery/adoption pilot first, repeated cells before promotion.
+
+Choose tasks with room for a genuinely different mechanism and retain a
+near-ceiling or noisy case as a limit check. Do not select checkpoints or omit
+branches after observing their scores.
+
 Only after these stages identify interactions should a factorial experiment
 combine promoted profiles.
 
@@ -608,21 +1887,36 @@ keyword.
 
 ## 11. Smallest Useful Implementation Slice
 
-The first implementation is deliberately narrow and reversible:
+M1 observation and the source-level feedback slice already exist: the typed
+replan projection returns the prior accepted path and later recorded progress;
+the opt-in strategy validates a source-bound proposal. Preserve exact-entry,
+stale/corrupt-input and feature-off qualification. These facts establish neither
+live model adoption nor scientific or cost benefit, and do not justify another
+feedback ledger.
 
-1. Add one public architecture vocabulary for effect, delivery, and authority
-   stride.
-2. Derive a read-only stride observation from existing Turn, settlement, Todo,
-   quota, and gate receipts where available.
-3. Add an offline evaluator that reports layer metrics and mismatch signals.
-4. Characterize standard and fine-grained LoopX profiles with public-safe
-   fixtures and at least one real model behavior qualification path.
-5. Emit shadow recommendations only. Do not alter Todo selection, scheduler
-   frequency, effect execution, or user notification.
+The next usable M3 episode connects one real capability/provider result to the
+existing task/replan writeback and readback. Deliver its current basis, admit a
+bounded continuation or successor, observe actual adopted work, and return its
+artifact, outcome and remaining gap to the next review. Include a late correction,
+lost/duplicate delivery and ordinary context recovery, retaining current authority
+and owed settlement. The packaged task/capability journey must expose waiting,
+failure, stale/unavailable and adopted-result facts. A synthetic verdict or CLI
+receipt alone remains partial.
 
-The first slice should extend the nearest existing Turn/status read model. It
-should not create a new built-in capability, executor, scheduler, or generic
-policy framework.
+Use an already supported execution entry, such as the opt-in managed ZCode
+native Goal or scoped Goal Chat continuation, to qualify the Host side of this
+episode. Those paths do not supply research-result validity: the experiment
+provider and first decision contract remain owned by
+[Research §11.5](research-exploration-control-plane-v0.md#115-evidence-conditioned-experiment-decisions-proposed-refinement).
+Include unchanged Goal-instance identity with amended criteria/source scope
+and a slow-check/stop case. Read back the next protected action's current basis
+and actual adoption; binding identity, native active status or a timer value
+alone is insufficient.
+
+§7.7 separately qualifies claims requiring the same captured research state and
+comparable feedback opportunities; it need not block this bounded integration.
+Repeated matched results and full-cost evidence remain prerequisites for M5
+promotion. This refinement activates no policy or additional model call.
 
 ## 12. Milestones
 
@@ -651,6 +1945,13 @@ policy framework.
   transitions;
 - validate recommendations against independent acceptance rules;
 - retain Todo and replan as the only execution authorities.
+- qualify §7.6 decision followthrough at the real replan entry and observe
+  whether the next probe changes relevant information, rather than identifiers;
+- connect the existing feedback projection to the §11 provider/adoption episode,
+  including late correction, context recovery and product readback;
+- qualify one §7.7 research-state branch and matched continuation profile;
+- qualify the proposed §7.5 provider checkpoint/monitor binding in shadow;
+  distinguish model decisions from experiment completion and Turn settlement.
 
 ### M4: Authority-stride shadow recommendations
 
@@ -664,6 +1965,8 @@ policy framework.
 - retain hard ceilings and rollback;
 - compare repeated results against the pinned fixed profile;
 - publish limitations and failure modes with any claimed improvement.
+- for long-running work, qualify §7.5 lost-result recovery and default-off
+  parity before suppressing model admission; observer cost remains measured.
 
 ## 13. Validation Criteria
 
@@ -685,6 +1988,14 @@ The research program is qualified only when it can prove:
 9. promoted profiles improve end-to-end quality or cost across repeated runs,
    not only one layer-local count;
 10. failure cases remain honestly terminal and recoverable.
+11. research scope changes preserve the original task and acceptance; evidence
+    breadth is justified by decision value rather than repeated-check count;
+12. a restored research point retains conversation/evidence/code and equivalent
+    feedback opportunities without reviving source execution authority;
+13. prior decision, actual experiment, result interpretation and adopted action
+    are distinguishable; missing execution or utility remains unknown;
+14. matched continuation comparisons retain incumbent, uncertainty, failures and
+    full model/tool/control costs; a local proxy gain is not native goal gain.
 
 ## 14. Non-Goals
 

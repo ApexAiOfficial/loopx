@@ -34,6 +34,10 @@ export function loadPlaywright() {
   throw new Error("Playwright package not found; install playwright or set LOOPX_PLAYWRIGHT_PACKAGE");
 }
 
+// Playwright names the shell `chrome-headless-shell` on POSIX and
+// `chrome-headless-shell.exe` on Windows.
+const CHROME_HEADLESS_SHELL_NAMES = new Set(["chrome-headless-shell", "chrome-headless-shell.exe"]);
+
 function findChromeHeadlessShell(root) {
   if (!existsSync(root)) {
     return null;
@@ -46,7 +50,7 @@ function findChromeHeadlessShell(root) {
       const path = resolve(current, entry.name);
       if (entry.isDirectory()) {
         pending.push(path);
-      } else if (entry.isFile() && entry.name === "chrome-headless-shell") {
+      } else if (entry.isFile() && CHROME_HEADLESS_SHELL_NAMES.has(entry.name)) {
         matches.push(path);
       }
     }
@@ -58,24 +62,62 @@ export async function launchBrowser(chromium) {
   const configuredPath = process.env.LOOPX_CHROME_HEADLESS_SHELL;
   const playwrightPath = chromium.executablePath();
   const executablePath = [configuredPath, playwrightPath]
-    .find((candidate) => candidate && basename(candidate) === "chrome-headless-shell" && existsSync(candidate))
+    .find((candidate) => candidate && CHROME_HEADLESS_SHELL_NAMES.has(basename(candidate)) && existsSync(candidate))
     ?? findChromeHeadlessShell(resolve(homedir(), ".cache/hyperframes/chrome"))
     ?? findChromeHeadlessShell(resolve(homedir(), ".cache/ms-playwright"))
-    ?? findChromeHeadlessShell(resolve(homedir(), "Library/Caches/ms-playwright"));
+    ?? findChromeHeadlessShell(resolve(homedir(), "Library/Caches/ms-playwright"))
+    // Windows installs the browser cache under %LOCALAPPDATA% instead.
+    ?? (process.env.LOCALAPPDATA
+      ? findChromeHeadlessShell(resolve(process.env.LOCALAPPDATA, "ms-playwright"))
+      : null);
   if (!executablePath) {
     throw new Error("chrome-headless-shell not found; set LOOPX_CHROME_HEADLESS_SHELL");
   }
   return chromium.launch({ executablePath, headless: true });
 }
 
-export function startViteDashboardServer({ dashboardDir, port }) {
+export async function startViteDashboardServer({ dashboardDir, port }) {
   const nodeBin = process.env.LOOPX_NODE_BIN || process.execPath;
-  const viteBin = resolve(dashboardDir, "node_modules/vite/bin/vite.js");
-  return spawn(nodeBin, [viteBin, "--host", "127.0.0.1", "--port", String(port), "--strictPort", "--force"], {
+  // HTTP from the selected port could belong to a different Vite process.
+  // Confirm the bind over the channel owned by this child before browsing.
+  const entry = `
+import { createServer } from "vite";
+const port = Number(process.argv[1]);
+const vite = await createServer({
+  server: { host: "127.0.0.1", port, strictPort: true },
+  forceOptimizeDeps: true,
+});
+await vite.listen();
+process.send(vite.httpServer.address().port);
+`;
+  const server = spawn(nodeBin, ["--input-type=module", "--eval", entry, String(port)], {
     cwd: dashboardDir,
     env: { ...process.env },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
+  let diagnostic = "";
+  server.stderr.on("data", chunk => { diagnostic = (diagnostic + chunk).slice(-8000); });
+  const startup = new AbortController();
+  let timer;
+  try {
+    const [boundPort] = await Promise.race([
+      once(server, "message", { signal: startup.signal }),
+      once(server, "close", { signal: startup.signal }).then(([code, signal]) => {
+        throw new Error(`Dashboard Vite server exited (${code ?? signal}) before binding port ${port}: ${diagnostic.trim()}`);
+      }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Dashboard Vite server did not confirm port ${port} within 20 seconds`)), 20_000);
+      }),
+    ]);
+    if (boundPort !== port) throw new Error(`Dashboard Vite server bound port ${boundPort}; expected ${port}`);
+    return server;
+  } catch (error) {
+    await stopServer(server);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    startup.abort();
+  }
 }
 
 export async function waitForHttp(url, timeoutMs = 20_000) {
@@ -92,15 +134,16 @@ export async function waitForHttp(url, timeoutMs = 20_000) {
 }
 
 async function stopServer(server) {
-  if (!server || server.exitCode !== null || server.signalCode !== null) {
+  if (!server?.pid || server.exitCode !== null || server.signalCode !== null) {
     return;
   }
   const exited = once(server, "exit");
   server.kill("SIGTERM");
+  let timer;
   const stopped = await Promise.race([
     exited.then(() => true),
-    new Promise((resolveTimeout) => setTimeout(() => resolveTimeout(false), 5_000)),
-  ]);
+    new Promise((resolveTimeout) => { timer = setTimeout(() => resolveTimeout(false), 5_000); }),
+  ]).finally(() => clearTimeout(timer));
   if (!stopped && server.exitCode === null && server.signalCode === null) {
     const forceExited = once(server, "exit");
     server.kill("SIGKILL");

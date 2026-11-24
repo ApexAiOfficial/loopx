@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -117,7 +119,7 @@ def handle_opencode2_goal_worker_command(
             node_args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
         )
     except FileNotFoundError:
         payload = {
@@ -129,16 +131,16 @@ def handle_opencode2_goal_worker_command(
         print_payload(payload, args.format, _render_worker_markdown)
         return 1
 
-    log_path = Path(
-        tempfile.mkstemp(prefix="loopx-oc2-worker-", suffix=".log")[1]
-    )
+    fd, raw_log_path = tempfile.mkstemp(prefix="loopx-oc2-worker-", suffix=".log")
+    os.close(fd)
+    log_path = Path(raw_log_path)
     worker_log_tail = ""
 
     def _drain(stream: Iterable[str]) -> None:
         nonlocal worker_log_tail
         with log_path.open("a", encoding="utf-8") as log_handle:
             for line in stream:
-                print(line, end="", flush=True)
+                print(line, end="", file=sys.stderr, flush=True)
                 log_handle.write(line)
                 log_handle.flush()
         tail = log_path.read_text(encoding="utf-8").splitlines()[-120:]
@@ -188,18 +190,19 @@ def handle_opencode2_goal_worker_command(
         log_path.unlink(missing_ok=True)
         print_payload(payload, args.format, _render_worker_markdown)
         return 1
+    ok = process.returncode == 0 and parsed.get("ok", True) is not False
     payload: dict[str, object] = {
-        "ok": process.returncode == 0 and parsed.get("ok", True) is not False,
         "schema_version": "loopx_opencode2_worker_result_v0",
         "operation": "opencode2_goal_worker",
-        "exit_code": process.returncode,
     }
     payload.update(parsed)
+    payload["ok"] = ok
+    payload["exit_code"] = process.returncode
     if worker_log_tail:
         payload["worker_log_tail"] = worker_log_tail[-1200:]
     log_path.unlink(missing_ok=True)
     print_payload(payload, args.format, _render_worker_markdown)
-    return process.returncode
+    return 0 if ok else (process.returncode or 1)
 
 
 def _render_worker_markdown(payload: dict[str, object]) -> str:

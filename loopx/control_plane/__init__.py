@@ -34,6 +34,17 @@ def compact_control_plane_policy(value: Any) -> dict[str, Any]:
                 default=enabled,
             ),
         }
+    if isinstance(value.get("progress_review"), dict):
+        # Typed sentinel policy travels with the compact projection so status
+        # readers see the same mode the obligation path enforces. The policy
+        # module is dependency-free; malformed blocks project as `off`.
+        from .work_items.progress_review_policy import (
+            progress_review_goal_policy_summary,
+        )
+
+        compact["progress_review"] = progress_review_goal_policy_summary(
+            {"control_plane": value}
+        )
     return compact
 
 

@@ -1,6 +1,11 @@
 # 验证说明：NoKV canonical coordination provider（v0）
 
-- 配套 RFC：[多端共享 Goal 的在线权威与可插拔状态 Provider (v0)](./shared-goal-authority-state-provider-v0.zh-CN.md)
+> 历史证据存档。此处 `nokv-shadow-provider` 和 Python head/executor 原型已于
+> 2026-09-26 退役；命令和路径仅描述当时基线，不再是当前运行指南。当前 File/SQLite
+> 资格及 NoKV Stage 2A 入口见 [E2E ladder](../../../examples/shared-goal-authority-e2e/README.md)。
+
+
+- 配套 RFC：[LoopX 共享控制面权威与可插拔状态 Provider (v0)](./shared-goal-authority-state-provider-v0.zh-CN.md)
 - 参考实现与探针：`examples/nokv-shadow-provider/`
 - 证据范围：canonical coordination aggregate、target-scoped conflict、内部 CAS
   rebase 与历史 operation receipt 重放
@@ -35,7 +40,10 @@
 python3 examples/nokv-shadow-provider/probes.py contract
 ```
 
-命令退出码为 `0`，并逐项报告以下九个通过的合同探针：
+命令退出码为 `0`，并逐项报告以下九个通过的合同探针。自 Stage 2 切片合并
+后，claim/CAS 探针全部由生产 `CoordinationAuthorityExecutor` 与生产 head
+编解码驱动（不再存在第二套参考 authority），且每个探针的持久 head 都经
+生产 `validated_head` 回环校验：
 
 - `contract.bootstrap_and_preconditions`；
 - `contract.a_success_b_advance_replay_a`；
@@ -43,9 +51,10 @@ python3 examples/nokv-shadow-provider/probes.py contract
 - `contract.competing_claims`；
 - `contract.crash_windows_and_ambiguity`；
 - `contract.version_domains_and_retain_all`；
-- `contract.nokv_adapter_exception_mapping`（NoKV adapter 把 0.11.0 SDK 的
-  `FileNotFoundError` / `FileExistsError` / `RuntimeError` 全部映射为类型化
-  provider 结果，不向 authority 泄露异常）；
+- `contract.nokv_adapter_exception_mapping`（NoKV adapter 仅按异常类分类：
+  `FileNotFoundError` 是唯一的 missing 信号；其余客户端失败在读路径抛类型化
+  `ProviderUnavailableError`、在 CAS 前置为类型化 `failed`，携带 not-found
+  文案的路由故障不再被误判为未初始化）；
 - `contract.durable_completion_projection`；
 - `contract.durable_completion_fail_closed`（含显式 `completion_continuation`
   缺失或矛盾时的 fail-closed）。
@@ -168,3 +177,71 @@ live NoKV 测试。确定性 fake 的通过结果与这项静态 API 核对必�
 
 真实栈若产生原始日志，应保留在 ignored local state；公共文档只记录可复跑
 命令、候选 commit、机器可判定的不变量和明确的未验证项。
+
+## 7. Stage 2 切片复跑记录（2026-08-23）
+
+按第 5 节的复跑要求逐项记录本轮 live 证据：
+
+1. **精确 commit**：LoopX 侧为 Stage 2 分支（本记录随该分支评审，git 树即
+   源码 digest），基于 Stage 1 Part 2 分支头；NoKV 侧为 `v0.11.0` 标签，
+   经其 Python SDK wheel 驱动。
+2. **探针源码**：`examples/nokv-shadow-provider/live_e2e.py`（随分支评审）。
+   驱动的是生产 `CoordinationAuthorityExecutor` 与生产 head 编解码，不再是
+   参考实现。
+3. **A → B → replay A 断言**：八场景矩阵对 file provider 与 NoKV provider
+   逐行结果一致（含精确重放行：重建 executor 后 `already_applied` 且
+   receipt 逐字段相等；lost-response 行：ambiguous 后经 receipt index 收敛
+   到 `already_applied`）。
+4. **same-id/different-request 负例**：同 operation_id 改语义字段返回
+   `rejected/operation_identity_mismatch`，且聚合与 generation 不变。
+5. **未执行与限定**：renew/release/reclaim、retention 策略、HA、多节点
+   未验证。SIGKILL 重启演练已在本地 dev 栈执行（owner 被杀后运维式重开：
+   head 字节级一致、原 receipt 精确重放、三版本域恢复推进）；该演练脚本
+   因绑定具体部署形态保留在本地忽略状态，不入公共树。回执增长、并发包络
+   等数字是单节点 dev 栈的量化观测，按第 5 节规则不构成生产结论；其含义
+   已写入 RFC 第 11 节 Stage 2 状态小节。
+
+## 8. Stage ladder E2E 复跑记录（2026-09-03）
+
+按第 5 节的复跑要求逐项记录本轮 stage ladder 证据：
+
+1. **精确 commit**：LoopX 侧为 `test/shared-authority-e2e-ladder` 分支（基于
+   PR #3818 第三轮修订头，含单一 effective runtime root 修复；ladder 报告的 `bindings.loopx_commit` 与
+   `bindings.loopx_tree_dirty` 记录实际运行的树）。NoKV 侧本轮在本机单节点栈上
+   执行（`nokv` 83971e62ab，Python SDK 0.11.0，`nokv serve` 以静态 etcd 路由 +
+   RustFS 对象存储运行；报告只记录 `bindings.nokv_client_config_sha256` 与 SDK
+   版本，不记录任何连接值）；PostgreSQL 侧无可达栈，对应行按设计报告 `unverified`。
+2. **探针源码**：`loopx/control_plane/testing/authority_e2e_ladder.py`、
+   `loopx/control_plane/testing/authority_e2e_fixtures.py` 与只读 TypeScript
+   探针 `tests/control_plane_ts/authority_store_readback_probe.ts`（随分支评审；
+   报告 `bindings.probe_sha256[]` 记录其 digest）。入口为
+   `examples/shared-goal-authority-e2e/ladder.py`，pytest 投影为
+   `tests/control_plane/test_shared_goal_authority_e2e.py`。各行驱动的是真实
+   `python -m loopx.cli` 与生产 `FileAuthorityStore`，不是参考实现。
+3. **断言**：本轮 9 个 deterministic 行全部 pass，2 个 NoKV live 行在本机栈上
+   pass：`s0.nokv_live_matrix` 十三个 NoKV 场景行全为 true 且与 file provider 的
+   十二个共享行逐行一致；`s2a.nokv_live_qualification` 对既有 workbench 以新铸
+   tenant/goal 运行已合并的 live 资格探针，13 项 check 全部 `passed`，final
+   generation `3`，SDK `0.11.0` / API `1`，且报告声明未改变 authority source、未
+   证明可用性。deterministic 行：`s0.file_matrix_twelve_rows`
+   十二个 file provider 场景行全为 true；`s1.cli_document_decodes_through_ts_store`
+   三次 CLI 写入经 TypeScript store 回读 cursor `3`、operation id 按序一致、首条
+   receipt found；七个 `s2c1.*` 行（configure 往返、12 个 writer family 全部
+   captured 且候选 cursor `12`、default-off 隔离、候选失败保主写、SIGKILL 崩溃
+   间隙只丢失一次 observation、`--runtime-root` 与 `common_runtime_root` 不同时
+   五次写入落入单一 store identity 且候选 cursor `5`、`migrate-state` 新 lineage
+   cursor `1`）。
+4. **负例**：幂等 re-acquire 不携带 `authority_shadow`；default-off goal 无
+   `authority-shadow/` 目录且响应字段与 observed goal 一致；候选目录被占用时
+   `outcome=failed` / `reason_code=shadow_observation_failed` 但主写已提交；
+   迁移后的候选序列化中不含旧 store identity、legacy revision、源路径与私有
+   字节；报告隐私扫描把注入的临时路径改写为 `fail/privacy_violation`，仅泄露到
+   bindings 块时 `summary.privacy_violations=1` 且退出码为 1，且 live 变量清空时
+   ladder 退出码为 1（均由 pytest 钉住）。
+5. **未执行与限定**：`s2b.postgresql_conformance_live`（`postgres_url_missing`）
+   本轮 unverified；在没有 NoKV 与 PostgreSQL 栈的 CI 环境里三个 live 行都报告
+   `unverified`。9 个 `s2c2.*` 行以 pending 声明，未宣称；选中任一 pending 行而不传
+   `--allow-pending` 时 ladder 以非零退出，零执行的报告不可能显示为 green。默认
+   全量运行退出码为 1，`--allow-unverified --allow-pending` 才为 0。Stage 2C
+   parity、outbox、drain 与增长门槛均未验证；本记录不构成任何 provider 晋升
+   或生产结论。

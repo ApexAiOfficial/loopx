@@ -22,7 +22,7 @@ from ..runtime.event_ledger import (
 from ..runtime.promotion_readiness import build_promotion_readiness_summary
 from ..runtime.run_history import build_run_history
 from ..quota.usage_summary import build_usage_summary
-from ..todos.todo_index import build_todo_index
+from ..todos.todo_index import EventsForGoal, build_todo_index
 
 
 StatusCallback = Callable[..., Any]
@@ -89,6 +89,9 @@ def build_status_runtime_summaries(
     display_limit: int,
     todo_index_limit: int,
     context: StatusRuntimeSummaryContext,
+    events_for_goal: EventsForGoal | None = None,
+    recent_run_limit: int | None = None,
+    include_goal_subagent_configuration: bool = False,
 ) -> dict[str, Any]:
     def event_class_for_run(run: dict[str, Any]) -> str:
         return event_ledger_event_class(run, context=context)
@@ -105,6 +108,10 @@ def build_status_runtime_summaries(
             compact_run=context.compact_run,
             quota_status=context.quota_status,
             display_limit=display_limit,
+            recent_run_limit=recent_run_limit,
+            include_goal_subagent_configuration=(
+                include_goal_subagent_configuration
+            ),
         ),
         "event_ledger_summary": build_event_ledger_summary(
             history,
@@ -137,6 +144,7 @@ def build_status_runtime_summaries(
         "usage_summary": build_usage_summary(
             history,
             parse_timestamp=context.parse_timestamp,
+            runtime_root=runtime_root,
         ),
         "todo_index": build_todo_index(
             queue=queue,
@@ -144,5 +152,6 @@ def build_status_runtime_summaries(
             runtime_root=runtime_root,
             public_safe_compact_text=context.public_safe_compact_text,
             limit=todo_index_limit,
+            events_for_goal=events_for_goal,
         ),
     }

@@ -6,6 +6,7 @@ lifecycle envelope and explicitly loads the manifest-declared validator for
 ``decision_research_dashboard_v0``. Publishing a finance surface therefore
 validates the finance view here, in the extension, rather than in Core.
 """
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -24,6 +25,10 @@ from .presentation_validation import (
     record as _record,
     required_text as _required_text,
     text_list as _text_list,
+)
+from .source_coverage import (
+    validate_source_period_metrics,
+    validate_spot_market_identity,
 )
 
 DECISION_RESEARCH_VIEW_SCHEMA_VERSION = "decision_research_dashboard_v0"
@@ -72,7 +77,9 @@ def _identity(value: Any) -> dict[str, Any]:
         allowed={"title", "subtitle", "as_of", "evidence_cutoff"},
     )
     return {
-        "title": _required_text(record, "title", context="view.identity", max_length=160),
+        "title": _required_text(
+            record, "title", context="view.identity", max_length=160
+        ),
         "subtitle": _required_text(
             record,
             "subtitle",
@@ -137,8 +144,12 @@ def _metrics(value: Any) -> list[dict[str, Any]]:
         metrics.append(
             {
                 "id": _identifier(record.get("id"), context=f"{context}.id"),
-                "label": _required_text(record, "label", context=context, max_length=80),
-                "value": _required_text(record, "value", context=context, max_length=120),
+                "label": _required_text(
+                    record, "label", context=context, max_length=80
+                ),
+                "value": _required_text(
+                    record, "value", context=context, max_length=120
+                ),
                 "detail": _required_text(
                     record,
                     "detail",
@@ -182,8 +193,12 @@ def _dashboard_summaries(value: Any) -> list[dict[str, Any]]:
         summaries.append(
             {
                 "id": _identifier(record.get("id"), context=f"{context}.id"),
-                "label": _required_text(record, "label", context=context, max_length=80),
-                "title": _required_text(record, "title", context=context, max_length=160),
+                "label": _required_text(
+                    record, "label", context=context, max_length=80
+                ),
+                "title": _required_text(
+                    record, "title", context=context, max_length=160
+                ),
                 "summary": _required_text(
                     record,
                     "summary",
@@ -219,7 +234,9 @@ def _layers(value: Any) -> list[dict[str, Any]]:
             {
                 "id": _identifier(record.get("id"), context=f"{context}.id"),
                 "order": order,
-                "label": _required_text(record, "label", context=context, max_length=100),
+                "label": _required_text(
+                    record, "label", context=context, max_length=100
+                ),
                 "status": _enum(
                     record.get("status"),
                     _LAYER_STATES,
@@ -289,9 +306,13 @@ def _observations(value: Any, *, entity_context: str) -> list[dict[str, Any]]:
         observations.append(
             {
                 "id": _identifier(record.get("id"), context=f"{context}.id"),
-                "label": _required_text(record, "label", context=context, max_length=100),
+                "label": _required_text(
+                    record, "label", context=context, max_length=100
+                ),
                 "kind": kind,
-                "value": _required_text(record, "value", context=context, max_length=200),
+                "value": _required_text(
+                    record, "value", context=context, max_length=200
+                ),
                 "as_of": _iso_value(record.get("as_of"), context=f"{context}.as_of"),
                 "source_ref": _evidence_reference(
                     record.get("source_ref"),
@@ -368,8 +389,12 @@ def _scenario_estimates(
         scenarios.append(
             {
                 "scenario": scenario,
-                "label": _required_text(record, "label", context=context, max_length=100),
-                "value": _required_text(record, "value", context=context, max_length=160),
+                "label": _required_text(
+                    record, "label", context=context, max_length=100
+                ),
+                "value": _required_text(
+                    record, "value", context=context, max_length=160
+                ),
                 "horizon": _required_text(
                     record,
                     "horizon",
@@ -568,7 +593,9 @@ def _research_ledger(value: Any) -> list[dict[str, Any]]:
                     record.get("case_id"),
                     context=f"{context}.case_id",
                 ),
-                "label": _required_text(record, "label", context=context, max_length=180),
+                "label": _required_text(
+                    record, "label", context=context, max_length=180
+                ),
                 "gate_states": gate_states,
                 "decision": _enum(
                     record.get("decision"),
@@ -688,7 +715,9 @@ def _event_gates(value: Any) -> list[dict[str, Any]]:
                     record.get("event_id"),
                     context=f"{context}.event_id",
                 ),
-                "label": _required_text(record, "label", context=context, max_length=180),
+                "label": _required_text(
+                    record, "label", context=context, max_length=180
+                ),
                 "status": _enum(
                     record.get("status"),
                     _EVENT_STATES,
@@ -820,6 +849,8 @@ def validate_decision_research_view(
             "identity",
             "adjudication",
             "metrics",
+            "source_period_metrics",
+            "spot_market_identity",
             "dashboard_summaries",
             "layers",
             "entities",
@@ -830,13 +861,11 @@ def validate_decision_research_view(
             "boundary",
         },
     )
-    return {
+    result = {
         "identity": _identity(record.get("identity")),
         "adjudication": _adjudication(record.get("adjudication")),
         "metrics": _metrics(record.get("metrics")),
-        "dashboard_summaries": _dashboard_summaries(
-            record.get("dashboard_summaries")
-        ),
+        "dashboard_summaries": _dashboard_summaries(record.get("dashboard_summaries")),
         "layers": _layers(record.get("layers")),
         "entities": _entities(record.get("entities")),
         "research_ledger": _research_ledger(record.get("research_ledger")),
@@ -845,3 +874,12 @@ def validate_decision_research_view(
         "method_state": _method_state(record.get("method_state")),
         "boundary": _boundary(record.get("boundary")),
     }
+    if "source_period_metrics" in record:
+        result["source_period_metrics"] = validate_source_period_metrics(
+            record.get("source_period_metrics")
+        )
+    if "spot_market_identity" in record:
+        result["spot_market_identity"] = validate_spot_market_identity(
+            record.get("spot_market_identity")
+        )
+    return result

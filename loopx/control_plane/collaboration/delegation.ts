@@ -1,0 +1,906 @@
+/** Explicit local execution bindings. Registration/messages alone grant no launch.
+ * These are host observations; canonical task/Turn/acceptance remain authoritative. */
+import {executionRequestSubject, type JsonObject} from "../effect_program.ts";
+import {requireInteger, requireJsonObject, requireStringArray} from "../runtime_decode.ts";
+import {EffectRuntimeRequestError} from "../effect_runtime_errors.ts";
+import {canonicalAuthoritySha256} from "../coordination/authority_store_codec.ts";
+import {canonicalTaskValidationPlan} from "../goals/task_validation_plan.ts";
+import {normalizeTodoCompletionValidationDeclaration} from "../todos/completion_validation_declaration.ts";
+import {readTurnSelectionRejection, turnSelectionRejectionState} from "../turn_driver/selection_rejection.ts";
+import { BARE_SHA256_PATTERN } from "../content_digest.ts";
+import {PROJECTION_ENVELOPE_SEAL_REQUEST, sealProjectionEnvelope} from "../projection_envelope.ts";
+import {readRequestControl, requestOriginalDigest, requestRevisionDigest} from "./request_control.ts";
+import {EffectiveAction} from "../quota/effective_action.generated.ts";
+import {normalizeCollaborationBrief, planCollaborationRequestPublication} from "./semantic_request.ts";
+
+function requireThat(ok: unknown, message: string): asserts ok {
+  if (!ok) throw new EffectRuntimeRequestError(message);
+}
+function text(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 4096;
+}
+
+/** The canonical acceptance reader resolves owner scope before this plan.
+ * A null requirement is out of scope/disabled, never an unbound-task fallback.
+ * Private declarations must match the current Todo authority, also on readback. */
+export function delegationValidationPlan(params: JsonObject): JsonObject {
+  const binding = requireJsonObject(params.binding, "delegation binding");
+  if (binding.todo_id == null) {
+    requireThat(requireJsonObject(params.basis, "canonical validation basis").status === "loaded", "delegation canonical authority unavailable");
+    const normalized = normalizeTodoCompletionValidationDeclaration(
+      binding.request_validation == null ? {} : requireJsonObject(binding.request_validation, "request validation"), {
+      strict_fields: true, require_command: true, require_canonical_input: true,
+    });
+    if (!normalized.ok) return {todo_id: null, state: "unbound", source: null,
+      reason: "independent_delegation_validation_required", effects: [], canonical_done: false};
+    const declaration = normalized.value;
+    const effects = [{kind: "caller_validation", validation_command: declaration.validation_command,
+      validation_argv: declaration.validation_command_argv, validation_label: declaration.validation_label,
+      validation_timeout_seconds: declaration.validation_timeout_seconds,
+      validation_declaration_sha256: canonicalAuthoritySha256(declaration), task_repository: null}];
+    return {todo_id: null, state: "ready", source: "request_validation", effects,
+      canonical_done: false, task_basis_sha256: canonicalAuthoritySha256(binding),
+      observation: {source: "request_validation", basis_sha256: canonicalAuthoritySha256({binding, effects}),
+        check_count: effects.length, pinned_file_count: 0}};
+  }
+  let plan: JsonObject;
+  try {
+    plan = canonicalTaskValidationPlan({todo_id: binding.todo_id,
+      basis: params.basis, declaration: params.declaration});
+  } catch (error) {
+    if (!(error instanceof EffectRuntimeRequestError)) throw error;
+    // Retain the established delegation diagnostics at this compatibility entry.
+    const message = error.message === "canonical task Todo must be an object"
+      ? "canonical delegation Todo must be an object"
+      : error.message === "canonical task requires a current matching canonical Todo"
+        ? "delegation requires a current matching canonical Todo"
+        : error.message === "canonical task requires matching owner acceptance criteria"
+          ? "delegation requires matching owner acceptance criteria" : null;
+    if (message === null) throw error;
+    throw new EffectRuntimeRequestError(message, error.code, error.details);
+  }
+  if (plan.reason === "no_declaration")
+    return {...plan, reason: "independent_delegation_validation_required"};
+  if (plan.state !== "ready") return plan;
+  return {...plan, observation: {...requireJsonObject(plan.observation, "current validation observation"),
+    ...currentOracleChecks(requireJsonObject(params.basis, "canonical validation basis"), plan.effects as JsonObject[])}};
+}
+
+/** Consume only the acceptance owner's current exact-source observation. */
+function currentOracleChecks(basis: JsonObject, effects: JsonObject[]): JsonObject {
+  const contract = basis.goal_acceptance_contract as JsonObject | undefined;
+  if (!contract || !Array.isArray(contract.criteria) || !contract.criteria.some(raw => (raw as JsonObject).oracle)) return {};
+  const receipt = contract.verification as JsonObject | null;
+  const checks = (contract.criteria as JsonObject[]).flatMap(criterion => {
+    const oracle = criterion.oracle as JsonObject | undefined;
+    const result = (receipt?.results as JsonObject[] | undefined)?.find(row => row.criterion_id === criterion.id);
+    return oracle?.state === "current" && effects.some(effect => effect.criterion_id === criterion.id)
+      && result?.oracle_evidence ? [{criterion_id: criterion.id, ...result.oracle_evidence as JsonObject}] : [];
+  });
+  return {oracle_checks: checks};
+}
+
+/** Fresh host check observation.
+ * Host IO brackets the actual checks; only stable declared output versions return. */
+export function delegationCheckedArtifacts(params: JsonObject): JsonObject {
+  const binding = requireJsonObject(params.binding, "delegation binding");
+  const plan = requireJsonObject(params.plan, "current validation plan");
+  requireThat(plan.todo_id === binding.todo_id && plan.state === "ready" && (plan.canonical_done === true
+      || binding.todo_id == null && plan.source === "request_validation"),
+    "delegation requires current canonical completion");
+  const observation = requireJsonObject(plan.observation, "current validation observation");
+  requireThat((observation.source === "goal_acceptance" || observation.source === "todo_validation" || observation.source === "request_validation")
+    && typeof observation.basis_sha256 === "string" && BARE_SHA256_PATTERN.test(observation.basis_sha256)
+    && Number.isInteger(observation.check_count) && Number(observation.check_count) > 0
+    && Number.isInteger(observation.pinned_file_count) && Number(observation.pinned_file_count) >= 0,
+  "current validation basis required");
+  requireThat(typeof params.checked_at === "string"
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(params.checked_at)
+    && Number.isFinite(Date.parse(params.checked_at)), "host check time required");
+  const refs = binding.output_refs;
+  requireThat(Array.isArray(refs) && refs.length > 0
+    && refs.length <= 20 && new Set(refs).size === refs.length,
+  "declared output refs required");
+  const versions = (value: unknown) => {
+    requireThat(Array.isArray(value) && value.length === refs.length,
+      "declared output versions required");
+    const rows = value.map(item => {
+      const row = requireJsonObject(item, "output version");
+      requireThat(text(row.ref) && !row.ref.startsWith("/") && !row.ref.includes("\\")
+        && !row.ref.split("/").includes("..") && refs.includes(row.ref)
+        && typeof row.sha256 === "string" && BARE_SHA256_PATTERN.test(row.sha256),
+      "valid declared output version required");
+      return {ref: row.ref, sha256: row.sha256};
+    });
+    requireThat(new Set(rows.map(row => row.ref)).size === rows.length, "duplicate output version");
+    return rows.sort((a, b) => a.ref.localeCompare(b.ref));
+  };
+  const before = versions(params.before);
+  const after = versions(params.after);
+  requireThat(canonicalAuthoritySha256(before) === canonicalAuthoritySha256(after),
+    "delegation output changed during validation; recheck the original output");
+  return {source: observation.source, basis_sha256: observation.basis_sha256,
+    check_count: observation.check_count, pinned_file_count: observation.pinned_file_count,
+    checked_at: params.checked_at, output_versions: after,
+    ...(Array.isArray(observation.oracle_checks) ? {oracle_checks: observation.oracle_checks.filter(raw => {
+      const check = requireJsonObject(raw, "oracle execution evidence");
+      return Array.isArray(check.output_versions) && after.every(output => (check.output_versions as JsonObject[])
+        .some(row => row.ref === output.ref && row.sha256 === output.sha256));
+    })} : {})};
+}
+export function selectDelegationBinding(params: JsonObject): JsonObject {
+  const config = requireJsonObject(params.config, "delegation configuration");
+  requireThat(config.schema_version === "loopx_local_delegation_v0", "unsupported delegation configuration");
+  requireThat(Array.isArray(config.bindings) && config.bindings.length <= 100, "bounded bindings required");
+  const rows = config.bindings.map(value => requireJsonObject(value, "delegation binding"));
+  requireThat(new Set(rows.map(row => row.id)).size === rows.length, "duplicate binding identity");
+  const binding = rows.find(row => row.id === params.binding_id);
+  requireThat(binding, "delegation binding unavailable");
+  requireThat(new TextEncoder().encode(JSON.stringify(binding)).length <= 16000, "delegation binding exceeds limit");
+  requireThat([binding.id, binding.agent_id, binding.workspace].every(text)
+    && (binding.todo_id == null || text(binding.todo_id)), "binding identity/workspace required");
+  requireThat(Array.isArray(binding.requesters) && binding.requesters.includes(params.agent_id)
+    && binding.agent_id !== params.agent_id, "caller has no delegation grant");
+  requireThat(Array.isArray(binding.host_args) && binding.host_args.length > 0
+    && binding.host_args.every(text), "operator host arguments required");
+  requireThat(Number.isInteger(binding.timeout_seconds) && Number(binding.timeout_seconds) >= 1
+    && Number(binding.timeout_seconds) <= 3600, "bounded execution timeout required");
+  requireThat(Array.isArray(binding.output_refs) && binding.output_refs.length > 0
+    && binding.output_refs.length <= 20 && binding.output_refs.every(ref => text(ref)
+      && !ref.startsWith("/") && !ref.includes("\\") && !ref.split("/").includes("..")), "bounded relative output refs required");
+  return binding.todo_id === undefined ? {...binding, todo_id: null} : binding;
+}
+
+/**
+ * Recover only the original source, peer work, binding and return conversation.
+ * The host observes these records through the existing exact-Goal Inbox owner.
+ */
+export function verifyDelegationSourceReplay(params: JsonObject): JsonObject {
+  const binding = selectDelegationBinding(params);
+  const record = requireJsonObject(params.record, "saved delegation");
+  const identity = requireJsonObject(record.identity, "saved delegation identity");
+  const source = requireJsonObject(params.source_request, "original source request");
+  const peer = requireJsonObject(params.peer_request, "original peer request");
+  const operation = requireJsonObject(params.peer_operation, "original peer operation");
+  planCollaborationRequestPublication({request: operation, entry: peer, operation});
+  const conversation = requireJsonObject(params.conversation, "original conversation");
+  const same = (a: unknown, b: unknown) => canonicalAuthoritySha256(a) === canonicalAuthoritySha256(b);
+  requireThat(typeof params.source_request_id === "string" && BARE_SHA256_PATTERN.test(params.source_request_id)
+    && source.request_id === params.source_request_id && source.execution_binding_id === binding.id
+    && peer.source_kind === "peer" && peer.source_agent_id === params.agent_id
+    && source.goal_id === params.goal_id && peer.goal_id === params.goal_id
+    && source.agent_id === binding.agent_id && peer.agent_id === binding.agent_id
+    && same(source.goal_ref ?? null, peer.goal_ref ?? null)
+    && same(source.goal_ref ?? null, params.goal_ref ?? null), "delegation replay source identity mismatch");
+  requireThat(text(params.operation_id) && typeof peer.request_id === "string"
+    && BARE_SHA256_PATTERN.test(peer.request_id)
+    && same(identity, {binding, request_id: peer.request_id,
+      operation_id: params.operation_id, source_request_id: params.source_request_id,
+      ...(binding.todo_id == null ? {request_subject: delegationRequestSubject(source, binding)} : {})}),
+  "delegation replay operation identity mismatch");
+  const brief = normalizeCollaborationBrief(params.brief);
+  requireThat(same(source.brief, brief) && same(peer.brief, brief), "delegation replay brief changed");
+  requireThat(Object.keys(conversation).length === 2 && text(conversation.session_id) && text(conversation.turn_id)
+    && same(record.conversation, conversation) && same(params.source_conversation, conversation),
+  "delegation replay return conversation changed");
+  return {matched: true};
+}
+
+/** The original request revision and exact operator binding own ordinary work. */
+export function delegationRequestSubject(entry: JsonObject, binding: JsonObject, expected?: unknown): JsonObject {
+  requireThat(binding.todo_id == null && entry.agent_id === binding.agent_id
+    && typeof entry.request_id === "string" && BARE_SHA256_PATTERN.test(entry.request_id),
+  "ordinary delegation requires its original request");
+  const control = entry.request_control == null ? null : readRequestControl(entry);
+  const revision = control?.revisions.at(-1);
+  requireThat(control?.cancellation == null, "delegation request was cancelled");
+  const subject = executionRequestSubject({request_id: entry.request_id,
+    request_revision: revision?.revision ?? 1,
+    request_digest: revision ? requestRevisionDigest(entry, revision) : requestOriginalDigest(entry),
+    execution_scope_sha256: canonicalAuthoritySha256(binding)})!;
+  if (expected !== undefined) requireThat(
+    canonicalAuthoritySha256(executionRequestSubject(expected)) === canonicalAuthoritySha256(subject),
+    "original request revision or scope changed");
+  return subject;
+}
+
+/** Called only after the host has re-read the original Inbox/source grant. */
+export function delegationRequestDecision(params: JsonObject): JsonObject {
+  const subject = executionRequestSubject(params.request_subject);
+  requireThat(subject !== null, "original request subject required");
+  const packet = structuredClone(requireJsonObject(params.decision, "current quota decision"));
+  // A request never bypasses Stop, budget, health, a true gate or required replan.
+  if (packet.should_run !== true || packet.effective_action !== EffectiveAction.NORMAL_RUN
+      || packet.normal_delivery_allowed !== true) return packet;
+  delete packet.selected_todo;
+  delete packet.agent_lane_next_action;
+  delete packet.action_portfolio;
+  delete packet.task_orchestration_contract;
+  delete packet.action_selection_qualification;
+  delete packet.goal_route_hint;
+  delete packet.next_action_projection_warning;
+  if (packet.planning_horizon != null) {
+    const horizon = requireJsonObject(packet.planning_horizon, "planning horizon");
+    delete horizon.selected_todo_id;
+    delete horizon.selection_contract;
+    if (Array.isArray(horizon.work_items)) for (const raw of horizon.work_items) {
+      const item = requireJsonObject(raw, "horizon item");
+      if (Array.isArray(item.context_reasons)) item.context_reasons = item.context_reasons.filter(reason =>
+        reason !== "related_to_selected" && reason !== "higher_priority_than_selected");
+    }
+  }
+  packet.recommended_action = "Process the original delegated request and return its validated result.";
+  const cli = requireJsonObject(requireJsonObject(packet.interaction_contract, "interaction contract").cli_channel, "CLI channel");
+  for (const key of ["selection_required", "selection_command", "selection_instruction"]) delete cli[key];
+  cli.spend_after_validation = true;
+  cli.spend_policy = "spend once after independent request validation and durable writeback";
+  const contract = requireJsonObject(packet.interaction_contract, "interaction contract");
+  const agent = requireJsonObject(contract.agent_channel, "agent channel");
+  for (const key of ["selection_required", "action_portfolio_ref", "suggested_action_count"]) delete agent[key];
+  const work = requireJsonObject(agent.work_context, "work context");
+  if (Array.isArray(work.sources)) work.sources = work.sources.filter(raw =>
+    requireJsonObject(raw, "work source").source !== "selected_todo");
+  delete work.selected_todo_text_verified;
+  delete work.selected_todo_authority;
+  agent.must_attempt = true;
+  agent.delivery_allowed = true;
+  agent.quiet_noop_allowed = false;
+  agent.primary_action = "Process the original delegated request and return its validated result.";
+  packet.request_subject = subject;
+  return packet;
+}
+
+/** Original work is a captured material, not an implicit workspace convention.
+ * The host has reobserved the operation/grant through the existing owners.
+ * No locator, Host configuration or new authority enters the model input. */
+export function delegationTurnWorkContext(params: JsonObject): JsonObject {
+  const binding = selectDelegationBinding(params);
+  if (params.record === null) {
+    const call = requireJsonObject(params.turn, "request preview Turn");
+    const source = requireJsonObject(params.source_request, "original request");
+    requireThat(binding.todo_id == null && call.todo_id == null
+      && call.agent_id === binding.agent_id && call.workspace === binding.workspace
+      && text(call.turn_instance_id) && source.goal_id === call.goal_id
+      && source.agent_id === binding.agent_id && source.execution_binding_id === binding.id
+      && typeof source.message === "string" && source.message === params.original_message,
+      "request preview does not match its original source");
+    return {request_id: source.request_id, goal_id: source.goal_id, agent_id: source.agent_id,
+      todo_id: null, turn_instance_id: call.turn_instance_id,
+      brief: normalizeCollaborationBrief(source.brief), instruction: source.instruction,
+      request_subject: delegationRequestSubject(source, binding),
+      source_request: {request_id: source.request_id, message: source.message,
+        brief: source.brief, instruction: source.instruction}};
+  }
+  const record = requireJsonObject(params.record, "delegation record");
+  const identity = requireJsonObject(record.identity, "delegation identity");
+  const call = requireJsonObject(params.turn, "delegated Turn");
+  const peer = requireJsonObject(params.peer_request, "original peer request");
+  const same = (a: unknown, b: unknown) => canonicalAuthoritySha256(a) === canonicalAuthoritySha256(b);
+  requireThat(record.work_context_required === true && params.stop === null
+    && (record.status === "prepared" || record.status === "running")
+    && same(identity.binding, binding) && identity.operation_id === params.operation_id
+    && peer.request_id === identity.request_id && peer.goal_id === call.goal_id
+    && peer.agent_id === binding.agent_id && peer.source_agent_id === params.agent_id
+    && peer.source_kind === "peer" && call.agent_id === binding.agent_id
+    && call.todo_id === binding.todo_id && call.workspace === binding.workspace
+    && text(call.turn_instance_id) && call.turn_instance_id === params.turn_instance_id,
+  "delegation material does not belong to this Turn");
+  planCollaborationRequestPublication({request: params.peer_operation, entry: peer, operation: params.peer_operation});
+  const brief = normalizeCollaborationBrief(peer.brief);
+  const source = params.source_request === null ? null : requireJsonObject(params.source_request, "original source request");
+  requireThat((identity.source_request_id === undefined) === (source === null), "delegation source material required");
+  if (source !== null) requireThat(source.request_id === identity.source_request_id
+    && source.goal_id === peer.goal_id && source.agent_id === peer.agent_id
+    && source.execution_binding_id === binding.id && same(source.goal_ref ?? null, peer.goal_ref ?? null)
+    && same(source.brief, brief) && typeof source.message === "string"
+    && source.message === params.original_message,
+  "original delegation message or identity changed");
+  if (binding.todo_id == null) requireThat(same(identity.request_subject,
+    delegationRequestSubject(source ?? peer, binding)), "original request revision or scope changed");
+  return {
+    operation_id: identity.operation_id, request_id: peer.request_id,
+    goal_id: peer.goal_id, agent_id: peer.agent_id, todo_id: binding.todo_id,
+    turn_instance_id: call.turn_instance_id, brief, instruction: peer.instruction,
+    ...(binding.todo_id == null ? {request_subject: delegationRequestSubject(source ?? peer, binding)} : {}),
+    ...(source === null ? {} : {source_request: {
+      request_id: source.request_id, message: source.message, brief: source.brief,
+      instruction: source.instruction,
+    }}),
+  };
+}
+
+type Observation = "prepared" | "running" | "turn_returned" | "accepted" | "rejected" | "stopped";
+
+function boundedReason(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  const reason = value.trim();
+  return reason.length > 0 ? reason.slice(0, 4096) : fallback;
+}
+
+/** Preserve the host owner's public diagnosis, not its private configuration.
+ * Optional fields keep older host previews compatible; null means unprobed. */
+export function delegationRuntimeFacts(executor: JsonObject): JsonObject {
+  const facts: JsonObject = {};
+  if (Object.hasOwn(executor, "runtime_probe")) {
+    if (executor.runtime_probe === null) facts.runtime_probe = null;
+    else {
+      const probe = requireJsonObject(executor.runtime_probe, "runtime probe");
+      requireThat(probe.schema_version === "managed_runtime_probe_v0"
+        && typeof probe.scope === "string"
+        && ["probing_interpreter", "configured_runner"].includes(probe.scope)
+        && (probe.module === null || (typeof probe.module === "string"
+          && probe.module.length <= 128 && /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$/.test(probe.module)))
+        && typeof probe.available === "boolean", "invalid runtime probe observation");
+      facts.runtime_probe = {schema_version: probe.schema_version, scope: probe.scope,
+        module: probe.module, available: probe.available};
+    }
+  }
+  if (Object.hasOwn(executor, "unavailable_remediation")) {
+    const remedies = executor.unavailable_remediation;
+    requireThat(Array.isArray(remedies) && remedies.length <= 8
+      && remedies.every(code => typeof code === "string" && /^[a-z][a-z0-9_]{0,79}$/.test(code)),
+    "invalid runtime remediation codes");
+    facts.unavailable_remediation = [...remedies];
+  }
+  return facts;
+}
+
+const todoValidationReasons = new Set([
+  "independent_delegation_validation_required", "completion_validation_declaration_unavailable",
+  "completion_validation_declaration_mismatch",
+]);
+
+/** Project the existing validation owner's facts, never its commands or private
+ * errors. Matching identity and file readiness retain the original admission. */
+function delegationAcceptanceFacts(todoId: unknown, acceptance: JsonObject | null, filesCurrent: unknown) {
+  const matching = acceptance?.todo_id === todoId;
+  const ready = matching && acceptance?.state === "ready" && filesCurrent === true;
+  if (ready) return {acceptance_ready: true, acceptance_reason_code: null, acceptance_next_action: "none"};
+  if (matching && acceptance?.state === "unbound" && typeof acceptance.reason === "string"
+      && todoValidationReasons.has(acceptance.reason)) {
+    return {acceptance_ready: false, acceptance_reason_code: acceptance.reason,
+      acceptance_next_action: todoId == null ? "review_original_request_validation" : "review_original_todo_validation"};
+  }
+  if (matching && acceptance?.state === "ready" && filesCurrent === false) {
+    return {acceptance_ready: false, acceptance_reason_code: "validation_files_unavailable",
+      acceptance_next_action: "restore_original_validation_files"};
+  }
+  return {acceptance_ready: false, acceptance_reason_code: "acceptance_binding_unavailable",
+    acceptance_next_action: "review_original_task_acceptance"};
+}
+
+/** Shared interpretation of the native lock owner's read-only liveness facts. */
+export function delegationLaneReadiness(params: JsonObject): JsonObject {
+  const lane = requireJsonObject(params.lane, "Turn lane observation");
+  requireThat(typeof lane.state === "string"
+    && ["live", "released", "dead", "absent", "foreign_host", "unreadable"].includes(lane.state),
+  "invalid Turn lane observation");
+  return {available: ["released", "dead", "absent"].includes(lane.state), state: lane.state};
+}
+
+/** Read the actual dry-run route/profile, never infer readiness from assignment. */
+export function delegationPreflight(params: JsonObject): JsonObject {
+  const binding = requireJsonObject(params.binding, "binding identity");
+  requireThat([binding.id, binding.agent_id].every(text) && (binding.todo_id == null || text(binding.todo_id)), "binding identities required");
+  // Missing observations preserve older host compatibility. Filesystem facts
+  // cannot establish canonical authority or executor readiness.
+  if (params.workspace !== undefined) {
+    const workspace = requireJsonObject(params.workspace, "workspace observation");
+    requireThat(typeof workspace.state === "string"
+      && ["available", "missing", "not_directory", "unavailable"].includes(workspace.state),
+    "invalid workspace observation");
+    if (workspace.state !== "available") {
+      requireThat(params.authority === null && params.preview === null
+        && params.acceptance === null && params.validation_files_current === false,
+      "unavailable workspace cannot claim authority, Turn or task acceptance inspection");
+      return {
+        schema_version: "loopx_delegation_preflight_v0",
+        binding: {id: binding.id, agent_id: binding.agent_id, todo_id: binding.todo_id},
+        state: "workspace_unavailable", workspace_state: workspace.state, dispatch_allowed: false,
+        workspace_next_action: "review_operator_workspace_binding",
+        turn_eligible: false, turn_route: null, acceptance_ready: false,
+        acceptance_reason_code: null, acceptance_next_action: "none",
+        authority_ready: null, authority_reason: null, authority_state: "uninspected",
+        authority_next_action: "none", promotion_from_surface_allowed: false,
+        executor: null,
+        effects: {host_invoked: false, state_written: false, quota_spent: false,
+          scheduler_acknowledged: false},
+        note: "Review the original operator-owned workspace binding, then retry inspection. "
+          + "Authority, acceptance and runtime were not inspected. No workspace is created, "
+          + "binding retargeted or worker launched.",
+      };
+    }
+  }
+  const authority = params.authority === undefined
+    ? {ready: true, reason: null}
+    : requireJsonObject(params.authority, "canonical authority readiness");
+  requireThat(typeof authority.ready === "boolean", "canonical authority readiness required");
+  if (authority.ready === false) {
+    const authorityState = authority.state ?? "unavailable";
+    requireThat(authorityState === "promotion_required" || authorityState === "unavailable",
+      "unavailable authority transition state required");
+    const authorityNextAction = authority.next_action ?? (authorityState === "promotion_required"
+      ? "preview_reviewed_goal_authority_promotion" : "repair_canonical_authority");
+    requireThat(authorityNextAction === "preview_reviewed_goal_authority_promotion"
+      || authorityNextAction === "repair_canonical_authority", "invalid authority next action");
+    requireThat(params.preview === null && params.acceptance === null
+      && params.validation_files_current === false,
+    "unavailable authority cannot claim a Turn preview or task acceptance");
+    const effects = {host_invoked: false, state_written: false, quota_spent: false,
+      scheduler_acknowledged: false};
+    return {
+      schema_version: "loopx_delegation_preflight_v0", binding,
+      state: "authority_unavailable", dispatch_allowed: false, turn_eligible: false, turn_route: null,
+      acceptance_ready: false, authority_ready: false,
+      acceptance_reason_code: null, acceptance_next_action: "none",
+      authority_reason: boundedReason(authority.reason, "canonical authority unavailable"),
+      authority_state: authorityState, authority_next_action: authorityNextAction,
+      promotion_from_surface_allowed: false,
+      executor: null, effects,
+      note: "Current canonical authority cannot be confirmed, so no executable permission is returned. "
+        + "No host was launched and no state was written or quota spent. "
+        + "Promote or repair authority explicitly before retrying; inspection never promotes a provider.",
+    };
+  }
+  if (params.request_required === true) return {
+    schema_version: "loopx_delegation_preflight_v0", binding, state: "turn_blocked",
+    request_required: true,
+    dispatch_allowed: false, turn_eligible: false, turn_route: null, acceptance_ready: false,
+    authority_ready: true, authority_reason: null, authority_state: "promoted",
+    authority_next_action: "none", promotion_from_surface_allowed: false,
+    acceptance_reason_code: null, acceptance_next_action: "none", executor: null,
+    reason: "An ordinary binding needs its original request for preflight; start preserves that request.",
+    effects: {host_invoked: false, state_written: false, quota_spent: false, scheduler_acknowledged: false},
+  };
+  const preview = requireJsonObject(params.preview, "Turn preview");
+  const effects = requireJsonObject(preview.effects, "preview effects");
+  if (preview.ok === false && preview.selection_rejection !== undefined) {
+    const refusal = readTurnSelectionRejection(preview.selection_rejection, binding.todo_id);
+    const refusalState = turnSelectionRejectionState(refusal.state);
+    requireThat(preview.effects_scope === "current_invocation"
+      && ["host_invoked", "state_written", "quota_spent", "scheduler_acknowledged"].every(k => effects[k] === false)
+      && refusal.schema_version === "loopx_turn_selection_rejection_v0"
+      && refusal.source === "quota.should-run" && refusal.requested_todo_id === binding.todo_id
+      && refusalState !== null
+      && preview.error_code === `turn_todo_selection_${refusalState}`,
+    "delegation inspection requires a matching effect-free selection refusal");
+    const acceptance = params.acceptance === null ? null : requireJsonObject(params.acceptance, "task acceptance");
+    return {
+      schema_version: "loopx_delegation_preflight_v0", binding, state: "turn_blocked", dispatch_allowed: false,
+      turn_eligible: false, turn_route: null, turn_blocker: refusal,
+      ...delegationAcceptanceFacts(binding.todo_id, acceptance, params.validation_files_current),
+      authority_ready: true, authority_reason: null, authority_state: "promoted",
+      authority_next_action: "none", promotion_from_surface_allowed: false,
+      executor: null, effects,
+      note: "Quota refused this exact Todo before host or executor inspection. Read status/check with the bound workspace scan root; do not retarget this inspection or bypass repair.",
+    };
+  }
+  requireThat(preview.dry_run === true && preview.status === "preview"
+    && ["host_invoked", "state_written", "quota_spent", "scheduler_acknowledged"].every(k => effects[k] === false),
+  "delegation inspection requires a read-only Turn preview");
+  const route = requireJsonObject(preview.route, "Turn admission route");
+  const executor = requireJsonObject(preview.managed_executor, "selected executor");
+  requireThat([true, false, null].includes(executor.available as boolean | null), "runtime availability required");
+  requireThat(typeof route.would_invoke_host === "boolean", "Turn admission observation required");
+  // Reuse the file-lock owner's liveness facts. These describe only the native
+  // Turn lane, never the presence/availability of an App or CLI conversation.
+  // Omission preserves earlier callers; an explicit unknown fails closed.
+  const lane = params.lane === undefined ? null : delegationLaneReadiness(params);
+  const laneBlocked = lane !== null && lane.available !== true;
+  const eligible = route.would_invoke_host === true && route.selected_todo_id === binding.todo_id && !laneBlocked;
+  const acceptance = params.acceptance === null ? null : requireJsonObject(params.acceptance, "task acceptance");
+  const acceptanceFacts = delegationAcceptanceFacts(binding.todo_id, acceptance, params.validation_files_current);
+  const pinned = acceptanceFacts.acceptance_ready;
+  const state = !eligible ? "turn_blocked" : !pinned ? "acceptance_unavailable"
+    : executor.available === false ? "runtime_unavailable"
+    : executor.available === null ? "runtime_unverified" : "launchable";
+  return {
+    schema_version: "loopx_delegation_preflight_v0", binding,
+    state, dispatch_allowed: state === "launchable" || state === "runtime_unverified",
+    // Only lane contention may defer an otherwise admissible source launch.
+    // This permits saving its original intent, never a Host invocation.
+    queueable: laneBlocked && route.would_invoke_host === true
+      && route.selected_todo_id === binding.todo_id && pinned && executor.available !== false,
+    turn_eligible: eligible, turn_route: route.kind,
+    ...acceptanceFacts, authority_ready: true, authority_reason: null,
+    authority_state: "promoted", authority_next_action: "none",
+    promotion_from_surface_allowed: false,
+    ...(lane === null ? {} : {turn_lane: {scope: "native_turn_lane", state: lane.state}}),
+    ...(laneBlocked ? {reason: lane!.state === "live" ? "turn_lane_in_flight" : "turn_lane_state_unknown"} : {}),
+    executor: {host: executor.executor, available: executor.available,
+      reason: executor.unavailable_reason, profile: executor.execution_profile,
+      ...(executor.operation_transport ? {operation_transport: executor.operation_transport} : {}),
+      ...delegationRuntimeFacts(executor)},
+    effects,
+    note: (laneBlocked ? "Native Turn lane is busy or unknown; retain the request and inspect again after its holder settles or observation is restored. " : "")
+      + "Point-in-time preflight, not an execution permit or evidence of running work. "
+      + "Start rechecks admission; inspect original operations before dispatching replacements. "
+      + "Runtime probes have the selected executor's scope, not remote capacity guarantees.",
+  };
+}
+const transitions: Record<Observation, readonly Observation[]> = {
+  prepared: ["running", "rejected", "stopped"], running: ["turn_returned", "rejected", "stopped"],
+  turn_returned: ["accepted", "rejected", "stopped"], accepted: [], rejected: [], stopped: [],
+};
+
+/** Page only the caller's existing journal. A cursor is not a fleet snapshot. */
+export function delegationInventoryQuery(params: JsonObject): JsonObject {
+  const limit = params.limit ?? 20;
+  const cursor = params.cursor ?? null;
+  requireThat(Number.isInteger(limit) && Number(limit) >= 1 && Number(limit) <= 50,
+    "delegation inventory limit must be between 1 and 50");
+  requireThat(cursor === null || (typeof cursor === "string" && BARE_SHA256_PATTERN.test(cursor)),
+    "invalid delegation inventory cursor");
+  return {limit, cursor};
+}
+
+/** The host supplies a fresh Delegations.read result, never a saved status. */
+export function delegationInventoryItem(params: JsonObject): JsonObject {
+  const record = requireJsonObject(params.record, "delegation inventory record");
+  requireThat(typeof record.record_id === "string" && BARE_SHA256_PATTERN.test(record.record_id),
+    "invalid delegation record address");
+  requireThat(record.operation_id === null || (typeof record.operation_id === "string"
+    && /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(record.operation_id)), "invalid delegation operation identity");
+  if (params.observation === null) return {
+    record_id: record.record_id, operation_id: record.operation_id,
+    status: "unavailable", recovery_required: null,
+    error: "delegation_readback_unavailable",
+  };
+  const observation = requireJsonObject(params.observation, "current delegation readback");
+  requireThat(observation.operation_id === record.operation_id && record.operation_id !== null,
+    "delegation inventory identity mismatch");
+  requireThat(Object.hasOwn(transitions, String(observation.status)), "invalid delegation observation");
+  requireThat([observation.request_id, observation.agent_id].every(text)
+    && (text(observation.todo_id) || observation.todo_id == null && executionRequestSubject(observation.request_subject) !== null),
+    "delegation request and task identities required");
+  requireThat(typeof observation.worker_active === "boolean"
+    && typeof observation.recovery_required === "boolean", "current worker observation required");
+  const result: JsonObject = {
+    record_id: record.record_id, operation_id: observation.operation_id,
+    request_id: observation.request_id, agent_id: observation.agent_id, todo_id: observation.todo_id,
+    ...(observation.request_subject ? {request_subject: observation.request_subject} : {}),
+    status: observation.status, worker_active: observation.worker_active,
+    recovery_required: observation.recovery_required,
+  };
+  if (observation.status === "accepted") {
+    requireThat(Array.isArray(observation.artifacts) && observation.artifacts.length > 0,
+      "accepted inventory requires current artifacts");
+    if (observation.current_use !== undefined) {
+      const use = requireJsonObject(observation.current_use, "delegation current use");
+      requireThat(use.state === "current" || use.state === "unavailable", "invalid delegation current use");
+      result.current_use = use;
+    }
+    result.artifacts = observation.artifacts.map(value => {
+      const artifact = requireJsonObject(value, "accepted artifact");
+      requireThat(text(artifact.ref) && typeof artifact.sha256 === "string"
+        && BARE_SHA256_PATTERN.test(artifact.sha256), "invalid accepted artifact reference");
+      return {ref: artifact.ref, sha256: artifact.sha256};
+    });
+  }
+  return result;
+}
+
+function inventoryPageItem(raw: unknown, recordId: string): JsonObject {
+  const entry = requireJsonObject(raw, "delegation page observation");
+  const record = requireJsonObject(entry.record, "delegation inventory record");
+  requireThat(record.record_id === recordId, "delegation inventory page identity mismatch");
+  try {
+    return delegationInventoryItem({record, observation: entry.observation});
+  } catch (error) {
+    // A malformed current observation cannot hide healthy siblings or imply acceptance.
+    if (error instanceof EffectRuntimeRequestError || error instanceof TypeError)
+      return delegationInventoryItem({record, observation: null});
+    throw error;
+  }
+}
+
+/** The lookahead address proves another page exists; its operation is not read. */
+export function delegationInventoryPage(params: JsonObject): JsonObject {
+  const query = delegationInventoryQuery(requireJsonObject(params.query, "delegation inventory query"));
+  const limit = Number(query.limit);
+  const recordIds = requireStringArray(params.record_ids, "delegation inventory addresses");
+  requireThat(recordIds.length <= limit + 1 && recordIds.every((id, index) =>
+    BARE_SHA256_PATTERN.test(id) && (query.cursor === null || id > String(query.cursor))
+    && (index === 0 || id > recordIds[index - 1]!)), "invalid delegation inventory page addresses");
+  const observations = params.observations;
+  requireThat(Array.isArray(observations) && observations.length === Math.min(limit, recordIds.length),
+    "delegation inventory page observations must match its addresses");
+  const items = observations.map((entry, index) => inventoryPageItem(entry, recordIds[index]!));
+  const facts = requireJsonObject(params.read_facts, "delegation inventory read facts");
+  const available = requireInteger(facts.available_count, "delegation inventory available_count");
+  requireThat(recordIds.length === Math.min(available, limit + 1),
+    "delegation inventory count does not match its page addresses");
+  const unavailable = items.filter(item => item.status === "unavailable").length;
+  const projectionEnvelope = sealProjectionEnvelope({
+    schema_version: PROJECTION_ENVELOPE_SEAL_REQUEST, projection: "delegation_inventory",
+    observed_at: facts.observed_at,
+    sources: [
+      {source_id: "delegation_directory", read_status: "read", last_read_at: facts.directory_read_at,
+        item_count: available},
+      {source_id: "delegation_operations", read_status: "read", last_read_at: facts.operations_read_at,
+        item_count: items.length, unreadable_count: unavailable},
+    ],
+    coverage: {scope: "requester_page", expected_count: items.length,
+      included_count: items.length - unavailable,
+      omitted: unavailable ? [{reason: "unavailable_operations", count: unavailable}] : [],
+      shown_count: items.length, available_count: available},
+  });
+  const more = recordIds.length > limit;
+  return {
+    schema_version: "loopx_delegation_inventory_v0", items, has_more: more,
+    next_cursor: more ? recordIds[limit - 1]! : null,
+    page_readback_complete: unavailable === 0,
+    projection_envelope: projectionEnvelope,
+    note: "Live requester-scoped page, not a snapshot or proof that the whole Goal is complete. "
+      + "Read original operations for full results; resume only when recovery is required. "
+      + "Restart paging to discover work added before the cursor. Listing starts no work.",
+  };
+}
+
+export function transitionDelegationObservation(params: JsonObject): JsonObject {
+  const from = params.from as Observation, to = params.to as Observation;
+  requireThat(Object.hasOwn(transitions, from) && Object.hasOwn(transitions, to), "invalid delegation observation");
+  requireThat(from === to || transitions[from].includes(to), "invalid delegation observation transition");
+  // A native lane race or owner interval wait before this operation has a
+  // Turn retains its original intent. Partial/resumed/unknown Turns keep normal
+  // recovery; only an exact, effect-free native refusal can return to prepared.
+  if (from === "running" && to === "turn_returned" && params.unstarted_turn === true
+      && params.turn_execution !== undefined) {
+    const result = requireJsonObject(params.turn_execution, "native Turn execution");
+    const effects = result.effects as JsonObject | undefined;
+    const host = result.host as JsonObject | undefined;
+    const admission = result.admission as JsonObject | undefined;
+    const laneWait = result.status === "unavailable" && result.reason === "turn_lane_in_flight"
+      && host?.executable === "not_invoked";
+    const intervalWait = result.status === "interval_wait" && result.reason === "minimum_interval_wait"
+      && admission?.reason === "minimum_interval_wait" && admission.admitted === false
+      && admission.reserved === false && admission.resumed !== true
+      && admission.pre_model_admission === "managed_turn_only"
+      && typeof admission.min_interval_minutes === "number" && Number.isSafeInteger(admission.min_interval_minutes)
+      && admission.min_interval_minutes > 0
+      && typeof admission.next_eligible_at_ms === "number" && Number.isSafeInteger(admission.next_eligible_at_ms)
+      && admission.next_eligible_at_ms > 0;
+    if (result.schema_version === "loopx_turn_execution_v0" && result.mode === "run_once"
+        && result.ok === false && result.dry_run === false && result.replayed === false
+        && (laneWait || intervalWait)
+        && result.result_kind === null && result.quota_slot_spend_count === 0
+        && effects !== undefined && effects !== null
+        && ["host_invoked", "state_written", "quota_spent", "scheduler_acknowledged"]
+          .every(key => effects[key] === false)
+        && Object.values(effects).every(value => value === false)) return {status: "prepared"};
+  }
+  if (to === "accepted") requireThat((params.canonical_done === true
+    || params.request_validated === true && executionRequestSubject(params.request_subject) !== null)
+    && params.acceptance_ready === true && params.artifacts_current === true,
+  "accepted return requires current canonical completion and artifacts");
+  if (to === "accepted" && from !== "accepted" && wakesItsConversation(params)) {
+    return {status: to, wake_intent: delegationWakeIntent(params)};
+  }
+  return {status: to};
+}
+
+type StopPhase = "requested" | "acknowledged" | "settled" | "unknown";
+const openStopPhases: readonly StopPhase[] = ["requested", "acknowledged"];
+/** What the Host transport read back about everything the operation's Turn launched. */
+type HostProcessDrain = "not_launched" | "drained" | "draining" | "unattributable";
+const hostProcessDrains: readonly HostProcessDrain[] = ["not_launched", "drained", "draining", "unattributable"];
+/** What canonical authority proved about the hard lease the stopped execution may hold.
+ *
+ * `unchecked` until the stop resolves it, which happens only once the execution
+ * is proven gone; it never means that no lease was owed. `not_owed` is proven
+ * by canonical authority for the execution's own identity, not by its record.
+ */
+type StopLease = "unchecked" | "not_owed" | "released" | "release_unproven" | "obligation_unproven";
+const stopLeases: readonly StopLease[] = ["unchecked", "not_owed", "released", "release_unproven", "obligation_unproven"];
+/** The next step for the host: resolve the lease from canonical authority, or record a receipt phase. */
+type DelegationStopStep =
+  | {action: "resolve_lease"}
+  | {action: "record"; phase: StopPhase; terminal: boolean; reason: string};
+
+function stopRecord(phase: StopPhase, reason: string): DelegationStopStep {
+  return {action: "record", phase, terminal: !openStopPhases.includes(phase), reason};
+}
+
+/** Advance one stop request from host release facts; a receipt is never inferred from time.
+ *
+ * The stopped execution is gone once the operation lock is free, the member's
+ * Turn lane was released by the stopped worker's process group, and the Host
+ * transport reads everything the Turn launched as drained or never launched.
+ * A worker and its lane can let go while the Host supervisor is still
+ * terminating the Host, so their release proves nothing about the Host. The
+ * host reads the lane from its holder record and never takes it, so a
+ * legitimate Turn is not refused, and a holder it cannot attribute is not
+ * released.
+ *
+ * Only then may the host resolve the execution's hard lease: its release hands
+ * the member's Todo on, so it waits for the execution, and a receipt never
+ * becomes terminal before that lease is resolved. ``settled`` needs the
+ * acknowledgement of a process that held the operation lock, the execution
+ * gone and the lease released or proven not owed. Everything released without
+ * an acknowledgement means the named holder vanished before recording what it
+ * observed, which is ``unknown`` rather than a fake settlement; with a Host
+ * that cannot be attributed nothing more can be learned, so it is ``unknown``
+ * without touching the lease. An acknowledged stop whose Host cannot be
+ * attributed stays open for a later read with the same identity. A grace
+ * timeout on its own moves nothing: a worker still holding a lock still runs.
+ */
+export function decideDelegationStop(params: JsonObject): DelegationStopStep {
+  const phase = params.phase as StopPhase;
+  requireThat(openStopPhases.includes(phase), "delegation stop decision requires an open stop phase");
+  requireThat(typeof params.acknowledged === "boolean", "delegation stop acknowledgement fact required");
+  requireThat(typeof params.operation_lock_free === "boolean" && typeof params.worker_lane_released === "boolean",
+    "delegation stop release facts required");
+  requireThat(hostProcessDrains.includes(params.host_process as HostProcessDrain),
+    "delegation stop host process drain fact required");
+  requireThat(stopLeases.includes(params.lease as StopLease), "delegation stop lease fact required");
+  requireThat(params.timed_out === undefined || typeof params.timed_out === "boolean",
+    "delegation stop timeout fact must be boolean");
+  requireThat(phase !== "acknowledged" || params.acknowledged === true,
+    "an acknowledged stop cannot lose its acknowledgement");
+  const operationFree = params.operation_lock_free === true;
+  const host = params.host_process as HostProcessDrain;
+  const lease = params.lease as StopLease;
+  const executionPending = !operationFree ? "operation_lock_still_held"
+    : params.worker_lane_released !== true ? "worker_lane_release_unproven"
+    : host === "draining" ? "host_process_still_running"
+    : host === "unattributable" ? "host_process_drain_unproven"
+    : null;
+  requireThat(executionPending === null || lease === "unchecked",
+    "a delegation stop resolves its lease only after its execution is proven gone");
+  const leaseStep = (open: StopPhase, terminal: StopPhase, reason: string): DelegationStopStep =>
+    lease === "unchecked" ? {action: "resolve_lease"}
+      : lease === "release_unproven" ? stopRecord(open, "required_lease_release_unproven")
+      : lease === "obligation_unproven" ? stopRecord(open, "lease_obligation_unproven")
+      : stopRecord(terminal, reason);
+  if (params.acknowledged === true) {
+    return executionPending === null
+      ? leaseStep("acknowledged", "settled", "acknowledged_worker_and_host_released")
+      : stopRecord("acknowledged", executionPending);
+  }
+  if (executionPending === null) return leaseStep("requested", "unknown", "holder_gone_without_acknowledgement");
+  if (executionPending === "host_process_drain_unproven") {
+    return stopRecord("unknown", "holder_gone_without_acknowledgement");
+  }
+  return stopRecord("requested", operationFree ? executionPending
+    : params.timed_out === true ? "holder_still_running_after_grace" : "awaiting_acknowledgement");
+}
+
+/** Same-operation recovery after an explicitly requested independent recheck.
+ * Admission supplies a qualified committed receipt and proves no Host reinvocation. */
+export function recoverRevalidatedDelegation(params: JsonObject): JsonObject {
+  requireThat(params.from === "rejected" && params.original_task_failure === true,
+    "revalidation recovery requires the original task failure");
+  requireThat(params.committed_progress === true && params.host_reinvoked === false,
+    "revalidation recovery requires committed progress without repeating Host work");
+  return {status: "turn_returned"};
+}
+
+/** Whether an accepted result may produce a wake intent at all.
+ *
+ * Only an operation started from a conversation can be continued there. An
+ * ordinary CLI/MCP delegation has no conversation, so it keeps the transition it
+ * always had: no intent, no wake state, and no change to what a plain
+ * `wait`/`read` returns. Producing an intent and then refusing it in the pump
+ * would still widen a shared persistent projection for every caller who never
+ * enabled this capability.
+ */
+function wakesItsConversation(params: JsonObject): boolean {
+  if (params.requester == null) return false;
+  const requester = requireJsonObject(params.requester, "wake requester");
+  return requester.conversation != null;
+}
+
+/** The first transition to ``accepted`` is the one durable moment a requester
+ * can be continued without polling.  The intent names the requester, the
+ * conversation whose Turn started the operation (null when it was not started
+ * from one) and the exact accepted result; it grants no Turn and is not a
+ * second settlement.  The conversation is part of the intent identity, so the
+ * wake cannot be consumed by another conversation of the same requester. */
+function delegationWakeIntent(params: JsonObject): JsonObject {
+  const requester = requireJsonObject(params.requester, "wake requester");
+  requireThat([requester.goal_id, requester.agent_id, requester.operation_id, requester.request_id].every(text),
+    "wake intent requires the requester and result identity");
+  const goalRef = requester.goal_ref == null ? null : requireJsonObject(requester.goal_ref, "requester goal reference");
+  const origin = requester.conversation == null ? null
+    : requireJsonObject(requester.conversation, "requester conversation");
+  requireThat(origin === null || (text(origin.session_id) && text(origin.turn_id)),
+    "requester conversation requires its session and Turn");
+  const conversation = origin === null ? null : {session_id: origin.session_id, turn_id: origin.turn_id};
+  requireThat(Array.isArray(requester.artifacts) && requester.artifacts.length > 0, "wake intent requires accepted artifacts");
+  const digests = requester.artifacts.map(value => {
+    const artifact = requireJsonObject(value, "accepted artifact");
+    requireThat(text(artifact.ref) && typeof artifact.sha256 === "string"
+      && BARE_SHA256_PATTERN.test(artifact.sha256), "invalid accepted artifact reference");
+    return {ref: artifact.ref, sha256: artifact.sha256};
+  });
+  return {
+    schema_version: "loopx_delegation_wake_intent_v0",
+    intent_id: canonicalAuthoritySha256([requester.goal_id, requester.agent_id, requester.operation_id,
+      requester.request_id, digests, conversation]),
+    requester: {goal_id: requester.goal_id, agent_id: requester.agent_id, goal_ref: goalRef},
+    conversation,
+    operation_id: requester.operation_id, request_id: requester.request_id,
+  };
+}
+
+/** Reading another conversation's result cannot consume its continuation. */
+export function decideDelegationWakeObservation(params: JsonObject): JsonObject {
+  const intent = requireJsonObject(params.intent, "wake intent");
+  const requester = requireJsonObject(intent.requester, "wake requester");
+  const observer = requireJsonObject(params.observer, "wake observer");
+  requireThat([observer.session_id, observer.goal_id, observer.agent_id].every(text),
+    "wake observation requires its conversation and requester");
+  const conversation = intent.conversation == null ? null
+    : requireJsonObject(intent.conversation, "wake conversation");
+  return {
+    observed: conversation?.session_id === observer.session_id
+      && requester.goal_id === observer.goal_id && requester.agent_id === observer.agent_id
+      && canonicalAuthoritySha256(requester.goal_ref ?? null)
+        === canonicalAuthoritySha256(observer.goal_ref ?? null),
+  };
+}
+
+/** Repair only a false terminal observation after the exact Turn validated.
+ *
+ * This does not retry model work.  The host boundary must prove that the
+ * caller-stable settlement identity resolved one canonical journal and that
+ * the journal already completed independent validation.  Recovery returns to
+ * ``turn_returned`` so the existing settlement path can complete durably.
+ */
+export function recoverValidatedDelegationSettlement(params: JsonObject): JsonObject {
+  requireThat(params.from === "rejected", "delegation recovery requires a rejected observation");
+  requireThat(params.identity_matched === true, "delegation recovery requires the exact Turn identity");
+  requireThat(params.journal_status === "in_progress",
+    "delegation recovery requires an unsettled Turn journal");
+  requireThat(params.result_kind === "validated_progress",
+    "delegation recovery requires validated progress");
+  requireThat(params.task_validation_passed === true,
+    "delegation recovery requires independent task validation");
+  requireThat(Array.isArray(params.completed_phases)
+    && JSON.stringify(params.completed_phases) === JSON.stringify([
+      "host_execute", "typed_result", "validation",
+    ]), "delegation recovery requires the validated settlement boundary");
+  return {
+    status: "turn_returned",
+    recovery_kind: "settlement_only",
+    host_reexecution_allowed: false,
+  };
+}
+
+/** Explicit requester decision backed by two current accepted executions. */
+export function recordDelegationAdoption(params: JsonObject): JsonObject {
+  const source = requireJsonObject(params.source, "source execution");
+  const consumer = requireJsonObject(params.consumer, "consumer execution");
+  requireThat(source.status === "accepted" && consumer.status === "accepted"
+    && source.operation_id !== consumer.operation_id, "adoption requires distinct accepted executions");
+  const inputs = params.inputs;
+  requireThat(Array.isArray(inputs), "consumer inputs required");
+  const artifacts = source.artifacts;
+  requireThat(Array.isArray(artifacts), "source artifacts required");
+  const used = inputs.filter(raw => {
+    const input = requireJsonObject(raw, "consumer input");
+    if (!input.delegation) return false;
+    const link = requireJsonObject(input.delegation, "delegation input");
+    return link.operation_id === source.operation_id && link.relation === "uses"
+      && artifacts.some(raw => {
+        const artifact = requireJsonObject(raw, "source artifact");
+        return artifact.ref === link.ref && artifact.sha256 === input.sha256;
+      });
+  });
+  requireThat(used.length > 0 && params.inputs_current === true,
+    "adoption requires the accepted consumer's exact current uses input");
+  requireThat(Array.isArray(consumer.artifacts) && consumer.artifacts.length > 0, "consumer artifacts required");
+  return {
+    consumer_operation_id: consumer.operation_id, consumer_request_id: consumer.request_id,
+    consumer_agent_id: consumer.agent_id, consumer_todo_id: consumer.todo_id,
+    source_artifacts: used.map(raw => {
+      const input = requireJsonObject(raw, "consumer input");
+      const link = requireJsonObject(input.delegation, "delegation input");
+      return {ref: link.ref, sha256: input.sha256};
+    }),
+    consumer_artifacts: consumer.artifacts.map(raw => {
+      const artifact = requireJsonObject(raw, "consumer artifact");
+      return {ref: artifact.ref, sha256: artifact.sha256};
+    }),
+  };
+}

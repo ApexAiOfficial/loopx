@@ -14,6 +14,17 @@ The source of truth remains:
 - quota and status projections;
 - run-history evidence and blocker writebacks.
 
+The graph's Todo nodes are selected from the same canonical domain-state rows
+used to build `todo_planning_inventory_v0`: `items`, `deferred_items`,
+`blocker_items`, and `monitor_open_items`. The graph enables the selector's
+terminal-row extension so completed predecessors and evidence remain visible;
+the planning inventory excludes those rows. This prevents graph, horizon, and
+portfolio consumers from inventing separate visibility-lane unions without
+pretending that every lens has identical scope. It does not make the graph
+agent-scoped: the graph may add gates, evidence, validation, and handoff
+context, but it never assigns `current_agent` claim meaning or owns action
+selection.
+
 The projection may appear under `attention_queue.items[].task_graph_projection`
 in `loopx --format json status --include-task-graph`. Default status output
 keeps this object on the cold path so the dashboard hot path remains within its
@@ -120,12 +131,123 @@ compact blocker or validation writebacks:
 - `audits` says compact run-history evidence reviews, checks, or bounds a
   selected work lane.
 - `continues` says compact run-history evidence is a continuation of a selected
-  work lane.
+  work lane, or a Todo follows a predecessor through explicit successor lineage.
+
+### Typed Todo topology
+
+Planning inventory, horizon and task graph share the TS `planning_relations`
+catalog. The graph is a different **read lens**, not another lifecycle reducer:
+
+| Persisted relation | Graph direction and label | Meaning |
+| --- | --- | --- |
+| A has successor B | B → A, `continues` | Lineage only; does not require A to complete |
+| A is superseded by B | B → A, `supersedes` | Lineage only; does not authorize a transition |
+| A unblocks B | B → A, `depends_on` | Typed lifecycle link, not the reverse dependency |
+| A resumes when B is done | A → B, `depends_on` | Completion condition; the resume evaluator owns readiness |
+| A resumes when Monitor M changes | A → M, `depends_on` | Generation-change condition, not Monitor completion |
+
+These are intentional corrections to the old graph, which collapsed successor
+lineage into dependencies, reversed unblocks discovery, and omitted Monitor
+conditions. Parallel lineage and condition edges are retained. Opaque route,
+capability and unknown-condition suffixes must not be interpreted as Todo IDs
+by either graph or horizon. Existing read-only node kinds, claim presentation
+and evidence/handoff renderers are unchanged.
+
+The predecessor lens expands the selected Todo and completed predecessors;
+open predecessors are visible boundaries, not recursive traversal roots.
+It admits at most four predecessor nodes, in deterministic breadth-first and
+Todo-ID order. Cycles do not duplicate nodes. Reaching the node cap must not
+discard another edge between already admitted nodes (including diamond joins).
+
+`limits.missing_predecessor_count` counts unique referenced predecessors absent
+from the supplied renderable snapshot. `source_truncated` records upstream
+omission; `predecessor_truncated` records display-limit omission. The additive
+`topology_complete` flag is true only if none of those conditions applies,
+**within this expansion policy**, not for the entire Goal graph. No missing
+target creates a phantom node, a provider read, a repair write, or an execution
+permission. No extra complete-state read is introduced: status supplies its
+existing source, and an incomplete summary stays explicitly incomplete.
+
+中文：谱系不等于依赖；Monitor 的 generation 条件不等于完成 Monitor。
+节点上限不应吞掉已展示节点间的边。完整度只针对上述有界展开策略，不能
+把缺失、上游裁剪或展示裁剪说成完整 Goal 图；图始终没有写入或准入权限。
 
 These relations may help a dashboard or reviewer explain why a work item is
 still active, stale, repaired, or safe to hand off. They must not create a graph
 resume command, mutate todo status, or replace freshness checks against current
 quota, gates, claims, and run history.
+
+A `deferred` Todo renders as `waiting` in every lens. Deferral ends scheduling,
+not delivery, so it must never appear as `done`.
+
+### Goal work map (`goal_task_map_v0`)
+
+The predecessor lens answers "what led to this item". The Goal work map answers
+"what is the shape of this Goal's work": one read-only map of the Goal's
+non-archived Todos and every typed relation above. It ships beside `graph` in
+the cold `GET /api/chat/delivery-review?goal_id=...` response and is never
+added to status hot paths.
+
+```json
+{
+  "schema_version": "goal_task_map_v0",
+  "mode": "read_only",
+  "goal_id": "community-day",
+  "limits": {
+    "node_limit": 120, "emitted_node_count": 22, "omitted_node_count": 0,
+    "source_truncated": false, "missing_endpoint_count": 0,
+    "cycle_edge_count": 0, "topology_complete": true
+  },
+  "nodes": [{ "node_id": "node_todo_...", "kind": "deliverable", "title": "Reserve the hall",
+              "state": "blocked", "depth": 1, "refs": { "todo_ids": ["todo_..."] },
+              "owner_agent": "logistics", "task_domain": "booking" }],
+  "edges": [{ "edge_id": "edge_unblocks_...", "from_node_id": "node_todo_...",
+              "to_node_id": "node_gate_...", "relation": "depends_on",
+              "enforcement": "typed_lifecycle", "reason": "..." }]
+}
+```
+
+- Node `kind` is `deliverable`, `gate` (a user Todo) or `monitor` (a
+  `continuous_monitor` Todo). Gates carry no owner. Nodes carry no note,
+  evidence or raw Todo text beyond the compact public-safe title.
+- Edges use the relation mapping in the table above. `enforcement` reuses the
+  `planning_relations` catalog (`typed_lifecycle`, `typed_condition`,
+  `lineage_only`), so a reader can tell a lifecycle link from lineage.
+- The TS effect `work_item.task_graph.goal_topology` composes the map's node
+  kinds, metadata visibility, edges, limits and `depth` (the longest recorded
+  prerequisite path). Python retains shared source/text/state/identity codecs;
+  owner labels are sanitized only after admission. Admission is deterministic:
+  unfinished work first, then direct completed prerequisites of unfinished
+  work, then remaining history, up to the public map's 120-node limit. The
+  reusable internal topology lens accepts limits up to 200.
+- `depends_on` edges order the map. Lineage (`continues`, `supersedes`)
+  carries no ordering obligation: it adds depth only where it agrees with the
+  dependency order. A follow-up recorded opposite to a dependency, such as a
+  gate spawned by the work it later unblocks, is drawn but is not a cycle.
+- `cycle_edge_count` counts dependency loops only; their back edges are
+  counted, not drawn as an order. `topology_complete` is true only when nothing
+  was omitted, the source list was not truncated, no relation names an absent
+  Todo, and no dependency loop exists. Missing endpoints never create phantom
+  nodes.
+- An unreadable Todo source returns `goal_map: null` and leaves the rest of the
+  delivery review available.
+- The native map carries the existing `projection_envelope`, scoped to
+  `goal_task_map`. Actual Todo read time is distinct from assembly time;
+  missing read facts stay unknown. Unrenderable Todos, display-limit omissions
+  and unresolved relations prevent a whole-map completeness claim. A truncated
+  source has an unknown denominator. The outer delivery review inherits source
+  age and incomplete coverage from status and the map; an unreadable map alerts.
+  The UI and Markdown export disclose these flags without changing source-open
+  or execution authorization. See the [kernel read contract](../contracts/projection-envelope-contract.md).
+
+Like the predecessor lens, the map has no write authority. A drawn line is a
+recorded relation, not a readiness verdict; the resume evaluator and lifecycle
+commands keep that authority.
+
+中文：工作地图只读展示一个 Goal 的全部未归档 Todo 和已记录的类型化关系；
+连线来自记录而非推断，不代表“可以执行”。顺序只由依赖决定，延续/替代仅在不与依赖
+冲突时加深层级，因此反向记录的后续不算成环；`cycle_edge_count` 只统计依赖环。截断、
+缺失端点和依赖环都必须显式计入 `limits`，不能把不完整的图画成完整顺序。
 
 ## Write Boundary
 

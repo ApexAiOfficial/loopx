@@ -9,20 +9,18 @@ implementations do not carry a second copy of that state machine.
 from __future__ import annotations
 
 import json
-import queue
 import re
-import subprocess
-import threading
 import time
-from collections import Counter, deque
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import Any, Protocol, Self, TextIO
+from pathlib import Path
+from typing import Any, Protocol
 
-
-class NativeGoalProtocolError(RuntimeError):
-    """The app-server exchange did not prove the required Goal transaction."""
+from ...control_plane.turn_driver.codex_stdio import (
+    NativeGoalProtocolError, StdioNativeGoalTransport,
+)
 
 
 class NativeGoalDeadlineExceeded(NativeGoalProtocolError):
@@ -37,6 +35,9 @@ class NativeGoalTransport(Protocol):
 
 class NativeGoalEventTransport(NativeGoalTransport, Protocol):
     def next_event(self, *, timeout_sec: float) -> Mapping[str, Any] | None: ...
+
+
+_RETAINED_DECISION_BYTES = 48_000
 
 
 def _digest(value: str) -> str:
@@ -113,6 +114,9 @@ class NativeGoalTurn:
     notifications: list[str] = field(default_factory=list)
     notification_counts: dict[str, int] = field(default_factory=dict)
     error_signatures: list[str] = field(default_factory=list)
+    terminal_error_signature: str | None = None
+    terminal_error_kind: str | None = None
+    terminal_error_http_status: int | None = None
     event_turn_id_observed: bool = False
     terminal_event_observed: bool = False
     turn_status: str = "not_started"
@@ -323,6 +327,10 @@ def observe_native_goal_event(
         turn.turn_id = event_turn_id
         turn.event_turn_id_observed = True
         turn.turn_status = str(event_turn.get("status") or "inProgress")
+        turn.terminal_event_observed = False
+        turn.terminal_error_signature = None
+        turn.terminal_error_kind = None
+        turn.terminal_error_http_status = None
         turn.turn_started_count += 1
         return False
     if event_turn_id and event_turn_id != turn.turn_id:
@@ -340,16 +348,62 @@ def observe_native_goal_event(
         "event_msg:turn_completed",
     }:
         turn.terminal_event_observed = True
-        turn.turn_status = str(event_turn.get("status") or "completed")
+        error = event_turn.get("error") or params.get("error")
+        # JSONL task_complete has no turn.status; an attached error is a failed
+        # Turn, not a successful terminal event. Do not count a repeated error
+        # notification as another failed request or retain its message.
+        turn.turn_status = "failed" if error else str(event_turn.get("status") or "completed")
+        if error:
+            turn.terminal_error_signature = _digest(json.dumps(error, sort_keys=True, default=str))[:12]
+            turn.terminal_error_kind = "unknown"
+            if isinstance(error, Mapping):
+                info = error.get("codexErrorInfo", error.get("codex_error_info"))
+                # Native Codex variants only; unknown/free-text data stays out
+                # of this public receipt. Do not infer HTTP status from prose.
+                scalar_kinds = {"contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded",
+                                "rateLimitExceeded", "serverOverloaded", "cyberPolicy",
+                                "misalignmentPolicyViolation", "internalServerError", "unauthorized",
+                                "badRequest", "threadRollbackFailed", "sandboxError", "other"}
+                http_kinds = {"httpConnectionFailed", "responseStreamConnectionFailed",
+                              "responseStreamDisconnected", "responseTooManyFailedAttempts"}
+                statuses = []
+                if isinstance(info, str) and info in scalar_kinds:
+                    turn.terminal_error_kind = info
+                elif isinstance(info, Mapping) and len(info) == 1:
+                    kind = next(iter(info))
+                    if kind in http_kinds and isinstance(info[kind], Mapping):
+                        turn.terminal_error_kind = kind
+                        statuses.append(info[kind].get("httpStatusCode"))
+                valid = {value for value in statuses if type(value) is int and 100 <= value <= 599}
+                turn.terminal_error_http_status = next(iter(valid)) if len(valid) == 1 else None
         turn.turn_completed_count += 1
     return turn.terminal_event_observed
+
+
+def native_goal_outcome(turn: NativeGoalTurn) -> str:
+    """Classify the latest terminal Turn separately from its Goal's status.
+
+    This is native transport evidence, not task acceptance or retry authority.
+    Historical recoverable errors must not override a later completed Turn.
+    """
+    if not turn.terminal_event_observed:
+        return "unknown"
+    if turn.turn_status in {"failed", "error"}:
+        return "failed"
+    if turn.turn_status in {"interrupted", "cancelled"}:
+        return "cancelled"
+    if turn.turn_status != "completed":
+        return "unknown"
+    return {"complete": "complete", "blocked": "blocked", "paused": "paused",
+            "budgetLimited": "budget_exhausted", "usageLimited": "usage_limited"
+            }.get(turn.post_goal_status, "unknown")
 
 
 def wait_native_goal_turn(
     transport: NativeGoalEventTransport,
     turn: NativeGoalTurn,
     *,
-    timeout_sec: float,
+    timeout_sec: float | None,
     completed_before: int | None = None,
 ) -> NativeGoalTurn:
     """Drain events until one more correlated turn reaches a terminal event.
@@ -359,18 +413,18 @@ def wait_native_goal_turn(
     preserves the single-turn behavior for existing callers.
     """
 
-    if timeout_sec <= 0:
+    if timeout_sec is not None and timeout_sec <= 0:
         raise ValueError("timeout_sec must be positive")
-    deadline = time.monotonic() + timeout_sec
+    deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
     if completed_before is None:
         if turn.terminal_event_observed:
             return turn
         completed_before = turn.turn_completed_count
     while turn.turn_completed_count <= completed_before:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
             raise NativeGoalProtocolError("goal_turn_timeout")
-        event = transport.next_event(timeout_sec=min(0.25, remaining))
+        event = transport.next_event(timeout_sec=0.25 if remaining is None else min(0.25, remaining))
         if event is not None:
             observe_native_goal_event(turn, event)
     return turn
@@ -399,7 +453,7 @@ def run_native_goal_turn(
     transport: NativeGoalEventTransport,
     config: NativeGoalConfig,
     *,
-    timeout_sec: float,
+    timeout_sec: float | None,
 ) -> NativeGoalTurn:
     """Execute the complete native Goal transaction over an admitted transport."""
 
@@ -409,11 +463,71 @@ def run_native_goal_turn(
     return turn
 
 
+def run_retained_decision_turn(
+    transport: NativeGoalEventTransport,
+    config: NativeGoalConfig,
+    *,
+    capture: Path,
+    digest: str,
+    timeout_sec: float | None,
+) -> NativeGoalTurn:
+    """Preserve exact captured bytes as tool data for one ephemeral Codex turn."""
+    from ...control_plane.turn_driver.decision_capture import read_context_capture_file
+
+    config.validate()
+    if config.token_budget is not None or config.sandbox_policy is not None or config.required_skill_ids:
+        raise ValueError("retained decision turns use the fixed read-only profile")
+    if timeout_sec is not None and not 0 < timeout_sec < float("inf"):
+        raise ValueError("turn timeout must be positive")
+    if not capture.is_absolute() or capture.name != "decision.json":
+        raise ValueError("retained decision requires an absolute original decision.json path")
+    # A single retained item leaves headroom under Codex's shared retention budget.
+    if capture.lstat().st_size > _RETAINED_DECISION_BYTES:
+        raise ValueError("decision capture exceeds the 48000-byte retained input budget")
+    _, raw, _ = read_context_capture_file(str(capture), digest, private=True)
+    if len(raw) > _RETAINED_DECISION_BYTES:
+        raise ValueError("decision capture exceeds the 48000-byte retained input budget")
+    transport.request("initialize", {"clientInfo": {"name": "loopx_retained_decision", "version": "0.1.0"},
+                                     "capabilities": {"experimentalApi": True}})
+    transport.notify("initialized", {})
+    thread = _nested(transport.request("thread/start", {
+        "cwd": config.cwd, "ephemeral": True, "sandbox": "read-only", "approvalPolicy": "never",
+        "config": {"features.multi_agent": False, "features.multi_agent_v2": False,
+                   "agents.max_threads": 1, "tool_output_token_limit": _RETAINED_DECISION_BYTES},
+        **({"model": config.model} if config.model else {}),
+    }), "thread")
+    thread_id = thread.get("id")
+    if thread.get("ephemeral") is not True or not isinstance(thread_id, str) or not thread_id:
+        raise NativeGoalProtocolError("decision_retention_requires_ephemeral_thread")
+    transport.request("thread/inject_items", {"threadId": thread_id, "items": [{
+        "retention": "always",
+        "item": {"type": "function_call_output", "name": "loopx_original_decision",
+                 "output": raw.decode("utf-8")},
+    }]})
+    response = _nested(transport.request("turn/start", {
+        "threadId": thread_id, "input": [{"type": "text", "text": config.objective + "\n\n" + config.task_instruction}],
+        **({"model": config.model} if config.model else {}),
+        **({"effort": config.effort} if config.effort else {}),
+    }), "turn")
+    turn_id = response.get("id")
+    if not isinstance(turn_id, str) or not turn_id:
+        raise NativeGoalProtocolError("turn_start_id_missing")
+    turn = NativeGoalTurn(
+        thread_id=thread_id, turn_id=turn_id, response_turn_id=turn_id, goal_status="not_attached",
+        objective_sha256=_digest(config.objective), objective_chars=len(config.objective),
+        task_instruction_sha256=_digest(config.task_instruction), task_instruction_chars=len(config.task_instruction),
+        token_budget_present=False,
+        methods=["initialize", "initialized", "thread/start", "thread/inject_items", "turn/start"],
+    )
+    return wait_native_goal_turn(transport, turn, timeout_sec=timeout_sec)
+
+
 def run_native_goal_until_terminal(
     transport: NativeGoalEventTransport,
     config: NativeGoalConfig,
     *,
-    timeout_sec: float,
+    timeout_sec: float | None,
+    on_turn_started: Callable[[NativeGoalTurn], None] | None = None,
 ) -> NativeGoalTurn:
     """Run one native Goal until its status leaves ``active``.
 
@@ -422,14 +536,16 @@ def run_native_goal_until_terminal(
     continuation events and reading the Goal status under one total timeout.
     """
 
-    if timeout_sec <= 0:
+    if timeout_sec is not None and timeout_sec <= 0:
         raise ValueError("timeout_sec must be positive")
     turn = start_native_goal_turn(transport, config)
-    deadline = time.monotonic() + timeout_sec
+    if on_turn_started is not None:
+        on_turn_started(turn)
+    deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
     completed_before = turn.turn_completed_count
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
             raise NativeGoalDeadlineExceeded("goal_timeout_before_terminal")
         try:
             wait_native_goal_turn(
@@ -447,153 +563,6 @@ def run_native_goal_until_terminal(
         completed_before = turn.turn_completed_count
         if refresh_native_goal_status(transport, turn) != "active":
             return turn
-
-
-_StreamItem = Mapping[str, Any] | Exception
-
-
-def _read_stream(stream: TextIO, messages: queue.Queue[_StreamItem]) -> None:
-    try:
-        for line in stream:
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                messages.put(NativeGoalProtocolError("app_server_frame_invalid_json"))
-                continue
-            if not isinstance(message, Mapping):
-                messages.put(NativeGoalProtocolError("app_server_frame_not_object"))
-                continue
-            messages.put(message)
-    finally:
-        messages.put(EOFError("app_server_stream_closed"))
-
-
-class StdioNativeGoalTransport:
-    """Line-delimited JSON-RPC transport backed by a real app-server process."""
-
-    def __init__(
-        self,
-        process: subprocess.Popen[str],
-        *,
-        response_timeout_sec: float = 30,
-    ) -> None:
-        if process.stdin is None or process.stdout is None:
-            raise ValueError("process must expose text stdin and stdout pipes")
-        if response_timeout_sec <= 0:
-            raise ValueError("response_timeout_sec must be positive")
-        self.process = process
-        self.response_timeout_sec = float(response_timeout_sec)
-        self._messages: queue.Queue[_StreamItem] = queue.Queue()
-        self._pending_events: deque[Mapping[str, Any]] = deque()
-        self._next_request_id = 1
-        self._reader = threading.Thread(
-            target=_read_stream,
-            args=(process.stdout, self._messages),
-            daemon=True,
-        )
-        self._reader.start()
-
-    @classmethod
-    def spawn(
-        cls,
-        command: Sequence[str],
-        *,
-        cwd: str,
-        env: Mapping[str, str] | None = None,
-        response_timeout_sec: float = 30,
-        stderr: int | TextIO | None = subprocess.DEVNULL,
-    ) -> StdioNativeGoalTransport:
-        if not command:
-            raise ValueError("command must be non-empty")
-        process = subprocess.Popen(
-            list(command),
-            cwd=cwd,
-            env=dict(env) if env is not None else None,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=stderr,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-        )
-        return cls(process, response_timeout_sec=response_timeout_sec)
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        self.close()
-
-    def _send(self, message: Mapping[str, Any]) -> None:
-        if self.process.stdin is None or self.process.poll() is not None:
-            raise NativeGoalProtocolError("app_server_stdin_closed")
-        try:
-            self.process.stdin.write(json.dumps(message) + "\n")
-            self.process.stdin.flush()
-        except (BrokenPipeError, OSError) as exc:
-            raise NativeGoalProtocolError("app_server_write_failed") from exc
-
-    def _next_message(self, *, timeout_sec: float) -> Mapping[str, Any] | None:
-        try:
-            message = self._messages.get(timeout=max(0.0, timeout_sec))
-        except queue.Empty:
-            return None
-        if isinstance(message, Exception):
-            raise NativeGoalProtocolError(str(message)) from message
-        return message
-
-    def request(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
-        request_id = self._next_request_id
-        self._next_request_id += 1
-        self._send({"id": request_id, "method": method, "params": dict(params)})
-        deadline = time.monotonic() + self.response_timeout_sec
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise NativeGoalProtocolError(f"app_server_response_timeout:{method}")
-            message = self._next_message(timeout_sec=remaining)
-            if message is None:
-                if self.process.poll() is not None:
-                    raise NativeGoalProtocolError("app_server_exited_before_response")
-                continue
-            if message.get("id") == request_id:
-                if message.get("error") is not None:
-                    raise NativeGoalProtocolError(f"app_server_request_failed:{method}")
-                result = message.get("result")
-                return result if isinstance(result, Mapping) else {}
-            if message.get("method"):
-                self._pending_events.append(message)
-                continue
-            raise NativeGoalProtocolError("app_server_unexpected_response")
-
-    def notify(self, method: str, params: Mapping[str, Any]) -> None:
-        self._send({"method": method, "params": dict(params)})
-
-    def next_event(self, *, timeout_sec: float) -> Mapping[str, Any] | None:
-        if self._pending_events:
-            return self._pending_events.popleft()
-        message = self._next_message(timeout_sec=timeout_sec)
-        if message is None:
-            if self.process.poll() is not None:
-                raise NativeGoalProtocolError("app_server_exited_before_terminal_event")
-            return None
-        if message.get("method"):
-            return message
-        raise NativeGoalProtocolError("app_server_unexpected_response")
-
-    def close(self) -> None:
-        if self.process.stdin is not None:
-            try:
-                self.process.stdin.close()
-            except OSError:
-                pass
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=2)
 
 
 def _default_app_server_command(codex_bin: str) -> list[str]:
@@ -636,7 +605,7 @@ def run_native_goal_process(
     process_env: Mapping[str, str] | None = None,
     process_cwd: str | None = None,
     response_timeout_sec: float = 30,
-    goal_timeout_sec: float = 21_600,
+    goal_timeout_sec: float | None = 21_600,
 ) -> NativeGoalTurn:
     """Spawn a real app-server and execute one complete native Goal turn."""
 
@@ -658,7 +627,7 @@ def run_native_goal_process_until_terminal(
     process_env: Mapping[str, str] | None = None,
     process_cwd: str | None = None,
     response_timeout_sec: float = 30,
-    goal_timeout_sec: float = 21_600,
+    goal_timeout_sec: float | None = 21_600,
 ) -> NativeGoalTurn:
     """Spawn app-server and keep the native Goal alive through continuations."""
 
@@ -714,6 +683,9 @@ def compact_native_goal_receipt(turn: NativeGoalTurn) -> dict[str, Any]:
             else None
         ),
         "error_signatures": list(turn.error_signatures),
+        "terminal_error_signature": turn.terminal_error_signature,
+        "terminal_error_kind": turn.terminal_error_kind,
+        "terminal_error_http_status": turn.terminal_error_http_status,
         "public_boundary": {
             "raw_objective_recorded": False,
             "raw_task_instruction_recorded": False,
@@ -735,12 +707,14 @@ __all__ = [
     "attach_native_goal",
     "compact_native_goal_receipt",
     "observe_native_goal_event",
+    "native_goal_outcome",
     "probe_native_goal_process",
     "refresh_native_goal_status",
     "run_native_goal_process",
     "run_native_goal_process_until_terminal",
     "run_native_goal_turn",
     "run_native_goal_until_terminal",
+    "run_retained_decision_turn",
     "start_native_goal_turn",
     "wait_native_goal_turn",
 ]

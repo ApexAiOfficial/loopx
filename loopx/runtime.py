@@ -1,24 +1,20 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
+import os
 import shutil
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from .history import load_registry
-from .paths import resolve_runtime_root
+from .paths import (
+    goal_state_file_from_record,
+    resolve_runtime_root,
+    validate_goal_id_path_segment as validate_goal_id_path_segment,
+)
 from .registry import registry_goals
-
-
-def validate_goal_id_path_segment(goal_id: str) -> str:
-    value = goal_id.strip()
-    if not value:
-        raise ValueError("goal id is required")
-    if value in {".", ".."} or "/" in value or "\\" in value:
-        raise ValueError("goal id must be a single path segment")
-    if Path(value).name != value:
-        raise ValueError("goal id must not include path traversal")
-    return value
 
 
 def unique_archive_path(archive_root: Path, goal_id: str, timestamp: str) -> Path:
@@ -31,6 +27,144 @@ def unique_archive_path(archive_root: Path, goal_id: str, timestamp: str) -> Pat
     return candidate
 
 
+def _validate_archive_destination(source: Path, destination: Path) -> None:
+    source_path = source.resolve()
+    destination_path = Path(os.path.abspath(destination))
+    if destination.resolve().is_relative_to(source_path) or any(
+        parent.resolve() == source_path for parent in destination_path.parents
+    ):
+        raise ValueError(
+            "archive destination must be outside the runtime goal directory"
+        )
+
+
+def _archive_source_registry_paths(
+    registry: dict[str, Any],
+    *,
+    registry_path: Path,
+    goal_id: str,
+) -> tuple[Path, ...]:
+    from .control_plane.projects.registry_codec import SOURCE_SESSION_PROFILE_ID
+
+    paths: set[Path] = set()
+    resolved_registry_path = registry_path.expanduser().resolve()
+    if registry.get("profile_id") == SOURCE_SESSION_PROFILE_ID:
+        paths.add(resolved_registry_path)
+    for goal in registry_goals(registry):
+        if str(goal.get("id")) != goal_id:
+            continue
+        raw_path = goal.get("source_registry")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = resolved_registry_path.parent / path
+        paths.add(path.resolve())
+    return tuple(sorted(paths, key=str))
+
+
+def _archive_source_goal_refs(
+    source_registry_paths: tuple[Path, ...],
+    *,
+    goal_id: str,
+) -> tuple[tuple[Path, str, str], ...]:
+    from .control_plane.goals.source_session_registry_state import current_goal_ref
+    from .control_plane.projects.registry_codec import (
+        SOURCE_SESSION_PROFILE_ID,
+        load_project_registry,
+    )
+
+    refs: list[tuple[Path, str, str]] = []
+    for source_registry_path in source_registry_paths:
+        source_registry = load_project_registry(source_registry_path)
+        if source_registry.get("profile_id") != SOURCE_SESSION_PROFILE_ID:
+            continue
+        if not any(
+            str(goal.get("id")) == goal_id
+            for goal in registry_goals(source_registry)
+        ):
+            continue
+        goal_ref, _goal = current_goal_ref(
+            source_registry,
+            goal_id=goal_id,
+            require_active=False,
+        )
+        refs.append(
+            (
+                source_registry_path,
+                goal_ref["goal_id"],
+                goal_ref["goal_instance_id"],
+            )
+        )
+    return tuple(refs)
+
+
+def _archive_closeout_payload(
+    *,
+    runtime_root: Path,
+    goal_id: str,
+    goal_record: dict[str, Any],
+    registry_path: Path,
+    archive_path: Path,
+) -> dict[str, Any]:
+    """Run the archive hook after the committed move, best effort only.
+
+    Nothing here may fail the archive: the directory already moved. When no
+    hook is configured the record's state file is never resolved at all, so a
+    stale operator path cannot turn a finished archive into an error.
+    """
+
+    from .lifecycle.goal_closeout import (
+        GOAL_CLOSEOUT_LEDGER_SCHEMA_VERSION,
+        goal_closeout_configuration,
+        run_goal_closeout,
+    )
+
+    unconfigured = {
+        "schema_version": GOAL_CLOSEOUT_LEDGER_SCHEMA_VERSION,
+        "goal_id": goal_id,
+        "trigger": "archive-runtime",
+        "terminal_reason": "archived",
+        "status": "not_configured",
+        "ledger_recorded": False,
+    }
+    try:
+        configuration, configuration_error = goal_closeout_configuration(runtime_root)
+        if configuration_error is None and not (configuration or {}).get("command"):
+            return unconfigured
+        state_file: str | None = None
+        archived_state_file = archive_path / "ACTIVE_GOAL_STATE.md"
+        try:
+            if archived_state_file.exists():
+                # The archived copy wins so the consumer reads the file where
+                # the committed move put it.
+                state_file = str(archived_state_file)
+            else:
+                declared = goal_state_file_from_record(
+                    goal_record,
+                    registry_path=registry_path,
+                )
+                state_file = str(declared) if declared is not None else None
+        except Exception:  # an unusable declared path is not worth a failure
+            state_file = None
+        repo = goal_record.get("repo")
+        return run_goal_closeout(
+            runtime_root=runtime_root,
+            goal_id=goal_id,
+            repo=str(repo) if repo else None,
+            state_file=state_file,
+            terminal_reason="archived",
+            trigger="archive-runtime",
+            ledger_dir=archive_path,
+        )
+    except Exception as exc:  # the terminal command already finished
+        return {
+            **unconfigured,
+            "status": "preparation_error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def archive_runtime_goal(
     *,
     registry_path: Path,
@@ -41,12 +175,18 @@ def archive_runtime_goal(
     execute: bool,
 ) -> dict[str, Any]:
     registry = load_registry(registry_path)
-    runtime_root = resolve_runtime_root(registry, runtime_root_override)
+    runtime_root = resolve_runtime_root(
+        registry,
+        runtime_root_override,
+        registry_path=registry_path,
+    )
     safe_goal_id = validate_goal_id_path_segment(goal_id)
     registered_ids = {str(goal.get("id")) for goal in registry_goals(registry)}
     registry_member = safe_goal_id in registered_ids
     if registry_member and not allow_registered:
-        raise ValueError("goal exists in registry; pass --allow-registered only after confirming it is obsolete")
+        raise ValueError(
+            "goal exists in registry; pass --allow-registered only after confirming it is obsolete"
+        )
 
     source = runtime_root / "goals" / safe_goal_id
     if not source.exists():
@@ -59,12 +199,136 @@ def archive_runtime_goal(
         raise ValueError("runtime goal directory resolved outside the goals root")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    archive_base = archive_root.expanduser() if archive_root else runtime_root / "archived-goals"
+    archive_base = (
+        archive_root.expanduser() if archive_root else runtime_root / "archived-goals"
+    )
     destination = unique_archive_path(archive_base, safe_goal_id, timestamp)
+    _validate_archive_destination(source, destination)
 
+    closeout: dict[str, Any] | None = None
+    closeout_facts: dict[str, Any] | None = None
     if execute:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(source), str(destination))
+        from .control_plane.coordination.shadow_management import (
+            runtime_artifact_lock_target,
+            shadow_maintenance_lock_target,
+        )
+        from .control_plane.effect_runtime import (
+            CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+        )
+        from .control_plane.goals.source_session_registry_state import guard_path
+        from .file_lock import exclusive_cross_runtime_file_lock
+
+        source_registry_paths = _archive_source_registry_paths(
+            registry,
+            registry_path=registry_path,
+            goal_id=safe_goal_id,
+        )
+        source_goal_refs = _archive_source_goal_refs(
+            source_registry_paths,
+            goal_id=safe_goal_id,
+        )
+        with ExitStack() as locks:
+            resolved_runtime_root = runtime_root.resolve()
+            locks.enter_context(
+                exclusive_cross_runtime_file_lock(
+                    runtime_artifact_lock_target(
+                        resolved_runtime_root,
+                        safe_goal_id,
+                    ),
+                    operation="archive_runtime_goal_artifacts",
+                    timeout_seconds=CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+                )
+            )
+            # Exact writers enter source before maintenance. Match that order so
+            # archive cannot overtake a writer between its admission locks.
+            for source_registry in source_registry_paths:
+                locks.enter_context(
+                    exclusive_cross_runtime_file_lock(
+                        guard_path(source_registry, safe_goal_id),
+                        operation="archive_runtime_goal_source",
+                    )
+                )
+            locks.enter_context(
+                exclusive_cross_runtime_file_lock(
+                    shadow_maintenance_lock_target(
+                        resolved_runtime_root,
+                        safe_goal_id,
+                    ),
+                    operation="archive_runtime_goal",
+                    timeout_seconds=CANONICAL_AUTHORITY_WRITE_TIMEOUT_SECONDS,
+                )
+            )
+            locks.enter_context(
+                exclusive_cross_runtime_file_lock(
+                    registry_path.expanduser().resolve(),
+                    operation="archive_runtime_goal_registry",
+                )
+            )
+            locked_registry = load_registry(registry_path)
+            locked_source_registry_paths = _archive_source_registry_paths(
+                locked_registry,
+                registry_path=registry_path,
+                goal_id=safe_goal_id,
+            )
+            if locked_source_registry_paths != source_registry_paths:
+                raise ValueError("source registry route changed during archive preflight")
+            if (
+                _archive_source_goal_refs(
+                    locked_source_registry_paths,
+                    goal_id=safe_goal_id,
+                )
+                != source_goal_refs
+            ):
+                raise ValueError("goal instance changed during archive preflight")
+            registry_member = safe_goal_id in {
+                str(goal.get("id")) for goal in registry_goals(locked_registry)
+            }
+            if registry_member and not allow_registered:
+                raise ValueError(
+                    "goal exists in registry; pass --allow-registered only "
+                    "after confirming it is obsolete"
+                )
+            if not source.exists():
+                raise FileNotFoundError(
+                    f"runtime goal directory does not exist: {source}"
+                )
+            if not source.is_dir():
+                raise ValueError(f"runtime goal path is not a directory: {source}")
+            if source.resolve().parent != goals_root:
+                raise ValueError(
+                    "runtime goal directory resolved outside the goals root"
+                )
+            destination = unique_archive_path(
+                archive_base,
+                safe_goal_id,
+                timestamp,
+            )
+            _validate_archive_destination(source, destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            # The move is irreversible. Only plain copies of already confirmed
+            # facts happen before the canonical locks release; every fallible
+            # hook-only step waits for the best-effort boundary below.
+            locked_archive_goal = next(
+                (
+                    goal
+                    for goal in registry_goals(locked_registry)
+                    if str(goal.get("id")) == safe_goal_id
+                ),
+                None,
+            )
+            closeout_facts = {
+                "goal_record": dict(locked_archive_goal) if locked_archive_goal else {},
+                "archive_path": destination,
+            }
+    if closeout_facts is not None:
+        closeout = _archive_closeout_payload(
+            runtime_root=runtime_root,
+            goal_id=safe_goal_id,
+            goal_record=closeout_facts["goal_record"],
+            registry_path=registry_path,
+            archive_path=closeout_facts["archive_path"],
+        )
 
     return {
         "ok": True,
@@ -78,10 +342,12 @@ def archive_runtime_goal(
         "dry_run": not execute,
         "archived": execute,
         "action": "moved" if execute else "would-move",
+        "closeout": closeout,
         "checks": [
             "goal id is a single path segment",
             "source runtime goal directory exists",
             "source resolves under runtime_root/goals",
+            "archive destination resolves outside the source directory",
             "registry membership checked",
         ],
     }
@@ -103,7 +369,7 @@ def render_archive_runtime_markdown(payload: dict[str, Any]) -> str:
     ]
     if payload.get("error"):
         lines.append(f"- error: {payload.get('error')}")
-    checks = payload.get("checks") if isinstance(payload.get("checks"), list) else []
+    checks = cast(list[Any], payload.get("checks")) if isinstance(payload.get("checks"), list) else []
     if checks:
         lines.extend(["", "## Checks"])
         lines.extend(f"- {check}" for check in checks)

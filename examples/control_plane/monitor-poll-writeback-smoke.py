@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ from loopx.control_plane.scheduler.monitor_poll_writeback import (  # noqa: E402
     write_monitor_poll_todo_state,
 )
 from loopx.control_plane.testing.canary_harness import (  # noqa: E402
+    import_fixture_authority,
     read_run_index,
     run_json_cli,
     run_json_cli_result,
@@ -237,14 +239,13 @@ def write_fixture(
         registered_agents=[AGENT_ID],
         quota_allowed_slots=None,
     )
+    import_fixture_authority(registry_path, GOAL_ID)
     return registry_path, state_file
 
 
 def run_cli(registry_path: Path, *args: str) -> dict:
-    scan_args = ["--scan-path", str(Path(__file__).resolve())] if args[:1] == ("quota",) else []
     return run_json_cli(
         *args,
-        *scan_args,
         registry_path=registry_path,
         runtime_root=runtime_root_from_registry(registry_path),
         cwd=REPO_ROOT,
@@ -253,10 +254,8 @@ def run_cli(registry_path: Path, *args: str) -> dict:
 
 
 def run_cli_expect_error(registry_path: Path, *args: str) -> dict:
-    scan_args = ["--scan-path", str(Path(__file__).resolve())] if args[:1] == ("quota",) else []
     returncode, payload = run_json_cli_result(
         *args,
-        *scan_args,
         registry_path=registry_path,
         runtime_root=runtime_root_from_registry(registry_path),
         cwd=REPO_ROOT,
@@ -275,8 +274,6 @@ def run_cli_markdown_expect_error(registry_path: Path, *args: str) -> str:
         "--runtime-root",
         str(runtime_root_from_registry(registry_path)),
         *args,
-        "--scan-path",
-        str(Path(__file__).resolve()),
     ]
     result = subprocess.run(
         command,
@@ -321,6 +318,8 @@ def assert_due_monitor_selected(registry_path: Path, *, due_count: int = 1) -> N
         registry_path,
         "quota",
         "should-run",
+        "--context-delivery",
+        "off",
         "--goal-id",
         GOAL_ID,
         "--agent-id",
@@ -381,6 +380,8 @@ def assert_unchanged_writeback() -> None:
             registry_path,
             "quota",
             "should-run",
+            "--context-delivery",
+            "off",
             "--goal-id",
             GOAL_ID,
             "--agent-id",
@@ -426,6 +427,8 @@ def assert_interleaved_monitor_stalls_replan_blocked_benchmark() -> None:
             registry_path,
             "quota",
             "should-run",
+            "--context-delivery",
+            "off",
             "--goal-id",
             GOAL_ID,
             "--agent-id",
@@ -452,6 +455,8 @@ def assert_stalled_monitor_does_not_preempt_runnable_advancement() -> None:
             registry_path,
             "quota",
             "should-run",
+            "--context-delivery",
+            "off",
             "--goal-id",
             GOAL_ID,
             "--agent-id",
@@ -612,7 +617,8 @@ def assert_material_transition_followup() -> None:
         compact_contract = compact_after["interaction_contract"]
         assert compact_contract["agent_channel"]["must_attempt"] is True, compact_contract
         assert compact_contract["agent_channel"]["primary_action"], compact_contract
-        assert compact_contract["cli_channel"]["spend_after_validation"] is True, compact_contract
+        assert compact_contract["agent_channel"]["delivery_allowed"] is False, compact_contract
+        assert compact_contract["cli_channel"]["spend_after_validation"] is False, compact_contract
         runtime_root = runtime_root_from_registry(registry_path)
         rollout_events = load_rollout_events(rollout_event_log_path(runtime_root, GOAL_ID))
         monitor_events = [
@@ -624,6 +630,8 @@ def assert_material_transition_followup() -> None:
             registry_path,
             "quota",
             "should-run",
+            "--context-delivery",
+            "off",
             "--goal-id",
             GOAL_ID,
             "--agent-id",
@@ -633,6 +641,8 @@ def assert_material_transition_followup() -> None:
             "--available-capability",
             "external_evidence_poll",
             "--codex-app",
+            "--turn-instance-id",
+            "material-successor-selection",
         )
         assert handoff["ok"] is True, handoff
         assert handoff["decision"] == "run", handoff
@@ -647,10 +657,20 @@ def assert_material_transition_followup() -> None:
         scheduler = handoff["scheduler_hint"]
         assert scheduler["action"] == "run_now", scheduler
         assert scheduler["cadence_class"] == "active_work", scheduler
-        assert scheduler["codex_app"]["recommended_rrule"] == "FREQ=MINUTELY;INTERVAL=3", scheduler
+        assert scheduler["app_automation"]["recommended_rrule"] == "FREQ=MINUTELY;INTERVAL=3", scheduler
         contract = handoff["interaction_contract"]
         assert contract["agent_channel"]["must_attempt"] is True, contract
-        assert contract["cli_channel"]["spend_after_validation"] is True, contract
+        assert contract["agent_channel"]["delivery_allowed"] is False, contract
+        assert contract["cli_channel"]["spend_after_validation"] is False, contract
+        assert contract["cli_channel"]["selection_required"] is True, contract
+        assert "settlement_identity" not in handoff["heartbeat_receipt"], handoff
+        selection = contract["cli_channel"]["selection_command"]
+        selected = run_cli(registry_path, *shlex.split(
+            selection["command_args_template"].replace("{todo_id}", successor_id)
+        ), "--context-delivery", "off")
+        assert selected["heartbeat_receipt"]["settlement_identity"]["todo_id"] == successor_id, selected
+        assert selected["interaction_contract"]["agent_channel"]["delivery_allowed"] is True, selected
+        assert not find_todo(state_file, successor_id).get("claimed_by")  # Selection is not a claim.
 
 
 def assert_external_material_transition_receipt_correlation() -> None:
@@ -706,6 +726,8 @@ def assert_due_monitor_poll_allowed_with_open_user_gate() -> None:
             registry_path,
             "quota",
             "should-run",
+            "--context-delivery",
+            "off",
             "--goal-id",
             GOAL_ID,
             "--agent-id",
@@ -789,7 +811,7 @@ def assert_target_key_cannot_hijack_selected_due_monitor() -> None:
         )
         assert "- ok: `False`" in markdown, markdown
         assert "- mode: `monitor-poll`" in markdown, markdown
-        assert "- todo_id: ``" in markdown, markdown
+        assert "- todo_id: `todo_monitorpoll111`" in markdown, markdown
         assert f"- target_key: `{OTHER_TARGET_KEY}`" in markdown, markdown
         assert "- material_change: `True`" in markdown, markdown
         assert "- appended: `False`" in markdown, markdown
@@ -801,6 +823,28 @@ def assert_target_key_cannot_hijack_selected_due_monitor() -> None:
         assert selected["result_hash"] == "old", selected
         assert other["result_hash"] == "old", other
         assert monitor_poll_records(registry_path) == [], run_index_records(registry_path)
+
+        explicit = run_cli(
+            registry_path,
+            "quota",
+            "monitor-poll",
+            "--goal-id",
+            GOAL_ID,
+            "--agent-id",
+            AGENT_ID,
+            "--todo-id",
+            other["todo_id"],
+            "--target-key",
+            OTHER_TARGET_KEY,
+            "--result-hash",
+            "old",
+            "--execute",
+        )
+        assert explicit["todo_writeback"]["todo_id"] == other["todo_id"], explicit
+        assert find_todo(state_file, TODO_ID) == selected
+        assert find_todo(state_file, other["todo_id"])["consecutive_no_change"] == "2"
+        assert len(monitor_poll_records(registry_path)) == 1
+        assert not any(r["classification"] == "quota_slot_spent" for r in run_index_records(registry_path))
 
 
 def assert_compacted_auxiliary_due_monitor_can_write_back() -> None:
@@ -815,6 +859,8 @@ def assert_compacted_auxiliary_due_monitor_can_write_back() -> None:
             registry_path,
             "quota",
             "should-run",
+            "--context-delivery",
+            "off",
             "--goal-id",
             GOAL_ID,
             "--agent-id",
@@ -874,13 +920,16 @@ def assert_capability_gated_monitor_poll_requires_declaration_parity() -> None:
             registry_path,
             "quota",
             "should-run",
+            "--context-delivery",
+            "off",
             "--goal-id",
             GOAL_ID,
             "--agent-id",
             AGENT_ID,
-            *capability_args,
         )
-        assert should_run["work_lane_contract"]["obligation"] == "attempt_due_monitor", should_run
+        assert should_run["effective_action"] == "capability_bridge_repair", should_run
+        assert should_run["capability_gate"]["action"] == "repair_bridge", should_run
+        assert should_run["capability_gate"]["missing"] == list(capabilities), should_run
 
         failure = run_cli_expect_error(
             registry_path,
@@ -898,6 +947,7 @@ def assert_capability_gated_monitor_poll_requires_declaration_parity() -> None:
             "old",
             "--include-detail",
             "decisions",
+            "--execute",
         )
         assert "monitor-poll recomputes should-run" in failure["reason"], failure
         retry = failure["capability_retry"]
@@ -968,6 +1018,8 @@ def assert_should_run_turn_receipt_is_idempotent() -> None:
             registry_path,
             "quota",
             "should-run",
+            "--context-delivery",
+            "off",
             "--goal-id",
             GOAL_ID,
             "--agent-id",
@@ -983,6 +1035,8 @@ def assert_should_run_turn_receipt_is_idempotent() -> None:
             registry_path,
             "quota",
             "should-run",
+            "--context-delivery",
+            "off",
             "--goal-id",
             GOAL_ID,
             "--agent-id",
@@ -999,6 +1053,8 @@ def assert_should_run_turn_receipt_is_idempotent() -> None:
         command = (
             "quota",
             "should-run",
+            "--context-delivery",
+            "off",
             "--goal-id",
             GOAL_ID,
             "--agent-id",
@@ -1038,7 +1094,6 @@ def assert_turn_scoped_monitor_poll_is_idempotent() -> None:
         status_payload = collect_status(
             registry_path=registry_path,
             runtime_root_override=str(runtime_root),
-            scan_roots=[Path(__file__).resolve()],
             limit=AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK,
         )
         turn_id = "2026-07-23T02:33:00Z"
@@ -1086,7 +1141,7 @@ def assert_cli_monitor_poll_preserves_codex_app_scheduler_context() -> None:
     with tempfile.TemporaryDirectory(prefix="loopx-monitor-poll-codex-app-") as tmp:
         hints = cli_monitor_poll_scheduler_hints(write_fixture(Path(tmp))[0], "--codex-app")
         for scheduler_hint in hints:
-            assert scheduler_hint["codex_app"]["applicability"] == "applicable", scheduler_hint
+            assert scheduler_hint["app_automation"]["applicability"] == "applicable", scheduler_hint
             assert scheduler_hint["action"] != "repair_scheduler_execution_context", scheduler_hint
 
 
@@ -1099,8 +1154,8 @@ def assert_cli_monitor_poll_preserves_outer_controller_scheduler_context() -> No
             execution_context = scheduler_hint["execution_context"]
             execution_phase = scheduler_hint["execution_phase"]
             assert scheduler_hint["action"] != "repair_scheduler_execution_context", scheduler_hint
-            assert scheduler_hint["codex_app"]["applicability"] == "not_applicable", scheduler_hint
-            assert "stateful_backoff" not in scheduler_hint["codex_app"], scheduler_hint
+            assert scheduler_hint["app_automation"]["applicability"] == "not_applicable", scheduler_hint
+            assert "stateful_backoff" not in scheduler_hint["app_automation"], scheduler_hint
             assert (
                 execution_context["host_surface"],
                 execution_context["scheduler_owner"],
@@ -1128,8 +1183,8 @@ def assert_cli_monitor_poll_invalid_scheduler_context_fails_closed() -> None:
             execution_context = scheduler_hint["execution_context"]
             execution_phase = scheduler_hint["execution_phase"]
             assert scheduler_hint["action"] == "repair_scheduler_execution_context", scheduler_hint
-            assert scheduler_hint["codex_app"]["applicability"] == "blocked_invalid_context", scheduler_hint
-            assert "stateful_backoff" not in scheduler_hint["codex_app"], scheduler_hint
+            assert scheduler_hint["app_automation"]["applicability"] == "blocked_invalid_context", scheduler_hint
+            assert "stateful_backoff" not in scheduler_hint["app_automation"], scheduler_hint
             assert execution_context["valid"] is False, scheduler_hint
             assert execution_context["errors"] == [
                 "outer_controller requires execution_mode=isolated_headless"
@@ -1151,13 +1206,17 @@ def assert_writeback_helper_preview_contract() -> None:
         assert resolved["todo_id"] == TODO_ID, resolved
         assert resolved["target_key"] == TARGET_KEY, resolved
         generated_at = "2026-01-01T00:05:00+00:00"
+        before = run_cli(registry_path, "todo", "list", "--goal-id", GOAL_ID, "--todo-id", TODO_ID)
+        source = _state_file.read_bytes()
         preview = write_monitor_poll_todo_state(
             registry_path=registry_path,
+            runtime_root=runtime_root_from_registry(registry_path),
             goal_id=GOAL_ID,
             generated_at=generated_at,
             execute=False,
             todo_id=TODO_ID,
             result_hash="old",
+            agent_id=AGENT_ID,
         )
         assert preview["schema_version"] == "monitor_poll_todo_writeback_v0", preview
         assert preview["dry_run"] is True, preview
@@ -1170,6 +1229,22 @@ def assert_writeback_helper_preview_contract() -> None:
         assert preview["last_checked_at"] == generated_at, preview
         assert preview["next_due_at"] != "2026-01-01T00:00:00+00:00", preview
         assert preview["cadence"] == "15m", preview
+        for actor in (None, "codex-unregistered"):
+            try:
+                write_monitor_poll_todo_state(
+                    registry_path=registry_path,
+                    runtime_root=runtime_root_from_registry(registry_path),
+                    goal_id=GOAL_ID, generated_at=generated_at,
+                    execute=False, todo_id=TODO_ID, result_hash="old", agent_id=actor,
+                )
+            except ValueError as exc:
+                assert "registered actor" in str(exc), str(exc)
+            else:
+                raise AssertionError("Monitor preview admitted an undeclared actor")
+        after = run_cli(registry_path, "todo", "list", "--goal-id", GOAL_ID, "--todo-id", TODO_ID)
+        assert after["todo"] == before["todo"], after
+        assert after["authority_read"]["provider_revision"] == before["authority_read"]["provider_revision"], after
+        assert _state_file.read_bytes() == source
 
 
 def assert_cli_monitor_poll_uses_should_run_lookback() -> None:
@@ -1224,28 +1299,28 @@ def assert_cli_monitor_poll_uses_should_run_lookback() -> None:
         identity_signature=None,
         dry_run=True,
         execute=False,
-        scan_root=str(REPO_ROOT),
-        scan_path=[],
         limit=5,
         format="json",
     )
     original_collect_status = quota_command.collect_status
     original_record_monitor_poll = quota_command.record_quota_monitor_poll
-    try:
-        quota_command.collect_status = fake_collect_status
-        quota_command.record_quota_monitor_poll = fake_record_quota_monitor_poll
-        rc = quota_command.handle_quota_command(
-            args,
-            registry_path=REPO_ROOT / ".loopx" / "registry.json",
-            runtime_root_arg=None,
-            print_payload=fake_print_payload,
-            append_cli_rollout_event=lambda **_: {},
-        )
-    finally:
-        quota_command.collect_status = original_collect_status
-        quota_command.record_quota_monitor_poll = original_record_monitor_poll
+    with tempfile.TemporaryDirectory(prefix="loopx-monitor-poll-lookback-") as tmp:
+        registry_path, _ = write_fixture(Path(tmp))
+        try:
+            quota_command.collect_status = fake_collect_status
+            quota_command.record_quota_monitor_poll = fake_record_quota_monitor_poll
+            rc = quota_command.handle_quota_command(
+                args,
+                registry_path=registry_path,
+                runtime_root_arg=None,
+                print_payload=fake_print_payload,
+                append_cli_rollout_event=lambda **_: {},
+            )
+        finally:
+            quota_command.collect_status = original_collect_status
+            quota_command.record_quota_monitor_poll = original_record_monitor_poll
 
-    assert rc == 0, rc
+    assert rc == 0, (rc, seen.get("payload"))
     assert seen["limit"] == AUTONOMOUS_REPLAN_PERIODIC_LOOKBACK, seen
     assert seen["record_kwargs"]["available_capabilities"] == ["network"], seen
     scheduler_context = seen["record_kwargs"]["scheduler_execution_context"]

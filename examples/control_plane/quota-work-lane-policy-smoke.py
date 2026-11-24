@@ -24,6 +24,10 @@ from loopx.control_plane.work_items.work_lane_context import (  # noqa: E402
 from loopx.control_plane.testing.quota_fixtures import quota_status_payload  # noqa: E402
 from loopx.quota import build_quota_should_run  # noqa: E402
 
+from loopx.control_plane.scheduler.execution_context import (  # noqa: E402
+    GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
+)
+
 
 GOAL_ID = "work-lane-policy-fixture"
 PAST_DUE_AT = "2000-01-01T00:00:00+00:00"
@@ -101,7 +105,10 @@ def assert_unchanged_monitor_attempt_yields_to_advancement() -> None:
         agent_todo_items=items,
         latest_runs=[unchanged_poll],
     )
-    guard = build_quota_should_run(payload, goal_id=GOAL_ID)
+    guard = build_quota_should_run(
+            payload, goal_id=GOAL_ID,
+            scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
+        )
     lane = guard["work_lane_contract"]
     assert lane["lane"] == "advancement_task", lane
     assert lane["reason_codes"] == [
@@ -122,7 +129,10 @@ def assert_unchanged_monitor_attempt_yields_to_advancement() -> None:
             unchanged_poll,
         ],
     )
-    guard = build_quota_should_run(payload, goal_id=GOAL_ID)
+    guard = build_quota_should_run(
+            payload, goal_id=GOAL_ID,
+            scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
+        )
     lane = guard["work_lane_contract"]
     assert lane["lane"] == "continuous_monitor", lane
     assert lane["selected_todo_id"], lane
@@ -131,10 +141,12 @@ def assert_unchanged_monitor_attempt_yields_to_advancement() -> None:
 def assert_work_lane_context_matches_quota_state_machine_cases() -> None:
     due_todo = "[P0] Monitor the overdue update-note draft PR before feature work."
     executable_todo = "[P1] Implement the bounded runtime repair slice."
+    dependency_payload = status_payload(status="side_bypass_dependency_observation")
+    dependency_payload["attention_queue"]["items"][0]["project_asset"]["progress_scope"] = "dependency_observation"
     cases = [
         (
             "dependency_observation",
-            status_payload(status="side_bypass_dependency_observation"),
+            dependency_payload,
         ),
         (
             "surface_only_followthrough",
@@ -177,12 +189,23 @@ def assert_work_lane_context_matches_quota_state_machine_cases() -> None:
     ]
     for name, payload in cases:
         item = payload["attention_queue"]["items"][0]
-        guard = build_quota_should_run(payload, goal_id=GOAL_ID)
+        guard = build_quota_should_run(
+            payload, goal_id=GOAL_ID,
+            scheduler_execution_context=GENERIC_CLI_OUTER_CONTROLLER_SCHEDULER_CONTEXT,
+        )
         direct = build_work_lane_context_contract(
             item,
             agent_todo_summary=guard["agent_todo_summary"],
         )
-        assert direct == guard["work_lane_contract"], (name, direct, guard)
+        # Guard normalization adds content revisions to execution candidates.
+        # Compare lane decisions independently of that transport annotation.
+        expected = dict(guard["work_lane_contract"])
+        if "monitor_due_items" in expected:
+            expected["monitor_due_items"] = [
+                {key: value for key, value in todo.items() if key != "content_revision"}
+                for todo in expected["monitor_due_items"]
+            ]
+        assert direct == expected, (name, direct, guard)
         for lane_item in guard["work_lane_contract"].get("monitor_due_items") or []:
             assert "title" not in lane_item, (name, lane_item)
             assert "handoff_note" not in lane_item, (name, lane_item)
@@ -191,16 +214,18 @@ def assert_work_lane_context_matches_quota_state_machine_cases() -> None:
 def assert_work_lane_context_progress_scope_sources() -> None:
     dependency_payload = status_payload(status="side_bypass_dependency_observation")
     dependency_item = dependency_payload["attention_queue"]["items"][0]
-    assert item_progress_scope(dependency_item) == "dependency_observation"
+    assert item_progress_scope(dependency_item) == "primary_goal"
     assert latest_run_progress_scope(
         {"classification": "runner_dependency_observed"}
-    ) == "dependency_observation"
+    ) == "primary_goal"
     assert latest_run_progress_scope(
         {
             "classification": "runner_dependency_observed",
             "progress_scope": "primary_goal",
         }
     ) == "primary_goal"
+    dependency_item["progress_scope"] = "dependency_observation"
+    assert item_progress_scope(dependency_item) == "dependency_observation"
 
 
 def main() -> int:

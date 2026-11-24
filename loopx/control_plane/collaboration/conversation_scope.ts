@@ -1,0 +1,249 @@
+/** Pure identity contract shared with presentation. Host grant observation and
+ * filesystem IO remain outside this classifier. */
+export function goalAgentConversationIdentity(input: Record<string, unknown>): Record<string, unknown> {
+  const goal = input.goal_id, agent = input.managed_agent_id;
+  if (typeof goal !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(goal)
+      || goal === "loopx-manager" || typeof agent !== "string"
+      || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(agent)) {
+    throw new Error("select an exact registered Goal and Agent");
+  }
+  // Core's route key also contains goal_id. The separate Agent channel keeps
+  // legacy Goal conversations unassigned, without conflating an executor id
+  // with the registered work identity or encoding ambiguous Goal/Agent pairs.
+  return {managed_agent_id: agent, channel_id: `agent.${agent}`};
+}
+
+export function normalizeProjectContext(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid project conversation context");
+  const context = value as Record<string, unknown>;
+  const ref = context.project_ref, workspace = context.workspace_path;
+  if (typeof ref !== "string" || !/^[a-f0-9]{24}$/.test(ref)
+      || typeof workspace !== "string" || !workspace || context.kind !== "project_workspace"
+      || !["local_owner", "bound_owner", "bound_group"].includes(String(context.audience))
+      || !["workspace_read", "workspace_write"].includes(String(context.grant))
+      || (workspace[0] !== "/" && !/^[A-Za-z]:[\\/]/.test(workspace))) {
+    throw new Error("invalid project conversation context");
+  }
+  const normalized: Record<string, string> = {kind: "project_workspace", project_ref: ref, workspace_path: workspace,
+    audience: String(context.audience), grant: String(context.grant)};
+  if (context.filesystem_scope !== undefined) {
+    if (context.filesystem_scope !== "workspace_only") throw new Error("invalid project filesystem scope");
+    normalized.filesystem_scope = "workspace_only";
+  }
+  if (context.audience === "bound_owner" || context.audience === "bound_group") {
+    for (const field of ["binding_id", "source_ref", "provider_ref", "operator_ref"]) {
+      const value = context[field];
+      if (typeof value !== "string" || !/^[a-f0-9]{24}$/.test(value)) throw new Error("incomplete bound project identity");
+      normalized[field] = value;
+    }
+  }
+  if (context.audience === "bound_group") {
+    if (context.filesystem_scope !== "workspace_only") throw new Error("group Chat requires workspace-only isolation");
+    for (const field of ["group_ref", "topic_ref"]) {
+      const value = context[field];
+      if (typeof value !== "string" || !/^[a-f0-9]{24}$/.test(value)) throw new Error("incomplete group topic identity");
+      normalized[field] = value;
+    }
+  }
+  return normalized;
+}
+
+export function projectConversationIdentity(input: Record<string, unknown>): Record<string, unknown> {
+  const context = normalizeProjectContext(input.context);
+  // A Core-admitted result review narrows this one adapter. Keep the original
+  // grant/store/thread identity; never migrate an ordinary thread into a new
+  // isolated store merely to inspect work which already ran.
+  const review = input.read_only_review === true;
+  if (review && context.audience !== "bound_owner") throw new Error("result review requires the original private owner");
+  const writable = context.grant === "workspace_write" && !review;
+  const permissions = context.filesystem_scope === "workspace_only" || review ? {
+    // Share authentication within this authorized workspace/owner binding,
+    // never with another App or local-owner context. Source topics retain
+    // separate threads without requiring a new login for every message.
+    ...(context.filesystem_scope === "workspace_only" ? {
+      host_store_key: [context.project_ref, ...(context.audience !== "local_owner"
+        ? [context.binding_id, context.provider_ref, context.operator_ref] : ["local"])].join("."),
+    } : {}),
+    permissions_profile: `loopx_workspace_only_${writable ? "write" : "read"}`,
+    host_config: {
+      default_permissions: `loopx_workspace_only_${writable ? "write" : "read"}`,
+      allow_login_shell: false,
+      web_search: "disabled",
+      shell_environment_policy: {
+        inherit: "none", include_only: ["PATH"], experimental_use_profile: false,
+        // A minimal POSIX search path keeps native file tools usable without
+        // inheriting account-defined variables or user-installed executables.
+        ...(context.workspace_path.startsWith("/")
+          ? {set: {PATH: "/usr/bin:/bin:/usr/sbin:/sbin"}} : {}),
+      },
+      // The host may discover instructions outside the filesystem sandbox.
+      // Read project instructions/skills through the bounded native tools.
+      skills: {include_instructions: false},
+      project_doc_max_bytes: 0,
+      ...(review ? {features: {apps: false, multi_agent: false, multi_agent_v2: false}} : {}),
+      permissions: {
+        [`loopx_workspace_only_${writable ? "write" : "read"}`]: {
+          extends: ":workspace",
+          filesystem: {
+            ":root": "deny", ":minimal": "read", ":tmpdir": "deny", ":slash_tmp": "deny",
+            ":workspace_roots": {".": writable ? "write" : "read"},
+          },
+          network: {enabled: false},
+        },
+      },
+    },
+  } : {};
+  return {context, sandbox: writable ? "workspace-write" : "read-only", ...permissions,
+    channel_id: context.audience === "local_owner"
+    ? `project.${context.project_ref}` : `project.external.${context.binding_id}.${context.source_ref}`};
+}
+
+export function normalizeStewardGoalScope(value: unknown): string[] {
+  if (!Array.isArray(value)
+      || value.some(g => typeof g !== "string" || !/^[A-Za-z0-9._-]{1,160}$/.test(g)
+        || [".", "..", "loopx-manager"].includes(g))) throw new Error("invalid steward Goal scope");
+  return [...new Set(value as string[])].sort();
+}
+
+/** An explicitly selected steward has a bounded portfolio, including an honest
+ * empty one. Identity is persisted by Core; message text cannot select it.
+ */
+export function normalizeStewardContext(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("steward context unavailable");
+  const row = value as Record<string, unknown>;
+  const topicRef = row.topic_ref;
+  if (topicRef !== undefined && (typeof topicRef !== "string" || !/^[a-f0-9]{24}$/.test(topicRef))) {
+    throw new Error("invalid steward topic identity");
+  }
+  const {topic_ref: _ignoredTopic, ...baseRow} = row;
+  const workspace = normalizeProjectContext({...baseRow, kind: "project_workspace", grant: "workspace_read"});
+  if (row.kind !== "bound_steward" || row.audience !== "bound_owner" || row.grant !== "portfolio_read"
+      ) throw new Error("invalid bounded steward context");
+  return {...workspace, ...(topicRef !== undefined ? {topic_ref: topicRef} : {}),
+    kind: "bound_steward", grant: "portfolio_read", goal_ids: normalizeStewardGoalScope(row.goal_ids)};
+}
+
+export function stewardConversationIdentity(input: Record<string, unknown>): Record<string, unknown> {
+  const context = normalizeStewardContext(input.context);
+  const channel_id = typeof context.topic_ref === "string"
+    ? `manager.external.native.${context.binding_id}.${context.source_ref}.topic.${context.topic_ref}`
+    : `manager.external.native.${context.binding_id}.${context.source_ref}`;
+  if (input.metadata_review === true && input.answer_review === true) throw new Error("steward review modes are exclusive");
+  if (input.metadata_review === true || input.answer_review === true) {
+    // Reuse the narrower native result-review policy without turning a
+    // portfolio grant into project execution authority. Default to the existing
+    // workspace-only frozen reads. The host may retain its already-authorized
+    // trusted-owner read subset below; no writes or network are permitted.
+    const review = projectConversationIdentity({context: {...context, topic_ref: undefined,
+      kind: "project_workspace", grant: "workspace_read"}, read_only_review: true});
+    const config = review.host_config as Record<string, unknown>;
+    config.features = {...config.features as object, shell_tool: false,
+      apply_patch_freeform: false};
+    if (input.answer_review === true && input.answer_review_host_read === true) {
+      // The host derives this subset from the original trusted-owner runtime,
+      // never from the portfolio grant, model text or provider availability.
+      // Preserve its host reads while denying every write and network effect.
+      const profiles = config.permissions as Record<string, Record<string, unknown>>;
+      const narrow = profiles.loopx_workspace_only_read;
+      const profile = "loopx_steward_host_read";
+      review.permissions_profile = profile;
+      config.default_permissions = profile;
+      config.features = {...config.features as object, shell_tool: true};
+      config.permissions = {[profile]: {...narrow,
+        filesystem: {...narrow.filesystem as object, ":root": "read"}, network: {enabled: false}}};
+    }
+    return {...review, context, channel_id};
+  }
+  return {context, channel_id};
+}
+
+type ConversationScope = Record<string, unknown> & (
+  | {kind: "owner_portfolio"; goal_ids: null; private_conversation: true}
+  | {kind: "owner_goal"; goal_ids: [string]; private_conversation: true}
+  | {kind: "project_workspace"; goal_ids: []; private_conversation: boolean}
+  | {kind: "external_audience" | "unavailable"; goal_ids: []; private_conversation: false}
+);
+
+/** Classify a host-owned conversation, never model-supplied role or scope.
+ * This selects existing read/delivery boundaries; it grants no execution rights.
+ */
+export function resolveConversationScope(input: Record<string, unknown>): ConversationScope {
+  const channel = input.channel_id;
+  const goal = input.goal_id;
+  if (goal === null) {
+    try {
+      const context = normalizeProjectContext(input.project_context);
+      if (context.audience === "local_owner" && (input.origin === undefined || input.origin === "web")
+          && channel === `project.${context.project_ref}`) {
+        return {kind: "project_workspace", goal_ids: [], private_conversation: true};
+      }
+      if (context.audience !== "local_owner" && (input.origin === undefined || input.origin === "lark" || input.origin === "external"
+          || input.origin === "web" && context.audience === "bound_owner")
+          && channel === `project.external.${context.binding_id}.${context.source_ref}`) {
+        return {kind: "project_workspace", goal_ids: [], private_conversation: false};
+      }
+    } catch { /* Incomplete host identity grants no context. */ }
+    // Explicit null identifies a project Session; a missing legacy Goal field
+    // is different and must not be manufactured by an observation adapter.
+    return {kind: "unavailable", goal_ids: [], private_conversation: false};
+  }
+  if (goal === "loopx-manager" && (input.origin === undefined || input.origin === "lark" || input.origin === "external" || input.origin === "web" || input.origin === "native_loopx")) {
+    try {
+      const selected = stewardConversationIdentity({context: input.steward_context});
+      if (channel === selected.channel_id) {
+        return {kind: "external_audience", goal_ids: [], private_conversation: false, bound_steward: true};
+      }
+    } catch { /* An incomplete steward identity cannot authorize a portfolio. */ }
+  }
+  // Declared context must match a typed identity above; a legacy channel cannot
+  // turn inconsistent recovered project metadata into broader authority.
+  if (input.project_context != null) {
+    return {kind: "unavailable", goal_ids: [], private_conversation: false};
+  }
+  if (input.managed_agent_id != null) {
+    try {
+      const identity = goalAgentConversationIdentity(input);
+      if (channel === identity.channel_id && input.session_mode === "managed_runtime"
+          && input.steward_context == null && (input.origin === undefined || input.origin === "web")) {
+        return {kind: "owner_goal", goal_ids: [String(goal)], private_conversation: true};
+      }
+    } catch { /* Inconsistent recovered identity grants no context. */ }
+    return {kind: "unavailable", goal_ids: [], private_conversation: false};
+  }
+  if (channel === "manager") {
+    return {kind: "owner_portfolio", goal_ids: null, private_conversation: true};
+  }
+  if (typeof goal === "string" && /^[A-Za-z0-9._-]{1,160}$/.test(goal)
+      && goal !== "." && goal !== ".." && goal !== "loopx-manager" && channel === `goal.${goal}`
+      && (input.origin === undefined || input.origin === "web")) {
+    return {kind: "owner_goal", goal_ids: [goal], private_conversation: true};
+  }
+  if (typeof channel === "string" && channel.startsWith("manager.external.")
+      && channel.length > "manager.external.".length) {
+    return {kind: "external_audience", goal_ids: [], private_conversation: false};
+  }
+  return {kind: "unavailable", goal_ids: [], private_conversation: false};
+}
+
+/** One executor match for bound input and native work; provider/source admission remains separate. */
+export function boundConversationExecutorMatches(row: Record<string, unknown>, session: Record<string, unknown>): boolean {
+  if (session.agent_id === row.executor_endpoint_id && session.executor_endpoint_id === row.executor_endpoint_id) return true;
+  const allocation = session.manager_executor_allocation as Record<string, unknown> | undefined;
+  const configured = row.executor_endpoint_id;
+  if (configured !== "antigravity" && configured !== "codex") return false;
+  const fallback = configured === "antigravity" ? "codex" : "antigravity";
+  const flexiblePoolMatch =
+    (allocation?.configured_endpoint === configured && allocation.allocation_reason === "flexible_availability_fallback")
+    || (allocation?.configured_endpoint === fallback && allocation.allocation_reason === "flexible_primary_available");
+  return row.context_kind === "steward" && row.audience !== "group"
+    && session.agent_id === fallback && session.executor_endpoint_id === fallback
+    && allocation?.schema_version === "manager_executor_allocation_v0"
+    && allocation.selection_policy === "flexible"
+    && allocation.executor_endpoint === fallback && flexiblePoolMatch
+    && typeof allocation.configuration_revision === "string" && allocation.configuration_revision.length > 0
+    && Array.isArray(allocation.eligible_endpoints) && allocation.eligible_endpoints.length === 2
+    && allocation.eligible_endpoints.includes("antigravity") && allocation.eligible_endpoints.includes("codex")
+    && Array.isArray(session.upstream_context_history) && session.upstream_context_history.some(value =>
+      value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).agent_id === configured
+      && typeof (value as Record<string, unknown>).thread_id === "string");
+}

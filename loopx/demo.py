@@ -7,11 +7,11 @@ from .bootstrap import (
     DEFAULT_DOMAIN,
     bootstrap_project,
 )
-from .paths import DEFAULT_RUNTIME_ROOT
+from .paths import select_default_runtime_root
 from .quota import build_quota_should_run
 from .state_refresh import refresh_state_run
 from .status import collect_status
-from .todos import add_goal_todo
+from .control_plane.todos.mutation_api import add_goal_todo
 
 
 DEFAULT_DEMO_PROJECT = Path("/tmp/loopx-demo")
@@ -41,7 +41,7 @@ def run_demo(
     agent_todo: str,
 ) -> dict[str, Any]:
     project = project.expanduser().resolve()
-    runtime_root = runtime_root.expanduser().resolve() if runtime_root else DEFAULT_RUNTIME_ROOT
+    runtime_root = runtime_root.expanduser().resolve() if runtime_root else select_default_runtime_root()
     registry_path = project / ".loopx" / "registry.json"
     goal_doc = project / "GOAL.md"
     project.mkdir(parents=True, exist_ok=True)
@@ -69,7 +69,6 @@ def run_demo(
         max_children=3,
         allowed_domains=[],
         write_scope=[],
-        onboarding_scan_enabled=False,
         force=False,
         dry_run=False,
         sync_global=False,
@@ -103,7 +102,6 @@ def run_demo(
     status_payload = collect_status(
         registry_path=registry_path,
         runtime_root_override=str(runtime_root),
-        scan_roots=[project],
         limit=5,
         goal_id=goal_id,
     )
@@ -148,7 +146,7 @@ def run_demo(
         "next_commands": [
             f"cd {project}",
             'registry="$PWD/.loopx/registry.json"',
-            'loopx --registry "$registry" status --scan-root "$PWD"',
+            'loopx --registry "$registry" status',
             f'loopx --registry "$registry" --format json quota should-run --goal-id {goal_id} --runtime-profile generic_cli',
         ],
         "dashboard_status_commands": [

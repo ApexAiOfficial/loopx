@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+import os
+from pathlib import Path
 
-from ..slash_command_install import (
-    install_slash_commands,
-    render_slash_command_install_markdown,
-)
+from ..pi_goal_mode.installation import inspect_pi_installations, render_pi_installation_markdown
+from ..slash_command_install import install_slash_commands, render_slash_command_install_markdown
 from ..slash_commands import build_slash_command_catalog, render_slash_command_catalog_markdown
 
 
@@ -47,6 +47,11 @@ def register_slash_commands_command(
         action="store_true",
         help="Remove LoopX-managed command skill files for supported hosts while preserving user-owned files.",
     )
+    install_group.add_argument(
+        "--inspect",
+        action="store_true",
+        help="Read project and user Pi extension installation state without writing files.",
+    )
     parser.add_argument(
         "--surface",
         action="append",
@@ -64,12 +69,20 @@ def register_slash_commands_command(
             "gemini-cli",
             "cursor",
             "cursor-agent",
+            "zcode",
+            "z-code",
+            "agy",
+            "antigravity",
+            "antigravity-app",
+            "kiro",
+            "kiro-cli",
             "pi",
         ],
         help=(
             "Host surface to install. Repeatable. Defaults to static command facades "
-            "for Codex, Claude Code, and OpenCode. `gemini`, `cursor` and `pi` are "
-            "opt-in: they write into those hosts' own homes only when requested."
+            "for Codex, Claude Code, and OpenCode. `gemini`, `cursor`, `zcode`, "
+            "`agy`, `kiro-cli`, `pi` are opt-in: they write into those hosts' own "
+            "homes only when requested."
         ),
     )
     parser.add_argument(
@@ -97,6 +110,45 @@ def register_slash_commands_command(
         help="Cursor CLI home for MCP registration. Defaults to CURSOR_HOME or ~/.cursor.",
     )
     parser.add_argument(
+        "--zcode-home",
+        dest="zcode_home",
+        help="ZCode home for skill installation. Defaults to ZCODE_HOME or ~/.zcode.",
+    )
+    parser.add_argument(
+        "--zcode-agents-home",
+        dest="zcode_home",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--agy-home",
+        help=(
+            "Antigravity config home for skill, MCP, and hooks installation. "
+            "Defaults to AGY_HOME or ~/.gemini/config (and ~/.gemini/antigravity-cli for legacy CLI)."
+        ),
+    )
+    parser.add_argument(
+        "--with-agy-mcp",
+        action="store_true",
+        help="Optionally register the LoopX MCP server in Antigravity mcp_config.json.",
+    )
+    parser.add_argument(
+        "--with-agy-hooks",
+        action="store_true",
+        help="Optionally install an Antigravity Stop recovery hook; pass --goal-id, --agent-id, and --conversation-id (or bind via bind-agent-thread --with-agy-hooks) to enable it.",
+    )
+    parser.add_argument(
+        "--goal-id",
+        help="Optional Goal id bound into the Antigravity Stop recovery hook when using --with-agy-hooks.",
+    )
+    parser.add_argument(
+        "--agent-id",
+        help="Optional Agent id bound into the Antigravity Stop recovery hook when using --with-agy-hooks.",
+    )
+    parser.add_argument(
+        "--conversation-id",
+        help="Optional Antigravity Conversation ID bound into the Stop recovery hook when using --with-agy-hooks.",
+    )
+    parser.add_argument(
         "--opencode-home",
         help="OpenCode config directory. Defaults to OPENCODE_CONFIG_DIR or ~/.config/opencode.",
     )
@@ -104,6 +156,12 @@ def register_slash_commands_command(
         "--pi-project",
         default=".",
         help="Project directory for the Pi goal extension install. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "--pi-scope",
+        choices=("project", "user"),
+        default="project",
+        help="Install Pi extension code for one project or the current user. Defaults to project.",
     )
     parser.add_argument(
         "--dry-run",
@@ -117,23 +175,73 @@ def handle_slash_commands_command(
     *,
     output_format: FormatSelector,
     print_payload: PrintPayload,
+    registry_path: Path | None = None,
+    registry_was_configured: bool | None = None,
 ) -> int | None:
     if args.command != "slash-commands":
         return None
+    if args.inspect:
+        if args.surface != ["pi"]:
+            raise ValueError("--inspect requires exactly --surface pi")
+        if args.dry_run or args.with_goal_bridge:
+            raise ValueError("--inspect cannot be combined with --dry-run or --with-goal-bridge")
+        payload = inspect_pi_installations(pi_project=args.pi_project)
+        print_payload(payload, output_format(args), render_pi_installation_markdown)
+        return 0 if payload["ok"] else 1
     if args.install or args.uninstall or args.dry_run:
+        effective_cli_bin = (
+            args.cli_bin
+            if args.cli_bin != "loopx"
+            else (getattr(args, "control_cli_bin", None) or args.cli_bin)
+        )
+        agy_goal_id = getattr(args, "goal_id", None)
+        if registry_was_configured is None:
+            from ..paths import default_registry_path
+
+            raw_reg = getattr(args, "registry", None)
+            configured_registry = bool(os.environ.get("LOOPX_REGISTRY")) or (
+                bool(raw_reg) and str(raw_reg) != str(default_registry_path())
+            )
+        else:
+            configured_registry = registry_was_configured
+        resolved_registry = (
+            registry_path
+            if registry_path is not None
+            else (Path(args.registry).expanduser() if getattr(args, "registry", None) else None)
+        )
+        agy_registry = (
+            str(resolved_registry.resolve())
+            if agy_goal_id and configured_registry and resolved_registry is not None
+            else None
+        )
+        agy_runtime_root = (
+            str(Path(args.runtime_root).expanduser().resolve())
+            if agy_goal_id and getattr(args, "runtime_root", None)
+            else None
+        )
         payload = install_slash_commands(
             execute=bool((args.install or args.uninstall) and not args.dry_run),
             uninstall=bool(args.uninstall),
             with_goal_bridge=bool(args.with_goal_bridge),
+            with_agy_mcp=bool(getattr(args, "with_agy_mcp", False)),
+            with_agy_hooks=bool(getattr(args, "with_agy_hooks", False)),
             surfaces=args.surface,
-            cli_bin=args.cli_bin,
+            cli_bin=effective_cli_bin,
             include_legacy_aliases=not bool(args.no_legacy_aliases),
             codex_home=args.codex_home,
             claude_home=args.claude_home,
             opencode_home=args.opencode_home,
             gemini_home=args.gemini_home,
             cursor_home=args.cursor_home,
+            zcode_home=getattr(args, "zcode_home", None),
+            agy_home=getattr(args, "agy_home", None),
+            agy_goal_id=agy_goal_id,
+            agy_agent_id=getattr(args, "agent_id", None),
+            agy_conversation_id=getattr(args, "conversation_id", None),
+            agy_runtime_root=agy_runtime_root,
+            agy_registry=agy_registry,
             pi_project=args.pi_project,
+            pi_scope=args.pi_scope,
         )
         print_payload(payload, output_format(args), render_slash_command_install_markdown)
         return 0 if payload.get("ok") is True else 1

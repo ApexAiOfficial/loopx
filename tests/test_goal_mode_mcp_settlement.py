@@ -5,9 +5,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from loopx.control_plane import host_adapter_settlement
 from loopx.control_plane.host_adapter_settlement import (
     HostTodoSettlementRequest,
     host_adapter_turn_instance_id,
+    settle_host_todo_completion,
+)
+from loopx.control_plane.coordination.goal_storage_initialization import (
+    initialize_goal_storage_target,
 )
 from loopx.goal_mode_mcp import GoalModeMCPConfig, GoalModeMCPControlPlane
 from loopx.status import parse_active_state_todos
@@ -16,6 +23,152 @@ from loopx.todos import add_goal_todo
 
 GOAL_ID = "mcp-settlement-fixture"
 AGENT_ID = "claude"
+
+
+def test_host_settlement_adapter_uses_two_runtime_crossings_and_stops_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = HostTodoSettlementRequest(
+        goal_id="goal",
+        agent_id="agent",
+        todo_id="todo_abc123",
+        runtime_profile="claude_code",
+        legacy_host_surface="claude_code",
+        scheduler_owner="agent_cli_loop",
+        execution_mode="interactive",
+        completion_args=("todo", "complete", "todo_abc123"),
+    )
+    identity = {
+        "schema_version": "quota_settlement_identity_v0",
+        "effect_id": "goal:agent:todo_abc123:mcp-turn",
+        "goal_id": "goal",
+        "agent_id": "agent",
+        "todo_id": "todo_abc123",
+        "turn_instance_id": "mcp-turn",
+    }
+    runtime_phases: list[str] = []
+
+    def fake_runtime(_method: str, params: dict[str, object]) -> dict[str, object]:
+        runtime_phases.append(str(params["phase"]))
+        if params["phase"] == "prepare":
+            return {
+                "schema_version": "loopx_host_todo_completion_reduction_v0",
+                "phase": "prepare",
+                "decision": "execute",
+                "identity": identity,
+                "provider_effect": {
+                    "provider_id": "loopx_cli",
+                    "kind": "ordered_cli_sequence",
+                    "steps": [
+                        {
+                            "step_kind": "guard",
+                            "args": ["guard"],
+                            "legacy_args": None,
+                            "continue_when": {
+                                "kind": "equals",
+                                "path": ["ok"],
+                                "value": True,
+                            },
+                        },
+                        {
+                            "step_kind": "lifecycle_completion",
+                            "args": ["complete"],
+                            "legacy_args": None,
+                            "continue_when": {
+                                "kind": "equals",
+                                "path": ["ok"],
+                                "value": True,
+                            },
+                        },
+                        {
+                            "step_kind": "durable_writeback",
+                            "args": ["writeback"],
+                            "legacy_args": None,
+                            "continue_when": {
+                                "kind": "equals",
+                                "path": ["ok"],
+                                "value": True,
+                            },
+                        },
+                        {
+                            "step_kind": "quota_spend",
+                            "args": ["spend"],
+                            "legacy_args": None,
+                            "continue_when": None,
+                        },
+                    ],
+                },
+                "result": None,
+            }
+        assert params["phase"] == "finalize"
+        outcomes = params["provider_outcomes"]
+        assert isinstance(outcomes, list)
+        assert [item["step_kind"] for item in outcomes] == [
+            "guard",
+            "lifecycle_completion",
+        ]
+        return {
+            "schema_version": "loopx_host_todo_completion_reduction_v0",
+            "phase": "finalize",
+            "decision": "provider_result",
+            "identity": identity,
+            "provider_effect": None,
+            "result": json.loads(str(outcomes[-1]["output"])),
+        }
+
+    provider_calls: list[list[str]] = []
+
+    def fake_provider(args: list[str], *, legacy_args: list[str] | None = None) -> str:
+        del legacy_args
+        provider_calls.append(args)
+        return '{"ok": true}' if args == ["guard"] else '{"ok": false}'
+
+    monkeypatch.setattr(host_adapter_settlement, "effect_runtime_result", fake_runtime)
+
+    result = json.loads(settle_host_todo_completion(request, run_cli=fake_provider))
+
+    assert result == {"ok": False}
+    assert runtime_phases == ["prepare", "finalize"]
+    assert provider_calls == [["guard"], ["complete"]]
+
+
+def test_typescript_provider_plan_short_circuits_typed_completion_rejection() -> None:
+    request = HostTodoSettlementRequest(
+        goal_id="goal",
+        agent_id="agent",
+        todo_id="todo_abc123",
+        runtime_profile="claude_code",
+        legacy_host_surface="claude_code",
+        scheduler_owner="agent_cli_loop",
+        execution_mode="interactive",
+        completion_args=("todo", "complete", "todo_abc123"),
+    )
+    provider_calls: list[list[str]] = []
+    rejection = {
+        "ok": False,
+        "completed": False,
+        "status": "open",
+        "reason": "validation failed",
+    }
+
+    def provider(args: list[str], *, legacy_args: list[str] | None = None) -> str:
+        del legacy_args
+        provider_calls.append(args)
+        if args[:2] == ["quota", "should-run"]:
+            return json.dumps(
+                {
+                    "ok": True,
+                    "selected_todo": {"todo_id": request.todo_id.upper()},
+                }
+            )
+        return json.dumps(rejection)
+
+    result = json.loads(settle_host_todo_completion(request, run_cli=provider))
+
+    assert result == rejection
+    assert len(provider_calls) == 2
+    assert provider_calls[0][:2] == ["quota", "should-run"]
+    assert provider_calls[1][:2] == ["todo", "complete"]
 
 
 def _write_fixture(tmp_path: Path) -> tuple[Path, Path]:
@@ -46,11 +199,15 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path]:
                 "goals": [
                     {
                         "id": GOAL_ID,
+                        "creation_operation_id": f"goal-create:{GOAL_ID}",
                         "domain": "harness_self_improvement",
                         "status": "active",
                         "repo": str(project),
                         "state_file": state_file.name,
-                        "adapter": {"kind": "harness_self_improvement"},
+                        "adapter": {
+                            "kind": "harness_self_improvement",
+                            "status": "connected-read-only",
+                        },
                         "quota": {
                             "compute": 1.0,
                             "window_hours": 24,
@@ -59,6 +216,11 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path]:
                         "coordination": {
                             "agent_model": "peer_v1",
                             "registered_agents": [AGENT_ID],
+                            "storage_target": {
+                                "schema_version": "loopx_new_goal_storage_target_v1",
+                                "provider": "file",
+                                "handoff_mode": "soft_claim",
+                            },
                         },
                     }
                 ],
@@ -66,6 +228,14 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path]:
         ),
         encoding="utf-8",
     )
+    goal = json.loads(registry.read_text(encoding="utf-8"))["goals"][0]
+    initialized = initialize_goal_storage_target(
+        tmp_path / "runtime",
+        goal,
+        registry_path=registry,
+    )
+    assert initialized["authority_initialized"] is True
+    assert initialized["legacy_fallback_used"] is False
     return registry, state_file
 
 
@@ -116,6 +286,7 @@ def test_real_mcp_settlement_rejects_missing_writeback_then_commits_same_identit
         text="Deliver the bounded fixture change.",
         task_class="advancement_task",
         claimed_by=AGENT_ID,
+        continuation_policy="same_agent_non_delivery",
     )
     todo_id = str(added["todo_id"])
     request = HostTodoSettlementRequest(
@@ -134,6 +305,8 @@ def test_real_mcp_settlement_rejects_missing_writeback_then_commits_same_identit
         registry,
         "quota",
         "should-run",
+        "--context-delivery",
+        "off",
         "--goal-id",
         GOAL_ID,
         "--agent-id",
@@ -163,7 +336,7 @@ def test_real_mcp_settlement_rejects_missing_writeback_then_commits_same_identit
         "--slots",
         "1",
         "--source",
-        "heartbeat",
+        "visible-goal",
         "--execute",
     )
     assert premature_rc == 1
@@ -190,11 +363,14 @@ def test_real_mcp_settlement_rejects_missing_writeback_then_commits_same_identit
     assert settlement["lifecycle_completion"]["ok"] is True
     assert settlement["quota_spend"]["ok"] is True
     assert settlement["quota_spend"]["appended"] is True
+    assert settlement["quota_spend"]["source"] == "visible-goal"
 
     status_rc, status = _run_cli(
         registry,
         "quota",
         "should-run",
+        "--context-delivery",
+        "off",
         "--goal-id",
         GOAL_ID,
         "--agent-id",
@@ -232,6 +408,8 @@ def test_real_mcp_settlement_rejects_missing_writeback_then_commits_same_identit
         registry,
         "quota",
         "should-run",
+        "--context-delivery",
+        "off",
         "--goal-id",
         GOAL_ID,
         "--agent-id",
@@ -292,6 +470,8 @@ def test_real_mcp_terminal_completion_closes_out_after_spend(
         registry,
         "quota",
         "should-run",
+        "--context-delivery",
+        "off",
         "--goal-id",
         GOAL_ID,
         "--agent-id",
@@ -310,3 +490,97 @@ def test_real_mcp_terminal_completion_closes_out_after_spend(
     )
     assert completed["status"] == "done"
     assert "no_followup=true" in state_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("lost_after", ["lifecycle", "writeback", "spend"])
+def test_real_mcp_completion_recovers_a_lost_mutation_response(
+    tmp_path: Path,
+    lost_after: str,
+) -> None:
+    """The real write commits, but its caller sees a failure: retry must not pay twice."""
+    registry, _ = _write_fixture(tmp_path)
+    added = add_goal_todo(
+        registry_path=registry, goal_id=GOAL_ID, role="agent",
+        text="Validate response-loss recovery.", task_class="advancement_task",
+        claimed_by=AGENT_ID,
+    )
+    control = _control(registry)
+    original = control.run_cli
+    injected = False
+    bound_identity = None
+
+    def lose_once(args, **kwargs):
+        nonlocal injected, bound_identity
+        output = original(args, **kwargs)
+        step = {"lifecycle": ["todo", "complete"], "writeback": ["refresh-state"],
+                "spend": ["quota", "spend-slot"]}[lost_after]
+        if not injected and args[:len(step)] == step and json.loads(output).get("ok"):
+            injected = True
+            bound_identity = json.loads(output)["settlement_identity"]
+            return json.dumps({"ok": False, "error": "synthetic_response_lost_after_commit"})
+        return output
+
+    control.run_cli = lose_once
+    first = json.loads(control.complete_task(
+        added["todo_id"], AGENT_ID, "recovery fixture check passed", no_follow_up=True,
+    ))
+    assert injected and first["ok"] is False
+    from loopx.control_plane.quota.settlement import read_heartbeat_settlement
+    readback = read_heartbeat_settlement(
+        tmp_path / "runtime", goal_id=GOAL_ID, agent_id=AGENT_ID,
+        todo_id=added["todo_id"], turn_instance_id=bound_identity["turn_instance_id"],
+    )
+    assert readback.replay_phase == ("settled" if lost_after == "spend" else "settlement_pending")
+    if lost_after != "spend":
+        rc, terminal = _run_cli(
+            registry, "todo", "complete", "--goal-id", GOAL_ID,
+            "--todo-id", added["todo_id"], "--agent-id", AGENT_ID,
+            "--turn-instance-id", bound_identity["turn_instance_id"],
+            "--no-follow-up", "--evidence", "synthetic terminal intent",
+        )
+        assert rc != 0 and terminal["settlement_blocked_completion"] is True
+    replay = json.loads(control.complete_task(
+        added["todo_id"], AGENT_ID, "recovery fixture check passed", no_follow_up=True,
+    ))
+    assert replay["ok"] is True
+    again = json.loads(control.complete_task(
+        added["todo_id"], AGENT_ID, "recovery fixture check passed", no_follow_up=True,
+    ))
+    assert again["ok"] is True
+    assert again["settlement_identity"] == replay["settlement_identity"]
+    assert again["settlement"]["quota_spend"]["appended"] is False
+    status = json.loads(control.should_run())
+    assert status["quota"]["spent_slots"] == 1
+
+
+def test_real_mcp_links_existing_successor_without_creating_another_todo(
+    tmp_path: Path,
+) -> None:
+    registry, state_file = _write_fixture(tmp_path)
+    ids = [str(add_goal_todo(
+        registry_path=registry, goal_id=GOAL_ID, role="agent", text=text,
+        task_class="advancement_task",
+        claimed_by=AGENT_ID,
+    )["todo_id"]) for text in ("First accepted step.", "Already planned follow-up.")]
+    control = _control(registry)
+    before = state_file.read_bytes()
+    rejected = json.loads(control.complete_task(
+        ids[0], AGENT_ID, "synthetic check passed", successor_todo_ids=[ids[1]], no_follow_up=True,
+    ))
+    assert rejected["ok"] is False
+    assert state_file.read_bytes() == before
+    first = json.loads(control.complete_task(
+        ids[0], AGENT_ID, "synthetic check passed", successor_todo_ids=[ids[1]],
+    ))
+    assert first["ok"] is True, first
+    replay = json.loads(control.complete_task(
+        ids[0], AGENT_ID, "synthetic check passed", successor_todo_ids=[ids[1]],
+    ))
+    assert replay["ok"] is True
+    assert replay["settlement_identity"] == first["settlement_identity"]
+    todos = parse_active_state_todos(state_file.read_text())["agent_todos"]["items"]
+    by_id = {row["todo_id"]: row for row in todos}
+    assert set(by_id) == set(ids)
+    assert by_id[ids[0]]["status"] == "done" and by_id[ids[1]]["status"] == "open"
+    assert by_id[ids[0]]["successor_todo_ids"] == [ids[1]]
+    assert json.loads(control.should_run())["quota"]["spent_slots"] == 1

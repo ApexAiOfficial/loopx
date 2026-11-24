@@ -26,6 +26,33 @@ const fixture = JSON.parse(
   }>;
 };
 
+test("settled replay preserves observed cadence without deciding a future schedule", () => {
+  for (const observed of [null, "FREQ=MINUTELY;INTERVAL=3", "FREQ=MINUTELY;INTERVAL=60"]) {
+    const request = { schema_version: SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+      operation: "settled_replay", observed_host_rrule: observed };
+    const before = structuredClone(request);
+    const result = evaluateSchedulerStateTransition(request);
+    assert.equal(result.operation, "settled_replay");
+    const hint = result.hint as Record<string, unknown>;
+    assert.equal(hint.action, "preserve_current_schedule");
+    assert.equal(hint.next_trigger, "fresh_turn_identity");
+    assert.equal(hint.reset_policy, undefined);
+    const host = hint.app_automation as Record<string, unknown>;
+    assert.equal(host.observed_host_rrule, observed);
+    assert.equal(host.host_action, "none");
+    assert.equal(host.ack_required, false);
+    for (const field of ["recommended_rrule", "recommended_interval_minutes", "stateful_backoff",
+                        "ack_hint", "failure_hint", "fallback_hint"]) {
+      assert.equal(host[field], undefined, field);
+    }
+    assert.deepEqual(request, before);
+  }
+  assert.throws(() => evaluateSchedulerStateTransition({
+    schema_version: SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+    operation: "settled_replay", observed_host_rrule: 3,
+  }), /observed_host_rrule must be a string/);
+});
+
 test("pinned Python scheduler transition characterization remains exact", () => {
   assert.equal(
     fixture.schema_version,
@@ -85,6 +112,107 @@ test("transition decisions do not mutate caller input", () => {
   const before = structuredClone(request);
   evaluateSchedulerStateTransition(request);
   assert.deepEqual(request, before);
+});
+
+test("monitor schedule materializes cadence and preserves explicit due time", () => {
+  const cadence = evaluateSchedulerStateTransition({
+    schema_version: SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+    operation: "monitor_schedule",
+    generated_at: "2026-08-25T10:00:00+08:00",
+    cadence: "30 minutes",
+    explicit_next_due_at: null,
+  });
+  assert.deepEqual(cadence, {
+    schema_version: SCHEDULER_STATE_TRANSITION_RESULT_SCHEMA,
+    operation: "monitor_schedule",
+    next_due_at: "2026-08-25T02:30:00Z",
+    schedule_source: "cadence",
+    cadence_seconds: 1800,
+  });
+
+  const explicit = evaluateSchedulerStateTransition({
+    schema_version: SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+    operation: "monitor_schedule",
+    generated_at: "ignored-for-explicit-schedule",
+    cadence: "1h",
+    explicit_next_due_at: "2026-08-26T09:00:00+08:00",
+  });
+  assert.equal(explicit.next_due_at, "2026-08-26T09:00:00+08:00");
+  assert.equal(explicit.schedule_source, "explicit");
+  assert.equal(explicit.cadence_seconds, 3600);
+
+  const lowercaseDue = evaluateSchedulerStateTransition({
+    schema_version: SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+    operation: "monitor_schedule",
+    generated_at: "2026-08-25T10:00:00Z",
+    explicit_next_due_at: "2026-12-04t01:15:00z",
+  });
+  assert.equal(lowercaseDue.next_due_at, "2026-12-04t01:15:00z");
+  assert.equal(lowercaseDue.schedule_source, "explicit");
+  const lowercaseGenerated = evaluateSchedulerStateTransition({
+    schema_version: SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+    operation: "monitor_schedule",
+    generated_at: "2026-08-25t10:00:00z",
+    cadence: "30 minutes",
+  });
+  assert.equal(lowercaseGenerated.next_due_at, "2026-08-25T10:30:00Z");
+
+  const missing = evaluateSchedulerStateTransition({
+    schema_version: SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+    operation: "monitor_schedule",
+    generated_at: "2026-08-25T10:00:00+08:00",
+    cadence: "not-a-cadence",
+  });
+  assert.equal(missing.next_due_at, null);
+  assert.equal(missing.schedule_source, "none");
+});
+
+test("monitor schedule rejects malformed timestamps without wall-clock fallback", () => {
+  assert.throws(
+    () => evaluateSchedulerStateTransition({
+      schema_version: SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+      operation: "monitor_schedule",
+      generated_at: "not-a-timestamp",
+      cadence: "30m",
+    }),
+    /generated_at must be an ISO timestamp/,
+  );
+  assert.throws(
+    () => evaluateSchedulerStateTransition({
+      schema_version: SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+      operation: "monitor_schedule",
+      generated_at: "2026-08-25T10:00:00Z",
+      explicit_next_due_at: "not-a-timestamp",
+    }),
+    /explicit_next_due_at must be an ISO timestamp/,
+  );
+});
+
+test("monitor schedule rejects illegal calendar timestamps without wall-clock fallback", () => {
+  for (const generatedAt of ["2026-02-29T00:00:00Z", "2026-02-31T00:00:00Z", "2026-11-31T10:04:00Z", "2026-02-31t00:00:00z"]) {
+    assert.throws(
+      () => evaluateSchedulerStateTransition({
+        schema_version: SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+        operation: "monitor_schedule",
+        generated_at: generatedAt,
+        cadence: "30 minutes",
+      }),
+      /generated_at must be an ISO timestamp/,
+      generatedAt,
+    );
+  }
+  for (const explicitNextDueAt of ["2026-02-31T12:00:00Z", "2026-11-31T10:04:00Z", "2026-11-31t10:04:00z"]) {
+    assert.throws(
+      () => evaluateSchedulerStateTransition({
+        schema_version: SCHEDULER_STATE_TRANSITION_REQUEST_SCHEMA,
+        operation: "monitor_schedule",
+        generated_at: "2026-08-25T10:00:00Z",
+        explicit_next_due_at: explicitNextDueAt,
+      }),
+      /explicit_next_due_at must be an ISO timestamp/,
+      explicitNextDueAt,
+    );
+  }
 });
 
 function backoffRequest(extra: Record<string, unknown> = {}) {
@@ -147,6 +275,132 @@ test("coarse backoff transition owns cadence, retention, and host decision", () 
     (failedPair.recorded_host_failure as Record<string, unknown>).failure_count,
     1,
   );
+});
+
+test("backoff rejects illegal calendar clocks instead of rolling them", () => {
+  const schedulerState = {
+    progression_index: 1,
+    last_applied_rrule: "FREQ=MINUTELY;INTERVAL=30",
+    reset_token: "reset-token",
+    identity_signature: "identity-signature",
+    updated_at: "2026-01-01T12:00:00Z",
+  };
+  const held = evaluateSchedulerStateTransition(backoffRequest({
+    scheduler_state: schedulerState,
+    current_time: "2026-01-01T12:10:00Z",
+  }));
+  assert.equal(held.cadence_transition, "hold_until_interval");
+
+  // Jan 32 is not a Date.parse instant on this runtime; Feb 31 and Nov 31 are
+  // rolled forward. Neither clock may count as an elapsed backoff interval.
+  for (const currentTime of [
+    "2026-01-32T12:10:00Z",
+    "2026-02-31T12:10:00Z",
+    "2026-11-31T12:10:00Z",
+  ]) {
+    assert.throws(
+      () => evaluateSchedulerStateTransition(backoffRequest({
+        scheduler_state: schedulerState,
+        current_time: currentTime,
+      })),
+      /current_time must be an ISO timestamp/,
+      currentTime,
+    );
+  }
+  for (const updatedAt of ["2026-01-32T12:00:00Z", "2026-02-31T12:00:00Z"]) {
+    assert.throws(
+      () => evaluateSchedulerStateTransition(backoffRequest({
+        scheduler_state: { ...schedulerState, updated_at: updatedAt },
+        current_time: "2026-01-01T12:10:00Z",
+      })),
+      /updated_at must be an ISO timestamp/,
+      updatedAt,
+    );
+  }
+});
+
+test("backoff identity reset does not read an obsolete illegal updated_at", () => {
+  const obsolete = {
+    progression_index: 1,
+    last_applied_rrule: "FREQ=MINUTELY;INTERVAL=30",
+    reset_token: "old-reset-token",
+    identity_signature: "old-identity",
+    updated_at: "2026-02-31T12:00:00Z",
+  };
+  const reset = evaluateSchedulerStateTransition(backoffRequest({
+    scheduler_state: obsolete,
+    reset_token: "new-reset-token",
+    identity_signature: "new-identity",
+    current_time: "2026-01-01T12:10:00Z",
+  }));
+  assert.equal(reset.state_status, "reset_required");
+  assert.equal(reset.cadence_transition, "identity_reset");
+  assert.equal(reset.current_index, 0);
+  assert.equal(reset.current_interval_minutes, 15);
+  assert.equal(reset.current_rrule, "FREQ=MINUTELY;INTERVAL=15");
+  assert.equal(reset.host_transition, "apply_required");
+
+  const legalClock = evaluateSchedulerStateTransition(backoffRequest({
+    scheduler_state: { ...obsolete, updated_at: "2026-01-01T12:00:00Z" },
+    reset_token: "new-reset-token",
+    identity_signature: "new-identity",
+    current_time: "2026-01-01T12:10:00Z",
+  }));
+  assert.equal(legalClock.cadence_transition, "identity_reset");
+  assert.equal(legalClock.current_interval_minutes, 15);
+  assert.equal(legalClock.host_transition, "apply_required");
+
+  const retry = evaluateSchedulerStateTransition(backoffRequest({
+    scheduler_state: {
+      progression_index: 0,
+      last_applied_rrule: "FREQ=MINUTELY;INTERVAL=60",
+      reset_token: "reset-token",
+      identity_signature: "identity-signature",
+      updated_at: "2026-11-31T12:00:00Z",
+      host_update_failures: [{
+        schema_version: "scheduler_host_update_failure_v0",
+        target_rrule: "FREQ=MINUTELY;INTERVAL=15",
+        observed_host_rrule: "FREQ=MINUTELY;INTERVAL=60",
+        failure_kind: "timeout",
+        failure_count: 1,
+        failed_at: "2026-01-01T11:30:00Z",
+      }],
+    },
+    observed_host_rrule: "RRULE:FREQ=MINUTELY;INTERVAL=60",
+  }));
+  assert.equal(retry.cadence_transition, "retry_unacknowledged_failure");
+
+  const heldInitial = evaluateSchedulerStateTransition(backoffRequest({
+    scheduler_state: {
+      progression_index: 1,
+      last_applied_rrule: "FREQ=MINUTELY;INTERVAL=30",
+      reset_token: "reset-token",
+      identity_signature: "identity-signature",
+      updated_at: "2026-01-32T12:00:00Z",
+    },
+    advance_same_identity: false,
+  }));
+  assert.equal(heldInitial.cadence_transition, "hold_active_initial");
+  assert.equal(heldInitial.current_index, 0);
+});
+
+test("backoff still treats a missing or blank updated_at as an elapsed interval", () => {
+  const schedulerState = {
+    progression_index: 1,
+    last_applied_rrule: "FREQ=MINUTELY;INTERVAL=30",
+    reset_token: "reset-token",
+    identity_signature: "identity-signature",
+  };
+  for (const updatedAt of [undefined, "", "   "]) {
+    const state = updatedAt === undefined
+      ? schedulerState
+      : { ...schedulerState, updated_at: updatedAt };
+    const advanced = evaluateSchedulerStateTransition(backoffRequest({
+      scheduler_state: state,
+      current_time: "2026-01-01T12:10:00Z",
+    }));
+    assert.equal(advanced.cadence_transition, "advance_after_interval");
+  }
 });
 
 test("coarse backoff boundary rejects malformed state facts", () => {

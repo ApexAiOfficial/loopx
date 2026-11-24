@@ -4,6 +4,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from ...feedback import validate_public_safe_text
+from ...control_plane.effect_runtime import EffectRuntimeRejected, effect_runtime_result
 
 
 CHANGE_QUALITY_RESULT_SCHEMA_VERSION = "change_quality_agent_result_v2"
@@ -104,14 +105,28 @@ def _bounded_text(value: Any, *, field: str, limit: int) -> str:
     return text
 
 
+def _exact_text(value: Any, *, field: str, limit: int) -> str:
+    """Keep the caller's value byte for byte; only reject what cannot be a path.
+
+    Evidence names a file the scope just enumerated, so trimming or collapsing
+    whitespace here would turn ``" padded.py"`` into a different, unrecordable
+    name.
+    """
+
+    text = str(value or "")
+    validate_public_safe_text(field, text)
+    if len(text) > limit:
+        raise ValueError(f"{field} exceeds {limit} characters")
+    return text
+
+
 def _relative_path(value: Any, *, field: str) -> str | None:
-    text = str(value or "").strip().replace("\\", "/")
+    text = _exact_text(value, field=field, limit=1000)
     if not text:
         return None
     path = PurePosixPath(text)
     if path.is_absolute() or ".." in path.parts:
         raise ValueError(f"{field} must be a repo-relative path")
-    validate_public_safe_text(field, text)
     return path.as_posix()
 
 
@@ -137,7 +152,7 @@ def _bounded_text_list(
 
 
 def _normalize_evidence_ref(value: Any, *, field: str) -> str:
-    text = _bounded_text(value, field=field, limit=400)
+    text = _exact_text(value, field=field, limit=400)
     kind, separator, target = text.partition(":")
     if not separator or kind not in EVIDENCE_REF_KINDS:
         raise ValueError(
@@ -154,15 +169,13 @@ def _normalize_evidence_ref(value: Any, *, field: str) -> str:
 
 
 def _normalize_evidence_refs(value: Any, *, field: str) -> list[str]:
-    refs = [
-        _normalize_evidence_ref(item, field=f"{field}[]")
-        for item in _bounded_text_list(
-            value,
-            field=field,
-            item_limit=400,
-            count_limit=20,
-        )
-    ]
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be an array")
+    if len(value) > 20:
+        raise ValueError(f"{field} supports at most 20 items")
+    refs = [_normalize_evidence_ref(item, field=f"{field}[]") for item in value]
     if len(set(refs)) != len(refs):
         raise ValueError(f"{field} must not contain duplicates")
     return refs
@@ -268,7 +281,46 @@ def _normalize_validation(value: Any, *, index: int) -> dict[str, Any]:
         evidence["reason"] = reason
     if status in {"failed", "skipped"} and not reason:
         raise ValueError(f"{field} with status={status} requires reason")
+    if "covers_paths" in value:
+        covers = value["covers_paths"]
+        if not isinstance(covers, list):
+            raise ValueError(f"{field}.covers_paths must be an array")
+        if len(covers) > 200:
+            raise ValueError(f"{field}.covers_paths supports at most 200 items")
+        evidence["covers_paths"] = [
+            _relative_path(item, field=f"{field}.covers_paths[]") for item in covers
+        ]
+    if "failure_attribution" in value:
+        _validate_attribution_public_safety(value["failure_attribution"], field=field)
+        evidence["failure_attribution"] = value["failure_attribution"]
     return evidence
+
+
+def _validate_attribution_public_safety(value: Any, *, field: str) -> None:
+    # IO/privacy codec only. Shape, freshness and qualification belong to TS.
+    if isinstance(value, str):
+        validate_public_safe_text(field, value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _validate_attribution_public_safety(item, field=f"{field}.{key}")
+    elif isinstance(value, list):
+        for item in value:
+            _validate_attribution_public_safety(item, field=field)
+
+
+def _qualify_validation(
+    validation: list[dict[str, Any]], scope: dict[str, Any] | None,
+) -> dict[str, Any]:
+    try:
+        result = effect_runtime_result(
+            "capabilities.change_quality.validation_gate",
+            {"validation": validation, "scope": scope},
+        )
+    except EffectRuntimeRejected as error:
+        raise ValueError(str(error)) from error
+    if not isinstance(result, dict):
+        raise TypeError("typed change-quality validation result mismatch")
+    return result
 
 
 def _validate_evidence_targets(
@@ -349,6 +401,7 @@ def normalize_change_quality_result(
     safe_fix_allowed: bool,
     expected_changed_files: list[str] | None = None,
     expected_instruction_refs: list[str] | None = None,
+    expected_scope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("result JSON root must be an object")
@@ -388,6 +441,8 @@ def normalize_change_quality_result(
     )
     risks = _normalize_risks(value.get("risks"))
     validation = _normalize_validations(value.get("validation"))
+    if any("failure_attribution" in item for item in validation):
+        validation = _qualify_validation(validation, expected_scope)["validation"]
     changed_files = set(expected_changed_files or [])
     instruction_refs = set(expected_instruction_refs or [])
     validator_ids = {item["validator"] for item in validation}
@@ -428,9 +483,12 @@ def normalize_change_quality_result(
     }
 
 
-def derive_change_quality_guardrails(result: dict[str, Any]) -> dict[str, Any]:
+def derive_change_quality_guardrails(
+    result: dict[str, Any], *, expected_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     risks = result["risks"]
     validation = result["validation"]
+    qualification = _qualify_validation(validation, expected_scope)
     states: list[dict[str, Any]] = []
     blocking_codes: list[str] = []
     for guardrail_id in SIMPLIFY_GUARDRAIL_LENS_IDS:
@@ -441,19 +499,10 @@ def derive_change_quality_guardrails(result: dict[str, Any]) -> dict[str, Any]:
             if item["severity"] == "blocker" and item["resolved"] is not True
         ]
         validation_blockers: list[str] = []
-        optional_skips: list[str] = []
+        validation_risks: list[str] = []
         if guardrail_id == "test_validation":
-            validation_blockers = [
-                f"validator:{item['validator']}"
-                for item in validation
-                if item["status"] == "failed"
-                or (item["status"] == "skipped" and item["required"])
-            ]
-            optional_skips = [
-                f"validator:{item['validator']}"
-                for item in validation
-                if item["status"] == "skipped" and not item["required"]
-            ]
+            validation_blockers = qualification["blocking_codes"]
+            validation_risks = qualification["risk_codes"]
         current_blockers = [*unresolved_blockers, *validation_blockers]
         blocking_codes.extend(current_blockers)
         unresolved_risks = [
@@ -461,7 +510,7 @@ def derive_change_quality_guardrails(result: dict[str, Any]) -> dict[str, Any]:
         ]
         if current_blockers:
             status = "blocked"
-        elif unresolved_risks or optional_skips:
+        elif unresolved_risks or validation_risks:
             status = "risk"
         elif category_risks:
             status = "resolved"
@@ -486,8 +535,8 @@ def derive_change_quality_guardrails(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def change_quality_result_decision(
-    result: dict[str, Any],
+    result: dict[str, Any], *, expected_scope: dict[str, Any] | None = None,
 ) -> tuple[str, list[str]]:
-    guardrails = derive_change_quality_guardrails(result)
+    guardrails = derive_change_quality_guardrails(result, expected_scope=expected_scope)
     unresolved = list(guardrails["blocking_codes"])
     return ("fail", unresolved) if unresolved else ("pass", [])

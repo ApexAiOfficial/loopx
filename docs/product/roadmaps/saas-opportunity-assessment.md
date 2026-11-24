@@ -144,8 +144,7 @@ the protocol.
 
 Third, LoopX's architectural position is an upper-layer combination of the
 first two patterns: Letta-like durable state plus Mastra-like managed
-operations, generalized across heterogeneous runtimes. The differentiated
-product is not a larger framework. It is the semantic control plane that keeps
+operations, generalized across heterogeneous runtimes. It is the semantic control plane that keeps
 goal, authority, planning, supervision, evidence, recovery, and handoff
 coherent across agents and runs. The comparison validates the monetization
 shape; LoopX still has to validate repeat demand for this distinct layer.
@@ -378,8 +377,7 @@ bounded work. It provides authoritative, conflict-aware state; Supervisor
 scheduling; stalled-loop detection; recovery, handoff, and governed replan;
 and cross-runtime identity, claim, quota, evidence, and acceptance continuity.
 
-The Supervisor is not a hidden autonomous manager. Hosting does not grant it
-human authority. BYOC and managed private deployment are the lower-risk first
+The Supervisor is not a hidden autonomous manager. BYOC and managed private deployment are the lower-risk first
 forms; full multi-tenant hosting follows only after isolation, deletion,
 backup, support, and on-call economics are proven.
 
@@ -548,6 +546,73 @@ evidence:
 The evidence is strong enough to justify design-partner work and a measured
 commercial thesis. It is not strong enough to skip LoopX's own recurrence,
 outcome, willingness-to-pay, and unit-economics gates.
+
+## Open/Closed Commercial Synergy & Plan B Open-Core Boundary
+
+To eliminate tension between open-source protocol adoption and durable SaaS
+monetization, LoopX aligns commercial expansion with the four-state Global
+Commander horizon ([evaluations/horizon.md](../releases/evaluations/horizon.md))
+and the repository license boundary ([licensing.md](../../project/licensing.md))
+along one explicit **Plan B Open-Core split**:
+
+- **Public repository (`loopx-project/loopx`, Apache-2.0)**: owns all semantic
+  state contracts, single-host local stores (`File` / `SQLite`), host/model
+  adapters, verification gates, the `openPostgresqlStore` SPI, and the wire-neutral
+  outbound `RemoteAuthority` client (staged cleanly by PR `#9223` without keeping
+  half-hosted server daemons inside the OSS checkout).
+- **Private commercial repository (`loopx-project/loopx-cloud`)**: owns the
+  multi-tenant PostgreSQL RLS authority service, hosted `RemoteAuthority`
+  server, org governance, metered billing, and hosted worker fleets.
+
+### Four Permanent Apache-2.0 Open-Source Baselines
+
+1. **Single-Host Durable Control-Plane Kernel**: File/SQLite `AuthorityStore`,
+   `EffectTurn`, conditional CAS, hard lease & generation fencing, and lossless
+   `authority-archive` export/import so user history is never hostage state.
+2. **Runtime, Model & Sandbox Neutrality (`L1-L4` Connectors)**: CLI/ACP adapters
+   across supported coding hosts, `dsh-loopx-plugin`, and isolated local worktree
+   sandboxes.
+3. **Open Cross-Host & Verification Protocols (`open_protocol_core`)**:
+   `StorageConfig` + `openPostgresqlStore` SPI, wire-neutral outbound
+   `RemoteAuthority` schemas, Steward handoff/lease contracts, `tau_B` +
+   Stop-Hook benchmark isolation, `loopx pr-review`, `canary`, and the `a+b`
+   release evaluation gate.
+4. **Local Workbench & Community Domain Pack Contracts**: local CLI, Desktop,
+   LooChat web surfaces, and `domain_pack_contract_v0` human-gate templates.
+
+### Six Closed-Source Cloud / BYOC Enterprise Moats
+
+1. **Managed Multi-Tenant PostgreSQL & Hosted `RemoteAuthority` Server**:
+   connection pooling, tenant RLS isolation, high-availability WAL/PITR failover,
+   and cross-region durable state replication.
+2. **Enterprise Identity, Org Governance & Compliance Plane**: SSO/SCIM, org
+   RBAC, centralized secret/key brokering, and tamper-evident SOC2/audit
+   retention.
+3. **Elastic Cross-Host Agent Fleet & Cohort Scheduler**: hosted 10-to-100+
+   worker cohorts, cross-team budget fencing, fair queueing, and anti-loop fleet
+   scheduling (`4.5` / `4.6` enterprise operational layer).
+4. **Enterprise Benchmark Replay Cluster & Regression Intelligence**: confidential
+   repo replay vaults, fleet telemetry aggregation, and organization-wide
+   Kendall `tau_b` release/regression dashboards.
+5. **Managed Omnichannel Gateway & Enterprise Connector Hub**: multi-workspace
+   hosted Lark/Slack/webhook bridges and private VPC network relays.
+6. **Usage Metering, Billing, SLA & Curated Enterprise Packs**: team seat and
+   control-plane usage billing, contracted SLAs, and compliance-certified domain
+   packs.
+
+### Three-Tier Monetization Flywheel & Generational Coupling
+
+| Delivery Shape | Control Plane Host | Code & Execution Locality | Core Revenue & Adoption Engine |
+|---|---|---|---|
+| **Tier 1 — Team Cloud** | Hosted `loopx-cloud` SaaS | Managed cloud workspaces + GitHub/Lark bots | Zero-ops team onboarding; seat + metered control-plane usage |
+| **Tier 2 — Hybrid BYOC** | Hosted control plane or outbound `RemoteAuthority` | Customer VPC via SPI & outbound client | Compliance/IP sensitivity without losing cloud governance & telemetry |
+| **Tier 3 — Enterprise Harness + Bounded FDE** | Dedicated `loopx-cloud` cluster | Customer private network & internal CI | Time-boxed Forward-Deployed Engineering feeding generic fixes back to OSS while licensing curated packs & annual platform SLA |
+
+Every generic state machine or wire improvement discovered in Tiers 2-3 flows
+back into Apache-2.0 `open_protocol_core` lines (`1.5`, `4.5`, `4.6`, `7.3`,
+`8.4` in [horizon.md](../releases/evaluations/horizon.md)), driving bottom-up OSS
+adoption in `2.x -> 3.0` while expanding recurring Cloud/BYOC expansion ARR
+without customer lock-in.
 
 ## Relation To Existing Docs
 

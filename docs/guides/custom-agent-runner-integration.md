@@ -74,8 +74,7 @@ loopx agent-onboard \
 
 The packet returns the current doctor/install command, bootstrap command pack,
 quota guard, and recheck command. Declare only capabilities the current host
-actually has. `--available-capability` reports observed execution ability; it
-does not grant permission or satisfy a user gate.
+actually has. `--available-capability` reports observed execution ability.
 
 For `other-agent`, doctor intentionally does not inspect `~/.codex/skills`.
 CLI health and workflow delivery are separate checks. The custom host must
@@ -94,7 +93,7 @@ skill does not activate it; the current goal policy controls activation.
 If the host has no skill system, inject the equivalent `SKILL.md` instructions
 and keep one short re-entry instruction that tells the Agent to:
 
-1. read a fresh JSON quota packet for the current goal and Agent;
+1. read a fresh JSON Complete Turn for the current goal and Agent;
 2. follow `interaction_contract`, `goal_boundary`, and the selected todo;
 3. perform one bounded action and validate the real postcondition;
 4. write the result through LoopX; and
@@ -105,11 +104,13 @@ todo list, cadence, or project policy.
 
 ## Run One Self-Driven Tick
 
-Use JSON for the machine path:
+The current JSON entry point defaults to Complete Turn v1. The published
+`v2.4.0` tag delivers the historical quota packet. Read the current work
+instructions from `interaction_contract` in either version.
 
 ```bash
 loopx --format json \
-  --registry "$HOME/.codex/loopx/registry.global.json" \
+  --registry "$HOME/.loopx/registry.global.json" \
   quota should-run \
   --goal-id <goal-id> \
   --agent-id <agent-id> \
@@ -128,7 +129,7 @@ Then follow this loop:
    boundary, compact evidence references, and writeback contract. Let it
    dynamically plan the bounded action.
 5. **Validate:** Read the real repository, test, CI, service, or Provider
-   result. The Agent's completion claim is not proof.
+   result.
 6. **Write back:** Complete, update, block, defer, or add a successor todo;
    record compact evidence; then run `refresh-state`.
 7. **Account:** Spend quota only after validated durable writeback. A failed
@@ -145,6 +146,39 @@ stale receipt.
 
 Every new wake starts again at step 1. Do not resume from remembered model
 state or a cached packet.
+
+### Save Original CLI Results
+
+If your runner needs a local copy, capture the CLI result when it executes.
+Do not ask the model to reconstruct a returned JSON object in a heredoc: that
+duplicates generated text and can change the receipt. Saving a copy is optional
+and does not count as validated work or settlement.
+
+For the full guard decision, use the existing capture option with an explicit
+Turn identity and a new directory for **each invocation**:
+
+```bash
+loopx --format json --registry "$HOME/.loopx/registry.global.json" \
+  quota should-run --goal-id <goal-id> --agent-id <agent-id> \
+  --turn-instance-id <turn-id> --decision-output-dir ./guard-001 && \
+cat ./guard-001/decision.json
+```
+
+The parent directory must exist; LoopX creates the private capture directory.
+Check command success, `ok`, and Goal/Agent/Turn identity before consuming the
+saved decision. Current JSON guards deliver `loopx_turn_envelope_v1` by default.
+Read all required hooks, admission and settlement instructions in that decision.
+Selection or lease revalidation still needs a fresh guard and a new directory.
+After a late capture failure, inspect the existing Turn receipt before retrying.
+See the [capture contract](../reference/protocols/turn-envelope-v0.md).
+
+For other CLI results, the runner can save stdout directly to a new private file
+while retaining stderr and the original exit status. Do not let a pipe or the
+subsequent file read hide failure, and do not rerun a mutation just to obtain a
+copy of its output. In particular, spend exactly once as instructed by the
+current settlement contract. Keep raw results out of public artifacts; preserve
+host lifecycle receipts separately. This recipe does not automatically enable
+capture in existing workers or establish a model-efficiency improvement.
 
 ## Choose The Right Execution Boundary
 
@@ -173,6 +207,23 @@ validator is independent, retry/resume/replay cannot duplicate effects, and
 the outer runner applies and acknowledges scheduler state correctly. Those are
 useful extension and contribution surfaces for making Turn more mature; an
 Agent process exit code or scraped transcript is not a substitute for them.
+
+### Watch a running Turn
+
+In a second terminal, inspect the same Turn while `run-once` is active:
+
+```bash
+loopx --registry <registry.json> --runtime-root <runtime-root> turn inspect-journal \
+  --goal-id <goal-id> --agent-id <agent-id> --turn-key <sha256-turn-key> \
+  --watch --watch-interval 1 --format json
+```
+
+Watch mode emits one newline-delimited JSON progress event whenever the journal
+status or completed phase list changes. The event contains only Turn identity,
+journal status, completed phases, and an empty effects list; it never includes
+host output or session content. It stops at `committed`, `stopped`, or `failed`.
+The command is read-only; use Ctrl-C to stop watching early. Start it after the
+Turn journal exists, and use the same registry and runtime root as the runner.
 
 ## Acceptance Checklist
 

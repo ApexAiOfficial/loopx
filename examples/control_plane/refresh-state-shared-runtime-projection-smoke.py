@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -19,12 +20,14 @@ from loopx.control_plane.runtime.shared_runtime_refresh_projection import (  # n
     build_shared_runtime_projection,
     write_shared_runtime_projection,
 )
-from loopx.control_plane.runtime import runtime_projection_route as route_module  # noqa: E402
 from loopx.control_plane.runtime.runtime_projection_route import (  # noqa: E402
     compact_runtime_projection_route,
     resolve_runtime_projection_route,
 )
 from loopx import doctor as doctor_module  # noqa: E402
+from loopx import paths as paths_module  # noqa: E402
+from loopx.paths import global_registry_path  # noqa: E402
+from loopx.control_plane.testing.canary_harness import import_fixture_authority  # noqa: E402
 from loopx.presentation.renderers.status_markdown import (  # noqa: E402
     render_status_markdown,
 )
@@ -46,6 +49,7 @@ def run_cli(*args: str, cwd: Path, shared_runtime: Path) -> dict:
             **os.environ,
             "PYTHONPATH": str(REPO_ROOT),
             "LOOPX_RUNTIME_ROOT": str(shared_runtime),
+            "LOOPX_CONTEXT_DELIVERY": "off",
         },
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -65,6 +69,7 @@ def run_cli_failure(*args: str, cwd: Path, shared_runtime: Path) -> dict:
             **os.environ,
             "PYTHONPATH": str(REPO_ROOT),
             "LOOPX_RUNTIME_ROOT": str(shared_runtime),
+            "LOOPX_CONTEXT_DELIVERY": "off",
         },
     )
     assert result.returncode != 0, result.stdout + result.stderr
@@ -134,6 +139,8 @@ def write_fixture(root: Path) -> tuple[Path, Path, Path, Path]:
         + "\n",
         encoding="utf-8",
     )
+    import_fixture_authority(source_registry, GOAL_ID)
+    import_fixture_authority(shared_registry, GOAL_ID)
     return project, project_runtime, source_registry, shared_registry
 
 
@@ -173,6 +180,7 @@ def write_route_source(
         + "\n",
         encoding="utf-8",
     )
+    import_fixture_authority(registry, goal_id)
     return registry, goal_id
 
 
@@ -307,6 +315,18 @@ def main() -> None:
             no_sync_unqualified["error"]
         ), no_sync_unqualified
 
+        no_sync_guard = run_cli(
+            "--registry",
+            str(source_registry),
+            "quota",
+            "should-run",
+            "--goal-id",
+            GOAL_ID,
+            "--agent-id",
+            AGENT_ID,
+            cwd=project,
+            shared_runtime=shared_runtime,
+        )
         no_change_vision = Path(tmp) / "no-change-vision.json"
         no_change_vision.write_text(
             json.dumps(
@@ -332,6 +352,9 @@ def main() -> None:
                         "retained": ["Keep the shared-runtime projection boundary."],
                         "evidence_refs": ["evidence:shared-runtime-projection-verified"],
                     },
+                    "stride_decision": no_sync_guard["replan_action_packet"][
+                        "stride_control"
+                    ]["minimal_example"],
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -387,8 +410,10 @@ def main() -> None:
             shared_runtime=shared_runtime,
         )
         route_diagnostics = status["runtime_projection_routes"]
-        assert route_diagnostics == {"healthy": True}, route_diagnostics
+        assert route_diagnostics["healthy"] is True, route_diagnostics
+        assert route_diagnostics["goal_count"] == 1, route_diagnostics
         assert "runtime_projection_routes: healthy=True" in render_status_markdown(status)
+        assert "goals=1" in render_status_markdown(status), render_status_markdown(status)
 
         source_index = project_runtime / "goals" / GOAL_ID / "runs" / "index.jsonl"
         source_rows = [
@@ -420,16 +445,20 @@ def main() -> None:
             shared_runtime=shared_runtime,
         )
         lagging_routes = lagging_status["runtime_projection_routes"]
-        assert lagging_routes == {"healthy": False}, lagging_routes
+        assert lagging_routes["healthy"] is False, lagging_routes
+        assert lagging_routes["goal_count"] == 1, lagging_routes
         lagging_markdown = render_status_markdown(lagging_status)
         assert "runtime_projection_routes: healthy=False" in lagging_markdown
         assert "details=loopx doctor" in lagging_markdown
-        default_runtime_root = doctor_module.DEFAULT_RUNTIME_ROOT
-        doctor_module.DEFAULT_RUNTIME_ROOT = shared_runtime
+        default_runtime_root = paths_module.DEFAULT_RUNTIME_ROOT
+        legacy_runtime_root = paths_module.LEGACY_RUNTIME_ROOT
+        paths_module.DEFAULT_RUNTIME_ROOT = shared_runtime
+        paths_module.LEGACY_RUNTIME_ROOT = Path(tmp) / "isolated-legacy-runtime"
         try:
             doctor = doctor_module.collect_doctor()
         finally:
-            doctor_module.DEFAULT_RUNTIME_ROOT = default_runtime_root
+            paths_module.DEFAULT_RUNTIME_ROOT = default_runtime_root
+            paths_module.LEGACY_RUNTIME_ROOT = legacy_runtime_root
         doctor_routes = doctor["runtime_projection_routes"]
         assert doctor_routes["healthy"] is False, doctor_routes
         assert doctor_routes["counts"]["lagging"] == 1, doctor_routes
@@ -437,6 +466,26 @@ def main() -> None:
             item.get("goal_id") == GOAL_ID and item.get("status") == "lagging"
             for item in doctor_routes["items"]
         ), doctor_routes
+        # Same selected routes yield the same health even through different registries.
+        assert doctor_routes["healthy"] is lagging_routes["healthy"]
+        assert doctor_routes["goal_count"] == lagging_routes["goal_count"] == 1
+        assert doctor_routes["registry"] == str(global_registry_path(shared_runtime).resolve())
+        assert lagging_status["registry"] == str(source_registry)
+        assert doctor_routes["registry"] != lagging_status["registry"]
+        doctor_markdown = doctor_module.render_doctor_markdown(doctor)
+        assert f"registry=`{doctor_routes['registry']}`" in doctor_markdown
+        assert f"registry: `{source_registry}`" in lagging_markdown
+        assert f"goal_filter: `{GOAL_ID}`" in lagging_markdown
+        assert "global details=loopx doctor" in lagging_markdown
+
+        # A healthy unrelated registry can have the same count as the lagging one.
+        other_project, other_runtime, other_registry, other_global = write_fixture(Path(tmp) / "other")
+        other_status = run_cli("--registry", str(other_registry), "status", "--goal-id", GOAL_ID,
+                               cwd=other_project, shared_runtime=other_global.parent)
+        assert other_status["runtime_projection_routes"]["goal_count"] == doctor_routes["goal_count"]
+        assert other_status["runtime_projection_routes"]["healthy"] is True
+        assert other_status["registry"] != doctor_routes["registry"]
+        assert f"registry: `{other_registry}`" in render_status_markdown(other_status)
 
         single_runtime = Path(tmp) / "single-runtime"
         single_registry, single_goal = write_route_source(
@@ -501,16 +550,14 @@ def main() -> None:
             source_registry=standalone_registry,
             goal_id="unrelated-goal",
         )
-        original_default_runtime = route_module.DEFAULT_RUNTIME_ROOT
-        route_module.DEFAULT_RUNTIME_ROOT = unrelated_runtime
-        try:
+        with patch.object(paths_module, "DEFAULT_RUNTIME_ROOT", unrelated_runtime), patch.object(
+            paths_module, "LEGACY_RUNTIME_ROOT", Path(tmp) / "unused-legacy-runtime"
+        ):
             standalone_route = resolve_runtime_projection_route(
                 registry_path=standalone_registry,
                 goal_id=standalone_goal,
                 source_runtime_root=standalone_runtime,
             )
-        finally:
-            route_module.DEFAULT_RUNTIME_ROOT = original_default_runtime
         assert standalone_route["status"] == "single_runtime", standalone_route
         assert standalone_route["declaration_source"] == "source_runtime_fallback"
 
@@ -618,6 +665,15 @@ def main() -> None:
         audit = quota["interaction_contract"]["agent_channel"][
             "vision_continuation_audit"
         ]
+        if "projection_ref" in audit:
+            # Complete decisions retain the full audit once in the same capture.
+            assert quota["schema_version"] == "loopx_turn_envelope_v1"
+            assert audit["projection_ref"] == "$.vision_continuation_audit"
+            owner = quota["vision_continuation_audit"]
+            assert "projection_ref" not in owner
+            assert audit["required"] == owner["required"]
+            assert audit["decision"] == owner["decision"]
+            audit = owner
         assert audit["acceptance_gaps"][0]["acceptance_summary"] == VISION_ACCEPTANCE
 
     print("refresh-state shared-runtime projection smoke passed")

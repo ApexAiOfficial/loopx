@@ -1,0 +1,1244 @@
+# RFC: Shared Goal Alignment and Governed Amendment Protocol (v0)
+
+- Status: Accepted
+- Supersedes / closes: none
+- Tracking issue: [#3836](https://github.com/huangruiteng/loopx/issues/3836)
+- Date: 2026-09-02
+- Last updated: 2026-10-13
+- Scope: peer Agents collaborating around one shared Goal while preserving
+  canonical intent, per-Agent execution frontiers, claim/lease ownership, and
+  auditable replan/amendment decisions
+- Related contracts:
+  [Goal Vision and Replan](../../reference/protocols/goal-vision-replan-contract-v0.md),
+  [Shared Control-Plane Authority and Pluggable State Providers](./shared-goal-authority-state-provider-v0.md),
+  and [Decision Context](../../reference/protocols/decision-context-architecture-v0.md)
+- Language note: the
+  [Chinese version](./shared-goal-alignment-and-governed-amendment-v0.zh-CN.md)
+  and this English version are semantic mirrors. A difference between them is
+  a defect.
+
+---
+
+## 1. Summary and decision
+
+The explicit local profile in §9.3 implements immutable root intent, fixed-template
+commit, original-operation recovery and peer/replan readback. Generic runtime
+and automatic adoption remain separate; this does not close all Stages 3–5.
+
+Existing Stage 1/2 read and admission path: alignment and amendment admission
+share one full Todo/lease source snapshot. Before promotion this remains a
+legacy read; afterwards canonical empty state and provider failures never fall
+back to Markdown or per-Todo lease files. Typed selection excludes non-open,
+archived and unsatisfied-wait work; Agent eligibility also honors exclusions,
+while amendment impact may include peer-held or executor-excluded open work.
+The source digest binds the canonical provider revision in `source_basis.todo_basis`.
+With a state event log, `revision_basis=state_event_log` still names only that
+event axis. Without one, promoted reads use `canonical_todo_snapshot` with
+event sequence 0 and an unbound Agent frontier. A changed canonical digest
+requires `needs_rebase` even at sequence 0. Legacy Markdown now also binds the
+parsed Todo/lease facts used by the typed reader, ordered by stable Todo id and
+excluding compatibility prose and observation time. A peer claim therefore changes the basis even when
+`updated_at` does not change. Previously this path omitted those facts and
+admitted any digest at sequence 0; a new submission with a different observed
+digest now requires `needs_rebase`. Re-read alignment and submit revised content
+under a new proposal id; an exact replay still returns the original historical
+admission unchanged, not a fresh current-basis decision. Pending proposals made
+by the older producer may therefore need a fresh basis after upgrade.
+This does not version the full Goal
+intent envelope, infer Agent acknowledgement, or turn admission into an approval
+or CAS commit; Stage 3 must still revalidate its own exact commit-time basis.
+
+LoopX will distinguish four kinds of state that must not collapse into one
+mutable plan:
+
+1. a **canonical shared Goal intent envelope**;
+2. a **shared eligible work graph**;
+3. one **per-Agent frontier** for each registered peer; and
+4. **proposal and receipt records** for governed shared amendments.
+
+An Agent may correct its own frontier while remaining inside canonical intent.
+It may propose a shared amendment when evidence invalidates shared assumptions.
+The proposal does not change the Goal, block unrelated work, or grant the
+proposer unilateral commit authority. A shared amendment becomes effective
+only after LoopX's `GoalAmendmentAuthority` validates it against the pre-authorized
+policy and exact base revision, commits it with compare-and-set (CAS), and
+produces a durable receipt. Every Agent then rebinds its frontier to the new
+canonical revision.
+
+The normal path is automated. It does not require every peer to vote or a human
+to approve routine Goal evolution. `peer_v1` describes equal execution rank,
+not universal authority to escape the root user intent or acquire new
+permissions. Goal creation freezes a `root_intent` and an amendment-policy
+envelope. Inside that envelope, policy checks and, for higher-risk classes, an
+independent verifier Agent authorize automatic commit. Outside it, the old Goal
+remains effective and the proposal is rejected or structurally blocked; human
+escalation occurs only when the Goal explicitly configured it.
+
+```text
+canonical shared Goal intent envelope
+  (objective, non-goals, acceptance, permissions, stop conditions, revision)
+                 |
+                 v
+shared eligible work graph
+                 |
+        +--------+--------+
+        |                 |
+        v                 v
+per-Agent frontier A   per-Agent frontier B
+        |                 |
+claim + lease/fence    claim + lease/fence
+        |                 |
+bounded evidence       bounded evidence
+        +--------+--------+
+                 |
+       lane replan or amendment proposal
+                 |
+     automated policy + optional verifier
+                 |
+       base-revision CAS commit
+                 |
+ committed shared amendment + receipt
+                 |
+       every frontier rebases or gates
+```
+
+- Checkpoint moved to the execution ledger: [Verified delivery and manager integration checkpoint (2026-09-13)](ledger/shared-goal-alignment-and-governed-amendment-v0/2026-09-13-verified-delivery-and-manager-integration.md).
+- Checkpoint moved to the execution ledger: [Owner-authorized acceptance checkpoint](ledger/shared-goal-alignment-and-governed-amendment-v0/2026-09-17-owner-authorized-acceptance.md).
+
+## 2. Problem and current boundary
+
+LoopX already coordinates execution usefully:
+
+- registered peer identities and Agent-scoped Todo lanes;
+- visible/selectable unclaimed Todos with claim-before-work guidance;
+- soft claims plus hard lease/fence ownership;
+- per-Agent vision and checkpoint state;
+- typed autonomous-replan obligations and settlement;
+- action-scoped cross-owner Todo lifecycle grants; and
+- provider-neutral coordination CAS and receipt foundations.
+
+[#3693](https://github.com/huangruiteng/loopx/pull/3693) is a positive bounded
+fix in this layer. It prevents shared `Next Action` prose from shadowing an
+exact settlement-bound or current-Agent Todo. It does not define shared Goal
+alignment or shared semantic amendment authority.
+
+The missing seam appears when multiple Agents independently discover that the
+shared plan or acceptance boundary is wrong. Per-Agent vision can remain
+internally consistent while the combined work no longer proves the original
+Goal. Conversely, letting every Agent rewrite shared prose turns the latest
+writer into accidental authority.
+
+No type system can prove that arbitrary natural-language changes preserve the
+user's intent. LoopX can instead make silent reinterpretation impossible: an
+amendment must name what is retained, changed, and stopped; cite evidence; bind
+the exact base revision and digest; pass an explicit authority policy; and
+leave a recoverable receipt.
+
+## 3. State partition and invariants
+
+### 3.1 Canonical intent envelope
+
+`shared_goal_intent_v0` contains:
+
+- `goal_id`, `goal_revision`, and `intent_digest`;
+- objective and non-goals;
+- acceptance conditions;
+- permission/write scope;
+- stop and terminal conditions; and
+- the root intent that Agents cannot amend;
+- the authority policy that governs each amendment class; and
+- the configured disposition for out-of-policy proposals (`reject`, `block`,
+  or explicit `human_escalation`).
+
+This is semantic authority, not a status projection. `Next Action`, Agent
+vision, chat messages, scheduler hints, and provider heads cannot overwrite it.
+
+### 3.2 Shared work graph
+
+The shared work graph contains Todos, dependencies, eligibility, blocking
+gates, and lifecycle state. It describes candidate work, not who may currently
+execute it. Work-graph edits must remain traceable to the canonical intent
+revision they are intended to advance.
+
+### 3.3 Per-Agent frontier
+
+Each registered Agent receives a bounded `shared_goal_alignment_v0` projection:
+
+- canonical Goal revision/digest;
+- that Agent's frontier and `based_on_goal_revision`;
+- its claims and lease/fence facts;
+- eligible unclaimed work;
+- open lane replan or shared amendment obligations; and
+- conflicts or stale-basis facts.
+
+An Agent may replan its own route without a shared amendment when the change
+stays within current objective, non-goals, acceptance, permissions, and stop
+conditions and does not mutate another Agent's claimed work.
+
+### 3.4 Proposals and receipts
+
+Proposals are advisory, durable inputs. Receipts prove canonical transitions.
+Neither is a substitute for the other. A pending or approved proposal has no
+effect until a successful commit receipt names the new Goal revision.
+
+### 3.5 Host-session locators and advisory context
+
+A task deep link can make entry into this protocol precise without becoming a
+fifth kind of shared state. For Codex, `codex://threads/<thread-id>` identifies
+a local chat. LoopX may resolve that locator through the current project
+registry and bind the source session to an existing Agent and Goal identity.
+The returned provider-neutral `host-session:codex:<thread-id>` scope can then
+select that session in an explicitly enabled Decision Context provider.
+
+This is an optional, transient **advisory context input**. It remains outside
+`shared_goal_intent_v0`, `goal_amendment_proposal_v0`,
+`goal_amendment_receipt_v0`, and the provider CAS head. It helps peers:
+
+- identify the exact task in which a gap or evidence pointer was discovered;
+- recall a bounded set of source-task messages while reviewing current facts;
+- route an amendment proposal to an independent verifier or affected peer; and
+- return to the relevant task after commit for receipt readback and frontier
+  reconciliation.
+
+```text
+host task deep link -> project-local binding -> normalized host-session scope
+        | explicitly configured, read-only ContextProvider
+        v
+local-private transient recall -> verify against current authority sources
+        | explicit promotion to durable typed evidence
+        | base Goal revision + intent digest
+        v
+governed amendment proposal -> authority decision -> canonical receipt
+```
+
+The ordering is normative. A deep link is not an `evidence_ref`, a recalled
+message is not an amendment decision, and the extension lifecycle revision is
+not `base_goal_revision`, `authority_revision`, `provider_generation`, or
+`lease_epoch`. Any session-derived conclusion needed by the amendment must
+first be checked against current authority and promoted to the existing Todo
+evidence, Agent evidence log, or registered material owner. The proposal then
+cites those durable typed references and independently binds the current Goal
+revision and intent digest.
+
+The locator also grants no read access, permission, claim, lease, lifecycle
+authority, verifier independence, or amendment commit authority. If the link is
+unresolvable, inaccessible, or its extension is disabled or unavailable, only
+the optional context-enrichment step fails open; the canonical Goal and
+unrelated work remain valid. Decision Context records the provider degradation
+and continues from available authority sources. Receipt recovery uses `operation_id`
+and `readReceipt`, so losing a host session cannot make a committed amendment
+unrecoverable. A cross-Goal rendezvous may help two peers coordinate, but each
+Goal still requires its own proposal, policy decision, CAS commit, and receipt.
+
+Core parses host-specific deep-link syntax exactly once and exposes only the
+normalized scope to providers. The optional `loopx-obelisk` extension maps that
+scope to Obelisk's public read-only query interface. It does not read Obelisk's
+storage schema, build or attune the index, or open, resume, or message a live
+task. Other harnesses can implement the same Decision Context provider protocol
+without adding host syntax or transcript storage to the Goal authority.
+
+### 3.6 Peer agent directory and bounded observation
+
+A per-Agent frontier tells one Agent about its own route. Peers also need the
+same three abilities about each other, and the steward needs them about every
+Agent it is asked about: discover which Agents exist and which are running,
+observe one of them within bounds, and hand one of them a bounded request. That
+reusable contract is
+[`peer_agent_directory_v0`](../../reference/protocols/peer-agent-directory-and-observation-v0.md).
+
+It adds no sixth kind of shared state. Identity, work, claims, leases and the
+canonical revision stay exactly where this document already put them; the
+contract contributes an Agent-facing *view* plus the rules for reading and
+delivering. Three of those rules carry the weight here:
+
+- **Presence is advisory and provider-scoped.** A live session never creates an
+  identity, and an Agent with no live session is still registered, still owns
+  its claims and is still a delivery target. A provider reports its own
+  locations with session-scoped handles and its own liveness vocabulary; a
+  reader that cannot classify a target reports `unknown` and names the coverage
+  gap rather than inferring completion or absence of progress.
+- **Observation and delivery grant nothing.** Reading a peer, or handing it
+  context, is not a claim, a lease, a priority, a plan change or an amendment.
+  Delivery stays `context_handoff`; what the Goal asks for still changes only
+  through `GoalAmendmentAuthority`, and work state still changes only through
+  the canonical Todo, quota and lane owners.
+- **Terminal-space providers are providers, not the contract.** A host surface
+  that owns terminals may supply presence and bounded live output, and must
+  declare how a caller proves it is inside the space, what survives a detach or
+  restart, and what it cannot recover. With no such provider the directory
+  degenerates to registered identity plus durable work state, which is the
+  normal case for a prompt-only transport.
+
+Three rules generalize the same contract beyond one provider and beyond the
+steward, and they are what make it reusable instead of host-specific:
+
+- **One space, three layers, two audiences.** The space is this Goal's execution
+  space, and a host surface is a transport inside it. The contract is reachable
+  as typed state and governed commands, as the in-space skill a running Agent
+  loads, and as a provider surface that supplies presence only; a layer may
+  narrow authority, never widen it. The steward (manager channel) and a peer
+  Agent (`peer_v1`) are two callers of the one contract, scoped by the channel's
+  Goal binding and by the Goal's registered Agents respectively, so a caller
+  resolves itself from the binding it arrived on and its targets from the
+  directory.
+- **Bounded waits pin identity and require forward movement.** A wait, or the
+  readback that a delivery produced a turn, pins the resolved Agent, work
+  identity and provider location, so a replacement occupant of the same location
+  cannot satisfy it, and it requires that the observed state moved after the
+  request began, so a stale re-read proves nothing. This is the binding shape
+  this document already requires of a governed write's settlement.
+- **An attention rollup is typed, and assigns nothing.** A "who needs a decision
+  now" view may order and annotate rows from typed state. It creates no claim, no
+  lease and no priority, and it is not an input to automatic assignment.
+
+### 3.7 Current work and Goal requirements
+
+Separate the work an Agent currently focuses on from the requirements the whole
+Goal must still satisfy. A feedback view may organize existing facts as `work`,
+`obligations`, `reflection`, and `continuation`. These are conceptual projection
+sections, not a new persisted schema or a model-writable source of authority:
+
+| Section | Meaning and existing owner |
+| --- | --- |
+| `work` | Selected Todo/frontier, its local acceptance, and exact source detail. |
+| `obligations` | Goal acceptance criteria and retained commitments, independent of the selected Todo and current Agent. |
+| `reflection` | Evidence-based interpretation and unresolved questions; advisory until an owning validator accepts evidence. |
+| `continuation` | Next eligible work, wait/stop reasons and their scope; reuse frontier and settlement owners. |
+
+The intended requirement contract must retain stable IDs, source criterion IDs,
+Goal revision/digest, status and evidence bindings. Every declared structured
+criterion must have explicit coverage; changing focus cannot delete or rewrite a
+registered requirement. This is coverage of the declared contract, not proof that
+arbitrary natural-language intent was completely extracted. Reuse the existing
+`acceptance_contract.ts` and `acceptance_authority.ts` owners; lane replan
+obligations retain their different lifecycle and must not become a second Goal
+acceptance ledger.
+
+Commitments remain stable within a revision. An authorized amendment may
+supersede them with retained history and explicit lease/frontier consequences;
+do not make legitimate Goal changes impossible. Evidence may become stale after
+code, scope or contract changes, so satisfaction is not monotonic. A nonempty
+reference is only structural validity. Acceptance additionally needs resolvable
+evidence, relevant scope, freshness and the owning validation result; preserve
+failed and untested outcomes. Existing selected-work acceptance is not global
+Goal acceptance.
+
+The existing acceptance owner already verifies a versioned contract. A current,
+passing Todo-scoped verification projects `partial` unless an applicable work
+guard holds it; failed, stale and held results keep their distinct status.
+Full verification must cover every criterion in that contract. An accepted
+`selected_work` contract remains limited to its declared work; no acceptance
+write alone changes Goal lifecycle status.
+
+Global closeout must additionally reconcile coverage of the current declared
+mandatory Goal requirements, required work across Agents and amendments that
+can affect the conclusion. Preserve local acceptance and historical receipts
+while exposing a remaining global gap. Optional exploration branches need not
+all finish; recurring work follows its declared wait/termination contract, not
+permanent completion after one observation or an invented endless loop. One
+Agent's `no_followup` or an empty frontier cannot establish `achieved`. Recheck
+applicability at the owning protected action; this requires no new cross-owner
+transaction. A compact projection retains identity and a lossless detail route.
+
+**Delivery boundary:** the existing typed interaction owner generates full Goal
+source reads, enabled canonical acceptance inspection and exact current-Todo
+reads after admission. Ordinary product heartbeat and TurnEnvelope consume the
+same list; the envelope signs it rather than inventing another read policy.
+Goal documents recover intent and stops, while canonical acceptance and exact
+Todo readers retain their existing authority and scope. A selected-work
+acceptance document cannot replace whole-Goal intent. Shared host adapters
+preserve selected context. Default heartbeat generation → guard → source
+readback must be tested alongside envelope transport; one route cannot qualify
+the other. This does not
+implement the full requirement ledger, a global closeout gate, automatic proof
+of required-read execution, or model adherence. Those remain with R1/R4/R5 and
+S11; this RFC does not silently enable a new acceptance policy. The next complete
+slice should map existing structured criteria through a work switch and restart,
+reject dropped coverage, and invalidate stale evidence under the same owner.
+
+**Supporting-outcome checkpoint:** [default outcome refinement](goal-outcome-refinement-v0.md)
+now proposes cumulative requirements and evidence-backed Agent review inside the
+same acceptance owner, inline work context and existing frontier replan. This
+adds no default enable switch; the legacy switch still controls executable checks.
+Self-review cannot bypass configured checks or close a root Goal. Additive
+requirements, File/SQLite recovery and runnable-research parity form this slice;
+general supersession, global closeout, cross-Agent reassignment and S11 model/
+benchmark adoption remain open. This is a disclosed default guidance change,
+not qualification of the complete R4 contract.
+
+The [Goal contract evolution proposal](goal-contract-evolution-v0.md) composes
+operating-objective revision and supporting requirement evolution under these
+same owners. A source-bound change set retains original intent and version
+history, validates each effect's authority, publishes coupled changes atomically,
+and identifies affected peers without a unanimous barrier. Record storage and
+bounded decision context follow that semantic boundary. Current local template
+commit remains narrower; this proposal neither enables general supersession nor
+proves model use. Its E1–E9 and M1–M3 refine R4/R5's existing acceptance work.
+
+### 3.8 Invalid evidence and affected consumers
+
+Recovery and work switching must preserve the different observations defined
+in §3.7. `work_context.complete` currently means source adapters reported no
+failure; it can coexist with a full Goal document still in `required_reads`.
+An inline exact-Todo or acceptance body supplies that read's content, not proof
+that a model consumed it or that its criteria passed. A current continuation
+note, adoption receipt and journal `continue` each qualify their own boundary.
+None is a whole-Goal completion result or an independent execution grant.
+
+For the next new action after compaction, replacement or handoff, qualification
+must reconnect three existing sources: current Goal identity/intent, applicable
+acceptance criterion/revision, and the versions of explicitly consumed evidence.
+Preserve pending reads and unknowns. These reads need not be one cross-owner
+transaction; the owning action boundary must recheck their current applicability
+when a relevant revision changes. Do not add a recovery-context authority or
+infer dependencies from shared words. A Todo-facts fingerprint or file existence
+cannot establish the validity of all three sources.
+
+Original-operation recovery remains separate. Resolve its journal/effect under
+the existing identity and fences; never rewrite an old receipt with a new Goal
+basis to make it continue. Before new dependent work, obtain fresh admission and
+reassess any changed criterion or explicit source. A legal recovery transition
+does not by itself authorize that new work. Preserve unrelated valid results.
+Qualify a criterion change after context capture, a source becoming unavailable
+before dependent work, and an amendment arriving during restore: the original
+effect is reconciled once, stale assumptions do not authorize the next action,
+and stopped work is not revived by reading a snapshot. Full requirement coverage
+and real-model adoption remain the open §3.7/R4 acceptance, not completed by this
+clarification.
+
+The [Goal Direction Baseline](goal-direction-baseline-v0.md) M1 candidate can
+describe declared material drift from supplied inputs. It has no production
+receipt writer/consumer yet and neither authenticates those receipts nor supplies
+the shared Goal-intent revision or execution grant needed here. Preserve this
+observation boundary when composing future direction and acceptance consumers.
+
+This is a proposed qualification contract for existing acceptance and explicit
+result-use owners, not a new global error state, taint graph or automatic
+amendment policy. Historical completion and current eligibility to use evidence
+are separate facts. Preserve the original receipt, declared basis and outcome;
+re-evaluate current applicability rather than rewriting a completed Todo to
+make the history appear consistent.
+
+Source unavailability, changed version/scope and an owner-confirmed false claim
+have different meanings. An unreadable source establishes no current evidence;
+it does not establish that its content is false. A semantic refutation needs a
+current criterion and attributable counterevidence accepted by the owning
+validator or authorized review. Exact bytes and successful transport alone
+cannot resolve it. Optional assessment follows the
+[detection handoff contract](optional-semantic-assistance-jev-v0.md#detection-result-and-handoff-to-the-owning-rule).
+
+For an explicit relationship whose contract requires current evidence:
+
+1. Identify the source operation/artifact version, criterion and actual declared
+   consumer input. Keep the cause and affected scope readable. Do not infer
+   consumption from message delivery, shared keywords or all files in a workspace.
+2. Revalidate that basis before new acceptance, adoption or the owning protected
+   execution boundary. An unchanged consumer output passing its local validator
+   does not independently prove the validity of its declared source chain.
+   Bind the decision to the observed versions at the actual admission boundary;
+   an earlier UI read or cached success cannot authorize later use. Preserve
+   unrelated work; do not stop every Agent because one source is missing.
+3. Expose unavailable current use through the existing typed readback and guard.
+   Reads do not mutate history, clear leases, retract messages or spawn repair.
+   Do not reuse `goal_acceptance_stale` for arbitrary source failure: its current
+   owner means a changed acceptance/work binding.
+4. Recovery obtains current source evidence, restores the exact permitted basis
+   or validates a replacement through its existing owner, then checks consumer
+   eligibility again. Restored bytes prove version availability only. A confirmed
+   semantic failure additionally needs its relevant criterion revalidated; a
+   model saying “fixed”, a fresh ACK or a new evidence ID is insufficient.
+
+Sender context is a record of prior reasoning. When affected work resumes or is
+handed over, the existing context owner must carry the invalidated basis, the
+unresolved point, current evidence and the next required check. This qualifies
+new context delivery, not erasure of all previous sessions or proof that a model
+understood the correction. Already committed external effects retain their own
+reconciliation or explicitly authorized compensation contract.
+
+**Source implementation checkpoint at `3dd3c550afecfa0c525a34e8744a3cf06774ac94`:**
+the former direct-only gap is addressed by the existing
+[`delegation_result_use.ts`](../../../loopx/control_plane/collaboration/delegation_result_use.ts)
+owner and [`delegation_results.py`](../../../loopx/control_plane/collaboration/delegation_results.py)
+host observations. Read, start, adoption and settlement qualify explicit,
+requester-scoped ancestry. Historical accepted/done records remain unchanged.
+Collection has per-admission memoization, cycle detection and bounds of 64
+operations, depth 16 and a 15-second elapsed budget; the budget stops new checks,
+not an already running validator. Missing or unvisited evidence is unavailable.
+No success is cached across admissions, and this is not an atomic file snapshot.
+Admission and adoption consume the aggregate result; expiry after per-link checks
+also withdraws those links instead of preserving early success.
+
+[`test_delegation_result_use.py`](../../../tests/test_delegation_result_use.py)
+exercises synthetic worker tasks through the real local provider, independent
+validators and both File/SQLite stores:
+source → A → B withdraws current use when A's input changes, refuses downstream
+start/adoption, retains history and recovers after repair without redispatching
+accepted workers. Typed tests cover shared sources, cycles and exhausted bounds.
+The packaged team/evidence journey reads these results through production HTTP,
+withdraws the affected report, exposes its cause and rechecks after repair.
+CLI/MCP/Chat share the same owner; usage is in
+[local delegation](../../reference/local-delegation.md#repair-and-recheck).
+This is a locally validated candidate, not installed behavior or full Goal-wide
+reverse propagation, session correction, business rollback or cross-host HA.
+
+## 4. Authority matrix
+
+### 4.1 What `GoalAmendmentAuthority` means
+
+`GoalAmendmentAuthority` is not a person, a leader Agent, a model, or a storage
+service. It is LoopX's single typed write boundary for canonical Goal
+amendments. A concrete implementation is expected to separate:
+
+```text
+proposal + current Goal + policy + lease impact + optional verifier decision
+                                  |
+                                  v
+                 GoalAmendmentAuthority.decide()
+                       reject | needs_rebase | commit
+                                  |
+                                  v
+                  provider CAS + canonical receipt
+```
+
+The decision reducer enforces deterministic policy, identities, digests,
+revisions, and impact rules. An optional verifier Agent supplies a typed input
+for semantic questions, but cannot commit. The transaction executor persists an
+accepted decision through the provider-neutral store, but cannot widen it.
+Calling this boundary an authority means all canonical writers must pass
+through it; it does not mean that one privileged Agent decides for its peers.
+
+### 4.2 Amendment classes
+
+| Amendment class | Example | Proposal authority | Automated commit rule | Default effect while pending |
+| --- | --- | --- | --- | --- |
+| `lane_route` | reorder one Agent's unclaimed local steps | owning Agent | deterministic lane policy | none outside that lane |
+| `shared_work_graph` | add a Todo or dependency that preserves intent | registered Agent | policy validation plus impact check | unrelated work continues |
+| `shared_acceptance` | refine an acceptance condition or non-goal inside root intent | registered Agent | policy validation plus independent verifier Agent | affected acceptance path is gated |
+| `protected_authority` | acquire new permission or escape root intent | registered Agent | never auto-commit unless the immutable envelope already delegates the exact class | affected work fails closed |
+
+`GoalAmendmentAuthority` is the normal commit boundary. A verifier Agent returns a
+typed, evidence-bound decision; it does not become a durable leader and cannot
+edit the proposal it verifies. Proposer and verifier identities must differ for
+classes whose policy requires independence. Deterministic checks remain the
+first gate; model judgment cannot override permissions, scope, stop conditions,
+or a stale base.
+
+Being a scheduler, Supervisor, latest writer, lease holder, or provider
+operator does not grant semantic commit authority. Out-of-policy proposals are
+rejected or left structurally blocked while the old Goal continues. They ask a
+human only when `human_escalation` was explicitly enabled, rather than turning
+every Goal change into an approval queue.
+
+## 5. Amendment lifecycle: how a proposal becomes effective
+
+```text
+draft -> submitted -> admitted -> policy_check -> verified -> committing
+  |          |            |             |             |
+  +--------> rejected <----+-------------+-------------+
+                             stale/conflict -> needs_rebase
+
+committing --CAS success--> committed + receipt -> frontier reconciliation
+          \--unknown------> ambiguous -> readReceipt/reconcile
+          \--CAS conflict-> needs_rebase
+```
+
+The effective path is:
+
+1. **Propose.** Any authorized proposer submits
+   `goal_amendment_proposal_v0`, including the base revision/digest, amendment
+   class, retained/changed/stopped intent, evidence references, affected Todos,
+   and linked replan obligation. A request-derived proposal also binds the
+   immutable source request id and revision. An optional host-session rendezvous
+   may help discover or review the gap, but only promoted durable evidence enters
+   the proposal.
+2. **Admit.** LoopX validates schema, actor identity, bounded evidence pointers,
+   amendment class, and impact scope. A host locator cannot prove actor identity
+   or count as evidence. Admission does not approve or apply the proposal.
+3. **Policy decision and optional verification.** LoopX evaluates deterministic
+   invariants and the pre-authorized amendment envelope. A higher-risk but
+   in-envelope class may invoke an independent verifier Agent that returns a
+   typed decision bound to the exact proposal digest. The policy may reject or
+   request rebase. A verifier decision cannot be reused for edited content.
+4. **Impact decision.** Before commit, the authority decides how in-flight
+   claimed/leased Todos are handled: unaffected, allowed to finish under the
+   old revision, explicitly cancelled with a new fence epoch, or blocked by
+   policy. A semantic amendment cannot silently invalidate work already
+   authorized by a lease.
+5. **Commit.** The `GoalAmendmentAuthority` transaction submits the policy-authorized digest
+   with an `operation_id`, expected `base_goal_revision`, and
+   `base_intent_digest`, then revalidates policy and performs one CAS. For a
+   request-derived proposal, require the exact source reservation and terminal
+   operation protocol in §5.1; a remote liveness read followed by Goal CAS is
+   insufficient. Stale Goal bases and unreserved superseded source revisions
+   fail closed. Routine in-envelope amendments do not wait for a human.
+6. **Receipt.** The same transaction records the proposal digest, actor,
+   authority source, old/new revisions, retained/changed/stopped delta,
+   evidence references, affected Todos, lease disposition, and exact replan
+   obligation settlement.
+7. **Reconcile.** Projections rotate to the new revision. Every Agent either
+   rebinds its frontier, opens a lane replan, or is gated if its current work is
+   incompatible. Old-revision semantic writes are rejected.
+
+Only step 5 makes the amendment canonical. Step 6 makes that fact recoverable
+when a response is lost; step 7 makes it operational for all peers.
+
+### 5.1 Source-request reservation and cancellation ordering
+
+This is a proposed qualification requirement for request-derived Stage 3
+commits, not a shipped API or a new distributed transaction. Reuse the
+[collaboration request fence](capable-manager-semantic-handoff-v0.md#510-minimum-contract-and-legal-observations)
+and the qualified amendment owner's operation/receipt transaction. Keep request
+and Goal state under their separate owners.
+
+1. **Reserve at the request owner.** In one request transaction, validate the
+   live source revision and its authority, acquire its exclusive effectful
+   attempt fence, and persist a reservation binding request/revision,
+   attempt/fence epoch, target Goal and authority source, proposal digest,
+   expected Goal basis, actor and `operation_id`. The amendment owner must
+   authenticate this reservation; a caller-supplied token is not authority.
+   Reservation replay returns the same binding; changing any bound input
+   conflicts. Reservation and effective cancellation/supersession use the same
+   request-owner CAS over source revision, lifecycle and fence epoch; whichever
+   wins determines eligibility. Recording a later correction does not revoke
+   the already reserved operation or make its immutable source binding stale.
+2. **Order later control requests.** Once reserved, cancellation or correction
+   can be recorded immediately but cannot revoke that in-flight operation by
+   changing only the request store. Mark it pending settlement, prevent further
+   effects/reassignment, and ask the amendment owner to abort that exact
+   operation. The reservation covers only this immutable operation, never the
+   rest of a superseded request or a replacement proposal. Authorization and
+   policy checks at the actual effect owner still apply. Abort requires a
+   request-owner cancellation/recovery receipt bound to the reservation, reason
+   and operation; knowing an operation ID is insufficient authority.
+3. **Settle at the Goal owner.** An authenticated commit or abort competes for
+   one durable terminal operation record at `GoalAmendmentAuthority`. Commit
+   validates the reservation, current policy and expected Goal basis, then
+   atomically writes the Goal delta and `committed` receipt. Abort atomically
+   writes an `aborted` no-effect receipt only if that operation has not committed.
+   Both use the same operation identity and serialization boundary; abort is a
+   terminal tombstone, not a separate retry identity. A committed operation
+   cannot be undone by abort, and an aborted operation can never commit. Replays
+   read the original outcome; digest/binding drift conflicts. Definitive policy
+   or basis rejection also closes the operation without a Goal mutation. Validate
+   the authenticated binding inside this serialization boundary. A fresh
+   operation ID requires a new reservation and cannot bypass an old tombstone.
+   Terminal receipts discriminate `committed`, `aborted` and `rejected`, carry
+   the reservation/attempt reference, and state whether this operation changed
+   the Goal. No-effect receipts have no resulting Goal revision and say nothing
+   about other external effects in the broader request.
+4. **Recover before releasing.** Link the exact terminal Goal-owner receipt to
+   the immutable request attempt before releasing its fence or acknowledging
+   cancellation. This linking/settlement is a separate idempotent request-owner
+   transaction: settle the exact attempt, apply pending control changes for
+   remaining work, then release. It never rolls back a committed Goal delta.
+   A missing receipt, timeout or expired worker lease proves
+   nothing: read back or race a conditional abort against commit under the same
+   operation identity. If the owner is unavailable, retain pending/unknown and
+   allow unrelated work; do not reassign the effect. Retain the terminal record
+   until stale attempts are provably unable to submit, including after restart
+   or source migration. A delayed worker must hit that durable boundary, not
+   merely a token TTL. Reservations do not expire independently of settlement;
+   deadlines trigger recovery, not permission to forget an unresolved operation.
+   Unsupported profiles cannot commit request-derived
+   amendments; they may still admit proposals and continue independent work.
+
+Reservation CAS orders source eligibility; the Goal-owner terminal transaction
+orders the reserved commit versus abort. These are two explicit local decisions,
+not a claim that a source read and Goal write are atomic. The first Stage 3
+class remains `shared_work_graph`; this protocol adds no amendment permission.
+
+The combined manager A7/A16 fixture must exercise these interleavings through
+both owners, not two independent unit suites:
+
+| Interleaving | Required outcome |
+| --- | --- |
+| Cancellation/correction wins before reservation | No reservation and no Goal mutation from the obsolete proposal |
+| Reservation exists; cancellation's abort wins at Goal owner | One `aborted` receipt; delayed original commit rejected; cancellation can settle |
+| Reserved commit wins before abort | One `committed` receipt; cancellation reports the already committed effect and stops remaining work, without claiming rollback |
+| Crash after reservation/check but before a known Goal outcome | Fence remains; same-operation recovery/conditional abort yields exactly one terminal outcome, even if the old worker resumes |
+| Goal CAS succeeds but its response or request-side linkage is lost | Read back the original committed receipt, attach it to the old attempt, and never reapply the delta |
+| Lease expires or host restarts while outcome is unknown | No replacement effect on timeout alone; terminal abort blocks late commit, or the existing commit is reconciled |
+
+Frontend, Lark and CLI project the same distinction between cancellation
+requested, pending settlement and settled-with/without-an-already-committed
+effect. A timeout must not display “cancelled, no change.” Implementing PRs must
+qualify this path on the selected authority profile before enabling it.
+
+## 6. Proposed schemas
+
+Illustrative `goal_amendment_proposal_v0`:
+
+```json
+{
+  "schema_version": "goal_amendment_proposal_v0",
+  "proposal_id": "gap_...",
+  "goal_id": "goal-1",
+  "proposer_agent_id": "agent-a",
+  "amendment_class": "shared_acceptance",
+  "base_goal_revision": 17,
+  "base_intent_digest": "sha256:...",
+  "retained": ["original outcome remains unchanged"],
+  "changed": ["acceptance now requires the recovered receipt"],
+  "stopped": [],
+  "evidence_refs": ["evidence:..."],
+  "affected_todo_ids": ["todo-a", "todo-b"],
+  "replan_obligation_id": "replan:...",
+  "source_request_ref": {"request_id": "req_...", "revision": 1}
+}
+```
+
+Illustrative `goal_amendment_receipt_v0` adds:
+
+```json
+{
+  "schema_version": "goal_amendment_receipt_v0",
+  "operation_id": "op_...",
+  "proposal_id": "gap_...",
+  "proposal_digest": "sha256:...",
+  "decision": "committed",
+  "authority_actor_id": "goal-amendment-authority",
+  "authority_source": "goal_amendment_policy_v0",
+  "verifier_decision_digest": "sha256:...",
+  "previous_goal_revision": 17,
+  "new_goal_revision": 18,
+  "new_intent_digest": "sha256:...",
+  "lease_dispositions": [],
+  "settled_replan_obligation_id": "replan:..."
+}
+```
+
+The read-only `shared_goal_alignment_v0` projection must identify pending,
+approved, conflicting, and committed proposals without treating any pre-commit
+state as canonical intent.
+
+## 7. Concurrency, recovery, and multi-Agent behavior
+
+Multiple proposals from one base may coexist. Policy/verifier decisions and
+commit are bound to the exact proposal digest. Canonical commit is serialized by Goal revision:
+after one proposal commits, another proposal from the old base becomes
+`needs_rebase`; it is never silently merged or applied last-writer-wins.
+
+Independent lane work continues while a proposal is pending unless a typed
+impact gate names that Todo or acceptance path. An Agent may claim eligible
+unclaimed work only through the existing atomic claim and, when configured,
+lease/fence acquisition. Proposal authorship does not reserve a Todo, and Todo
+claim ownership does not authorize a Goal amendment.
+
+If provider commit succeeds but the response is lost, the caller does not
+blindly retry with a new operation identity. It calls `readReceipt` using the
+same `operation_id`. A found receipt proves the canonical revision. An absent
+receipt plus a changed head requires reconciliation; ambiguity is not treated
+as failure. Provider-specific file, NoKV, or PostgreSQL behavior remains behind
+the provider-neutral authority store contract.
+
+## 8. Replan integration
+
+Replan classifies a discovered gap before choosing a writer:
+
+- a failed check or invalid evidence within unchanged intent first follows its
+  existing task/acceptance/result-use repair or revalidation path; reading the
+  failure grants no new authority and need not amend the shared work graph;
+- a route correction wholly inside canonical intent opens or settles an
+  Agent-scoped replan obligation;
+- a cross-lane dependency/work-graph gap opens a shared amendment obligation;
+- evidence that changes acceptance, non-goals, or the operational objective
+  inside the root-intent envelope opens an automatically governed amendment
+  obligation; and
+- a change outside delegated permissions or root intent is rejected or remains
+  structurally blocked under the configured escalation disposition.
+
+Each obligation has a stable id. Proposal ACK alone does not settle it.
+Settlement requires either a committed receipt for that exact obligation, a
+rejected/no-change decision with a structured rationale accepted by policy, or
+a superseding obligation that explicitly preserves the causal chain.
+
+For an evidence-caused obligation, retain the source/version and affected
+criterion through repair and recheck. Settling a replan records an accepted
+route decision; it does not itself clear the failed business criterion or an
+unknown effect. Their owners require their own current recovery evidence.
+
+After commit, an Agent whose `based_on_goal_revision` is stale may observe but
+cannot make controlled semantic writes until it rebases or receives an explicit
+grandfathered-work disposition. This connects shared change to existing
+per-Agent Goal Vision without turning one Agent's vision into peer authority.
+
+## 9. Provider and projection boundaries
+
+The `GoalAmendmentAuthority` decides whether a proposal is legal and may commit.
+File, NoKV, and PostgreSQL providers persist normalized transactions, CAS
+heads, and receipts; they do not interpret Goal prose or choose amendment
+policy.
+
+This RFC does not expand the current coordination aggregate in its first
+implementation slice. The existing shared-authority RFC continues to own
+Todo/claim/lease/receipt persistence. Goal semantic amendment first ships as a
+read-only projection and proposal contract. Mapping its commit into a
+provider-neutral aggregate requires a separate reviewed transaction boundary.
+
+`Next Action` remains compatibility prose and a read projection. It is never a
+claim, lease, Goal amendment, replan settlement, or authority decision.
+
+Integrated recommendation checkpoint: `refresh-state --next-action` evolves
+the existing recommendation receipt into an actor-bound, within-Todo step;
+it no longer overwrites the compatibility prose. Single and multiple peers
+use the same rule. The existing lane selector chooses work, then the TS
+recommendation owner decorates it with a still-valid step. Task text and
+claim/lease prerequisites remain intact. Peer summaries use those same derived
+routes, with no independent plan store. Source/task/actor-step read fences reject
+stale writes and discard stale read decorations. See the
+[writeback contract](../../quota-allocation.md).
+
+This advances advisory continuity, not Stage 3 amendment commit. The source-facts
+digest is not a canonical intent revision; run history is not the shared
+Todo/claim/lease transaction store. Ordinary task changes, protected intent,
+acceptance, Vision and replan settlement retain their existing owners.
+
+### 9.1 Semantic handoff and execution-route integration
+
+Use the existing alignment projection to supply a receiver's actual work
+basis. In-intent lane replanning stays in the receiver's Vision/Replan path;
+shared changes use this RFC's classification and admission. Stage 2 may
+retain a request-derived proposal, with source/context references and an
+explicit unresolved obligation, but cannot report that the shared Goal changed.
+Missing full intent authority is not repaired by synthesizing a revision from
+the Todo provider head or the event sequence.
+
+The next amendment implementation remains **one bounded Stage 3 work-graph
+commit class**, not broad acceptance/permission rewriting. It must first
+establish the actual canonical intent/policy basis and reviewed transaction
+mapping, then prove exact-basis admission, lease impact, CAS receipt recovery
+and peer frontier rebase. Reuse the [shared authority](shared-goal-authority-state-provider-v0.md)
+storage guarantees and [TS transaction migration](typescript-control-plane-migration-v0.md)
+owner; neither currently grants amendment semantics just by being available.
+
+Manager M1 and ordinary M2 handoff can ship before that commit class. Until
+then, expose proposal/admission and the unavailable-commit boundary while
+unrelated work continues. After qualification, the manager invokes the future
+Stage 3 `GoalAmendmentAuthority` commit owner under its existing policy; no permanent manager-superuser role, mandatory peer
+vote or repeated owner confirmation is added. The manager's result links the
+committed amendment receipt and peer/in-flight disposition. Cross-Goal handoff
+does not merge distinct Goals' intents or authorize either Goal's amendment.
+
+The manager RFC's A16 reuses the existing alignment/amendment fixtures for
+lane/proposal/stale-basis negatives and later qualifies the supported commit
+path. This RFC retains Stage 3–5 implementation and promotion ownership;
+manager readiness cannot silently mark those stages done.
+
+### 9.2 First commit transaction: one policy-bound work item
+
+This is the concrete transaction mapping required by §9.1. The bounded local
+implementation and its activation boundary are recorded in §9.3. It does not
+activate a general runtime profile. Stage 1/2 remain proposal-only. The first
+Stage 3 operation adds **one unclaimed Agent Todo from an owner-preauthorized
+fixed template**, inside `shared_work_graph`. It does not edit acceptance,
+permissions, existing Todo meaning, dependencies or another Agent's work.
+Ordinary Todo creation remains with its existing writer; the amendment path is
+used only when an admitted proposal must record a shared Goal revision and
+exact replan settlement under this policy.
+
+A fixed template is a deliberately narrow first policy, not a classifier for
+arbitrary intent-preserving prose. The owner chooses its bounded purpose and
+complete authority-relevant Todo fields once. The proposer selects its id and
+supplies only operation/causal identities; it cannot supply replacement text,
+write scopes, capabilities, recipients, claim/lease state, approval outcomes,
+validation results or a different template revision. Additional amendment
+operations require their own reviewed policy; this choice does not broaden any
+existing Agent permission or oblige owners to preauthor every ordinary Todo.
+
+#### Root intent, policy and lifetime
+
+The full canonical envelope in §3.1 must exist before this operation is
+available: objective, non-goals, acceptance, permission/write boundaries, stop
+and terminal conditions, immutable root intent, policy, Goal revision and
+intent digest. The source Goal lifecycle owns its exact `goal_instance_id`;
+provider identity, Todo digest, state-event sequence and the existing acceptance
+contract cannot substitute for it. Initialization is an explicit trusted-owner
+operation on that exact Goal, not an Agent field update or an automatic import
+from Markdown. Existing legacy goals stay on their existing path until the
+lifecycle owner admits an explicit migration; do not mint an unrelated id in
+the amendment module.
+
+Keep intent and its amendment receipts in the **existing canonical Goal
+projection and atomic journal**, not a new file/store beside it. Reuse the
+source/lifetime owner's admission and retirement fence so a Goal recreation
+cannot race a commit. A pre-commit identity read alone is insufficient. The
+current generic registry path rejects the lifecycle-only `source_session_v1`
+profile; this proposal does not waive that gate or grant all business effects.
+A selected profile must qualify this named owner before it can commit.
+
+The policy identifies the permitted operation, fixed templates and revisions,
+eligible registered proposers, bounded creation scope/capacity, and its explicit
+out-of-policy disposition. Missing policy means unavailable, not an implicit
+allow. For this deterministic class, exact template/authority checks may be the
+configured automatic rule; classes requiring an independent verifier retain
+§4's separate actor and exact proposal-digest requirements. Policy membership
+never replaces current runtime permission, capability, lease or stop checks.
+Root intent cannot be amended by this operation. Initialization and retirement
+must be retryable through their existing lifecycle owners; a lost response must
+not create another root or reactivate a retired one.
+
+#### Transaction and readback ownership
+
+| Boundary | Existing owner to reuse | Required implementation and observable result |
+| --- | --- | --- |
+| Intent and policy authoring | Goal lifecycle plus the canonical Goal authority; `acceptance_authority.ts` supplies a transaction pattern, not full-intent semantics | Owner-authored complete root/policy, exact source lifetime and provider revision; no inferred root from an acceptance document or team receipt |
+| Proposal | `goal_amendment_proposal.ts` / `.py`, existing durable admission journal | Bind the actual intent revision/digest, template revision and complete work basis. Historical Stage 2 source-only proposals remain readable but cannot be silently upgraded into commit-ready proposals |
+| Current source and actor | Current Goal source/lifetime and canonical writer fences | Same Goal instance, current registered proposer and supported profile must remain admitted through the commit boundary; stale source, recreation or unsupported owner refuses |
+| Work-item planning | `todo_create.ts::planCoordinationTodoCreate` and the existing Todo domain normalizer | Plan an active, unclaimed Agent record from the fixed template. Reuse role, scope, duplicate and record rules; do not call the standalone create transaction and then separately update the Goal |
+| In-flight work | Complete canonical Todo/lease snapshot and existing lease owner | This operation leaves every existing Todo and lease unchanged. Record the applicable `unaffected` disposition and exact observed basis; a stale basis conflicts. An operation needing cancellation/fence rotation is outside this policy and must not relabel its impact as unaffected |
+| Canonical effect | `prepareCoordinationProjectionCommit`, existing `AuthorityStore` CAS and `CoordinationCommandReceipt` recovery | One accepted transaction publishes the new Todo, Goal revision/basis change, amendment event and immutable receipt, with the same operation/proposal identity. No intermediate Todo-only or revision-only state may become authoritative |
+| Replan settlement | Existing autonomous-replan semantic observation and acknowledgement owner | The canonical receipt binds the exact obligation and committed outcome. The owning reader must validate and consume that evidence; an unchecked string, ordinary acknowledgement or new side ledger cannot settle it |
+| Peers and projections | Shared alignment, Agent Vision/frontier and existing projection delivery owners | Expose the new Goal basis and whether each peer has adopted it. Preserve current work only under its explicit compatible disposition; new semantic writes based on the old revision reject or rebase |
+| Operator result | Existing Goal/Agent interaction, proposal detail and readback; CLI and packaged frontend share the same typed result | Distinguish submitted, canonically committed, historical replay and pending replan/peer adoption. A stored receipt is not a claim, lease or current execution grant |
+
+The amendment owner must compose the existing **planner**, not nest a separate
+Todo commit inside a second transaction. A duplicate/equivalent existing Todo
+must follow the existing semantic-duplicate rules without inventing another
+Goal advancement. Operation replay returns its original historical result;
+changed operation content conflicts. The current authority projection is read
+separately so a replay cannot restamp old evidence as the latest Goal state.
+
+The atomic unit includes the canonical amendment and its exact settlement
+fact. Replan history, UI projection delivery and peer adoption are separate
+owner readbacks, not fictitious cross-store writes inside the provider CAS.
+If a reader cannot yet consume the committed evidence, report that pending
+boundary and keep the affected continuation held. Recover delivery using the
+same receipt/operation; never reapply the Todo or write an independent success
+ACK to make the projection green. The implementing change must show the actual
+consumer path before claiming Stage 3 replan settlement complete.
+
+A provider exception after dispatch is ambiguous until the original receipt is
+read. Retain the operation identity and fence; do not generate a replacement
+id or infer no effect from a timeout. For a request-derived proposal, all of
+§5.1's reservation, commit/abort ordering and request-side linkage are also
+required. A profile missing those capabilities must refuse request-derived
+commit while preserving proposal admission and unrelated work. It must not
+strip source context and relabel the request as a direct Goal proposal.
+
+#### One implementation package and decisive acceptance
+
+Deliver the following as one useful stage package rather than independent
+serializer, registry or receipt-only PRs. The first supported local profile
+must execute the actual owning backend and packaged interaction; simulated
+providers do not qualify the transaction.
+
+1. An owner can inspect the full root/policy, explicitly authorize the bounded
+   template operation and read it back through the same Goal lifetime. A regular
+   Agent cannot initialize, replace or widen it. Off/legacy behavior is unchanged.
+2. A registered proposer creates an in-envelope proposal, sees its exact current
+   basis, commits the template work item without a per-proposal human approval,
+   and reads the newly created unclaimed Todo plus its immutable amendment receipt.
+3. Exercise incorrect/missing lifetime, unsupported profile, stale Goal/provider
+   revision, edited template/proposal, unregistered actor, protected fields,
+   stopped Goal and incompatible lease impact. Each rejects without partial
+   mutation; unrelated Goal/Agent work retains its existing path.
+4. Lose responses before and after the actual provider commit and restart the
+   caller. The same operation yields zero or one canonical transaction and one
+   original outcome, with independent Todo, Goal-basis and receipt readback.
+   A stale concurrent proposal rebases; an already committed replay remains
+   historical. No generic retry creates a second work item.
+5. Complete exact-obligation settlement and have two peers read the new basis:
+   one continues compatible leased work, the other adopts the new unclaimed work
+   through ordinary claim/lease admission. Prove stale semantic writes cannot
+   proceed, and that adoption is observed rather than inferred from message send.
+6. In the packaged Goal/Agent journey, inspect unavailable/stale states, correct
+   the proposal, reload after a lost response and read both the committed result
+   and any remaining adoption hold. CLI reads the same owner state. Lark remains
+   separately unqualified until its actual interaction is tested. If shared
+   PostgreSQL authority code is changed, run its isolated real-server suite;
+   File/SQLite fixtures do not stand in for it.
+
+Revert before activation by removing the unconsumed candidate. After a root or
+amendment has been committed, keep its historical readers and fences: disabling
+the entrypoint cannot delete intent, roll back committed work or permit old
+writers. Use the original owners' forward reconciliation/retirement procedures.
+This package is a prerequisite for the broader Stage 4/5 and manager acceptance,
+not evidence that those milestones or G1's two real cycles have completed.
+
+### Steward execution integration (2026-09-16)
+
+[Roadmap](loopx-overall-roadmap-v0.md) R1 repairs team-plan source-basis preconditions; R4 supplies the product continuation for Stage 3–5. The current team receipt `intent_basis` only reuses `source_basis_digest`, a source-facts summary that does not cover the full objective/non-goals/acceptance/permissions/stop envelope. It may be absent and is not a CAS precondition. Do not claim full canonical intent binding.
+
+First connect existing commitments/work basis to commit-time validation. Then version intent in this owner and implement one intent-preserving work-graph amendment class with policy/verifier, lease impact, conflicts and receipt recovery. Ordinary Todo edits retain their writer rather than being forced into amendments. A steward may organize and synthesize peer work without gaining leader write authority. Stage 1/2 and the local 24-row directory exist; §9.3 adds the bounded local commit owner. Automatic frontier/Turn adoption, presence/lease epoch and pagination gaps remain explicit.
+
+### 9.3 Bounded local implementation and operation
+
+`goal_amendment_authority.ts` owns the immutable `shared_goal_intent_v0` in the
+existing canonical head. It implements a new `goal_work_graph_amendment_v0`
+proposal and the single template operation in §9.2. Existing Stage 2 admission
+journals remain historical; their source-only proposals cannot be committed by
+this owner. Operation names are local to this TS dispatcher; Python CLI and
+HTTP transport do not define another decision owner.
+
+The supported source is an exact, active `source_session_v1` Goal with File or
+SQLite authority. A fresh project can explicitly initialize that authority with
+`project register --goal-instance-profile source_session_v1 --operation-id ID
+--registered-agent AGENT --canonical-storage sqlite` (or `file`), together with
+the existing required project/Goal declaration flags. This reuses the existing
+new-Goal creation owner, freezes hard leases, and requires an empty source. It
+neither migrates work nor grants execution. Omitting `--canonical-storage`
+preserves lifecycle-only creation. After an interrupted initialization, retry
+the original registration and target; its retained registration and storage
+receipt determine recovery. Existing Goals without original creation
+commitments need a source-owner migration; Markdown is not reconstructed into
+an original declaration.
+
+In the packaged workspace, select the Goal, open **Goal settings → Task
+ownership → Goal commitments and governed changes**, inspect the original
+objective/non-goals/acceptance/stop condition, fill the permitted work and
+permission/terminal envelope, review it and explicitly freeze it. The same
+operator HTTP route cannot impersonate a peer. Current readback lists actual
+peer basis acknowledgements and pending/settled replan observations. Saving a
+root or committing a Todo is not work execution or whole-Goal acceptance.
+Source metadata discovery works while generic status, chat execution and
+unqualified companion settings retain their existing refusal.
+
+Synthetic examples from the packaged interface (not live Goal or model evidence):
+
+![Review the fixed work policy](../../assets/goal-amendment/desktop-preview.png)
+
+[Unknown response and original-operation recovery](../../assets/goal-amendment/unknown-response.png) · [Current revision, peer adoption and replan readback on a narrow screen](../../assets/goal-amendment/mobile-readback.png)
+
+The CLI uses the same owner; writes preview unless `--execute` is supplied:
+
+```sh
+loopx --registry REGISTRY --format json goal-amendment-proposal \
+  --governed inspect --goal-id GOAL --goal-instance-id INSTANCE
+loopx --registry REGISTRY --format json goal-amendment-proposal \
+  --governed adopt --goal-id GOAL --goal-instance-id INSTANCE \
+  --agent-id AGENT --operation-id ADOPTION --request-json basis.json --execute
+```
+
+`basis.json` contains `base_goal_revision`, `base_intent_digest` and
+`base_work_digest` from the current inspect result. `propose` additionally
+requires a fresh `proposal_id`, an authorized `template_id`, the exact current
+`replan_obligation_id` and bounded `evidence_refs` (`evidence:ID` or
+`sha256:HEX`; raw evidence remains in its owning store). It accepts no replacement
+Todo text, permission, acceptance or request-derived source context. `commit`
+takes only the retained `proposal_id` and `proposal_digest`. Each mutation uses
+its own stable `--operation-id`; changed input under that id conflicts.
+
+A successful commit creates unclaimed work and advances the Goal revision in
+one CAS, preserving all prior Todos and leases. Peers must inspect and adopt the
+new basis. `claim` takes that basis, `todo_id`, `expected_provider_revision` and
+`lease_request` (the existing `idempotency_key`, `expected_version`, `ttl_seconds`
+contract). The existing claim owner enforces hard leases. Once its causal binding
+is recorded, reconfirming the claim or reacquiring an expired lease uses that
+owner without reopening the settled replan obligation. Only the original
+proposer's exact causal binding can satisfy its source-derived replan obligation;
+another peer's claim cannot settle it. This is replan consumption, not terminal
+acceptance of the created work. The original amendment receipt keeps its
+historical pending adoption/settlement fields; current observations are separate.
+
+For root/proposal/adoption/commit history, use `--governed receipt` with a JSON
+request containing `receipt_operation_id`. Claim recovery stays with its
+original claim operation/receipt. Retry the exact original mutation after a
+lost reply, never a fresh operation. The UI retains the reviewed request across
+reload and can read the original receipt or retry that same request. A missing
+receipt is not proof of no commit; stale basis requires a new inspected preview.
+The typed Goal owner supplies the operation outcome to both transports:
+`no_change` is a successful no-op, while missing current authority cannot make
+inspection or a mutation successful. Restore the original storage before retrying.
+
+Validation covers native registration/CLI/HTTP with real File/SQLite, an existing
+peer lease, stale or retired lifetimes, source commitment preservation,
+semantic corruption, response loss, same-operation recovery and claim/replan
+isolation. The shared claim changes also require the isolated real PostgreSQL
+suite. Packaged browser evidence must distinguish this named settings journey
+from unavailable generic runtime reads. Lark, automatic Turn/Vision adoption,
+request-derived reservation/abort, protected or acceptance amendments and live
+model collaboration remain separately unqualified. Disabling the entrypoint
+stops new operations; retain historical readers and fences and use the existing
+lifecycle owner for forward retirement. Never remove committed intent to resume
+an old writer.
+
+### 9.4 Local request-derived changes and cancellation recovery
+
+The local candidate now connects §5.1 to the existing request and Goal owners.
+It requires an exact `source_session_v1` Goal, the configured local runtime,
+existing canonical File/SQLite authority, frozen Goal intent/policy, and a
+local private request addressed to a registered receiver. An independently
+bound host execution or external source is not qualified by this profile.
+No command below activates a Goal, launches a model, or grants more work scope.
+
+The existing request entry retains its original message, brief and identity.
+Its `collaboration_request_control_v0` field owns ordered corrections, per-revision
+read/assessment facts, one unresolved effect reservation and operation receipts.
+`request_control_contract.ts` owns the bounded wire values shared by the Goal
+owner and frontend. These are request-domain contracts, not additional entries
+or proof claims in the original 26-vocabulary acceptance.
+
+A `goal_request_work_graph_amendment_v0` proposal carries an exact
+`source_request` reference: `request_id`, `request_revision`, `request_digest`.
+Before commit the request owner reserves the original operation with that
+reference, receiver, proposal, Goal/work/intent basis and actual authority-source
+identity. The Goal owner's existing work planner still decides the allowed delta.
+Commit and source-authorized conditional abort compete for the same durable
+operation receipt. A lost response remains unresolved until that receipt is read
+and linked back to the request; an absent receipt or a fresh operation id does
+not release the reservation. A definitive stale Goal basis records `rejected`
+without changing Goal work. Current request state and the historical Goal outcome
+are separate observations.
+
+A correction may advance the request while the old reserved effect is unknown.
+The source entry attempts conditional abort after recording that correction.
+The old binding remains immutable; another effect cannot begin until its exact
+terminal receipt is linked. Cancellation before reservation closes admission.
+Cancellation after reservation remains pending; if commit already won, the
+result reports that committed Goal change and retains its created work. It does
+not claim rollback, cancel independent Goal work, or settle its execution or
+acceptance. Source/provider identity changes retain a recovery hold rather than
+writing an abort into another authority store.
+
+**Owner journey.** Open the original private conversation's delegation details.
+Edit the brief or cancel the request there; Goal/receiver/source identities are
+already bound to the original message. Saving validates and writes in one user
+gesture. A failed current read clears current controls. Before dispatch, read
+back the complete retained request, including its route, operation, basis and
+content. If retention fails, keep the editable page draft and send no mutation;
+an in-memory value alone does not establish reload recovery. Unknown write responses
+retain that original request across reload; retry that exact operation. A typed
+stale-basis refusal reloads the latest revision for editing. Pending cancellation
+and committed/aborted/rejected outcomes remain distinct. Historical Goal instances
+remain read-only here; this is not restored-runtime authorization.
+
+**Receiver journey.** `manager-inbox read` supplies the current brief, revision,
+digest and `source_request` reference. Acknowledge with `--request-revision N
+--request-digest DIGEST`, and report with `--request-revision N`. MCP
+`assess_request` and `return_result` accept the same explicit revision fields.
+An omitted revision continues to name original revision 1; late original results
+remain appendable without satisfying a newer request. A new revision's first
+conclusion uses the existing immutable result-update chain automatically.
+For a conversation return, `--phase decision` retains one immutable interim
+update per revision. An older conclusion cannot suppress a newer revision's
+interim update; an available conclusion for that same revision supersedes its
+unsent interim update. Original decision/result records remain unchanged.
+Returned peer and conversation results identify their source revision.
+
+Use the existing governed proposal fields plus `source_request` when proposing
+this request's fixed-template work. Commit with the retained `proposal_id`,
+`proposal_digest`, `source_request` and stable `--operation-id`; the adapter
+reserves and links through the real owners. Removing source context from a
+request-derived proposal does not make its commit independent.
+
+The original requester can inspect, revise, cancel or recover through:
+
+```sh
+loopx --registry REGISTRY --runtime-root RUNTIME --format json manager-inbox control \
+  --goal-id GOAL --goal-instance-id INSTANCE --agent-id REQUESTER \
+  --peer-agent-id RECEIVER --request-id REQUEST --control-operation inspect
+```
+
+For `revise`/`cancel`, supply `--operation-id` and `--control-file` containing
+`expected_revision`, `expected_digest`, `reason`, and (for revise) the complete
+`brief`; use `--execute` to write. Omit `--agent-id` only for the authenticated
+original local conversation owner. `recover --execute` reads the original
+terminal receipt and may conditionally abort an already cancelled or superseded reservation;
+it never reassigns an unknown effect. The bound peer MCP `control_peer_request`
+uses the same source owner. Browser writes cannot impersonate a receiver/peer.
+
+Limits: eight request revisions, sixteen effect reservations, sixty-four request
+operation receipts and the existing 128,000-byte entry read boundary. Admission
+reserves space for a maximum legal cancellation and terminal linkage, including
+JSON escaping; oversized new work is refused before persistence. Replays do not
+consume additional capacity. Source text and artifacts keep their existing
+owners and limits; there is no new automatic private-locator service.
+
+Validation combines actual source registration, request IO, canonical File/SQLite
+transactions, independent CLI/MCP consumers, original-conversation HTTP and
+packaged UI; shared Goal transactions also require isolated real PostgreSQL.
+Synthetic source progress observations are not model behavior. General request
+reassignment, arbitrary host effects, live Lark/model qualification, restored
+writer activation and whole M2/G1 acceptance remain unqualified. Existing Lark
+tracking consumes the same revision/control facts with its audience filtering;
+no live transport send is inferred from readback tests.
+
+Before use, the code can be reverted. After control/proposal records exist,
+stop new admission and retain readers, original request/Goal receipts and fences.
+Do not erase the control field or roll back only one side to make work eligible.
+Restoration and a wider runtime/profile rollout retain their existing ownership
+and qualification gates.
+
+## 10. Staged delivery
+
+1. **Stage 0 — characterization and RFC.** Record own-lane, unclaimed,
+   peer-claimed, replan, concurrent proposal, and in-flight lease scenarios.
+2. **Stage 1 — read-only alignment.** Add `shared_goal_alignment_v0` with
+   canonical revision binding, per-Agent frontier basis, unclaimed work, and
+   drift/conflict facts. An optional Decision Context extension may pair an
+   exact host-session scope with bounded advisory recall. No writer changes.
+3. **Stage 2 — proposal only.** Validate and retain
+   `goal_amendment_proposal_v0`; proposals have no canonical effect.
+4. **Stage 3 — one bounded commit class.** Implement governed commit for a
+   shared work-graph amendment that preserves root intent, including automated
+   policy commit, CAS, receipt, replan settlement, and lease impact handling.
+5. **Stage 4 — provider-neutral shadow/parity.** Map the reviewed transaction
+   to the file reference provider and optional NoKV/PostgreSQL candidates;
+   compare projections and recovery without changing default authority.
+6. **Stage 5 — TEST ONLY shared canary.** Exercise two peers, concurrent
+   proposals, unclaimed claim, response-loss recovery, stale bases, and
+   protected changes before any authority-source promotion.
+
+Acceptance and operational-objective commits are not the first runtime slice.
+They require demonstrated need and a separately reviewed automated policy and
+verifier contract. Permission expansion or escape from root intent cannot be
+auto-committed unless Goal creation explicitly delegated that exact class.
+
+The proposed [current operating objective](goal-outcome-refinement-v0.md#current-operating-objective)
+slice addresses stale source declarations through explicit owner apply and
+independent peer adoption. It does not enable automated root-intent, acceptance
+or permission amendments. The existing immutable work-template intent and
+its revision keep their meaning; the operating-objective history has its own
+versioned contract, and old `intent_basis` receipts are not upgraded in place.
+
+## 11. Validation matrix
+
+At minimum, tests must prove:
+
+- a work switch, compaction, restart or handoff preserves declared requirement identities and coverage;
+- a late acceptance clause remains available through exact detail, without substituting another Todo or a stale display;
+- dropped or rewritten criteria require an authorized amendment; a missing, irrelevant or stale evidence reference cannot satisfy acceptance;
+- local completion with another Agent's outstanding requirement cannot settle the whole Goal;
+- own-lane replan cannot change canonical intent;
+- unclaimed work is visible but cannot execute before claim/lease;
+- a pending proposal does not affect unrelated peers;
+- policy and verifier decisions are bound to the exact proposal digest;
+- two conflicting proposals from one base yield at most one canonical commit;
+- stale revision/digest commits fail closed;
+- response-loss recovery returns the original receipt;
+- protected changes cannot be committed by proposer, scheduler, lease holder,
+  verifier, or provider operator identity alone;
+- routine in-envelope amendments complete without human approval, while an
+  out-of-policy proposal never silently expands authority;
+- in-flight leased work receives an explicit disposition; and
+- all Agent projections rotate or gate after a canonical revision changes;
+- a host-task locator resolves only through the current project binding and
+  grants no claim, lease, lifecycle, verifier, or amendment authority;
+- disabling or removing the advisory provider does not block authority-source
+  collection, while amendment submission still independently requires the
+  current Goal revision and intent digest.
+
+Existing Goal-amendment and authority-store conformance tests remain the owners
+of durable proposal, receipt recovery, and cross-Goal commit isolation. The
+optional locator/provider tests must not duplicate those state-machine suites.
+
+## 12. Non-goals
+
+This version does not define automatic voting or consensus, CRDT/offline
+multi-writer merge, an omniscient planner, a permanent leader, direct Agent
+writes to storage providers, broad migration of LoopX state, or autonomous
+escape from the immutable root user intent. Human approval is not a required
+step in the normal amendment lifecycle. Host-session locators, deep links, and
+transcripts are also not part of the Goal aggregate or a durable evidence store.
+
+The smallest useful outcome is a legible, read-only alignment projection and a
+proposal that is visibly non-authoritative. Runtime commit follows only after
+that boundary proves useful in real multi-Agent work.
+
+## Appendix A: Execution ledger
+
+Dated checkpoints for this RFC live in the
+[per-entry ledger](ledger/shared-goal-alignment-and-governed-amendment-v0/), one
+file per measured slice. Sections 1–12 above stay the normative contract; a
+ledger entry records what shipped and what it did not establish without
+changing that contract.

@@ -16,6 +16,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from loopx.long_task_cadence import (  # noqa: E402
     LONG_TASK_CADENCE_HINT_SCHEMA_VERSION,
     build_long_task_cadence_hint,
+    reconcile_long_task_cadence_hint,
 )
 from loopx.quota import build_quota_should_run  # noqa: E402
 
@@ -119,6 +120,47 @@ def assert_runtime_hint() -> None:
         "reason_codes": ["missing_recent_runs"],
     }, unknown
 
+    reconciled = reconcile_long_task_cadence_hint(
+        gated,
+        interaction_contract={
+            "agent_channel": {
+                "must_attempt": True,
+                "quiet_noop_allowed": False,
+            }
+        },
+        scheduler_hint={"action": "run_now", "cadence_class": "active_work"},
+    )
+    assert reconciled == {
+        "schema_version": LONG_TASK_CADENCE_HINT_SCHEMA_VERSION,
+        "signal": "active_work",
+        "recommendation": "keep",
+        "reason_codes": ["final_agent_scoped_active_work"],
+        "authority": "final_agent_scoped_interaction_and_scheduler",
+        "superseded": {
+            "signal": "blocked",
+            "recommendation": "wait",
+            "reason_codes": [
+                "quota_state_operator_gate",
+                "open_user_todos_visible",
+            ],
+        },
+    }, reconciled
+
+    still_gated = reconcile_long_task_cadence_hint(
+        gated,
+        interaction_contract={
+            "agent_channel": {
+                "must_attempt": False,
+                "quiet_noop_allowed": False,
+            }
+        },
+        scheduler_hint={
+            "action": "backoff_waiting_for_user",
+            "cadence_class": "human_gate",
+        },
+    )
+    assert still_gated == gated, still_gated
+
 
 def assert_status_and_quota_projection() -> None:
     with tempfile.TemporaryDirectory(prefix="loopx-cadence-hint-") as tmp:
@@ -140,6 +182,8 @@ def assert_status_and_quota_projection() -> None:
                     "",
                     "## Objective",
                     "Validate cadence hint projection.",
+                    "",
+                    "## Agent Todo",
                     "",
                     "## Latest Run",
                     "- Run ID: run_thin_2",
@@ -188,6 +232,9 @@ def assert_status_and_quota_projection() -> None:
             encoding="utf-8",
         )
 
+        from loopx.control_plane.testing.canary_harness import import_fixture_authority
+        import_fixture_authority(registry, "cadence", provider="sqlite")
+
         status = subprocess.check_output(
             [
                 sys.executable,
@@ -229,8 +276,10 @@ def main() -> int:
         "Long-Task Cadence Hint",
         "not a scheduler policy",
         "`cadence_hint_v0`",
-        "`blocked`, `thin_progress`, `material_progress`, `unknown`",
+        "`blocked`, `active_work`, `thin_progress`, `material_progress`, `unknown`",
         "`wait`, `widen`, `keep`",
+        "final agent channel",
+        "`superseded`",
         "not a perfect measure of actual agent-loop runtime",
         "conversation transcripts",
         "raw local logs",

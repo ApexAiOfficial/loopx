@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
 from ...control_plane.runtime.public_safety import public_safe_compact_text
+from ...public_safe_text import (
+    MODULE_QUALIFIED_SURFACE_PATTERN as SURFACE_RE,
+    PUBLIC_SAFE_REFERENCE_PATTERN as TOKEN_RE,
+)
+from .experience_quality import (
+    normalize_procedural_experience,
+    procedural_experience_quality,
+)
 from .registry import IDENTITY_SCOPE_FIELDS
 
 
@@ -30,8 +37,6 @@ ELIGIBLE_POLICY_ACTOR_ROLES = {
     "verified_repository_core_contributor",
     "verified_project_owner_or_operator",
 }
-TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}$")
-SURFACE_RE = re.compile(r"^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$")
 MAX_SURFACES = 12
 MAX_ACTION_SCOPES = 12
 
@@ -186,13 +191,14 @@ def _authority_checkpoint(raw: object) -> dict[str, Any]:
 
 def _candidate_ref(candidate: Mapping[str, Any]) -> str:
     identity = {
-        key: candidate[key]
+        key: candidate.get(key)
         for key in (
             "target_class",
             "content_summary",
             "source",
             "scope",
             "guard_context",
+            "experience",
             "requested_action_scopes",
         )
     }
@@ -209,6 +215,11 @@ def _guard(
     requested = set(candidate["requested_action_scopes"])
     target_class = candidate["target_class"]
     guard_context = candidate["guard_context"]
+    experience_quality = procedural_experience_quality(
+        target_class=target_class,
+        experience=candidate.get("experience"),
+    )
+    reasons.extend(experience_quality["reason_codes"])
     if guard_context["source_freshness"] != "current":
         reasons.append("source_freshness_not_current")
     if guard_context["conflict_state"] != "clear":
@@ -246,6 +257,7 @@ def _guard(
             "and_no_authority_expansion"
         ),
         "semantic_reasoning_preserved": True,
+        "experience_quality": experience_quality,
     }
 
 
@@ -283,6 +295,10 @@ def build_reward_memory_candidate(
         "lifecycle": lifecycle,
         "privacy": {"raw_content_captured": False},
     }
+    if proposal.get("experience") is not None:
+        candidate["experience"] = normalize_procedural_experience(
+            proposal.get("experience")
+        )
     candidate["candidate_ref"] = _candidate_ref(candidate)
     checkpoint = _authority_checkpoint(authority_checkpoint)
     guard = _guard(candidate, checkpoint)
@@ -339,9 +355,7 @@ def review_reward_memory_candidate(
         if isinstance(lifecycle, Mapping)
         else []
     )
-    expires_at = (
-        lifecycle.get("expires_at") if isinstance(lifecycle, Mapping) else None
-    )
+    expires_at = lifecycle.get("expires_at") if isinstance(lifecycle, Mapping) else None
     if decision == "retire" and state != "active":
         raise ValueError("retire requires an active reviewed record")
     if decision != "retire" and state != "candidate":

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -11,20 +10,25 @@ from .adapters import (
     SINK_RESULT_SCHEMA,
     _normalize_artifact_result,
 )
-from .core import _reject_raw_keys
+from .core import (
+    _reject_raw_keys,
+    _SINK_ROLES,
+    _SINK_STATUSES,
+)
+from ...control_plane.content_digest import ENVELOPED_SHA256_PATTERN
+from ...control_plane.digest_envelope import sha256_envelope
+from ...public_safe_text import PUBLIC_SAFE_SLUG_PATTERN
 
 GENERATION_BUNDLE_SCHEMA = "periodic_report_generation_bundle_v0"
 GENERATION_RECEIPT_SCHEMA = "periodic_report_generation_receipt_v0"
 SINK_BINDING_SCHEMA = "periodic_report_sink_binding_v0"
 EXTENSION_READINESS_SCHEMA = "periodic_report_extension_readiness_v0"
+DELIVERY_INTENT_SCHEMA = "periodic_report_delivery_intent_v0"
 DELIVERY_RECEIPT_SCHEMA = "periodic_report_delivery_receipt_v0"
 
-_TOKEN_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _VERSION_RE = re.compile(r"^[0-9a-z][a-z0-9_.+-]{0,127}$")
 _DEPENDENCY_POLICIES = {"required", "optional", "disabled"}
-_SINK_ROLES = {"archive", "delivery"}
 _PROVIDER_STATUSES = {"ready", "unavailable", "unknown"}
-_SINK_STATUSES = {"pending", "sent", "failed", "skipped", "unknown"}
 _READINESS_ITEM_STATUSES = {
     "disabled",
     "incompatible",
@@ -65,7 +69,7 @@ def _text(value: object, label: str, *, maximum: int = 500) -> str:
 
 def _token(value: object, label: str) -> str:
     token = _text(value, label, maximum=128).lower()
-    if not _TOKEN_RE.fullmatch(token):
+    if not PUBLIC_SAFE_SLUG_PATTERN.fullmatch(token):
         raise ValueError(f"{label} must be a lower-snake-like public token")
     return token
 
@@ -172,7 +176,7 @@ def _sha256(value: object) -> str:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return sha256_envelope(encoded)
 
 
 def _identity(value: object, *, prefix: str) -> str:
@@ -190,7 +194,7 @@ def _generation_receipt(raw: object) -> dict[str, Any]:
     document_digest = _text(
         receipt.get("document_digest"), "document_digest", maximum=80
     )
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", document_digest):
+    if not ENVELOPED_SHA256_PATTERN.fullmatch(document_digest):
         raise ValueError("generation_receipt.document_digest must use sha256")
     artifacts = _sequence(receipt.get("artifact_receipts"), "artifact_receipts")
     if not artifacts:
@@ -207,7 +211,7 @@ def _generation_receipt(raw: object) -> dict[str, Any]:
         content_digest = _text(
             artifact.get("content_digest"), f"{label}.content_digest", maximum=80
         )
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", content_digest):
+        if not ENVELOPED_SHA256_PATTERN.fullmatch(content_digest):
             raise ValueError(f"{label}.content_digest must use sha256")
         normalized_artifacts.append(
             {

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from .history import load_registry
+from .control_plane.projects.registry_codec import load_registry
 from .paths import resolve_runtime_root
 from .rollout_event_log import (
+    RolloutAppendPreconditionChanged,
     append_rollout_event,
     append_rollout_event_once,
     build_rollout_event,
@@ -18,6 +20,7 @@ def append_cli_rollout_event(
     registry_path: Path,
     runtime_root_arg: str | None,
     event_kind: str,
+    goal_ref: Mapping[str, object] | None = None,
     agent_id: str | None = None,
     todo_id: str | None = None,
     case_id: str | None = None,
@@ -29,6 +32,7 @@ def append_cli_rollout_event(
     details: dict[str, object] | None = None,
     allow_failed: bool = False,
     idempotency_fields: list[str] | None = None,
+    precondition: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Append a compact rollout event for core CLI lifecycle commands.
 
@@ -48,10 +52,11 @@ def append_cli_rollout_event(
             runtime_root = Path(str(runtime_root_value)).expanduser()
         else:
             registry = load_registry(registry_path)
-            runtime_root = resolve_runtime_root(registry, runtime_root_arg)
+            runtime_root = resolve_runtime_root(registry, runtime_root_arg, registry_path=registry_path)
         event = build_rollout_event(
             goal_id=goal_id,
             event_kind=event_kind,
+            goal_ref=goal_ref,
             agent_id=agent_id or str(payload.get("agent_id") or "").strip() or None,
             todo_id=todo_id or str(payload.get("todo_id") or "").strip() or None,
             case_id=case_id,
@@ -70,6 +75,7 @@ def append_cli_rollout_event(
                 log_path,
                 event,
                 identity_fields=idempotency_fields,
+                precondition=precondition,
             )
         else:
             appended = append_rollout_event(log_path, event)
@@ -84,6 +90,8 @@ def append_cli_rollout_event(
         if idempotency_fields:
             rollout_event_view["appended"] = newly_appended
         payload["rollout_event"] = rollout_event_view
+    except RolloutAppendPreconditionChanged:
+        raise
     except Exception as exc:
         payload["rollout_event_log_error"] = {
             "recorded": False,

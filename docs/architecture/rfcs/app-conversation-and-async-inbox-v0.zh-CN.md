@@ -1,0 +1,1490 @@
+# App 会话与可复用的异步工作投递
+
+- 状态：Accepted；设计和工作可认领。会话入口修复已交付，更多连续性和异步收件箱验收仍未完成。不新增 provider、调度器或权限。
+- **替代 / 关闭：** none
+- 基线：`27f0fc93b`，检查于 2026-09-25。实现与真实运行验收分别记录。
+- 归属：[总体路线图](loopx-overall-roadmap-v0.md) R1–R3/G0–G2；
+  [语义交接](capable-manager-semantic-handoff-v0.md) M1–M3；
+  [会话界面](intelligent-review-presentation-surfaces-v0.md#88-reusable-conversation-work-surface)；
+  [TS 迁移](typescript-control-plane-migration-v0.md) T0–T4。
+- 评估：[steward 黄金查询](../../product/use-cases/steward/golden-queries.md)。
+- 语言：[英文语义镜像](app-conversation-and-async-inbox-v0.md)。
+
+## 普通工作区会话：有界实现检查点
+
+Core Chat 可以独立于 Goal 和管家 portfolio 打开普通工作区 Session。在 App 中，
+工作区是管家对话的一个范围：“范围”选择器列出宿主授权的工作区，选中后继续该
+工作区自己的 Session，输入框、历史、流式输出、停止和图片与其他对话共用同一路径。
+范围不会出现在管家总览或 Goal 列表中；切回管家范围即恢复管家 Session。
+共享 typed context owner 核验确切工作区引用和当前 grant；目录缺失、symlink
+重定向或 grant 变化时拒绝继续。不会合成 Goal、注入 portfolio，也不凭工作区
+grant 授权 peer delegation。
+
+本次扩展现有 conversation-scope owner 的 `project_workspace` 分类及宿主观测合同，
+不增加 provider 自有 Session authority。Python 负责文件系统观测和既有 durable Chat
+store，TypeScript 负责上下文身份及范围。原生 Codex 恢复保留原 upstream thread
+和工作区；HTTP/协议 fixture 验证连续性与拒绝行为，不证明真实模型采用了上下文。
+
+App grant 仅面向本机 owner 明确授权的工作区操作。App 范围入口本身不证明 Lark 私聊
+admission、安装或手机旅程已通过；grant 撤销后历史仍可读，
+新消息在宿主重新授权前被阻止。下方独立检查点说明 Lark 的源码实现资格。
+
+本机 owner 的工作区入口现已接入独立核验的 Lark App 私聊绑定。既有设置 →
+Lark 页面选择一个非默认 App、当前可用工作区和宿主 executor，读回监听状态、待回复
+数量及恢复缺口；重新绑定不会把旧 Session 移到其它工作区。
+
+既有群聊监听器也可通过同一个已核验 App profile 接入本人私聊。在设置 → Lark
+中选择该 App 和本人私聊；经核验指向同一 App 的配置别名自动复用唯一的既有
+listener selector，包括旧版保存的 App ID，不另起竞争监听器。库存发现同时支持
+配置名和 App ID；移除、改绑或身份变化仍拒绝。单个 consumer
+将明确的群聊事件交给既有群聊准入，将私聊交给 Core 本人准入；拒绝后不转投
+另一受众。群聊授权和审阅回调保持独立，解绑一路保留另一路。HTTP/Core fixture
+覆盖配置、本人未登录、App 不匹配和路由移除，不代表远程 Agent 投递或安装态
+provider 往返已通过。
+未保存 App id 的旧群聊配置使用刚核验的私聊 profile 身份，同时保留原 profile
+级 consumer lease 及 App 级 lease，同时隔离旧进程与新别名。配置在发布 Core
+绑定前校验实际共享组合；发布前 App 身份变化
+则拒绝，绑定保持不变。真实 HTTP/Core/runtime-refresh fixture 覆盖此路径及冷启动
+监听发现，不发送 provider 消息或执行模型。
+
+共享 typed Core 核验 App、本人、受众和当前工作区 grant，拥有稳定 Session、原生
+Turn FIFO 和确切 stop/new/status 目标。传输层保存独立的受理与最终投递意图，通过
+provider 读回确认回复；发生没有 receipt 的不确定写入时不盲目重发。两 App 复用
+现有服务及按 App 获取的 listener lease，不创建第二套队列、模型 runner 或隐藏 Goal。
+飞书排队提示只表达已观测的队列状态，不断言已有前一条请求正在运行：首个 Turn
+也可能等待原生 claim。恢复继续使用已持久化提示的原文与 provider intent。
+
+私聊受理返回及本地 Turn worker 退出（含准备失败）时，唤醒既有四槽回复池。
+进程内 Event 只作提示，不携带内容或投递权限，也不执行 provider IO；扫描仍读取
+canonical journal，并重新核验来源与 Core。扫描前清除提示，避免扫描期间到达的
+信号在随后等待时丢失；关闭服务会唤醒等待并注销 runtime 提示。保留一秒恢复轮询、
+工作池上限、请求公平性和三十秒 owner 通知节奏；没有 hook 的自定义 controller
+继续轮询。工作槽被占用时，请求仍可能延至后续扫描；不通过已完成 Future 的回调
+反复重排尚未完成的工作。File/Core 与原生协议 fixture 单独验证这一调度路径，
+不替代安装态服务、provider 延迟、完整停止回执及 Web 首次可见结果的验收。
+
+原生 Lark 新发送和回执恢复在单次操作内，由同一来源校验核验当前 App、确切
+profile/chat/message 及 Core grant，与既有回复编辑路径一致。观测到的 Bot 名称
+必须匹配 Inbox 元数据；改名时仍先停止发送，刷新元数据后再继续。校验等待全部
+来源读取完成，并在返回前重读确切绑定。丢失读回保留同一 attempt，重新校验但不
+重复发送。操作之间不缓存身份或 grant；旧 membership-only callback 继续独立验证
+发送身份。File/Core fixture 验证这一传输事务及读取期间撤权，不认证安装态 provider
+延迟、完整停止 SLA 或 Web 首次可见结果。
+
+源码 canary 已验证打包页面的桌面/窄屏、撤权拒绝与恢复、慢会话期间另一 App 完成、
+后续消息持久排队、exact stop，以及重启后原会话恢复和已确认回复不重复发送。
+这些是合成 provider/协议验收；真实原生 Codex 另行验证独立线程与上下文隔离。
+真实 Lark 收发、安装候选、手机旅程、注册 Agent 选择、媒体/增量/权限回调，以及
+更广的长期协调仍未验收。普通项目权限以当前 workspace grant 为准，新增管家入口保持独立授权。
+
+私聊配置复用设置 → Lark；App 范围仍是本机普通对话的唯一入口。未存储 App 身份
+的旧群聊 profile 保留原 profile-hash 监听锁键。没有私聊绑定时不增加鉴权；有绑定
+时，同一请求内的别名检查与连接共用一次已验证身份观测。飞书 HTTP 组合位于
+extension，typed binding owner 继续保持 provider-neutral。
+
+绑定解析在 provider 身份观测后重读确切授权。观测期间撤销或替换该绑定会拒绝请求；
+其它绑定的修改不使当前绑定失效。typed owner 仍检查当前上下文，不跨次缓存身份核验。
+
+同一设置读模型也展示本机已安装 transport 的 Core binding。监听状态取确切宿主组合
+provider 的可选 `health_snapshot()`，返回仅含状态的观测；默认 profile 使用已有
+Lark listener 观测。该本地 hook 只读取缓存，不发起网络请求。仅投影已有监听标签
+`starting`、`listening`、`retrying`、`stopped`、`standby`、`inactive`；缺失、格式
+错误或读取失败均为 `unknown`，界面显示“连接尚未确认”。不返回 provider 其它字段或
+异常原文。监听就绪不等于送达回执或任务验收。原生 binding、宿主组合和 HTTP 回归
+验证源码读模型；各 provider 的安装态监听及结果回传仍分别验收。
+
+### 当前普通会话的模型选择
+
+普通 Codex 输入框将运行时提供的模型与支持的思考深度保存到确切已有 Session。
+选择不创建 Turn 或线程，不重放历史、不中断工作。活动回合保留实际配置；菜单区分
+已保存的后续选择与原生运行时回读。回合之间沿既有恢复 owner 在同一原生线程确认
+选择，然后才发送。新消息受理前被拒绝时保留草稿；排队请求仍由原队列处理失败与恢复。
+刷新保留 Session 和已保存选择，不改变其他会话或本机默认设置；保存失败可重试，
+不能显示成功。
+
+外部宿主、管家、注册 Agent、绑定受众、原生 Goal 和需要迁移的旧会话仍由原设置
+入口负责。不支持的 provider 不能悄悄新建替代对话。可用性与准入复用同一读模型。
+真实 HTTP/存储配合合成原生协议验证配置、历史、运行中/排队采用与拒绝；这些证据
+不代表真实模型质量、已安装原生输入或跨渠道同步已经通过验收。
+
+### 在本机 App 继续原私聊会话
+
+设置 → Lark 在已有本人私聊连接上提供 **继续原会话**。发现过程使用 Core 已核验
+的 binding 选择器，并要求响应回显同一身份；之后 URL 固定该 binding 和确切的
+已有 Session。目标缺失、地址非法、撤权、会话关闭或服务不支持时明确不可用，
+不回退到普通管家/项目历史，不新建替代 Session，也不在这里切换执行器或模型。
+群受众保留原有边界。
+
+本人私聊管家的 Session 已采用新执行器、binding 仍指向原执行器时，新捕获的
+普通消息保持待准入，关联确切的原 Session。原回复 worker 等待两者对齐，
+再次核验原消息后才入队。准入前关闭原 Session 会结束该请求，不创建替代
+会话。此前已拒绝的请求保留原结果。
+
+飞书私聊回复的事件省略话题 ID 时，适配器从已核验的原消息上下文保留该 ID。
+App 因此可以一起呈现原正文、精确引用和已核验的话题节选。重复到达时省略
+该 ID 仍可沿用原请求，明确给出不同 ID 时继续拒绝。
+
+已有本人私聊管家连接还提供 **用于 App 管家**。Core 在原 binding 集合中保存
+明确的入口选择，不改变受众、受管身份或执行授权。多个管家不按列表顺序或最近
+活跃时间竞争。点击本机 App 管家聊天时，仅在所选来源中发现当前已有 Session，
+随后将确切 binding 与 Session 固定在 URL。发现完成前阻止普通输入框出现；
+发现不调用模型、不创建会话。未选择的旧安装保留普通入口。选定来源缺失、撤权
+或被替换时保持不可用，等待恢复或明确取消选择，不悄悄回退到另一管家或普通会话。
+Goal 范围、项目、明确原会话、受管 Agent 以及远端/只读视图保留各自导航。
+后来修改默认选择，不挪走已固定的原会话。
+默认 `POST /api/chat/sessions` 管家入口也在服务端解析同一已存选择，API 调用同样
+遵守；只能恢复原 Session 或拒绝请求，新会话/模型覆盖不能悄悄创建独立本机管家。
+明确指定的既有 Session 保持原身份。发现期间原 Session 关闭或身份变化时，
+默认管家入口拒绝此次打开，并保留原历史。飞书机器人已核验但本人登录不可用时，明确
+提示恢复本人登录，不清除选择、不放宽来源核验；用原账号为同一 App 恢复登录后重试。
+概览中的快捷提问与输入框使用同一个明确选择，复用确切原 Session 的发送、
+活动回合排队、流恢复和读回；选择核验不自动打开聊天，也不遮住 Goal 导航。
+核验期间禁止发送，失败时在输入框旁显示重试与会话设置，不切回普通管家。
+未选择时保持普通概览行为；选择原来源后，概览快捷提问仍可发现，打开完整对话
+时将已核验的 binding 与 Session 固定到 URL。此旅程不建立第二队列或消息消费者。
+所选 binding 已移除或工作区不可用时，设置仍保留明确取消选择的入口；取消只改变
+默认入口，保留全部会话历史与执行授权。
+
+**尚未交付的桌面验收项。** 普通 App、网页与外部消息入口必须共用一个机器级服务
+归属，以及其原 Chat 存储、Session 身份和委派受众。打开窗口不能悄悄另起一套
+服务/runtime，形成不同历史。关闭、重开及升级 App 应保留原消费者与在途工作；
+服务缺失或尚未核验时明确显示恢复，不能切到另一份存储。既有独立 App 历史保留
+用于明确恢复，不擅自混入或删除；开发隔离须显式选择。对某个 Bot 服务做浏览器
+验收不能证明实际原生 App 路由正确。此项保持未闭，直至原生路径实现并独立读回。
+
+Chat 存储覆盖不另选注册工作的权威根目录。工作区状态与交付任务图沿用协调器
+既有的注册 runtime root，私有 Chat 历史与设置仍留在原存储。
+绑定 Session 索引在同一次新 Core 核验和 binding 锁内返回有限的显示来源。
+打开该原会话不再等待全部连接的设置清单、无关 Agent 候选或 listener／恢复诊断。
+客户端仍要求准确的 binding 回显、本人私聊、可用工作区和一致执行器；来源描述
+缺失或失效时拒绝，不回退设置清单或另建 Session。既有五秒读取边界和每次输入的
+新准入不变。
+原会话未发送的输入归属于固定 binding／Session，不随执行器的加载或不可用显示
+状态改换草稿。来源拒绝及恢复保留可编辑正文和内存中的图片，不因此允许发送；
+普通多执行器会话仍各自保存草稿。唯一一份旧执行器分键草稿恢复到同一原会话，
+多份有冲突的草稿保留为可单独恢复的内容，不覆盖当前输入。未确认发送恢复时保留
+原请求／Turn 身份，显式重试前仍走正常来源准入。文字沿用原标签页的 session
+storage 生命周期，不新增图片跨刷新持久化。
+此项资格只覆盖来源读取边界，不代表完整历史／媒体同步或安装态的
+真实 provider 往返已通过。
+原会话委派列表通过
+既有 Effect 请求范围为每次 HTTP 读取固定一个已核验代码修订。在一次读取内，
+每个不同的原 Session（包括重开会话背后的旧 Session）先独立核验 provider 范围，
+返回任何内容前再对所有已观察来源做一次新核验。每条记录仍检查当前来源依据、
+宿主、Turn、目标授权、Goal 生命周期和回执状态；结束核验发现 binding 或 provider
+身份被撤销时，整份响应拒绝返回。证明不跨 HTTP 读取保存，下一页独立核验来源
+范围和代码修订。provider IO 因而随来源数而非历史记录数增长，不缓存回执决策、
+不缩小扫描覆盖。来源不可读继续显示覆盖不完整，不能当作成功的空列表。
+
+每次 HTTP 读取内，Chat 来源观测器对每个已核验来源 Session 只定位一次原 client Turn，
+随后每条请求仍重新读取确切 Turn 文件。此 Python IO 定位器只保留 store 路径，
+不缓存正文、授权或回执决策，下一页重新构建。Turn 丢失或 client 身份变化仍计为
+来源覆盖不可读。这样消除重复全历史扫描，不改变 typed 协作 owner 及其核验；
+provider 延迟与完整安装态跨端验收仍是独立边界。
+
+冷启动 Goal 深链接时，先等待当前状态目录，再判断所选 Goal 是否已失效；内置
+占位数据不能证明有效 Goal 已被删除，初始 Goal 路由因此不会误入默认管家发现。
+
+![选择已有合成来源](../../assets/personal-workspace/app-steward-entry/choose-source.png)
+![继续其原会话](../../assets/personal-workspace/app-steward-entry/original-conversation.png)
+
+公开安全的打包证据另含
+[窄屏选择](../../assets/personal-workspace/app-steward-entry/selected-source-narrow.png)、
+[入口不可用](../../assets/personal-workspace/app-steward-entry/unavailable-narrow.png)和
+[窄屏完整报告](../../assets/personal-workspace/app-steward-entry/full-report-narrow.png)。
+以上使用临时 Core/HTTP 状态及合成 provider/模型数据，不代替安装态外部送达或
+完整同步目标的验收。
+
+App 复用原对话历史、单输入框、流恢复和排队输入 owner。安静刷新读取经核验的
+紧凑索引，仅在变化时读取快照；原来源新增消息无需导航即可显示，Web 输入保留
+Web 来源，通过已有 Core 队列及新鲜来源准入。连接列表独立于 App/凭证目录加载，
+目录失败不会隐藏已有会话或将其标为未连接。
+
+真实 Chat HTTP/SQLite/Core 配合合成 provider 与模型，验证来源选择、两种输入
+来源、拒绝/恢复及不创建替代 Session；打包浏览器证据另行验证本机 UI 路径。
+真实 Lark 结果回传、安装态服务采用、分离运行根组合及无 Goal 项目的 peer 交办
+仍未关闭，不由此检查点代替。
+
+现有 Lark 回复 worker 现在也投递该本人私聊确切 Session 中已提交的 App 用户消息和
+回答。每份 provider outbox 保留 canonical 消息身份、冻结正文和发送尝试。原 Lark
+输入只提供地址来源证据；投影不会重新受理它或启动模型工作。每次发送和恢复回执前，
+Core 重查 Session、当前绑定与受众，provider 核验原来源。消息标明 App 发言者，在
+该 outbox 内按 canonical 追加顺序发送，长正文沿用既有富文本分段，保留完整内容。
+飞书能为已核验送达的 App 提问镜像提供消息链接时，新回复会链接到同一 Turn 的提问。
+长提问使用最后一条实际分段消息。outbox 在首次发送前保留链接，恢复时沿用同一发送
+尝试的正文。原私聊取不到链接时，正文继续沿既有路径送达。
+App 来源 Turn 的终态错误也沿原私聊补齐。根据原 Turn 与精确匹配的错误行生成
+失败提示，并标注原结束时间。原始诊断留在 App。恢复时使用原 outbox 与消息身份，
+已送达的输入可以补回一条历史失败提示。先前未确认的停止提示与已完成的 Turn
+不作为终态失败投递。
+即使正文相同，不同 canonical 消息及分段也使用不同 provider 幂等键；未提供该身份
+的既有调用者保持原回执 digest。恢复先读回已知发送，再继续未发送部分；已经开始但
+没有 provider locator 的写入，重启后仍保留未确认。撤权或身份变化阻止后续投递。
+关闭既有连接即可撤销授权；回滚须保留私有投递 journal。
+
+新核验送达的 App 用户镜像也复用已有表情回执：`Get` 表示已收到，仅在观测到 Core
+Turn 已进入 starting/running 后添加 `OnIt`；完成、失败或中断后清理处理中表情，
+保留已收到。排队不冒充处理中，App 答案不加这两种表情。长输入作用于最后一条已核验的
+实际分段消息，不对组合 parts locator 操作。Turn 独立变化即使没有追加正文，也会由
+既有五秒扫描发现。每次副作用前重查 canonical 输入/Turn、当前来源和授权，以及冻结
+provider 消息；反馈失败保留可恢复回执，不阻断正文送达或启动工作，未知 provider
+写入不重发。App 可选反馈最多占用既有回复池的一个槽位，在正文 outbox 锁外执行；
+回写时仅合并反馈字段，保留并发完成的当前和后续答案投递。
+空闲扫描仅在本地日志未变化时复用 App 消息和 Turn 的引用；每轮仍读当前 Turn 状态，
+有表情待更新时沿原路径核验完整输入、来源和 provider 消息。
+不伪造 incoming event，也不结算原 Lark 请求。已有已结束镜像不补写表情，
+当前活动镜像可接续此反馈。`loopx chat --no-private-reactions` 仍可关闭反馈，正文路径
+不变。隔离真实 HTTP/Core 配合合成 provider 的检查只核验源码行为；安装后的实际
+Lark 表情和 provider 呈现仍独立验收。
+
+通过上述 **继续原会话** 或明确选定的 App 管家入口使用该路径；旧普通历史继续
+独立保留。本检查点覆盖文本、提问链接及有界 App 图片投影。原生回复和话题位置、
+向 Lark 历史回插旧时间及全渠道广播仍待处理。Core 中的 App 图片复用既有资源上传与 post
+发送器，正文及有序行内图片留在原私聊；长正文只在最后一个实际分段携带图片。
+每次上传和发送均重新核验原来源、当前 Core 消息与授权。发送和编辑在 provider
+预检返回后、记录写入意图前再次检查；每个继续或恢复的富文本分段复用该边界。
+完成还须独立读回图片
+字节。验证失败时沿同一消息回执恢复，不再次上传或发送。上传确认未知，或发送
+已开始但缺少消息定位符时，重启后仍保留未确认。以前已发送的附件占位说明保留
+冻结回执及 partial 状态，升级不自动重放。真实 HTTP/Core 配合合成 provider 的
+旅程覆盖重复输入、完整图片和长正文、重启、回执缺失/未知、字节不符、撤权及
+App 身份替换；安装态 provider 读回另行验收。
+
+绑定的 App 历史也显示 Core 已明确判为不支持的原飞书文件、音频或视频的只读
+提示。展示前核对原 Session、当前本地本人绑定和两份原回执；原来源时间参与
+历史分页，迟到记录会使受影响的旧游标失效；即使没有新 Turn，提示变化也会触发
+App 刷新。提示不携带资源字节或凭据，不创建 Turn，也不重发原回复。
+
+同源 App 读取已绑定的管家历史时，可请求图片地址，不必在历史分页内传输 base64。
+历史校验包含由原图内容导出的地址。读取图片时核对原 Session、消息、附件位置和
+内容摘要，再返回原字节。App 在图片接近可见区域时加载，读取失败后可在原消息中
+重试。刷新时只接受已核验的同一 Session、消息和附件位置的图片地址，旧内容摘要
+保持不可用。旧客户端、文档和 Turn 输入继续使用原有格式。
+
+实现判断来自一手源码比较，不把共享上下文视为双向送达已经成立：
+
+- [OpenClaw 历史增量](https://github.com/openclaw/openclaw/blob/b3ba4d622638ac23f64c0cec415bf5bfe81f5cf5/src/gateway/server-methods/chat-history-delta.ts)
+  对不完整/受限投影要求重置；其
+  [发送重试 owner](https://github.com/openclaw/openclaw/blob/b3ba4d622638ac23f64c0cec415bf5bfe81f5cf5/src/gateway/server-methods/chat-send-retry.ts)
+  对已经开始的执行先对账。这些机制用于恢复设计，不代表已有 Lark 桥。
+- [nanobot 统一会话键](https://github.com/HKUDS/nanobot/blob/9e9e22d3319678178dba05a76f0ea61064b78ee8/nanobot/session/keys.py)
+  和[最后目的地路由](https://github.com/HKUDS/nanobot/blob/9e9e22d3319678178dba05a76f0ea61064b78ee8/nanobot/agent/loop.py)
+  可以共享上下文，但最后目的地不等于向每个界面复制完整记录。
+- [mautrix 消息映射](https://github.com/mautrix/go/blob/a4237e5b9f8f0e9b35c81d5310615eb70c202cea/bridgev2/database/message.go)
+  及 [portal 回声处理](https://github.com/mautrix/go/blob/a4237e5b9f8f0e9b35c81d5310615eb70c202cea/bridgev2/portal.go)
+  支持稳定事务/分段身份和回声抑制的设计判断。采用 Matrix homeserver/桥还会增加
+  独立基础设施与身份 owner；LoopX 借鉴设计，不复制 MPL-2.0 代码，另两个快照为 MIT。
+
+![合成私聊工作区设置](../../assets/personal-workspace/private-project-conversations.png)
+![窄屏私聊设置](../../assets/personal-workspace/private-project-conversations-narrow.png)
+![工作区撤权读回](../../assets/personal-workspace/private-project-workspace-revoked.png)
+
+## 指定群话题：隔离的普通项目 Chat
+
+设置 → Lark 可将项目 App 接到明确选定的群。群列表来自当前 App 的 provider 成员
+观测，Core 在配置时核验白名单；这是现有 binding 的受众选项，不新增 Goal Channel、
+listener、队列或模型 runner。一个 App 仍只有一个 binding owner，已有私聊绑定保留
+原受众及宿主权限。
+
+新群绑定只核验选定 Bot 的 App 身份，不要求同一 profile 登录个人用户。群 principal
+限定于 App，不提供本人私聊权限；个人项目和管家私聊仍同时要求独立核验 App 与用户。
+旧群绑定若使用用户 principal，继续保留确切身份和原生 home；明确解绑再连接才选择
+新的 App principal，并需要新的隔离 home/登录。轮询或用户登录、退出不会迁移绑定。
+
+成员 @Bot 开始话题。受理时读取 provider 原消息，续聊还读取原话题根；事件文字不能
+替换根消息或提及证据。同一话题的成员共享 Session 与 FIFO，不同话题、群和 App
+使用独立 Session。status、stop、new 只作用于当前话题。受理反馈、流式消息、最终
+编辑和回执恢复复用现有投递路径，使用 `source_thread` 落点。解绑或原消息不可读后，
+即使执行完成，也不得继续发送结果。
+
+已在本机受理的话题收到 `/status`、`/help`、`/new` 或 `/stop` 时，传输层用一次
+原始 provider 读取获取当前消息和根消息。已接受的根 journal 只用于确定这两个读取
+ID，不授予权限。IO 完成后，Core 在既有请求与来源路由锁内重新核验确切 binding
+和 App；进程内来源校验器依据该次结果核对发送者、关联关系、根提及及仍有效的绑定，
+然后才创建 journal 或返回确切重放。换 App、撤权、缺失消息或来源冲突均拒绝控制。
+事件提示是控制命令而 canonical 正文是普通文字时，在任何 Core 写入前返回普通
+渲染路径。未知话题和旧版已固定渲染文字的 journal 保留原路径，不跨事务缓存身份；
+投递校验、typed 受理决定及停止恢复仍归原 owner。File/Core 测试覆盖事务与拒绝、
+重放边界；真实 provider 的读取耗时不单独证明完整停止回执或 Web SLA。
+
+带结构化 Bot 提及前缀的控制命令使用同一有界读取路径。事件中的渲染名称或提及 key
+只提示读取哪个来源；原始正文的开头提及必须匹配本次新核验的 App，并解析为同一个
+确切命令。普通文字、其他 Bot 的提及或不匹配的提示不能授予控制权。原始渲染消息
+保持不变，用于确切重放及兼容旧 journal。
+
+本机群绑定仍启用且 Core 已完成、固定原目标的停止请求，可在 Core 重新核验绑定和
+App 身份时，并行读取两条原 provider 消息。两项只读观测全部成功后，仍须核对来源、
+关联关系和根消息提及，才能投递；仅该次校验复用身份观测，不持久化或跨次复用。
+绑定发生变化时丢弃预读消息；普通输入、本人私聊和未知停止范围保持原路径。
+
+普通 Codex 话题空闲时，`/stop` 也覆盖同一原生 Session 中已完成 Turn 遗留的后台命令。
+Core 先在原请求日志固定 Session 与候选 Turn，原 listener 随即继续受理消息；现有
+回复工作池再恢复这条 prepared 请求，读取原生命令清单并取消原目标。恢复只能缩小
+固定候选，不能追停后来的 Turn 或新 Session。
+发现已完成命令时，一次分页读完确切原生线程的 item 清单，仅保留冻结候选的命令
+归属，避免按历史 Turn 逐个往返。归属缺失或冲突、分页不完整仍不能确认；之后仍须
+执行原有的确切 Turn 取消与独立终端清单读回。prepared 恢复复用受理路径在原请求与
+来源路由锁内的新鲜授权核验，不在等待锁前重复探测 provider；等待期间撤权即阻止
+控制和投递。慢速或失败的原生控制不阻塞入站，
+也不提前回复“已停止”；没有固定目标的旧请求保持未知，活跃 Turn 仍沿原确切中断路径。
+这只调整现有 IO 调度，不新增队列、消费者或完成状态；实际安装、停止时延与完整社区
+准出仍需分别验收。
+
+群上下文强制使用 `workspace_only`，不受本人私聊 `host_default` 影响。只保留选定
+工作区的读写 grant，不提供个人 portfolio、直连 Agent 选择、全局 skills、MCP、
+shell profile 或继承的账号环境。原生宿主必须确认确切 permissions profile 和工作区
+根；独立存储不能复制个人凭据或历史，模型认证可由可信宿主提供。`/status` 只显示项目标题，不展示
+宿主绝对工作区路径。
+
+Core、HTTP、provider 读回及原生协议 fixture 验证上述边界，属于合成传输/模型证据。
+[社区黄金查询](../../product/use-cases/community/golden-queries.md) 仍需隔离的公开工作区、
+模型认证与真实调试群旅程通过后，才能接入两个正式开发群。公开来源读取另需完成其
+限定范围工具的验收；本改动不启用无限制网络或个人浏览器。
+
+`workspace_only` 会话新建与恢复时均关闭原生 Apps connector 和继承的 MCP。
+宿主显式设置 `LOOPX_CHAT_PUBLIC_SOURCE_READ=on` 后，仅允许匿名
+`read_public_url` / `read_public_image`，并为这两项工具设置原生批准规则；其他 MCP
+工具仍不可用。关闭该开关会移除公开 reader，隔离会话的 Apps 仍保持关闭。
+普通 `host_default` 会话保留账号原有配置。
+
+已有项目原生登录继续使用其选定账号；否则，可信宿主的原生文件式 ChatGPT 认证
+可通过 Codex 实验性 `chatgptAuthTokens` 接口，仅在私有 stdio 中提供 access token
+和账号标识。短期认证保留在进程内存，不写入项目存储、模型上下文、工具环境或命令行。
+认证失效时，由原生宿主账号存储刷新；并发请求复用已刷新的 token。宿主账号不可用、
+凭据损坏或账号变化时返回脱敏错误，恢复宿主账号后可在原 Session 重试。
+本 adapter 不桥接仅存于 keyring 的认证或 API key；仍可对项目独立执行原生登录。
+该认证路径不扩大工作区、skills、工具或群受众权限，也不代表社区准出已通过。
+
+## 普通工作区读写：默认值与撤权检查点
+
+普通项目 Chat 对宿主声明的工作区默认使用 `workspace_write`。Core context owner
+在启动和原线程恢复时导出真实 Codex `workspace-write` 沙箱；仍是普通对话，不借
+Task/Goal 模式或 manager 权限。项目 prompt 要求读取工作区 AGENTS.md 与适用 skills，
+执行明确请求所需的有界编辑；持久状态继续走既有 owner。读写 grant 本身不激活
+Material Lifecycle，也不证明项目 adapter 的 intake/ranking 已接通。
+
+`loopx chat --project-workspace-grant workspace_read` 将宿主及 Lark 项目绑定限制为
+只读。设置 → Lark 的 Codex 项目 App 默认读写，并保留只读选项；其它 executor 在
+宿主策略完成验收前保持只读。设置读回、/status 和 /help 显示实际 grant，重新选择
+已配置 App 会恢复持久配置。改变 grant 会创建新绑定及 Session，拒绝旧会话的新工作，
+直连 Agent 必须重新授权；不能偷偷提高 attached 宿主或另一 App 的权限。宿主撤权或
+降为只读后，入站受理及恢复重新核验授权。本机 Scope 只复用相同 typed 项目上下文；
+宿主授权变化时创建新会话，保留旧历史，拒绝在旧会话上执行新工作。
+
+`loopx chat --project-filesystem-scope workspace_only` 进一步将普通 Codex 项目 Session
+限制为工作区文件工具：拒绝根目录访问，只保留最小系统可执行文件读取，既有读写 grant
+只作用于选中工作区。关闭临时目录、shell 环境继承、login shell、web search 和工具
+网络访问。typed context 持久化该选择，变化后旧上下文不能复用；默认仍是可写的
+`host_default` scope。
+
+shell 只保留 `PATH`，禁用 shell profile snapshot，POSIX 使用固定最小系统搜索路径，
+同时过滤账户配置覆盖及继承变量。macOS 可信宿主可通过固定系统 `xcode-select` 选择
+标准 Command Line Tools/Xcode toolchain，将其 Git 目录前置并授予只读。由二进制到
+`/` 的每个路径都必须 canonical、root-owned、类型正确，且 group/other 和调用方均
+不可写，包括 ACL。容器不安全（含可写 `/Applications`）、toolchain 缺失或选择不支持
+时保留原 profile/搜索路径，不放开 toolchain 写入、根目录读取、账户环境或工具网络。
+真实探针不证明 Windows 执行合格。
+
+收窄 profile 关闭自动 skill catalog 注入和项目指令发现，Agent 可经有界文件工具读取
+工作区自己的 `AGENTS.md` 与 skills；普通项目 Session 保留原生发现。workspace-only
+原生 Session 使用私有 `HOME`/`CODEX_HOME`、最小进程环境及文件式原生凭据存储；
+新建与恢复均禁用有效 MCP server（包括 managed/项目配置）及原生 Apps connector。
+operator 的 `LOOPX_CHAT_PUBLIC_SOURCE_READ=on` 只准入匿名 `read_public_url`/
+`read_public_image`，并须原生工具显式批准；其他 MCP 不可用，关闭开关移除 reader，
+Apps 仍关闭。Core 按获授权工作区和 App/owner binding 派生 store identity；不同
+话题保留独立线程，不要求每条消息重新登录。`host_default` 保留账户原配置和认证。
+
+不把认证或对话历史复制到新 store，已有项目原生登录保留所选账户。否则，可信宿主有
+文件式原生 ChatGPT 登录时，adapter 仅经私有 app-server stdio 的
+[`chatgptAuthTokens`](https://learn.chatgpt.com/docs/app-server#3c-log-in-with-externally-managed-chatgpt-tokens-chatgptauthtokens)
+传递 access token 与账户标识。该实验模式只在进程内存持有 token，不写项目 store、
+模型 prompt、工具环境或命令行。未授权 token callback 要求宿主账户 store 刷新，并发
+callback 复用已轮换 token；账户不可用、store 无效或账户变化失败关闭并脱敏报错，恢复
+账户后可重试而无需重绑。此 adapter 不桥接 keyring-only 或 API-key 认证；可将
+`CODEX_HOME` 指向 Session 已记录 home，走原生独立登录。旧共享 home 的 workspace-only
+Session 不静默恢复/迁移，须显式选择隔离 home 的新 Session；普通 legacy Session 保留
+原 home 和精确原线程恢复。
+
+adapter 在新建和精确线程恢复时只发送 Core 所属 named permissions profile，不同时
+发送 legacy sandbox override。核验返回 profile 与唯一工作区根，后续 Turn 固定该
+profile；宿主不支持时拒绝，不 fallback 到更宽权限。此 scope 拒绝其他 executor，
+native helper 使用 canonical Codex executable，home symlink 无需另加读取 grant。
+这是文件系统工具边界，不是完整社区 Bot 隔离；不授权群受众、不清空历史、不隔离任意
+host dynamic tools，也不让含私有文件的 checkout 自动具备公开安全性。公开启用前仍须
+群准入、干净公开工作区、合格模型认证及真实隐私/交互验收；原生上下文隔离和文件探针
+通过只是前置证据。
+
+typed Core、HTTP 与原生宿主回归覆盖默认读写、明确只读、工作区身份、App 独立授权、
+旧会话拒绝和原线程恢复。既有源码证据记录了 Codex canary 编辑并读回合成笔记、
+保留原文且不创建 Goal；这项历史宿主/文件系统证据与本次合成协议回归分开，
+不代表真实 Lark 写入、素材 intake 或发布完成。
+
+断开外部绑定或替换其身份、上下文、grant 时，先发布 typed 撤权，再复用 Core
+精确回合中断：先取消该绑定排队的工作，再停止活动回合，覆盖话题和恢复会话，
+其他仍有授权的会话继续运行。历史保持可读，相同配置的重试不中断执行；等待宿主
+停止时不持有授权发布锁，也不新建队列、调度器或 provider authority。停止未确认
+时保留已发布的撤权并明确返回失败；使用旧 binding identity 和当前 revision
+重试断开可继续确认停止，替换失败后亦如此。Settings 从 Core 已持久化的排队/运行
+回合投影旧授权目标：变更失败后仍读回当前 revision，刷新、重载保留精确停止重试，
+不恢复授权。只有 Core 确认回合终止后才移除恢复项，新绑定和无关工作保持不变，
+不引入独立停止台账。已领取的 attached 宿主仍无推送停止
+能力：撤权明确报告这个限制，取消其待领取外部请求，保留无关本地回合。这些源码
+语义由合成 Codex/provider 回归验证；安装态和真实宿主停止、物理命令取消及社区
+准出仍需分别验收。
+
+同 claim 已领取回执恢复与新任务准入分开：响应丢失后撤权，原宿主可读回已提交回执；
+新领取及外部结果发送仍拒绝。验证使用真实 Core HTTP、文件存储、领取 broker 与
+合成 Codex/provider；不声称本次运行真实模型编辑或手机旅程。安装与真实 Lark 旅程、
+更多 IM 交互仍未关闭。
+
+## 本人私聊管家：明确的新委托
+
+设置 → Lark 可为独立 App 选择管家角色。既有 typed conversation binding
+固定 App、独立核验的本人、来源和工作区。新建本人管家默认 `all_registered`：
+从当前配置的 registry 发现全部已注册 Goal 与 Agent，后续注册也自动可见。
+停止的工作可通过显式历史查询发现，但不接收新工作。已核验的空 registry 与授权
+不可用分开，不导入旧历史 registry 或身份。普通项目聊天仍没有 Goal 或管家身份。
+
+旧绑定保留原已选范围。设置 → Lark → **授权全部已注册工作** 原地升级既有绑定及
+其已知本人来源的交办策略，不替换 Session 或受众。单个收件 Agent 的撤权继续生效；
+发现目录不证明执行就绪，也不增加受保护操作权限。可信本地的
+`manager-inbox configure-delivery-scope` 复用相同 source-policy owner；新核验私聊来源
+仅初始化一次策略，普通消息不会重新放宽人工收紧的既有策略。
+升级先写入并核验所有已知交办策略，再发布扩大的绑定范围。I/O 写入失败时，
+界面保留原绑定范围并允许明确重试；本次升级已授权、先前成功的来源策略可能
+保留，重试会收敛而不重置单个收件人的撤权。这不声称跨文件原子事务。
+
+配置的 registry 声明 `common_runtime_root` 时，即使 Chat 使用独立存储 override，
+协调上下文、inbox 和返回处理仍使用该根目录。App 绑定、对话和 provider 凭据保留
+原私有存储；未声明共同根目录时保留原本地 Chat 行为。本增量不等于 worker 激活、
+接收方采用或原路结果返回闭环；原生私聊 ingress 与已有群 ingress 仍是独立集成边界。
+
+只有显式 `/delegate --tokens N 具体目标` 会准备既有 `goal.create` 预览。
+确认必须在十五分钟内从原本人、App 和私聊来源进入。预览固定只读边界、原生总
+token 上限和不启用默认调度的事实。既有 canonical Chat action 创建 Goal 并返回
+回执，Core 仅把该确切新创建加入此管家范围。已有 Goal 或单一工作区 fallback
+不能重定向委托；普通聊天和模型文字不能创建委托。
+
+既有服务 worker 推进已持久受理的 Core 操作，入站不等终态。只读工作由 Codex
+原生 Goal continuation 执行，结果经原私聊 delivery journal 返回。
+`/stop-commission` 在受理时固定确切执行目标；显式
+`/resume-commission ... --tokens N` 保留原 Session、原生线程、目标和累计用量。
+原生完成是宿主执行证据，不是 canonical Goal/Todo 验收。总上限包含历史用量与
+上下文，运行中的请求可能超过上限；没有默认 heartbeat。
+
+新委托扩展 portfolio 时，在原管家线程刷新有界证据和工具。创建提交后，既有
+请求日志先保存确切资源回执，再尝试加入管家范围。加入或读回失败时，操作保持
+排队以供恢复。恢复重新核验原 binding 与 canonical 回执，采用同一批资源并
+返回结果，不再创建 Goal 或模型线程。范围加入仍待恢复时，通知回执不能结算
+该操作。故障旅程覆盖加入失败、加入后读回丢失、创建 owner 调用中断及 binding
+撤权；验证的是 provider/Core IO 恢复，不是完整宿主重启。App、本人、来源和
+工作区仍固定并重新核验。原生事件读取在没有输出时，也不能卡住停止所需的控制
+RPC 回执。Lark 专属设置 companion 归 extension；会话、请求、范围和创建语义
+仍由现有 typed owner 持有。
+
+回归覆盖独立空态与无授权、另一 App/来源确认拒绝、过期、创建与 scope adoption、
+原生结果返回、停止、重复事件和同线程恢复。本地真实 Codex 源码 canary 另验证
+合成委托遇到额度限制后，沿用原生线程恢复并返回可核验的 fixture 结果。
+这不证明真实飞书入站或手机验收。多 Agent 协调、真实媒体/权限交互、正式安装与
+登录恢复、手机旅程仍开放；runtime/authority 发布继续等待维护者审核。
+
+合成产品预览：[空管家与项目助手](../../assets/personal-workspace/private-steward-empty.png)、
+[窄视口](../../assets/personal-workspace/private-steward-empty-narrow.png)。
+
+## 私聊状态与帮助：授权范围内的观测
+
+`/status` 与 `/help` 复用既有 typed bound-request owner，展示已授权角色、工作区、
+executor endpoint、原生 Session/active Turn 与已持久排队数量。管家只统计此 binding
+当前获授权的新委托。executor endpoint 不代表已经选择注册 Agent；原生执行结束
+不代表 Goal 验收，也不证明结果已经投递。
+
+Core request 在 provider 投递前保存带时间的观测。重复事件保留原快照，不切换到
+较新的 Session。已选定注册 Agent 时固定观测其确切绑定 Session：即使该会话已
+失败或关闭也如实读取，不退回更新的会话；执行证据缺失和未知状态明确显示不可判定。这两个命令不会打开
+Session、调用模型或创建 Goal。`/help` 按角色列出命令、既有设置 → Lark 的工作区、
+执行器与解绑入口，以及图片支持和暂不可用的媒体/原宿主边界。
+
+本人管家的 `/triage`、`/gates`、`/todos` 与 `/triage all` 复用既有授权查询和持久
+投递路径，不启动模型 Turn。同一 App 的回调消费者分发管家查询卡和 typed operation
+确认卡，不另建订阅。查询回调保留原 Chat binding、来源授权与 Session；操作回调
+沿用既有操作处理器和控制器的协调根，包括原提案、确认、claim 与原卡结果读回。
+Chat action store 不作为备用操作权威。App 不可用或身份变化时拒绝操作；未知回调
+形状忽略，各协议原有 owner 继续负责来源校验和重复处理。若已配置独立操作消费者，
+切换前须协调其归属；本片段不停止该消费者，也不迁移已配置的 managed wake 策略。
+未配置的 managed wake 仍无执行授权。
+
+混合协议回归使用一条实际回调流，以及 Chat/协调根分离的 fixture，运行真实 Core
+operation store，provider/执行器为合成实现。它验证错误会话拒绝、重放只执行一次、
+原卡结果读回、解绑撤权及查询不增加模型 Turn；File、SQLite 来源查询回归仍须通过。
+这属于源码和打包路径资格，正式服务切换与真实客户端点击仍待验收。
+
+回归使用生产原生文件 store、持久队列、bound request 与 provider 受理/投递路径，
+provider 和协议执行器为合成 fixture。它验证排队、停止、读回和重复投递，不证明
+本增量的真实 provider、手机或正式安装验收。注册 Agent 选择及更广协调仍开放。
+
+## 显式注册 Agent 选择：沿用原 attached 宿主
+
+设置 → Lark 可以为项目 App 授权确切的已有注册 Agent attached Session。
+共享类型化 binding owner 核验工作区、Goal、Agent、Session、执行器、Goal lifetime
+和确切宿主；App/本人独立核验，配置通过 revision fence 发布。每个 App 最多
+16 个明确目标授权；执行器名称不等于注册 Agent 身份。此操作不创建 Agent 或
+Goal，不导入宿主历史、旧绑定或 portfolio。
+
+私聊 `/agents` 只列当前可用授权；复制完整 `/agent <target-ref>` 选择后，后续
+文字进入原 canonical Session 持久队列，由已有宿主领取并写回。`/project`
+返回原普通项目会话。切换或崩溃后，已受理消息仍保持原目标与 App/source，结果
+返回原私聊；不启动或恢复另一 model adapter。原宿主须已接入
+[原生 attached broker](../../integrations/attached-agent-session-broker.md)。
+
+队列保存冻结受众与确切目标。宿主领取前在 grant/queue fences 内重新核验本地
+授权、注册、工作区、lifetime 与宿主；撤销拒绝尚未领取的消息和私聊结果回传，
+已被领取的执行仍归原宿主。Session 与宿主受众 stamp 阻止将同一持续对话分给
+另一 App，包括撤销后重新授权。入站与出站另行核验原 App 的本人/source。
+消息授权保留原宿主的执行策略与领取/完成 authority。
+
+`/status` 展示真实 Agent 接收者与持久队列。当前 attached broker 不支持 push
+interrupt 或新建原宿主会话：`/stop`、`/new` 明确回应不可用，保留原执行；
+请在原宿主处理，或 `/project` 回到普通聊天。设置可撤销目标或解绑 App；
+缺失工作区与失效授权保持不可用。候选空态不会自动建立角色或虚构 Goal。
+
+合成 provider/native-store 旅程覆盖选择、追问、原结果回传、重放/恢复、撤销后
+领取拒绝、确切注册和跨 App/宿主隔离；类型检查与 Settings 打包覆盖产品伴随面。
+真实 attached 宿主自动领取、手机验收、增量媒体/权限交互和更广的管家协调仍开放。
+本源码增量经维护者评审后才能进入正式安装。
+
+## 决策：让 App 成为工作会话持续进行的地方
+
+用户应能在 LoopX 中说“接着做，结果给我” / “Keep going and bring me the result”，
+无需寻找另一个终端、复制上下文或在 Agent 之间搬运答案。优先完成安装后的 App 使用路径。
+共享语义和证据，各 transport 独立验收。Lark 保留为受支持且有回归覆盖的 adapter，
+App 改进无需等待 Lark。
+
+这不只是显示远端对话记录。LoopX 必须接受请求，将其关联到现有负责工作和执行者，
+投递纠偏、观察真实进度，并把可读结果返回同一会话。runtime 仍拥有执行责任。
+Goal/Todo、lease、quota、验收和 effect 各自保留原有权限归属。加入会话不产生权限。
+
+体验围绕五个问题组织：请求还在吗；谁确实在工作；纠偏或停止生效了吗；
+核验过的结果在哪里；失败后如何回来且不重新启动工作？
+
+### 实时 Bot 入口与接收者职责
+
+原生 Bot 替换是这套对话生命周期的另一个入口，实时连接独立于 Goal 周期工作。
+入口与接收者职责分开：普通项目对话、与既有 Agent 直接交流、持久管家共享机制，
+但目标与授权不同。[管家运行契约](capable-manager-semantic-handoff-v0.zh-CN.md#10-运行契约)
+在 S5 下排列传输隔离、普通私聊/角色选择、进度/媒体/权限及安装态替换验收。
+
+普通项目对话需要共享 Core 会话上下文，明确授权工作区、executor 和受众，
+无需用户创建 Goal，也不自动赋予全局管家目标。这是尚待实现的入口要求，
+不是新增已发布 Session schema。Lark 不能通过创建隐藏 Goal、复制其它 host session
+或另建 executor 来实现。显式接收者选择使用权限范围内的稳定引用，标签不授予权限。
+切换接收者影响未来输入；已受理工作和回报保留原 Session、来源和受众。
+停止针对当前精确请求，不停止 Bot 后面的全部 Agent。
+
+### Managed 与 attached 是不同的执行关系
+
+| 关系 | App 承诺 | 必需证据与限制 |
+| --- | --- | --- |
+| Managed | 从会话启动或继续已授权的 LoopX worker，观察并控制其实际 Turn | 稳定的请求→工作→session/Turn 关系、实际 model/effort、准入、受支持的中断、结果和重启读回。每个 binding 只有一个执行 driver |
+| Attached | 连接现有已注册工作与 session，在保留上下文和原生入口的同时把后续互动移入 LoopX | 核验 host/session binding 与 adapter 能力。经受支持的 live control 或 inbox/next-Turn 路径投递；排队不等于采纳。不静默创建第二个 session 或启动竞争 driver |
+| 未绑定或不可用 | 保留请求，解释缺失的连接、认证、权限或容量 | 提供现有受支持的连接、创建或修复路径；目录中存在不等于可用。只有实际歧义或缺失授权才需要询问 |
+
+“迁移会话”指后续请求、结果和稳定链接的连续性，不授权复制原始 host rollout 数据库、
+重绑定另一个身份或导入隐藏、私有历史。使用已授权的摘要和 artifact 引用。
+原生 runtime 可以保持打开，但不能成为第二个不同步的工作事实源。
+关闭 App 只停止观察，不停止执行。停止会话不隐式停止委派工作。
+
+## 产品表达：借鉴什么，哪些尚未证实
+
+[Lorca 发布帖](https://x.com/localhost_4173/status/2103454978220470708)
+检查于 2026-09-25，内容是**静态截图**，没有已核验的互动或恢复演示。
+截图展示具名会话列表、一个主会话、简洁的委派与返回记录，以及易读的回答块。
+[创作者产品页](https://lorca.app/zh)描述单人和群组聊天、本地执行、具名 Agent 和跨设备继续。
+这些属于创作者陈述；本次调研没有安装 Lorca，也没有验收其 runtime、隐私、正确性或长期运行保证。
+
+[创作者会话文档](https://lorca.app/zh/docs/chats)描述流式回复、当前模型或工具步骤之后的方向更新，
+以及桌面中断。提及对象交给 Agent 理解。文档还描述跨 Agent 接收者在各自会话回答：
+LoopX 还必须核验综合结果返回原请求。这些是文档陈述，非观察到的执行。
+不因匹配参考而引入固定转发次数限制或隐藏工具活动。
+
+借鉴信息层次，不复制素材或未验证的承诺：
+
+- 稳定、易读的角色和会话身份应比 runtime id 更易扫读。实际 model、host 和连接细节放在一步可达的位置。
+- 活跃会话和结果获得最大的有效阅读空间。简洁的委派记录说明谁负责什么并链接实际工作；
+  返回记录指向当前结果。不要让用户到另一会话寻找已请求的答案。
+- 把一个有用的下一步放在对应失败或决定旁。折叠常规活动，保留缺失授权、过期信息和失败。
+  管家与 Goal 详情复用一份可读事项说明：正文、原因/建议和证据链接优先，标识与声明范围放入键盘可达的折叠区；
+  不把列表摘要重复成另一张详情卡。来源只有摘要时明确标注，不能冒充完整请求。
+  操作继续由既有新预览、只读和生命周期约束决定，Markdown 展示不能推断授权。
+- 使用现有设计系统的字体、间距和克制的状态强调。动效解释已核验的转换，不虚构忙碌 worker。
+- 保持创建、连接、直接与 owner 对话以及团队工作可发现。更简洁的界面不能隐藏未解决工作或减少授权范围内的 owner 发现。
+
+预览使用公开或合成数据。检查有内容、安静、阻塞、不可用的桌面和窄屏视图。
+保留键盘访问、阅读位置和返回上下文。首屏改动仍须遵循仓库预览门禁。
+本设计不重新分发外部截图、私有事故记录或专有素材。
+
+事项详情这一切片验证打包渲染器及合成的桌面中文、窄屏英文和只读来源：可读 Markdown、
+完整正文、证据链接、折叠区/返回焦点、一次准确作用域的预览、失败/缺失/被替代来源约束，以及不可执行的来源 HTML。
+这是待交付的 App 展示改进，不代表已安装回读或完整 GQ10 排序能力。
+跨项目选择、最多两项建议与真实的范围内采用，仍归既有 P1 注意力工作。
+
+共用的对话证据投影应把已声明的恢复条件、后继关系与决定范围保留为结构化事实。
+概览正文有界，并用 `content_truncated` 标明节选；既有管家/Goal 上下文工具通过
+精确的 `view=todos`、`goal_id`、`todo_id` 读取恢复许可范围内的全文。
+CLI/SSH 导出使用 `goal-portfolio --manager-view todos --goal-id GOAL --todo-id TODO`，
+仍保留外部受众边界。条件或已完成的引用对象都不授予执行权限，也不证明恢复就绪。
+大目录复用已有的本机私有快照传输，对话行容量不变。真实 File/SQLite 回读、来源缺失、
+撤权、超大记录及执行器工具桥接验证这个证据切片；它们不证明模型排序、打包 App 采用，
+也不代表完整 GQ09/GQ10 已走通，这些结果仍须在 release 评测中验证。
+
+### 等待也是对话的一部分
+
+管家、Goal 对话和总览里的紧凑回执共用一个 TypeScript 活动组件。
+用户发送后立即显示接收反馈，不等执行器会话准备完毕才出现。最短路径是：
+发送 → 看见接收 → 真实活动或可处理的失败 → 在原处读到答案。
+
+- 用一行显示最近报告的活动和已用时间。时间表示等待时长，不表示完成比例或
+  持续计算的证明。切换视图保留起始时间；恢复时使用已记录的回合时间，未知则不编造。
+- 工具和阶段记录可展开，只显示上游报告的信息，不模拟阶段或暴露隐藏推理。
+  一段时间没有新事件时明确说明仍在等待，不推断失败，也不靠动画假装有进展。
+- 原飞书私聊受众与 Codex 使用同一套有界近期思考摘要模型：最多四条，合并后的
+  投影不超过 1,200 字符，并与答案流放在同一回复中；Lark 的树视图不再重复工具和
+  命令标题。群聊及未经限定的投影仍只显示粗粒度状态。反重力把经过共享脱敏的
+  `plannerResponse.thinking` 摘要映射进活动契约；`rawThinking`、planner 完成与
+  工具完成仍是不同事实。最终答案仍在绑定原请求的同一消息中替换草稿。
+- 普通 Codex Chat 在每个 Turn 明确请求简短的原生思考摘要，包括继承了
+  `summary=none` 的恢复会话和受限答复复核会话。执行宿主保留自己的摘要配置。
+  现有活动投影只展示上游实际返回的摘要；模型没有输出摘要时仍显示粗粒度状态。
+  该请求不增加 Turn，也不暴露原始推理正文。
+- 可见答案只生成一次，随后附加完整隐藏 review envelope，`message: ""` 表示
+  复用前面的 Markdown，仍经过相同脱敏与 typed 元数据归一化。旧的非空 message
+  保持优先；缺失或 null 不启用该约定。Codex 采用完成的最终答案 item，排除之前
+  的 commentary。信封不完整或格式错误时仍丢弃动作元数据。减少重复生成不代表
+  端到端回复时延已经达标。
+- 提交前只能取消准备，并说明请求尚未提交；接收后复用精确回合的纠偏与中断。
+  停止观察不等于停止执行器。总览回执和完整对话提供相同的操作。
+- Codex provider 通过原生 `turn/steer` 发送纠偏本身，保留多行文本和精确的
+  active Turn 身份。重放初始任务/policy envelope 会错误地把纠偏声明为新的
+  独立任务，可能挤掉原交付要求。初始 Turn 的准入、policy 和答复协议仍由既有
+  owner 管理；排队消息及 resume context 保留调用方给定的范围。修复位于 TS
+  迁移边界允许保留的 Python provider adapter，同时服务管家与 Goal Chat。
+  HTTP/store/protocol 回归只证明投递内容与重放行为，不证明模型采用或首次结果。
+- 失败停止实时状态，保留原请求和部分答案，并说明下一步。管家回合结束与
+  接收方采用、完成委派分别显示，不能把“已交办”算作任务完成。
+
+2026-09-29 核对的一手资料（并非对其他产品的实机验收）：
+[Perplexity Pro Search](https://www.perplexity.ai/help-center/en/articles/10352903-what-is-pro-search)
+说明问题拆解和来源链接；[Cursor Agent](https://cursor.com/docs/agent/overview)
+区分排队追问与执行中纠偏；[Gemini Deep Research](https://support.google.com/gemini/answer/15719111?hl=en)
+提供计划审阅与完成通知。借鉴可见性、可控性和完成边界，不照搬特定场景的阶段文案。
+通知与跨重启的持久计时仍需独立验收，浏览器计时器不代表已实现这些能力。
+
+决定性回归：延迟连接，提交前取消，重试并遇到启动失败，再在实际流式回合中切换
+总览与完整对话；验证时间连续、静默等待、精确回合操作、部分答案保留且不重复提交。
+打包 UI 使用合成数据验证，选中的真实查询另行验收。
+
+## 当前归属与缺口
+
+| 已检查边界 | 现有实现 | 经现有 owner 解决的缺口 |
+| --- | --- | --- |
+| App 自由文本 | `personal-workspace-page.tsx`、`workspace-action-form.tsx` | 退役浏览器对 Goal 创建、Todo 改动、分配和调度的意图分类。所有自由文本完整到达 Chat；显式控件打开 typed form 与需审阅的 preview |
+| Chat 请求与观察 | `chat_ingress.py`、`chat_store.py`、dashboard `data/chat.ts` | 现有 client ingress/Turn 身份与事件 cursor 可复用。证明响应丢失、同 key 不同 payload 和 reload 恢复后，才能宣称持久端到端入口成立 |
+| 协作 | `control_plane/collaboration/inbox.py`、typed collaboration rules 与 return-delivery owner | 虽有历史存储名称，现有语义已对 Agent 中立。保留 decision/read/return 区别，不另建 manager 专用 inbox |
+| Operator inbox | `control_plane/work_items/operator_inbox.py` | 已有 source contract 与共享 urgency projection；检查并迁移真实 pending/read/ack 生命周期，不新增泛化 wrapper |
+| Lark transport | `extensions/lark/event_inbox.py`、`routed_inbox.py`、`inbox_reply.py` 与 reaction adapter | Provider 归一化、幂等 capture、read/processed 记录、reply recovery 与 Lark id/policy 共存。只提取已有证据的可复用语义；认证、寻址、provider id、reaction 和消息限制留在 adapter |
+| 执行与控制 | 现有 managed Turn、attached-session/host binding、Chat steering/interrupt | 验收精确受支持的 profile。已注册或 inbox acknowledged 都不等于正在运行；原生 steering、next-Turn queue 和 unsupported 必须分别表达 |
+| 结果 | Answer-report、artifact/revision、review/adoption 与 return owners | 读取已存版本，保留来源与独立审阅。report 读取失败重试读取，不重新运行模型 |
+
+本机输入修复复用现有 `POST /api/chat/sessions/{session_id}/turns`，传入
+`message` 与稳定的 `client_turn_id`；`delivery: "queue"` 仍可省略。
+对已经存在的本人私聊绑定会话，普通发送在重新核对 provider/本人、原 binding
+与工作区后进入同一队列，保留 `origin=web`、原 Session/thread 和原项目或管家受众，
+不伪装 provider 事件，也不扩大成本机全局 portfolio。群输入与直接 steering
+继续受来源守卫约束；请求体不能声明 origin、本人或 provider 身份。
+TS binding/source owner 决定准入和来源关联，Python 观测身份并在 binding 发布锁内落队列。
+管家 ingress 沿注册的 coordination root 和现有 source policy，执行授权仍独立。
+真实 File/SQLite HTTP 回归覆盖完整文本、重放、FIFO 和撤权竞态。
+现有会话列表也支持 `GET /api/chat/sessions?conversation_binding_id=<binding_id>`，
+由同一 binding owner 重新核验后发现已经存在的本人私聊 Session。
+返回既有公开 Session 摘要，保留项目的空 Goal 和原 Session/channel；不创建或恢复线程、
+不排入工作，也不授予执行权限。群、不可用或已经变化的来源明确拒绝；关闭会话不再作为
+当前目标提供，历史继续保存。空、重复或混合筛选不能退回普通的未筛选列表。
+筛选响应包含相同的 `conversation_binding_id`；调用方采用目标前必须核对一致。
+旧服务可能忽略这个 query，返回不带该字段的普通列表；这不算已经完成此发现操作。
+Provider 观测在发布锁外完成；普通会话列表不增加 provider IO。产品选择器须采用
+这个已核验的原会话身份，不能把普通工作区 channel 当作已经绑定的 Chat。
+此项是 Core/API 前置：打包前端发现、真实共享飞书会话采用、项目接收者协作与原会话
+结果返回仍须完成各自现有验收，不以合成测试宣称整条用户旅程完成。
+
+Lark 可读回复的出口还要检查实际强调呈现，不能把 Markdown 原文读回一致当成视觉验收。
+依照 [CommonMark 分隔符规则](https://spec.commonmark.org/0.31.2/#emphasis-and-strong-emphasis)，
+共享 inbox 回复适配器对“加粗内的末尾标点紧接下一单词”做格式规范化：
+`**完成。**下一句` 转为 `**完成**。下一句`。显示文字不变，末尾标点移到强调之外；
+行内/围栏代码、转义标记和链接地址不参与改写。用真实 post 的已渲染 bold 样式与保留的行内代码
+语法验收，同时保留原上下文/线程位置及幂等读回。此项属于 TS 重构 RFC 允许保留的
+Python Lark provider 格式适配，不新增会话状态或决策 owner。
+App 格式和其他 Lark Markdown 结构仍有各自的验收边界。
+
+首个修复不需要新 capability：它属于现有 App 会话与 action 边界，内置 Chat/runtime provider 不变。
+共享 inbox 工作属于现有 coordination/collaboration owners；Lark 仍是 extension 提供的 provider。
+只有真实 provider-neutral 调用结果无法容纳于这些 owner 时，才重新考虑公开 capability。
+
+### 下一实现边界：让项目会话成为 peer 接收者
+
+剩余的项目接收者路径属于协作机制，不是再次修复本机输入。
+`semantic_request.ts` 当前要求 Goal/Agent 对，`peers.py` 在同一 Goal 内校验双方，
+`source_grants.ts` 解析已注册 Goal 接收者。另一方面，`conversation_bindings.py`
+可以发现原项目 Session，但 `queued_admission.py` 仍只通过既有人类/provider 来源
+准入绑定输入。发现会话并没有打通这两份契约；伪造 Goal 或 `origin=web` 都不是合法适配。
+下文继续作为验收契约。源码提案已沿这些 owner 将确切的
+`source_session_v1` 请求方接入已有的 Codex 本人私聊项目会话，保留原 Session、
+native thread 与 null Goal；恢复旧线程时使用单 Turn response schema，不要求增加
+dynamic tools。File/SQLite 集成沿用生产来源、请求、FIFO、修订与回传 owner，只有
+模型传输使用脚本替身。打包浏览器证据仅认证本机管理路径；旧请求方 profile、
+其他执行器、已安装 provider 投递与自然接收方采用仍待验收。操作和恢复方式见
+[原项目会话协作契约](../../reference/original-project-collaboration.md)。
+这仍是提案行为，不代表已交付验收。
+
+已接受的纠正以修订/digest 绑定的续办进入同一 FIFO，包括原结论已被读取后的纠正。
+队列写入和已存答案的恢复复用该修订，不再次调用模型；首个 Turn 与结果保留为历史。
+面板选择当前修订的状态，不把较早结论显示为当前待读取的结果。
+
+请求方的自动 Goal Turn 摘要与显式 Inbox 结果读取复用同一个类型化发出地址 reader。
+原项目请求保留版本化会话接收者，不伪造 Goal/Agent。摘要按当前修订区分等待结果和
+等待请求方显式消费；只读结论不移除该项。请求方身份变化或原返回路由缺失/冲突时，
+覆盖保持不完整，不报空队列。本源码只读检查点不确认工作或派发新 Turn；完整 brief、
+实际采用与已安装 provider 资格仍按各自验收保留。
+
+发现、授权、请求发布、接收方读取/评估和回传应使用同一个类型化接收者身份。
+在现有 collaboration owner 内，给已注册 Goal/Agent 接收者增加显式原会话接收者。
+后者从 fresh binding 和 canonical Session 解析，保留 provider、本人、受众、项目和
+执行器身份；Session 的 Goal 仍为 null，沿用原 native thread。仅有 Session ID 或
+工作区路径只是选择器，不是授权。保留现有 Goal 接收者地址、请求 hash 和历史回执；
+新接收者采用版本化表达，不能静默重解释旧字段。请求方的 Goal lifetime（若有）和
+接收方的会话身份含义不同。
+
+既有工作区授权、核实后的会话发现或 `all_registered` Goal 投递范围，都不自动授权
+新接收者类型。沿用 source policy 的显式来源→接收者授权，并核验原 parent lineage
+和当前 binding。接收方执行仍受自身工作区、工具和成本权限约束，接收上下文不新增权限。
+配置、发现及拒绝回读应进入现有协作/连接路径，CLI 暴露同一 owner。已授权工作不增加
+确认轮次；真正缺少授权时只暂停依赖该授权的投递。
+
+沿这些 owner 完成一个纵向路径：
+
+1. 请求方选择核实后的原接收者，通过既有 collaboration 入口提交 brief、继承来源引用
+   和稳定 operation 身份。来源/store 身份由宿主观测提供，模型给出的 route 不授予权限。
+2. 类型化 publication owner 将 operation 绑定到不可变的请求方、接收方和来源身份。
+   同一 operation 重试恢复原请求；接收者、来源或内容改变则拒绝。可执行工作可见前先
+   持久化原回传路径。沿用现有请求存储与回执模型，不新增项目专属 inbox 数据库。
+3. 原 Chat 宿主以明确 peer 来源将请求准入既有 Session FIFO；同时扩展队列准入和
+   worker 执行前的来源校验，只改 enqueue 检查不算完成。派发前重查撤权、关闭和身份。
+   发布/入队响应丢失时以同一请求及 Turn 身份恢复，不新建队列、Session 或执行器。
+   claim/lease 与宿主繁忙状态继续由原 owner 负责。
+4. 接收者读取当前请求，通过共享 request/result owner 独立记录 adopt/defer/reject。
+   项目接收者不应为了记录决定而虚构 Goal/Todo。保留请求修订与取消：现有 exact-Goal
+   control profile 不能直接放宽为 null Goal。接收上下文、采用和执行成功仍分别记录。
+5. 有证据的结论沿保存的 requester route 回传。在绑定项目会话中执行不等于获准把 peer
+   结果发给该会话的外部受众。结果回执丢失时重试回传，不重跑模型；请求方读取/采用仍
+   单独记录。现有会话 UI 须展示排队、不可用、决定与返回状态，CLI 调用成功不能单独
+   认证整个用户路径。
+
+决定性隔离测试从一个已注册请求方与一个已有、无 Goal 的绑定项目 Session 开始，
+Chat 与 coordination 使用不同 root。经生产入口投递获准请求，穿插普通本人输入，
+在发布与入队之间重启，读取 brief、独立决定并将精确结果回给请求方。断言每个 operation
+只有一个 Turn，Session/thread/Goal 身份未变。覆盖来源/接收者撤权，App/本人/受众/
+项目变化，关闭，并发重放，同 key 异内容，过期修订/取消及回传回执丢失。以已注册
+接收者和普通绑定本人输入作为兼容对照。受影响的支持后端遵循仓库真实路径策略；
+合成 provider/model 结果仅认证协议。打包后的发现与实际接收方使用仍是各自可观察的
+验收，文档或合并不隐含完成。
+
+## 分阶段交付与决定性查询
+
+顺序以证据为依据，不承诺所有阶段在一个 PR 交付。每阶段完成一条有用的用户路径，
+包括反例和读回。
+
+| 优先级 / 阶段 | 自然查询 | 有用的出口、现有 owner 与下一依赖 |
+| --- | --- | --- |
+| P0 / 会话入口 | “解释一下 monitor 的工作原理。” / “Explain how a monitor works.” | 所选会话收到完整问题并返回答案；不产生无关 monitor/heartbeat preview 或调度写入。显式调度控件仍可用。R1 下首个有界 App 修复 |
+| P0 / 连接并继续 | “用已经在跑的那个，接着做。” / “Continue with the one already running.” | GQ02 的 managed 与 attached 变体：一个已核验 owner/binding，保留上下文，实际 dispatch 或如实 queued 状态，结果返回原会话。确属新工作时遵循 GQ01；不强迫每个问题进入 Goal |
+| P0 / 持久互动 | “先只看微软。” / “Focus on Microsoft.” | 同一工作上的 GQ07–09：steering 被采纳或明确 next-Turn queue、范围内停止、重新连接/reload/restart 恢复，不重复执行或丢失结果 |
+| P0 / 小队 | “组个小队，把分歧查清楚。” / “Get a small team to resolve the disagreement.” | GQ05/GQ11–13：2–3 个真实 worker、两个周期、依赖消费、独立审阅、revision 采纳与原路综合返回；不需手工复制 |
+| P1 / 注意力与移交 | “这周先做什么？” / “What comes first this week?” | GQ06/GQ10/GQ14–15：基于证据的优先级、材料与范围内重规划，保留 model/cost 限制；常规进度安静，已请求结果返回 |
+| P2 / 扩展 | “本机安排，云上跑。” / “Plan here and run in the cloud.” | GQ16/GQ17 保留独立的跨 host 和规模验收。仅在有界本地路径通过后开始 |
+
+首个修复不代表完整 GQ01/GQ02 或自主小队验收。
+继续既有创建、连接、会话可靠性、affinity handoff 与小队 Todos，不创建重复计划队列。
+每个可用阶段都运行打包和首次使用检查，不等到架构重写结束。
+
+### 最近的可感知交付：一句话交办，过程可控，结果回来
+
+先验收一条 G0/R3 真实路径，再扩充功能清单。用户说：**“给 LoopX 做份社区问卷，先给我草稿。”**
+App 找到合格的已有负责人，保留请求，展示对方真实判断，在原对话返回带来源的可读 Markdown 草稿。
+补充 **“先做中文，别发布。”** 后，实际接收方必须采用纠偏；发布不属于本草稿试点。
+
+以 GQ02/GQ04/GQ08/GQ09 冻结验收：
+
+- 用户不提供 Agent ID、旧会话链接，不重复背景，不催办、不搬运结果；接收方和任务目的清晰。
+- 接收、延期、拒绝、执行、回传保持区分；延期回复送达不等于任务完成。
+  延期原因在请求旁可见，接收方的私有判断不得自动泄露到外部受众。
+- 一个获准驱动实际干活；纠偏和定向停止分别有接收方或运行时读回，传输 ACK 不够。
+- 原对话可打开草稿，刷新或更换会话后仍在；源码、打包前端、真实原生执行分别记录通过、失败、阻塞或未运行。
+
+既有对话 reader 还有一个有界 GQ02 companion：`view=agent_route` 通过共享 TS
+selector 与只读宿主 adapter 观察精确发现的 Goal/Agent，可跨归档历史定位唯一可读
+binding，无需用户复制 session 链接。未知或多个可读 binding 保持未解析，远端来源
+不可观测时明确不可用，不偷读本机宿主。管家与普通 Goal reader 共用该路径，不增加
+管家专属生命周期或执行驱动。验收使用真实隔离 host store，保持其不变；这只修复
+read-tool 缺口，不关闭原生派发、纠偏采用、定向停止或原路结果验收。安装态行为仍须
+维护者合并与 promotion 后验证。
+
+随后验收已有 G1：**“组个小队，核对现金流，把分歧查清楚。”**
+2–3 个真实 worker 消费版本化材料，独立指出期间或单位错误，采用修订后回传综合结论；
+第二轮修改输入，必须改变实际消费依据。对应 GQ05/GQ11–13，不新增里程碑或任务队列。
+
+`tests/test_chat_delegation_journey.py` 的确定性集成通过一次性文件存储，连接生产
+Chat controller、作用域内交办、接收方 inbox 与结果回传，同时覆盖管家和 Goal Chat。
+它验证请求重试、单独采纳纠偏，以及更换会话、重新加载存储后 Markdown 仍回到原对话。
+模型答复和接收方工作由脚本提供：这**不代表**选人质量、原生执行、实时 steering/stop、
+打包 App 或 G1 已通过。Release 验收仍须使用选定的真实执行器覆盖这些边界；
+日常测试不需要模型凭证或付费调用。
+
+App snapshot 按原始交办回执的 Goal instance 定位请求，复用已有 TS 历史读取规则。
+即使 Goal 别名被重建，原接收方判断仍可见，既有 App 回传监听能继续保留原会话。
+route 与回执不匹配时不替换成其他实例；读取不可用时保留已保存消息。
+生产 HTTP 测试用真实一次性存储覆盖管家与 Goal Chat。这是回读验收，
+不代表原生执行器或模型选人已通过。
+
+单独阅读已保存的答复时，也保留时间线中的事实区分：现有回传阶段决定“进度更新”或
+“处理结论”，送达核验状态在其旁显示；送达本身不代表任务完成。导航复用类型化的
+对话作用域 owner，而不是消息的存储 Goal：Goal 答复返回该 Goal，个人总览答复返回
+管家，外部答复提供“打开管家”，不声称打开原外部受众。打包只读验证使用真实
+HTTP/store 与回传投影，接收方结果由合成数据提供。这里修复答复呈现缺口；外部对话
+选择、原生采用/纠偏和两轮真实协作仍分别待验收。
+
+在制工作集中于第一条路径及其实际阻碍，复用请求恢复、GoalRef 和延迟回传工作。
+TS 重构随受影响事务推进；全量迁移、Lark 视觉对齐、规模化与宣传片不阻塞试点。
+组件 PR 合并不代表试点已经通过。
+
+## TS 与通用异步 inbox：随用户路径迁移
+
+### 语义边界
+
+复用现有持久身份和合同。概念关系是来源请求 → 具名接收者/工作 → 准入执行 → 结果 → 原路返回。
+这些是各现有 owner 之间的链接，不要求把所有 message、Todo 和 artifact 合并到一张数据库表。
+
+| 事实 | 含义 | 绝不隐含 |
+| --- | --- | --- |
+| Accepted/queued | 持久 owner 接受范围内请求或将其排队 | Worker 已启动或消息已采纳 |
+| Supplied/read | 请求经受支持的接收路径暴露或读取 | 同意、责任移交或权限 |
+| Adopted/declined/deferred | 接收者记录有依据的实际处置 | Artifact 独立验收或任务完成 |
+| Executing | 当前 owner 提供真实执行证据与观察时间 | 可用 quota、打开的 Todo、在线注册或 ACK |
+| Result ready | 有版本化结果；验证状态独立保留 | 原请求者已收到 |
+| Returned | 原路径存在适用的投递/读回事实 | 用户已阅读、批准或下游已消费 |
+
+工作、执行、transport、freshness 与验收是正交事实。
+显示其有用组合，不虚构通用 `isActive`，也不强迫每个简单答案进入 adoption 流程。
+
+### 替换节奏
+
+1. **App 调用者优先（R1/T0）。** 在现有 Chat 路径复现输入、message 身份与 scope 竞态。
+   在任何 store 迁移前修复所选的完整会话。操作归属现有语义执行者或显式控件时，
+   删除浏览器 effect heuristic；不换成更大的关键词黑名单，也不在每条消息前加入付费 classifier。
+2. **完整异步生命周期（R3/T1–T2）。** 清点 Chat、collaboration inbox 与 Lark 的 producer、
+   持久记录、consumer、retry、return 和 cleanup。先刻画当前合法、非法转换。
+   将一个内聚的 accept→pending→consume/disposition→return-recovery 生命周期迁入最近的 typed owner，
+   source IO/provider adapter 放在其周围。App 与一个 Lark adapter 经此 owner 准入，证明 adapter-off isolation。
+   不引入逐字段 RPC、dual write 或第二个持久队列。
+3. **恢复与退役（T3–T4）。** 以明确 schema/read 兼容和原 id 迁移现有 pending 记录。
+   在 acceptance 与 dispatch 之间、provider acceptance 与 reply 记录之间及 restart 中注入失败。
+   只有取得真实路径 parity 和 schema-aware rollback 证据后，才退役旧 transition logic/writers。
+   保留合法历史事实；rollback 不能重激活旧 executor 或重发已提交 effect。
+4. **扩展。** App 与 Lark 各自验收后，在真实调用者需要时把共享合同应用于另一已授权入口。
+   不只为给抽象命名而新增 broker、调度引擎、provider marketplace 或第三本任务账本。
+   更广泛的持久化切换保留 D1–D3。
+
+Provider 认证、签名、外部事件解码、寻址、chat membership、rate limit、附件和渲染留在 Lark。
+通用 pending 选择、稳定请求身份、replay/disposition 与恢复规则不能依赖 `oc_`/`om_` id 或 bot reaction。
+Notification/attention、Todo/lease、model admission 和 artifact acceptance 保留现有 owners。
+Dispatch 事件在准入范围内唤醒现有 driver，polling 修补缺口。Inbox 不授权启动另一个 automation。
+
+已返回阻塞或可审阅草稿，不能阻止后续完成结果回到同一对话。保留首条不可变结论，
+通过共享 TS 发布 owner 追加有明确身份的结果更新。同一更新重试保留结果身份，冲突替换拒绝。
+Chat/Lark 发送须等待前一结果核验送达；Peer 消费只确认已读的那条结果。
+在打包对话中验证重启、重复重试、前次发送不确定及精确 Goal 实例隔离。
+这是 R3/T1–T2 的结果连续性，不新增工作请求、权限、任务完成声明或管家专用队列。
+
+provider 暂时核验失败须与终态拒绝分开：共享 owner 先复核持久化发送事实与当前路由，
+保留原不确定结果并按退避恢复，不再次发送。显式撤权、路由丢失或 provider 必需 ACK
+缺失仍是终态 blocker。`source_session_v1` Goal 被重建后也一样：崩溃前持久化的
+attempt 沿原 GoalRef 与对话恢复，暂时核验失败退避且不重发，typed 终态阻塞保持停止。
+这只验证持久恢复边界，不证明真实 provider 可用性或完整 GQ09 旅程。
+
+已提交委派的恢复复用现有 typed collaboration lifecycle。原请求 Turn 失败、超时或
+被打断，不会取消已经进入接收方 Inbox 的工作。该 Turn 结束后，即使调用方没能保存
+handoff 回答，接收方已保存的结果仍可沿同一可信路由返回。重新核验当前来源授权、
+已提交请求身份、路由与精确 Goal 实例；已有 handoff 回执冲突时拒绝恢复，不能忽略。
+保留原失败 Turn，只追加一次幂等回传。原 Turn 仍在运行时等待；来源撤权、entry
+缺失或路由变更都不能授权发送。Provider 的首次回复确认和发送后核验仍是独立门槛。
+
+GQ07/GQ09 的回归变体是“接着做，结果给我”。在 Inbox/route 已提交、调用方回答
+尚未保存时注入故障，重新打开真实 store，再由接收方提交结论。管家和 Goal 对话必须
+只显示一次结论，不重跑模型、不改写失败 Turn。合成数据下的生产 File/HTTP 路径与
+typed 反例验收此恢复边界，不证明真实负责人选择、接收方采用、原生 steering 或两轮
+真实团队协作。
+
+同一提交事实现在也为 owner-private App 提供回读：调用方仍在运行或回答丢失时，
+优先挂在已保存的回答；没有回答则挂在原用户消息，复用已有交办卡片，不伪造回答或
+改写失败 Turn。共享 typed lifecycle 分开准入观察与结果发送；等待读取、提供上下文、
+采用和结果回传仍是不同事实。核验原保存会话、client Turn、请求及 Goal 实例；路由
+有歧义或回执冲突时不生成卡片。外部会话不展示私有 brief 或接收方理由。路由发现
+保留现有有界历史扫描；完整积压索引及安装/真实旅程验收仍单独保留。
+
+共享 TypeScript 读取模型在首次回复送达后、页面切换后继续观察已访问的会话。
+回传追加消息不会修改执行状态 `updated_at`，因此现有会话索引补充不暴露文件身份的
+`transcript_revision`。Python 只观察存储文件；TS 选择变化的读取，并把结果更新回原上下文。
+协作及送达元数据待核验时仍读回；安静的历史不反复下载全文。失败不推进已读修订，
+保留旧内容等待重试。不新增持久 schema、生命周期权限、模型重跑或 Inbox owner。
+打包验收使用生产 HTTP/store 与合成结果写入，覆盖首次结果、另一个上下文可见时的
+后续修订、一次读取失败、去重与当前会话保留。已安装原生执行、接收方采用及多次结果
+发布仍保留各自验收边界。
+
+Pending 回执检查点把“文件存在即结束”的分类迁入共享 `collaboration/inbox_receipts.ts` read model。
+Decision/result 缺失、不可读与身份冲突分别表达；损坏的结论不能静默清除接收方请求，
+也不能让原 App 对话的协作卡片消失。恢复原始记录后只回传一次，不重跑工作或更换受众。
+真实一次性 private-file/CLI 与生产 HTTP 测试覆盖此边界；打包浏览器检查覆盖既有的送达未核验展示。
+Adapter 按数量和编码字节分批，不提高 bridge 上限；不新增 store 或持久 schema。
+这不代表 accept/consume/cancel 全生命周期迁移完成，也不验收原生负责人选择、steering、
+团队采用或真实 Lark transport。
+
+每次提取前报告 base/head 的真实调用 latency、边界穿越次数、bytes、删除或保留的 owners 与兼容调用者。
+产品交付无需等待 Python 完全退役。Python 可保留 IO，TS 对已迁移 transition 和 effect 拥有唯一责任。
+适用时复用现有 TS receipt 和 CAS 机制，不把 Chat 记录伪装成 Todo command。
+
+## 验收与失败矩阵
+
+运行前冻结 source/package/runtime/profile、公开输入、budget、timeout 与独立预期结果。
+分别记录通过、失败和未测试；浏览器 fixture 不能验收真实 attached host。
+
+| 边界 | 必需反例与可观察结果 |
+| --- | --- |
+| 含义 | 解释、引用、否定、混合语言和将来条件句提到调度时仍为会话。显式 UI 调度仍到达需审阅的 typed 路径 |
+| Acceptance | 持久接受后丢失响应：以同一范围内身份恢复，只有一个逻辑 Turn/provider 调用。同 id 不同文本冲突；有意重复的新请求仍可提交 |
+| Dispatch | 接受后、启动前失败：现有恢复继续请求。没有执行的 ACK 标为 queued 并给出下一 trigger，不标 running |
+| Scope | 导航 A→B→A、迟到响应、旧 subscription 终态事件：只更新原 source/session/Turn。完整 snapshot 与 delta stream 采用不同合并规则 |
+| Stream | 重复或迟到事件与 hydrate 重叠保留一个逻辑答案。用户阅读历史时新事件不强制滚动 |
+| 纠偏/停止 | 工具执行中和完成时：实际接收者采纳最新 scope，或报告 queued/unsupported。停止针对原 Turn，不隐式停止其后继或所有 peer |
+| 结果 | 切换当前会话或离开页面后仍能收到旧会话的后续结果、修订；一次回复送达不终止观察。安静的历史只读紧凑会话索引，有变化或待核验元数据时才更新原上下文，保留当前流式文本。文件缺失仅重试读取；v1 review 不认证 v2；打开 report 不等于 adoption。Return ACK 丢失先 reconcile 再再次发送 |
+| Attached | 原生 host 离线、stale binding、不支持 steering、只支持 next-Turn 的 adapter 与 restart：请求保持可见；不猜测成功或引入竞争 driver |
+| Managed | Runtime 启动失败、quota 拒绝、缺失登录、stop/restart：实际 profile 和条件可读；不静默替换 model/account |
+| 权限 | 撤销访问或 source 改变拒绝 stale effect；无关且被允许的分支继续。私有历史不进入共享 audience |
+| 打包 | 受支持的本地安装 bundle 完成首个请求与返回；窄屏、键盘、reload、不可用和安静情况仍可用 |
+
+测量首个有用结果耗时、恢复、定位答案、不必要的人工转发、状态误读与每个验收结果的成本。
+分别保留 setup、首结果与 recovery 耗时。保留黄金查询集冻结的注意力比较；本设计不宣称已测得改进。
+
+## 交付边界
+
+当前会话入口修复移除 App 中所有浏览器自由文本 action 分类，检查普通 Chat 路径及显式调度控件。
+不改变权限或已存 message schema。Managed/attached 会话连续性、通用 TS inbox 提取和真实运行的两周期小队验收，
+在各自证据记录前仍属计划。该入口修复可按 App routing 改动回滚；后续持久合同迁移需要各自兼容计划。
+
+群聊直接输入的伴随修复保留共享 TS admission 的具体原因，经 provider 传到 App。
+界面分别说明上次观察到的消息与当前触发设置：开启免 @ 不证明旧消息执行，也不会扫描并补跑已采集历史。
+连续的简短请求及纠偏应保留各自对象、约束和原入口回传关系；传输 fixture 不认证接收方采用或实际修复合并。
+
+通用会话先理解目标、核验影响决策的事实，再判断是否委派。当前证据证明目标已达成时，直接带依据返回，
+不重复派工或生成受保护操作提案；历史记录和不可用读取不构成当前事实。直接分析、复用已有工作与有界 peer 核验
+都是有效结果。这是跨领域的推理指引，不新增关键词 classifier 或权限 owner；Core 类型化授权与 effect 仍拥有最终决定。
+外部事实复用正常、已授权的 host 工具，受限 audience 保留明确缺口。GQ03/GQ07 同时验收已达成和确需继续的请求，
+并以报告类任务验证通用性；真实查询工具与模型质量留在 release qualification。
+
+### 入口行为兼容
+
+所有普通输入现经所选会话处理，包括创建或改变工作的请求。
+Runtime 工具支持、授权和现有 action review 仍决定实际执行内容；移除浏览器 classifier 不认证模型完成 GQ01–GQ17 的能力。
+显式创建和调度控件打开基于字段的 form，且只创建需审阅的 preview。
+Goal 权限在 form 中显式选择，保留既有“确认后允许修改工作区”默认值；权限不再从边界描述推断。
+下游须同时尊重权限选择与书面执行边界。
+显式 status-only profile 返回有标签的 snapshot，不返回以关键词构造的答案。
+把回复转为任务时打开完整可编辑文本，不猜测其中的下一步句子。
+保留结构化 ID、date 与 resume-condition 验证。Lark 准入继续使用原对话 owner。
+
+Todo 提案可以携带从许可目录核实的 `goal_id`。带明确目标的管家回答进入既有类型化
+Todo 确认卡；未指定目标的管家提案、或与当前 Goal 不一致的提案，不会静默继承界面
+当前选择。旧版未带目标的 Goal 回复仍使用原 Goal；这里不增加自动写入。
+
+在已绑定的管家私聊中，同一有目标提案由规范 `todo.create` owner 准备，并返回既有
+`/confirm`、`/cancel` 入口。原请求 journal 在预览 IO 前保留有效期和幂等身份。
+确认须来自当前相同 App、本人、私聊来源及获准 Goal，且在十五分钟有效期内；读取
+范围和模型提案本身都不授权写 Todo。既有规范 writer 提供已核验回执，结果返回原
+私聊；不创建 Goal，不分配或启动执行。过期、撤权和 stale 预览拒绝写入；预览回执
+丢失恢复同一提案，已提交的 Todo 恢复原回执，不重复写。没有新增 callback consumer、
+执行器或独立工作队列。源码与 fixture 合同不代表已安装 Bot 或模型理解已通过验收。
+
+### 对话式目标准备：吸收团队工作台提案
+
+[KashiwaByte](https://github.com/KashiwaByte) 的 [PR #4376](https://github.com/loopx-project/loopx/pull/4376)
+带来了值得吸收的交互：每次提出一个关键问题，用贴合上下文的建议回复帮助用户理清目标。
+将它接入现有 App 对话和 Goal 操作路径；不采用独立工作台、JSON 存储、子进程执行器和调度器。
+未发布原型从本 PR 的最终产品差异中移除，贡献与原始实现保留在提交历史中。
+
+| 思想 | 现有归属与验收 |
+| --- | --- |
+| 对话式目标草稿与情境选项 | R1 / GQ01：共享类型化 `goal_draft`、可复用 App 卡片与可编辑创建表单。选项只填入输入框，用户发送后才继续；未知要求留空，不新增正则意图分类器或自动创建 |
+| 请人补材料、执行工作或判断结果 | 既有 operator inbox、user gate 与复核/采用契约。区分三类决定；回复不等于授予委派权限。完整验收仍开放 |
+| 记住纠偏与协作者所长 | 既有作用域 brief/context 与能力记忆 owner。纠偏可影响后续工作，但不产生权限、不证明能力，也不隐式改变执行绑定 |
+| 滚动计划与独立检查 | R2/R3 工作图、managed/attached Turn 与独立验收 owner。仍须证明真实依赖采用、纠偏、停止和结果回传；目标草稿不代表团队已验收 |
+| 可选远程执行器 | 既有扩展与执行 profile 契约。没有真实调用者、显式绑定与生命周期验收，不引入新 provider |
+
+本次实现是 provider 响应中的建议，不是第二个规划器或 Goal 真相源。
+现有 collaboration 中的 TypeScript owner 校验结构，Python 负责传输脱敏，草稿随完成消息持久化。
+App 历史与重连读取同一条消息；managed 和 attached 完成存储均保留该可选字段。
+普通回答与非法草稿保持原响应契约。Provider 必须实际返回结构化建议；存储/UI 验收不代表模型意图质量或真实 attached-host 工作链已验证。
+
+准备新目标之前，先根据当前对话和可见工作识别已有任务。继续或纠偏沿用合格的原负责人和既有委派；当前 Goal Chat 的追问保留在原对话。比较所有合理候选；身份有歧义才询问，权限缺失或目标停止不能变成新建替代目标的理由。用户明确要求独立目标时可以主题重叠。这是模型结合宿主证据的语义选择，不是关键词路由或第二套发现服务。TypeScript 保证委派、受保护操作、提案或 gate 不能同时携带新目标草稿；宿主仍验证接收权限。
+
+完整草稿直接进入类型化 `goal.create` 预览，只需一次显式应用；修改是可选入口，复用同一请求构造器和既有表单。信息不全的草稿可继续补充。同一来源消息与草稿重开预览保持操作身份，另一条消息则是另一请求。草稿默认只读且不启用 heartbeat，原显式创建入口保持默认行为。工作区、负责人、权限检查继续生效；创建不代表执行或交付。Lark 共享语义回答与委派行为，草稿卡片和直接预览仅在 App 提供，不增加 capability、provider 或调度器。
+
+[公开模型评测](../../../examples/evaluations/chat-intake.py) 仅在 release 候选版本验收时显式启用付费调用，默认及新增宣传的模型配置分别至少重复两次。平时 PR、每次提交和 heartbeat 只跑离线回归及受影响的浏览器场景，不运行付费评测。记录候选版本，保留失败；凭证不可用记为跳过，不视为通过。评测使用生产 prompt/parser 和固定公开上下文，覆盖新建、已有负责人、多候选、停止/无授权、纠偏、当前 Goal 追问、引用、否定、普通问答与中英文表达。冲突操作、协议缺失、生成截断均记录为失败。记录模型、prompt/用例哈希、请求参数、token 用量和重复次数，不泄露凭证。该层只验证模型解释已提供证据，不证明真实发现、派发、停止执行或完整 GQ01/GQ02；打包浏览器和实际委派传输测试分别覆盖其边界。
+
+时间戳相同的消息保留原 Session 的追加顺序；随机消息 ID 只标识身份，不表示时间。
+共享历史合并保留完整正文与重复文本，只按同一 Session／消息身份去重；独立快照时间
+相同时按 Session 确定显示顺序，避免读取完成先后影响排序。浏览器恢复检查等待异步
+回填及被挂起的旧读取结束，允许旧请求已经超时，不再强求已取消请求的响应。
+[合成顺序截图](../../assets/personal-workspace/conversation-history/README.md)只验收该读取／显示边界，
+完整历史分页、回复线程和已安装 App／飞书双向送达仍分别验收。
+
+同一 Session 快照接口支持显式 `message_limit`（1–200）和 `message_cursor`。
+新增的 `loopx_chat_message_page_v1` 只读元数据把偏移绑定到原 Session、冻结记录数
+和原始前缀摘要。读取期间追加消息不移动该边界；前缀被改写、截短或 journal 无法
+完整读取时明确拒绝，正文与附件不裁剪。协作投影从完整冻结上下文选择原卡片载体，
+只投影本页及相关回传标签；跨页不重复挂载卡片，也不重读全部页外 Turn。
+TS 历史 owner 校验并读完全部页面，随后复核
+确切连接／Goal 来源，才发布完整快照；断线、重复、来源不符或不一致的游标保留为
+不可读，通过既有恢复路径重读，不重放模型。未分页 v1 调用保持兼容。游标是无状态
+读取提示，不增加 store、consumer、执行状态或 grant。File Chat 每次重新读取
+journal，原始字节摘要相同时可复用一份有大小上限的严格解析。内容变化或超限时仍
+严格解析；文件无法读取时请求仍失败。每页继续核验冻结前缀并重新读取 provider
+投影。journal 读取和前缀摘要仍随完整历史增长。HTTP／store 与源码、
+打包浏览器检查验收该历史路径；实际原生输入、回复线程和真实 App／飞书媒体仍需
+分别验收。此前基线及 `--pagination-only` 运行未验收默认回传场景的后台读取等待，
+该历史超时保留；当前默认回传旅程已覆盖管家／Goal 切换期间的后台修订读取。
+App 入口保持同一个工作区及其读取器挂载，共享来源读回；来源发现尚未完成或失败时
+仍阻止普通队列准入。隔离 HTTP／store 检查只验收该接续路径，不扩大实际原生或
+真实 provider 的验收范围。
+
+已核验完整绑定 Session 后，App 刷新变更的快照时可提交最多 5,000 条已显示消息的证明。
+原接口从当前投影（包括原引用与回传状态）核验旧前缀；完全一致才返回最多 200 条
+新增消息。前缀变化、新增超限或旧服务时沿既有全量路径读取，合并后展示前仍重新核验
+原绑定。该证明只在内存中使用，不替代原始冻结游标，也不授权任何效果。
+
+同一对话界面在用户停留底部时跟随输出，上翻阅读后保持位置，并提供回到最新消息的入口。
+窗口或时间线尺寸变化（包括图片布局与展开回复）后仍应跟随最新回复，不必等待下一条消息。
+用户上翻阅读时，布局变化保留当前位置；既有回到最新消息按钮恢复跟随。该行为留在共享
+对话界面，不新增 Session 或执行者。[合成桌面与窄屏截图](../../assets/personal-workspace/conversation-layout-follow/README.md)
+只验收布局边界，不代表已安装原生输入、完整历史分页、provider 投递或飞书媒体双向同步已通过。
+多行草稿在有界输入框中展开；快捷提问留在总览或空对话入口，避免挤占当前对话。
+
+### 图片准入与当前对话位置
+
+“看看截图，帮我写一份社区感谢草稿。”这样的普通请求应携带完整图片进入既有对话。
+Turn HTTP 预算包含既有附件额度的 base64 编码：最多四张图片，单张 5 MiB，合计 12 MiB。
+文字与元数据另保留 64,000 字节预算，其他 JSON 入口维持原上限。只有明确发生在 Turn
+准入之前的拒绝，才恢复草稿和图片，供用户修改后重新发送。已接收或投递状态不确定的请求
+不能提示为可安全重放。
+
+操作卡应位于消息间的实际创建位置。刷新或恢复旧操作不能把它追加到新回复下面；
+无日期历史不能冒充新活动。共享 TypeScript 对话读模型负责排序，Python HTTP/附件适配器
+负责传输准入。既有确认与执行权限不变。
+
+源码验收覆盖 HTTP 准入、会话持久化读回和合成 Codex 协议进程，以及打包后的桌面/窄屏
+图片发送、历史操作卡与拒绝后的草稿恢复。该证据只证明传输和界面行为，不证明真实模型质量、
+公开发布或已安装宿主验收。GQ06 的材料入口及 GQ07–09 的连续性仍须完成各自的交付与恢复验收。
+
+### 本地文本文件附件
+
+本地托管 Codex 会话也接受 UTF-8 `.md`、`.txt` 原始文件附件。沿用最多四个
+附件及序列化消息/元数据 64,000 字节预算；文本数据不借用图片额度。原始字节
+保存在已接收的 Session 请求和队列中，作为标注来源的文本交付原生输入，并可在
+原会话预览、下载。忙碌会话 FIFO、重放身份和重启恢复继续由既有队列负责。
+非法编码、类型/文件名不匹配、二进制 NUL 和超限都会拒绝整个请求，不截断正文。
+Attached 宿主、其他 executor 以及关联/Lark 会话在准入前拒绝这种新输入；这不
+授予文件同步或任意路径访问。图片保留现有路径。来源送达不证明理解、自动材料采用、
+完整 GQ06 验收或模型成本降低。
+
+本地托管 Codex 的 Goal 网页对话也可以返回用户要求的 Markdown 或纯文本文件。
+在原对话中点击“下载原文”即可保存。即使工作区文件后来改变，重新打开消息仍可取回当时
+的字节。Agent 在答复中提供文件名、MIME 类型、字节数和内联 Base64 数据，沿用已有的
+数量、大小及 UTF-8 校验。文件含受保护的本机路径时，答复会说明附件交付失败。
+LoopX 只使用答复携带的数据。
+
+### 飞书私聊默认复用原生 Turn 图片附件
+
+普通项目与管家私聊默认接收图片和图文消息。provider 在接收 App 下核验 canonical
+message，仅以该 App 身份下载属于这条消息的资源，再将 PNG/JPEG/GIF/WebP 交给
+既有 Core request 与持久 Session queue。沿用四张、单张 5 MiB、合计 12 MiB 上限。
+保留配文；资源 key 和私有图片字节不进入 typed routing 观测。重复事件复用原输入
+和 Turn；重启后仍由原 Turn、原 upstream thread 执行。下载后及回复前重新核验授权。
+
+下载失败、文件/音视频、携图控制命令或原宿主 Agent 图片请求均明确告知未提交执行，
+不会只执行混合消息的文字部分。原宿主媒体与文件交付仍待补齐。回归覆盖图片模型输入、
+原 Session、重复投递、持久重启与下载中撤权；真实 provider/model 验收另行记录。
+本增量不新增 Session authority、queue、worker 或默认关闭的功能开关。
+
+### 飞书私聊原消息核对
+
+本人私聊的默认后台同时核对飞书原消息与原生收件记录，复用既有投递扫描器、
+已核验 App 和已经准入的本人目的地；不新增消费者。首次在一分钟内开始，完成后
+一分钟再查；初次实时窗口最多回看一天，后续完整窗口重叠一分钟。每轮先核对最多
+20 页实时来源，再从 provider 起点向实时窗口之前的固定边界读取最多五页旧历史；
+私有分页 cursor 支持跨重启继续，也会自动补齐只有实时 cursor 的旧回执。
+旧历史尚未翻页完成时不得报告已核对。每页历史请求预算仍为五秒，身份核验保留
+既有超时。失败、过期或绑定变化均不推进覆盖；有界成功的历史分页批次可以保存
+cursor，但不能据此宣称完成。已发现缺口
+保留在私有回执中，不因后来窗口缺少该消息而消失；群话题与其他 provider 维持
+各自覆盖契约。
+
+收件证据按同一已核验 App/profile、provider 来源、本人私聊目的地和本人身份匹配，
+也保留旧上下文绑定中的对应收据。该收据只证明收件，不授予当前绑定执行权限，
+也不证明已经最终回传；异来源继续隔离。
+
+停机后从最后完整 cursor 继续，以最多一天的窗口有界追平，不能把尚未扫描的区间标为
+已覆盖；每个绑定的回执锁覆盖读取、provider 查询和写回。回归通过真实原生绑定、Core
+与连接 HTTP 入口，配合合成 provider 历史及宿主执行，验证两天停机后仍能发现漏收；
+两个观察交错后只准入较晚消息，也不能抹掉较早缺口。
+
+原连接 API 与 Lark 设置将 `ingress` 原消息核对状态和实时监听、待执行数量分开，
+只展示未核对、已核对、有缺口或暂不可用，以及时间和计数，不返回原消息 ID 或正文。
+看到 Bot 回复不代表原生收件、最终答复或本人采纳。实时窗口内新发现且没有原 App
+回复的缺口至多触发一次本服务自有消费者重连，旧历史发现不触发该重连；
+由既有 App 租约与刷新生命周期启动替代者。
+历史消息不进入 Core 准入、发送、重试或失败 Turn 恢复；重连只缓解后续实时入口，
+不能证明历史请求已经执行或 provider 漏消息根因已修复。
+
+### 原生历史迁移与未完成请求续办
+
+失败通知送达不等于业务请求完成。旧管家上下文迁移后，原有私聊回复扫描器会发现
+符合条件、尚未完成的普通 Codex 管家请求。上下文版本 21 将完整可见的用户与助手
+历史恢复到原生持久历史中。大历史按 UTF-8 边界分批恢复。每次成功压缩后，
+adapter 根据 Codex 重新估算的上下文大小确定剩余空间，预留提示开销并继续有界导入。
+无法获取估算时仍逐批压缩。受理确认不等于压缩完成，必须等确切压缩 item 与对应原生
+Turn 成功终结。小历史与已有线程恢复沿用原路径。Core 完整可见正文保持不变，模型
+上下文的压缩状态由原生压缩器负责。结果未知、失败或中断时，关闭尚未发布绑定的新
+adapter，不重放注入或启动业务。旧上游身份仍保留，本次迁移不替换原生 Goal 或
+attached 执行。分批压缩会消耗模型工作；源码和协议测试不证明真实摘要质量或费用。
+本改动不递增上下文版本，也不重置既有恢复预算。
+恢复等待期间持续核对原来源绑定、配置与 Goal guard。排队 Turn 的停止和空闲 managed
+Session 的关闭先发布既有存储状态转换，再等待 adapter 清理；压缩静默不能挡住取消，
+也不能让已关闭的会话重新打开。
+所有批次共用已配置的 Turn 硬时限，不为每次压缩续期。
+
+已绑定的 Codex 管家在账户可核验时打开工作 adapter，会记录原生线程、provider
+和来源权限依据。服务若在复核前重启，只有账户、设置与绑定仍一致时才能使用该记录。
+对于仍在线的 adapter，Core 先核验空闲，再将原工作线程身份与复核 Turn 一起保存。
+回到相同权限范围时，
+没有新增可见答复就直接恢复原线程；有新增答复则通过原生分支继承压缩检查点，
+只注入这些答复。恢复使用的用户输入仍属于原请求，不作为新增历史。核验当前权限、
+来源、排队 Turn 和衔接内容后才发布子线程绑定。分支或注入结果未知时保留旧绑定
+与历史。无可验证记录的旧会话或权限变化沿用既有迁移路径。
+
+为已受理的排队 Turn 打开 Codex adapter 前，Core 在该 Turn 的
+`native_context_preparation` 元数据中保留首次路径选择。不可改写的记录包括计划使用的
+原生 `thread/start`、`thread/resume` 或 `thread/fork`、原线程、计划传入的历史消息数，
+以及当前控制器实际使用的迁移、设置和检查点条件；不包含正文、宿主路径或账户数据。
+直接复用进程内健康 adapter 时不增加恢复记录。这只是准备路径的计划，不能证明
+原生 IO、压缩或业务成功；这些事实仍以原生及终态记录为准。该元数据不改变生命周期
+事件或派发前恢复凭证。缺少此记录的旧 Turn 保持未知，不回写补造。
+
+发现阶段使用本地已启用绑定和同一 typed 候选规划器，不为每条历史失败做网络身份
+核验。这只是队列提示；受理仍须在原 fence 内重新解析当前 App、本人、grant，
+核验确切原消息与原生凭证后，才能预留或排队任何续办。
+
+Codex 与 Antigravity 管家在本地以 `manager_authorization_unavailable` 失败的请求，
+也可进入这一原队列。Core 必须完整记录排队、管家上下文准备、上下文快照与失败四个
+不同 ID 的事件，且没有上游 Turn、答复、增量、追加纠正或附件；仅缺少执行事件不
+构成安全证明。仍须重新核验原消息与当前绑定。原 worker 复用 Session 队列，最多
+预留三次确定性续办，分别在各次失败的一、二、四分钟后准入。停止、等待中的新输入、
+用户后来重交相同消息、其他恢复类型或相矛盾的原生证据都会阻止新执行。已受理续办
+仅修复关联，不重复派发。原失败及其送达记录保留；符合范围的私聊管家通知说明
+有条件接续，不承诺盲目重放。原生派发后的未知失败继续保留。
+
+原私聊项目助手或 Codex 管家的账户传输准备失败也可进入这一原队列。Core 必须恰好
+保留 Session 排队和失败两个事件，持久化 `started_at`、`first_event_at` 检查点均为空，
+没有原生 Turn、结果、答复、增量或附件，输入和 origin 未改变；这也覆盖旧版在队列
+首次持久化启动检查点之前产生的确切 `resume_failed` 诊断。准入前重新核验原消息、
+grant 和账户传输，核验本身不发起模型请求。准备接续沿用既有 quota/routing/preparation
+计数，上限仍为三次，不重置退避或历史；后来已派发的失败不能再开启其他业务重试
+类型。原失败及已送达的失败通知保持不变。
+
+来源核验同时支持普通文字与纯文字富文本。富文本必须保留原 provider 渲染、明确为空
+的附件清单，以及按原受理空白归一后相同的模型输入；provider 当前消息类型与完整
+渲染也必须相符。证据缺失或被编辑、图片及附件失败继续停止；恢复不下载资源，
+也不只提交媒体说明文字。
+
+只有重新核验当前 App、本人、grant 和未改变的原消息，并独立读回确切失败的原生
+Turn，确认完整条目清单仅包含原用户输入后，Core 才能按每条请求和上下文版本
+受理一次关联续办。策略或额度拒绝、追加纠正、工具、未知效果、关闭的 Session、
+群或 attached 路由及读回不可用均继续保留。原失败 Turn 与已核验的失败通知不变；
+续办由原 Session 队列执行，最终原消息结果使用独立冻结的送达阶段。重启恢复同一个
+确定性预留，不重复派发。已有 provider 回复作为数据随恢复提供，供保留已完成工作、
+避免重复效果。
+
+该有界准入也覆盖当前格式中的 `host_gate` 失败：原生错误为 `other`，且稳定、完整
+的原生清单证明只有原用户输入，没有任何执行条目时，才允许一次续办。它恢复既有
+线程，不迁移历史，也不匹配错误消息文本。这证明尚未执行，不证明 provider 健康
+或最终成功；这一未分类宿主／上下文迁移路径的续办若进入 Core 失败终态，就回传并
+保留失败，不能沿这一条路径再生成下一次续办。
+
+原有同轮传输重试也识别原生 `other` 类别下的确切诊断
+`workspace routing discovery timed out`。这个 provider 提示本身不授予重试权：
+必须重新读回稳定、完整的原生清单，证明最新失败 Turn 只有原用户输入。未知或改变的
+诊断、额外条目、停止、grant 或配置变化及重试预算耗尽仍阻止重试。它复用原 Core
+Turn、输入、Session 和至多三次的既有重试及退避预算，不重新打开已终止的历史请求，
+也不因重启重置预留。重试 journal 不复制原生错误正文；App 与 Lark 沿既有进展和
+最终读回路径展示同一请求的实际结果。
+
+同轮重试结束后，原私聊回复 worker 也可为普通项目助手与管家恢复已证实的路由故障。
+必须从最新失败的原生 Turn 独立读回上述确切诊断，或原生远端压缩任务附加的同一诊断。
+稳定、完整的条目清单只允许一条用户输入与原生压缩记账；回答、工具、追加纠正、未知
+条目和活动原生工作仍阻止恢复。每次受理前继续重新核验原消息、App／本人和 grant。
+Core 对每条原请求至多预留三次新的关联续办，分别从前次持久化失败起退避 60／120／240
+秒；重启不重置预算，也不重新打开失败 Turn。排队成功后丢失确认时，采用确切 client
+身份对应的既有 Turn，包括已经完成的 Turn，不再次排队。每次恢复有独立的呈现 key，
+并保留之前的预留与失败通知历史。续办的失败通知已送达仍不等于工作完成；已完成答复
+不会激活恢复。这不证明 provider 可用或业务最终完成，也不增加事件消费者。
+
+恢复发现的退避只是临时提示。规范请求仍存在时，原回复 worker 保留该请求的公平
+计数；某轮没有提示不代表工作已退役，也不能让前面的未结请求反复占满全部空位。
+四 worker 和不增加执行积压的上限保持。
+
+续办的接收提示、进展、游标与最终回传按版本独立记账，不重新打开原 Inbox 已确认的
+消息，也不把原失败通知改成新草稿；最终结果只替换本次新草稿。对于已经回传、但旧版
+误用原失败通知的续办，原 worker 可凭确切已确认的编辑凭证恢复旧通知，并结束随后
+残留的旧草稿。这仅是消息编辑修复：必须核验当前来源与 grant、原生规范 Turn，以及
+provider 当前正文等于已知前文或目标正文。正文改变、效果不明与编辑次数耗尽继续
+保留待办；不重新排队执行，也不另发结果。验收独立检查 provider 实际正文，覆盖草稿
+续段与回执丢失。
+
+资格验证覆盖真实后台扫描器、来源与授权反例、原生条目读取，以及受理前、排队后、
+传输同步前的中断。合成模型/provider 通路及只读原生观察不证明真实模型完成，
+也不代表更广泛的会话 SLA 已通过。
+
+### 管家答复被服务重启中断
+
+使用已配置灵活额度路由的 Codex 管家，遇到 `server_restarted` 且工具已经执行后，
+仍可预约一次受限的答案复核。原回复 worker 必须独立读回稳定、完整、没有最终答案
+和活动 item 的原生中断清单。原生 dynamic-tool 调用同样属于效果条目；稳定的终态
+清单只允许这次只读复核，不授予业务重放权。实际复核前再次核验清单摘要。
+
+provider 在这次复核与已完成工作的读回中复用同一组被动原生条目类型，包含
+`imageView`。读取图片不会使清单变成未知，也不算业务效果已结束的证明。
+图片元数据仍绑定原 Turn 和完整稳定清单的摘要；变化、重复、外国 Turn 或未知图片
+条目类型继续被原检查拒绝。原有效果终态、没有最终答案和没有活动工作的要求保留。
+
+复核沿用原来源、本人、grant、停止检查及同一 `review-1` 队列预留。受理及派发前
+都须重新核验已配置的 Codex 额度。新受限 thread 只保留原授权管家读取，禁用写入、
+网络效果、委派及业务续办；基于现有证据答复，或给出具体的部分答案。原失败 Turn
+与失败通知不变；重启或入队回执不明时采用已预留复核，不产生新次数。缺少原生证据
+或额度仍保留待办。失败提示说明这些恢复条件，不再对所有重启一律提示不会自动重放。
+
+这次独立答案复核在派发时收到完整原问题及已核验的可见结果，不在答复前导入、串行
+压缩无关的整段对话。Core 完整聊天记录保留；普通对话的历史恢复逻辑继续保留全部历史。
+
+原私聊管家也可能存在已核验的历史缺口，却完全没有 Core 请求。原服务可以在已绑定的
+Codex Session 上为该来源预留一次**仅补答案的复核**：须完成历史观察，重新读回原本人
+及原消息，队列空闲、binding 不变，且原来源之后没有 Stop/New；早于该 Session 的问题
+保留等待。provider 明确记录 `provider_history` 来源，不冒充收到的 WS 事件，也不虚构
+失败 Turn。复核复用受限 adapter 与正常账户策略，不切执行器，不写入、发送、委派或
+重跑业务；由原回复 worker 沿原消息回传并独立读回。入队确认丢失时采用同一预留。
+已捕获的普通请求、项目/attached/group 来源、命令、媒体及失败复核保留原边界；历史
+不能转为普通准入或业务重试。现有证据足够时直接答题；过去效果未知或业务未完成的
+部分仍明确保留。
+
+历史补答使用独立的受限原生上下文，不复用上一条补答的模型历史。派发输入带原来源
+时点之前、同一 Core Session 的至多 12 条完整消息；明确这只是可用 Core 前缀，
+不是 provider 全历史证明。超过 64 KiB 时保留不可用原因，不静默截句；不能从后来的
+提问、补答或当前工作记录推定“上面”等指代。只有已完成、已核验送达、无动作且
+明确保留 gate 的旧版只读历史复核，才可由原服务预留一次上下文纠正；旧 Turn 和
+原回复回执保持不变，纠正沿同一来源返回，丢失入队确认仍采用同一预留。失败、
+未知执行、普通业务、完整答复、未核实投递及已纠正项不适用，也不解除 Stop、
+撤权、忙会话和原生背景工作门禁。上下文纠正不结清原业务。
+纠正只推进该请求的预留版本，沿用既有只读 client 后缀，使已支持补答的旧 reader
+仍识别受限角色；正确交付原上下文需要更新后的运行版本，兼容不证明降级后的答复质量。
+
+provider 每次核对至多 64 条未核验原消息，形成完整的来源控制清单；数量更大、清单
+不完整或存在无法读取的原消息时继续保留等待，原实时接收优先。含有此类预留的存储
+降级到不支持仅补答案协议的旧 reader，不在本恢复契约内。
+若重启发生在取得队列 claim 后、原生派发前，worker 沿正常准备与执行屏障采用同一
+未启动 Turn，不空等 queued 自己变成 running；尚未发布的受管接收和已启动工作仍由
+各自原 owner 处理。
+
+### Turn 完成后的显式未完工作
+
+模型 Turn 终态与业务完成分开。私有项目 worker 核验已结束工作的实际结果后，可在
+回答 envelope 中报告 `unfinished_work={remaining,dependency,effects_settled:true}`。
+这份有界报告不授予权限，不创建任务、调度器或重试授权。权限门、受保护操作、
+交办、未知效果和旧自然语言回复均不能提供该续办意图。
+此路径只覆盖已绑定来源的普通私有项目 Codex 会话；管家、群聊、attached-host
+及携带附件的请求不进入该路径。
+
+既有原消息回复 worker 在 60 秒后才可预留一次续办。Core 重新核对原本人/App/
+来源、未变化的消息、工作区 grant 和停止/纠正状态。独立原生读回必须证明精确原始
+Turn 已完成、完整 item 库存稳定、所有效果 item 均已结束、没有后台工作，且同一
+最终回答确实包含该报告。历史工作只有在全部后续原生 Turn 均关联已结束的规范
+Core Turn，且各自完整 item 库存独立稳定、没有未知或未结束效果时才可续办。
+证明绑定这些库存的摘要；后续同内容来源提交、外来原生输入、未知 item、未结束/
+拒绝/活动效果、来源被编辑或 grant 被撤销均保持等待。原生 owner 丢失仍保持等待：
+冷客户端不能通过恢复 thread 来证明另一个进程没有后台效果。
+
+原生命令失败不等于进程效果未结束：provider 必须保留明确的普通非零退出码、
+有序的开始/结束时间戳及输出。缺少退出码、超时/信号退出，以及失败的文件改动
+或 MCP 效果仍保持等待。这不证明业务成功，也不授权重放失败命令；worker 仍须
+核验现有产物，只在原已结束报告与 grant 下完成剩余工作。
+
+执行复用原 Session 队列和确定性的 `work-1` 预留；重启采用已提交 Turn，不能再次
+派发。实际派发前再次读回原生库存，有新输入排队时让其优先。worker 先读原历史和
+实际产物，只完成仍获授权的剩余工作。新结果使用独立的
+原来源送达阶段，旧 Turn 与部分回复保持原样。续办失败或仍未完成时，不能再落入
+业务、路由或额度重试。没有第二个消费者。旧的非结构化部分回复继续保留，不从
+措辞推导意图或改写其终态；这项能力不证明其业务完成。一次性原生/provider 完整
+流程验证的是这一有界路径，不能冒称历史用户请求或真实模型行为已验收。
+
+### 飞书进度编辑预算与最终结果恢复
+
+私聊与管家委托复用已持久化的 Turn 事件更新同一条进度消息；完整结果仍由 Core
+终态回答决定。进度最多尝试 12 次编辑，尝试次数在 provider 写入前持久化，未知
+回执也占用预算，重启不重置。该预算是保守的 transport 限制，不代表飞书最大额度。
+达到预算后仍累计原 Turn 事件，保留最终编辑及必要的关闭通知额度。
+
+旧长任务可能已经耗尽 provider 额度。只有飞书明确返回 `230072`，且重新读回确认
+目标正文未到达时，才保留被拒编辑的 proof，并通过现有源会话、受众与幂等发送路径
+单独投递完整结果。不能把已耗尽的草稿标成成功关闭；不能重跑模型或重建 Session。
+未知错误、丢失回执或不可读回仍保持原请求可恢复，不盲目补发。结果已经读回但
+reaction 清理未完成时，也只恢复原结果 proof，不能再次发送。
+
+回归覆盖预算跨重启、最终结果保留、明确额度拒绝、未知失败、写入后丢失回执、
+读回不可用、旧失败 journal 升级恢复与两 App 隔离。真实 provider 投递独立验收；
+模型执行完成、材料入库或中间卡片可见均不能代替最终消息读回。
+
+### Core 失败后的原生结果恢复
+
+原生终止错误仍是失败。只有完整的当前调用已空闲、所有已观察步骤均结束，且
+最后错误步骤为 done，适配器才先撤下该调用的取消目标，再返回原结构化错误。
+仍在活动或状态未知的步骤保留既有有界取消和权限处理。避免第二次取消不证明
+没有执行效果，也不授予重放、恢复、结果采用或业务完成资格。
+
+额度耗尽的失败提示仍是待办。对于 Antigravity，只在原 worker 两次独立读回同一
+空闲轨迹，证明最新一次调用恰好是原始输入和结构化 `QUOTA_EXHAUSTED` 错误、
+没有任何模型输出或工具步骤时，现有队列才可预约一次新的 quota 续办 Turn。
+准入绑定原 prompt hash、来源、执行时间、原生索引、当前授权与最新额度；后续
+来源输入、steering、stop、新队列、未知或已清理步骤均阻止续办。取消未确认本身
+不构成重放资格。已启用的灵活端点池可沿既有额度 owner 选择 Codex，派发前再次
+核验当前配置与容量。失败 Turn 和原失败通知保留，崩溃恢复采用同一个预约身份；
+正常结果仍须由原 Bot 沿原受众实际回传并独立读回。
+
+同一 Core Session 忙碌或仍有活跃 Turn 时，历史原生结果暂不进入读回发现，避免
+占用当前进度所需的共享回复 worker。已核验结果的元数据仍由原关联修复路径负责。
+
+Antigravity 原生端可能已经完成，而 Core 仍保留 transport 失败。原回复 worker
+可以采用既有答复，不准入另一个 Turn，不发送原生输入，也不取消执行。会话的
+typed owner 核验原私聊管家 binding、来源、失败 Turn 和当前授权，并排除附件、
+steering、stop/new 与 attached-host 路由。provider 读回必须完整覆盖稳定、空闲的
+轨迹、最后一条输入及同一 execution 的已结束步骤，并以正常最终答复结束。关联
+依赖准确的 Core 来源上下文、原消息及落在失败 Turn 执行期间的输入时间；新输入
+还在既有 `turn.started` 事件中保存发送前 prompt hash 和原生起始索引。证据缺失、
+冲突或以 stream error 结束时继续保留待办。
+
+既有请求 journal 先冻结采用结果和消息正文，再以确定性 message id 追加一条 canonical Chat
+消息；原失败 Turn、事件和已送达的失败通知均不改写。飞书沿同一个 Inbox 意图与
+读回路径使用独立阶段，崩溃后恢复同一消息和回执。写入后丢失确认仍记为欠回，
+不能盲目重发。操作元数据无效时保留正文、明确显示 gate，不提交其中任何动作；
+结果恢复本身也不执行有效的操作元数据。即使正文已补回，这些工作仍保持待办；
+正文恢复不证明业务或委派完成。取消失败同时保留原 provider 错误和清理未确认状态。
+
+正文已独立验明送达且匹配原生结果后，若原动作批次只有受限文本 brief 的委派，
+原 Session 队列可以预约一次**格式复核**。准入重新核验原生输入/答复 hash、
+当前 binding、原消息读回和空闲队列。委派的 `inputs` 只标识共享工作区的相对
+文件；PR、Issue 和其他网页链接写进 `context`。当 brief 其余字段合规，且
+每项输入都是没有凭据、查询参数或片段的普通 HTTPS 链接时，原 adapter 已预约的
+复核保留完整原 brief 作为上下文，并将文件输入置空；不访问链接或重新调用模型。
+其他合格格式或已选定 Codex 备用路由的复核，仍走禁用工具的纯文本路径，校验前
+不展示模型正文。两条路径都保留原文、
+接收者及顺序；附加动作、目标变化、未知结束、新输入、steering、停止或授权撤销
+均不能提交委派。
+
+既有 ingress 保持原 source id，普通投递因此沿用每个接收者的稳定请求身份和
+当前授权。正常 handoff owner 提供实际回执，接收者结论仍须单独回传。原回复
+worker 使用独立展示阶段返回这些回执，保留原失败 Turn、失败通知和恢复正文。
+预约或入队后的崩溃只采用同一个队列 Turn；失败、部分提交或结果未知的复核继续
+记为欠办，不能变成又一次复核或业务重试。其他错误动作、没有已核验原生结果的
+completed Turn 继续明确保留，本路径不提供通用动作或执行重放。
+
+### 已完成的普通项目部分答复复核
+
+原普通项目 Turn 已完成且包含 typed `unfinished_work` 时，如果执行效果不能支持
+可写续办，可以退回一次受限的结果复核。provider 必须读回同一份稳定、已结束的
+原生最终答复和未完声明，后续原生输入也必须能关联到 Core。该观测**不证明效果
+已经结清**；失败或被信号终止的命令不能借此取得重放权限。
+
+没有 typed 未完声明的旧请求也可获得一次自己的结果复核，但只限同一 Session、
+binding 和受众下，更早的独立来源提出完全相同的问题，且其合格结果复核在该旧
+答复之后完成并已投递。Core 固定这项规范证据与原生最终答复，不按失败措辞分类。
+另一条答复不算本条已收到，也不能补充原指代、结清效果或制造缺失的业务意图。
+原 worker 独立检查当前产物，沿本条原消息自己的幂等身份补回一次只读答案。
+旧请求复核不能再作为其他旧请求的准入依据；证据变化或次数用尽继续保持等待。
+
+两处保留 Turn 证据在跨 JSON/JavaScript 边界前排除宿主事件压缩用的文件系统标记，
+避免纳秒数值舍入被当成答案或授权变化；全部语义字段仍固定。旧准备阶段已失败时，
+只有规范轨迹恰为入队后本地 `host_gate`、没有原生输入、delta 或答复，且新鲜原生
+清单排除隐藏派发，才允许一次准备恢复。失败 Turn 与预约继续留在历史中，恢复使用
+独立固定的准备回执及投递阶段，不重新授予一次模型调用。已经派发、原生工作未知、
+来源或证据变化、停止，以及第二次准备失败继续保持等待；预约和入队崩溃只认回
+同一个准备回执。
+它沿用 `preparation-1` 标识并携带显式只读准备标记，旧版本在回滚后会于模型
+派发前拒绝这一策略组合。
+
+新的结果复核现在要求明确观测到没有挂接原可写 adapter。原进程仍挂接时，效果
+读回暂时没有结论，应保持等待，不能为复述已投递的部分答复而用模型复核替换
+原进程。已有回复 worker 的探测等待间隔继续生效；后续取得新鲜效果结清证明后，
+可直接准入原有的一次剩余工作续办，不要求用户再发一条消息。进程归属未知也
+保持等待。已预约复核继续核对同一队列回执；这条规则不为已丢失的原生进程制造归属。
+
+原 worker 复用已有 Session、队列和项目 binding，仍核验新鲜来源和授权、空闲队列、
+等待间隔，以及停止、steering 和附件边界。原生进程仍在时，只在它持有原线程且
+没有运行中或后台工作时通过该进程读回结果。会话没有现成 adapter 时才启动冷读取。
+复核使用现有工作区只读权限配置并禁用网络。它可检查当前本地产物和回执，不能写入、
+发送、委派或替换原未完声明。旧问题中的指代仅使用原提问之前的 Core 上下文。
+原部分答复 Turn 和投递保持不变，由同一个飞书 worker 使用独立、幂等阶段补回新
+答复；预约崩溃只采用同一个已入队复核。如果可写续办已入队、原请求日志尚未更新，
+worker 先认回同一个 Turn。执行前仍重查原来源、队列和原生效果。
+
+复核后原业务义务继续保留。无 gate 的复核成功送达后，原 worker 可以依据原有结构化
+部分答复重新核验尚未使用的 `work-1` 续办资格。原线程的当前 owner 必须重新证明效果
+已结清，包括期间的复核与后续输入。Core 核对原来源、授权、队列、停止与 steering，
+以及原 Turn 与复核 Turn 的精确关联。原 worker 在执行前再次核验效果清单，续办结果
+独立于此前两次答复送达。复核失败、复核 gate、原生 owner 丢失、新输入替代或效果未知
+时继续保留原待办。已准入的续办在失败、有 gate、未完成或尚未核验结果送达时继续可见。
+复核本身不授予执行权限，每条请求最多复核一次。
+
+已完成的复核不消耗原请求仅一次的 `work-1` 预约。如果原可写运行进程通过普通工作
+恢复可用，现有回复 worker 可以重新检查保留的原未完声明。它必须取得新鲜的原生
+效果结清证明，并重新核验原消息、授权、已完成复核和 binding 快照。后续相同正文的
+独立来源请求仍会暂停旧工作。复核正文和冷读取清单不能替代该证明。准入及执行前
+复用已有续办检查，崩溃只认回同一预约 Turn。续办失败或仍不完整时继续保持待办，
+不能增加执行次数。
+
+### File 后端的空闲恢复观测
+
+逐条检查旧请求时，不应反复解析全部历史 Turn 和来源正文。File Chat provider
+只保留经过验证的终态 Turn 身份/状态，以及既有 stop/new 和后续输入检查所需的
+来源控制字段。复用要求 device、inode、纳秒 mtime、ctime 和文件大小均未改变，
+并在原读取前后核对。变化或不可读的文件仍走原 reader；非终态 Turn 每次读取
+完整正文。删除项清理、并发调用返回独立元数据，读取期间发生替换时不保存可复用观测。
+Windows 的 Python stat ctime 可能代表创建时间，不能作为可靠的变化标识，因此
+继续走原来的新鲜读取路径，见
+[Python stat 时间字段说明](https://docs.python.org/3.12/library/os.html#os.stat_result.st_ctime_ns)。
+私聊回复 journal 的观测复用同一个变化标识实现，仍保留自身的旧修复投影和原效果核验。
+
+这些观测不是恢复决定或授权。精确请求、选中的 Turn、当前 binding、原生效果及
+typed 准入仍保持新鲜读取。源码资格以同一份 File 历史和完整恢复计划做对照，
+覆盖新入队输入、严格读取失败、stop/new 变化及保留 mtime 的文件替换。实际安装后的
+响应速度、provider/模型可用性和原受众真正收到答复，仍须分别验收。

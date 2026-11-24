@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import pytest
+
 from loopx.bootstrap import (
     bootstrap_project,
     render_state_markdown,
     repair_missing_todo_source_sections,
+)
+from loopx.control_plane.coordination.local_authority import (
+    CanonicalAuthorityRequired,
 )
 from loopx.control_plane.goals.goal_frontier import (
     build_goal_frontier_projection_from_summaries,
@@ -97,11 +102,10 @@ def test_existing_state_migration_preserves_recognized_legacy_source_heading() -
     assert "## Agent Todo" in migrated
 
 
-def test_bootstrap_repairs_existing_state_todo_sources_in_place(tmp_path) -> None:
+def test_bootstrap_rejects_existing_markdown_only_state_without_rewriting(tmp_path) -> None:
     state_file = tmp_path / ".codex/goals/goal-terminal-test/ACTIVE_GOAL_STATE.md"
     state_file.parent.mkdir(parents=True)
-    state_file.write_text(
-        """\
+    original = """\
 # Active Goal State
 
 ## Objective
@@ -111,70 +115,41 @@ Preserve this existing state.
 ## Next Action
 
 - Continue.
-""",
-        encoding="utf-8",
-    )
+"""
+    state_file.write_text(original, encoding="utf-8")
+    registry_path = tmp_path / ".loopx/registry.json"
+    runtime_root = tmp_path / ".loopx-runtime"
 
-    result = bootstrap_project(
-        project=tmp_path,
-        registry_path=tmp_path / ".loopx/registry.json",
-        runtime_root=tmp_path / ".loopx-runtime",
-        goal_id="goal-terminal-test",
-        objective="Do not replace the existing objective.",
-        domain="issue-fix",
-        role="primary",
-        parent_goal_id=None,
-        state_file=state_file,
-        goal_doc=None,
-        adapter_kind="issue_fix_workflow_v0",
-        adapter_status="connected",
-        next_probe=None,
-        spawn_allowed=False,
-        max_children=0,
-        allowed_domains=[],
-        write_scope=[],
-        force=False,
-        dry_run=False,
-        sync_global=False,
-    )
+    with pytest.raises(CanonicalAuthorityRequired) as caught:
+        bootstrap_project(
+            project=tmp_path,
+            registry_path=registry_path,
+            runtime_root=runtime_root,
+            goal_id="goal-terminal-test",
+            objective="Do not replace the existing objective.",
+            domain="issue-fix",
+            role="primary",
+            parent_goal_id=None,
+            state_file=state_file,
+            goal_doc=None,
+            adapter_kind="issue_fix_workflow_v0",
+            adapter_status="connected",
+            next_probe=None,
+            spawn_allowed=False,
+            max_children=0,
+            allowed_domains=[],
+            write_scope=[],
+            force=False,
+            dry_run=False,
+            sync_global=False,
+        )
 
-    repaired = state_file.read_text(encoding="utf-8")
-    assert result["state_action"] == "kept-existing"
-    assert result["todo_source_migration"] == {
-        "schema_version": "todo_source_section_migration_v0",
-        "added_roles": ["user", "agent"],
-        "applied": True,
-    }
-    assert "Preserve this existing state." in repaired
-    assert "Do not replace the existing objective." not in repaired
-    assert "## User Todo / Owner Review Reading Queue" in repaired
-    assert "## Agent Todo" in repaired
-
-    second_result = bootstrap_project(
-        project=tmp_path,
-        registry_path=tmp_path / ".loopx/registry.json",
-        runtime_root=tmp_path / ".loopx-runtime",
-        goal_id="goal-terminal-test",
-        objective="Still do not replace the existing objective.",
-        domain="issue-fix",
-        role="primary",
-        parent_goal_id=None,
-        state_file=state_file,
-        goal_doc=None,
-        adapter_kind="issue_fix_workflow_v0",
-        adapter_status="connected",
-        next_probe=None,
-        spawn_allowed=False,
-        max_children=0,
-        allowed_domains=[],
-        write_scope=[],
-        force=False,
-        dry_run=False,
-        sync_global=False,
-    )
-
-    assert second_result["todo_source_migration"] is None
-    assert state_file.read_text(encoding="utf-8") == repaired
+    assert caught.value.code == "canonical_authority_required"
+    assert caught.value.payload["operation"] == "goal_create"
+    assert caught.value.payload["legacy_fallback_used"] is False
+    assert state_file.read_text(encoding="utf-8") == original
+    assert not registry_path.exists()
+    assert not runtime_root.exists()
 
 
 def test_agent_only_no_followup_closes_explicit_empty_user_source() -> None:
@@ -195,6 +170,60 @@ def test_agent_only_no_followup_closes_explicit_empty_user_source() -> None:
         "agent_todos": "valid",
     }
     assert goal_frontier_is_terminal_no_followup(projection=projection) is True
+
+
+@pytest.mark.parametrize("readback", ["legacy", "current"])
+@pytest.mark.parametrize("acceptance_status", ["unverified", "failed", "accepted"])
+def test_no_followup_requires_current_checks_across_readback_versions(
+    readback: str, acceptance_status: str,
+) -> None:
+    parsed = _closed_todo_sources()
+    contract = {
+        "criteria": [{"id": "calculator", "description": "Validate the complete calculator result."}],
+        "tasks": [{"todo_id": "todo_fix", "state": "ready", "applicable": True}],
+        "status": acceptance_status,
+    }
+    if readback == "legacy":
+        contract["enabled"] = True
+    parsed["agent_todos"]["goal_acceptance_contract"] = contract
+    status = quota_status_payload(
+        goal_id="goal-terminal-test", status="active",
+        recommended_action="Inspect current verification of the completed calculator result.",
+        user_todos=parsed["user_todos"], agent_todos=parsed["agent_todos"],
+    )
+
+    decision = build_quota_should_run(status, goal_id="goal-terminal-test")
+
+    projection = decision["goal_frontier_projection"]
+    assert goal_frontier_is_terminal_no_followup(projection=projection) is (acceptance_status == "accepted")
+    if acceptance_status == "accepted":
+        assert projection["source_completeness"]["goal_acceptance"] == "accepted"
+    else:
+        assert projection.get("terminal_state") is None
+    # A failed or missing whole-Goal verification cannot manufacture another
+    # empty delivery after the work closed. Preserve its original evidence.
+    assert decision["should_run"] is False
+
+
+@pytest.mark.parametrize("pending_gap", [False, True])
+def test_default_outcome_without_checks_uses_its_existing_frontier(pending_gap: bool) -> None:
+    parsed = _closed_todo_sources()
+    gaps = [{"kind": "goal_outcome_uncovered", "outcome_id": "calculator",
+             "requirement_ids": ["explanation"]}] if pending_gap else []
+    agent_summary = summarize_user_todos_for_quota(parsed["agent_todos"])
+    agent_summary["goal_acceptance_contract"] = {
+        "outcome_requirements": {"outcomes": [], "acceptance_gaps": gaps},
+    }
+
+    projection = build_goal_frontier_projection_from_summaries(
+        goal_id="goal-terminal-test", agent_id=None,
+        user_todo_summary=summarize_user_todos_for_quota(parsed["user_todos"]),
+        agent_todo_summary=agent_summary, work_lane_contract=None,
+        replan_obligation=None, acceptance_gaps=gaps,
+    )
+
+    assert "goal_acceptance" not in projection.get("source_completeness", {})
+    assert goal_frontier_is_terminal_no_followup(projection=projection) is (not pending_gap)
 
 
 def test_watch_only_monitor_does_not_block_terminal_convergence() -> None:

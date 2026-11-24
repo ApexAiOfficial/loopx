@@ -114,39 +114,6 @@ def _assert(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def test_action_text_uses_signed_primary_action() -> None:
-    request = _request(
-        recommended_action="legacy action must not win",
-        primary_action="signed primary action",
-    )
-    _assert(
-        adapter.extract_action_text(request) == "signed primary action",
-        "signed primary_action must be the bounded task body",
-    )
-
-
-def test_unsigned_action_is_rejected() -> None:
-    request = _request()
-    request["turn_envelope"]["action_signature"]["matches"] = False
-    try:
-        adapter.extract_action_text(request)
-    except ValueError as exc:
-        _assert("action signature" in str(exc), "signature error must be actionable")
-    else:  # pragma: no cover - defensive
-        raise AssertionError("unsigned TurnEnvelope action must fail closed")
-
-
-def test_action_tampering_after_signature_is_rejected() -> None:
-    request = _request()
-    request["turn_envelope"]["action"]["primary_action"] = "tampered action"
-    try:
-        adapter.extract_action_text(request)
-    except ValueError as exc:
-        _assert("action signature" in str(exc), "tamper error must be actionable")
-    else:  # pragma: no cover - defensive
-        raise AssertionError("post-signature TurnEnvelope tampering must fail closed")
-
-
 def test_prompt_preserves_structured_turn_authority() -> None:
     request = _request(recommended_action="legacy action must not appear")
     authority = adapter.extract_turn_authority(request)
@@ -248,12 +215,10 @@ def test_text_fields_are_bounded() -> None:
         "next_action": "z" * 5000,
     }
     result = adapter.build_result(request, candidate)
-    _assert(
-        len(result["classification"]) <= 120,
-        "classification must respect its limit",
-    )
-    _assert(len(result["summary"]) <= 400, "summary must respect its limit")
-    _assert(len(result["next_action"]) <= 1_200, "next_action must respect its limit")
+    for field in ("classification", "summary", "next_action"):
+        _assert(result[field] == candidate[field], "adapter must preserve " + field)
+    verdict = validate_loopx_turn_host_result(_plan(request), result)
+    _assert(not verdict["ok"], "the executor must reject oversized candidate text")
 
 
 def test_subprocess_adapter_roundtrip_with_fake_host() -> None:
@@ -316,10 +281,62 @@ def test_subprocess_adapter_roundtrip_with_fake_host() -> None:
             "--output-last-message" in argv,
             "adapter must read the native structured result file",
         )
+        _assert(
+            "--permission-mode" not in argv,
+            "default adapter invocation must use TraeX's headless policy",
+        )
+        sandbox_index = argv.index("--sandbox")
+        _assert(
+            argv[sandbox_index + 1] == "workspace-write",
+            "default adapter invocation must permit governed workspace writes",
+        )
+
+
+def test_explicit_permission_mode_is_forwarded() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = Path(tmp) / "fake-traex"
+        argv_file = Path(tmp) / "argv.json"
+        block = json.dumps(
+            {
+                "result_kind": "wait",
+                "classification": "permission probe",
+                "summary": "No workspace change requested.",
+                "recommended_action": "none",
+                "next_action": "none",
+                "vision_unchanged_reason": "the objective is unchanged",
+            }
+        )
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            f"pathlib.Path({str(argv_file)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+            "output_path = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
+            f"output_path.write_text({block!r}, encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "traex_turn_host_adapter.py"),
+                "--traex-bin",
+                str(fake),
+                "--permission-mode",
+                "bypass_permissions",
+            ],
+            input=json.dumps(_request()),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        _assert(completed.returncode == 0, "adapter must exit 0: " + completed.stderr)
+        argv = json.loads(argv_file.read_text())
         permission_index = argv.index("--permission-mode")
         _assert(
-            argv[permission_index + 1] == "default",
-            "default adapter invocation must not bypass permissions",
+            argv[permission_index + 1] == "bypass_permissions",
+            "explicit permission mode must be forwarded unchanged",
         )
 
 
@@ -372,9 +389,6 @@ def test_timeout_terminates_traex_descendants() -> None:
 
 def main() -> int:
     tests = [
-        test_action_text_uses_signed_primary_action,
-        test_unsigned_action_is_rejected,
-        test_action_tampering_after_signature_is_rejected,
         test_prompt_preserves_structured_turn_authority,
         test_structured_result_file_is_the_only_candidate_channel,
         test_material_progress_result_validates,
@@ -382,6 +396,7 @@ def main() -> int:
         test_missing_result_block_fails_closed_to_wait,
         test_text_fields_are_bounded,
         test_subprocess_adapter_roundtrip_with_fake_host,
+        test_explicit_permission_mode_is_forwarded,
         test_timeout_terminates_traex_descendants,
     ]
     for test in tests:

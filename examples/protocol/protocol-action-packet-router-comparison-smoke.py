@@ -4,158 +4,29 @@
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT))
-
-from loopx.quota import build_quota_should_run
-
-
-GOAL_ID = "protocol-router-comparison-fixture"
 SCHEMA_VERSION = "protocol_router_comparison_v0"
 
-
-def todo(index: int, text: str, *, role: str = "agent", priority: str = "P1", task_class: str | None = None) -> dict:
-    item = {
-        "index": index,
-        "text": text,
-        "role": role,
-        "status": "open",
-        "priority": priority,
-    }
-    if task_class:
-        item["task_class"] = task_class
-    return item
-
-
-def status_payload(
-    *,
-    scenario_id: str,
-    agent_todos: list[dict],
-    user_todos: list[dict] | None = None,
-    status: str = "protocol_router_comparison_fixture",
-    next_action: str | None = None,
-) -> dict:
-    if next_action is None:
-        next_action = f"Run cold-path comparison fixture for {scenario_id}."
-    agent_summary = {
-        "schema_version": "todo_summary_v0",
-        "source_section": "Agent Todo",
-        "total_count": len(agent_todos),
-        "open_count": len(agent_todos),
-        "done_count": 0,
-        "first_open_items": agent_todos[:3],
-    }
-    item = {
-        "goal_id": GOAL_ID,
-        "status": status,
-        "waiting_on": "codex",
-        "severity": "info",
-        "source": "project_asset",
-        "recommended_action": next_action,
-        "quota": {
-            "compute": 1.0,
-            "window_hours": 24,
-            "slot_minutes": 1,
-            "allowed_slots": 10,
-            "spent_slots": 0,
-            "state": "eligible",
-            "reason": "eligible fixture",
-        },
-        "project_asset": {
-            "next_action": next_action,
-            "stop_condition": "stop on private material",
-            "agent_todos": agent_summary,
-        },
-    }
-    if user_todos:
-        user_summary = {
-            "schema_version": "todo_summary_v0",
-            "source_section": "User Todo / Owner Review Reading Queue",
-            "total_count": len(user_todos),
-            "open_count": len(user_todos),
-            "done_count": 0,
-            "first_open_items": user_todos[:3],
-            "items": user_todos,
-        }
-        item["user_todos"] = user_summary
-        item["project_asset"]["user_todos"] = user_summary
-    payload = {
-        "ok": True,
-        "attention_queue": {"items": [item]},
-        "run_history": {
-            "goals": [
-                {
-                    "id": GOAL_ID,
-                    "registry_member": True,
-                    "status": status,
-                    "adapter_kind": "harness_self_improvement",
-                    "adapter_status": "connected-read-only",
-                    "quota": {
-                        "compute": 1.0,
-                        "window_hours": 24,
-                        "slot_minutes": 1,
-                        "allowed_slots": 10,
-                    },
-                }
-            ]
-        },
-    }
-    advancement_items = [
-        item
-        for item in agent_todos
-        if item.get("task_class") == "advancement_task"
-        or "protocol simplification" in str(item.get("text") or "")
-    ]
-    monitor_items = [
-        item
-        for item in agent_todos
-        if item.get("task_class") == "continuous_monitor"
-        or "observation lane" in str(item.get("text") or "")
-    ]
-    if advancement_items:
-        payload["attention_queue"]["autonomous_backlog_candidates"] = {
-            "source": "attention_queue.agent_todos",
-            "open_count": len(advancement_items),
-            "task_class": "advancement_task",
-            "items": [
-                {
-                    "goal_id": GOAL_ID,
-                    "status": status,
-                    "waiting_on": "codex",
-                    "quota_state": "eligible",
-                    "priority": item.get("priority"),
-                    "todo_index": item.get("index"),
-                    "task_class": "advancement_task",
-                    "text": item.get("text"),
-                    "source": "agent_todos",
-                }
-                for item in advancement_items
-            ],
-        }
-    if monitor_items:
-        payload["attention_queue"]["autonomous_monitor_candidates"] = {
-            "source": "attention_queue.agent_todos",
-            "open_count": len(monitor_items),
-            "task_class": "continuous_monitor",
-            "items": [
-                {
-                    "goal_id": GOAL_ID,
-                    "status": status,
-                    "waiting_on": "codex",
-                    "quota_state": "eligible",
-                    "priority": item.get("priority"),
-                    "todo_index": item.get("index"),
-                    "task_class": "continuous_monitor",
-                    "text": item.get("text"),
-                    "source": "agent_todos",
-                }
-                for item in monitor_items
-            ],
-        }
-    return payload
+# Cold-sidecar inputs only: these named synthetic v0 summaries are not current
+# quota output or historical archive validation. Keep them independent of the
+# quota producer so the legacy comparison cannot reintroduce packet writes.
+LEGACY_SYNTHETIC_SUMMARIES = {
+    "advancement": (
+        "actor=agent user_action_required=false agent_action_required=true "
+        "quiet_noop_allowed=false lane=advancement_task llm=no_api "
+        "agent_action=advance the protocol simplification comparison with validation"
+    ),
+    "user_action": (
+        "actor=agent_with_user_gate user_action_required=true agent_action_required=true "
+        "quiet_noop_allowed=false lane=advancement_task llm=no_api "
+        "user_action_pending=true user_action=decide whether to approve a setup check "
+        "agent_action=advance independent scope-bounded work with validation"
+    ),
+    "monitor_quiet": (
+        "actor=agent user_action_required=false agent_action_required=false "
+        "quiet_noop_allowed=true lane=continuous_monitor llm=no_api "
+        "agent_action=quiet no-op until the monitor reports a material transition"
+    ),
+}
 
 
 def deterministic_router_summary(rule_summary: str) -> str:
@@ -194,8 +65,7 @@ def boundary_forbidden_terms() -> tuple[str, ...]:
     )
 
 
-def comparison_for(scenario_id: str, guard: dict) -> dict:
-    rule_summary = guard["protocol_action_packet"]["summary"]
+def comparison_for(scenario_id: str, rule_summary: str) -> dict:
     router_summary = deterministic_router_summary(rule_summary)
     facts = required_facts(rule_summary)
     required_terms = {
@@ -229,66 +99,15 @@ def comparison_for(scenario_id: str, guard: dict) -> dict:
 
 
 def build_comparison_report() -> dict:
-    scenarios = [
-        (
-            "advancement",
-            status_payload(
-                scenario_id="advancement",
-                agent_todos=[
-                    todo(
-                        1,
-                        "[P1] Protocol simplification comparison: measure rule packet against a cold-path router summary.",
-                        task_class="advancement_task",
-                    )
-                ],
-            ),
-        ),
-        (
-            "user_action",
-            status_payload(
-                scenario_id="user_action",
-                agent_todos=[
-                    todo(
-                        1,
-                        "[P2] Meta canary/readiness observation lane: keep status health observable.",
-                        priority="P2",
-                        task_class="continuous_monitor",
-                    )
-                ],
-                user_todos=[
-                    todo(
-                        1,
-                        "[P1] Decide whether to approve a no-submit setup check.",
-                        role="user",
-                        task_class="advancement_task",
-                    )
-                ],
-            ),
-        ),
-        (
-            "monitor_quiet",
-            status_payload(
-                scenario_id="monitor_quiet",
-                agent_todos=[
-                    todo(
-                        1,
-                        "[P2] Meta canary/readiness observation lane: keep status health observable.",
-                        priority="P2",
-                        task_class="continuous_monitor",
-                    )
-                ],
-                next_action="Stay quiet until the monitor lane reports a material transition.",
-            ),
-        ),
-    ]
     comparisons = [
-        comparison_for(scenario_id, build_quota_should_run(payload, goal_id=GOAL_ID))
-        for scenario_id, payload in scenarios
+        comparison_for(scenario_id, summary)
+        for scenario_id, summary in LEGACY_SYNTHETIC_SUMMARIES.items()
     ]
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "deterministic_cold_path_fixture",
         "input_schema": "protocol_action_packet_v0",
+        "input_source": "legacy_synthetic_fixture",
         "codex_cli_invoked": False,
         "direct_llm_api_invoked": False,
         "env_read": False,
@@ -304,7 +123,7 @@ def build_comparison_report() -> dict:
         "decision": {
             "direct_llm_api": "defer",
             "codex_cli": "optional_cold_path_only",
-            "hot_path": "keep_protocol_action_packet_v0_rule_baseline",
+            "hot_path": "candidate_structured_quota_contracts_without_legacy_packet",
             "next_step": "if needed, compare this fixture against an actual Codex CLI summary outside quota should-run",
         },
     }
@@ -313,6 +132,7 @@ def build_comparison_report() -> dict:
 def main() -> None:
     report = build_comparison_report()
     assert report["schema_version"] == SCHEMA_VERSION, report
+    assert report["input_source"] == "legacy_synthetic_fixture", report
     assert report["codex_cli_invoked"] is False, report
     assert report["direct_llm_api_invoked"] is False, report
     assert report["env_read"] is False, report

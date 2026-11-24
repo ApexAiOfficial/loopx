@@ -3,7 +3,9 @@ from pathlib import Path
 
 import pytest
 
+from loopx.entrypoint import main as loopx_main
 from loopx import slash_command_install
+from loopx.pi_goal_mode.installation import inspect_pi_installations
 from loopx.slash_command_install import (
     install_slash_commands,
     materialize_loopx_entry_skill,
@@ -43,15 +45,31 @@ def test_host_materialization_installs_generated_loopx_entry_skill(
         "skill_id": "loopx",
         "path": str(skill),
         "status": "created",
+        "metadata_status": "created",
     }
-    assert 'name: "loopx"' in skill_text
+    # A plain scalar, not `name: "loopx"`: hosts such as Kiro CLI keep the quote
+    # characters verbatim and would expose the skill as `/"loopx"`.
+    assert "name: loopx\n" in skill_text
+    assert 'name: "loopx"' not in skill_text
     assert "ark-managed-agent" in skill_text
     assert "--slash-command-arguments" in skill_text
     assert "The CLI, not the model, owns parsing" in skill_text
     assert "Never split or recompose" in skill_text
     assert "never infer a route from issue/PR wording or URLs" in skill_text
+    assert "[--new-peer]" in skill_text
+    assert "explicitly asks for a fresh, new" in skill_text
+    assert "Do not infer a fresh identity" in skill_text
+    assert "verified active LoopX Goal/Agent binding" in skill_text
+    assert "Do not call `start-goal` for an ordinary phase" in skill_text
+    assert "typed Todo/writeback path for the bound agent" in skill_text
+    assert "explicit new-Goal request" in skill_text
     assert "`ordered_steps` and `goal_start_contract` as authoritative" in skill_text
     assert "surface the exact pasteable gate" in skill_text
+    # Optional preference instructions belong to its active hook, not this
+    # universally installed entry skill (including the empty-store recipe).
+    assert "semantic-preference" not in skill_text
+    assert "Agent preferences" not in skill_text
+    assert "preference-dependent" not in skill_text
     assert "follow its exact CLI `interaction_contract` or quota command first" in skill_text
     assert "reuse the packet's verified thread binding" not in skill_text
     assert "capability show <capability-id> --format json" not in skill_text
@@ -81,6 +99,8 @@ def test_host_materialization_can_bind_exact_managed_agent_surface(
     assert "The CLI, not the model, owns parsing" in skill_text
     assert "`ordered_steps` and `goal_start_contract` as authoritative" in skill_text
     assert "never infer a route" in skill_text
+    assert "verified active LoopX Goal/Agent binding" in skill_text
+    assert "Do not call `start-goal` for an ordinary phase" in skill_text
     assert "follow its exact CLI `interaction_contract` or quota command first" in skill_text
     assert "current Todo evidence and the next executable Todo" not in skill_text
     assert "generic Todos remain scheduling records" not in skill_text
@@ -125,6 +145,31 @@ def test_host_materialization_rejects_unknown_fixed_surface(tmp_path: Path) -> N
         )
 
 
+@pytest.mark.parametrize("host_surface", ["ark-managed-agent", "deepseek-harness-native"])
+def test_exact_host_materialization_does_not_add_codex_policy(tmp_path, host_surface):
+    result = materialize_loopx_entry_skill(
+        skills_dir=tmp_path, execute=True, host_surface=host_surface,
+    )
+    assert "metadata_status" not in result
+    assert not (tmp_path / "loopx/agents/openai.yaml").exists()
+
+
+@pytest.mark.parametrize("user_skill", [False, True])
+def test_entry_materialization_preserves_user_metadata(tmp_path, user_skill):
+    skill, metadata = _loopx_paths(tmp_path)
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text('interface:\n  display_name: "My workflow"\n')
+    if user_skill:
+        skill.write_text("User-owned skill\n")
+    result = materialize_loopx_entry_skill(skills_dir=tmp_path / "skills", execute=True)
+    assert metadata.read_text() == 'interface:\n  display_name: "My workflow"\n'
+    if user_skill:
+        assert result["status"] == "skipped_user_file"
+        assert skill.read_text() == "User-owned skill\n"
+    else:
+        assert result["metadata_status"] == "skipped_user_file"
+
+
 def test_codex_install_upgrades_managed_loopx_facade(tmp_path: Path) -> None:
     codex_home = tmp_path / "codex"
     skill, metadata = _loopx_paths(codex_home)
@@ -149,6 +194,17 @@ def test_codex_install_upgrades_managed_loopx_facade(tmp_path: Path) -> None:
     assert "use `codex-ide` for the IDE" not in skill_text
     assert "surface the exact pasteable gate" in skill_text
     assert "follow its exact CLI `interaction_contract` or quota command first" in skill_text
+    assert "treat `--action-kind` as the documented extensible public-safe token" in skill_text
+    assert "do not search the LoopX source for an allowlist" in skill_text
+    assert "never pipe it through `head` or `tail`" in skill_text
+    assert "never rerun the turn-start call to recover hidden fields" in skill_text
+    # A skill facade is installed for every host, so it must not present a
+    # Codex-only flag as the universal turn-start mechanism.
+    assert "never pipe a `--begin-turn` call" not in skill_text
+    assert "passes its own `--turn-instance-id`" in skill_text
+    assert "interaction_contract.cli_channel.selection_command" in skill_text
+    assert "Read capability_gate.repair_missing even when should_run is true" in skill_text
+    assert "do not claim a missing declaration proves a missing tool" in skill_text
     assert "do not return merely after setup, planning, or claim" not in skill_text
     metadata_text = metadata.read_text(encoding="utf-8")
     assert 'display_name: "LoopX"' in metadata_text
@@ -275,12 +331,146 @@ def test_claude_install_routes_global_risks_to_focused_cli(tmp_path: Path) -> No
         "boundary warnings, failing checks, and whether a formally evidenced "
         "rollback candidate source is available, without mutating state."
     )
-    for name_skill in ("loopx-global-risks", "loop-global-risks"):
-        skill = claude_home / "skills" / name_skill / "SKILL.md"
-        skill_text = skill.read_text(encoding="utf-8")
-        assert expected in skill_text
-        assert "This command is read-only" in skill_text
-        assert "global-summary" not in skill_text
+    skill = claude_home / "skills" / "loopx-global-risks" / "SKILL.md"
+    skill_text = skill.read_text(encoding="utf-8")
+    assert expected in skill_text
+    assert "This command is read-only" in skill_text
+    assert "global-summary" not in skill_text
+    # One canonical facade per outcome: the deprecated alias skill file is never
+    # reinstalled into a host root, so a host import cannot copy it elsewhere.
+    assert not (claude_home / "skills" / "loop-global-risks").exists()
+
+
+def test_install_retires_managed_alias_facades_on_every_host_root(
+    tmp_path: Path,
+) -> None:
+    """A managed /loop-global-* file is retired; a user-owned same-name skill is
+    preserved. The deprecated facade used to be republished to Claude Code and
+    OpenCode, then imported into ~/.agents/skills as a second copy of an
+    outcome whose canonical facade already exists."""
+
+    marker = "<!-- loopx-managed-slash-command:v1 command=/loop-global-summary surface=claude-skills -->\n"
+    claude_home = tmp_path / "claude"
+    opencode_home = tmp_path / "opencode"
+    managed = claude_home / "skills" / "loop-global-summary" / "SKILL.md"
+    managed.parent.mkdir(parents=True)
+    managed.write_text(marker + "\n# LoopX /loop-global-summary\nold\n", encoding="utf-8")
+    user_owned = opencode_home / "skills" / "loop-global-summary" / "SKILL.md"
+    user_owned.parent.mkdir(parents=True)
+    user_owned.write_text("user-owned skill body\n", encoding="utf-8")
+
+    payload = install_slash_commands(
+        execute=True,
+        surfaces=["claude-code", "opencode"],
+        claude_home=str(claude_home),
+        opencode_home=str(opencode_home),
+    )
+
+    rows = {
+        (item["surface"], item["command"]): item
+        for item in payload["installed"]
+        if item["command"] == "/loop-global-summary"
+        and str(item["mechanism"]).startswith("retired_")
+    }
+    assert not managed.exists()
+    assert rows[("claude-code", "/loop-global-summary")]["mechanism"] == (
+        "retired_claude_code_legacy_alias"
+    )
+    assert rows[("claude-code", "/loop-global-summary")]["status"] == "retired_managed_file"
+    assert user_owned.read_text(encoding="utf-8") == "user-owned skill body\n"
+    assert rows[("opencode", "/loop-global-summary")]["status"] == "skipped_user_file"
+    assert (claude_home / "skills" / "loopx-global-summary" / "SKILL.md").is_file()
+    assert (opencode_home / "skills" / "loopx-global-summary" / "SKILL.md").is_file()
+
+
+def test_legacy_alias_retirement_keeps_native_slash_commands(
+    tmp_path: Path,
+) -> None:
+    """OpenCode keeps the alias as a typed command; only the skill file that a
+    host import could copy into a shared root is retired."""
+
+    opencode_home = tmp_path / "opencode"
+    install_slash_commands(
+        execute=True,
+        surfaces=["opencode"],
+        opencode_home=str(opencode_home),
+    )
+
+    assert (opencode_home / "commands" / "loop-global-summary.md").is_file()
+    assert not (opencode_home / "skills" / "loop-global-summary").exists()
+    assert (opencode_home / "skills" / "loopx-global-summary" / "SKILL.md").is_file()
+
+
+@pytest.mark.parametrize("surface,home_option,flat", [
+    ("codex", "codex_home", False),
+    ("claude-code", "claude_home", False),
+    ("gemini", "gemini_home", False),
+    ("agy", "agy_home", True),
+    ("kiro-cli", "kiro_home", False),
+    ("cursor", "cursor_home", False),
+    ("zcode", "zcode_home", False),
+    ("opencode", "opencode_home", False),
+])
+@pytest.mark.parametrize("uninstall", [False, True])
+def test_alias_retirement_is_owned_and_repeatable_across_hosts(
+    tmp_path, monkeypatch, surface, home_option, flat, uninstall,
+):
+    monkeypatch.setattr(slash_command_install, "_provisioned_mcp_interpreter", lambda: None)
+    root = tmp_path / surface
+    skills = root / "skills"
+    managed = (skills / "loop-global-summary.md" if flat else
+               skills / "loop-global-summary" / "SKILL.md")
+    user = (skills / "loop-global-risks.md" if flat else
+            skills / "loop-global-risks" / "SKILL.md")
+    managed.parent.mkdir(parents=True)
+    user.parent.mkdir(parents=True, exist_ok=True)
+    managed.write_text(MANAGED_SKILL + "old alias\n")
+    user.write_text("user-owned skill\n")
+    options = {home_option: str(root)}
+    preview = install_slash_commands(
+        execute=False, surfaces=[surface], uninstall=uninstall,
+        include_legacy_aliases=False, **options,
+    )
+    assert managed.read_text() == MANAGED_SKILL + "old alias\n"
+    assert user.read_text() == "user-owned skill\n"
+    assert next(r for r in preview["installed"] if r["path"] == str(managed))["status"] == "would_retire_managed_file"
+    for _ in range(2):
+        actual = install_slash_commands(
+            execute=True, surfaces=[surface], uninstall=uninstall,
+            include_legacy_aliases=False, **options,
+        )
+        assert not managed.exists()
+        assert user.read_text() == "user-owned skill\n"
+        assert next(r for r in actual["installed"] if r["path"] == str(user))["status"] == "skipped_user_file"
+    if not uninstall:
+        canonical = (skills / "loopx-global-summary.md" if flat else
+                     skills / "loopx-global-summary" / "SKILL.md")
+        assert canonical.is_file()
+        assert not any(r["command"] == "/loop-global-summary" and r["invoke_as"]
+                       for r in actual["installed"])
+
+
+def test_facade_alias_role_comes_from_catalog_not_name_prefix(tmp_path, monkeypatch):
+    build_catalog = slash_command_install.build_slash_command_catalog
+
+    def renamed_alias(**options):
+        catalog = build_catalog(**options)
+        for row in catalog["commands"]:
+            if row["command"] == "/loopx-global-summary":
+                row["legacy_aliases"] = ["/old-summary"]
+        return catalog
+
+    monkeypatch.setattr(slash_command_install, "build_slash_command_catalog", renamed_alias)
+    specs = slash_command_install._command_prompt_specs(cli_bin="loopx", include_legacy_aliases=True)
+    alias = next(spec for spec in specs if spec["name"] == "old-summary")
+    assert alias["alias_for"] == "/loopx-global-summary"
+    root = tmp_path / "claude"
+    old = root / "skills" / "old-summary" / "SKILL.md"
+    old.parent.mkdir(parents=True)
+    old.write_text(MANAGED_SKILL + "old alias\n")
+    install_slash_commands(execute=True, surfaces=["claude-code"], claude_home=str(root))
+    assert not old.exists()
+    assert (root / "skills" / "loopx-global-summary" / "SKILL.md").is_file()
 
 
 def test_opencode_static_uninstall_preserves_installed_bridge(tmp_path: Path) -> None:
@@ -552,6 +742,202 @@ def test_pi_install_writes_self_contained_extension_into_project(
     assert not (tmp_path / ".pi" / "extensions" / "package.json").exists()
 
 
+def test_pi_user_scope_installs_atomic_extension_unit(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    payload = install_slash_commands(
+        execute=True,
+        surfaces=["pi"],
+        pi_scope="user",
+        pi_user_home=str(home),
+    )
+
+    root = home / ".pi" / "agent" / "extensions" / "loopx"
+    assert payload["summary"]["pi_scope"] == "user"
+    assert payload["summary"]["pi_extension_path"] == str(root / "index.ts")
+    assert payload["summary"]["pi_runtime_path"] == str(root / "pi-goal-loop-runtime.mjs")
+    assert any("scope=user" in note for note in payload["notes"])
+    assert (root / "index.ts").is_file()
+    assert (root / "pi-goal-loop-runtime.mjs").is_file()
+    assert inspect_pi_installations(pi_project=str(tmp_path), pi_user_home=str(home))["location"] == "user-global"
+
+
+def test_pi_user_scope_preflight_blocks_both_files(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    root = home / ".pi" / "agent" / "extensions" / "loopx"
+    root.mkdir(parents=True)
+    runtime = root / "pi-goal-loop-runtime.mjs"
+    runtime.write_text("user owned\n", encoding="utf-8")
+
+    payload = install_slash_commands(
+        execute=True,
+        surfaces=["pi"],
+        pi_scope="user",
+        pi_user_home=str(home),
+    )
+
+    assert payload["ok"] is False
+    assert not (root / "index.ts").exists()
+    assert runtime.read_text(encoding="utf-8") == "user owned\n"
+
+
+def test_pi_user_scope_preserves_user_entry_and_upgrades_managed_files(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    root = home / ".pi/agent/extensions/loopx"
+    root.mkdir(parents=True)
+    entry = root / "index.ts"
+    runtime = root / "pi-goal-loop-runtime.mjs"
+    entry.write_text("// user entry\n", encoding="utf-8")
+
+    blocked = install_slash_commands(
+        execute=True, surfaces=["pi"], pi_scope="user", pi_user_home=str(home)
+    )
+    assert blocked["ok"] is False
+    assert entry.read_text(encoding="utf-8") == "// user entry\n"
+    assert not runtime.exists()
+
+    entry.write_text(slash_command_install.pi_extension_source() + "\n// old\n", encoding="utf-8")
+    stale = inspect_pi_installations(pi_project=str(tmp_path), pi_user_home=str(home))
+    assert stale["scopes"]["user"]["status"] == "partial"
+    updated = install_slash_commands(
+        execute=True, surfaces=["pi"], pi_scope="user", pi_user_home=str(home)
+    )
+    assert updated["ok"] is True
+    assert _row(updated, "pi_goal_extension")["status"] == "updated"
+    assert _row(updated, "pi_goal_extension_runtime")["status"] == "created"
+    assert inspect_pi_installations(pi_project=str(tmp_path), pi_user_home=str(home))["scopes"]["user"]["status"] == "current"
+
+
+def test_pi_user_scope_follows_pi_agent_dir_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_dir = tmp_path / "custom-agent-dir"
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_dir))
+    payload = install_slash_commands(execute=True, surfaces=["pi"], pi_scope="user")
+
+    assert payload["summary"]["pi_extension_path"] == str(agent_dir / "extensions/loopx/index.ts")
+    assert (agent_dir / "extensions/loopx/index.ts").is_file()
+    assert inspect_pi_installations(pi_project=str(tmp_path))["scopes"]["user"]["status"] == "current"
+
+
+def test_pi_inspect_cli_reads_selected_project_and_user_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    agent_dir = tmp_path / "agent"
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_dir))
+    install_slash_commands(
+        execute=True, surfaces=["pi"], pi_scope="user", pi_project=str(tmp_path)
+    )
+
+    exit_code = loopx_main(
+        ["--format", "json", "slash-commands", "--inspect", "--surface", "pi", "--pi-project", str(tmp_path)]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["location"] == "user-global"
+    assert payload["scopes"]["project"]["status"] == "absent"
+    assert payload["scopes"]["user"]["extension_path"] == str(agent_dir / "extensions/loopx/index.ts")
+
+
+def test_pi_readback_distinguishes_absent_stale_partial_and_dual_scope(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+
+    def readback() -> dict[str, object]:
+        return inspect_pi_installations(pi_project=str(tmp_path), pi_user_home=str(home))
+
+    assert readback()["location"] == "absent"
+
+    install_slash_commands(execute=True, surfaces=["pi"], pi_project=str(tmp_path))
+    assert readback()["location"] == "project-local"
+    assert readback()["scopes"]["project"]["status"] == "current"
+
+    project_runtime = tmp_path / ".pi/extensions/pi-goal-loop-runtime.mjs"
+    project_runtime.write_text(project_runtime.read_text(encoding="utf-8") + "\n// old\n")
+    assert readback()["scopes"]["project"]["status"] == "stale"
+    project_runtime.unlink()
+    assert readback()["scopes"]["project"]["status"] == "partial"
+
+    install_slash_commands(execute=True, surfaces=["pi"], pi_project=str(tmp_path))
+    install_slash_commands(
+        execute=True, surfaces=["pi"], pi_scope="user", pi_user_home=str(home)
+    )
+    dual = readback()
+    assert dual["location"] == "dual-scope"
+    assert dual["ok"] is False
+    assert "duplicate" in dual["duplicate_load_warning"]
+
+    install_slash_commands(
+        execute=True, uninstall=True, surfaces=["pi"], pi_scope="user", pi_user_home=str(home)
+    )
+    assert readback()["location"] == "project-local"
+
+
+def test_pi_user_uninstall_retires_managed_entry_and_keeps_user_runtime(
+    tmp_path: Path,
+) -> None:
+    """A user-owned runtime must not make the managed adapter unremovable."""
+    home = tmp_path / "home"
+    install_slash_commands(
+        execute=True, surfaces=["pi"], pi_scope="user", pi_user_home=str(home)
+    )
+    root = home / ".pi/agent/extensions/loopx"
+    extension = root / "index.ts"
+    runtime = root / "pi-goal-loop-runtime.mjs"
+    runtime.write_text("// user replacement\n", encoding="utf-8")
+
+    payload = install_slash_commands(
+        execute=True, uninstall=True, surfaces=["pi"], pi_scope="user", pi_user_home=str(home)
+    )
+    assert payload["ok"] is True
+    assert _row(payload, "pi_goal_extension")["status"] == "retired_managed_file"
+    assert _row(payload, "pi_goal_extension_runtime")["status"] == "skipped_user_file"
+    assert not extension.exists()
+    assert runtime.read_text(encoding="utf-8") == "// user replacement\n"
+
+
+def test_pi_project_uninstall_survives_edited_runtime(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression: the default project scope must keep its per-file uninstall."""
+    installed = loopx_main(
+        [
+            "--format",
+            "json",
+            "slash-commands",
+            "--install",
+            "--surface",
+            "pi",
+            "--pi-project",
+            str(tmp_path),
+        ]
+    )
+    capsys.readouterr()
+    assert installed == 0
+    extension = tmp_path / ".pi/extensions/loopx-goal.ts"
+    runtime = tmp_path / ".pi/extensions/pi-goal-loop-runtime.mjs"
+    assert extension.is_file() and runtime.is_file()
+    runtime.write_text("// user replacement\n", encoding="utf-8")
+
+    exit_code = loopx_main(
+        [
+            "--format",
+            "json",
+            "slash-commands",
+            "--uninstall",
+            "--surface",
+            "pi",
+            "--pi-project",
+            str(tmp_path),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["ok"] is True
+    assert _row(payload, "pi_goal_extension")["status"] == "retired_managed_file"
+    assert _row(payload, "pi_goal_extension_runtime")["status"] == "skipped_user_file"
+    assert not extension.exists()
+    assert runtime.read_text(encoding="utf-8") == "// user replacement\n"
+
+
 def test_pi_install_does_not_touch_default_all_surfaces(tmp_path: Path) -> None:
     payload = install_slash_commands(
         execute=True,
@@ -668,7 +1054,7 @@ def test_gemini_surface_writes_skill_files_gemini_cli_can_discover(tmp_path: Pat
     assert skill.exists()
     body = skill.read_text(encoding="utf-8")
     assert body.startswith("---")
-    assert 'name: "loopx"' in body
+    assert "name: loopx\n" in body
 
     row = _row(payload, "gemini_cli_skills")
     assert row["surface"] == "gemini"
@@ -701,7 +1087,7 @@ def test_cursor_surface_installs_skills(tmp_path: Path) -> None:
     )
     skill = cursor_home / "skills" / "loopx" / "SKILL.md"
     assert skill.exists()
-    assert 'name: "loopx"' in skill.read_text(encoding="utf-8")
+    assert "name: loopx\n" in skill.read_text(encoding="utf-8")
     assert _row(payload, "cursor_skills")["host_surfaces"] == ["cursor-agent"]
 
 
@@ -980,3 +1366,25 @@ def test_marker_retires_after_user_edits_the_entry_and_dry_run_writes_nothing(
     )
     assert _row(payload, "cursor_mcp_server")["status"] == "skipped_user_owned_mcp_entry"
     assert json.loads(config.read_text(encoding="utf-8"))["mcpServers"]["loopx"] == entry
+
+
+def test_antigravity_resident_guidance_is_isolated_to_antigravity_surfaces(tmp_path: Path) -> None:
+    ark_skills = tmp_path / "ark-skills"
+    materialize_loopx_entry_skill(
+        skills_dir=ark_skills,
+        execute=True,
+        host_surface="ark-managed-agent",
+    )
+    ark_text = (ark_skills / "loopx" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Antigravity App fixed resident session" not in ark_text
+    assert "--with-agy-hooks" not in ark_text
+
+    codex_home = tmp_path / "codex"
+    install_slash_commands(
+        execute=True,
+        surfaces=["codex"],
+        codex_home=str(codex_home),
+    )
+    codex_text = (codex_home / "skills" / "loopx" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Antigravity App fixed resident session" not in codex_text
+    assert "--with-agy-hooks" not in codex_text

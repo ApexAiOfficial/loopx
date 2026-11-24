@@ -60,8 +60,8 @@ Direct CLI:
 
 ```bash
 loopx-community-discussion --doctor
-loopx-community-discussion scan --owner huangruiteng --repo loopx --days 14 --format json
-loopx-community-discussion scan --owner huangruiteng --repo loopx --days 14 --format md
+loopx-community-discussion scan --owner loopx-project --repo loopx --days 14 --format json
+loopx-community-discussion scan --owner loopx-project --repo loopx --days 14 --format md
 ```
 
 `schemas/fact.schema.json`, `schemas/scan.schema.json`, and the request/response

@@ -6,11 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from loopx.event_sourced_state import (
-    AppendOnlyStateEventStore,
-    TODO_ADDED,
-    make_state_event,
-)
+from loopx.control_plane.testing.canary_harness import import_fixture_authority
 from loopx.todos import list_goal_todos
 
 GOAL_ID = "todo-list-explicit-limit-goal"
@@ -94,6 +90,7 @@ def _write_fixture(
                         "status": "active",
                         "repo": str(project),
                         "state_file": str(state_relative),
+                        "coordination": {"registered_agents": [agent_id] if agent_id else []},
                     }
                 ],
             }
@@ -101,6 +98,7 @@ def _write_fixture(
         + "\n",
         encoding="utf-8",
     )
+    import_fixture_authority(registry_path, GOAL_ID)
     return registry_path
 
 
@@ -206,8 +204,7 @@ def test_default_payload_keeps_the_pre_limit_shape(tmp_path: Path) -> None:
 
     payload = list_goal_todos(registry_path=registry_path, goal_id=GOAL_ID)
 
-    # The no-limit cold path is byte-identical to the pre---limit shape:
-    # no explicit-limit disclosure fields appear.
+    # The cold view retains its fields and adds the required read provenance.
     assert set(payload) == {
         "ok",
         "dry_run",
@@ -223,7 +220,12 @@ def test_default_payload_keeps_the_pre_limit_shape(tmp_path: Path) -> None:
         "project",
         "user_todos",
         "agent_todos",
+        "authority_read",
+        "projection_envelope",
     }
+    assert payload["projection_envelope"]["coverage"]["expected_count"] == 16
+    assert payload["authority_read"]["source_authority"] == "file_v0"
+    assert payload["authority_read"]["decision_read_from_provider"] is True
     assert payload["todo_count"] == 16
     assert len(payload["todos"]) == 16
     for absent_key in (
@@ -248,7 +250,7 @@ def test_todo_id_lookup_ignores_the_section_cap(tmp_path: Path) -> None:
     assert payload["matched"] is True
     assert payload["todo"]["todo_id"] == "todo_agent_open_007"
     assert payload["todo_count"] == 1
-    assert [item["todo_id"] for item in payload["todos"]] == ["todo_agent_open_007"]
+    assert "todos" not in payload
 
 
 def test_explicit_limit_rejects_non_positive_values(tmp_path: Path) -> None:
@@ -318,68 +320,3 @@ def test_cli_limit_path_and_typed_rejections(tmp_path: Path) -> None:
     non_integer = _run_cli(registry_path, "--limit", "many")
     assert non_integer.returncode == 2
     assert "invalid int value" in non_integer.stderr
-
-
-def test_explicit_limit_bounds_projection_overlay_lineage(
-    tmp_path: Path,
-) -> None:
-    registry_path = _write_fixture(
-        tmp_path,
-        item_count_per_role=200,
-        agent_id=AGENT_ID,
-    )
-    state_file = (
-        tmp_path / "project" / ".local/goals" / GOAL_ID / "ACTIVE_GOAL_STATE.md"
-    )
-    store = AppendOnlyStateEventStore(state_file.with_name("events.jsonl"))
-    store.append(
-        make_state_event(
-            event_id="evt-explicit-limit-overlay",
-            goal_id=GOAL_ID,
-            event_type=TODO_ADDED,
-            refs={"todo_id": "todo_agent_open_000"},
-            payload={
-                "role": "agent",
-                "title": "Overlay the first advancement step.",
-                "task_class": "continuous_monitor",
-                "claimed_by": AGENT_ID,
-            },
-            recorded_at="2026-01-01T00:00:00Z",
-            producer="todo-list-explicit-limit-overlay",
-        )
-    )
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "loopx.cli",
-            "todo",
-            "list",
-            "--format",
-            "json",
-            "--goal-id",
-            GOAL_ID,
-            "--limit",
-            "3",
-        ],
-        cwd=REPO_ROOT,
-        env={**os.environ, "LOOPX_REGISTRY": str(registry_path)},
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-    payload = json.loads(result.stdout)
-
-    assert payload["source"] == "event_projection_with_markdown_overlay"
-    assert payload["explicit_limit"] == 3
-    assert payload["returned_todo_count"] == 6
-    overlay = payload["projection_overlay"]
-    assert overlay["overlaid_count"] == 1
-    assert overlay["event_only_count"] == 0
-    assert overlay["markdown_only_count"] == 399
-    assert overlay["full_detail_cold_path"] == (
-        "todo list without --limit or active state"
-    )
-    assert [key for key in overlay if key.endswith("_todo_ids")] == []

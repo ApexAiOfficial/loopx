@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from loopx.capabilities.decision_context import cli as decision_context_cli
+from loopx.capabilities.decision_context import runtime as decision_context_runtime
+from loopx.capabilities.context_providers import (
+    ContextProviderItem,
+    ContextProviderRetrieval,
+)
 from loopx.capabilities.decision_context import (
     DecisionEvidenceRecords,
     LocalFileDecisionSourceProvider,
@@ -14,6 +22,7 @@ from loopx.capabilities.decision_context import (
     build_decision_proposal,
     commit_profile_decision_cursors,
     load_private_pending_decision_settlement,
+    recall_profile_decision_context,
     settle_profile_decision_review,
     write_private_pending_decision_settlement,
 )
@@ -23,6 +32,7 @@ from loopx.rollout_event_log import append_rollout_event, build_rollout_event
 OBSERVED_AT = "2100-01-01T00:00:00+00:00"
 BEFORE = "2100-01-01T00:01:00+00:00"
 PRIVATE_CONTENT = "Current authority keeps adoption at a bounded pilot."
+PRIVATE_RECALL_CONTENT = "Peer task found the extension boundary."
 
 
 def write_profile(
@@ -67,6 +77,27 @@ def write_profile(
             "automatic_capture": False,
             "fail_open": True,
         },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def write_extension_context_profile(
+    path: Path,
+    authority_path: Path,
+    *,
+    extension_id: str = "loopx-obelisk",
+) -> Path:
+    payload = json.loads(
+        write_profile(path, authority_path).read_text(encoding="utf-8")
+    )
+    payload["context_provider"] = {
+        "provider": "extension",
+        "namespace": "peer-session",
+        "scope_ref": "host-session:codex:thread-a",
+        "max_results": 4,
+        "timeout_seconds": 10,
+        "config": {"extension_id": extension_id},
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
@@ -175,6 +206,19 @@ def append_review_gate_event(
     return append_rollout_event(path, event)
 
 
+def append_unrelated_rollout_events(path: Path, *, count: int = 1001) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        for index in range(count):
+            event = build_rollout_event(
+                goal_id="example-decision-goal",
+                event_kind="quota_monitor_poll",
+                run_id=f"unrelated-{index}",
+                status="observed",
+                recorded_at=OBSERVED_AT,
+            )
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
 def test_profile_runtime_builds_providers_and_returns_private_cursor_proposal(
     tmp_path: Path,
 ) -> None:
@@ -221,6 +265,37 @@ def test_profile_runtime_builds_providers_and_returns_private_cursor_proposal(
     )
     assert PRIVATE_CONTENT not in json.dumps(packet, sort_keys=True)
     assert str(authority) not in json.dumps(packet, sort_keys=True)
+
+
+def test_extension_context_provider_failure_fails_open_without_blocking_sources(
+    tmp_path: Path,
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_extension_context_profile(
+        tmp_path / "profile.json",
+        authority,
+    )
+
+    activation, assembly = assemble_profile_decision_evidence(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        decision_id="decision:adoption",
+        observed_at=OBSERVED_AT,
+        before=BEFORE,
+        rebase=lambda _collection: DecisionEvidenceRecords(),
+        runtime_root=tmp_path / "runtime",
+    )
+
+    assert activation["status"] == "available"
+    assert assembly is not None
+    packet = assembly.public_packet()
+    assert packet["source_scan_receipts"][0]["status"] == "completed"
+    assert packet["context_retrieval_receipt"]["status"] == "unavailable"
+    assert packet["context_retrieval_receipt"]["reason_code"] == (
+        "extension_not_installed"
+    )
 
 
 def test_private_host_provider_drives_generic_scan_exact_read_and_checkpoint(
@@ -311,6 +386,48 @@ def test_private_host_provider_can_commit_cursor_after_validated_writeback(
     assert receipt["status"] == "committed"
     assert receipt["cursor_state_mutated"] is True
     assert receipt["readback_verified"] is True
+    assert json.loads(cursors.read_text(encoding="utf-8")) == dict(
+        assembly.proposed_cursors
+    )
+
+
+def test_cursor_commit_finds_validated_writeback_before_long_log_tail(
+    tmp_path: Path,
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_profile(tmp_path / "profile.json", authority)
+    cursors = tmp_path / "cursors.json"
+    event_log = tmp_path / "rollout-events.jsonl"
+    _activation, assembly = assemble_profile_decision_evidence(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        decision_id="decision:adoption",
+        observed_at=OBSERVED_AT,
+        before=BEFORE,
+        cursor_path=cursors,
+        rebase=semantic_rebase,
+    )
+    assert assembly is not None
+    proposal, outcome = decision_chain(assembly)
+    writeback = append_decision_writeback(event_log, assembly, proposal, outcome)
+    append_unrelated_rollout_events(event_log)
+
+    receipt = commit_profile_decision_cursors(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        cursor_path=cursors,
+        assembly=assembly,
+        proposal=proposal,
+        outcome_receipt=outcome,
+        lifecycle_event_log_path=event_log,
+        lifecycle_event_id=str(writeback["event_id"]),
+    )
+
+    assert receipt["status"] == "committed"
+    assert receipt["lifecycle_event_id"] == writeback["event_id"]
     assert json.loads(cursors.read_text(encoding="utf-8")) == dict(
         assembly.proposed_cursors
     )
@@ -410,6 +527,420 @@ def test_prepare_evidence_cli_preserves_private_cursor_until_semantic_rebase(
         "sha256:previous",
     ):
         assert private_value not in serialized
+
+
+def test_prepare_evidence_cli_passes_effective_runtime_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_profile(tmp_path / "profile.json", authority)
+    captured: dict[str, Any] = {}
+
+    def assemble(**kwargs: Any) -> tuple[dict[str, Any], None]:
+        captured.update(kwargs)
+        return {
+            "ok": True,
+            "status": "disabled",
+            "available": False,
+        }, None
+
+    monkeypatch.setattr(
+        decision_context_cli,
+        "assemble_profile_decision_evidence",
+        assemble,
+    )
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        assert main(
+            [
+                "--runtime-root",
+                str(tmp_path / "runtime"),
+                "--format",
+                "json",
+                "decision-context",
+                "prepare-evidence",
+                "--goal-id",
+                "example-decision-goal",
+                "--agent-id",
+                "example-agent",
+                "--profile",
+                str(profile),
+                "--decision-id",
+                "decision:adoption",
+            ]
+        ) == 0
+
+    assert captured["runtime_root"] == tmp_path / "runtime"
+
+
+def test_ephemeral_recall_overrides_scope_without_scanning_or_profile_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_extension_context_profile(
+        tmp_path / "profile.json",
+        authority,
+    )
+    profile_before = profile.read_bytes()
+    captured: dict[str, Any] = {}
+
+    class Provider:
+        provider_id = "loopx-obelisk"
+
+        def retrieve(self, **kwargs: Any) -> ContextProviderRetrieval:
+            captured.update(kwargs)
+            return ContextProviderRetrieval(
+                provider=self.provider_id,
+                namespace=kwargs["namespace"],
+                status="completed",
+                query_summary=kwargs["query_summary"],
+                observed_at=kwargs["observed_at"],
+                search_performed=True,
+                read_performed=True,
+                items=(
+                    ContextProviderItem(
+                        resource_ref="private:thread-b:message-1",
+                        summary="Historical Codex task assistant",
+                        content=PRIVATE_RECALL_CONTENT,
+                        score=0.9,
+                    ),
+                ),
+                requested_limit=kwargs["max_results"],
+            )
+
+    monkeypatch.setattr(
+        decision_context_runtime,
+        "_build_advisory_context_provider",
+        lambda *_args, **_kwargs: Provider(),
+    )
+    monkeypatch.setattr(
+        decision_context_runtime,
+        "_build_source_providers",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ephemeral recall must not build source providers")
+        ),
+    )
+
+    packet = recall_profile_decision_context(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        context_scope_ref="host-session:codex:thread-b",
+        query="extension boundary",
+        query_summary="peer task extension decision",
+        observed_at=OBSERVED_AT,
+        max_results=2,
+        timeout_seconds=3,
+        runtime_root=tmp_path / "runtime",
+    )
+
+    assert captured["scope_ref"] == "host-session:codex:thread-b"
+    assert captured["query"] == "extension boundary"
+    assert packet["status"] == "completed"
+    assert packet["visibility"] == "local_private_transient"
+    assert packet["source_scan_performed"] is False
+    assert packet["cursor_state_read"] is False
+    assert packet["pending_settlement_written"] is False
+    assert packet["profile_write_performed"] is False
+    assert packet["private_locator_persisted"] is False
+    assert packet["execution_authorized"] is False
+    assert packet["results"][0]["content"] == PRIVATE_RECALL_CONTENT
+    assert packet["results"][0]["content_trust"] == "untrusted_advisory"
+    assert packet["results"][0]["content_may_instruct"] is False
+    assert packet["raw_content_returned"] is True
+    assert [
+        {
+            key: value
+            for key, value in item.items()
+            if key in {"provider_ref", "summary", "score"}
+        }
+        for item in packet["results"]
+    ] == packet["retrieval_receipt"]["results"]
+    assert packet["raw_content_persisted"] is False
+    assert "content" not in packet["retrieval_receipt"]["results"][0]
+    assert "thread-b" not in json.dumps(packet["retrieval_receipt"])
+    assert "extension boundary" not in json.dumps(
+        packet["retrieval_receipt"]
+    )
+    assert profile.read_bytes() == profile_before
+
+
+def test_ephemeral_recall_cli_passes_one_off_scope_and_effective_runtime_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "profile.json"
+    profile.write_text("{}", encoding="utf-8")
+    captured: dict[str, Any] = {}
+
+    def recall(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {
+            "schema_version": "decision_context_ephemeral_recall_v0",
+            "ok": True,
+            "status": "completed",
+        }
+
+    monkeypatch.setattr(
+        decision_context_cli,
+        "recall_profile_decision_context",
+        recall,
+    )
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        assert main(
+            [
+                "--runtime-root",
+                str(tmp_path / "runtime"),
+                "--format",
+                "json",
+                "decision-context",
+                "recall-context",
+                "--goal-id",
+                "example-decision-goal",
+                "--agent-id",
+                "example-agent",
+                "--profile",
+                str(profile),
+                "--context-scope-ref",
+                "host-session:codex:thread-b",
+                "--query",
+                "approved extension boundary",
+                "--query-summary",
+                "peer task extension decision",
+                "--max-results",
+                "2",
+            ]
+        ) == 0
+
+    assert captured["runtime_root"] == tmp_path / "runtime"
+    assert captured["context_scope_ref"] == "host-session:codex:thread-b"
+    assert captured["query"] == "approved extension boundary"
+    assert captured["query_summary"] == "peer task extension decision"
+    assert captured["max_results"] == 2
+
+
+def test_ephemeral_recall_requires_goal_and_agent_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_extension_context_profile(
+        tmp_path / "profile.json",
+        authority,
+    )
+    provider_calls = 0
+
+    def build_provider(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("disabled agent must not reach provider construction")
+
+    monkeypatch.setattr(
+        decision_context_runtime,
+        "_build_advisory_context_provider",
+        build_provider,
+    )
+
+    packet = recall_profile_decision_context(
+        goal_id="example-decision-goal",
+        agent_id="another-agent",
+        profile_path=profile,
+        context_scope_ref="host-session:codex:thread-b",
+        query="extension boundary",
+        query_summary="peer task extension decision",
+        observed_at=OBSERVED_AT,
+    )
+
+    assert packet["status"] == "agent_not_enabled"
+    assert packet["ok"] is False
+    assert packet["results"] == []
+    assert packet["raw_content_returned"] is False
+    assert provider_calls == 0
+
+
+def test_ephemeral_recall_disabled_profile_does_not_build_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_extension_context_profile(
+        tmp_path / "profile.json",
+        authority,
+    )
+    payload = json.loads(profile.read_text(encoding="utf-8"))
+    payload["enabled"] = False
+    profile.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(
+        decision_context_runtime,
+        "_build_advisory_context_provider",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled profile must not build a context provider")
+        ),
+    )
+
+    packet = recall_profile_decision_context(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        context_scope_ref="host-session:codex:thread-b",
+        query="extension boundary",
+        query_summary="peer task extension decision",
+        observed_at=OBSERVED_AT,
+    )
+
+    assert packet["status"] == "disabled"
+    assert packet["ok"] is False
+    assert packet["results"] == []
+    assert packet["raw_content_returned"] is False
+
+
+def test_ephemeral_recall_extension_unavailable_returns_degraded_receipt(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_extension_context_profile(
+        tmp_path / "profile.json",
+        authority,
+    )
+    profile_before = profile.read_bytes()
+
+    packet = recall_profile_decision_context(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        context_scope_ref="host-session:codex:thread-b",
+        query="extension boundary",
+        query_summary="peer task extension decision",
+        observed_at=OBSERVED_AT,
+        runtime_root=tmp_path / "missing-runtime",
+    )
+
+    assert packet["status"] == "unavailable"
+    assert packet["reason_code"] == "extension_not_installed"
+    assert packet["ok"] is False
+    assert packet["results"] == []
+    assert packet["retrieval_receipt"]["status"] == "unavailable"
+    assert packet["retrieval_receipt"]["reason_code"] == (
+        "extension_not_installed"
+    )
+    assert packet["retrieval_receipt"]["search_performed"] is False
+    assert packet["retrieval_receipt"]["read_performed"] is False
+    assert packet["provider_readiness"] == {
+        "schema_version": "loopx_extension_provider_readiness_v0",
+        "extension_id": "loopx-obelisk",
+        "status": "extension_not_installed",
+        "installed": False,
+        "enabled": False,
+        "doctor_verified": False,
+        "next_action": "install_extension",
+    }
+    assert packet["source_scan_performed"] is False
+    assert packet["cursor_state_read"] is False
+    assert packet["pending_settlement_written"] is False
+    assert packet["profile_write_performed"] is False
+    assert packet["external_writes_performed"] is False
+    assert packet["execution_authorized"] is False
+    assert profile.read_bytes() == profile_before
+    assert not (tmp_path / "missing-runtime").exists()
+
+    assert (
+        main(
+            [
+                "--runtime-root",
+                str(tmp_path / "missing-runtime"),
+                "--format",
+                "json",
+                "decision-context",
+                "recall-context",
+                "--goal-id",
+                "example-decision-goal",
+                "--agent-id",
+                "example-agent",
+                "--profile",
+                str(profile),
+                "--context-scope-ref",
+                "host-session:codex:thread-b",
+                "--query",
+                "extension boundary",
+                "--query-summary",
+                "peer task extension decision",
+                "--observed-at",
+                OBSERVED_AT,
+            ]
+        )
+        == 0
+    )
+    cli_packet = json.loads(capsys.readouterr().out)
+    assert cli_packet["reason_code"] == "extension_not_installed"
+    assert cli_packet["provider_readiness"] == packet["provider_readiness"]
+    assert profile.read_bytes() == profile_before
+    assert not (tmp_path / "missing-runtime").exists()
+
+
+def test_ephemeral_recall_fails_closed_when_profile_changes_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_extension_context_profile(
+        tmp_path / "profile.json",
+        authority,
+    )
+
+    class Provider:
+        provider_id = "loopx-obelisk"
+
+        def retrieve(self, **kwargs: Any) -> ContextProviderRetrieval:
+            profile.write_text(profile.read_text() + " ", encoding="utf-8")
+            return ContextProviderRetrieval(
+                provider=self.provider_id,
+                namespace=kwargs["namespace"],
+                status="completed",
+                query_summary=kwargs["query_summary"],
+                observed_at=kwargs["observed_at"],
+                search_performed=True,
+                read_performed=True,
+                items=(
+                    ContextProviderItem(
+                        resource_ref="private:thread-b:message-1",
+                        summary="Historical Codex task assistant",
+                        content=PRIVATE_RECALL_CONTENT,
+                    ),
+                ),
+                requested_limit=kwargs["max_results"],
+            )
+
+    monkeypatch.setattr(
+        decision_context_runtime,
+        "_build_advisory_context_provider",
+        lambda *_args, **_kwargs: Provider(),
+    )
+
+    packet = recall_profile_decision_context(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        context_scope_ref="host-session:codex:thread-b",
+        query="extension boundary",
+        query_summary="peer task extension decision",
+        observed_at=OBSERVED_AT,
+    )
+
+    assert packet["status"] == "unavailable"
+    assert packet["reason_code"] == "profile_changed_during_recall"
+    assert packet["results"] == []
+    assert packet["raw_content_returned"] is False
 
 
 def test_profile_runtime_fails_open_when_provider_config_cannot_build(
@@ -807,6 +1338,51 @@ def test_review_settlement_commits_consumed_cursor_without_future_outcome(
     )
 
 
+def test_review_settlement_finds_gate_event_before_long_log_tail(
+    tmp_path: Path,
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_profile(tmp_path / "profile.json", authority)
+    cursors = tmp_path / "cursors.json"
+    event_log = tmp_path / "rollout-events.jsonl"
+    _activation, assembly = assemble_profile_decision_evidence(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        decision_id="decision:adoption",
+        observed_at=OBSERVED_AT,
+        before=BEFORE,
+        cursor_path=cursors,
+        rebase=semantic_rebase,
+    )
+    assert assembly is not None
+    proposal, _legacy_outcome = decision_chain(assembly)
+    gate_event = append_review_gate_event(event_log, proposal, "approve")
+    append_unrelated_rollout_events(event_log)
+
+    result = settle_profile_decision_review(
+        goal_id="example-decision-goal",
+        agent_id="example-agent",
+        profile_path=profile,
+        cursor_path=cursors,
+        assembly=assembly,
+        lifecycle_event_log_path=event_log,
+        actor_ref="owner:goal",
+        reason_code="owner_approve",
+        summary="Owner recorded approve.",
+        proposal=proposal,
+        source_event_id=str(gate_event["event_id"]),
+        execute=True,
+    )
+
+    assert result["disposition"] == "approve"
+    assert result["cursor_commit"]["status"] == "committed"
+    assert json.loads(cursors.read_text(encoding="utf-8")) == dict(
+        assembly.proposed_cursors
+    )
+
+
 def test_semantic_no_change_settlement_is_quiet_and_commits_cursor(
     tmp_path: Path,
 ) -> None:
@@ -895,6 +1471,39 @@ def test_review_settlement_rejects_gate_bound_to_another_proposal(
         )
 
     assert not cursors.exists()
+
+
+@pytest.mark.parametrize("rebase", [
+    lambda _: DecisionEvidenceRecords(),
+    lambda _: DecisionEvidenceRecords(semantic_no_change=True),
+])
+@pytest.mark.parametrize("execute", [False, True])
+def test_observed_settlement_requires_material_review_before_any_write(
+    tmp_path: Path, rebase: Any, execute: bool,
+) -> None:
+    authority = tmp_path / "authority.md"
+    authority.write_text(PRIVATE_CONTENT, encoding="utf-8")
+    profile = write_profile(tmp_path / "profile.json", authority)
+    cursors = tmp_path / "cursors.json"
+    event_log = tmp_path / "events.jsonl"
+    _, assembly = assemble_profile_decision_evidence(
+        goal_id="example-decision-goal", agent_id="example-agent",
+        profile_path=profile, cursor_path=cursors,
+        decision_id="decision:adoption", observed_at=OBSERVED_AT,
+        before=BEFORE, rebase=rebase,
+    )
+    assert assembly is not None
+    with pytest.raises(ValueError, match="observed settlement lacks material review"):
+        settle_profile_decision_review(
+            goal_id="example-decision-goal", agent_id="example-agent",
+            profile_path=profile, cursor_path=cursors, assembly=assembly,
+            lifecycle_event_log_path=event_log,
+            actor_ref="agent:decision-advisor", reason_code="new_facts_reviewed",
+            summary="New facts were reviewed.", disposition="observed",
+            execute=execute,
+        )
+    assert not cursors.exists()
+    assert not event_log.exists()
 
 
 def test_prepare_and_settle_no_change_cli_crosses_turns_without_private_output(

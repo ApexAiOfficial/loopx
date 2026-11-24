@@ -1,6 +1,7 @@
 # RFC：Goal Artifact 生命周期投影（milestone / guard / next-transition）v0
 
-- 状态：Draft，maintainer 评审中
+- 状态：已接受
+- 替代 / 关闭：无
 - 提出方：LoopX maintainers
 - 日期：2026-08-12
 - 范围：一个只读的 goal 级生命周期投影，由现有 typed state 派生；全局聚合视图作为后续切片；不改变运行时状态机，不引入流程引擎
@@ -62,6 +63,17 @@ Milestone 的达成：优先取 goal 声明的 acceptance 标记；没有声明�
 2. 一个 fixture smoke：用合成 goal 证明派生规则——声明的 milestone、evidence 达成的 milestone、未关闭的 owner gate 作为 blocking guard、来自 work lane 的合法 next transition。
 3. 第一个消费者：status markdown 与 dashboard 的 goal 详情（与 `goal_channel_projection_v0` 并列展示 `goal_artifact_lifecycle_projection_v0`），让运维能回答例子里的三个问题。
 4. 公开边界与现有投影一致：不含 raw logs、evidence body、credentials、本地路径。
+
+### 验收观察的数据来源
+
+现有 `goal_acceptance_observation_projection_v0` 从近期记录和保留的语义历史中
+识别 Agent lane。它调用现有 `goal_frontier.semantic_history` module 的 vision
+读取 interface。对已知 Agent，存在的语义历史决定当前 vision 或其缺失状态。
+退休标记或缺失的 lane 不能让较早的近期记录重新生效。没有语义历史时，保留
+原有近期列表回退。未归属的历史记录仍不归属到其他 Agent。保留的观察只提供
+部分覆盖，不证明验收完成。公开文本校验和输出上限保持不变。同一个观察
+module 为 artifact lifecycle 提供证据 guard。这个只读修复不新增存储状态、
+权限或执行 gate。
 
 ## 4. 中期应用（2-4 个 release）
 

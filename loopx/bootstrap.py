@@ -1,18 +1,38 @@
 from __future__ import annotations
 
-import json
-import re
-import shlex
+from contextlib import nullcontext
+from uuid import uuid4
 from pathlib import Path
+
+from .capabilities.machine_configuration.goal_storage import new_goal_storage_target
+from .control_plane.coordination.new_goal_storage_transport import initialize_goal_storage_target
+from .control_plane.projects.identity import (
+    GoalCreationConflictError as GoalCreationConflictError,
+    slugify_goal_id as slugify_goal_id,
+    default_goal_id as default_goal_id,
+    derive_goal_display_name as derive_goal_display_name,
+)
+from .registry import find_registry_goal, resolve_state_file
+from .control_plane.coordination.local_authority import (
+    read_canonical_todos_if_promoted,
+    require_canonical_authority,
+)
+from .control_plane.coordination.legacy_writer_fence import require_legacy_state_replacement_allowed
+from .control_plane.coordination.legacy_writer_fence import require_registry_source_write_allowed
+from .control_plane.projects.registry_codec import (
+    load_project_registry,
+    project_registry_transaction,
+    require_runtime_compatible_project_registry,
+)
 from typing import Any
 
 from .control_plane.runtime.time import now_local_iso
+from .control_plane.runtime.document_io import atomic_write_state_text
 from .control_plane.todos.active_state_editing import (
     TODO_SECTION_HEADINGS,
     insertion_anchor,
     section_bounds,
 )
-from .control_plane.todos.next_action_runtime import bind_next_action_to_todo
 from .control_plane.todos.handoff_mode import (
     HANDOFF_MODE_LEGACY,
     goal_handoff_mode,
@@ -24,56 +44,27 @@ from .execution_profile import (
 )
 from .global_registry import sync_project_registry_to_global
 from .install_contract import (
-    ARCHIVE_FALLBACK_INSTALL_COMMAND,
-    DEFAULT_INSTALL_REPAIR_COMMAND,
+    archive_fallback_install_command,
+    install_repair_command,
 )
-from .onboarding import build_onboarding_scan
 from .orchestration import (
     DEFAULT_ORCHESTRATION_MODE,
     MULTI_SUBAGENT_ORCHESTRATION_MODE,
 )
-from .paths import DEFAULT_RUNTIME_ROOT, rel_or_abs
+from .paths import (
+    registered_goal_state_file,
+    rel_or_abs,
+    require_single_goal_state_route,
+    resolve_runtime_root,
+    validate_goal_id_path_segment,
+)
+from .control_plane.goals.active_state_metadata import markdown_blockquote, markdown_frontmatter_string
 from .registry_writability import probe_registry_write_path
-from .todos import add_todo_to_lines
 
 
 DEFAULT_OBJECTIVE = "Improve this project through bounded, verified goal segments."
 DEFAULT_DOMAIN = "project-goal-control-plane"
-GENERIC_ONBOARDING_ADAPTER_KINDS = frozenset(
-    {"generic_project_goal_v0", "read_only_project_map_v0"}
-)
-HEARTBEAT_OPT_IN_STATUS_REQUIRED = (
-    "requires explicit heartbeat=yes/no before a recurring Codex App automation is installed"
-)
-HEARTBEAT_OPT_IN_STATUS_PREAUTHORIZED = (
-    "explicitly preauthorized; create or update the host loop before claiming recurring automation is active"
-)
-HEARTBEAT_OPT_IN_STATUS_DECLINED = (
-    "explicitly declined; keep the goal manual or on-demand unless the user later opts in"
-)
-HEARTBEAT_OPT_IN_INSTRUCTION = (
-    "Ask the user whether to enable the Codex App heartbeat. heartbeat=yes means create or update a recurring "
-    "Codex App automation from an identity-scoped `loopx heartbeat-prompt --thin` task body; heartbeat=no means "
-    "keep the goal manual or on-demand."
-)
-HEARTBEAT_OPT_IN_PREAUTHORIZED_INSTRUCTION = (
-    "The user preauthorized the Codex App heartbeat. Create or update the recurring automation from an "
-    "identity-scoped `loopx heartbeat-prompt --thin` task body before claiming recurring automation is active."
-)
-HEARTBEAT_OPT_IN_DECLINED_INSTRUCTION = (
-    "The user declined the Codex App heartbeat. Do not install recurring automation; keep the goal manual or "
-    "on-demand unless the user later opts in."
-)
-CODEX_APP_HEARTBEAT_CHOICES = {"ask", "yes", "no"}
-
-
-def slugify_goal_id(value: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.lower()).strip("-")
-    return slug or "project-goal"
-
-
-def default_goal_id(project: Path) -> str:
-    return f"{slugify_goal_id(project.name)}-goal"
+DEFAULT_NEXT_ACTION = "Initial routing is owned by the connected domain adapter."
 
 
 def now_iso() -> str:
@@ -83,16 +74,12 @@ def now_iso() -> str:
 def read_json_if_exists(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    with path.open(encoding="utf-8") as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        raise ValueError(f"{path} must contain a JSON object")
+    payload = load_project_registry(path)
+    require_runtime_compatible_project_registry(
+        payload,
+        operation="bootstrap",
+    )
     return payload
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def resolve_project_path(project: Path, path: Path | None) -> Path | None:
@@ -128,314 +115,6 @@ def repair_missing_todo_source_sections(state_text: str) -> tuple[str, list[str]
     return "\n".join(lines) + trailing_newline, added_roles
 
 
-def onboarding_candidates(onboarding_scan: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if not isinstance(onboarding_scan, dict):
-        return []
-    candidates = onboarding_scan.get("agent_todo_candidates")
-    if not isinstance(candidates, list):
-        return []
-    return [candidate for candidate in candidates if isinstance(candidate, dict)]
-
-
-def normalize_codex_app_heartbeat(value: str | None) -> str:
-    choice = (value or "ask").strip().lower()
-    if choice not in CODEX_APP_HEARTBEAT_CHOICES:
-        raise ValueError("codex_app_heartbeat must be one of: ask, yes, no")
-    return choice
-
-
-def heartbeat_opt_in_required(
-    *,
-    onboarding_scan: dict[str, Any] | None,
-    codex_app_heartbeat: str,
-) -> bool:
-    return bool(onboarding_scan and codex_app_heartbeat == "ask")
-
-
-def host_loop_activation_required(
-    *,
-    onboarding_scan: dict[str, Any] | None,
-    codex_app_heartbeat: str,
-) -> bool:
-    return bool(onboarding_scan and codex_app_heartbeat in {"ask", "yes"})
-
-
-def heartbeat_status(codex_app_heartbeat: str) -> str:
-    if codex_app_heartbeat == "yes":
-        return HEARTBEAT_OPT_IN_STATUS_PREAUTHORIZED
-    if codex_app_heartbeat == "no":
-        return HEARTBEAT_OPT_IN_STATUS_DECLINED
-    return HEARTBEAT_OPT_IN_STATUS_REQUIRED
-
-
-def heartbeat_instruction(codex_app_heartbeat: str) -> str | None:
-    if codex_app_heartbeat == "yes":
-        return HEARTBEAT_OPT_IN_PREAUTHORIZED_INSTRUCTION
-    if codex_app_heartbeat == "no":
-        return HEARTBEAT_OPT_IN_DECLINED_INSTRUCTION
-    return HEARTBEAT_OPT_IN_INSTRUCTION
-
-
-def render_onboarding_state_markdown(
-    *,
-    onboarding_scan: dict[str, Any] | None,
-    accept_onboarding_agent_todos: bool,
-    begin_autonomous_advance: bool,
-    codex_app_heartbeat: str,
-) -> str:
-    if not onboarding_scan:
-        return ""
-    scan_policy = onboarding_scan.get("scan_policy")
-    scan_policy = scan_policy if isinstance(scan_policy, dict) else {}
-    recent_commits = onboarding_scan.get("recent_commits")
-    recent_commits = recent_commits if isinstance(recent_commits, list) else []
-    signal_files = onboarding_scan.get("signal_files")
-    signal_files = signal_files if isinstance(signal_files, list) else []
-    validation_files = onboarding_scan.get("validation_signal_files")
-    validation_files = validation_files if isinstance(validation_files, list) else []
-    validation_paths = [
-        str(item.get("path"))
-        for item in validation_files
-        if isinstance(item, dict) and item.get("path")
-    ]
-    acceptance_status = (
-        "accepted and written into Agent Todo"
-        if accept_onboarding_agent_todos
-        else "requires user selection before delivery work"
-    )
-    autonomous_status = (
-        "allowed after accepted agent todos and a fresh quota guard"
-        if begin_autonomous_advance
-        else "requires an explicit user yes/no choice"
-    )
-    lines = [
-        "## Onboarding Control",
-        "",
-        "- Fast repository scan: `enabled`.",
-        f"- Scan read file bodies: `{bool(scan_policy.get('raw_file_bodies_read'))}`.",
-        f"- Git repo detected: `{bool(onboarding_scan.get('is_git_repo'))}`.",
-        f"- Local change count from `git status --short`: `{int(onboarding_scan.get('status_path_count') or 0)}`.",
-        f"- Recent commits sampled: `{len(recent_commits)}`.",
-        f"- Project signal files: `{', '.join(str(item) for item in signal_files) or 'none'}`.",
-        f"- Validation signal files: `{', '.join(validation_paths) or 'none'}`.",
-        f"- Candidate agent todos: `{acceptance_status}`.",
-        f"- Autonomous advancement: `{autonomous_status}`.",
-        f"- Codex App heartbeat: `{heartbeat_status(codex_app_heartbeat)}`.",
-        "",
-        "## Proposed Onboarding Candidates",
-        "",
-    ]
-    candidates = onboarding_candidates(onboarding_scan)
-    for index, candidate in enumerate(candidates, start=1):
-        text = str(candidate.get("text") or "").strip()
-        reason = str(candidate.get("reason") or "").strip()
-        action_kind = str(candidate.get("action_kind") or "analyze").strip()
-        task_class = str(candidate.get("task_class") or "advancement_task").strip()
-        lines.append(f"{index}. {text}")
-        if reason:
-            lines.append(f"   - reason: {reason}")
-        lines.append(f"   - metadata: `{task_class}:{action_kind}`")
-    if not candidates:
-        lines.append("No candidate agent todos were generated.")
-    return "\n".join(lines)
-
-
-def onboarding_user_todo_text(
-    *,
-    acceptance_required: bool,
-    autonomous_choice_required: bool,
-    heartbeat_choice_required: bool,
-) -> str | None:
-    decisions: list[str] = []
-    reply_parts: list[str] = []
-    if acceptance_required:
-        decisions.append("which proposed onboarding agent todos to accept")
-        reply_parts.append("accepted numbers")
-    if autonomous_choice_required:
-        decisions.append("whether Codex may start autonomous advancement")
-        reply_parts.append("autonomous=yes/no")
-    if heartbeat_choice_required:
-        decisions.append("whether to enable the Codex App heartbeat")
-        reply_parts.append("heartbeat=yes/no")
-    if not decisions:
-        return None
-    verb = "Choose" if acceptance_required else "Decide"
-    return f"[P1] {verb} {' and '.join(decisions)}; reply with {' plus '.join(reply_parts)}."
-
-
-def onboarding_agent_review_todo_text(
-    *,
-    acceptance_required: bool,
-    autonomous_choice_required: bool,
-    heartbeat_choice_required: bool,
-) -> str | None:
-    if not acceptance_required and not autonomous_choice_required and not heartbeat_choice_required:
-        return None
-    prompts: list[str] = []
-    if acceptance_required:
-        prompts.append("which candidate agent todos to accept")
-    if autonomous_choice_required:
-        prompts.append("whether autonomous advancement may start")
-    if heartbeat_choice_required:
-        prompts.append("whether to enable the Codex App heartbeat")
-    prefix = "Present the onboarding scan and ask " if acceptance_required else "Ask "
-    text = f"[P1] {prefix}{', '.join(prompts)} before delivery work."
-    if heartbeat_choice_required:
-        text += (
-            " If heartbeat=yes, create or update the Codex App heartbeat from an identity-scoped "
-            "`loopx heartbeat-prompt --thin` task body before claiming recurring automation is active."
-        )
-    return text
-
-
-def onboarding_connection_validation_action(adapter_kind: str) -> dict[str, str] | None:
-    if adapter_kind not in GENERIC_ONBOARDING_ADAPTER_KINDS:
-        return None
-    return {
-        "text": (
-            "[P1] Run `loopx check` against the project registry and record the first "
-            "project-specific adapter signal or an explicit no-follow-up rationale."
-        ),
-        "task_class": "advancement_task",
-        "action_kind": "onboarding_connection_validation",
-    }
-
-
-def onboarding_next_action(
-    *,
-    adapter_kind: str,
-    onboarding_scan: dict[str, Any] | None,
-    accept_onboarding_agent_todos: bool,
-    begin_autonomous_advance: bool,
-    codex_app_heartbeat: str,
-    include_connection_validation: bool = True,
-) -> str:
-    if not onboarding_scan:
-        validation_action = (
-            onboarding_connection_validation_action(adapter_kind)
-            if include_connection_validation
-            else None
-        )
-        if validation_action:
-            return validation_action["text"]
-        return "Initial routing is owned by the connected domain adapter."
-    need_heartbeat_choice = codex_app_heartbeat == "ask"
-    if not accept_onboarding_agent_todos or not begin_autonomous_advance or need_heartbeat_choice:
-        asks: list[str] = []
-        if not accept_onboarding_agent_todos:
-            asks.append("which proposed onboarding agent todos to accept")
-        if not begin_autonomous_advance:
-            asks.append("whether Codex may start autonomous advancement")
-        if need_heartbeat_choice:
-            asks.append("whether to enable the Codex App heartbeat")
-        follow_up = "then write accepted choices and refresh state before delivery work."
-        heartbeat_follow_up = ""
-        if need_heartbeat_choice:
-            heartbeat_follow_up = (
-                " If heartbeat=yes, create or update the recurring automation from an identity-scoped "
-                "`loopx heartbeat-prompt --thin` task body."
-            )
-        elif codex_app_heartbeat == "yes":
-            heartbeat_follow_up = (
-                " Create or update the preauthorized recurring automation from an identity-scoped "
-                "`loopx heartbeat-prompt --thin` task body."
-            )
-        autonomous_follow_up = (
-            " If autonomous=yes, run the quota guard and execute the first accepted onboarding agent todo."
-            if not begin_autonomous_advance
-            else " Run the quota guard and execute the first accepted onboarding agent todo once accepted choices permit."
-        )
-        return f"Ask the user {', '.join(asks)}, {follow_up}{heartbeat_follow_up}{autonomous_follow_up}"
-    if codex_app_heartbeat == "yes":
-        return (
-            "Create or update the Codex App heartbeat from an identity-scoped `loopx heartbeat-prompt --thin` task "
-            "body, run the quota guard, execute the first accepted onboarding Agent Todo as a bounded segment, write "
-            "evidence, complete or update the todo, and refresh state."
-        )
-    return (
-        "Run the quota guard, execute the first accepted onboarding Agent Todo as a bounded segment, write evidence, "
-        "complete or update the todo, and refresh state."
-    )
-
-
-def apply_onboarding_todos_to_state(
-    text: str,
-    *,
-    adapter_kind: str,
-    updated_at: str,
-    onboarding_scan: dict[str, Any] | None,
-    accept_onboarding_agent_todos: bool,
-    begin_autonomous_advance: bool,
-    codex_app_heartbeat: str,
-    include_connection_validation: bool = True,
-) -> str:
-    if not onboarding_scan:
-        lines = text.splitlines()
-        action = (
-            onboarding_connection_validation_action(adapter_kind)
-            if include_connection_validation
-            else None
-        )
-        if action:
-            added = add_todo_to_lines(
-                lines,
-                role="agent",
-                text=action["text"],
-                task_class=action["task_class"],
-                action_kind=action["action_kind"],
-                updated_at=updated_at,
-            )
-            bind_next_action_to_todo(lines, todo_id=str(added["todo_id"]))
-        return "\n".join(lines) + "\n"
-    lines = text.splitlines()
-    if accept_onboarding_agent_todos:
-        for candidate in onboarding_candidates(onboarding_scan):
-            todo_text = str(candidate.get("text") or "").strip()
-            if not todo_text:
-                continue
-            add_todo_to_lines(
-                lines,
-                role="agent",
-                text=todo_text,
-                task_class=str(candidate.get("task_class") or "advancement_task"),
-                action_kind=str(candidate.get("action_kind") or "analyze"),
-                updated_at=updated_at,
-            )
-
-    acceptance_required = not accept_onboarding_agent_todos
-    autonomous_choice_required = not begin_autonomous_advance
-    heartbeat_choice_required = codex_app_heartbeat == "ask"
-    user_todo = onboarding_user_todo_text(
-        acceptance_required=acceptance_required,
-        autonomous_choice_required=autonomous_choice_required,
-        heartbeat_choice_required=heartbeat_choice_required,
-    )
-    if user_todo:
-        add_todo_to_lines(
-            lines,
-            role="user",
-            text=user_todo,
-            task_class="user_gate",
-            action_kind="onboarding_decision",
-            updated_at=updated_at,
-        )
-    agent_todo = onboarding_agent_review_todo_text(
-        acceptance_required=acceptance_required,
-        autonomous_choice_required=autonomous_choice_required,
-        heartbeat_choice_required=heartbeat_choice_required,
-    )
-    if agent_todo:
-        add_todo_to_lines(
-            lines,
-            role="agent",
-            text=agent_todo,
-            task_class="advancement_task",
-            action_kind="onboarding_todo_review",
-            updated_at=updated_at,
-        )
-    return "\n".join(lines) + "\n"
-
-
 def render_state_markdown(
     *,
     project: Path,
@@ -445,30 +124,11 @@ def render_state_markdown(
     updated_at: str,
     goal_doc: Path | None,
     execution_profile: dict[str, Any] | None,
-    onboarding_scan: dict[str, Any] | None = None,
-    accept_onboarding_agent_todos: bool = False,
-    begin_autonomous_advance: bool = False,
-    codex_app_heartbeat: str = "ask",
-    include_connection_validation: bool = True,
     handoff_mode: str = HANDOFF_MODE_LEGACY,
 ) -> str:
-    safe_objective = objective.replace('"', '\\"')
+    safe_objective = markdown_frontmatter_string(objective)
     profile_summary = execution_profile_summary(execution_profile)
-    onboarding_markdown = render_onboarding_state_markdown(
-        onboarding_scan=onboarding_scan,
-        accept_onboarding_agent_todos=accept_onboarding_agent_todos,
-        begin_autonomous_advance=begin_autonomous_advance,
-        codex_app_heartbeat=codex_app_heartbeat,
-    )
-    onboarding_block = f"\n{onboarding_markdown}\n" if onboarding_markdown else ""
-    next_action = onboarding_next_action(
-        adapter_kind=adapter_kind,
-        onboarding_scan=onboarding_scan,
-        accept_onboarding_agent_todos=accept_onboarding_agent_todos,
-        begin_autonomous_advance=begin_autonomous_advance,
-        codex_app_heartbeat=codex_app_heartbeat,
-        include_connection_validation=include_connection_validation,
-    )
+    next_action = DEFAULT_NEXT_ACTION
     # ``handoff_mode`` travels in the state front matter (RFC shared-goal
     # authority, Appendix B). Legacy is the absent default and is never
     # materialized, so an untouched goal keeps its byte-for-byte shape.
@@ -478,7 +138,7 @@ def render_state_markdown(
     state_text = f"""---
 status: active
 owner_mode: goal
-objective: "{safe_objective}"
+objective: {safe_objective}
 updated_at: {updated_at}
 adapter_id: {goal_id}
 {handoff_mode_line}---
@@ -487,7 +147,7 @@ adapter_id: {goal_id}
 
 ## Objective
 
-{objective}
+{markdown_blockquote(objective)}
 
 ## Authority Sources
 
@@ -512,7 +172,6 @@ adapter_id: {goal_id}
 - Do not perform irreversible production operations without explicit approval.
 - Do not publish private project evidence.
 - Do not optimize for activity if no useful artifact or decision can be produced.
-{onboarding_block}
 
 ## User Todo / Owner Review Reading Queue
 
@@ -530,37 +189,11 @@ adapter_id: {goal_id}
 
 - Created the initial goal state and registry connection.
 """
-    return apply_onboarding_todos_to_state(
-        state_text,
-        adapter_kind=adapter_kind,
-        updated_at=updated_at,
-        onboarding_scan=onboarding_scan,
-        accept_onboarding_agent_todos=accept_onboarding_agent_todos,
-        begin_autonomous_advance=begin_autonomous_advance,
-        codex_app_heartbeat=codex_app_heartbeat,
-        include_connection_validation=include_connection_validation,
-    )
+    return state_text
 
 
 def relative_state_file(project: Path, state_file: Path) -> str:
     return rel_or_abs(state_file, project)
-
-
-def todo_add_command(
-    *,
-    project: Path,
-    registry_path: Path,
-    goal_id: str,
-    candidate: dict[str, Any],
-) -> str:
-    return (
-        f"loopx --registry {shlex.quote(relative_state_file(project, registry_path))} todo add "
-        f"--goal-id {shlex.quote(goal_id)} "
-        "--role agent "
-        f"--text {shlex.quote(str(candidate.get('text') or ''))} "
-        f"--task-class {shlex.quote(str(candidate.get('task_class') or 'advancement_task'))} "
-        f"--action-kind {shlex.quote(str(candidate.get('action_kind') or 'analyze'))}"
-    )
 
 
 def build_goal_entry(
@@ -591,6 +224,10 @@ def build_goal_entry(
                 "role": "primary_goal_document",
             }
         )
+    adapter = {
+        "kind": adapter_kind,
+        "status": adapter_status,
+    }
     return {
         "id": goal_id,
         **({"display_name": display_name} if display_name else {}),
@@ -601,10 +238,7 @@ def build_goal_entry(
         "repo": str(project),
         "state_file": relative_state_file(project, state_file),
         "authority_sources": authority_sources,
-        "adapter": {
-            "kind": adapter_kind,
-            "status": adapter_status,
-        },
+        "adapter": adapter,
         "spawn_policy": {
             "mode": (
                 MULTI_SUBAGENT_ORCHESTRATION_MODE
@@ -685,33 +319,30 @@ def bootstrap_project(
     execution_surface_streak_threshold: int | None = None,
     execution_outcome_must_advance: list[str] | None = None,
     execution_turn_granularity: str | None = None,
-    onboarding_scan_enabled: bool = True,
-    accept_onboarding_agent_todos: bool = False,
-    begin_autonomous_advance: bool = False,
-    codex_app_heartbeat: str = "ask",
-    onboarding_max_commits: int = 5,
-    onboarding_max_status_paths: int = 12,
-    onboarding_max_top_level_files: int = 24,
     preserve_todos: bool = False,
     display_name: str | None = None,
-    include_connection_validation: bool = True,
     force: bool,
     dry_run: bool,
     sync_global: bool,
     allow_global_route_replacement: bool = False,
+    creation_operation_id: str | None = None,
 ) -> dict[str, Any]:
     project = project.expanduser().resolve()
-    codex_app_heartbeat = normalize_codex_app_heartbeat(codex_app_heartbeat)
+    goal_id = validate_goal_id_path_segment(goal_id or default_goal_id(project))
     registry_path = registry_path.expanduser()
     if not registry_path.is_absolute():
         registry_path = project / registry_path
-    goal_id = goal_id or default_goal_id(project)
-    state_file = state_file or (project / ".codex" / "goals" / goal_id / "ACTIVE_GOAL_STATE.md")
+    explicit_state_file = state_file is not None
+    state_file = state_file or registered_goal_state_file(
+        project, goal_id, read_json_if_exists(registry_path)
+    )
+    if not explicit_state_file:
+        require_single_goal_state_route(project, goal_id, state_file)
     state_file = state_file.expanduser()
     if not state_file.is_absolute():
         state_file = project / state_file
     goal_doc = resolve_project_path(project, goal_doc)
-    runtime_root = runtime_root.expanduser() if runtime_root else DEFAULT_RUNTIME_ROOT
+    runtime_root = resolve_runtime_root(read_json_if_exists(registry_path), str(runtime_root) if runtime_root else None, registry_path=registry_path).resolve()
     updated_at = now_iso()
     execution_profile = build_execution_profile(
         minimum_scale=execution_minimum_scale,
@@ -722,16 +353,6 @@ def bootstrap_project(
         surface_streak_threshold=execution_surface_streak_threshold,
         outcome_must_advance=execution_outcome_must_advance,
         turn_granularity=execution_turn_granularity,
-    )
-    onboarding_scan = (
-        build_onboarding_scan(
-            project,
-            max_commits=onboarding_max_commits,
-            max_status_paths=onboarding_max_status_paths,
-            max_top_level_files=onboarding_max_top_level_files,
-        )
-        if onboarding_scan_enabled
-        else None
     )
 
     registry = read_json_if_exists(registry_path)
@@ -759,10 +380,40 @@ def bootstrap_project(
         execution_profile=execution_profile,
         display_name=display_name,
     )
+    if creation_operation_id is not None:
+        goal_entry["creation_operation_id"] = creation_operation_id
+    previous_goal = find_registry_goal(registry, goal_id)
+    if creation_operation_id is not None and previous_goal is not None:
+        raise GoalCreationConflictError("Goal id was registered by another operation")
+    storage_target = ((previous_goal or {}).get("coordination") or {}).get("storage_target")
+    if previous_goal is None and not state_file.exists():
+        storage_target = new_goal_storage_target(runtime_root)
+    if storage_target is not None:
+        goal_entry.setdefault("coordination", {})["storage_target"] = storage_target
+    canonical_creation = (storage_target or {}).get("schema_version") == "loopx_new_goal_storage_target_v1"
+    # Imported/promoted Goals have no canonical *creation* receipt. Resolve
+    # their current authority through the existing typed reader, never by
+    # manufacturing a creation target or reviving their old Markdown source.
+    existing_authority = (read_canonical_todos_if_promoted(runtime_root=runtime_root, goal_id=goal_id)
+        if previous_goal is not None and not canonical_creation else None)
+    canonical_existing = existing_authority is not None
+    if not canonical_creation and not canonical_existing:
+        require_canonical_authority(goal_id=goal_id, operation="goal_create")
+    if canonical_creation and previous_goal is not None and force:
+        raise ValueError("Canonical creation cannot rebuild existing state; restore or migrate through its owning operation")
+    if canonical_existing and force:
+        raise ValueError("Canonical authority cannot rebuild existing state; restore or migrate through its owning operation")
+    if canonical_existing:
+        registered_state = resolve_state_file(Path(previous_goal["repo"]), previous_goal["state_file"])
+        if (registered_state is None or registered_state.resolve(strict=False) != state_file.resolve(strict=False)
+            or Path(previous_goal["repo"]).expanduser().resolve() != project):
+            raise ValueError("Canonical reconnect must use its registered project and state route")
+    if canonical_creation:
+        goal_entry["creation_operation_id"] = creation_operation_id or (previous_goal or {}).get("creation_operation_id") or f"goal-create:{uuid4().hex}"
     registry, registry_goal_action = merge_goal(registry, goal_entry, force=force)
 
     state_exists = state_file.exists()
-    state_action = "created"
+    state_action = "kept-existing" if canonical_existing or (canonical_creation and previous_goal is not None) else "created"
     if state_exists and force and preserve_todos:
         state_action = "kept-existing-preserve-todos"
     elif state_exists and not force:
@@ -772,7 +423,7 @@ def bootstrap_project(
 
     repaired_state_text: str | None = None
     repaired_todo_source_roles: list[str] = []
-    if state_exists and state_action in {
+    if not canonical_creation and not canonical_existing and state_exists and state_action in {
         "kept-existing",
         "kept-existing-preserve-todos",
     }:
@@ -797,7 +448,7 @@ def bootstrap_project(
     }
     force_bootstrap_warning = None
     declared_handoff_mode = HANDOFF_MODE_LEGACY
-    if state_exists and force:
+    if not canonical_creation and state_exists and force:
         # A forced rebuild replaces todos, never the goal's handoff contract:
         # the declared mode is carried into the rewritten front matter, and an
         # invalid declaration fails closed before anything is rewritten.
@@ -831,25 +482,6 @@ def bootstrap_project(
                 "goal": goal_id,
             }
         )
-
-    candidates = onboarding_candidates(onboarding_scan)
-    heartbeat_required = heartbeat_opt_in_required(
-        onboarding_scan=onboarding_scan,
-        codex_app_heartbeat=codex_app_heartbeat,
-    )
-    host_loop_required = host_loop_activation_required(
-        onboarding_scan=onboarding_scan,
-        codex_app_heartbeat=codex_app_heartbeat,
-    )
-    accept_candidate_commands = [
-        todo_add_command(
-            project=project,
-            registry_path=registry_path,
-            goal_id=goal_id,
-            candidate=candidate,
-        )
-        for candidate in candidates
-    ]
 
     global_sync: dict[str, Any] | None = None
     global_writability: dict[str, Any] | None = None
@@ -888,41 +520,80 @@ def bootstrap_project(
                 "todo_source_migration": todo_source_migration,
                 "force_bootstrap_warning": force_bootstrap_warning,
                 "execution_profile": execution_profile,
-                "onboarding_scan": onboarding_scan,
-                "onboarding_agent_todo_candidates": candidates,
-                "accept_onboarding_agent_todos": accept_onboarding_agent_todos,
-                "begin_autonomous_advance": begin_autonomous_advance,
-                "codex_app_heartbeat": codex_app_heartbeat,
-                "onboarding_acceptance_required": bool(onboarding_scan and not accept_onboarding_agent_todos),
-                "autonomous_advance_choice_required": bool(onboarding_scan and not begin_autonomous_advance),
-                "heartbeat_opt_in_required": heartbeat_required,
-                "host_loop_activation_required": host_loop_required,
-                "heartbeat_opt_in_instruction": (
-                    heartbeat_instruction(codex_app_heartbeat) if onboarding_scan else None
-                ),
-                "onboarding_todos_written": False,
-                "accept_candidate_commands": accept_candidate_commands,
                 "global_sync": global_sync,
                 "actions": actions,
                 "next_commands": [
                     "Fix global registry write access, then rerun this command.",
                     "Use --no-global-sync only for an explicit local-only setup.",
                 ],
-                "install_repair_command": DEFAULT_INSTALL_REPAIR_COMMAND,
-                "archive_fallback_install_command": ARCHIVE_FALLBACK_INSTALL_COMMAND,
+                "install_repair_command": install_repair_command(),
+                "archive_fallback_install_command": archive_fallback_install_command(),
                 "install_repair_note": (
                     "If this local LoopX install is missing or stale, repair the PyPI distribution "
                     "and packaged workflow skills, then confirm with loopx doctor before continuing."
                 ),
-                "private_boundary_note": "Add .loopx/ and .codex/goals/ to the project .gitignore if the goal state contains private evidence.",
+                "private_boundary_note": "Add .loopx/ to the project .gitignore if the goal state contains private evidence; keep .codex/goals/ ignored while legacy state remains.",
                 "error": str(global_writability.get("error") or "global registry is not writable"),
             }
+    storage_selection = None
+    shadow_evidence: dict[str, Any] = {}
     if not dry_run:
-        write_json(registry_path, registry)
-        if state_action in {"created", "replaced"}:
-            state_file.parent.mkdir(parents=True, exist_ok=True)
-            state_file.write_text(
-                render_state_markdown(
+        # Reconnect enters the same typed receipt owner before compatibility
+        # reads or rebuild checks. It alone decides whether unfinished creation
+        # needs a full source capture; completed authority never needs Markdown.
+        if canonical_creation and previous_goal is not None:
+            storage_selection = initialize_goal_storage_target(runtime_root,
+                {**previous_goal, "state_file": str(state_file)}, registry_path=registry_path)
+        canonical_reconnect = canonical_existing or (storage_selection is not None and storage_selection.get("authority_initialized") is True)
+        canonical_bootstrap_transport = canonical_creation
+        with project_registry_transaction(
+            registry_path,
+            operation="bootstrap_registry",
+            create=dict,
+        ) as registry_transaction, nullcontext():
+            current_registry = registry_transaction.payload_copy()
+            current_goal = find_registry_goal(current_registry, goal_id)
+            if canonical_existing and current_goal != previous_goal:
+                raise ValueError("Canonical Goal registration changed; retry bootstrap")
+            if creation_operation_id is not None and current_goal is not None:
+                # The App is creating a new Goal, not reconnecting one. Recheck
+                # under the publication lock before state/provider side effects.
+                raise GoalCreationConflictError("Goal id was registered by another operation")
+            # A concurrent creator or reconnect owns its frozen target, including absence.
+            if current_goal is not None or state_file.exists():
+                frozen = ((current_goal or {}).get("coordination") or {}).get("storage_target")
+                goal_entry.setdefault("coordination", {}).pop("storage_target", None)
+                if frozen is not None:
+                    goal_entry["coordination"]["storage_target"] = frozen
+            frozen_target = goal_entry.get("coordination", {}).get("storage_target") or {}
+            canonical_creation = frozen_target.get("schema_version") == "loopx_new_goal_storage_target_v1"
+            if canonical_creation and force and (current_goal is not None or state_file.exists()):
+                raise ValueError("Canonical creation cannot rebuild existing state; restore or migrate through its owning operation")
+
+            # A first explicit bootstrap has no previous Goal authority to fence.
+            # Existing Goals still resolve and authorize their original route.
+            if current_registry.get("goals"):
+                previous_root = resolve_runtime_root(current_registry, None, registry_path=registry_path).resolve()
+                if previous_root != runtime_root:
+                    for previous_goal in current_registry["goals"]:
+                        if isinstance(previous_goal, dict) and previous_goal.get("id"):
+                            require_legacy_state_replacement_allowed(runtime_root=previous_root,
+                                goal_id=str(previous_goal["id"]), goal=previous_goal)
+            original = state_file.read_text(encoding="utf-8") if not canonical_reconnect and state_file.exists() else ""
+            if not canonical_reconnect and (force or not state_file.exists()):
+                require_legacy_state_replacement_allowed(runtime_root=runtime_root,
+                    goal_id=goal_id, goal=current_goal)
+            if canonical_reconnect:
+                state_action = "kept-existing"
+            else:
+                state_action = ("kept-existing-preserve-todos" if force and preserve_todos else "kept-existing") if state_file.exists() and (not force or preserve_todos) else "replaced" if state_file.exists() else "created"
+            for action in actions:
+                if action.get("path") == str(state_file):
+                    action["action"] = state_action
+            planned = original
+            if state_action in {"created", "replaced"}:
+                declared_handoff_mode = goal_handoff_mode(original) if original and force else frozen_target.get("handoff_mode", HANDOFF_MODE_LEGACY)
+                planned = render_state_markdown(
                     project=project,
                     goal_id=goal_id,
                     adapter_kind=adapter_kind,
@@ -930,19 +601,27 @@ def bootstrap_project(
                     updated_at=updated_at,
                     goal_doc=goal_doc,
                     execution_profile=execution_profile,
-                    onboarding_scan=onboarding_scan,
-                    accept_onboarding_agent_todos=accept_onboarding_agent_todos,
-                    begin_autonomous_advance=begin_autonomous_advance,
-                    codex_app_heartbeat=codex_app_heartbeat,
-                    include_connection_validation=include_connection_validation,
                     handoff_mode=declared_handoff_mode,
-                ),
-                encoding="utf-8",
-            )
-        elif repaired_state_text is not None and repaired_todo_source_roles:
-            state_file.write_text(repaired_state_text, encoding="utf-8")
-            if todo_source_migration is not None:
-                todo_source_migration["applied"] = True
+                )
+            elif not canonical_creation and not canonical_reconnect:
+                planned, repaired_todo_source_roles = repair_missing_todo_source_sections(original)
+            if planned != original:
+                if canonical_bootstrap_transport:
+                    require_registry_source_write_allowed(registry_path=registry_path, runtime_root=runtime_root,
+                        goal_id=goal_id, state_file=state_file)
+                atomic_write_state_text(state_file, planned)
+                if todo_source_migration is not None:
+                    todo_source_migration["applied"] = True
+            current_registry.setdefault("schema_version", "0.1")
+            current_registry["updated_at"] = updated_at.split("T")[0]
+            current_registry["common_runtime_root"] = str(runtime_root)
+            registry, registry_goal_action = merge_goal(current_registry, goal_entry, force=force)
+            registry_transaction.commit(registry)
+        # Registry intent survives an interrupted initialization. Reconnect retries
+        # it outside the legacy/registry locks; changing machine defaults cannot
+        # retarget that Goal. The TS owner refuses replacing an existing provider.
+        if not canonical_existing:
+            storage_selection = initialize_goal_storage_target(runtime_root, find_registry_goal(registry, goal_id) or {}, registry_path=registry_path)
         if sync_global:
             global_sync = sync_project_registry_to_global(
                 registry_path=registry_path,
@@ -953,6 +632,12 @@ def bootstrap_project(
             )
 
     return {
+        **shadow_evidence,
+        **({"authority_read": {key: existing_authority[key] for key in (
+            "provider_revision", "cursor", "source_authority", "decision_read_from_provider", "legacy_fallback_used",
+        )}} if existing_authority is not None else {}),
+        "storage_selection": storage_selection,
+        "storage_target": (find_registry_goal(registry, goal_id) or {}).get("coordination", {}).get("storage_target"),
         "ok": True,
         "dry_run": dry_run,
         "project": str(project),
@@ -967,20 +652,6 @@ def bootstrap_project(
         "todo_source_migration": todo_source_migration,
         "force_bootstrap_warning": force_bootstrap_warning,
         "execution_profile": execution_profile,
-        "onboarding_scan": onboarding_scan,
-        "onboarding_agent_todo_candidates": candidates,
-        "accept_onboarding_agent_todos": accept_onboarding_agent_todos,
-        "begin_autonomous_advance": begin_autonomous_advance,
-        "codex_app_heartbeat": codex_app_heartbeat,
-        "onboarding_acceptance_required": bool(onboarding_scan and not accept_onboarding_agent_todos),
-        "autonomous_advance_choice_required": bool(onboarding_scan and not begin_autonomous_advance),
-        "heartbeat_opt_in_required": heartbeat_required,
-        "host_loop_activation_required": host_loop_required,
-        "heartbeat_opt_in_instruction": heartbeat_instruction(codex_app_heartbeat) if onboarding_scan else None,
-        "onboarding_todos_written": bool(
-            onboarding_scan and state_action in {"created", "replaced"} and not dry_run
-        ),
-        "accept_candidate_commands": accept_candidate_commands,
         "global_sync": global_sync
         or {
             "enabled": sync_global,
@@ -1000,13 +671,13 @@ def bootstrap_project(
             f"loopx --registry {runtime_root / 'registry.global.json'} status",
             f"loopx --registry {relative_state_file(project, registry_path)} history --goal-id {goal_id}",
         ],
-        "install_repair_command": DEFAULT_INSTALL_REPAIR_COMMAND,
-        "archive_fallback_install_command": ARCHIVE_FALLBACK_INSTALL_COMMAND,
+        "install_repair_command": install_repair_command(),
+        "archive_fallback_install_command": archive_fallback_install_command(),
         "install_repair_note": (
             "If this local LoopX install is missing or stale, repair the PyPI distribution "
             "and packaged workflow skills, then confirm with loopx doctor before continuing."
         ),
-        "private_boundary_note": "Add .loopx/ and .codex/goals/ to the project .gitignore if the goal state contains private evidence.",
+        "private_boundary_note": "Add .loopx/ to the project .gitignore if the goal state contains private evidence; keep .codex/goals/ ignored while legacy state remains.",
     }
 
 
@@ -1032,16 +703,11 @@ def render_bootstrap_markdown(payload: dict[str, Any]) -> str:
         f"- registry_goal_action: `{payload.get('registry_goal_action')}`",
         f"- state_action: `{payload.get('state_action')}`",
         f"- execution_profile: `{execution_profile_text}`",
-        f"- onboarding_acceptance_required: `{payload.get('onboarding_acceptance_required')}`",
-        f"- autonomous_advance_choice_required: `{payload.get('autonomous_advance_choice_required')}`",
-        f"- codex_app_heartbeat: `{payload.get('codex_app_heartbeat')}`",
-        f"- heartbeat_opt_in_required: `{payload.get('heartbeat_opt_in_required')}`",
-        f"- host_loop_activation_required: `{payload.get('host_loop_activation_required')}`",
-        f"- onboarding_todos_written: `{payload.get('onboarding_todos_written')}`",
         f"- global_sync: `{(payload.get('global_sync') or {}).get('wrote')}`",
-        "",
-        "## Actions",
     ]
+    if error := payload.get("error"):
+        lines.extend(["", "## Error", str(error)])
+    lines.extend(["", "## Actions"])
     for action in payload.get("actions") or []:
         lines.append(f"- `{action.get('path')}`: {action.get('action')} ({action.get('goal', '')})")
 
@@ -1058,81 +724,6 @@ def render_bootstrap_markdown(payload: dict[str, Any]) -> str:
                 f"- preserve_todos_option: `{force_warning.get('preserve_todos_option')}`",
             ]
         )
-
-    onboarding_scan = payload.get("onboarding_scan")
-    if isinstance(onboarding_scan, dict):
-        recent_commits = onboarding_scan.get("recent_commits")
-        recent_commits = recent_commits if isinstance(recent_commits, list) else []
-        signal_files = onboarding_scan.get("signal_files")
-        signal_files = signal_files if isinstance(signal_files, list) else []
-        status_sample = onboarding_scan.get("status_paths_sample")
-        status_sample = status_sample if isinstance(status_sample, list) else []
-        lines.extend(
-            [
-                "",
-                "## Onboarding Scan",
-                f"- schema: `{onboarding_scan.get('schema_version')}`",
-                f"- git_repo: `{onboarding_scan.get('is_git_repo')}`",
-                f"- status_path_count: `{onboarding_scan.get('status_path_count')}`",
-                f"- recent_commits: `{len(recent_commits)}`",
-                f"- signal_files: `{', '.join(str(item) for item in signal_files) or 'none'}`",
-                "- raw_file_bodies_read: `False`",
-            ]
-        )
-        if status_sample:
-            lines.append("- status_sample:")
-            for item in status_sample[:5]:
-                lines.append(f"  - `{item}`")
-        if recent_commits:
-            lines.append("- recent_commit_sample:")
-            for commit in recent_commits[:5]:
-                if isinstance(commit, dict):
-                    lines.append(f"  - `{commit.get('hash')}` {commit.get('subject')}")
-
-    candidates = payload.get("onboarding_agent_todo_candidates")
-    candidates = candidates if isinstance(candidates, list) else []
-    if candidates:
-        lines.extend(["", "## Proposed Onboarding Candidates"])
-        for index, candidate in enumerate(candidates, start=1):
-            if not isinstance(candidate, dict):
-                continue
-            lines.append(f"{index}. {candidate.get('text')}")
-            if candidate.get("reason"):
-                lines.append(f"   - reason: {candidate.get('reason')}")
-            lines.append(
-                "   - metadata: "
-                f"`{candidate.get('task_class') or 'advancement_task'}:{candidate.get('action_kind') or 'analyze'}`"
-            )
-
-    accept_commands = payload.get("accept_candidate_commands")
-    accept_commands = accept_commands if isinstance(accept_commands, list) else []
-    if accept_commands:
-        lines.extend(
-            [
-                "",
-                "## Accept Candidate Commands",
-                "Run only the commands for candidates the user accepts, then refresh state.",
-            ]
-        )
-        for command in accept_commands:
-            lines.append(f"- `{command}`")
-
-    if onboarding_scan:
-        lines.extend(
-            [
-                "",
-                "## Autonomy And Heartbeat Choice",
-            ]
-        )
-        instruction = payload.get("heartbeat_opt_in_instruction")
-        if instruction:
-            lines.append(f"- heartbeat_opt_in_instruction: {instruction}")
-        if payload.get("autonomous_advance_choice_required"):
-            lines.append(
-                "- Ask the user whether Codex may start autonomous advancement. If autonomous=yes, run the quota "
-                "guard and execute the first accepted Agent Todo; if autonomous=no, stop after writing accepted todos "
-                "and refresh-state."
-            )
 
     lines.extend(["", "## Next Commands"])
     for command in payload.get("next_commands") or []:

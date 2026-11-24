@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable, Mapping
+from typing import cast
 
 from .control_plane.heartbeat.agent import (
     agent_prompt_command_args,
@@ -13,9 +14,14 @@ from .control_plane.heartbeat.agent import (
     normalize_agent_scopes,
     render_peer_agent_scope_instruction,
 )
+from .control_plane.heartbeat.agent_input import (
+    HEARTBEAT_AGENT_INPUT_SCHEMA_VERSION,
+    project_heartbeat_agent_input,
+)
 from .control_plane.heartbeat.budget import (
     INTERFACE_BUDGET_CHARS,
     NATIVE_GOAL_HOST_MAX_CHARS,
+    REWARD_MEMORY_OUTCOME_PROMPT_HEADROOM_CHARS,
     build_interface_budget,
     heartbeat_prompt_mode,
     prompt_budget_text,
@@ -51,9 +57,11 @@ __all__ = [
     "DEFAULT_MATERIAL_QUEUE_RULE",
     "DEFAULT_PERMISSION_RULE",
     "HEARTBEAT_NOTIFICATION_RULE_SHORT",
+    "HEARTBEAT_AGENT_INPUT_SCHEMA_VERSION",
     "HEARTBEAT_VISION_WRITEBACK_RULE_SHORT",
     "INTERFACE_BUDGET_CHARS",
     "NATIVE_GOAL_HOST_MAX_CHARS",
+    "REWARD_MEMORY_OUTCOME_PROMPT_HEADROOM_CHARS",
     "RUNTIME_CAPABILITY_PROJECTION_THIN_RULE",
     "RUNTIME_EXECUTION_ROUTING_RULE",
     "SCHEDULER_HINT_APPLICATION_RULE",
@@ -77,6 +85,7 @@ __all__ = [
     "normalize_agent_scope",
     "normalize_agent_scopes",
     "prompt_budget_text",
+    "project_heartbeat_agent_input",
     "render_ark_managed_agent_goal_task_body",
     "render_brief_heartbeat_task_body",
     "render_compact_heartbeat_task_body",
@@ -94,66 +103,66 @@ __all__ = [
 ]
 
 
-def build_heartbeat_prompt(**kwargs):
+def build_heartbeat_prompt(**kwargs: object) -> dict[str, object]:
     from .control_plane.heartbeat.builder import build_heartbeat_prompt as _impl
-    return _impl(**kwargs)
+    return cast(Callable[..., dict[str, object]], _impl)(**kwargs)
 
 
-def build_heartbeat_prompt_error_payload(**kwargs):
+def build_heartbeat_prompt_error_payload(**kwargs: object) -> dict[str, object]:
     from .control_plane.heartbeat.builder import build_heartbeat_prompt_error_payload as _impl
-    return _impl(**kwargs)
+    return cast(Callable[..., dict[str, object]], _impl)(**kwargs)
 
 
-def render_heartbeat_task_body(**kwargs):
+def render_heartbeat_task_body(**kwargs: object) -> str:
     from .control_plane.heartbeat.task_body import render_heartbeat_task_body as _impl
-    return _impl(**kwargs)
+    return cast(Callable[..., str], _impl)(**kwargs)
 
 
-def render_brief_heartbeat_task_body(**kwargs):
+def render_brief_heartbeat_task_body(**kwargs: object) -> str:
     from .control_plane.heartbeat.task_body import render_brief_heartbeat_task_body as _impl
-    return _impl(**kwargs)
+    return cast(Callable[..., str], _impl)(**kwargs)
 
 
-def render_compact_heartbeat_task_body(**kwargs):
+def render_compact_heartbeat_task_body(**kwargs: object) -> str:
     from .control_plane.heartbeat.task_body import render_compact_heartbeat_task_body as _impl
-    return _impl(**kwargs)
+    return cast(Callable[..., str], _impl)(**kwargs)
 
 
-def render_visible_goal_task_body(**kwargs):
+def render_visible_goal_task_body(**kwargs: object) -> str:
     from .control_plane.heartbeat.task_body import render_visible_goal_task_body as _impl
-    return _impl(**kwargs)
+    return cast(Callable[..., str], _impl)(**kwargs)
 
 
-def render_traex_visible_goal_task_body(**kwargs):
+def render_traex_visible_goal_task_body(**kwargs: object) -> str:
     from .control_plane.heartbeat.task_body import render_traex_visible_goal_task_body as _impl
-    return _impl(**kwargs)
+    return cast(Callable[..., str], _impl)(**kwargs)
 
 
-def _render_goal_task_body(**kwargs):
+def _render_goal_task_body(**kwargs: object) -> str:
     from .control_plane.heartbeat.task_body import _render_goal_task_body as _impl
-    return _impl(**kwargs)
+    return cast(Callable[..., str], _impl)(**kwargs)
 
 
-def render_ark_managed_agent_goal_task_body(**kwargs):
+def render_ark_managed_agent_goal_task_body(**kwargs: object) -> str:
     from .control_plane.heartbeat.task_body import render_ark_managed_agent_goal_task_body as _impl
-    return _impl(**kwargs)
+    return cast(Callable[..., str], _impl)(**kwargs)
 
 
-def render_thin_heartbeat_task_body(**kwargs):
+def render_thin_heartbeat_task_body(**kwargs: object) -> str:
     from .control_plane.heartbeat.task_body import render_thin_heartbeat_task_body as _impl
-    return _impl(**kwargs)
+    return cast(Callable[..., str], _impl)(**kwargs)
 
 
-def render_heartbeat_generator_inputs_markdown(payload: dict[str, Any]):
+def render_heartbeat_generator_inputs_markdown(payload: Mapping[str, object]) -> str:
     from .control_plane.heartbeat.task_body import render_heartbeat_generator_inputs_markdown as _impl
-    return _impl(payload)
+    return _impl(dict(payload))
 
 
-def render_heartbeat_prompt_error_markdown(payload: dict[str, Any]):
+def render_heartbeat_prompt_error_markdown(payload: Mapping[str, object]) -> str:
     from .control_plane.heartbeat.task_body import render_heartbeat_prompt_error_markdown as _impl
-    return _impl(payload)
+    return _impl(dict(payload))
 
 
-def render_heartbeat_prompt_markdown(payload: dict[str, Any]):
+def render_heartbeat_prompt_markdown(payload: Mapping[str, object]) -> str:
     from .control_plane.heartbeat.task_body import render_heartbeat_prompt_markdown as _impl
-    return _impl(payload)
+    return _impl(dict(payload))

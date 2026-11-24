@@ -154,11 +154,13 @@ After parsing, the host hands the agent or CLI a compact packet:
 ```
 
 Codex App CLI reads `CODEX_THREAD_ID` when `--thread-id` is omitted, including
-`codex-app-ssh` remote sessions. A stable thread ID with no binding returns an
-identity gate that requires selecting an existing lane when registered agents
-exist; fresh registration is the default only for a goal with no registered
-lanes or explicit `--new-peer`. Selecting an existing lane is an explicit
-takeover choice. The selected fresh or existing identity must be persisted with
+`codex-app-ssh` remote sessions. A stable thread ID with no binding defaults to
+a fresh-Agent registration preview even when registered agents exist. Selecting
+an existing lane is an explicit takeover choice and is never the default.
+Fresh registration is also the default for a goal with no registered lanes or
+an explicit `--new-peer`. A caller without a stable thread ID keeps the
+fail-closed identity gate when lanes exist. The selected fresh or existing
+identity must be persisted with
 `loopx bind-agent-thread --execute`, and its source/global readback must verify
 before Todo writeback. Later `/loopx` calls in the same
 `(host_surface, goal_id, thread_id)` reuse that agent ID and carry it through
@@ -168,6 +170,56 @@ explicit new-session intent with `--new-peer`; the identity gate remains
 fail-closed.
 Thread IDs are opaque public-safe tokens only; raw transcripts, credentials, and
 local paths are never persisted.
+
+### Deep-link task rendezvous
+
+LoopX accepts a task link copied from Codex App. The
+[Codex App command reference](https://learn.chatgpt.com/docs/reference/commands)
+documents `codex://threads/<thread-id>` as the canonical form for opening an
+existing local task.
+LoopX treats that link as a host-session locator for review, handoff, and
+coordination, not as a second agent identity or an authority grant. A receiving
+Codex task can confirm the target's existing project-local LoopX binding without
+changing it:
+
+```bash
+loopx resolve-agent-thread \
+  --thread-link 'codex://threads/<thread-id>'
+```
+
+A deep link does not encode the task's execution surface. Without an explicit
+`--host-surface`, LoopX searches only the Codex host family (`codex-app`,
+`codex-app-ssh`, `codex-ide-plugin`, and `codex-cli-tui`) and reports the
+matched surface. The caller may pass one of those surfaces to narrow lookup. A
+`bound` result names exactly one `goal_id` and `agent_id`. A `missing` result
+means only that the link parsed successfully; it does not authorize takeover or
+prove that the target task is connected to this LoopX project. `ambiguous` and
+invalid results fail closed. The command stores nothing and returns the parsed
+locator with `authority=locator_only`. The sender must still register and bind
+its own agent lane through the normal guided-start flow, and both tasks must
+state their responsibilities explicitly. The deep link does not share chat
+context, permissions, credentials, workspace access, leases, or write scope.
+Concurrent writers still need separate worktrees or equivalent isolation.
+After a unique binding is confirmed, a host that exposes read-only task
+inspection may use the parsed `thread_id` to inspect or cite that task. Tool
+availability and access are checked separately; if inspection is unavailable,
+the sender must relay the required context explicitly.
+
+中文：在目标 Codex 任务菜单中选择“复制 -> 复制深度链接”，把
+`codex://threads/<thread-id>` 连同双方分工发给另一个任务。接收方先运行
+上面的只读命令；只有返回 `bound` 且 `goal_id`、`agent_id` 与预期一致时，
+才把它视为已确认的 LoopX 会话绑定。`missing` 只表示链接格式有效但尚无本
+项目绑定。深度链接只负责定位，不同步权限、目录、对话上下文、lease 或写
+入范围；并行修改代码仍需独立 worktree。
+
+For same-project context sharing, the parsed locator also returns a
+provider-neutral `context_scope_ref`. An explicitly enabled Decision Context
+extension may use that scope as a one-off `recall-context` argument for bounded
+advisory recall without modifying its persistent profile. The bundled
+`loopx-obelisk` package is one optional provider; another harness adapter may
+implement the same protocol. Provider output remains transient and fail-open.
+Authoritative alignment outranks chat, and durable conclusions remain owned by
+Goal Todos, evidence events, registered material, or governed amendments.
 
 The packet may be rendered to the agent prompt, passed to a tool call, or used
 to run the CLI directly. It must not contain raw transcripts, credentials,
@@ -182,6 +234,11 @@ diagnostics a second time. Consumers that genuinely need those lower-level
 fields can rerun the advertised command or pass
 `--include-command-pack-detail`. Both modes must produce the same host-action
 projection before a compact default is promoted.
+
+If the recommendation repeats the planning prompt, the default packet supplies
+`recommended_next_step.plan_prompt_ref` as a JSON Pointer to the complete
+prompt in that same packet. Follow it without a second command. The ordered
+planning step and the explicit detail view retain their inline text.
 
 `start-goal --project <path>` keeps that exact project route. In particular, a
 fresh linked worktree must not silently inherit a goal registered by another
@@ -200,8 +257,10 @@ cannot expose its automation tools, so the visible `/goal` owns continuation.
 used alongside an editor. The legacy `codex-ide` value remains accepted as a
 compatibility alias but is not offered by the selection gate. If the option is
 omitted, the command returns a read-only `host_surface_selection` gate with
-exact rerun commands; it must not connect a project, write todos, activate a
-host, or spend quota.
+compact default choices and exact rerun commands for common hosts. Omitted
+surfaces remain discoverable through `full_choices_detail_command`, which
+reruns the same read-only gate with `--include-command-pack-detail`; neither
+projection may connect a project, write todos, activate a host, or spend quota.
 
 ## Permission Boundary
 
@@ -243,7 +302,7 @@ loopx --format json start-goal --guided --project . --goal-text "<goal text>" --
 loopx bootstrap-command-pack --project . --goal-text "<goal text>"
 loopx pr-review
 loopx global-summary
-loopx --format json --registry "$HOME/.codex/loopx/registry.global.json" quota should-run --goal-id <goal-id> --agent-id <agent-id>
+loopx --format json --registry "$HOME/.loopx/registry.global.json" quota should-run --goal-id <goal-id> --agent-id <agent-id>
 ```
 
 If host command parsing is unavailable, the user or a skill fallback can still

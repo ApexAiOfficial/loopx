@@ -15,6 +15,7 @@ TEMPLATE = ROOT / "docs" / "product" / "release-note-template.md"
 README = ROOT / "README.md"
 DOCS_INDEX = ROOT / "docs" / "README.md"
 PRODUCT_INDEX = ROOT / "docs" / "product" / "README.md"
+INSTALL_GUIDE = ROOT / "docs" / "guides" / "installing-loopx.md"
 
 FORBIDDEN_PUBLIC_STRINGS = [
     "/Users/",
@@ -96,20 +97,32 @@ def heading_level(line: str) -> int | None:
 
 def section(text: str, heading: str) -> str:
     lines = text.splitlines()
-    try:
-        start = lines.index(heading)
-    except ValueError as exc:
-        raise AssertionError(f"release notes missing heading {heading!r}") from exc
-
     level = heading_level(heading)
     assert level is not None
-    end = len(lines)
-    for index in range(start + 1, len(lines)):
-        candidate_level = heading_level(lines[index])
+    start: int | None = None
+    fence: tuple[str, int] | None = None
+    for index, line in enumerate(lines):
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if marker:
+            delimiter, suffix = marker.groups()
+            if fence is None:
+                if delimiter[0] != "`" or "`" not in suffix:
+                    fence = (delimiter[0], len(delimiter))
+            elif delimiter[0] == fence[0] and len(delimiter) >= fence[1] and not suffix.strip():
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        if start is None:
+            if line == heading:
+                start = index
+            continue
+        candidate_level = heading_level(line)
         if candidate_level is not None and candidate_level <= level:
-            end = index
-            break
-    return "\n".join(lines[start + 1 : end])
+            return "\n".join(lines[start + 1 : index])
+    if start is None:
+        raise AssertionError(f"release notes missing heading {heading!r}")
+    return "\n".join(lines[start + 1 :])
 
 
 def validate_surface_entry(
@@ -310,6 +323,24 @@ loopx example --check
             surfaces=["Example Surface"],
             expect_no_optional_capability_changes=False,
         )
+        code_comments_path = tmp_path / "code-comments.md"
+        code_comments_path.write_text(
+            valid.replace(
+                "loopx example --check",
+                "# Prepare the readback\n## Validation\nloopx example --check",
+            ),
+            encoding="utf-8",
+        )
+        validate_release_notes(
+            code_comments_path,
+            surfaces=["Example Surface"],
+            expect_no_optional_capability_changes=False,
+        )
+        assert_rejected(
+            tmp_path / "code-only-surface.md",
+            valid.replace("### Example Surface", "```bash\n### Example Surface\n```", 1),
+            "release-note gate accepted a surface heading inside a code fence",
+        )
         validate_release_notes(
             no_changes_path,
             surfaces=[],
@@ -364,17 +395,27 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    for path in [DOC, TEMPLATE, README, DOCS_INDEX, PRODUCT_INDEX]:
+    for path in [DOC, TEMPLATE, README, DOCS_INDEX, PRODUCT_INDEX, INSTALL_GUIDE]:
         validate_boundary(path)
 
     doc = compact(read(DOC))
     for required in [
-        "Status: v0.x maintainer contract.",
+        "Status: stable maintainer contract.",
         "## Supported Install And Update Paths",
-        "loopx update --check",
-        "loopx update --dry-run",
-        "loopx update --execute",
+        "loopx update check",
+        "loopx update plan",
+        "loopx update apply",
+        "package acquisition, host-material delivery, core runtime activation",
+        "installation guide's active-layer checklist",
+        "## Atomic Local Promotion Failure Matrix",
+        "examples/release/release-promotion-concurrency-smoke.py",
+        "examples/release/local-install-promotion-boundary-smoke.py",
+        "Before default symlink swap?",
+        "canary_only_untrusted_checkout",
+        "explicit_override",
         "## Named Version Contract",
+        "LoopX releases are tagged and built from GitHub",
+        "when its Trusted Publisher gate passes, PyPI",
         "The version source is `loopx.__version__`, mirrored by `pyproject.toml`",
         "examples/release/release-version-contract-smoke.py",
         "## Compatibility Gate",
@@ -446,6 +487,18 @@ def main() -> None:
         "mirrors the English group structure and material claims",
     ]:
         assert_contains(doc, required, "release-readiness doc")
+
+    install_guide = compact(read(INSTALL_GUIDE))
+    for required in [
+        "### Verify The Active Layers",
+        "loopx update check",
+        "skill_delivery.status",
+        "loopx doctor --deep",
+        "loopx extension doctor --all-enabled --execute --format json",
+        "runtime_activation_qualification",
+        "ordinary pip and pipx users should stay on the tagged package channel",
+    ]:
+        assert_contains(install_guide, required, "installation guide")
 
     root_readme = read(README)
     docs_index = read(DOCS_INDEX)

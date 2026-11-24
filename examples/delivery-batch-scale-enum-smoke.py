@@ -25,8 +25,10 @@ from loopx.control_plane.work_items.delivery_batch_scale import (  # noqa: E402
     normalize_delivery_batch_scale,
     require_delivery_batch_scale,
 )
+from loopx.control_plane.work_items.delivery_history import (  # noqa: E402
+    project_delivery_history,
+)
 from loopx.state_refresh import refresh_state_run  # noqa: E402
-from loopx.status import delivery_batch_scale_for_run  # noqa: E402
 
 
 GOAL_ID = "delivery-batch-scale-enum-fixture"
@@ -72,6 +74,8 @@ def write_fixture(root: Path) -> tuple[Path, Path]:
             ],
         },
     )
+    from loopx.control_plane.testing.canary_harness import import_fixture_authority
+    import_fixture_authority(registry_path, GOAL_ID, provider="sqlite")
     return registry_path, runtime
 
 
@@ -86,13 +90,16 @@ def assert_enum_sets() -> None:
         "single_segment": DeliveryBatchScale.SINGLE_SURFACE,
         "bounded_segment": DeliveryBatchScale.SINGLE_SURFACE,
     }
-    assert set(DELIVERY_BATCH_SCALE_INPUT_CHOICES) == {
-        *DELIVERY_BATCH_SCALE_CHOICES,
-        "single_segment",
-        "bounded_segment",
-    }
+    assert DELIVERY_BATCH_SCALE_INPUT_CHOICES == DELIVERY_BATCH_SCALE_CHOICES
     assert require_delivery_batch_scale("multi_surface") == DeliveryBatchScale.MULTI_SURFACE
-    assert require_delivery_batch_scale("single_segment") == DeliveryBatchScale.SINGLE_SURFACE
+    for alias in DELIVERY_BATCH_SCALE_ALIASES:
+        try:
+            require_delivery_batch_scale(alias)
+        except ValueError as exc:
+            assert "read-only and ambiguous for new writes" in str(exc)
+        else:
+            raise AssertionError(f"legacy delivery scale alias accepted for a new write: {alias}")
+    assert normalize_delivery_batch_scale("single_segment") == DeliveryBatchScale.SINGLE_SURFACE
     assert normalize_delivery_batch_scale("bounded_segment") == DeliveryBatchScale.SINGLE_SURFACE
     assert delivery_batch_scale_value("single_segment") == DeliveryBatchScale.SINGLE_SURFACE.value
     assert normalize_delivery_batch_scale("unknown") is None
@@ -123,19 +130,23 @@ def assert_refresh_state_enforces_enum(registry_path: Path) -> None:
     )
     assert payload["delivery_batch_scale"] == DeliveryBatchScale.IMPLEMENTATION.value, payload
 
-    alias_payload = refresh_state_run(
-        registry_path=registry_path,
-        runtime_root_override=None,
-        goal_id=GOAL_ID,
-        project=None,
-        state_file=None,
-        classification="enum_fixture_alias",
-        recommended_action="Advance one bounded implementation batch.",
-        delivery_batch_scale="bounded_segment",
-        dry_run=True,
-        sync_global=False,
-    )
-    assert alias_payload["delivery_batch_scale"] == DeliveryBatchScale.SINGLE_SURFACE.value, alias_payload
+    try:
+        refresh_state_run(
+            registry_path=registry_path,
+            runtime_root_override=None,
+            goal_id=GOAL_ID,
+            project=None,
+            state_file=None,
+            classification="enum_fixture_alias",
+            recommended_action="Advance one bounded implementation batch.",
+            delivery_batch_scale="bounded_segment",
+            dry_run=True,
+            sync_global=False,
+        )
+    except ValueError as exc:
+        assert "read-only and ambiguous for new writes" in str(exc)
+    else:
+        raise AssertionError("refresh-state accepted an ambiguous legacy delivery scale alias")
 
     try:
         refresh_state_run(
@@ -199,15 +210,19 @@ def assert_refresh_state_enforces_enum(registry_path: Path) -> None:
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
-        check=True,
     )
-    alias_payload = json.loads(alias_cli_result.stdout)
-    assert alias_payload["delivery_batch_scale"] == DeliveryBatchScale.SINGLE_SURFACE.value, alias_payload
+    assert alias_cli_result.returncode != 0, alias_cli_result.stdout
+    assert "invalid choice" in alias_cli_result.stderr, alias_cli_result.stderr
 
 
-def assert_status_uses_enum_not_raw_value() -> None:
+def projected_delivery_batch_scale(run: dict[str, object]) -> str:
+    projection = project_delivery_history([run])
+    return str(projection["runs"][0]["delivery_batch_scale"])
+
+
+def assert_delivery_history_uses_enum_not_raw_value() -> None:
     assert (
-        delivery_batch_scale_for_run(
+        projected_delivery_batch_scale(
             {
                 "classification": "runner_batch_fixture",
                 "delivery_batch_scale": DeliveryBatchScale.MULTI_SURFACE.value,
@@ -216,7 +231,7 @@ def assert_status_uses_enum_not_raw_value() -> None:
         == DeliveryBatchScale.MULTI_SURFACE.value
     )
     assert (
-        delivery_batch_scale_for_run(
+        projected_delivery_batch_scale(
             {
                 "classification": "runner_batch_fixture",
                 "delivery_batch_scale": "batch_plus_raw_logs",
@@ -225,7 +240,16 @@ def assert_status_uses_enum_not_raw_value() -> None:
         == UNKNOWN_DELIVERY_BATCH_SCALE
     )
     assert (
-        delivery_batch_scale_for_run({"classification": "owner_handoff_consumer_test"})
+        projected_delivery_batch_scale({"classification": "owner_handoff_consumer_test"})
+        == UNKNOWN_DELIVERY_BATCH_SCALE
+    )
+    assert (
+        projected_delivery_batch_scale(
+            {
+                "classification": "owner_handoff_consumer_test",
+                "delivery_batch_scale": DeliveryBatchScale.TEST_ONLY.value,
+            }
+        )
         == DeliveryBatchScale.TEST_ONLY.value
     )
 
@@ -235,7 +259,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="delivery-batch-scale-enum-") as tmp:
         registry_path, _runtime = write_fixture(Path(tmp))
         assert_refresh_state_enforces_enum(registry_path)
-    assert_status_uses_enum_not_raw_value()
+    assert_delivery_history_uses_enum_not_raw_value()
     print("delivery batch scale enum smoke ok")
     return 0
 

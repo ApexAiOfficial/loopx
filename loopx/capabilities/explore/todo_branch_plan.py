@@ -13,7 +13,7 @@ from ...control_plane.todos.contract import (
     normalize_todo_id,
     normalize_todo_status,
 )
-from ...control_plane.todos.projection import (
+from ...control_plane.todos.todo_semantics import (
     todo_item_is_actionable_open,
     todo_item_task_class,
     todo_priority_rank,
@@ -214,40 +214,29 @@ def _claim_bucket(item: Mapping[str, Any], *, agent_id: str | None) -> int:
     return 2
 
 
-def _monitor_lane_exclusion(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
-    if candidate.get("task_class") != TODO_TASK_CLASS_MONITOR:
-        return None
+def _candidate_readiness(item: Mapping[str, Any]) -> dict[str, Any]:
+    # Reuse the canonical read model; a planner does not resolve dependencies
+    # from ownership, lineage, or the other candidates selected in this batch.
     return {
-        **candidate,
-        "selection_status": "excluded_non_exploration_lane",
-        "exclusion_reason": "continuous_monitor_does_not_consume_exploration_budget",
+        "actionable_open": todo_item_is_actionable_open(dict(item)),
+        **{key: item[key] for key in ("status", "resume_when", "resume_ready") if key in item},
     }
+
+
+def _execution_exclusion(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    if candidate.get("task_class") == TODO_TASK_CLASS_MONITOR:
+        return {
+            **candidate,
+            "selection_status": "excluded_non_exploration_lane",
+            "exclusion_reason": "continuous_monitor_does_not_consume_exploration_budget",
+        }
+    if not candidate["actionable_open"]:
+        return {**candidate, "selection_status": "not_actionable_open"}
+    return None
 
 
 def _lane_id(todo_id: str, *, index: int) -> str:
     return f"branch_{index}_{todo_id.removeprefix('todo_')}"
-
-
-def _lease_command(
-    *,
-    goal_id: str,
-    todo_id: str,
-    agent_id: str | None,
-    write_scopes: Sequence[str],
-) -> str | None:
-    owner = normalize_todo_claimed_by(agent_id)
-    if not owner:
-        return None
-    parts = [
-        "loopx task-lease acquire",
-        f"--goal-id {goal_id}",
-        f"--todo-id {todo_id}",
-        f"--owner {owner}",
-        f"--idempotency-key branch-plan:{goal_id}:{todo_id}",
-    ]
-    for scope in write_scopes:
-        parts.append(f"--write-scope {scope}")
-    return " ".join(parts)
 
 
 def _claim_command(*, goal_id: str, todo_id: str, agent_id: str | None) -> str | None:
@@ -366,6 +355,7 @@ def build_explore_todo_branch_plan(
         task_class = todo_item_task_class(dict(item))
         required_capabilities = _required_capabilities(item)
         candidate = {
+            **_candidate_readiness(item),
             "todo_id": todo_id,
             "text": _compact_text(item.get("text") or item.get("title")),
             "priority": item.get("priority"),
@@ -407,15 +397,16 @@ def build_explore_todo_branch_plan(
         )
     )
 
-    monitor_lanes = [
+    excluded_candidates = [
         exclusion
         for candidate in candidates
-        if (exclusion := _monitor_lane_exclusion(candidate)) is not None
+        if (exclusion := _execution_exclusion(candidate)) is not None
     ]
     exploration_candidates = [
         candidate
         for candidate in candidates
         if candidate.get("task_class") != TODO_TASK_CLASS_MONITOR
+        if candidate["actionable_open"]
     ]
     schedulable = [
         candidate
@@ -442,9 +433,8 @@ def build_explore_todo_branch_plan(
     dependency_rejections: list[dict[str, Any]] = []
     dependency_events: list[dict[str, Any]] = []
     while True:
-        selected = []
+        selected: list[dict[str, Any]] = []
         selection_rejections: list[dict[str, Any]] = []
-        selected_scopes: list[tuple[str, list[str]]] = []
         selected_by_resource_lane: dict[str, int] = {}
         for candidate in ordered_candidates:
             todo_id = str(candidate.get("todo_id") or "")
@@ -454,13 +444,7 @@ def build_explore_todo_branch_plan(
             scopes = _required_write_scopes(candidate)
             resource_lane = str(candidate.get("resource_lane") or "")
             conflict_with = ""
-            if scopes:
-                for selected_todo_id, existing_scopes in selected_scopes:
-                    if _scopes_overlap(scopes, existing_scopes):
-                        conflict_with = selected_todo_id
-                        hazards.append(f"write_scope_conflict:{selected_todo_id}")
-                        break
-            elif not allow_unscoped_parallel and selected:
+            if not scopes and not allow_unscoped_parallel and selected:
                 conflict_with = selected[0]["todo_id"]
                 hazards.append("unscoped_parallel_disabled")
 
@@ -510,6 +494,7 @@ def build_explore_todo_branch_plan(
             branch_index = len(selected)
             role = "primary" if branch_index == 0 else "speculative"
             selected_in_lane = selected_by_resource_lane.get(resource_lane, 0) + 1
+            claim_command = _claim_command(goal_id=goal_id, todo_id=todo_id, agent_id=normalized_agent)
             selected_candidate = {
                 **candidate,
                 "selection_status": "selected",
@@ -520,19 +505,7 @@ def build_explore_todo_branch_plan(
                     "verify and write back before keeping this branch; discard or convert "
                     "to successor todo if evidence does not advance the exploration"
                 ),
-                "suggested_commands": [
-                    command
-                    for command in (
-                        _claim_command(goal_id=goal_id, todo_id=todo_id, agent_id=normalized_agent),
-                        _lease_command(
-                            goal_id=goal_id,
-                            todo_id=todo_id,
-                            agent_id=normalized_agent,
-                            write_scopes=scopes,
-                        ),
-                    )
-                    if command
-                ],
+                "suggested_commands": [claim_command] if claim_command else [],
             }
             assignment = resource_assignment(
                 resource_portfolio,
@@ -542,7 +515,6 @@ def build_explore_todo_branch_plan(
             if assignment is not None:
                 selected_candidate["resource_assignment"] = assignment
             selected.append(selected_candidate)
-            selected_scopes.append((todo_id, scopes))
             if resource_lane:
                 selected_by_resource_lane[resource_lane] = selected_in_lane
 
@@ -552,7 +524,7 @@ def build_explore_todo_branch_plan(
             lane="todo_branch_plan",
         )
         if not invalidated:
-            rejected = [*monitor_lanes, *dependency_rejections, *selection_rejections]
+            rejected = [*excluded_candidates, *dependency_rejections, *selection_rejections]
             selected = valid_selected
             break
         new_invalidated_ids = {
@@ -562,7 +534,7 @@ def build_explore_todo_branch_plan(
         dependency_events.extend(events)
         invalidated_ids.update(new_invalidated_ids)
         if not new_invalidated_ids:
-            rejected = [*monitor_lanes, *dependency_rejections, *selection_rejections]
+            rejected = [*excluded_candidates, *dependency_rejections, *selection_rejections]
             selected = valid_selected
             break
 
@@ -602,10 +574,11 @@ def build_explore_todo_branch_plan(
         "exploration_candidate_count": len(exploration_candidates),
         "selected_count": len(selected),
         "selected_branches": selected,
+        "rejected_candidate_count": len(rejected),
         "rejected_candidates": rejected[: max(0, normalized_width * 3)],
         "resource_portfolio": resource_portfolio_with_selection(resource_portfolio, selected),
         "hazard_model": {
-            "write_scope_conflicts": "skip speculative branch when declared write scopes overlap",
+            "write_scope_conflicts": "retired from hard scheduling exclusion; leases isolate by Todo ownership and workspace checkout",
             "shared_dependencies": (
                 "shared_artifact:* and shared_implementation:* capabilities are read-only "
                 "dependency labels, not write mutexes; mutable shared builds must remain in "
@@ -642,6 +615,9 @@ def build_explore_todo_branch_plan(
             "registered goal's spawn_policy (spawn_allowed, max_children) to receive "
             "suggested commands; execution stays in the normal LoopX lifecycle."
             if gate["state"] == GATE_STATE_ANALYSIS_ONLY
+            else "No actionable branch was selected. Inspect rejected candidates and their "
+            "resume conditions; replan when readiness changes."
+            if not selected
             else "Run the primary branch normally; hand selected speculative branches to side "
             "agents only after claiming/lease commands are accepted and workspace guards pass."
             if len(selected) > 1

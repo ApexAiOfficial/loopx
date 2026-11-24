@@ -249,11 +249,9 @@ def _projection_lifecycle_events(projection: dict[str, Any]) -> list[dict[str, A
 
 
 def _projection_item_priority(item: dict[str, Any], text: str) -> str:
-    for value in (item.get("priority"), text):
-        match = re.search(r"\b(P[0-3])(?:\b|-)", str(value or "").upper())
-        if match:
-            return match.group(1)
-    return "P2"
+    from ....control_plane.todos.todo_semantics import todo_priority_label
+
+    return todo_priority_label({**item, "text": text}) or "P2"
 
 
 def _projection_todo_candidates(summary: Any) -> list[dict[str, Any]]:
@@ -323,7 +321,11 @@ def _projection_row(
     fallback_text: str,
     projection_agent_id: str | None = None,
 ) -> dict[str, Any]:
-    text = _projection_item_text(item, fallback=fallback_text)
+    text = (
+        _compact_text(item["next_step"], limit=260)
+        if kind == "next_action" and item.get("next_step")
+        else _projection_item_text(item, fallback=fallback_text)
+    )
     task_class = normalize_explicit_todo_task_class(item.get("task_class")) or (
         TODO_TASK_CLASS_USER_GATE if role == "user" else TODO_TASK_CLASS_ADVANCEMENT
     )
@@ -491,6 +493,33 @@ def projection_rows_from_payload(
                 projection_agent_id=payload_agent_id or agent_id,
             )
         )
+
+    frontier = _as_mapping(
+        projection.get("goal_frontier_projection")
+        or project_asset.get("goal_frontier_projection")
+    )
+    audit = _as_mapping(
+        projection.get("vision_continuation_audit")
+        or frontier.get("vision_continuation_audit")
+    )
+    for diagnostic in _as_mapping_list(audit.get("outcome_checkpoint_diagnostics")):
+        checks = _as_mapping(diagnostic.get("component_checks"))
+        check_summary = ", ".join(
+            f"{key}={'pass' if passed else 'fail'}" for key, passed in checks.items()
+        )
+        add_row(_projection_row(
+            source_id=source_id, goal_id=resolved_goal_id,
+            kind="outcome_checkpoint", identity=diagnostic.get("reason_code"),
+            role="agent", projection_agent_id=audit.get("agent_id") or payload_agent_id,
+            item={
+                **diagnostic,
+                "claimed_by": audit.get("agent_id") or payload_agent_id,
+                "text": diagnostic.get("resolution_hint"),
+                "evidence": f"{diagnostic.get('reason_code')}: {check_summary}",
+                "status": "open", "priority": "P0",
+            },
+            fallback_text="Resolve the final-outcome checkpoint gap",
+        ))
 
     next_action = _as_mapping(projection.get("agent_lane_next_action"))
     if not next_action and projection.get("next_action"):

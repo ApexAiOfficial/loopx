@@ -29,6 +29,7 @@ PRIMARY_SHOWCASE_IDS = [
     "2026-07-cpp-accuracy-long-run",
     "2026-07-four-day-unattended-agent",
     "2026-07-public-engine-refactor",
+    "2026-10-vllm-long-context-optimization",
     "2026-06-27-overnight-pr-batch",
     "2026-06-24-pr-issue-auto-fix",
     "2026-06-23-agent-to-agent-pr-comments",
@@ -86,11 +87,11 @@ def main() -> int:
     assert frontstage_ids[: len(PRIMARY_SHOWCASE_IDS)] == PRIMARY_SHOWCASE_IDS, frontstage_ids
 
     source_coverage = catalog.get("source_coverage")
-    assert isinstance(source_coverage, list) and len(source_coverage) == 6, source_coverage
+    assert isinstance(source_coverage, list) and len(source_coverage) == 7, source_coverage
     source_keys = {row.get("source_key") for row in source_coverage}
     assert len(source_keys) == len(source_coverage), source_keys
     promoted = [row for row in source_coverage if row.get("disposition") == "promoted_case"]
-    assert {row.get("case_id") for row in promoted} == set(PRIMARY_SHOWCASE_IDS[:3]), promoted
+    assert {row.get("case_id") for row in promoted} == set(PRIMARY_SHOWCASE_IDS[:4]), promoted
 
     assert_public_safe(CATALOG)
     assert_public_safe(SHOWCASES)
@@ -144,6 +145,8 @@ def main() -> int:
             assert localized_path.is_file(), case
             assert_public_safe(localized_path)
             localized_text = read(localized_path)
+            if isinstance(frontend, dict) and frontend.get("show_control_diagram") is False:
+                assert 'aria-label="LoopX control-plane sketch"' not in localized_text, localized_page
             for phrase in FORBIDDEN_SHOWCASE_COPY:
                 assert phrase not in localized_text, f"{localized_page}: forbidden copy {phrase!r}"
             for phrase in FORBIDDEN_TRIVIAL_METRIC_COPY:
@@ -154,6 +157,16 @@ def main() -> int:
                 localized_case = case.get("localizations", {}).get(lang, {})
                 expected_boundary = localized_case.get("evidence_boundary", case.get("evidence_boundary"))
                 assert str(expected_boundary) in localized_text, localized_page
+            if case.get("page_assets") == "shared":
+                table = case.get("showcase_table", {})
+                localized_table = case.get("localizations", {}).get(lang, {})
+                expected_proof = localized_table.get("proof_point", table.get("proof_point"))
+                expected_intervention = localized_table.get(
+                    "loopx_intervention", table.get("loopx_intervention")
+                )
+                assert expected_proof and str(expected_proof) in localized_text, localized_page
+                assert expected_intervention and str(expected_intervention) in localized_text, localized_page
+                assert 'href="../showcase-page.css"' in localized_text, localized_page
 
         demo_command = case.get("demo_command")
         if case.get("status") == "reproducible_synthetic_demo":
@@ -265,26 +278,22 @@ def main() -> int:
     ):
         assert phrase in feedback_loop, phrase
     for phrase in (
-        "Loop engineering for long-horizon AI agents and peer agent teams.",
-        "The open, provider-neutral, stateful control plane for long-horizon agents.",
-        "https://huangruiteng.github.io/loopx/",
-        "## Advanced Paths",
+        "https://loopx-project.github.io/loopx/",
         "docs/assets/long-running-loop-openviking-trajectory.png",
-        "docs/assets/long-running-loop-ml-experiment-trajectory.png",
-        "### Presets and Auto Research",
         "### Review Agent Work",
         "## Evidence",
         "### Used In Real Projects",
         "docs/showcases/cases/independent-cpp-accuracy-long-run.md",
         "docs/showcases/cases/independent-four-day-unattended-agent.md",
         "docs/showcases/cases/independent-public-engine-refactor.md",
+        "docs/showcases/cases/independent-vllm-long-context-optimization.md",
         "complete Showcase catalog",
     ):
         assert phrase in repo_readme, phrase
     featured_section = repo_readme.split("### Used In Real Projects", 1)[1].split("More inspectable surfaces:", 1)[0]
-    assert featured_section.count("- **Independent user") == 3, featured_section
+    assert featured_section.count("- **Independent user") == 4, featured_section
     assert "user-feedback-coverage.md" in showcase_index, showcase_index
-    hosted_frontstage = "https://huangruiteng.github.io/loopx/frontstage/"
+    hosted_frontstage = "https://loopx-project.github.io/loopx/frontstage/"
     assert hosted_frontstage not in repo_readme, (
         "README must promote the public homepage instead of hosted frontstage"
     )

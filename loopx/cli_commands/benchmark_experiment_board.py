@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from ..capabilities.benchmark_toolkit import (
+    BENCHMARK_EXPERIMENT_BOARD_ROW_SCHEMA_VERSION,
+    BenchmarkExperimentBoardValidationError,
     benchmark_experiment_board_row_key,
     build_benchmark_experiment_board,
     default_benchmark_experiment_board_path,
@@ -48,7 +50,7 @@ def _read_json_object(path_text: str) -> dict[str, Any]:
     )
     payload = json.loads(raw)
     if not isinstance(payload, dict):
-        raise TypeError("benchmark experiment board row must be an object")
+        raise TypeError("benchmark experiment board JSON input must be an object")
     return payload
 
 
@@ -73,6 +75,13 @@ def register_benchmark_experiment_board_commands(
     )
     add_subcommand_format(show_parser)
     _add_board_location_arguments(show_parser)
+    show_parser.add_argument(
+        "--four-arm-contract-json",
+        help=(
+            "Optional compact benchmark_four_arm_contract_v0 JSON. When present, "
+            "project qualified conditional effects and difference-in-differences."
+        ),
+    )
 
     upsert_parser = benchmark_subparsers.add_parser(
         "experiment-board-upsert",
@@ -84,6 +93,14 @@ def register_benchmark_experiment_board_commands(
         "--row-json",
         required=True,
         help="Compact benchmark_experiment_board_row_v0 JSON path, or - for stdin.",
+    )
+    upsert_parser.add_argument(
+        "--include-board",
+        action="store_true",
+        help=(
+            "Return the full board projection (legacy response) instead of the "
+            "default affected row and write receipt. Board filters apply to this projection."
+        ),
     )
     upsert_parser.add_argument(
         "--execute",
@@ -118,12 +135,24 @@ def _board_payload(
     rows: list[dict[str, Any]],
     benchmark_id: str | None,
     study_id: str | None,
+    four_arm_contract: dict[str, Any] | None,
 ) -> dict[str, Any]:
     return build_benchmark_experiment_board(
         rows,
         benchmark_id=benchmark_id,
         study_id=study_id,
+        four_arm_contract=four_arm_contract,
     )
+
+
+def _render_upsert_receipt(payload: dict[str, object]) -> str:
+    return "\n".join([
+        "# Benchmark experiment row",
+        "",
+        "```json",
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        "```",
+    ])
 
 
 def _reconcile_experiment_board(
@@ -191,7 +220,9 @@ def handle_benchmark_experiment_board_command(
             row = _read_json_object(args.row_json)
             if args.execute:
                 receipt = upsert_benchmark_experiment_board_row(ledger_path, row)
-                rows = read_benchmark_experiment_board_rows(ledger_path)
+                affected_row = receipt["row"]
+                if args.include_board:
+                    rows = read_benchmark_experiment_board_rows(ledger_path)
                 write = {
                     **receipt["write"],
                     "dry_run": False,
@@ -200,6 +231,7 @@ def handle_benchmark_experiment_board_command(
                 rows, preview_status = preview_benchmark_experiment_board_upsert(
                     rows, row
                 )
+                affected_row = next(item for item in rows if _row_key(item) == _row_key(row))
                 write = {
                     "status": f"preview_{preview_status}",
                     "write_performed": False,
@@ -207,6 +239,22 @@ def handle_benchmark_experiment_board_command(
                     "path_recorded": False,
                     "dry_run": True,
                 }
+            if not args.include_board:
+                payload = {
+                    "ok": True,
+                    "schema_version": BENCHMARK_EXPERIMENT_BOARD_ROW_SCHEMA_VERSION,
+                    "goal_id": args.goal_id,
+                    "path_recorded": False,
+                    "row": affected_row,
+                    "write": write,
+                    "read_hint": (
+                        "Use this row and receipt for the update decision. For comparisons, "
+                        "use experiment-board-show with the same route and relevant "
+                        "--benchmark-id/--study-id; --include-board restores the full upsert response."
+                    ),
+                }
+                print_payload(payload, output_format(args), _render_upsert_receipt)
+                return 0
         elif args.benchmark_command == "experiment-board-reconcile":
             rows, write = _reconcile_experiment_board(
                 args,
@@ -217,11 +265,18 @@ def handle_benchmark_experiment_board_command(
             rows=rows,
             benchmark_id=args.benchmark_id,
             study_id=args.study_id,
+            four_arm_contract=(
+                _read_json_object(args.four_arm_contract_json)
+                if getattr(args, "four_arm_contract_json", None)
+                else None
+            ),
         )
         payload["goal_id"] = args.goal_id
         payload["path_recorded"] = False
         if write is not None:
             payload["write"] = write
+    except BenchmarkExperimentBoardValidationError as exc:
+        args.benchmark_experiment_board_parser.error(str(exc))
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
         args.benchmark_experiment_board_parser.error(
             "invalid benchmark experiment board input"

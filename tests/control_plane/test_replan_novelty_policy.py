@@ -45,7 +45,7 @@ def test_generic_stall_obligation_carries_novelty_guidance() -> None:
 
     policy = obligation["replan_novelty_policy"]
     assert policy["schema_version"] == "replan_evidence_delivery_policy_v0"
-    assert policy["evidence_source"] == "agent_scoped_evidence_log"
+    assert policy["evidence_source"] == "compact_run_history"
     assert policy["delivery"] == "host_projected"
     assert policy["writeback"] == "typed_semantic_delta"
 
@@ -68,7 +68,7 @@ def test_dead_monitor_obligation_reuses_the_same_repair_delta_contract() -> None
     )
 
     policy = obligation["replan_novelty_policy"]
-    assert policy["evidence_source"] == "agent_scoped_evidence_log"
+    assert policy["evidence_source"] == "compact_run_history"
     assert policy["writeback"] == "typed_semantic_delta"
     action = obligation["recommended_action"]
     assert "resolve a dead monitor loop" in action
@@ -87,10 +87,34 @@ def test_periodic_review_obligation_reuses_the_same_preflight_contract() -> None
     )
 
     policy = obligation["replan_novelty_policy"]
-    assert policy["evidence_source"] == "agent_scoped_evidence_log"
+    assert policy["evidence_source"] == "compact_run_history"
     action = obligation["recommended_action"]
     assert "bounded autonomous periodic review" in action
     assert "host-projected coverage ledger" in action
+
+
+def test_replan_guidance_preserves_authorized_private_work_and_scopes_missing_authority() -> None:
+    obligation = _obligation([{
+        "kind": "periodic_review_due", "section": "run_history",
+        "text": "Review the authorized private analysis and proposed public delivery.",
+    }])
+    stop = obligation["stop_condition"]
+    assert "stop only the affected path" in stop
+    assert "existing user authority" in stop
+    assert "do not expose credentials" in stop
+    assert "private material beyond that authority" in stop
+    assert "honoring explicit stops" in stop
+    assert "Continue independent authorized replan work" in stop
+    assert "destructive git" in stop and "production actions" in stop
+    assert "stop if the replan requires private material" not in stop
+    decision = next(item for item in obligation["todo_actions"] if item["action"] == "ask_decision")
+    assert "authorized goal scope" in decision["text"]
+    assert "benchmark family" not in decision["text"]
+    assert "resource budget" in decision["text"] and "protected scope" in decision["text"]
+    # The guidance does not change admission, triggers or the typed writeback owner.
+    assert obligation["required"] is True
+    assert obligation["triggers"][0]["kind"] == "periodic_review_due"
+    assert obligation["replan_novelty_policy"]["writeback"] == "typed_semantic_delta"
 
 
 def test_aligned_repeat_until_closed_guidance_keeps_novelty_hint() -> None:
@@ -134,7 +158,7 @@ def test_compact_replan_obligation_keeps_only_authoritative_seam_refs() -> None:
     )
     compact = compact_replan_obligation(obligation)
     assert compact["replan_novelty_policy"] == {
-        "evidence_source": "agent_scoped_evidence_log",
+        "evidence_source": "compact_run_history",
         "delivery": "host_projected",
         "writeback": "typed_semantic_delta",
     }
@@ -154,7 +178,7 @@ def test_payload_builder_defaults_to_novelty_guidance_and_policy() -> None:
 
     assert "host-projected coverage ledger" in payload["recommended_action"]
     policy = payload["replan_novelty_policy"]
-    assert policy["evidence_source"] == "agent_scoped_evidence_log"
+    assert policy["evidence_source"] == "compact_run_history"
     assert policy["delivery"] == "host_projected"
     assert policy["writeback"] == "typed_semantic_delta"
 
@@ -199,7 +223,7 @@ def test_payload_builder_replaces_conflicting_policy_extra_fields() -> None:
 
     assert payload["replan_novelty_policy"] == {
         "schema_version": "replan_evidence_delivery_policy_v0",
-        "evidence_source": "agent_scoped_evidence_log",
+        "evidence_source": "compact_run_history",
         "delivery": "host_projected",
         "writeback": "typed_semantic_delta",
     }
@@ -218,7 +242,7 @@ def test_novelty_policy_materializes_host_context_and_action_packet() -> None:
     enriched = {**obligation, "replan_context": context}
     action = build_replan_action_packet(enriched)
 
-    assert context["evidence_source"] == "agent_scoped_evidence_log"
+    assert context["evidence_source"] == "compact_run_history"
     assert context["delivery"] == "host_projected"
     assert action["obligation_id"] == obligation["obligation_id"]
     assert action["required_outcome"] == "semantic_delta"
@@ -261,6 +285,30 @@ def test_semantic_ack_is_bound_to_the_exact_rotated_obligation() -> None:
     ) is True
 
 
+def test_nonperiodic_obligation_identity_ignores_incidental_run_timestamps() -> None:
+    first = _obligation(
+        [
+            {
+                "kind": "typed_progress_repeat",
+                "progress_fingerprint": "fingerprint-repeat",
+                "latest_generated_at": "2026-08-27T00:00:00Z",
+                "oldest_counted_generated_at": "2026-08-26T23:59:00Z",
+            }
+        ]
+    )
+    replay = _obligation(
+        [
+            {
+                **first["triggers"][0],
+                "latest_generated_at": "2026-08-27T01:00:00Z",
+                "oldest_counted_generated_at": "2026-08-27T00:59:00Z",
+            }
+        ]
+    )
+
+    assert replay["obligation_id"] == first["obligation_id"]
+
+
 def test_semantic_terminal_ack_cannot_close_an_open_todo_succession_gap() -> None:
     obligation = _obligation(
         [{"kind": "completed_advancement_without_successor", "todo_id": "todo-1"}]
@@ -295,6 +343,40 @@ def test_semantic_terminal_ack_cannot_close_an_open_todo_succession_gap() -> Non
         acceptance_gaps=[],
         todo_succession_gap_open=True,
     ) is True
+
+
+def test_monitor_ack_is_not_vetoed_by_an_independent_todo_succession_gap() -> None:
+    obligation = _obligation([{
+        "kind": "monitor_no_change_streak",
+        "monitor_target_id": "pending-public-source",
+        "run_count": 5,
+        "threshold": 5,
+    }])
+    ack = {
+        "recorded": True,
+        "semantic_delta": {
+            "accepted": True,
+            "obligation_id": obligation["obligation_id"],
+            "outcomes": ["new_concrete_blocker"],
+        },
+    }
+    assert autonomous_replan_ack_satisfies_obligation(
+        ack, replan_obligation=obligation, acceptance_gaps=[],
+        todo_succession_gap_open=True,
+    ) is True
+    # A separate lifecycle duty still needs its own exact receipt; neither a
+    # wrong identity nor a blocker for that duty becomes a successor.
+    lifecycle = _obligation([{
+        "kind": "completed_advancement_without_successor", "todo_id": "todo_prior_result",
+    }])
+    for selected, identity in (
+        (obligation, lifecycle["obligation_id"]),
+        (lifecycle, lifecycle["obligation_id"]),
+    ):
+        assert autonomous_replan_ack_satisfies_obligation(
+            {**ack, "semantic_delta": {**ack["semantic_delta"], "obligation_id": identity}},
+            replan_obligation=selected, acceptance_gaps=[], todo_succession_gap_open=True,
+        ) is False
 
 
 def test_policy_normalization_precedes_deterministic_peer_scope_selection() -> None:

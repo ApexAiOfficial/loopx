@@ -1,0 +1,445 @@
+# Goal handoff mode
+
+`soft_claim` uses the Todo assignment; `hard_lease` also requires the existing
+execution lease fences. New `set` and migration intents accept these two modes.
+`legacy` remains a historical source for backed-up upgrades and original receipt
+recovery; new requests cannot select it, even as a no-op. In the 2.0 candidate,
+fresh claim/update/terminal and Monitor admission, execution fences, acquisition
+and lease maintenance reject `legacy` with `handoff_mode_retired`. Inspection
+keeps the original lease record but reports it ineffective; an original acquire
+receipt cannot be presented as current execution proof. Exact release and original
+receipt recovery remain available. Delegation checks the typed inspection's
+`execution_policy.supported` before first launch and resuming a running operation,
+including retained records declaring that no lease was needed. This readback grants
+no execution authority; hard mode still needs its original claim/lease proof.
+Source-only lease inspection is historical: it cannot report an effective execution
+and no longer asks Python for a second full Todo projection. Existing Goals are not silently changed, and creation/Host defaults remain unchanged in this stage.
+This is an ownership policy, not a capability grant or a storage provider.
+
+The App's Task list and Task details use the same reviewed completion entry.
+When the terminal owner requires a lease or its current execution proof, the
+App explains that completion is unavailable from this caller. The responsible
+Agent must complete from its execution with the current proof; refresh the Task
+to read back that result. A recorded claim or a lease existing in the store is
+not a proof supplied by this caller. The App does not borrow a key, acquire a
+lease or change ownership policy to make the completion succeed. Other preview
+failures retain their own diagnostics. This explains an unavailable operation;
+it does not qualify App completion under `hard_lease`.
+
+## Ordinary Agent CLI work
+
+A CLI self-claim (`--claimed-by` equal to the explicit `--agent-id`) now prepares
+execution in the same canonical transaction. In `hard_lease`, it acquires the
+required scopes or reuses the caller's still-active grant. It renews only in the
+last third of the grant's original TTL. `soft_claim` does not create a lease.
+Assignment by another caller and explicit task-lease commands keep their existing
+semantics; this does not change any Goal's policy.
+
+```bash
+loopx --format json todo claim --goal-id example-goal --todo-id todo_example \
+  --agent-id worker-a --claimed-by worker-a --claim-operation-id work-a
+loopx --format json todo update --goal-id example-goal --todo-id todo_example \
+  --agent-id worker-a --claim-operation-id work-a --update-operation-id progress-a \
+  --note 'Validated progress'
+loopx --format json todo complete --goal-id example-goal --todo-id todo_example \
+  --agent-id worker-a --claim-operation-id work-a --evidence evidence:validated-output
+```
+
+Claim readback supplies ready progress/completion commands in JSON and Markdown
+with the original registry/runtime route. Normal self-claim output carries the
+claim reference instead of raw lease counters or a duplicated receipt; explicit
+lease commands retain their diagnostic output. Pre-upgrade plain-claim retries
+recover only their original assignment and never become managed execution.
+Keep any required original Turn identity and settlement.
+Progress can renew the still-active execution in the **same** write transaction;
+completion uses the existing terminal owner and release. Neither needs a separate
+inspection or a copied lease key/version. The reference resolves only the execution
+accepted by that claim: a later generation, foreign holder, expired grant, changed
+policy or unavailable receipt cannot be borrowed or silently reacquired. An
+explicit proof cannot be combined with the reference. Receipt recovery happens
+before maintenance, so retrying an accepted operation does not renew or repeat it.
+A read-only quota guard never claims or renews. Long-running delegated Hosts retain
+their existing supervision; this CLI path does not supervise an idle external
+process. The App's manual completion boundary described above is unchanged.
+
+To retire obsolete work after a managed self-claim, pass the same returned
+reference to `todo supersede` and name its replacement. For example, after the
+claim above, use this **instead of** completing `todo_example`:
+
+```bash
+loopx --format json todo supersede --goal-id example-goal --todo-id todo_example \
+  --agent-id worker-a --claim-operation-id work-a \
+  --reason 'Replace obsolete work' --next-agent-todo 'Deliver replacement work'
+```
+
+Use `--successor-todo-id <existing-todo-id>` instead of `--next-agent-todo` when
+the replacement already exists. Supersede retains the terminal owner's lease,
+acceptance and successor checks, retires the original execution atomically, and
+recovers the accepted receipt on an unchanged retry. An expired or replaced
+reference is rejected; inspect the current Todo and reconcile ownership before
+explicitly claiming again. Do not reuse the stale reference or copy lease counters.
+
+废弃已认领的任务时，可将自认领返回的 `claim_operation_id` 传给 `todo supersede`，
+并用 `--next-agent-todo` 创建替代任务，或用 `--successor-todo-id` 关联已有任务。
+租约、验收和后继检查仍由原终态 owner 执行；重试恢复原回执，不重复创建后继。
+过期或已换代的引用会拒绝，须先查看当前任务、核对归属，再显式重新认领。
+
+For a selected `hard_lease` Todo, the quota settlement plan now gives the ordinary
+claim command before task execution and carries its returned reference in the
+completion template. Quota and TurnEnvelope share that plan. The policy comes
+from the canonical Todo snapshot through `goal_boundary.handoff_mode`, including
+reads that omit lease records; display Markdown does not supply it. `soft_claim` retains its existing completion
+recipe. Supplied explicit proof is preserved, and an unavailable policy is not
+inferred as a new lease requirement. This is caller guidance, not acquisition,
+renewal or a replacement for validation and the existing fences.
+
+Goal-mode MCP uses the same task reference: retain `claim_operation_id` from
+`claim_task` and pass it to `complete_task`, including retries. This is a breaking
+tool-schema change: `complete_task` no longer accepts
+`task_lease_idempotency_key` or `task_lease_expected_version`. Migrate callers
+to the returned claim reference; do not synthesize one from an old lease key.
+Ordinary CLI help also omits those host-only proof flags. Explicit Host supervision
+and diagnostic lease commands retain their generation-fencing protocol.
+
+For an eligible task edit without explicit proof, recovery now offers ordinary
+`todo claim`, then retry with its returned reference. It does not direct the Agent
+through inspect/acquire/release. Expired or replaced references remain rejected;
+recovery advice itself never grants execution or changes state.
+
+If the refused edit supplied `--update-expected-provider-revision`, reclaiming
+execution does not validate that old revision, even when the claim reports no
+Todo change. Recovery then gives a targeted `todo list --todo-id ...` step after
+claiming. Reconcile that Todo with the intended edit before filling the retry's
+claim reference and `authority_read.provider_revision` from the read. No full
+Goal reread is needed by this recovery contract. The CLI does not replace the
+CAS automatically; a later concurrent edit still rejects the retry. Keep the
+original operation id and reconciled intent. Calls without an explicit CAS
+retain the direct claim-and-retry path, and recovery never overrides a Stop.
+
+An expired hard-lease execution can be reclaimed with ordinary `todo claim`
+by an eligible registered Agent. When the expired holder still matches the Todo
+claim, the claim owner and a fresh execution generation change in one canonical
+transaction. No response, release or transfer grant from the old process is
+required. This intentionally changes the previous cross-agent expiry behavior.
+Active executions remain protected. Missing, malformed, released or unrelated
+lease history cannot authorize this takeover; `soft_claim` keeps its prior
+handoff rules. Current task status, exclusions, acceptance, dependencies and
+write-scope checks remain in force. Concurrent claimants cannot both win the same
+provider revision. Old references cannot update, renew or release the replacement.
+Expiry prevents further control-plane writes; it cannot undo external effects
+already issued, and native Hosts still own process supervision.
+
+## Choose the policy independently of storage
+
+Use `soft_claim` for an explicitly single executor without parallel takeover.
+Local parallel Agents/automations and shared cloud work need `hard_lease`, with
+Host acquire/renew/release and blocked settlement qualified before a default
+change. An unknown topology should eventually choose hard, but this command
+does not infer topology or silently enable it.
+
+A fresh `coordination-shadow promote` CLI preview defaults to `preserve`: it
+changes storage authority while retaining the source policy. Explicit
+`--handoff-mode-migration hard_lease` reviews the policy upgrade in the same
+fenced cutover. Historical saved v0 hard-only plans retain their original
+semantics; saved plans cannot be overridden at execution.
+See [reviewed promotion](reviewed-coordination-promotion.md).
+
+## Read or change a quiescent Goal
+
+```bash
+loopx --format json handoff-mode show --goal-id example-goal
+loopx --format json handoff-mode set --goal-id example-goal --mode soft_claim --dry-run
+loopx --format json handoff-mode set --goal-id example-goal --mode soft_claim --operation-id mode-change-1
+```
+
+Before import, `show` can inspect historical frontmatter; normal `set` requires
+canonical authority. Canonical operations use the selected provider even when
+Markdown is stale or absent. Provider failure rejects the operation without fallback;
+leftover lease files cannot override canonical records. Only frontmatter and
+compact ownership facts cross the legacy TS planning boundary; unrelated body,
+metadata, line endings and the final newline remain intact.
+
+A changed `set` requires no unfinished claimed active Todo and no time-active
+lease in the complete snapshot. Invalid expiry/schema cannot prove quiescence;
+concurrent work invalidates its CAS. Identical soft/hard mode is a no-op even
+with active work. Historical malformed frontmatter must be resolved through the reviewed import
+boundary; it cannot create a normal writer fallback. Malformed canonical state
+is never repaired through that adapter.
+
+Canonical `--operation-id` binds Goal and target. Even an accepted no-op seals a
+receipt. Retry with the same ID/target recovers the original decision and never
+restores an old mode over later work; changed intent needs a fresh ID.
+`ambiguous`/`coordination_receipt_recovery_required` means retry that same request.
+Malformed receipts reject. An original `set --mode legacy --operation-id <original-id>`
+request still reaches receipt recovery after upgrade, including after a later
+policy change. New legacy writes and dry-runs return `handoff_mode_retired`;
+`plan-migration` also refuses legacy as a target. An unpromoted normal write returns `canonical_authority_required`; use the
+reviewed import before changing current policy.
+
+## Migrate an assigned canonical Goal with a verified backup
+
+Ordinary `set` is deliberately quiescence-only. To preserve existing assignments
+on a canonical Goal, review an immutable plan, then apply its exact digest:
+
+```bash
+loopx --format json handoff-mode plan-migration --goal-id example-goal \
+  --mode hard_lease --plan reviewed-mode.json
+# Inspect source identity/revision/digest, target and preserved claims/leases.
+loopx --format json handoff-mode migrate --goal-id example-goal \
+  --plan reviewed-mode.json --plan-sha256 <reviewed-digest>
+loopx --format json handoff-mode migrate --goal-id example-goal \
+  --plan reviewed-mode.json --plan-sha256 <reviewed-digest> --execute
+loopx --format json handoff-mode show --goal-id example-goal
+```
+
+Plan and preview do not change policy. Apply first exports and independently
+verifies `<plan>.backup.jsonl` using the existing portable authority archive.
+The archive retains every original transaction, receipt, full projection and
+Todo metadata. Goal/runtime, provider identity/revision, projection digest and
+registered Agents must match the reviewed source. Drift rejects; use a new plan
+path, never edit the digest. A concurrent write during backup fails the exact
+CAS and cannot be overwritten. File, SQLite and an admitted service provider
+use the same typed rule and receipt owner.
+
+Claims remain assignments. Live claim owners must be registered; retained
+active leases must have eligible owners, valid fencing counters and all named
+required scopes. Additional standalone lease scopes are retained verbatim;
+requirements are not an exact grant template. No scope or lease is invented.
+An upgrade to hard retains a valid current proof; a claim without a live lease
+must acquire one normally before protected work. A soft migration rejects every
+unreleased active lease, including expired ones: expiry alone does not prove a
+Host stopped. Settle those executions first.
+
+Apply uses a stable digest-derived operation and the existing durable receipt
+recovery. Retry the same plan after a lost response; it returns the original
+result without rewriting later work. Missing/corrupt retained backup rejects
+recovery. Changing policy back uses a **new** reviewed migration and backup,
+not an old archive that would discard subsequent writes. Archive restoration
+is a separate, isolated disaster-recovery operation.
+
+The App exposes this same explicit operation in **Goal settings → Task ownership**.
+Choose Collaborative claims (`soft_claim`) or Exclusive execution leases
+(`hard_lease`), preview preserved assignments/leases, then choose **Back up and
+apply**. Preview does not change policy or grant execution. Rejections show
+conflict counts and affected Todo identifiers; settle the owning executions
+before making a new plan. Unpromoted Goals must first use the promotion workflow.
+
+The App stores the opaque preview handle in browser session storage before
+enabling Apply; the server owns the immutable plan and verified backup. After a
+lost response or page reload in the same tab, retry the saved preview. Do not
+create a new operation to guess whether the first succeeded. A confirmed original
+receipt and the separately fetched current policy are distinct: later valid
+changes remain authoritative. **Read current policy** retries a failed readback;
+**Discard preview and start again** explicitly abandons the browser carrier,
+without deleting the server plan or backup. Clearing browser storage loses this
+carrier; retain server plans/backups for operator recovery through the CLI.
+Disabling browser storage leaves readback available but prevents applying an
+unretained preview.
+
+CLI and App share registry validation and the same TS migration owner. Lark
+ordinary Todo/lease actions consume that canonical state; policy migration has
+no Lark editor in this stage. The capability editor does not own this policy. Migration does not
+qualify provider defaults, D1–D3, or PostgreSQL deployment. Complete Host lease lifecycles, reviewed migration of remaining Goals and installed
+adoption remain release qualifications. The candidate's legacy execution cutoff
+is not evidence that those qualifications passed. Historical import/receipt
+readers stay at their migration/recovery boundary.
+
+## 中文
+
+新增 `set` 和迁移只接受 `soft_claim`、`hard_lease`。legacy 仍可作为升级来源、
+历史回执恢复输入，不能再作为新请求的目标；已有 Goal 和创建／Host 默认值不被静默改写。2.0 候选的 fresh
+claim／update／terminal、Monitor、执行 fence 及租约执行准入明确拒绝 legacy；
+inspect 保留原记录但报告无有效执行，旧 acquire 回执也不能换成当前 proof。
+精确 CAS release、历史原操作恢复及有备份的审核迁移继续可用。soft 用于明确的单执行者，hard 用于本机并行 Agent／automation 和云端
+共享；默认策略切换前还需验证 Host 的 acquire、renew、release 和阻塞结算。
+App 的任务列表和详情共用审核完成入口。终态 owner 要求租约或当前执行证明时，
+页面明确说明此调用方无法代为完成；负责 Agent 须从原执行提交当前证明，之后刷新
+任务读回结果。已有 claim 或 store 中存在租约不等于页面持有执行证明；App 不借用
+key、自动 acquire 或更改策略绕过拒绝。其他预览失败保留原诊断。此项只完善不可用
+状态说明，不代表 `hard_lease` 下 App 手动完成已经合格。
+存储晋升与所有权分开：新 CLI promote 默认 `preserve`，显式 hard 才审核策略升级；
+旧 v0 保存计划仍按原合同恢复。
+
+上面的 show/set 命令读取、预览或切换空闲 Goal。晋升后以 canonical provider 为准，
+不回退旧 Markdown／lease 文件。改变策略要求完整快照没有未完成的已认领活动 Todo、
+没有有效 lease；相同 soft/hard 是 no-op。CAS 防止并发覆盖，canonical 请求用固定
+operation ID 恢复原回执，不把后来状态改回去。升级后仍可用原来的
+`set --mode legacy --operation-id <原ID>` 确认历史操作；新 legacy 写入、预览和
+迁移目标明确拒绝。
+
+有 claim 的 canonical Goal 使用 `plan-migration → migrate 预览 → --execute`。
+执行先生成并核验 `<plan>.backup.jsonl`，保存全部事务、原回执、完整历史投影与
+Todo metadata；然后在同一个源 revision 上提交 mode。源身份、状态、注册 Agent
+或计划变化会拒绝，备份期间的并发写入也不能被覆盖。备份／恢复复用既有 authority
+archive，File、SQLite 和获准的 service provider 共用 TS 规则与 receipt owner。
+
+claim 原样保留；有效租约保留原 scope、version 和 epoch，不伪造 lease。
+Todo 的必需 scope 是任务要求，不等于本轮 lease 的完整范围；额外 scope 不被删除。
+没有有效 lease 的 claim owner 仍须正常 acquire 才能执行受保护写入。soft 迁移拒绝
+未 release 的 active lease，即使已过期，因为过期不能证明 Host 已停止。
+丢响应后重试同一计划恢复原结果；缺失／损坏备份会拒绝恢复。反向切换使用新计划和
+新备份，不恢复会丢掉后续工作数据的旧快照。
+
+App 在 **Goal 设置 → 任务所有权** 复用同一操作：选择协作认领或独占执行租约，
+预览保留的归属／租约，再点“备份并应用”。预览不改策略、不授予执行权；冲突展示
+数量和相关 Todo，须结清对应执行后重新计划。尚未晋升的 Goal 先完成晋升。
+
+浏览器先保存不透明的预览标识才允许应用；服务端保存不可变计划和备份。丢响应或
+同一标签页刷新后重试原预览，不能新建操作猜测旧结果。“原操作已确认”与“当前策略”
+分别展示，后续合法变更不被旧回执覆盖。可单独重新读取当前策略；显式放弃预览只
+清除浏览器载体，不删除服务端计划／备份。清空浏览器存储会丢失该载体，需保留服务端
+计划和备份供 CLI 恢复；禁止浏览器存储时仍可读取，但不能应用无法保存的预览。
+
+CLI 与 App 共用注册信息校验和 TS 迁移 owner；飞书普通操作消费相同 canonical 状态，
+本阶段没有飞书策略编辑器，也不新建 capability 设置项。此批不关闭 provider 默认与
+D1–D3；候选已拒绝 legacy 正常执行，并不证明 Host 生命周期、逐 Goal 备份迁移
+及安装采用已经完成。旧格式解析只保留在迁移／历史回执恢复边界。
+
+## Recover a canonical Todo edit with retained lease history
+
+A canonical Todo can retain a released or expired lease in historical `legacy`
+mode. That mode requires a reviewed migration before normal work, even with a
+retained active proof. Release the exact old execution first, then use the existing
+backup/plan/migrate flow; never acquire another legacy execution. In `hard_lease`,
+the retained record preserves execution lineage: `todo update` requires current
+active owner proof. In `soft_claim`, an open agent Todo's
+current claim owner may edit text/notes or clear those fields without proof when
+its retained lease is released and held by the same owner. The transaction keeps
+the lease, epoch and historical receipts unchanged and still checks actor,
+exclusion, binding and provider CAS. This does not authorize ownership, planning,
+work-requirement or completion changes. `handoff_mode_requires_lease` does **not** mean that the Goal
+has silently switched to `hard_lease`.
+
+Lease-proof rejections of canonical metadata edits now include the actual `handoff_mode` and a
+read-only `recovery` projection. It contains no execution key and grants no
+permission. Explicit old or partial proof is still rejected; for the qualifying
+soft-claim copy edit, recovery tells the caller to retry without both proof flags
+under a fresh operation and current revision. Other execution fences remain:
+
+| Observation | Recovery |
+| --- | --- |
+| Historical `legacy` policy, with or without a retained lease | Release any retained execution using its exact CAS, then review and back up a migration to `soft_claim` or `hard_lease`. Historical acceptance grants no current execution. |
+| Active execution held by the current claim owner; proof omitted | Use ordinary `todo claim` and retry with its returned reference; claim reuses eligible active execution. |
+| Released/expired execution; proof omitted and current owner passes acquisition checks | Use ordinary `todo claim` for fresh execution, then retry with its returned reference. |
+| Explicit Host proof is stale or partial | Inspect current execution and repair the Host's proof; do not silently fall back to a task reference. |
+| Expired execution matches the retained claim; eligible registered replacement actor | Use ordinary `todo claim` for atomic takeover, then use its new reference. |
+| Active foreign holder, divergent history, or absent claim | Reconcile ownership through its lifecycle; never borrow another holder's proof. |
+| `soft_claim` with released same-owner history, ordinary owner copy edit | Omit lease proof; keep the history. No replacement lease is needed or allowed. |
+| Rejected wait revision on an already deferred Todo | Review and explicitly resume the original Todo, then reapply the reviewed deferral using a separate operation and current provider revision. Neither step grants execution. |
+| Non-open Todo, acceptance hold or conflicting write scopes | Resolve the reported acquisition blocker. No acquire action is offered. |
+| Edit changes retained leased work requirements or status | Use the owning lifecycle transition; acquiring another lease cannot authorize the metadata edit. |
+
+For a deferred wait revision, the returned retry uses `--status open
+--clear-resume-when` with a reviewed reason, fresh update operation and current
+provider CAS. Read that result before submitting the intended deferral with
+another operation and fresh CAS. Do not repeat the rejected same-status request
+or carry its resume condition into the resume command. An active retained lease
+must be released by its holder first; explicit stale proof remains rejected.
+
+The existing `open -> blocked -> open` lifecycle also accepts a typed
+prerequisite wait: use `todo update --status blocked --resume-when
+todo_done:<dependency-todo> --reason '<bounded cause>'` after the active holder
+releases its execution lease. This explicit wait form is newly supported for
+native hard-lease Todos; the prior clear-wait pause form is unchanged. A live
+lease or bundled execution proof still rejects the transition. Resume with
+`--status open --clear-resume-when --reason '<resume basis>'`; neither transition
+grants execution authority, and the next execution requires a fresh lease.
+
+既有 `open -> blocked -> open` lifecycle 也支持 typed 前置任务等待：active
+holder 先释放执行 lease，再用 `todo update --status blocked --resume-when
+todo_done:<dependency-todo> --reason '<bounded cause>'` 暂停。此显式 wait 形式
+新增支持 native hard-lease Todo；原 clear-wait pause 形式保持不变。有效 lease
+或附带执行 proof 仍被拒绝。用 `--status open --clear-resume-when --reason
+'<resume basis>'` 恢复；两次转换都不授予执行权限，下一次执行仍需新 lease。
+
+For explicit Host-proof callers, the recovery descriptor uses the standalone
+`loopx task-lease acquire` command when acquisition is eligible.
+Combined `todo claim --task-lease-idempotency-key` is restricted to `hard_lease`
+and is unavailable in historical `legacy` mode. After reviewed migration,
+acquire uses `--owner`, a **fresh**
+`--idempotency-key`, `--expected-version` from `task-lease inspect`, a bounded
+`--ttl-seconds`, and any projected `--write-scope` values. Retry the original
+update with `--task-lease-idempotency-key` and `--task-lease-expected-version`
+from the new lease. Release with `task-lease release --owner ...
+--idempotency-key ... --expected-version ...` using current owner readback.
+
+An observed version is not a reservation. Concurrent changes can reject the
+acquire or update; reread instead of bypassing CAS. Preview and rejected writes
+do not acquire/release a lease or publish Todo changes. Recovery does not change
+the configured mode, promote a provider, or waive acceptance.
+
+### 保留租约历史时的更新恢复
+
+历史 `legacy` policy 即使保留 active lease，也不能执行新的 Todo mutation 或借原回执
+恢复当前执行资格。先按原 key／version 精确 release，再通过既有 plan／backup／migrate
+审核升级到 soft_claim 或 hard_lease；不改写旧回执、不丢弃 lease history，也不自动迁移活跃 Goal。
+
+canonical Todo 在历史 `legacy` 模式下也可能保留 released／expired lease，
+须先审核迁移；hard_lease 仍要求当前有效 owner proof。soft_claim 下，open Agent Todo 的当前
+claim owner 可不带 proof 编辑文本／备注或清空这些字段，前提是保留的 lease 已释放
+且同属本人。事务保留 lease、epoch 和原回执，仍核验 actor、excluded、bound 和
+provider CAS；这不授权 ownership、planning、工作要求或完成变更。未释放的 active
+lease 即使自然过期，也不适用。显式旧 proof 或部分 proof 仍拒绝；合法普通编辑的
+恢复提示要求去掉两个 proof flag，用新 operation 和当前 revision 重试。
+`handoff_mode_requires_lease`
+不表示 Goal 已自动切成 `hard_lease`；拒绝结果会返回真实 mode 与只读 `recovery`。
+
+未提供显式 proof 的普通任务调用，只有当前 owner 满足执行准入时，才提示普通
+`todo claim`，再用返回的 `claim_operation_id` 重试。有效执行复用，已结束执行须
+重新通过准入；旧引用不能复活过期或换代执行。显式 Host proof 过期或不完整时，
+仍须 inspect 并修复 Host 的执行证明，不静默切换协议。legacy 下独立 acquire 与合并式
+claim+lease 均不可执行，必须先审核迁移；合并式 claim+lease 仍仅限 hard_lease。
+
+异主有效 lease、claim 不一致、不允许执行的 Todo、验收阻塞或 scope
+冲突不会得到不可执行的 acquire 建议；修改已租用工作的要求或状态须走对应 lifecycle。
+提示不包含 execution key、不授予权限，也不修改 mode 或 provider。并发造成 version
+变化时重新读取，不能绕过 CAS；dry-run 和拒绝路径不产生 Todo 或租约写入。
+
+如果被拒绝的编辑提供了 `--update-expected-provider-revision`，重新认领不证明旧版本
+仍可用于编辑，即使认领回包显示 Todo 没有变化。恢复提示会在认领后给出只读取该 Todo
+的 `todo list --todo-id ...`。核对当前内容与原编辑意图后，再把新认领引用和这次读取的
+`authority_read.provider_revision` 填入重试命令；此恢复契约不要求重读整个 Goal。
+CLI 不会自动替换 CAS，读取后若再有并发修改，重试仍会拒绝。保留原 operation id 和
+核对后的意图。不带显式 CAS 的调用保持直接认领并重试，恢复也不会覆盖 Stop。
+
+修改已 deferred Todo 的等待条件若被拒绝，恢复命令先以 `--status open
+--clear-resume-when`、审核后的 reason、新 update operation 和当前 provider CAS
+显式恢复原任务；读回后，再用另一个 operation 和新的 CAS 提交审核后的延期。
+不重复原同状态请求，也不把其 resume 条件带入恢复命令。两步均不授予执行权，完整
+任务和历史保留；有效的历史 lease 须先由 holder 释放，显式过期 proof 仍被拒绝。
+
+### Agent 普通 CLI 操作
+
+CLI 由明确的 `--agent-id` 认领给自己时，会在同一 canonical 事务中准备执行；
+`hard_lease` 自动取得任务要求的 scope，或复用自己尚有效的执行。仅在原租期最后
+三分之一内续租，`soft_claim` 不创建租约，其他调用方分配任务和显式租约操作保持原义。
+认领结果在 JSON 和 Markdown 中返回保留 registry/runtime 路由的进展与完成命令，
+常规输出不再展开租约计数和重复回执，显式租约操作保留诊断读回。升级前旧认领只
+恢复原来的分配，不被升级成新执行。新认领的进展与完成命令均携带原
+`--claim-operation-id`，无需单独 inspect 或复制 key/version。进展写回按需在同一事务
+续租，完成复用原终态 owner 及释放操作；必要的原 Turn 身份与结算仍须保留。
+该引用只承接当初认领接受的执行，过期、换代、外部占用、策略变化或回执不可用时拒绝，
+不自动借用或重新取得证明；显式证明不能与引用混用。原操作回执先于维护恢复，重试不
+重复写入或续租。只读 quota guard 不做认领或续租；长期委派 Host 仍走已有监督，
+本 CLI 路径不监督空闲外部进程，也不改变 App 手工完成的现有边界。
+
+选中的 Todo 使用 `hard_lease` 时，quota 结算计划会在执行前给出普通认领命令，完成
+模板携带其返回的原引用；quota 与 TurnEnvelope 共用该计划。策略取自 canonical Todo
+快照，经 `goal_boundary.handoff_mode` 传递；即使读取未请求租约记录，也不从展示
+Markdown 推断。`soft_claim` 保持原完成命令；调用方已有显式证明时原样保留，策略
+不可用时不臆造租约要求。这是调用指引，
+不执行认领或续租，也不替代验收及已有 fence。
+
+Goal-mode MCP 同样传递任务引用：保存 `claim_task` 返回的 `claim_operation_id`，
+在 `complete_task` 及其重试中原样使用。本次为 breaking change，`complete_task`
+移除 `task_lease_idempotency_key` 和 `task_lease_expected_version` 参数；调用方须
+迁移到认领返回的引用，不能从旧 key 拼造。普通 CLI 帮助也不再展示这两个 Host
+证明参数；显式 Host 监督和诊断命令保留换代隔离协议。恢复提示不授予执行权或写入状态。
+
+过期的 hard-lease 执行可由符合当前条件的注册 Agent 用普通 `todo claim` 接管。
+只有过期持有者仍与 Todo claim 一致时，才在同一 canonical 事务中变更认领人并取得
+新一代执行，无需旧进程回复、释放或提供交接证明。本次明确改变原来的跨 Agent
+过期恢复行为。有效执行不可抢占；缺失、损坏、已释放或不对应的历史记录不能授予
+此接管，`soft_claim` 保持原交接规则。仍检查任务状态、排除规则、验收、依赖和写范围
+冲突；同一 revision 的并发竞争只允许一个成功，旧引用不能写入、续租或释放新执行。
+过期会阻止后续控制面写入，但无法撤回此前已发出的外部副作用；进程监督仍由 Host 负责。

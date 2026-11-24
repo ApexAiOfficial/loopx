@@ -36,11 +36,25 @@ MARKER_NAME = "docs/turn-e2e-marker.txt"
 MARKER_VALUE = "loopx-turn-dsh-e2e-step-1"
 ADAPTER = REPO_ROOT / "scripts" / "dsh_turn_host_adapter.py"
 
+# The fake runner stands in for the DeepSeek Harness host, so its keyword
+# signature must track the keyword set the adapter supplies, which
+# ``loopx.dsh_goal_mode.turn_host_adapter.load_dsh_runner`` documents. Three
+# smokes load a fake runner, so the signature is emitted from this one place: a
+# fixture that lags the adapter otherwise surfaces as an unattributed
+# ``host_failure`` instead of a readable error at the seam that moved.
+FAKE_DSH_RUNNER_SIGNATURE = (
+    "def run_dsh_turn(*, prompt, session_id, workspace, session_root,\n"
+    "                 provider, model, reasoning_effort, max_tokens, cordis,\n"
+    "                 runtime_bin, request_timeout_seconds):\n"
+    "    assert provider and model and reasoning_effort, (\n"
+    "        'the adapter must hand over the resolved execution profile')\n"
+)
+
 
 def _write_fixture(root: Path) -> tuple[Path, Path, Path, Path]:
     project = root / "project"
     runtime = root / "runtime"
-    workspace = root / "workspace"
+    workspace = project
     runtime.mkdir(parents=True)
     workspace.mkdir(parents=True)
     (workspace / "docs").mkdir()
@@ -112,6 +126,10 @@ def _write_fixture(root: Path) -> tuple[Path, Path, Path, Path]:
         + "\n",
         encoding="utf-8",
     )
+    from loopx.control_plane.testing.canary_harness import import_fixture_authority
+
+    for record in json.loads(registry.read_text())["goals"]:
+        import_fixture_authority(registry, record["id"], provider="sqlite")
     return project, runtime, workspace, registry
 
 
@@ -121,18 +139,18 @@ def _write_fake_dsh_runner(root: Path, workspace: Path) -> Path:
         {
             "result_kind": "validated_progress",
             "classification": "dsh_e2e_marker_written",
+            "work_evidence": [f"artifact:{MARKER_NAME}"],
+            "validation_evidence": ["fixture:independent-marker-validator"],
             "summary": "Wrote the public e2e marker file.",
             "next_action": "Replay idempotently; no further work.",
         }
     )
     runner.write_text(
         "import pathlib\n"
-        "def run_dsh_turn(*, prompt, session_id, workspace, session_root,\n"
-        "                 provider, model, max_tokens, cordis, runtime_bin,\n"
-        "                 request_timeout_seconds):\n"
-        f"    pathlib.Path({str(workspace)!r}).joinpath({MARKER_NAME!r}).write_text("
-        f"{MARKER_VALUE!r}, encoding='utf-8')\n"
-        f"    return {block!r}\n",
+        + FAKE_DSH_RUNNER_SIGNATURE
+        + f"    pathlib.Path({str(workspace)!r}).joinpath({MARKER_NAME!r}).write_text("
+        + f"{MARKER_VALUE!r}, encoding='utf-8')\n"
+        + f"    return {block!r}\n",
         encoding="utf-8",
     )
     return runner
@@ -197,14 +215,13 @@ def _base_argv(
         "isolated-headless",
         "--project",
         str(workspace),
+        "--host-adapter-request-schema", "loopx_turn_host_request_v1",
         "--host-command-json",
         host_command,
         "--validation-command-json",
         json.dumps(_validator_command()),
         "--validation-failure-kind",
         "repair_required",
-        "--scan-root",
-        str(registry.parent.parent),
         "--no-global-sync",
         "--timeout-seconds",
         str(timeout_seconds),

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import time
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from ...materials import read_bounded_material_file
 
 from .sources import (
     DecisionSourceExactRead,
@@ -110,18 +111,7 @@ class LocalFileDecisionSourceProvider:
         if source.provider_id != self.provider_id:
             raise ValueError("source provider identity does not match")
         path = Path(source.private_locator).expanduser()
-        if not path.is_file():
-            raise FileNotFoundError("configured authority file is unavailable")
-        stat = path.stat()
-        if stat.st_size > self.max_bytes:
-            raise ValueError("configured authority file exceeds max_bytes")
-        content = path.read_bytes()
-        revision = hashlib.sha256(content).hexdigest()
-        observed_at = datetime.fromtimestamp(
-            stat.st_mtime,
-            tz=timezone.utc,
-        ).isoformat()
-        return path.resolve(), content, revision, observed_at
+        return read_bounded_material_file(path, self.max_bytes)
 
     def scan(
         self,

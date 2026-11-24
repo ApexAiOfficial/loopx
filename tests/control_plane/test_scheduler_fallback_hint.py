@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
+from loopx.command_invocation import loopx_cli_route
 from loopx.control_plane.heartbeat.rules import (
     SCHEDULER_HINT_APPLICATION_RULE,
     SCHEDULER_HINT_COMPACT_RULE,
@@ -11,13 +16,22 @@ from loopx.control_plane.heartbeat.rules import (
 from loopx.control_plane.quota.live_decision import (
     bind_scheduler_followup_cli_routes,
 )
-from loopx.control_plane.scheduler.ack import build_codex_app_scheduler_ack_event
+from loopx.control_plane.quota.scheduler_ack import (
+    record_quota_scheduler_ack_for_decision,
+)
 from loopx.control_plane.scheduler.execution_context import (
     scheduler_execution_context_for_runtime_profile,
 )
-from loopx.control_plane.scheduler.scheduler_hint import build_scheduler_hint
-from loopx.upgrade import resolve_codex_app_automation_rrule
-
+from tests.control_plane.scheduler_arbitration_fixture import build_native_scheduler_hint as build_scheduler_hint
+from loopx.upgrade import (
+    load_codex_app_automation_manifest,
+    prompt_digest,
+    resolve_codex_app_automation_rrule,
+)
+from scripts.codex_app_apply_rrule import (
+    _read_automation_prompt,
+    _write_automation_toml,
+)
 
 GOAL_ID = "fallback-hint-goal"
 AGENT_ID = "codex-fixture"
@@ -78,19 +92,29 @@ def _hint(
     )
 
 
-def _ack_state(hint: dict, *, applied_rrule: str, generated_at: datetime) -> dict:
-    event = build_codex_app_scheduler_ack_event(
+def _ack_state(
+    hint: dict,
+    *,
+    runtime_root: Path,
+    applied_rrule: str,
+    generated_at: datetime,
+) -> dict:
+    event = record_quota_scheduler_ack_for_decision(
         {"goal_id": GOAL_ID, "scheduler_hint": hint},
+        runtime_root=runtime_root,
+        goal_id=GOAL_ID,
         agent_id=AGENT_ID,
+        execute=True,
         applied_rrule=applied_rrule,
         generated_at=generated_at.isoformat(),
     )
+    assert event["ok"] is True, event
     return event["scheduler_ack_event"]["scheduler_state"]
 
 
 def test_apply_needed_projects_fallback_hint_when_automation_id_resolved() -> None:
     hint = _hint(_active_decision(), automation_id="loopx")
-    codex_app = hint["codex_app"]
+    codex_app = hint["app_automation"]
     assert codex_app["stateful_backoff"]["apply_needed"] is True
 
     fallback = codex_app["fallback_hint"]
@@ -113,7 +137,7 @@ def test_apply_needed_projects_fallback_hint_when_automation_id_resolved() -> No
 
 def test_apply_needed_without_automation_id_projects_deterministic_fallback() -> None:
     hint = _hint(_active_decision(), automation_id=None)
-    fallback = hint["codex_app"]["fallback_hint"]
+    fallback = hint["app_automation"]["fallback_hint"]
     assert fallback["available"] is True
     assert fallback["automation_id_projected"] is True
     assert fallback["action"] == "create_then_apply_rrule_via_fallback"
@@ -124,11 +148,16 @@ def test_apply_needed_without_automation_id_projects_deterministic_fallback() ->
     assert "automation_id_projected" in fallback["reason"]
 
 
-def test_settled_cadence_omits_fallback_hint() -> None:
+def test_settled_cadence_omits_fallback_hint(tmp_path: Path) -> None:
     now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     first = _hint(_active_decision(), automation_id="loopx")
-    applied_rrule = first["codex_app"]["recommended_rrule"]
-    settled = _ack_state(first, applied_rrule=applied_rrule, generated_at=now)
+    applied_rrule = first["app_automation"]["recommended_rrule"]
+    settled = _ack_state(
+        first,
+        runtime_root=tmp_path,
+        applied_rrule=applied_rrule,
+        generated_at=now,
+    )
 
     second = _hint(
         _active_decision(),
@@ -136,14 +165,14 @@ def test_settled_cadence_omits_fallback_hint() -> None:
         host_rrule=applied_rrule,
         automation_id="loopx",
     )
-    assert second["codex_app"]["stateful_backoff"]["apply_needed"] is False
-    assert "fallback_hint" not in second["codex_app"]
+    assert second["app_automation"]["stateful_backoff"]["apply_needed"] is False
+    assert "fallback_hint" not in second["app_automation"]
 
 
-def test_fallback_hint_cli_route_binds_registry(tmp_path: Path) -> None:
+def test_fallback_hint_cli_route_binds_registry_and_runtime(tmp_path: Path) -> None:
     payload = {
         "scheduler_hint": {
-            "codex_app": {
+            "app_automation": {
                 "fallback_hint": {
                     "cli_args": [
                         "loopx-apply-rrule",
@@ -161,22 +190,257 @@ def test_fallback_hint_cli_route_binds_registry(tmp_path: Path) -> None:
         }
     }
     registry_path = tmp_path / "registry.json"
+    runtime_root = tmp_path / "runtime"
     bind_scheduler_followup_cli_routes(
         payload,
         registry_path=registry_path,
-        runtime_root=tmp_path / "runtime",
+        runtime_root=runtime_root,
     )
-    fallback = payload["scheduler_hint"]["codex_app"]["fallback_hint"]
-    assert fallback["cli_args"][:3] == [
+    fallback = payload["scheduler_hint"]["app_automation"]["fallback_hint"]
+    assert fallback["cli_args"][:5] == [
         "loopx-apply-rrule",
         "--registry",
         str(registry_path.resolve()),
+        "--runtime-root",
+        str(runtime_root.resolve()),
     ]
     assert fallback["route_binding"]["schema_version"] == (
         "codex_app_scheduler_fallback_route_v0"
     )
     assert fallback["route_binding"]["registry_bound"] is True
-    assert fallback["route_binding"]["runtime_root_bound"] is False
+    assert fallback["route_binding"]["runtime_root_bound"] is True
+
+
+def _fallback_payload() -> dict:
+    return {
+        "scheduler_hint": {
+            "app_automation": {
+                "fallback_hint": {
+                    "cli_args": [
+                        "loopx-apply-rrule",
+                        "--goal-id",
+                        GOAL_ID,
+                        "--agent-id",
+                        AGENT_ID,
+                        "--automation-id",
+                        "loopx",
+                        "--turn-instance-id",
+                        "${LOOPX_TURN:?}",
+                    ],
+                    "args": {
+                        "goal_id": GOAL_ID,
+                        "agent_id": AGENT_ID,
+                        "automation_id": "loopx",
+                        "turn_instance_id": "${LOOPX_TURN:?}",
+                    },
+                }
+            }
+        }
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the co-installed fallback launcher is a shell entrypoint")
+@pytest.mark.parametrize("has_companion", [True, False])
+@pytest.mark.parametrize("cli_bin_kind", ["absolute", "name"])
+def test_fallback_replays_the_bound_cli_and_its_companion(
+    tmp_path: Path, monkeypatch, has_companion: bool, cli_bin_kind: str,
+) -> None:
+    release = tmp_path / "selected release"
+    release.mkdir()
+    executable = release / "loopx"
+    executable.touch()
+    executable.chmod(0o700)
+    alias = tmp_path / "loopx-selected"
+    alias.symlink_to(executable)
+    monkeypatch.setenv("PATH", str(tmp_path), prepend=os.pathsep)
+    cli_bin = alias.name if cli_bin_kind == "name" else str(alias)
+    companion = release / "loopx-apply-rrule"
+    if has_companion:
+        companion.touch()
+        companion.chmod(0o700)
+
+    payload = _fallback_payload()
+    with loopx_cli_route(cli_bin):
+        bind_scheduler_followup_cli_routes(
+            payload,
+            registry_path=tmp_path / "registry.json",
+            runtime_root=tmp_path / "runtime",
+            turn_instance_id="original-turn",
+        )
+
+    fallback = payload["scheduler_hint"]["app_automation"]["fallback_hint"]
+    command = str(companion) if has_companion else "loopx-apply-rrule"
+    assert fallback["cli_args"][:3] == [command, "--loopx", str(executable)]
+    assert fallback["cli_args"][-2:] == ["--turn-instance-id", "original-turn"]
+
+
+def test_fallback_hint_binds_the_receipted_turn(tmp_path: Path) -> None:
+    payload = _fallback_payload()
+
+    bind_scheduler_followup_cli_routes(
+        payload,
+        registry_path=tmp_path / "registry.json",
+        runtime_root=tmp_path / "runtime",
+        turn_instance_id="turn-fallback-receipt-001",
+    )
+
+    fallback = payload["scheduler_hint"]["app_automation"]["fallback_hint"]
+    turn_index = fallback["cli_args"].index("--turn-instance-id")
+    assert fallback["cli_args"][turn_index + 1] == "turn-fallback-receipt-001"
+    assert fallback["args"]["turn_instance_id"] == "turn-fallback-receipt-001"
+    assert fallback["route_binding"]["turn_instance_bound"] is True
+
+
+def test_fallback_hint_renders_the_turn_reference_of_the_host_shell(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from loopx.control_plane.quota import effect_program as quota_effect_program
+
+    for windows_host, expected in (
+        (False, "${LOOPX_TURN:?}"),
+        (True, "$LOOPX_TURN"),
+    ):
+        monkeypatch.setattr(
+            quota_effect_program, "_is_windows_host", lambda value=windows_host: value
+        )
+        payload = _fallback_payload()
+
+        bind_scheduler_followup_cli_routes(
+            payload,
+            registry_path=tmp_path / "registry.json",
+            runtime_root=tmp_path / "runtime",
+        )
+
+        fallback = payload["scheduler_hint"]["app_automation"]["fallback_hint"]
+        turn_index = fallback["cli_args"].index("--turn-instance-id")
+        assert fallback["cli_args"][turn_index + 1] == expected
+        assert fallback["args"]["turn_instance_id"] == expected
+        assert fallback["route_binding"]["turn_instance_bound"] is False
+
+
+def test_fallback_hint_re_renders_every_posix_turn_reference(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from loopx.control_plane.quota import effect_program as quota_effect_program
+
+    monkeypatch.setattr(quota_effect_program, "_is_windows_host", lambda: True)
+    for posix_form in ("${LOOPX_TURN:?}", "${LOOPX_TURN}"):
+        payload = _fallback_payload()
+        fallback = payload["scheduler_hint"]["app_automation"]["fallback_hint"]
+        turn_index = fallback["cli_args"].index("--turn-instance-id")
+        fallback["cli_args"][turn_index + 1] = posix_form
+        fallback["args"]["turn_instance_id"] = posix_form
+
+        bind_scheduler_followup_cli_routes(
+            payload,
+            registry_path=tmp_path / "registry.json",
+            runtime_root=tmp_path / "runtime",
+        )
+
+        bound_index = fallback["cli_args"].index("--turn-instance-id")
+        assert fallback["cli_args"][bound_index + 1] == "$LOOPX_TURN"
+        assert fallback["args"]["turn_instance_id"] == "$LOOPX_TURN"
+
+
+def test_fallback_hint_appends_a_missing_turn_argument(tmp_path: Path) -> None:
+    payload = _fallback_payload()
+    fallback = payload["scheduler_hint"]["app_automation"]["fallback_hint"]
+    fallback["cli_args"] = [
+        argument
+        for argument in fallback["cli_args"]
+        if argument != "--turn-instance-id"
+    ]
+    fallback["cli_args"].remove("${LOOPX_TURN:?}")
+    del fallback["args"]["turn_instance_id"]
+
+    bind_scheduler_followup_cli_routes(
+        payload,
+        registry_path=tmp_path / "registry.json",
+        runtime_root=tmp_path / "runtime",
+        turn_instance_id="turn-fallback-receipt-002",
+    )
+
+    assert fallback["cli_args"][-2:] == [
+        "--turn-instance-id",
+        "turn-fallback-receipt-002",
+    ]
+    assert fallback["route_binding"]["turn_instance_bound"] is True
+
+
+def test_fallback_hint_keeps_a_concrete_projected_turn(tmp_path: Path) -> None:
+    payload = _fallback_payload()
+    fallback = payload["scheduler_hint"]["app_automation"]["fallback_hint"]
+    turn_index = fallback["cli_args"].index("--turn-instance-id")
+    fallback["cli_args"][turn_index + 1] = "turn-projected-003"
+    fallback["args"]["turn_instance_id"] = "turn-projected-003"
+
+    bind_scheduler_followup_cli_routes(
+        payload,
+        registry_path=tmp_path / "registry.json",
+        runtime_root=tmp_path / "runtime",
+    )
+
+    bound_index = fallback["cli_args"].index("--turn-instance-id")
+    assert fallback["cli_args"][bound_index + 1] == "turn-projected-003"
+    assert fallback["args"]["turn_instance_id"] == "turn-projected-003"
+    assert fallback["route_binding"]["turn_instance_bound"] is False
+
+
+@pytest.mark.parametrize("launcher", [(), ("-I", "-m", "loopx.entrypoint")])
+def test_scheduler_followup_routes_preserve_turn_lineage(
+    tmp_path: Path, launcher: tuple[str, ...],
+) -> None:
+    payload = {
+        "scheduler_hint": {
+            "app_automation": {
+                "ack_hint": {
+                    "cli_args": [
+                        *launcher,
+                        "quota",
+                        "scheduler-ack-current",
+                        "--execute",
+                    ],
+                    "args": {},
+                },
+                "failure_hint": {
+                    "cli_args": [
+                        *launcher,
+                        "quota",
+                        "scheduler-fail-current",
+                        "--execute",
+                    ]
+                },
+            }
+        }
+    }
+    turn_instance_id = "turn-scheduler-followup-001"
+
+    with loopx_cli_route(None, default_argv=[sys.executable, *launcher]):
+        bind_scheduler_followup_cli_routes(
+            payload,
+            registry_path=tmp_path / "registry.json",
+            runtime_root=tmp_path / "runtime",
+            turn_instance_id=turn_instance_id,
+        )
+
+    app_automation = payload["scheduler_hint"]["app_automation"]
+    for hint_name in ("ack_hint", "failure_hint"):
+        hint = app_automation[hint_name]
+        assert hint["cli_args"][:len(launcher) + 5] == [
+            *launcher,
+            "--registry", str((tmp_path / "registry.json").resolve()),
+            "--runtime-root", str((tmp_path / "runtime").resolve()),
+            "quota",
+        ]
+        assert hint["cli_args"][-3:] == [
+            "--turn-instance-id",
+            turn_instance_id,
+            "--execute",
+        ]
+        assert hint["route_binding"]["turn_instance_bound"] is True
+    assert app_automation["ack_hint"]["args"]["turn_instance_id"] == turn_instance_id
 
 
 def test_heartbeat_scheduler_rules_name_the_fallback(tmp_path: Path) -> None:
@@ -224,3 +488,89 @@ def test_resolve_codex_app_automation_rrule_returns_automation_id(
     )
     assert result["available"] is True
     assert result["automation_id"] == "fixture"
+
+
+def test_codex_app_automation_writer_round_trips_multiline_prompt(
+    tmp_path: Path,
+) -> None:
+    prompt = (
+        "Advance `multiline-goal` from active state.\n\n"
+        "Keep C:\\Users\\alice and an embedded \"\"\" marker.\n"
+        "Preserve a line ending with a slash \\\n"
+        "Use `quota should-run --available-capability=network`.\n\n"
+        "Agent: `multiline-agent`\n"
+    )
+    automation_path = tmp_path / "automations" / "multiline" / "automation.toml"
+    _write_automation_toml(
+        automation_path,
+        automation_id="multiline",
+        name="Multiline heartbeat",
+        prompt=prompt,
+        rrule="FREQ=MINUTELY;INTERVAL=3",
+        thread_id="multiline-thread",
+    )
+    assert _read_automation_prompt(automation_path) == prompt
+
+    manifest = load_codex_app_automation_manifest(tmp_path)
+    assert manifest["available"] is True
+    assert len(manifest["entries"]) == 1
+    entry = manifest["entries"][0]
+    assert entry["goal_id"] == "multiline-goal"
+    assert entry["agent_id"] == "multiline-agent"
+    assert entry["target_thread_id"] == "multiline-thread"
+    assert entry["rrule"] == "FREQ=MINUTELY;INTERVAL=3"
+    assert entry["prompt_sha256"] == prompt_digest(prompt)
+    assert entry["char_count"] == len(prompt)
+    assert entry["line_count"] == len(prompt.splitlines())
+    assert entry["available_capabilities"] == ["network"]
+
+    resolved = resolve_codex_app_automation_rrule(
+        goal_id="multiline-goal",
+        agent_id="multiline-agent",
+        thread_id="multiline-thread",
+        root=tmp_path,
+    )
+    assert resolved == {
+        "available": True,
+        "rrule": "FREQ=MINUTELY;INTERVAL=3",
+        "automation_id": "multiline",
+        "source": "codex_app_automation_manifest",
+    }
+
+
+def test_codex_app_automation_manifest_reports_bounded_parse_errors(
+    tmp_path: Path,
+) -> None:
+    automations = tmp_path / "automations"
+    for index in range(21):
+        path = automations / f"invalid-toml-{index:02d}" / "automation.toml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            'kind = "heartbeat"\nprompt = "C:\\Users\\alice"\n',
+            encoding="utf-8",
+        )
+    invalid_utf8 = automations / "00-invalid-utf8" / "automation.toml"
+    invalid_utf8.parent.mkdir(parents=True, exist_ok=True)
+    invalid_utf8.write_bytes(b'kind = "heartbeat"\nprompt = "\xff"\n')
+
+    manifest = load_codex_app_automation_manifest(tmp_path)
+    assert manifest["available"] is True
+    assert manifest["entries"] == []
+    assert manifest["reason"] == "no readable LoopX heartbeat automations discovered"
+    assert manifest["parse_error_count"] == 22
+    assert len(manifest["parse_errors"]) == 20
+    assert manifest["parse_errors_complete"] is False
+    assert {error["reason"] for error in manifest["parse_errors"]} == {
+        "invalid_utf8",
+        "invalid_toml",
+    }
+
+    resolved = resolve_codex_app_automation_rrule(
+        goal_id="missing-goal",
+        root=tmp_path,
+    )
+    assert resolved["available"] is False
+    assert resolved["candidate_count"] == 0
+    assert resolved["manifest_parse_error_count"] == 22
+    assert len(resolved["manifest_parse_errors"]) == 20
+    assert resolved["manifest_parse_errors_complete"] is False

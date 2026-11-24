@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import Callable
 
 from ..extensions.lark import LARK_EXTENSION_ID, LARK_PROJECTION_SINK_PERMISSION
+from ..extensions.lark.cli_transport import DEFAULT_CLI_BIN
 from ..extensions.lark.presentation.kanban import (
     DEFAULT_AGENT_ID,
-    DEFAULT_CLI_BIN,
     DEFAULT_STATUS_QUEUE_VIEW,
     DEFAULT_TABLE_NAME,
     LarkKanbanConfig,
@@ -36,6 +36,11 @@ from ..extensions.lark.presentation.kanban import (
 )
 from ..extensions.lark.presentation.explore_results import (
     sync_issue_fix_explore_on_material_change,
+)
+from ..extensions.lark.presentation.sink_visibility import (
+    SINK_VISIBILITY_OWNER_ONLY,
+    SINK_VISIBILITY_SHARED,
+    SINK_VISIBILITIES,
 )
 from ..extensions.runtime import (
     default_extension_state_file,
@@ -136,6 +141,12 @@ def register_lark_kanban_commands(
     seed.add_argument("--goal-id", default="loopx-lark-kanban-poc")
     seed.add_argument("--worker-command", default="")
     seed.add_argument("--workdir", default="")
+    seed.add_argument(
+        "--sink-visibility",
+        choices=sorted(SINK_VISIBILITIES),
+        default=SINK_VISIBILITY_SHARED,
+        help="Shared boards receive public-safe redaction; defaults to shared for this operator sync.",
+    )
     seed.add_argument("--execute", action="store_true", help="Actually upsert the sample record.")
 
     cases = sub.add_parser(
@@ -148,6 +159,12 @@ def register_lark_kanban_commands(
     cases.add_argument("--goal-id", default="loopx-lark-kanban-ux")
     cases.add_argument("--worker-command", default="")
     cases.add_argument("--workdir", default="")
+    cases.add_argument(
+        "--sink-visibility",
+        choices=sorted(SINK_VISIBILITIES),
+        default=SINK_VISIBILITY_SHARED,
+        help="Shared boards receive public-safe redaction; defaults to shared for this operator sync.",
+    )
     cases.add_argument("--execute", action="store_true", help="Actually upsert the records.")
 
     sync = sub.add_parser(
@@ -165,6 +182,12 @@ def register_lark_kanban_commands(
     sync.add_argument("--project")
     sync.add_argument("--state-file")
     sync.add_argument("--include-done", action="store_true")
+    sync.add_argument(
+        "--sink-visibility",
+        choices=sorted(SINK_VISIBILITIES),
+        default=SINK_VISIBILITY_SHARED,
+        help="Shared boards receive public-safe redaction; defaults to shared for this operator sync.",
+    )
     sync.add_argument(
         "--limit",
         type=int,
@@ -211,8 +234,8 @@ def register_lark_kanban_commands(
     projection.add_argument("--source-id", help="Stable source namespace used in synthetic row ids.")
     projection.add_argument(
         "--sink-visibility",
-        choices=["owner-only", "shared"],
-        default="owner-only",
+        choices=sorted(SINK_VISIBILITIES),
+        default=SINK_VISIBILITY_OWNER_ONLY,
         help="Use shared to redact local paths, private links, and external ids before writing projection rows.",
     )
     projection.add_argument("--include-done", action="store_true")
@@ -252,6 +275,12 @@ def register_lark_kanban_commands(
     heartbeat.add_argument(
         "--worker-command",
         help="Override the row's Worker Command for this heartbeat.",
+    )
+    heartbeat.add_argument(
+        "--sink-visibility",
+        choices=sorted(SINK_VISIBILITIES),
+        default=SINK_VISIBILITY_SHARED,
+        help="Shared boards receive public-safe redaction; defaults to shared for this operator board.",
     )
     heartbeat.add_argument(
         "--allow-command-prefix",
@@ -440,6 +469,7 @@ def handle_lark_kanban_command(
             payload = seed_lark_kanban_task(
                 _target_config(args, config_path=config_path),
                 task=task,
+                sink_visibility=args.sink_visibility,
                 execute=bool(args.execute),
             )
             payload["execute"] = bool(args.execute)
@@ -456,6 +486,7 @@ def handle_lark_kanban_command(
             payload = seed_lark_kanban_records(
                 _target_config(args, config_path=config_path),
                 records=records,
+                sink_visibility=args.sink_visibility,
                 execute=bool(args.execute),
             )
             payload["execute"] = bool(args.execute)
@@ -472,6 +503,7 @@ def handle_lark_kanban_command(
                 state_file=Path(args.state_file).expanduser() if args.state_file else None,
                 include_done=bool(args.include_done),
                 limit=args.limit,
+                sink_visibility=args.sink_visibility,
                 execute=bool(args.execute),
             )
             try:
@@ -483,6 +515,7 @@ def handle_lark_kanban_command(
                     agent_id=args.agent_id,
                     project=Path(args.project).expanduser() if args.project else None,
                     state_file=Path(args.state_file).expanduser() if args.state_file else None,
+                    sink_visibility=args.sink_visibility,
                     execute=bool(args.execute),
                 )
                 projection_result = (
@@ -587,6 +620,7 @@ def handle_lark_kanban_command(
                 agent_id=args.agent_id,
                 fixture=fixture,
                 worker_command=args.worker_command,
+                sink_visibility=args.sink_visibility,
                 execute_lark=bool(args.execute_lark),
                 execute_worker=bool(args.execute_worker),
                 complete_on_success=bool(args.complete_on_success),

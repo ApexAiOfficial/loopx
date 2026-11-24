@@ -11,6 +11,9 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+from loopx.control_plane.testing.canary_harness import import_fixture_authority  # noqa: E402
+
 GOAL_ID = "explore-configure-fixture"
 
 
@@ -86,7 +89,9 @@ def write_fixture(root: Path) -> tuple[Path, Path]:
         + "\n",
         encoding="utf-8",
     )
-    return registry, root / "runtime"
+    runtime_root = root / "runtime"
+    import_fixture_authority(registry, GOAL_ID)
+    return registry, runtime_root
 
 
 def goal(registry: Path) -> dict:
@@ -250,7 +255,7 @@ def main() -> int:
         assert closed["written"] is True, closed
         assert goal(registry)["spawn_policy"]["explore_harness"] == {"enabled": False}
 
-        graph_closed_harness_open = run_cli(
+        rejected_graphless_planning = run_cli(
             registry,
             runtime_root,
             "configure-goal",
@@ -259,9 +264,16 @@ def main() -> int:
             "--no-explore-graph-enabled",
             "--explore-harness-enabled",
             "--execute",
+            check=False,
         )
-        assert graph_closed_harness_open["written"] is True, graph_closed_harness_open
-        assert goal(registry)["explore_graph"] == {"enabled": False}
+        assert rejected_graphless_planning["ok"] is False, rejected_graphless_planning
+        assert "planning requires its evidence graph" in rejected_graphless_planning["error"]
+        assert goal(registry)["explore_graph"] == {"enabled": True}
+        assert goal(registry)["spawn_policy"]["explore_harness"] == {"enabled": False}
+        unified = run_cli(registry, runtime_root, "configure-goal", "--goal-id", GOAL_ID,
+                          "--explore-mode", "planning", "--execute")
+        assert unified["ok"]
+        assert goal(registry)["explore_graph"] == {"enabled": True}
         assert goal(registry)["spawn_policy"]["explore_harness"] == {"enabled": True}
 
         conflict = run_cli(

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import signal
+import time
 import stat
 import subprocess
 import sys
@@ -8,13 +12,77 @@ from pathlib import Path
 
 import pytest
 
+from loopx.control_plane.goals.first_party_host_admission import (
+    FirstPartyHostGoalAdmission,
+    FirstPartyHostRuntimeRejected,
+)
+from loopx.control_plane.projects.registry_codec import (
+    source_session_registry_transaction,
+)
 from loopx.control_plane.turn_driver.codex_cli import (
     CODEX_CLI_SESSION_SCHEMA_VERSION,
+    CODEX_STDIO_MCP_SERVER_SCHEMA_VERSION,
+    _diagnostic_failure_category,
+    _event_failure_categories,
+    _event_failure_category,
+    _prompt,
+    _select_failure_category,
     codex_cli_result_schema,
     codex_cli_session_binding,
     load_codex_cli_session,
     run_codex_cli_host,
 )
+from loopx.control_plane.turn_driver.executor import BuiltInHostError
+from loopx.control_plane.turn_driver.subagent_execution_topology import (
+    OPAQUE_REF_PATTERN,
+)
+from tests.control_plane.host_process_fixture import (
+    COUNTER_PROCESS_SOURCE,
+    write_python_host_fixture,
+)
+
+
+FAILURE_ENVELOPE_FIXTURES = (
+    Path(__file__).parent / "fixtures" / "codex_failure_envelopes.json"
+)
+SOURCE_GOAL_REF = {
+    "goal_id": "fixture-goal",
+    "goal_instance_id": "ginst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+}
+
+
+def _source_admission(tmp_path: Path) -> FirstPartyHostGoalAdmission:
+    registry = tmp_path / "source" / ".loopx" / "registry.json"
+    payload = {
+        "schema_version": "0.2",
+        "registry_role": "project-local",
+        "profile_id": "source_session_v1",
+        "common_runtime_root": str(tmp_path / "runtime"),
+        "projects": [],
+        "goals": [
+            {
+                "id": "fixture-goal",
+                "goal_instance_id": SOURCE_GOAL_REF["goal_instance_id"],
+                "status": "active",
+                "execution_authority": False,
+            }
+        ],
+        "session_bindings": [],
+        "session_receipts": [],
+        "lifetime_receipts": [],
+        "retired_goal_instances": [],
+    }
+    with source_session_registry_transaction(
+        registry,
+        operation="codex_host_goal_instance_test",
+        create=lambda: payload,
+    ) as transaction:
+        transaction.commit(payload)
+    return FirstPartyHostGoalAdmission.for_plan(
+        registry_path=registry,
+        goal_id="fixture-goal",
+        planned_goal_ref=SOURCE_GOAL_REF,
+    )
 
 
 def _request(
@@ -48,24 +116,35 @@ def _request(
     }
 
 
+def _session_files(runtime_root: Path) -> list[Path]:
+    # Session authority is a SHA-256 filename; lock diagnostics are not sessions.
+    return [
+        path for path in runtime_root.glob("goals/*/turn-sessions/*.json")
+        if re.fullmatch(r"[0-9a-f]{64}\.json", path.name)
+    ]
+
+
 def _fake_codex(tmp_path: Path) -> tuple[Path, Path]:
     executable = tmp_path / "fake-codex"
     log_path = tmp_path / "codex-argv.jsonl"
-    executable.write_text(
-        """#!/usr/bin/env python3
+    source = """#!/usr/bin/env python3
 import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import time
 
 args = sys.argv[1:]
 prompt = sys.stdin.read()
+if os.environ.get("FAKE_CODEX_PROMPT_CAPTURE"):
+    pathlib.Path(os.environ["FAKE_CODEX_PROMPT_CAPTURE"]).write_text(prompt, encoding="utf-8")
 log = pathlib.Path(os.environ["FAKE_CODEX_LOG"])
 with log.open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(args) + "\\n")
 turn_key = re.search(r'"turn_key":"([^"]+)"', prompt).group(1)
+time.sleep(float(os.environ.get("FAKE_CODEX_BEFORE_SESSION_SLEEP", "0")))
 print(json.dumps({
     "type": "thread.started",
     "thread_id": "session-fixture-0001",
@@ -73,15 +152,52 @@ print(json.dumps({
     "private_material": "must-not-persist"
 }), flush=True)
 if os.environ.get("FAKE_CODEX_FAIL") == "1":
+    failure_event = os.environ.get("FAKE_CODEX_FAILURE_EVENT")
+    failure_stderr = os.environ.get("FAKE_CODEX_FAILURE_STDERR")
+    stderr_first = os.environ.get("FAKE_CODEX_FAILURE_STDERR_FIRST") == "1"
+    if failure_stderr and stderr_first:
+        print(failure_stderr, file=sys.stderr, flush=True)
+        time.sleep(0.05)
+    if failure_event:
+        print(failure_event, flush=True)
+    if failure_stderr and not stderr_first:
+        print(failure_stderr, file=sys.stderr, flush=True)
+    hold_pipe_seconds = os.environ.get("FAKE_CODEX_HOLD_PIPE_SECONDS")
+    if hold_pipe_seconds:
+        subprocess.Popen([
+            sys.executable,
+            "-c",
+            f"import time; time.sleep({float(hold_pipe_seconds)!r})",
+        ])
     if os.environ.get("FAKE_CODEX_FAILURE_CATEGORY") == "model":
         print("This model requires a newer version of Codex.", file=sys.stderr)
     if os.environ.get("FAKE_CODEX_FAILURE_CATEGORY") == "session":
         print("Session not found.", file=sys.stderr)
+    if os.environ.get("FAKE_CODEX_FAILURE_CATEGORY") == "capacity-stderr":
+        print("Selected model is at capacity. Please try a different model.", file=sys.stderr)
+    if os.environ.get("FAKE_CODEX_FAILURE_CATEGORY") == "capacity-event":
+        print(json.dumps({
+            "type": "error",
+            "message": "Selected model is at capacity. Please try a different model.",
+            "private_material": "must-not-persist"
+        }), flush=True)
     raise SystemExit(9)
+if os.environ.get("FAKE_CODEX_CHILD_MARKER"):
+    marker = os.environ["FAKE_CODEX_CHILD_MARKER"]
+    child = subprocess.Popen([
+        sys.executable,
+        "-c",
+        __COUNTER_PROCESS_SOURCE__,
+        marker,
+        marker + ".pid",
+        ".01",
+    ])
+    while not pathlib.Path(marker).exists():
+        time.sleep(.01)
 if os.environ.get("FAKE_CODEX_SLEEP"):
     time.sleep(float(os.environ["FAKE_CODEX_SLEEP"]))
 output_path = pathlib.Path(args[args.index("--output-last-message") + 1])
-output_path.write_text(json.dumps({
+result = {
     "schema_version": "loopx_turn_result_v0",
     "turn_key": turn_key,
     "result_kind": "validated_progress",
@@ -92,22 +208,124 @@ output_path.write_text(json.dumps({
     "delivery_batch_scale": "implementation",
     "delivery_outcome": "outcome_progress",
     "vision_unchanged_reason": "The fixture objective remains unchanged.",
-    "summary": "One public fixture advanced."
-}), encoding="utf-8")
-""",
-        encoding="utf-8",
+    "summary": "One public fixture advanced.",
+    "work_evidence": ["artifact:fixture-change"],
+    "validation_evidence": ["check:fixture-validation"]
+}
+result.update(json.loads(os.environ.get("FAKE_CODEX_RESULT_FIELDS", "{}")))
+output_path.write_text(json.dumps(result), encoding="utf-8")
+"""
+    executable = write_python_host_fixture(
+        executable,
+        source.replace(
+            "__COUNTER_PROCESS_SOURCE__",
+            repr(COUNTER_PROCESS_SOURCE),
+        ),
     )
-    executable.chmod(0o755)
     return executable, log_path
 
 
-def test_codex_cli_result_schema_requires_only_bounded_contract_fields() -> None:
-    schema = codex_cli_result_schema()
+def _capture_fake_codex_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failure_category: str | None = None,
+    failure_event: dict[str, object] | None = None,
+    failure_stderr: str | None = None,
+    stderr_first: bool = False,
+) -> tuple[BuiltInHostError, Path]:
+    executable, log_path = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    monkeypatch.setenv("FAKE_CODEX_FAIL", "1")
+    if failure_category is not None:
+        monkeypatch.setenv("FAKE_CODEX_FAILURE_CATEGORY", failure_category)
+    if failure_event is not None:
+        monkeypatch.setenv("FAKE_CODEX_FAILURE_EVENT", json.dumps(failure_event))
+    if failure_stderr is not None:
+        monkeypatch.setenv("FAKE_CODEX_FAILURE_STDERR", failure_stderr)
+    if stderr_first:
+        monkeypatch.setenv("FAKE_CODEX_FAILURE_STDERR_FIRST", "1")
+    runtime_root = tmp_path / "runtime"
+    project = tmp_path / "project"
+    project.mkdir()
+    request = _request()
+
+    with pytest.raises(BuiltInHostError) as exc_info:
+        run_codex_cli_host(
+            request,
+            runtime_root=runtime_root,
+            project=project,
+            codex_bin=str(executable),
+            timeout_seconds=5,
+        )
+    return exc_info.value, runtime_root
+
+
+@pytest.mark.parametrize("kind", ["wait", "user_action_required", "iteration_failed"])
+@pytest.mark.parametrize("with_profile", [False, True])
+def test_codex_cli_stop_null_evidence_reaches_executor(tmp_path, monkeypatch, kind, with_profile):
+    from loopx.control_plane.turn_driver.executor import validate_loopx_turn_host_result
+
+    executable, log_path = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    monkeypatch.setenv("FAKE_CODEX_RESULT_FIELDS", json.dumps({
+        "result_kind": kind, "work_evidence": None, "validation_evidence": None,
+        "delivery_batch_scale": "", "delivery_outcome": "", "vision_unchanged_reason": "",
+        "path_delta_mode": "", "agent_vision_json": "", "progress_observation_json": "",
+    }))
+    request = _request()
+    if with_profile:
+        request["turn_envelope"]["contract_capsule"] = {
+            "execution_profile": {"work_kind": "engineering_change"}
+        }
+    result = run_codex_cli_host(request, runtime_root=tmp_path / "runtime",
+        project=tmp_path, codex_bin=str(executable), timeout_seconds=5)
+    assert "work_evidence" not in result and "validation_evidence" not in result
+    verdict = validate_loopx_turn_host_result({"transaction": {"turn_key": request["turn_key"]}}, result)
+    assert verdict["ok"], verdict["errors"]
+
+
+@pytest.mark.parametrize("with_profile", [False, True])
+def test_codex_cli_result_schema_requires_only_bounded_contract_fields(with_profile) -> None:
+    request = _request()
+    if with_profile:
+        request["turn_envelope"]["contract_capsule"] = {
+            "execution_profile": {"work_kind": "engineering_change"}
+        }
+    schema = codex_cli_result_schema(request)
 
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == set(schema["properties"])
+    assert not {"allOf", "if", "then"}.intersection(schema)
+    for field in ("work_evidence", "validation_evidence"):
+        assert schema["properties"][field]["type"] == ["array", "null"]
+        assert schema["properties"][field]["minItems"] == 1
     assert "raw_trajectory" not in schema["properties"]
     assert "stdout" not in schema["properties"]
+    assert "child_execution_receipts" not in schema["properties"]
+    request = _request()
+    request["subagent_execution_topology"] = {
+        "schema_version": "subagent_execution_topology_v0"
+    }
+    enabled_schema = codex_cli_result_schema(request)
+    receipt_properties = enabled_schema["properties"]["child_execution_receipts"][
+        "items"
+    ]["properties"]
+    assert "task_packet_digest" in receipt_properties
+    assert receipt_properties["context_mode"]["enum"] == [
+        "forked_snapshot",
+        "fresh",
+        "resume",
+    ]
+    assert receipt_properties["runtime_id"] == {
+        "type": "string",
+        "enum": ["codex-cli"],
+    }
+    assert (
+        receipt_properties["evidence_refs"]["items"]["pattern"]
+        == OPAQUE_REF_PATTERN
+    )
+    assert receipt_properties["evidence_refs"]["minItems"] == 1
     assert {
         field: schema["properties"][field]["maxLength"]
         for field in (
@@ -126,9 +344,149 @@ def test_codex_cli_result_schema_requires_only_bounded_contract_fields() -> None
     }
 
 
+@pytest.mark.parametrize(
+    ("diagnostic", "expected"),
+    [
+        (
+            "Selected model is at capacity. Please try a different model.",
+            "provider_capacity",
+        ),
+        ("Server overloaded; retry later.", "provider_overloaded"),
+        ("The service is overloaded.", "provider_overloaded"),
+        ("Too many requests; retry later.", "rate_limited"),
+        ("Quota exceeded. Check your plan and billing details.", "quota_exhausted"),
+        ("You've hit your usage limit. Try again after the reset.", "quota_exhausted"),
+        ("You’ve hit your usage limit. Try again after the reset.", "quota_exhausted"),
+    ],
+)
+def test_codex_cli_diagnostic_fallback_keeps_failure_classes_distinct(
+    diagnostic: str,
+    expected: str,
+) -> None:
+    assert _diagnostic_failure_category(diagnostic) == expected
+
+
+def test_codex_cli_failure_envelopes_match_real_protocol_shapes() -> None:
+    fixture = json.loads(FAILURE_ENVELOPE_FIXTURES.read_text(encoding="utf-8"))
+
+    assert fixture["schema_version"] == "loopx_codex_failure_envelopes_v1"
+    for case in fixture["cases"]:
+        assert case["source"]
+        assert _event_failure_category(case["event"]) == case["expected"], case[
+            "name"
+        ]
+
+
+def test_codex_cli_unknown_structured_code_blocks_message_fallback() -> None:
+    event = {
+        "type": "turn.failed",
+        "error": {
+            "code": "unknown_provider_code",
+            "message": "Selected model is at capacity.",
+        },
+    }
+
+    assert _event_failure_category(event) == "unknown"
+
+
+@pytest.mark.parametrize("event_type", ["error", "turn.failed"])
+@pytest.mark.parametrize("apostrophe", ["'", "’"])
+def test_codex_cli_message_only_subscription_limit_is_not_a_transient_retry(event_type, apostrophe) -> None:
+    message = f"You{apostrophe}ve hit your usage limit. Try again after the reset."
+    event = {"type": event_type, "error": {"message": message}}
+    assert _event_failure_category(event) == "quota_exhausted"
+    # A present discriminator still wins over familiar prose.
+    event["error"]["code"] = "future_provider_failure"
+    assert _event_failure_category(event) == "unknown"
+    event["error"]["code"] = "rate_limit_exceeded"
+    assert _event_failure_category(event) == "rate_limited"
+
+
+@pytest.mark.parametrize(
+    ("outer_code", "inner_code"),
+    [
+        ("future_provider_failure", "rate_limit_exceeded"),
+        ("rate_limit_exceeded", "future_provider_failure"),
+    ],
+)
+def test_codex_cli_host_fails_closed_on_mixed_structured_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outer_code: str,
+    inner_code: str,
+) -> None:
+    failure_event: dict[str, object] = {
+        "type": "response.failed",
+        "code": outer_code,
+        "response": {"error": {"code": inner_code}},
+    }
+
+    assert _event_failure_categories(failure_event) == ("unknown", None)
+
+    error, _runtime_root = _capture_fake_codex_failure(
+        tmp_path,
+        monkeypatch,
+        failure_event=failure_event,
+    )
+
+    assert error.reason == "codex_cli_unknown"
+    assert error.failure_kind == "unknown"
+    assert error.recovery_kind is None
+
+
+@pytest.mark.parametrize(
+    "categories",
+    [
+        ["unknown", "rate_limited"],
+        ["rate_limited", "unknown"],
+    ],
+)
+def test_failure_category_reduction_is_order_independent(
+    categories: list[str],
+) -> None:
+    assert _select_failure_category(categories) == "unknown"
+
+
+def test_codex_cli_specific_quota_code_wins_over_http_429() -> None:
+    event = {
+        "type": "response.failed",
+        "response": {
+            "error": {
+                "code": "insufficient_quota",
+                "httpStatusCode": 429,
+                "message": "Rate limit reached.",
+            }
+        },
+    }
+
+    assert _event_failure_category(event) == "quota_exhausted"
+
+
+def test_codex_cli_prompt_isolates_subagent_instructions_to_enabled_request() -> None:
+    request = _request()
+
+    disabled_prompt = _prompt(request)
+    assert "spawn_agent" not in disabled_prompt
+    assert "subagent_execution_topology" not in disabled_prompt
+
+    request["subagent_execution_topology"] = {
+        "schema_version": "subagent_execution_topology_v0"
+    }
+    prompt = _prompt(request)
+    assert "execute the separate host_adapter projection" in prompt
+    assert 'fresh maps to fork_turns="none"' in prompt
+    assert 'forked_snapshot maps to fork_turns="all"' in prompt
+    assert "never infer native arguments inside the generic LoopX task packet" in prompt
+    assert "set runtime_id to the stable host id codex-cli" in prompt
+    assert "Never use an executable, workspace, session-file" in prompt
+    assert "opaque evidence_refs such as artifact:child-result" in prompt
+
+
+@pytest.mark.parametrize("sandbox", ["read-only", "workspace-write", "danger-full-access"])
 def test_codex_cli_host_starts_then_resumes_opaque_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    sandbox: str,
 ) -> None:
     executable, log_path = _fake_codex(tmp_path)
     monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
@@ -142,7 +500,9 @@ def test_codex_cli_host_starts_then_resumes_opaque_session(
         runtime_root=runtime_root,
         project=project,
         codex_bin=str(executable),
-        sandbox="workspace-write",
+        sandbox=sandbox,
+        model="gpt-5.6-sol",
+        reasoning_effort="xhigh",
         timeout_seconds=5,
     )
     with pytest.raises(RuntimeError, match="binding changed after planning"):
@@ -162,7 +522,9 @@ def test_codex_cli_host_starts_then_resumes_opaque_session(
         runtime_root=runtime_root,
         project=project,
         codex_bin=str(executable),
-        sandbox="workspace-write",
+        sandbox=sandbox,
+        model="gpt-5.6-sol",
+        reasoning_effort="xhigh",
         timeout_seconds=5,
     )
 
@@ -174,9 +536,17 @@ def test_codex_cli_host_starts_then_resumes_opaque_session(
     assert "resume" not in argv_rows[0]
     assert "resume" in argv_rows[1]
     assert "session-fixture-0001" in argv_rows[1]
+    for argv in argv_rows:
+        assert argv[argv.index("--model") + 1] == "gpt-5.6-sol"
+        config_values = [
+            argv[index + 1]
+            for index, value in enumerate(argv)
+            if value == "-c"
+        ]
+        assert 'model_reasoning_effort="xhigh"' in config_values
     resume_argv = argv_rows[1]
     assert resume_argv[resume_argv.index("-c") + 1] == (
-        'sandbox_mode="workspace-write"'
+        f'sandbox_mode="{sandbox}"'
     )
     assert resume_argv[resume_argv.index("-C") + 1] == str(project)
     assert resume_argv.index("-C") < resume_argv.index("resume")
@@ -202,12 +572,733 @@ def test_codex_cli_host_starts_then_resumes_opaque_session(
         "host",
         "session_id",
     }
-    session_paths = list(runtime_root.glob("goals/*/turn-sessions/*.json"))
+    session_paths = _session_files(runtime_root)
     assert len(session_paths) == 1
-    assert stat.S_IMODE(session_paths[0].stat().st_mode) == 0o600
+    if os.name != "nt":  # POSIX mode bits do not express Windows ACLs.
+        assert stat.S_IMODE(session_paths[0].stat().st_mode) == 0o600
     persisted = session_paths[0].read_text(encoding="utf-8")
     assert "raw_trajectory" not in persisted
     assert "private_material" not in persisted
+
+
+@pytest.mark.parametrize("scope", ["todo", "agent"])
+def test_codex_session_scope_across_todos(tmp_path, monkeypatch, scope):
+    executable, log_path = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    project = tmp_path / "project"
+    project.mkdir()
+    runtime_root = tmp_path / "runtime"
+    first = _request()
+    first["session"]["context_policy"] = {"mode": "resume", "binding_scope": scope}
+    run_codex_cli_host(first, runtime_root=runtime_root, project=project,
+                       codex_bin=str(executable), timeout_seconds=5)
+    second = _request(turn_key="sha256:" + "b" * 64,
+                      session_action="resume" if scope == "agent" else "start_new")
+    second["turn_envelope"]["action"]["selected_todo"]["todo_id"] = "todo_successor"
+    second["session"]["context_policy"] = {"mode": "resume", "binding_scope": scope}
+    run_codex_cli_host(second, runtime_root=runtime_root, project=project,
+                       codex_bin=str(executable), timeout_seconds=5)
+    calls = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert ("resume" in calls[1]) is (scope == "agent")
+    if scope == "agent":
+        assert "session-fixture-0001" in calls[1]
+    assert len(_session_files(runtime_root)) == (1 if scope == "agent" else 2)
+
+
+def test_agent_resume_rejects_changed_profile_before_launch(tmp_path, monkeypatch):
+    executable, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    request = _request()
+    request["session"]["context_policy"] = {"mode": "resume", "binding_scope": "agent"}
+    options = dict(runtime_root=tmp_path / "runtime", project=tmp_path, codex_bin=str(executable))
+    run_codex_cli_host(request, model="fixture-model", **options)
+    request["session"]["action"] = "resume"
+    with pytest.raises(ValueError, match="profile changed"):
+        run_codex_cli_host(request, model="another-model", **options)
+    assert len(log.read_text().splitlines()) == 1
+
+
+def _write_resume_registry(path, project, *, scopes, expired=False, active=True):
+    entry = {"write_scope": scopes, "source": "operator-test", "decision": "approve",
+             "status": "active", "recorded_at": "2025-01-01T00:00:00Z"}
+    if expired:
+        entry["expires_at"] = "2025-01-02T00:00:00Z"
+    path.write_text(json.dumps({"schema_version": "0.2", "projects": [], "goals": [{
+        "id": "fixture-goal", "status": "active" if active else "retired", "repo": str(project),
+        "coordination": {"registered_agents": ["codex-fixture"],
+                         "checkpointed_boundary_authority": [entry]},
+    }]}))
+
+
+def test_approved_agent_write_resume_preserves_native_session(tmp_path, monkeypatch):
+    executable, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    project = tmp_path / "project"
+    project.mkdir()
+    registry = tmp_path / "registry.json"
+    _write_resume_registry(registry, project, scopes=["**"])
+    request = _request()
+    request["session"]["context_policy"] = {"mode": "resume", "binding_scope": "agent"}
+    options = dict(runtime_root=tmp_path / "runtime", project=project, codex_bin=str(executable),
+                   registry_path=registry)
+    run_codex_cli_host(request, sandbox="read-only", **options)
+    request["session"]["action"] = "resume"
+    run_codex_cli_host(request, sandbox="workspace-write", **options)
+    run_codex_cli_host(request, sandbox="workspace-write", **options)
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(calls) == 3
+    assert all("resume" in call and "session-fixture-0001" in call for call in calls[1:])
+    assert all('sandbox_mode="workspace-write"' in call for call in calls[1:])
+    assert len(_session_files(tmp_path / "runtime")) == 1
+
+
+def test_source_session_storage_observation_does_not_authorize_write_resume(tmp_path, monkeypatch):
+    from loopx.capabilities.native_chat.project_context import coordination_runtime_root
+
+    executable, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    project = tmp_path / "project"
+    project.mkdir()
+    admission = _source_admission(tmp_path)
+    with source_session_registry_transaction(
+        admission.registry_path, operation="fixture_lifecycle_workspace_approval"
+    ) as transaction:
+        payload = transaction.payload_copy()
+        goal = payload["goals"][0]
+        goal["repo"] = str(project)
+        goal["coordination"] = {
+            "registered_agents": ["codex-fixture"],
+            "checkpointed_boundary_authority": [{
+                "write_scope": ["**"], "source": "operator-test", "decision": "approve",
+                "status": "active", "recorded_at": "2025-01-01T00:00:00Z",
+            }],
+        }
+        transaction.commit(payload)
+    assert coordination_runtime_root(admission.registry_path, tmp_path / "chat") == tmp_path / "runtime"
+    request = _request()
+    request["goal_ref"] = SOURCE_GOAL_REF
+    request["session"]["context_policy"] = {"mode": "resume", "binding_scope": "agent"}
+    options = dict(runtime_root=tmp_path / "runtime", project=project,
+                   codex_bin=str(executable), registry_path=admission.registry_path,
+                   goal_admission=admission)
+    run_codex_cli_host(request, sandbox="read-only", **options)
+    binding = _session_files(tmp_path / "runtime")[0]
+    original_binding = binding.read_bytes()
+    original_registry = admission.registry_path.read_bytes()
+    request["session"]["action"] = "resume"
+    with pytest.raises(ValueError, match="profile changed"):
+        run_codex_cli_host(request, sandbox="workspace-write", **options)
+    assert len(log.read_text().splitlines()) == 1
+    assert binding.read_bytes() == original_binding
+    assert admission.registry_path.read_bytes() == original_registry
+
+
+@pytest.mark.parametrize("field", ["expires_at", "fresh_until"])
+@pytest.mark.parametrize("value", [
+    "not-an-iso-timestamp", "2026-02-30T00:00:00Z", 0, 20990101, False, [], {},
+    "0001-01-01T00:00:00+01:00",
+])
+def test_malformed_expiry_refuses_write_resume_without_binding_or_host_effects(
+    tmp_path, monkeypatch, field, value,
+):
+    executable, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    project = tmp_path / "project"
+    project.mkdir()
+    registry = tmp_path / "registry.json"
+    _write_resume_registry(registry, project, scopes=["**"])
+    request = _request()
+    request["session"]["context_policy"] = {"mode": "resume", "binding_scope": "agent"}
+    options = dict(runtime_root=tmp_path / "runtime", project=project,
+                   codex_bin=str(executable), registry_path=registry)
+    run_codex_cli_host(request, sandbox="read-only", **options)
+    binding = _session_files(tmp_path / "runtime")[0]
+    original_binding = binding.read_bytes()
+    payload = json.loads(registry.read_text())
+    entry = payload["goals"][0]["coordination"]["checkpointed_boundary_authority"][0]
+    entry[field] = value
+    registry.write_text(json.dumps(payload))
+    invalid_registry = registry.read_bytes()
+    request["session"]["action"] = "resume"
+    with pytest.raises(ValueError, match="profile changed"):
+        run_codex_cli_host(request, sandbox="workspace-write", **options)
+    assert len(log.read_text().splitlines()) == 1
+    assert binding.read_bytes() == original_binding
+    assert registry.read_bytes() == invalid_registry
+
+    # Correcting current source approval permits the same native Session.
+    entry[field] = "2099-01-01T00:00:00Z"
+    registry.write_text(json.dumps(payload))
+    run_codex_cli_host(request, sandbox="workspace-write", **options)
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(calls) == 2
+    assert "resume" in calls[1] and "session-fixture-0001" in calls[1]
+    assert json.loads(binding.read_text())["session_id"] == "session-fixture-0001"
+    assert len(_session_files(tmp_path / "runtime")) == 1
+
+
+@pytest.mark.parametrize("case", ["missing", "expired", "inactive", "file", "sibling", "parent",
+                                  "model", "home", "mcp", "unregistered", "projection"])
+def test_write_resume_rejects_unapproved_or_other_profile_changes(tmp_path, monkeypatch, case):
+    executable, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    project = tmp_path / "project"
+    project.mkdir()
+    worker = project / "worker"
+    worker.mkdir()
+    registry = tmp_path / "registry.json"
+    scopes = {"file": ["worker/result.json"], "sibling": ["other/**"],
+              "parent": ["worker/../**"]}.get(case, ["worker/**"])
+    _write_resume_registry(registry, project, scopes=scopes, expired=case == "expired")
+    if case in {"unregistered", "projection"}:
+        payload = json.loads(registry.read_text())
+        coordination = payload["goals"][0]["coordination"]
+        if case == "unregistered":
+            coordination["registered_agents"] = ["another-agent"]
+        else:
+            coordination["checkpointed_boundary_authority"] = {
+                "active_count": 1, "active_write_scope": ["worker/**"]}
+        registry.write_text(json.dumps(payload))
+    request = _request()
+    request["session"]["context_policy"] = {"mode": "resume", "binding_scope": "agent"}
+    options = dict(runtime_root=tmp_path / "runtime", project=worker, codex_bin=str(executable),
+                   registry_path=None if case == "missing" else registry, model="fixture-model")
+    run_codex_cli_host(request, sandbox="read-only", **options)
+    if case == "inactive":
+        _write_resume_registry(registry, project, scopes=scopes, active=False)
+    request["session"]["action"] = "resume"
+    if case == "model":
+        options["model"] = "another-model"
+    if case == "home":
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "different-home"))
+    if case == "mcp":
+        options["mcp_server"] = {"schema_version": CODEX_STDIO_MCP_SERVER_SCHEMA_VERSION,
+                                  "name": "changed", "command": [sys.executable, "server.py"]}
+    with pytest.raises(ValueError, match="profile changed"):
+        run_codex_cli_host(request, sandbox="workspace-write", **options)
+    assert len(log.read_text().splitlines()) == 1
+
+
+def test_agent_binding_still_requires_exact_goal_lifetime(tmp_path, monkeypatch):
+    executable, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    admission = _source_admission(tmp_path)
+    request = _request()
+    request["goal_ref"] = SOURCE_GOAL_REF
+    request["session"]["context_policy"] = {"mode": "resume", "binding_scope": "agent"}
+    run_codex_cli_host(request, runtime_root=tmp_path / "runtime", project=tmp_path,
+                       codex_bin=str(executable), goal_admission=admission)
+    with source_session_registry_transaction(admission.registry_path, operation="fixture_new_lifetime") as transaction:
+        registry = transaction.payload_copy()
+        registry["goals"][0]["goal_instance_id"] = "ginst_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        transaction.commit(registry)
+    with pytest.raises(RuntimeError, match="first-party Host runtime rejected"):
+        codex_cli_session_binding(tmp_path / "runtime", request["turn_envelope"],
+                                  session_scope="agent", goal_admission=admission)
+    request["session"]["context_policy"]["mode"] = "fresh"
+    with pytest.raises(RuntimeError, match="first-party Host runtime rejected"):
+        run_codex_cli_host(request, runtime_root=tmp_path / "runtime", project=tmp_path,
+                           codex_bin=str(executable), goal_admission=admission)
+    assert len(log.read_text().splitlines()) == 1
+
+
+def test_stopped_source_goal_rejects_resume_before_provider_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    admission = _source_admission(tmp_path)
+    request = _request()
+    request["goal_ref"] = SOURCE_GOAL_REF
+    request["session"]["context_policy"] = {
+        "mode": "resume",
+        "binding_scope": "agent",
+    }
+    options = {
+        "runtime_root": tmp_path / "runtime",
+        "project": tmp_path,
+        "codex_bin": str(executable),
+        "goal_admission": admission,
+    }
+    run_codex_cli_host(request, **options)
+    binding = next((tmp_path / "runtime").glob("goals/*/turn-sessions/*.json"))
+    original_binding = binding.read_bytes()
+
+    with source_session_registry_transaction(
+        admission.registry_path,
+        operation="fixture_stop_goal",
+    ) as transaction:
+        registry = transaction.payload_copy()
+        registry["goals"][0]["activation"] = {
+            "schema_version": "loopx_goal_activation_v1",
+            "state": "stopped",
+            "updated_at": "2026-10-10T12:00:00Z",
+            "reason": "Owner paused the Goal",
+        }
+        transaction.commit(registry)
+
+    request["session"]["action"] = "resume"
+    with pytest.raises(FirstPartyHostRuntimeRejected) as error:
+        run_codex_cli_host(request, **options)
+
+    assert error.value.code == "goal_stopped"
+    assert len(log.read_text().splitlines()) == 1
+    assert binding.read_bytes() == original_binding
+
+
+@pytest.mark.parametrize("context", ["fresh", "resume"])
+def test_executable_legacy_goal_stop_after_selection_prevents_host_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, context: str,
+) -> None:
+    from loopx.control_plane.projects.registry_codec import project_registry_transaction
+    from loopx.control_plane.turn_driver import codex_cli
+
+    executable, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    registry_path = tmp_path / "registry.json"
+    _write_resume_registry(registry_path, tmp_path, scopes=["**"])
+    request = _request()
+    request["session"]["context_policy"] = {"mode": "resume", "binding_scope": "agent"}
+    options = {"runtime_root": tmp_path / "runtime", "project": tmp_path,
+               "codex_bin": str(executable), "registry_path": registry_path}
+    run_codex_cli_host(request, **options)
+    binding = _session_files(tmp_path / "runtime")[0]
+    original_binding = binding.read_bytes()
+    original_input = codex_cli.prepare_codex_cli_input
+
+    def stop_before_dispatch(current):
+        with project_registry_transaction(registry_path, operation="fixture_stop_before_launch") as transaction:
+            registry = transaction.payload_copy()
+            registry["goals"][0]["activation"] = {
+                "schema_version": "loopx_goal_activation_v1", "state": "stopped",
+                "updated_at": "2026-10-10T12:00:00Z", "reason": "Owner stopped this Goal",
+            }
+            transaction.commit(registry)
+        return original_input(current)
+
+    monkeypatch.setattr(codex_cli, "prepare_codex_cli_input", stop_before_dispatch)
+    request["session"]["context_policy"]["mode"] = context
+    request["session"]["action"] = "resume" if context == "resume" else "start_new"
+    with pytest.raises(FirstPartyHostRuntimeRejected, match="goal_stopped"):
+        run_codex_cli_host(request, **options)
+    assert len(log.read_text().splitlines()) == 1
+    assert binding.read_bytes() == original_binding
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_default_turn_cli_blocks_native_launch_after_canonical_goal_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str,
+) -> None:
+    import contextlib
+    import io
+
+    from loopx.cli import main as cli_main
+    from loopx.control_plane.projects.registry_codec import project_registry_transaction
+    from loopx.control_plane.turn_driver import codex_cli
+    from tests.control_plane.canonical_authority_fixture import isolate_sqlite_runtime
+    from tests.test_loopx_turn_driver import _write_live_fixture
+
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry_path = _write_live_fixture(tmp_path, provider=provider)
+    executable, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    original_input = codex_cli.prepare_codex_cli_input
+    reached_host = []
+
+    def stop_before_dispatch(current):
+        reached_host.append(current["turn_key"])
+        with project_registry_transaction(registry_path, operation="fixture_stop_before_launch") as transaction:
+            registry = transaction.payload_copy()
+            registry["goals"][0]["activation"] = {
+                "schema_version": "loopx_goal_activation_v1", "state": "stopped",
+                "updated_at": "2026-10-10T12:00:00Z", "reason": "Owner stopped this Goal",
+            }
+            transaction.commit(registry)
+        return original_input(current)
+
+    monkeypatch.setattr(codex_cli, "prepare_codex_cli_input", stop_before_dispatch)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = cli_main([
+            "--registry", str(registry_path), "--runtime-root", str(runtime), "--format", "json",
+            "turn", "run-once", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+            "--host", "codex-cli", "--project", str(project),
+            "--codex-bin", str(executable), "--codex-sandbox", "read-only", "--no-global-sync",
+            "--iteration-context", "fresh", "--turn-instance-id", "cancel-before-native-launch",
+            "--validation-command-json", json.dumps([sys.executable, "-c", "pass"]), "--execute",
+        ])
+    payload = json.loads(output.getvalue())
+    assert reached_host and code == 1, payload
+    assert "goal_stopped" in json.dumps(payload)
+    assert not log.exists() and not _session_files(runtime)
+    index = runtime / "goals/loopx-turn-fixture/runs/index.jsonl"
+    rows = [json.loads(line) for line in index.read_text().splitlines()] if index.exists() else []
+    assert not any(row.get("classification") == "quota_slot_spent" for row in rows)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="ordinary Codex exec interrupt on POSIX")
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_default_turn_cli_interrupts_running_native_exec_after_goal_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str,
+) -> None:
+    import io
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import redirect_stdout
+
+    from loopx.cli import main as cli_main
+    from loopx.control_plane.goals.activation_service import set_goal_activation_state
+    from tests.control_plane.canonical_authority_fixture import isolate_sqlite_runtime
+    from tests.test_loopx_turn_driver import _write_live_fixture
+
+    if provider == "sqlite":
+        isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, registry = _write_live_fixture(tmp_path, provider=provider)
+    started, interrupted = project / "host-started", project / "host-interrupted"
+    executable = write_python_host_fixture(tmp_path / "codex-fixture", f'''#!{sys.executable}
+import signal, sys, time
+from pathlib import Path
+
+def on_interrupt(_signum, _frame):
+    Path({str(interrupted)!r}).touch()
+    sys.exit(1)
+
+assert sys.argv[1] == "exec"
+signal.signal(signal.SIGINT, on_interrupt)
+Path({str(started)!r}).touch()
+time.sleep(30)
+''')
+
+    def stop_running_goal():
+        deadline = time.monotonic() + 12
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert started.exists(), "ordinary native Host never launched"
+        return set_goal_activation_state(
+            registry_path=registry, goal_id="loopx-turn-fixture", state="stopped",
+            reason="Owner stopped the running fixture", actor_kind="owner", execute=True,
+        )
+
+    output = io.StringIO()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        stopped = executor.submit(stop_running_goal)
+        with redirect_stdout(output):
+            code = cli_main([
+                "--registry", str(registry), "--runtime-root", str(runtime), "--format", "json",
+                "turn", "run-once", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+                "--host", "codex-cli", "--project", str(project), "--codex-bin", str(executable),
+                "--codex-sandbox", "read-only", "--no-global-sync", "--iteration-context", "fresh",
+                "--turn-instance-id", "cancel-running-native-exec", "--timeout-seconds", "20",
+                "--validation-command-json", json.dumps([sys.executable, "-c", "pass"]), "--execute",
+            ])
+        assert stopped.result()["readback"]["verified"]
+    payload = json.loads(output.getvalue())
+    assert code == 1 and payload["error_code"] == "goal_stopped", payload
+    assert interrupted.exists()
+    assert not _session_files(runtime)
+    index = runtime / "goals/loopx-turn-fixture/runs/index.jsonl"
+    rows = [json.loads(line) for line in index.read_text().splitlines()] if index.exists() else []
+    assert not any(row.get("classification") == "quota_slot_spent" for row in rows)
+
+
+@pytest.mark.parametrize("context", ["fresh", "resume"])
+@pytest.mark.parametrize("change", ["stop", "replace"])
+def test_source_goal_change_after_session_selection_prevents_host_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, context: str, change: str,
+) -> None:
+    from loopx.control_plane.turn_driver import codex_cli
+
+    executable, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    admission = _source_admission(tmp_path)
+    request = _request()
+    request["goal_ref"] = SOURCE_GOAL_REF
+    request["session"]["context_policy"] = {"mode": "resume", "binding_scope": "agent"}
+    options = {"runtime_root": tmp_path / "runtime", "project": tmp_path,
+               "codex_bin": str(executable), "goal_admission": admission}
+    run_codex_cli_host(request, **options)
+    binding = _session_files(tmp_path / "runtime")[0]
+    original_binding = binding.read_bytes()
+    original_input = codex_cli.prepare_codex_cli_input
+
+    def change_before_dispatch(current):
+        # Session selection has succeeded, but no new Host request exists yet.
+        with source_session_registry_transaction(
+            admission.registry_path, operation="fixture_change_before_dispatch",
+        ) as transaction:
+            registry = transaction.payload_copy()
+            if change == "replace":
+                registry["goals"][0]["goal_instance_id"] = "ginst_" + "b" * 32
+            else:
+                registry["goals"][0]["activation"] = {
+                    "schema_version": "loopx_goal_activation_v1", "state": "stopped",
+                    "updated_at": "2026-10-10T12:00:00Z", "reason": "Owner stopped this Goal",
+                }
+            transaction.commit(registry)
+        return original_input(current)
+
+    monkeypatch.setattr(codex_cli, "prepare_codex_cli_input", change_before_dispatch)
+    request["session"]["context_policy"]["mode"] = context
+    request["session"]["action"] = "resume" if context == "resume" else "start_new"
+    with pytest.raises(FirstPartyHostRuntimeRejected) as error:
+        run_codex_cli_host(request, **options)
+    assert error.value.code == ("goal_stopped" if change == "stop" else "stale_goal_instance")
+    assert len(log.read_text().splitlines()) == 1
+    assert binding.read_bytes() == original_binding
+
+
+def test_codex_source_session_descriptor_persists_exact_goal_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, log_path = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    runtime_root = tmp_path / "runtime"
+    project = tmp_path / "project"
+    project.mkdir()
+    admission = _source_admission(tmp_path)
+    request = _request()
+    request["goal_ref"] = SOURCE_GOAL_REF
+
+    run_codex_cli_host(
+        request,
+        runtime_root=runtime_root,
+        project=project,
+        codex_bin=str(executable),
+        timeout_seconds=5,
+        goal_admission=admission,
+    )
+
+    envelope = request["turn_envelope"]
+    assert isinstance(envelope, dict)
+    binding = codex_cli_session_binding(
+        runtime_root,
+        envelope,
+        goal_admission=admission,
+    )
+    assert binding is not None
+    stored = load_codex_cli_session(
+        runtime_root,
+        lineage={
+            "goal_id": "fixture-goal",
+            "agent_id": "codex-fixture",
+            "todo_id": "todo_fixture0001",
+        },
+    )
+    assert stored is not None
+    assert stored["goal_ref"] == SOURCE_GOAL_REF
+
+
+def test_codex_source_session_rejects_alias_only_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, log_path = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    runtime_root = tmp_path / "runtime"
+    project = tmp_path / "project"
+    project.mkdir()
+    request = _request()
+    run_codex_cli_host(
+        request,
+        runtime_root=runtime_root,
+        project=project,
+        codex_bin=str(executable),
+        timeout_seconds=5,
+    )
+    descriptor_path = next(
+        (runtime_root / "goals" / "fixture-goal" / "turn-sessions").glob("*.json")
+    )
+    descriptor_before = descriptor_path.read_bytes()
+    admission = _source_admission(tmp_path)
+
+    with pytest.raises(
+        RuntimeError,
+        match="first-party Host runtime rejected: legacy_host_state",
+    ):
+        codex_cli_session_binding(
+            runtime_root,
+            request["turn_envelope"],
+            goal_admission=admission,
+        )
+
+    assert descriptor_path.read_bytes() == descriptor_before
+
+
+@pytest.mark.parametrize("server_name", ["loopx_delegation", "fixture_tools"])
+def test_codex_cli_host_materializes_bound_mcp_tools_for_fresh_and_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_name: str,
+) -> None:
+    executable, log_path = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    monkeypatch.setenv("LOOPX_TURN_KEY", "stale-turn")
+    runtime_root = tmp_path / "runtime"
+    project = tmp_path / "project"
+    project.mkdir()
+    server = {
+        "schema_version": CODEX_STDIO_MCP_SERVER_SCHEMA_VERSION,
+        "name": server_name,
+        "command": [
+            sys.executable,
+            "-m",
+            "loopx.collaboration_mcp",
+            "--agent-id",
+            "reviewer",
+        ],
+    }
+
+    run_codex_cli_host(
+        _request(),
+        runtime_root=runtime_root,
+        project=project,
+        codex_bin=str(executable),
+        mcp_server=server,
+        timeout_seconds=5,
+    )
+    run_codex_cli_host(
+        _request(
+            turn_key="sha256:" + "b" * 64,
+            session_action="resume",
+        ),
+        runtime_root=runtime_root,
+        project=project,
+        codex_bin=str(executable),
+        mcp_server=server,
+        timeout_seconds=5,
+    )
+
+    invocations = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(invocations) == 2
+    for turn_character, argv_json in zip("ab", invocations, strict=True):
+        argv = json.loads(argv_json)
+        config_values = [
+            argv[index + 1]
+            for index, value in enumerate(argv)
+            if value == "-c"
+        ]
+        assert (
+            f'mcp_servers.{server_name}.command={json.dumps(sys.executable)}'
+            in config_values
+        )
+        assert (
+            f"mcp_servers.{server_name}.args="
+            + json.dumps(server["command"][1:])
+            in config_values
+        )
+        assert f"mcp_servers.{server_name}.enabled=true" in config_values
+        assert f"mcp_servers.{server_name}.required=true" in config_values
+        assert (
+            f'mcp_servers.{server_name}.default_tools_approval_mode="approve"'
+            in config_values
+        )
+        assert f"mcp_servers.{server_name}.startup_timeout_sec=30" in config_values
+        assert f"mcp_servers.{server_name}.tool_timeout_sec=60" in config_values
+
+        turn_environment = {
+            key.rsplit(".", 1)[-1]: json.loads(value)
+            for entry in config_values
+            for key, value in [entry.split("=", 1)]
+            if key.startswith(f"mcp_servers.{server_name}.env.")
+        }
+        if server_name == "loopx_delegation":
+            assert turn_environment == {
+                "LOOPX_TURN_KEY": "sha256:" + turn_character * 64,
+                "LOOPX_TURN_GOAL_ID": "fixture-goal",
+                "LOOPX_TURN_AGENT_ID": "codex-fixture",
+                "LOOPX_TURN_WORKSPACE": str(project.resolve()),
+            }
+        else:
+            assert turn_environment == {}
+
+
+def test_codex_cli_host_rejects_invalid_mcp_binding_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, log_path = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    project = tmp_path / "project"
+    project.mkdir()
+
+    with pytest.raises(ValueError, match="server name is invalid"):
+        run_codex_cli_host(
+            _request(),
+            runtime_root=tmp_path / "runtime",
+            project=project,
+            codex_bin=str(executable),
+            mcp_server={
+                "schema_version": CODEX_STDIO_MCP_SERVER_SCHEMA_VERSION,
+                "name": "not.a.safe.table",
+                "command": [sys.executable, "-m", "fixture"],
+            },
+            timeout_seconds=5,
+        )
+
+    assert not log_path.exists()
+
+
+def test_codex_cli_host_rejects_unknown_reasoning_effort_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, log_path = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    project = tmp_path / "project"
+    project.mkdir()
+
+    with pytest.raises(ValueError, match="unsupported reasoning effort"):
+        run_codex_cli_host(
+            _request(),
+            runtime_root=tmp_path / "runtime",
+            project=project,
+            codex_bin=str(executable),
+            reasoning_effort="turbo",
+            timeout_seconds=5,
+        )
+
+    assert not log_path.exists()
+
+
+def test_codex_cli_host_fresh_iteration_ignores_stored_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, log_path = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    runtime_root = tmp_path / "runtime"
+    project = tmp_path / "project"
+    project.mkdir()
+    run_codex_cli_host(
+        _request(),
+        runtime_root=runtime_root,
+        project=project,
+        codex_bin=str(executable),
+        timeout_seconds=5,
+    )
+
+    fresh_request = _request(turn_key="sha256:" + "e" * 64)
+    fresh_request["session"]["context_policy"] = {
+        "schema_version": "loopx_iteration_context_policy_v0",
+        "mode": "fresh",
+        "scope": "iteration",
+    }
+    second = run_codex_cli_host(
+        fresh_request,
+        runtime_root=runtime_root,
+        project=project,
+        codex_bin=str(executable),
+        timeout_seconds=5,
+    )
+
+    assert second["turn_key"] == fresh_request["turn_key"]
+    argv_rows = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(argv_rows) == 2
+    assert all("resume" not in argv for argv in argv_rows)
 
 
 def test_codex_cli_host_ignores_legacy_session_eligibility(
@@ -227,7 +1318,7 @@ def test_codex_cli_host_ignores_legacy_session_eligibility(
         codex_bin=str(executable),
         timeout_seconds=5,
     )
-    session_path = next(runtime_root.glob("goals/*/turn-sessions/*.json"))
+    session_path = _session_files(runtime_root)[0]
     legacy = json.loads(session_path.read_text(encoding="utf-8"))
     legacy["schema_version"] = "loopx_codex_cli_session_v0"
     session_path.write_text(json.dumps(legacy), encoding="utf-8")
@@ -275,6 +1366,58 @@ def test_codex_cli_host_preserves_observed_session_after_timeout(
     project.mkdir()
     request = _request()
 
+    # This case needs a known-observed Session, not a bet that a Python Host
+    # starts before the deadline on a loaded machine. Control only the native
+    # supervisor timer; actual spawn, pipes, parsing, cleanup and persistence run.
+    # The separate real-deadline case below covers timeout before observation.
+    from loopx.control_plane.turn_driver import codex_cli
+
+    marker = tmp_path / "observed-session.json"
+    clock = tmp_path / "session-timeout.mjs"
+    clock.write_text("""
+import {writeFileSync} from 'node:fs';
+const timer = globalThis.setTimeout;
+let expire, pending = '';
+globalThis.setTimeout = (callback, ms, ...args) => {
+  // The guarded bridge subtracts startup from the transport's one-second
+  // minimum. No other timer in this fixture uses that interval.
+  if (!expire && ms > 0 && ms <= 1000) {
+    const watchdog = timer(callback, 5000, ...args);
+    expire = () => { clearTimeout(watchdog); callback(...args); };
+    return watchdog;
+  }
+  return timer(callback, ms, ...args);
+};
+const write = process.stdout.write.bind(process.stdout);
+process.stdout.write = (chunk, ...args) => {
+  const flushed = write(chunk, ...args);
+  const frame = JSON.parse(String(chunk));
+  if (frame.kind === 'stdout') {
+    pending += frame.text;
+    let newline;
+    while ((newline = pending.indexOf('\\n')) >= 0) {
+      const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
+      const event = JSON.parse(line);
+      if (event.type === 'thread.started') {
+        if (!expire) throw new Error('supervisor deadline not controlled');
+        writeFileSync(__MARKER__, JSON.stringify({session_id: event.thread_id}));
+        queueMicrotask(expire);
+      }
+    }
+  }
+  return flushed;
+};
+""".replace("__MARKER__", json.dumps(str(marker))), encoding="utf-8")
+    transport = codex_cli.run_host_process
+
+    def observed_deadline(*args, **kwargs):
+        environment = dict(os.environ)
+        environment["NODE_OPTIONS"] = (
+            environment.get("NODE_OPTIONS", "") + " --import=" + clock.as_uri()
+        ).strip()
+        return transport(*args, **kwargs, environment=environment)
+
+    monkeypatch.setattr(codex_cli, "run_host_process", observed_deadline)
     with pytest.raises(RuntimeError, match="codex_cli_timeout"):
         run_codex_cli_host(
             request,
@@ -284,9 +1427,35 @@ def test_codex_cli_host_preserves_observed_session_after_timeout(
             timeout_seconds=0.1,
         )
 
+    assert json.loads(marker.read_text()) == {"session_id": "session-fixture-0001"}
     envelope = request["turn_envelope"]
     assert isinstance(envelope, dict)
     assert codex_cli_session_binding(runtime_root, envelope) is not None
+
+
+def test_codex_cli_host_timeout_before_session_does_not_invent_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, log_path = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    # The real transport's minimum is one second; this event cannot arrive
+    # before that deadline. No timer or timeout policy is replaced in this arm.
+    monkeypatch.setenv("FAKE_CODEX_BEFORE_SESSION_SLEEP", "2")
+    runtime_root = tmp_path / "runtime"
+    project = tmp_path / "project"
+    project.mkdir()
+    request = _request()
+
+    with pytest.raises(BuiltInHostError, match="codex_cli_timeout") as failure:
+        run_codex_cli_host(request, runtime_root=runtime_root, project=project,
+                           codex_bin=str(executable), timeout_seconds=0.1)
+
+    assert failure.value.recovery_kind is None
+    envelope = request["turn_envelope"]
+    assert isinstance(envelope, dict)
+    assert codex_cli_session_binding(runtime_root, envelope) is None
+    assert _session_files(runtime_root) == []
 
 
 def test_codex_cli_host_classifies_failure_without_persisting_stderr(
@@ -337,6 +1506,168 @@ def test_codex_cli_host_classifies_failure_without_persisting_stderr(
     assert "resume" not in argv_rows[1]
 
 
+@pytest.mark.parametrize("source", ["capacity-stderr", "capacity-event"])
+def test_codex_cli_host_classifies_provider_capacity_as_retryable_without_prose(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    error, runtime_root = _capture_fake_codex_failure(
+        tmp_path,
+        monkeypatch,
+        failure_category=source,
+    )
+
+    assert error.reason == "codex_cli_provider_capacity"
+    assert error.failure_kind == "provider_capacity"
+    assert error.recovery_kind == "resume_session"
+    persisted = "\n".join(
+        path.read_text(encoding="utf-8") for path in runtime_root.rglob("*.json")
+    )
+    assert "at capacity" not in persisted
+    assert "private_material" not in persisted
+
+
+@pytest.mark.parametrize(
+    ("event", "expected_reason", "expected_kind", "expected_recovery"),
+    [
+        (
+            {
+                "type": "turn.failed",
+                "error": {"codexErrorInfo": "serverOverloaded"},
+            },
+            "codex_cli_provider_overloaded",
+            "provider_overloaded",
+            "resume_session",
+        ),
+        (
+            {
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": "rate_limit_exceeded",
+                        "message": "Quota exceeded.",
+                    }
+                },
+            },
+            "codex_cli_rate_limited",
+            "rate_limited",
+            "resume_session",
+        ),
+        (
+            {
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": "insufficient_quota",
+                        "message": "Rate limit reached.",
+                    }
+                },
+            },
+            "codex_cli_quota_exhausted",
+            "quota_exhausted",
+            None,
+        ),
+        (
+            {
+                "type": "turn.failed",
+                "error": {"message": "You’ve hit your usage limit. Try again after the reset."},
+            },
+            "codex_cli_quota_exhausted",
+            "quota_exhausted",
+            None,
+        ),
+        (
+            {
+                "type": "error",
+                "error": {"httpStatusCode": 429, "message": "opaque"},
+            },
+            "codex_cli_rate_limited",
+            "rate_limited",
+            "resume_session",
+        ),
+        (
+            {
+                "type": "turn.failed",
+                "error": {
+                    "code": "future_provider_failure",
+                    "message": "Selected model is at capacity.",
+                },
+            },
+            "codex_cli_unknown",
+            "unknown",
+            None,
+        ),
+    ],
+)
+def test_codex_cli_host_preserves_structured_failure_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event: dict[str, object],
+    expected_reason: str,
+    expected_kind: str,
+    expected_recovery: str | None,
+) -> None:
+    error, _runtime_root = _capture_fake_codex_failure(
+        tmp_path,
+        monkeypatch,
+        failure_event=event,
+    )
+
+    assert error.reason == expected_reason
+    assert error.failure_kind == expected_kind
+    assert error.recovery_kind == expected_recovery
+
+
+def test_codex_cli_host_prefers_structured_code_across_output_streams(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = {
+        "type": "response.failed",
+        "response": {
+            "error": {
+                "code": "insufficient_quota",
+                "message": "opaque structured failure",
+            }
+        },
+    }
+    error, _runtime_root = _capture_fake_codex_failure(
+        tmp_path,
+        monkeypatch,
+        failure_event=event,
+        failure_stderr="Too many requests; retry later.",
+        stderr_first=True,
+    )
+
+    assert error.reason == "codex_cli_quota_exhausted"
+    assert error.failure_kind == "quota_exhausted"
+    assert error.recovery_kind is None
+
+
+def test_codex_cli_host_fails_closed_when_output_observation_is_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "loopx.control_plane.turn_driver.codex_cli.OUTPUT_DRAIN_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setenv("FAKE_CODEX_HOLD_PIPE_SECONDS", "0.2")
+    error, _runtime_root = _capture_fake_codex_failure(
+        tmp_path,
+        monkeypatch,
+        failure_event={
+            "type": "response.failed",
+            "response": {"error": {"code": "rate_limit_exceeded"}},
+        },
+    )
+
+    assert error.reason == "codex_cli_unknown"
+    assert error.failure_kind == "unknown"
+    assert error.recovery_kind is None
+
+
 def test_codex_cli_host_discards_missing_resume_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -374,6 +1705,37 @@ def test_codex_cli_host_discards_missing_resume_session(
     assert codex_cli_session_binding(runtime_root, envelope) is None
 
 
+def test_native_input_observation_is_opt_in_and_does_not_change_host_result(tmp_path, monkeypatch):
+    from loopx.control_plane.turn_driver import codex_input_trace as trajectory_input_capture
+
+    executable, log_path = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    monkeypatch.delenv("CODEX_ROLLOUT_TRACE_ROOT", raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+    request = _request()
+    observed = []
+
+    def record(root, **fields):
+        observed.append((root, fields))
+        raise OSError("Synthetic diagnostic failure must not fail the Host")
+
+    monkeypatch.setattr(trajectory_input_capture, "record_codex_input_source", record)
+    baseline = run_codex_cli_host(request, runtime_root=tmp_path / "off", project=project,
+                                 codex_bin=str(executable), timeout_seconds=5)
+    assert observed == []
+    trace = tmp_path / "traces"
+    (trace / "trace-old").mkdir(parents=True)
+    monkeypatch.setenv("CODEX_ROLLOUT_TRACE_ROOT", str(trace))
+    result = run_codex_cli_host(request, runtime_root=tmp_path / "on", project=project,
+                               codex_bin=str(executable), timeout_seconds=5)
+    assert result == baseline
+    assert len(observed) == 1 and observed[0][0] == trace
+    fields = observed[0][1]
+    assert fields["text"] == _prompt(request) and fields["goal_id"] == "fixture-goal"
+    assert fields["prior_bundles"] == {"trace-old"}
+
+
 def test_public_e2e_smoke_runs_n_transactions_on_one_session() -> None:
     root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
@@ -407,3 +1769,146 @@ def test_public_e2e_smoke_runs_n_transactions_on_one_session() -> None:
         "scheduler_acknowledged": False,
         "state_written": False,
     }
+
+
+def test_checkpointed_write_approval_is_scoped_and_absent_by_default():
+    request = _request()
+    assert "It satisfies the write approval requirement" not in _prompt(request)
+    request["turn_envelope"]["boundary"] = {
+        "requires_parent_approval": ["write", "publish", "production-action"],
+        "checkpointed_boundary_authority": {
+            "schema_version": "checkpointed_boundary_authority_v0",
+            "active_count": 1,
+            "active_write_scope": ["src/**"],
+        },
+    }
+    prompt = _prompt(request)
+    assert "only within its active_write_scope" in prompt
+    assert "publish, and production actions retain their gates" in prompt
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group cleanup contract")
+@pytest.mark.parametrize("timeout", [False, True])
+def test_codex_cli_reaps_descendants_after_result_or_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: bool,
+) -> None:
+    executable, log_path = _fake_codex(tmp_path)
+    marker = tmp_path / "child-work"
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log_path))
+    monkeypatch.setenv("FAKE_CODEX_CHILD_MARKER", str(marker))
+    monkeypatch.setattr("loopx.control_plane.turn_driver.codex_cli.OUTPUT_DRAIN_TIMEOUT_SECONDS", .05)
+    if timeout:
+        monkeypatch.setenv("FAKE_CODEX_SLEEP", "30")
+    try:
+        kwargs = dict(runtime_root=tmp_path / "runtime", project=tmp_path,
+                      codex_bin=str(executable), timeout_seconds=1 if timeout else 5)
+        if timeout:
+            with pytest.raises(BuiltInHostError, match="codex_cli_timeout"):
+                run_codex_cli_host(_request(), **kwargs)
+        else:
+            result = run_codex_cli_host(_request(), **kwargs)
+            assert result["result_kind"] == "validated_progress"
+        before = marker.read_text()
+        time.sleep(.15)
+        assert marker.read_text() == before, "Codex child kept working after adapter returned"
+    finally:
+        pid_path = Path(str(marker) + ".pid")
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+def test_default_turn_cli_rejects_stopped_source_behind_stale_global_mirror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str,
+) -> None:
+    import contextlib
+    import io
+
+    from loopx.cli import main as cli_main
+    from loopx.control_plane.goals import activation_service
+    from loopx.control_plane.turn_driver import codex_cli
+    from tests.control_plane.canonical_authority_fixture import isolate_sqlite_runtime
+    from tests.test_loopx_turn_driver import _write_live_fixture
+
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, runtime, source_registry = _write_live_fixture(tmp_path, provider=provider)
+    mirror = runtime / "registry.global.json"
+    mirrored = json.loads(source_registry.read_text())
+    mirrored["registry_role"] = "global-local"
+    mirrored["goals"][0]["source_registry"] = str(source_registry)
+    mirror.write_text(json.dumps(mirrored))
+    original_mirror = mirror.read_bytes()
+    executable, native_log = _fake_codex(tmp_path)
+    native_launch = tmp_path / "native-launch.txt"
+    native_source = executable.read_text()
+    assert "args = sys.argv[1:]" in native_source
+    executable.write_text(native_source.replace(
+        "args = sys.argv[1:]",
+        f"pathlib.Path({str(native_launch)!r}).write_text('started\\n')\nargs = sys.argv[1:]",
+        1,
+    ))
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(native_log))
+    original_input = codex_cli.prepare_codex_cli_input
+    stopped = []
+
+    def stop_source_before_dispatch(request):
+        with monkeypatch.context() as fault:
+            fault.setattr(activation_service, "sync_project_registry_to_global", lambda **_kwargs: {
+                "ok": False, "error": "fixture lost global mirror update",
+            })
+            result = activation_service.set_goal_activation_state(
+                registry_path=mirror, goal_id="loopx-turn-fixture", state="stopped",
+                reason="Owner stopped the source while mirror synchronization failed.",
+                actor_kind="owner", execute=True,
+            )
+        assert result["written"] is True and result["partial_write"] is True
+        assert json.loads(source_registry.read_text())["goals"][0]["activation"]["state"] == "stopped"
+        assert mirror.read_bytes() == original_mirror
+        stopped.append(result)
+        return original_input(request)
+
+    monkeypatch.setattr(codex_cli, "prepare_codex_cli_input", stop_source_before_dispatch)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = cli_main([
+            "--registry", str(mirror), "--runtime-root", str(runtime), "--format", "json",
+            "turn", "run-once", "--goal-id", "loopx-turn-fixture", "--agent-id", "codex-fixture",
+            "--host", "codex-cli", "--project", str(project),
+            "--codex-bin", str(executable), "--codex-sandbox", "read-only", "--no-global-sync",
+            "--iteration-context", "fresh", "--turn-instance-id", "stale-mirror-stop-before-native",
+            "--validation-command-json", json.dumps([sys.executable, "-c", "pass"]), "--execute",
+        ])
+    payload = json.loads(output.getvalue())
+    # Independent process and model-boundary markers prove this rejection did
+    # not dispatch. The public error remains conservative because the same
+    # rejection type can also arise after a Host result has already arrived.
+    assert stopped and not native_launch.exists() and not native_log.exists(), payload
+    assert code == 1 and "goal_stopped" in json.dumps(payload), payload
+    assert payload["effects"]["host_invoked"] is not True
+    assert not _session_files(runtime)
+    index = runtime / "goals/loopx-turn-fixture/runs/index.jsonl"
+    assert not index.exists() or "quota_slot_spent" not in index.read_text()
+
+
+@pytest.mark.parametrize("declaration", ["envelope", "signature", "coverage"])
+def test_codex_host_rejects_unknown_contract_version_before_process(tmp_path, monkeypatch, declaration):
+    from loopx.control_plane.effect_runtime import EffectRuntimeRejected
+
+    executable, log = _fake_codex(tmp_path)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    request = _request()
+    envelope = request["turn_envelope"]
+    if declaration == "envelope":
+        envelope["schema_version"] = "unsupported_work_contract"
+    else:
+        envelope["action_signature"] = {
+            "schema_version" if declaration == "signature" else "coverage": "unsupported_required_semantics",
+        }
+    with pytest.raises(EffectRuntimeRejected, match="unsupported TurnEnvelope"):
+        run_codex_cli_host(request, runtime_root=tmp_path / "runtime", project=tmp_path,
+                           codex_bin=str(executable), timeout_seconds=5)
+    assert not log.exists()
+    assert not _session_files(tmp_path / "runtime")

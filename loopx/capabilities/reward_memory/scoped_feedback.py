@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import hashlib
 from collections.abc import Mapping
-from typing import Any
 
 from ...control_plane.runtime.public_safety import public_safe_compact_text
 from ..context_providers.base import ContextProvider
@@ -31,6 +32,7 @@ _EVENT_FIELDS = {
     "revision_ref",
     "target_class",
     "content_summary",
+    "experience",
     "source",
     "reasoning",
     "guard_context",
@@ -92,6 +94,7 @@ def build_scoped_feedback_reward_memory_candidate(
         {
             "target_class": raw.get("target_class"),
             "content_summary": raw.get("content_summary"),
+            "experience": raw.get("experience"),
             "source": raw.get("source"),
             "scope": {
                 "workspace_ref": raw.get("workspace_ref"),
@@ -166,7 +169,7 @@ def ingest_scoped_feedback_reward_memory_event(
         "adapter_schema_version": SCOPED_FEEDBACK_ADAPTER_SCHEMA_VERSION,
         "event_schema_version": SCOPED_FEEDBACK_EVENT_SCHEMA_VERSION,
         "feedback_ref": adapter["feedback_ref"],
-        "event_summary_digest": hashlib.sha256(summary.encode("utf-8")).hexdigest()[
+        "event_summary_digest": hashlib.sha256(cast(str, summary).encode("utf-8")).hexdigest()[
             :16
         ],
         "next_reward_memory_call": "explicit_function_boundary_recall",

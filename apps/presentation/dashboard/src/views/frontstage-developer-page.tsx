@@ -7,7 +7,6 @@ import {
   FileJson,
   GitCompareArrows,
   LayoutDashboard,
-  ListChecks,
   ShieldCheck,
   TestTube2,
 } from "lucide-react";
@@ -240,15 +239,15 @@ export function FrontstageDeveloperPage() {
             </div>
           </div>
           <div className="mt-4 grid gap-2">
-            <a className="flex items-center gap-2 rounded-md border border-slate-200 px-3 py-2 text-sm font-medium" href="/">
+            <a className="flex items-center gap-2 rounded-md border border-slate-200 px-3 py-2 text-sm font-medium" href="https://loopx-project.github.io/loopx/">
               <LayoutDashboard className="h-4 w-4" />
-              Control home
+              LoopX home
             </a>
-            <a className="flex items-center gap-2 rounded-md border border-slate-200 px-3 py-2 text-sm font-medium" href="/frontstage">
+            <a className="flex items-center gap-2 rounded-md border border-slate-200 px-3 py-2 text-sm font-medium" href="https://loopx-project.github.io/loopx/docs/showcases/index.en.html">
               <ExternalLink className="h-4 w-4" />
-              Public frontstage
+              Public cases
             </a>
-            <a className="flex items-center gap-2 rounded-md bg-slate-950 px-3 py-2 text-sm font-medium text-white" href="/frontstage/developer">
+            <a className="flex items-center gap-2 rounded-md bg-slate-950 px-3 py-2 text-sm font-medium text-white" href={`${import.meta.env.BASE_URL}developers/projections/`}>
               <Code2 className="h-4 w-4" />
               Developer cockpit
             </a>
@@ -269,7 +268,7 @@ export function FrontstageDeveloperPage() {
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div>
                 <div className="flex flex-wrap gap-2">
-                  <Badge variant="info">frontstage/developer</Badge>
+                  <Badge variant="info">developers/projections</Badge>
                   <Badge variant="success">public-safe</Badge>
                   <Badge variant="neutral">no browser writes</Badge>
                 </div>

@@ -74,6 +74,7 @@ def sync_explore_graph_after_material_refresh(
     *,
     registry_path: Path,
     goal_id: str,
+    runtime_root_override: str | None = None,
     agent_id: str | None = None,
     project: Path | None = None,
     state_file: Path | None = None,
@@ -82,14 +83,23 @@ def sync_explore_graph_after_material_refresh(
 ) -> dict[str, Any]:
     """Flush an enabled graph after the goal-level refresh transaction.
 
-    Explore Graph activation is independent from Explore Harness planning.  A
+    Explore Harness planning includes its evidence graph. A
     configured graph reuses the existing idempotent projection/sink adapter;
     disabled or absent policy performs no graph reads or writes.
     """
 
     goal = load_goal_from_registry(registry_path, goal_id)
+    explicit_graph_enabled = ((goal or {}).get("explore_graph") or {}).get("enabled") is True
+    if goal is not None:
+        from .machine_defaults import resolve_explore_goal
+        from ...control_plane.runtime.runtime_projection_route import resolve_goal_source_runtime_route
+        route = resolve_goal_source_runtime_route(
+            registry_path=registry_path, goal_id=goal_id,
+            runtime_root_override=runtime_root_override,
+        )
+        goal = resolve_explore_goal(goal, Path(route["source_runtime_root"]))
     policy = compact_explore_graph_policy(
-        goal.get("explore_graph") if isinstance(goal, dict) else None
+        (goal or {}).get("explore_graph"), ((goal or {}).get("spawn_policy") or {}).get("explore_harness")
     )
     base = {
         "ok": True,
@@ -125,6 +135,14 @@ def sync_explore_graph_after_material_refresh(
             ),
         }
 
+    # Disabled activation preserves the caller's authorization observation without
+    # reading or publishing anything.
+
+    external_sink_delivery_authorized = external_sink_delivery_authorized and (
+        explicit_graph_enabled
+    )
+    base["external_sink_delivery_authorized"] = external_sink_delivery_authorized
+
     if syncer is None:
         status = "projection_sink_provider_unavailable"
         return {
@@ -143,6 +161,7 @@ def sync_explore_graph_after_material_refresh(
         result = syncer(
             registry_path=registry_path,
             goal_id=goal_id,
+            runtime_root_override=runtime_root_override,
             agent_id=agent_id,
             project=project,
             state_file=state_file,

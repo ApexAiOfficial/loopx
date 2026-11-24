@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import re
+from typing import Any, Mapping
+
 from datetime import datetime, timedelta
-from typing import Any
 
 from ..runtime.time import now_utc
 from ..todos.contract import (
@@ -11,42 +11,23 @@ from ..todos.contract import (
     normalize_todo_resume_when,
     normalize_todo_status,
     normalize_todo_task_class,
+    normalize_todo_watch_only,
 )
 from .time import parse_scheduler_timestamp
-
-MONITOR_CADENCE_PATTERN = re.compile(
-    r"^\s*(?P<count>[1-9][0-9]{0,4})\s*"
-    r"(?P<unit>s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\s*$",
-    re.IGNORECASE,
-)
+from .state_transition_rules import project_monitor_todo_schedule
 
 
 parse_monitor_timestamp = parse_scheduler_timestamp
 
 
-def parse_monitor_counter(value: Any) -> int:
-    try:
-        return max(0, int(str(value or "0").strip()))
-    except ValueError:
-        return 0
-
-
 def monitor_cadence_delta(value: Any) -> timedelta | None:
-    candidate = str(value or "").strip()
-    if not candidate:
+    projected = project_monitor_todo_schedule(
+        generated_at="1970-01-01T00:00:00Z",
+        cadence=value,
+    )
+    if projected.cadence_seconds is None:
         return None
-    match = MONITOR_CADENCE_PATTERN.match(candidate)
-    if not match:
-        return None
-    count = int(match.group("count"))
-    unit = match.group("unit").lower()
-    if unit.startswith("s"):
-        return timedelta(seconds=count)
-    if unit.startswith("m"):
-        return timedelta(minutes=count)
-    if unit.startswith("h"):
-        return timedelta(hours=count)
-    return timedelta(days=count)
+    return timedelta(seconds=projected.cadence_seconds)
 
 
 def monitor_next_due_at(
@@ -55,21 +36,14 @@ def monitor_next_due_at(
     cadence: Any = None,
     explicit_next_due_at: Any = None,
 ) -> str | None:
-    explicit = str(explicit_next_due_at or "").strip()
-    if explicit:
-        if parse_monitor_timestamp(explicit) is None:
-            raise ValueError("--next-due-at must be an ISO timestamp")
-        return explicit
-    delta = monitor_cadence_delta(cadence)
-    if delta is None:
-        return None
-    checked_at = parse_monitor_timestamp(generated_at)
-    if checked_at is None:
-        checked_at = now_utc()
-    return (checked_at + delta).astimezone().replace(microsecond=0).isoformat()
+    return project_monitor_todo_schedule(
+        generated_at=generated_at,
+        cadence=cadence,
+        explicit_next_due_at=explicit_next_due_at,
+    ).next_due_at
 
 
-def monitor_todo_task_class(item: dict[str, Any], *, task_text: str | None = None) -> str:
+def monitor_todo_task_class(item: Mapping[str, Any], *, task_text: str | None = None) -> str:
     text = str(item.get("text") or "") if task_text is None else task_text
     return normalize_todo_task_class(
         item.get("task_class"),
@@ -94,10 +68,7 @@ def monitor_todo_next_due_at(item: dict[str, Any]) -> datetime | None:
 
 
 def monitor_todo_has_schedule(item: dict[str, Any]) -> bool:
-    return bool(
-        str(item.get("cadence") or "").strip()
-        or str(item.get("next_due_at") or "").strip()
-    )
+    return monitor_todo_next_due_at(item) is not None
 
 
 def monitor_todo_expires_at(item: dict[str, Any]) -> datetime | None:
@@ -142,5 +113,7 @@ def monitor_todo_missing_schedule(
     if monitor_todo_task_class(item, task_text=task_text) != TODO_TASK_CLASS_MONITOR:
         return False
     if monitor_todo_is_expired(item, now=now):
+        return False
+    if normalize_todo_watch_only(item.get("watch_only")) is True:
         return False
     return not monitor_todo_has_schedule(item)

@@ -1,17 +1,26 @@
 # LoopX Adopters
 
+> [简体中文](docs/project/adopters.zh-CN.md)
+
 This is a voluntary, self-attested directory of projects and users who choose
 to use LoopX. An entry records a public relationship; it is not a testimonial,
 certification, security review, support commitment, or maintainer endorsement.
 
-The maintainer-observed [Ecosystem Adoption](docs/community/ecosystem-adoption.md)
-inventory remains a separate evidence surface. `ADOPTERS.md` is for people and
-projects to describe their own use, including a planned or experimental trial.
+Looking for projects using or building on LoopX? Browse the
+[maintainer-observed ecosystem inventory](docs/community/ecosystem-adoption.md):
+it links [development workflows and integrations](docs/community/ecosystem-adoption.md#1-workflows-and-integrations),
+[mechanism borrowing](docs/community/ecosystem-adoption.md#2-mechanism-borrowing),
+and [proposals with their current limits](docs/community/ecosystem-adoption.md#3-proposals-and-deferred-adoption).
+Those public-source observations are maintained there; this directory records
+projects and users describing their own use, including planned or experimental trials.
 
 ## Current Directory
 
-There are no public self-attested entries yet. This empty list is intentional:
-projects and users should add themselves only when they want to be named.
+No projects or users have submitted a self-attested entry yet. This is the
+registration status of this directory, not a count of LoopX users. The
+[ecosystem inventory](docs/community/ecosystem-adoption.md) already records
+public evidence of use. Projects and users can voluntarily add or confirm
+their own entry below; observed cases are not copied into this table on their behalf.
 
 | Project or user | Public link | Adoption mode | Status | Public note | Last verified |
 | --- | --- | --- | --- | --- | --- |

@@ -27,7 +27,10 @@ from loopx.host_loop_activation import (
     normalize_agent_type,
     scheduler_command_binding_for_agent_type,
 )
-from loopx.project_prompt import render_accountable_progress_refresh_command
+from loopx.project_prompt import (
+    render_accountable_progress_refresh_command,
+    render_cli_command_prefix,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -172,11 +175,13 @@ def test_codex_ide_plugin_is_an_exact_host_type_with_visible_goal_activation() -
     (
         ("ark-managed-agent", "ark_managed_agent_goal"),
         ("codex-app", "codex_app_heartbeat"),
+        ("trae_app", "trae_app"),
         ("codex-app-ssh", "codex_app_ssh_goal"),
         ("codex-cli", "codex_cli"),
         ("codex-ide-plugin", "codex_cli"),
         ("claude-code", "claude_code"),
         ("kunluncode", "kunluncode"),
+        ("kiro-cli", "kiro_cli"),
         ("opencode", "generic_cli"),
         ("traex-cli", "generic_cli"),
         ("pi", "generic_cli"),
@@ -199,6 +204,9 @@ def test_first_class_hosts_bind_one_runtime_profile(
         ("codex_cli", True),
         ("codex_app_heartbeat", False),
         ("claude_code", False),
+        # Kiro settles as a visible Goal but must not render the Codex native
+        # `/goal` task body or its blocked-state rules.
+        ("kiro_cli", False),
     ),
 )
 def test_native_goal_host_family_is_profile_driven(
@@ -235,8 +243,11 @@ def test_pi_is_an_exact_host_type_with_visible_goal_extension_activation() -> No
     assert packet["setup_command"] == "loopx slash-commands --install --surface pi"
     assert packet["host_mutation"]["owner"] == "Pi LoopX goal extension"
     assert packet["host_mutation"]["host_tool"] == "loopx_goal_activate"
+    assert packet["host_mutation"]["tool_argument_mapping"]["activationToken"] == (
+        "pi_session_authority.token from the host startup/session packet"
+    )
     assert packet["host_mutation"]["tool_argument_mapping"]["goalId"] == (
-        "heartbeat_prompt.goal_id"
+        "optional compatibility echo; host authority derives the value"
     )
     assert packet["host_mutation"]["tool_argument_mapping"]["objective"] == (
         "heartbeat_prompt.task_body"
@@ -278,6 +289,7 @@ def test_deepseek_harness_is_an_exact_host_type_with_external_loop_activation() 
     assert packet["host_surface"] == "deepseek_harness_automation_loop", packet
     assert packet["activation_method"] == "external_loop_driver", packet
     assert "--runtime-profile generic_cli" in packet["commands"]["heartbeat_prompt"], packet
+    assert "--host dsh" in packet["entry_command_hint"], packet
     assert "loopx.dsh_goal_mode" in packet["entry_command_hint"], packet
     # The historical launcher stays a documented compatibility path.
     assert "scripts/dsh_turn_host_adapter.py" in packet["entry_command_hint"], packet
@@ -318,7 +330,7 @@ def test_deepseek_harness_native_is_distinct_same_session_host() -> None:
     "runtime_profile",
     ("ark_managed_agent_goal", "codex_app_ssh_goal"),
 )
-def test_goal_hosts_attribute_spend_to_current_progress_refresh(
+def test_goal_hosts_delegate_spend_to_live_settlement_not_static_templates(
     runtime_profile: str,
 ) -> None:
     payload = build_heartbeat_prompt(
@@ -330,26 +342,60 @@ def test_goal_hosts_attribute_spend_to_current_progress_refresh(
     refresh_command = f"`{payload['progress_refresh_state_command']}`"
     spend_command = f"`{payload['quota_spend_command']}`"
 
-    assert task_body.index(refresh_command) < task_body.index(spend_command)
+    assert refresh_command not in task_body
+    assert spend_command not in task_body
+    assert "settlement_plan.ordered_steps" in task_body
+    assert "preserve exact identities/effect ids and actual outcomes" in task_body
+    assert "Preserve command flags" in task_body
+    assert "truthful evidence" in task_body
     assert "<PUBLIC_SAFE_PROGRESS_CLASSIFICATION>" in refresh_command
     assert "<ACTUAL_DELIVERY_BATCH_SCALE>" in refresh_command
     assert "<ACTUAL_DELIVERY_OUTCOME>" in refresh_command
     assert "--delivery-batch-scale multi_surface" not in refresh_command
     assert "--delivery-outcome outcome_progress" not in refresh_command
-    normalized_task_body = " ".join(task_body.split())
     assert payload["quota_spend_command"].startswith("loopx --format json ")
-    assert (
-        "never default or upgrade them to `multi_surface` / `outcome_progress`"
-        in normalized_task_body
+    assert "actual outcomes" in task_body
+    assert "readback/recovery" in task_body
+
+
+def test_heartbeat_prompt_commands_keep_explicit_runtime_root() -> None:
+    runtime_root = Path("/tmp/loopx-runtime-root-fixture")
+
+    payload = build_heartbeat_prompt(
+        goal_id="runtime-root-fixture",
+        thin=True,
+        runtime_root=runtime_root,
+        runtime_profile="codex_cli",
+        agent_id="runtime-agent",
+        registered_agents=["runtime-agent"],
     )
-    assert "no pipe/retry" in normalized_task_body
+
+    command_prefix = render_cli_command_prefix(runtime_root=runtime_root)
+
+    assert payload["quota_guard_command"].startswith(
+        f"{command_prefix} --format json quota should-run "
+    )
+    assert payload["quota_spend_command"].startswith(
+        f"{command_prefix} --format json quota spend-slot "
+    )
+    assert payload["refresh_state_command"].startswith(
+        f"{command_prefix} refresh-state "
+    )
+    assert payload["progress_refresh_state_command"].startswith(
+        f"{command_prefix} refresh-state "
+    )
+    assert payload["thin_prompt_command"].startswith(
+        f"{command_prefix} heartbeat-prompt "
+    )
+    assert '"$HOME/.codex/loopx/registry.global.json"' not in payload["task_body"]
+    assert command_prefix in payload["task_body"]
 
 
 @pytest.mark.parametrize(
     "runtime_profile",
     ("ark_managed_agent_goal", "codex_app_ssh_goal"),
 )
-def test_goal_hosts_share_narrow_runtime_skill_routing(
+def test_goal_hosts_enter_live_contract_without_a_mandatory_skill_detour(
     runtime_profile: str,
 ) -> None:
     payload = build_heartbeat_prompt(
@@ -359,18 +405,16 @@ def test_goal_hosts_share_narrow_runtime_skill_routing(
     )
     task_body = " ".join(payload["task_body"].split())
 
-    assert (
-        "Normal turns use CLI `interaction_contract`; use `loopx-project` for "
-        "lifecycle/registry and `loopx-self-repair` for runtime/projection drift."
-        in task_body
-    )
-    assert "a segment is progress, not a new Goal boundary" in task_body
-    assert "do not create a successor host Goal merely to continue" in task_body
+    assert "Use current `interaction_contract`" in task_body
+    assert "loopx-project" in task_body
+    assert "loopx-self-repair" in task_body
+    assert "Progress is not a new Goal boundary" in task_body
+    assert "do not create a new host Goal merely to continue" in task_body
 
 
 def test_goal_hosts_reuse_thin_dispatch_and_stay_compact() -> None:
     shared_rules = (
-        "Run quota; execute interaction_contract.cli_channel.next_cli_actions[0] verbatim.",
+        "use selection_command when required",
         "No learning queue unless asked.",
     )
     common = {
@@ -398,9 +442,20 @@ def test_goal_hosts_reuse_thin_dispatch_and_stay_compact() -> None:
     for rule in shared_rules:
         assert rule in generic["task_body"]
     for payload in goal_hosts:
-        for rule in shared_rules:
-            assert rule in payload["task_body"]
-        assert payload["interface_budget"]["budget_char_count"] <= 2_800
+        assert "selection_command" in payload["task_body"]
+        assert "No learning queue unless asked." in payload["task_body"]
+        for obligation in (
+            "do/verify authorized work",
+            "settlement_plan.ordered_steps, else next_cli_actions",
+            "preserve exact identities/effect ids",
+        ):
+            assert obligation in payload["task_body"]
+        # The known first-guard choice adds 63 useful normalized characters:
+        # the largest fixed host fixture is 3,262, leaving 38 under this
+        # regression allowance. Keep the native host's hard cap separate.
+        assert "Known new-Turn choice: add `--todo-id <id>` to first guard" in payload["task_body"]
+        assert payload["interface_budget"]["budget_char_count"] <= 3_300
+        assert payload["interface_budget"]["max_chars"] == 4_000
         assert payload["interface_budget"]["within_budget"] is True
 
 
@@ -480,6 +535,46 @@ def test_codex_app_activation_uses_narrow_runtime_profile() -> None:
     assert "--execution-mode" not in command
 
 
+def test_trae_app_activation_uses_host_automation_and_stays_distinct_from_cli() -> None:
+    assert normalize_agent_type("trae_app") == "trae_app"
+    assert agent_type_for_host_surface("trae_app") == "trae_app"
+    assert normalize_agent_type("traex") == "traex-cli"
+    with pytest.raises(AgentTypeError, match="unsupported agent_type"):
+        normalize_agent_type("Trae App")
+
+    packet = build_host_loop_activation_packet(
+        agent_type="trae_app",
+        goal_id="fixture-goal",
+        agent_id="trae_app-fixture",
+        registered_agents=["trae_app-fixture"],
+    )
+
+    command = packet["commands"]["heartbeat_prompt"]
+    assert packet["host_surface"] == "trae_app"
+    assert packet["activation_method"] == (
+        "create_or_update_trae_app_automation"
+    )
+    assert packet["host_mutation"]["preferred_tool"] == "automation_update"
+    assert "--trae_app" in command
+    assert "--codex-app" not in command
+    assert "--runtime-profile" not in command
+    assert any(
+        "settled non-terminal turn leaves the automation active" in criterion
+        for criterion in packet["success_criteria"]
+    )
+
+    prompt = build_heartbeat_prompt(
+        goal_id="trae_app-prompt-fixture",
+        thin=True,
+        runtime_profile="trae_app",
+    )
+    assert "--trae_app" in prompt["quota_guard_command"]
+    assert "--trae_app" in prompt["task_body"]
+    rendered = render_heartbeat_prompt_markdown(prompt)
+    assert "Trae App heartbeat automation" in rendered
+    assert "Codex App heartbeat automation" not in rendered
+
+
 def test_new_agent_onboarding_defaults_to_fresh_identity() -> None:
     packet = build_host_loop_activation_packet(
         agent_type="codex-app",
@@ -546,6 +641,65 @@ def test_non_traex_identity_selection_preserves_v0_prompt_fields(
     assert choice["activation_input_command"] == choice["heartbeat_prompt_json"]
 
 
+def test_standalone_project_previews_use_their_declared_runtime_when_defaults_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from loopx import paths
+    from loopx.cli import main
+
+    monkeypatch.delenv("LOOPX_REGISTRY", raising=False)
+    monkeypatch.delenv("LOOPX_RUNTIME_ROOT", raising=False)
+    for root in (paths.DEFAULT_RUNTIME_ROOT, paths.LEGACY_RUNTIME_ROOT):
+        root.mkdir(parents=True, exist_ok=True)
+        paths.global_registry_path(root).write_text('{"goals": []}', encoding="utf-8")
+    assert paths.default_runtime_route()["status"] == "conflict"
+
+    goal_id = "standalone-route"
+    project, _ = _write_onboarding_goal(
+        tmp_path, goal_id=goal_id, registered_agents=["local-agent", "other-agent"],
+    )
+    registry = project / ".loopx" / "registry.json"
+    configured = json.loads(registry.read_text(encoding="utf-8"))
+    configured["common_runtime_root"] = str(tmp_path / "project-runtime")
+    registry.write_text(json.dumps(configured), encoding="utf-8")
+    original = registry.read_bytes()
+
+    for command, options in (
+        ("agent-onboard", ["--agent-type", "codex-app"]),
+        ("agent-onboard", ["--agent-type", "antigravity-app", "--agent-id", "local-agent"]),
+        ("bootstrap-command-pack", ["--host-surface", "antigravity-app", "--agent-id", "local-agent"]),
+    ):
+        assert main(["--format", "json", command, "--project", str(project), "--goal-id", goal_id, *options]) == 0
+        packet = json.loads(capsys.readouterr().out)
+        assert packet["ok"] is True
+        connection = packet["project_connection"]
+        assert Path(connection["registry"]) == registry.resolve()
+        assert connection["connection_state"] == "connected"
+        assert connection["canonical_project_alias"]["applied"] is False
+        assert connection["canonical_project_alias"]["global_registry"] is None
+        guard = packet["commands"]["quota_guard"]
+        if "codex-app" in options:
+            assert guard is None
+            assert {choice["agent_id"] for choice in packet["identity_selection_gate"]["choices"]} == {
+                "local-agent", "other-agent",
+            }
+        else:
+            argv = shlex.split(guard)
+            assert Path(argv[argv.index("--registry") + 1]) == registry.resolve()
+    assert registry.read_bytes() == original
+
+    unconnected = tmp_path / "unconnected"
+    unconnected.mkdir()
+    with pytest.raises(ValueError, match="Both default LoopX registries exist"):
+        main(["--format", "json", "agent-onboard", "--project", str(unconnected),
+              "--goal-id", goal_id, "--agent-type", "antigravity-app"])
+
+    subprocess.run(["git", "init", str(project)], check=True, capture_output=True)
+    with pytest.raises(ValueError, match="Both default LoopX registries exist"):
+        main(["--format", "json", "agent-onboard", "--project", str(project),
+              "--goal-id", goal_id, "--agent-type", "antigravity-app"])
+
+
 def test_new_agent_onboarding_gates_an_empty_agent_registry() -> None:
     packet = build_host_loop_activation_packet(
         agent_type="codex-app",
@@ -587,8 +741,7 @@ def test_codex_app_thin_prompt_embeds_profile_only_in_quota_command() -> None:
     assert "host_surface" not in prompt["task_body"]
     assert "scheduler_owner" not in prompt["task_body"]
     assert (
-        "Run quota; execute interaction_contract.cli_channel.next_cli_actions[0] "
-        "verbatim."
+        "use selection_command when required"
     ) in prompt["task_body"]
     assert "compact_prompt_command" not in prompt
     assert "brief_prompt_command" not in prompt
@@ -685,6 +838,7 @@ def test_traex_cli_is_an_exact_visible_goal_host_on_the_generic_cli_loop() -> No
     assert packet["activation_method"] == "set_visible_goal"
     assert packet["host_mutation"]["owner"] == "TraeX CLI TUI"
     assert packet["host_mutation"]["host_command"] == "/goal <task_body>"
+    assert packet["host_mutation"]["preferred_tool"] == "create_goal"
     assert packet["host_mutation"]["requires_host_feature_flag"] == (
         "[features] goals = true in ~/.trae/traecli.toml"
     )
@@ -1013,7 +1167,7 @@ def test_traex_visible_goal_allows_policy_words_in_goal_identity() -> None:
     )
 
     assert prompt["ok"] is True
-    assert "LoopX goal `scheduler-reliability`" in prompt["task_body"]
+    assert "goal `scheduler-reliability`" in prompt["task_body"]
 
 
 def test_traex_visible_goal_keeps_adversarial_capabilities_outside_task_body(
@@ -1147,3 +1301,23 @@ def test_ambiguous_codex_requires_app_ide_or_cli_selection() -> None:
         "codex-ide-plugin",
         "codex-cli",
     ]
+
+
+def test_codex_app_startup_saves_v2_and_loads_the_current_contract(tmp_path: Path) -> None:
+    goal_id = "app-bootstrap-fixture"
+    project, home = _write_onboarding_goal(
+        tmp_path, goal_id=goal_id, registered_agents=["worker-a"])
+    packet = build_agent_onboarding_packet(
+        project=project, agent_type="codex-app", goal_id=goal_id,
+        agent_id="worker-a", cli_bin=str(REPO_ROOT / "scripts" / "loopx"))
+    initial = _run_activation_command(packet["host_loop_activation"]["activation_input_command"], home=home)
+    assert initial["ok"] and initial["bootstrap"]
+    prompt = initial["task_body"]
+    assert prompt.startswith("LoopX managed heartbeat bootstrap v2\n每次唤醒先执行：\n")
+    command = prompt.split("```sh\n", 1)[1].split("\n```", 1)[0]
+    tokens = shlex.split(command)
+    assert "--bootstrap" not in tokens and "--codex-app" in tokens
+    assert tokens[tokens.index("--agent-id") + 1] == "worker-a"
+    loaded = _run_activation_command(command, home=home)
+    assert loaded["ok"] and not loaded.get("bootstrap")
+    assert "interaction_contract" in loaded["task_body"]

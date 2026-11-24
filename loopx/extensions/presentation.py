@@ -11,13 +11,28 @@ from pathlib import Path
 import re
 import tempfile
 from typing import Any
+
+from ..control_plane.runtime.public_safety import SECRET_LIKE_SURFACE_PATTERN
 from urllib.parse import parse_qsl, urlparse
 
 from ..file_lock import exclusive_file_lock
+# Public extension presentation utility; keep path classification single-owned.
+from ..public_safe_text import (
+    COMPACT_TOKEN_PATTERN as _ID_RE,
+    find_public_safe_local_path as find_public_safe_local_path,
+)
 from .runtime import (
+    MAX_EXTENSION_RESPONSE_BYTES,
     _resolved_active_extension,
     extension_catalog_entries,
     run_standalone_extension,
+)
+from .process_runtime import run_capped_process
+from ..control_plane.content_digest import BARE_SHA256_PATTERN
+from .readiness import (
+    CORE_VIEW_VALIDATORS,
+    ResolvedRuntimeEntrypoint,
+    runtime_process_environment,
 )
 from .manifest import validate_extension_id
 
@@ -33,18 +48,19 @@ EXTENSION_PROJECTION_PUBLISH_RECEIPT_SCHEMA_VERSION = (
     "extension_projection_publish_receipt_v0"
 )
 
-_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _ANCHOR_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MARKUP_RE = re.compile(r"<[^>]*>|javascript:", re.IGNORECASE)
-_LOCAL_PATH_RE = re.compile(
-    r"(?:^|[\s(])(?:~[/\\]|/+(?:Users|home|tmp|private|var|etc|opt)/|"
-    r"[A-Za-z]:[\\/])"
-)
+# Absolute, home-relative, drive/UNC, file:// and path:-prefixed local references
+# are decided once by the shared owner. This module keeps one separate policy:
+# a reference to a private *relative* directory (`.codex`, `.git`, `.local`) is
+# not an absolute-root shape, and presenting a project-local private directory is
+# still forbidden here.
 _PRIVATE_RELATIVE_PATH_RE = re.compile(
     r"(?:^|[\s:=('/\\])\.(?:codex|git|local)(?:[/\\]|$)",
     re.IGNORECASE,
 )
+# Local threshold policy only: the credential *shapes* are decided once by
+# SECRET_LIKE_SURFACE_PATTERN, which this site consults in addition to this list.
 _CREDENTIAL_RE = re.compile(
     r"(?:bearer\s+[A-Za-z0-9._~+/=-]{8,}|"
     r"(?:api[_ -]?key|access[_ -]?token|secret|password)\s*[:=]\s*\S+)",
@@ -73,6 +89,41 @@ _FORBIDDEN_KEY_TOKENS = {
     "secret",
     "token",
 }
+_ISOLATED_VIEW_VALIDATOR = """\
+import importlib
+import json
+import sys
+
+# The transport owner writes and reads UTF-8 bytes, and this helper runs under
+# `python -I`, which ignores PYTHONIOENCODING/PYTHONUTF8: its text streams fall
+# back to the host locale codec (`cp936` on a zh-CN Windows host), so the JSON
+# payload must be decoded and encoded as bytes here instead.
+request = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+reference = request["reference"]
+module_name, attribute_name = reference.split(":", 1)
+try:
+    module = importlib.import_module(module_name)
+except (ImportError, ModuleNotFoundError):
+    response = {"ok": False, "status": "unavailable"}
+else:
+    validator = getattr(module, attribute_name, None)
+    if not callable(validator):
+        response = {"ok": False, "status": "not_callable"}
+    elif request["operation"] == "resolve":
+        response = {"ok": True, "status": "ready"}
+    else:
+        try:
+            response = {"ok": True, "view": validator(request["view"])}
+        except Exception as exc:
+            response = {
+                "ok": False,
+                "status": "rejected",
+                "error": str(exc)[:1000],
+            }
+sys.stdout.buffer.write(
+    json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+)
+"""
 
 
 def _is_forbidden_key_name(value: Any) -> bool:
@@ -115,9 +166,9 @@ def _plain_text(
         raise ValueError(f"{context} must contain at most {max_length} characters")
     if "\x00" in text or _MARKUP_RE.search(text):
         raise ValueError(f"{context} must be plain text without markup")
-    if _LOCAL_PATH_RE.search(text) or _PRIVATE_RELATIVE_PATH_RE.search(text):
+    if find_public_safe_local_path(text) or _PRIVATE_RELATIVE_PATH_RE.search(text):
         raise ValueError(f"{context} must not contain a local path")
-    if _CREDENTIAL_RE.search(text):
+    if SECRET_LIKE_SURFACE_PATTERN.search(text) or _CREDENTIAL_RE.search(text):
         raise ValueError(f"{context} must not contain credential material")
     if _SENSITIVE_TEXT_RE.search(text):
         raise ValueError(f"{context} must not contain sensitive material")
@@ -273,7 +324,7 @@ def _evidence_reference(value: Any, *, context: str) -> str:
 
 def _sha256(value: Any, *, context: str) -> str:
     text = _plain_text(value, context=context, max_length=64)
-    if not _SHA256_RE.fullmatch(text):
+    if not BARE_SHA256_PATTERN.fullmatch(text):
         raise ValueError(f"{context} must be a lowercase SHA-256")
     return text
 
@@ -288,6 +339,9 @@ def validate_opaque_presentation_view(value: Any) -> Any:
 
 def load_presentation_view_validator(
     declared_surface: Mapping[str, Any],
+    *,
+    runtime_entrypoint: ResolvedRuntimeEntrypoint | None = None,
+    timeout_seconds: int = 30,
 ) -> Callable[[Any], Any]:
     """Load the exact validator declared by one active presentation surface."""
 
@@ -295,6 +349,89 @@ def load_presentation_view_validator(
     if not isinstance(reference, str) or ":" not in reference:
         raise ValueError("presentation surface has no declared view_validator")
     module_name, attribute_name = reference.split(":", 1)
+    if runtime_entrypoint is not None and reference not in CORE_VIEW_VALIDATORS:
+        python_executable = runtime_entrypoint.python_executable
+        if python_executable is None:
+            raise ValueError(
+                f"presentation surface view_validator `{reference}` is unavailable"
+            )
+
+        def invoke_runtime_validator(
+            operation: str, *, value: Any = None
+        ) -> Mapping[str, Any]:
+            try:
+                request = json.dumps(
+                    {"operation": operation, "reference": reference, "view": value},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "presentation surface view is not JSON serializable"
+                ) from exc
+            environment = dict(
+                runtime_process_environment(runtime_entrypoint.path_prefix) or os.environ
+            )
+            environment.pop("PYTHONPATH", None)
+            try:
+                completed = run_capped_process(
+                    [python_executable, "-I", "-c", _ISOLATED_VIEW_VALIDATOR],
+                    stdin=request,
+                    timeout_seconds=timeout_seconds,
+                    output_limit_bytes=MAX_EXTENSION_RESPONSE_BYTES,
+                    env=environment,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    f"presentation surface view_validator `{reference}` is unavailable"
+                ) from exc
+            if completed.returncode != 0 or completed.failure_kind is not None:
+                raise ValueError(
+                    f"presentation surface view_validator `{reference}` is unavailable"
+                )
+            try:
+                response = json.loads(completed.stdout.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"presentation surface view_validator `{reference}` returned invalid output"
+                ) from exc
+            if not isinstance(response, Mapping):
+                raise ValueError(
+                    f"presentation surface view_validator `{reference}` returned invalid output"
+                )
+            return response
+
+        resolved = invoke_runtime_validator("resolve")
+        if resolved.get("status") == "not_callable":
+            raise ValueError(
+                f"presentation surface view_validator `{reference}` is not callable"
+            )
+        if resolved.get("ok") is not True:
+            raise ValueError(
+                f"presentation surface view_validator `{reference}` is unavailable"
+            )
+
+        def validate_in_runtime(value: Any) -> Any:
+            response = invoke_runtime_validator("validate", value=value)
+            if response.get("ok") is True:
+                return response.get("view")
+            if response.get("status") == "not_callable":
+                raise ValueError(
+                    f"presentation surface view_validator `{reference}` is not callable"
+                )
+            if response.get("status") == "rejected":
+                error = response.get("error")
+                raise ValueError(
+                    error
+                    if isinstance(error, str) and error.strip()
+                    else "presentation surface view was rejected"
+                )
+            raise ValueError(
+                f"presentation surface view_validator `{reference}` is unavailable"
+            )
+
+        return validate_in_runtime
+
     try:
         module = import_module(module_name)
     except (ImportError, ModuleNotFoundError) as exc:
@@ -307,6 +444,22 @@ def load_presentation_view_validator(
             f"presentation surface view_validator `{reference}` is not callable"
         )
     return validator
+
+
+def _runtime_presentation_view_validator(
+    declared_surface: Mapping[str, Any],
+    *,
+    runtime_entrypoint: ResolvedRuntimeEntrypoint,
+    manifest: Mapping[str, Any],
+) -> Callable[[Any], Any]:
+    runtime = manifest.get("runtime")
+    if not isinstance(runtime, Mapping):
+        raise ValueError("extension active manifest is incomplete")
+    return load_presentation_view_validator(
+        declared_surface,
+        runtime_entrypoint=runtime_entrypoint,
+        timeout_seconds=int(runtime["timeout_seconds"]),
+    )
 
 
 def validate_provider_presentation_projection(
@@ -502,6 +655,7 @@ def _validate_persisted_envelope(
     extension_id: str,
     revision: str,
     declared_surface: Mapping[str, Any],
+    view_validator: Callable[[Any], Any] | None = None,
 ) -> dict[str, Any]:
     record = _record(
         value,
@@ -547,6 +701,7 @@ def _validate_persisted_envelope(
             "view": record.get("view"),
         },
         declared_surface=declared_surface,
+        view_validator=view_validator,
     )
     envelope = {
         "schema_version": EXTENSION_PROJECTION_SURFACE_SCHEMA_VERSION,
@@ -588,14 +743,15 @@ def _atomic_write_projection(path: Path, payload: Mapping[str, Any]) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
-        directory_fd = os.open(
-            path.parent,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        if os.name == "posix":
+            directory_fd = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -635,7 +791,11 @@ def publish_extension_projection(
     if not execute:
         return receipt
 
-    view_validator = load_presentation_view_validator(surface)
+    view_validator = _runtime_presentation_view_validator(
+        surface,
+        runtime_entrypoint=verified_entrypoint,
+        manifest=manifest,
+    )
     runtime_receipt = run_standalone_extension(
         safe_extension_id,
         state_file=state_path,
@@ -725,6 +885,7 @@ def publish_extension_projection(
             extension_id=safe_extension_id,
             revision=active_revision,
             declared_surface=surface,
+            view_validator=view_validator,
         )
         if readback != envelope:
             raise ValueError("published projection readback does not match exact payload")
@@ -822,6 +983,14 @@ def collect_active_extension_presentation_surfaces(
             continue
         extension_id = str(provider.get("id") or "")
         revision = str(provider.get("active_revision") or "")
+        try:
+            resolved_revision, runtime_entrypoint, active_manifest = (
+                _resolved_active_extension(extension_id, state_file=state_path)
+            )
+        except ValueError:
+            continue
+        if resolved_revision != revision:
+            continue
         surfaces = manifest.get("presentation_surfaces")
         if not isinstance(surfaces, list):
             continue
@@ -870,11 +1039,17 @@ def collect_active_extension_presentation_surfaces(
                 )
                 continue
             try:
+                view_validator = _runtime_presentation_view_validator(
+                    surface,
+                    runtime_entrypoint=runtime_entrypoint,
+                    manifest=active_manifest,
+                )
                 envelope = _validate_persisted_envelope(
                     raw,
                     extension_id=extension_id,
                     revision=revision,
                     declared_surface=surface,
+                    view_validator=view_validator,
                 )
             except ValueError as exc:
                 items.append(
@@ -938,7 +1113,7 @@ def read_extension_projection(
         payload_sha256,
         context="payload_sha256",
     )
-    active_revision, _entrypoint, manifest = _resolved_active_extension(
+    active_revision, runtime_entrypoint, manifest = _resolved_active_extension(
         safe_extension_id,
         state_file=state_path,
     )
@@ -973,6 +1148,11 @@ def read_extension_projection(
         extension_id=safe_extension_id,
         revision=active_revision,
         declared_surface=declared_surface,
+        view_validator=_runtime_presentation_view_validator(
+            declared_surface,
+            runtime_entrypoint=runtime_entrypoint,
+            manifest=manifest,
+        ),
     )
     if envelope["payload_sha256"] != requested_hash:
         raise ValueError("payload_sha256 does not match the published projection")

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .control_plane.quota.effective_action import EffectiveAction
 
 from typing import Any
 from urllib.parse import quote
@@ -75,8 +76,10 @@ def _first_executable_count(summary: dict[str, Any]) -> int:
 
 def _quota_scheduler_apply_needed(quota_payload: dict[str, Any]) -> bool | None:
     scheduler = _as_dict(quota_payload.get("scheduler_hint"))
-    codex_app = _as_dict(scheduler.get("codex_app"))
-    stateful = _as_dict(codex_app.get("stateful_backoff"))
+    app_automation = _as_dict(
+        scheduler.get("app_automation") or scheduler.get("codex_app")
+    )
+    stateful = _as_dict(app_automation.get("stateful_backoff"))
     value = stateful.get("apply_needed")
     return value if isinstance(value, bool) else None
 
@@ -263,7 +266,7 @@ def build_ready_score_report(
         quota_points += 8
     elif should_run:
         quota_points += 5
-    if normal_allowed or effective_action == "normal_run":
+    if normal_allowed or effective_action == EffectiveAction.NORMAL_RUN.value:
         quota_points += 5
     if scheduler_apply_needed is False:
         quota_points += 4

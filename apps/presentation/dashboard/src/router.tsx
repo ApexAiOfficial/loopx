@@ -1,4 +1,5 @@
 import {
+  Navigate,
   Outlet,
   createRootRoute,
   createRoute,
@@ -7,12 +8,83 @@ import {
 import { z } from "zod";
 
 import { DashboardPage } from "./views/dashboard-page";
-import { FrontstageDeveloperPage } from "./views/frontstage-developer-page";
-import { FrontstagePage } from "./views/frontstage-page";
+import { Suspense, lazy, useEffect } from "react";
+import { resolveLocalStatusUrl } from "./data/local-status-query";
+
+// Secondary routes load on demand. The workspace is what every visit opens;
+// contributor projections, benchmark studies and answer reports arrive as
+// their own chunks only when such a route is entered.
+const FrontstageDeveloperPage = lazy(() => import("./views/frontstage-developer-page").then((module) => ({ default: module.FrontstageDeveloperPage })));
+const BenchmarkStudyPage = lazy(() => import("./views/benchmark-study-page").then((module) => ({ default: module.BenchmarkStudyPage })));
+const AnswerReportPage = lazy(() => import("./features/personal-workspace/answer-report-page").then((module) => ({ default: module.AnswerReportPage })));
+
+function RouteLoading() {
+  return <main className="p-8" role="status">加载中… / Loading…</main>;
+}
+
+// The research readers validate their bookmarks against the selected Goal and
+// source. Keep their existing URL fields together for workspace navigation.
+const researchSearchShape = {
+  research_lens: z.unknown().optional(),
+  research_phase: z.unknown().optional(),
+  research_goal: z.unknown().optional(),
+  research_reading: z.unknown().optional(),
+  research_node: z.unknown().optional(),
+  research_finding: z.unknown().optional(),
+  research_event: z.unknown().optional(),
+  research_state: z.unknown().optional(),
+  research_group: z.unknown().optional(),
+  research_parent_node: z.unknown().optional(),
+  research_parent_group: z.unknown().optional(),
+  research_question: z.unknown().optional(),
+  research_return: z.unknown().optional(),
+  research_records: z.unknown().optional(),
+  research_pack: z.unknown().optional(),
+  research_compare: z.unknown().optional(),
+  research_analysis: z.unknown().optional(),
+  research_analysis_goal: z.unknown().optional(),
+};
+export const clearedResearchSearch = Object.fromEntries(
+  Object.keys(researchSearchShape).map(key => [key, undefined]),
+) as Record<keyof typeof researchSearchShape, undefined>;
 
 const searchSchema = z.object({
   goalId: z.string().optional().default(""),
+  // Absence alone opens all Goals. Preserve present decoded values, including
+  // empty strings/arrays, so malformed scope cannot become an unscoped visit.
+  // Numeric opaque IDs still survive the router's JSON decoding.
+  rootGoalId: z.unknown().transform(value => typeof value === "string" && value
+    ? value : JSON.stringify(value)).optional(),
+  ...researchSearchShape,
+  // Settings view state is validated by its local reader, just like research
+  // focus. Preserve it across workspace navigation without granting a target.
+  settings_scope: z.unknown().optional(),
+  settings_goal: z.unknown().optional(),
+  settings_tab: z.unknown().optional(),
+  // Stable Goal/Agent working conversation; empty string opens the directory.
+  workAgent: z.string().regex(/^[A-Za-z0-9._:-]{0,200}$/).optional().catch(undefined),
+  workSession: z.unknown().transform(value => typeof value === "string" ? value : JSON.stringify(value)).optional(),
+  todo: z.string().regex(/^[A-Za-z0-9._:-]{1,200}$/).optional().catch(undefined),
+  // UI-only work browsing; the feature reader fences it to its exact Goal/source.
+  workGoal: z.string().optional().catch(undefined),
+  workSource: z.string().optional().catch(undefined),
+  workLens: z.enum(["owner", "board", "map"]).optional().catch(undefined),
+  taskView: z.enum(["board", "list"]).optional().catch(undefined),
+  taskOwner: z.string().max(200).optional().catch(undefined),
+  taskFilter: z.enum(["all", "needsYou", "open", "blocked", "done"]).optional().catch(undefined),
+  taskQuery: z.string().max(256).optional().catch(undefined),
+  // Scopes the steward conversation to a host-granted workspace; selecting a Goal clears it.
+  workspace: z.string().regex(/^[A-Za-z0-9]{1,80}$/).optional().catch(undefined),
+  // Preserve malformed/partial addresses so they fail closed in the source
+  // reader instead of silently opening an ordinary steward conversation.
+  conversationBinding: z.unknown().transform(value => typeof value === "string" ? value : JSON.stringify(value)).optional(),
+  conversationSession: z.unknown().transform(value => typeof value === "string" ? value : JSON.stringify(value)).optional(),
   statusUrl: z.string().optional().default(""),
+  view: z.enum(["conversation", "overview", "tasks", "research", "files"]).optional(),
+  reportSessionId: z.string().regex(/^[A-Za-z0-9._-]{1,160}$/).optional(),
+  reportMessageId: z.string().regex(/^[A-Za-z0-9._-]{1,160}$/).optional(),
+  messageSession: z.string().regex(/^[A-Za-z0-9._-]{1,160}$/).optional().catch(undefined),
+  message: z.string().regex(/^[A-Za-z0-9._-]{1,160}$/).optional().catch(undefined),
 });
 
 const frontstageSearchSchema = z.object({
@@ -23,34 +95,100 @@ const frontstageSearchSchema = z.object({
   todoQuery: z.string().optional().default(""),
 });
 
+const deprecatedFrontstageOpsSearchSchema = frontstageSearchSchema.omit({ mode: true });
+
+const benchmarkStudySearchSchema = z.object({
+  dashboardUrl: z.string().optional().default(""),
+  view: z.enum(["campaign", "arms", "cases", "runs"]).optional().default("campaign"),
+  runId: z.string().optional().default(""),
+  caseId: z.string().optional().default(""),
+});
+
+// Bookmarks remain valid, but the retired boards no longer ship a second UI.
+function PublicCasesRedirect() {
+  const target = "https://loopx-project.github.io/loopx/docs/showcases/index.en.html";
+  useEffect(() => { window.location.replace(target); }, []);
+  return <a href={target}>Open LoopX cases / 浏览案例</a>;
+}
+
+function WorkspaceRedirect({ goalId, statusUrl }: { goalId: string; statusUrl: string }) {
+  const resolved = statusUrl ? resolveLocalStatusUrl(statusUrl, window.location.href) : null;
+  if (resolved?.error) return <main role="alert">{resolved.error}</main>;
+  return <Navigate replace to="/" search={{ goalId, statusUrl }} />;
+}
+
+function FrontstageRoutePage() {
+  const search = frontstageRoute.useSearch();
+  if (search.mode === "ops") return <WorkspaceRedirect {...search} />;
+  if (search.mode === "developer") return <Navigate replace to="/developers/projections" />;
+  return <PublicCasesRedirect />;
+}
+
+function DeprecatedFrontstageOpsRoutePage() {
+  return <WorkspaceRedirect {...deprecatedFrontstageOpsRoute.useSearch()} />;
+}
+
 export const rootRoute = createRootRoute({
   component: () => <Outlet />,
+  errorComponent: () => <main role="alert" className="p-8">
+    <h1>页面暂时无法显示 / Page unavailable</h1>
+    <p>请重新加载页面；这不会执行任务。 / Reloading does not execute tasks.</p>
+    <button type="button" onClick={() => window.location.reload()}>重新加载 / Reload</button>
+  </main>,
 });
 
 export const dashboardRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
   validateSearch: (search) => searchSchema.parse(search),
-  component: DashboardPage,
+  component: () => {
+    const search = dashboardRoute.useSearch();
+    return search.reportSessionId && search.reportMessageId
+      ? <Suspense fallback={<RouteLoading />}><AnswerReportPage sessionId={search.reportSessionId} messageId={search.reportMessageId} statusUrl={search.statusUrl}/></Suspense>
+      : <DashboardPage/>;
+  },
 });
 
 export const frontstageRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/frontstage",
   validateSearch: (search) => frontstageSearchSchema.parse(search),
-  component: FrontstagePage,
+  component: FrontstageRoutePage,
+});
+
+export const deprecatedFrontstageOpsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/deprecated/frontstage/ops",
+  validateSearch: (search) => deprecatedFrontstageOpsSearchSchema.parse(search),
+  component: DeprecatedFrontstageOpsRoutePage,
 });
 
 export const frontstageDeveloperRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/frontstage/developer",
-  component: FrontstageDeveloperPage,
+  component: () => <Navigate replace to="/developers/projections" />,
+});
+
+export const projectionDeveloperRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/developers/projections",
+  component: () => <Suspense fallback={<RouteLoading />}><FrontstageDeveloperPage /></Suspense>,
+});
+
+export const benchmarkStudyRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/benchmarks/study",
+  validateSearch: (search) => benchmarkStudySearchSchema.parse(search),
+  component: () => <Suspense fallback={<RouteLoading />}><BenchmarkStudyPage /></Suspense>,
 });
 
 const routeTree = rootRoute.addChildren([
   dashboardRoute,
   frontstageRoute,
+  deprecatedFrontstageOpsRoute,
   frontstageDeveloperRoute,
+  projectionDeveloperRoute,
+  benchmarkStudyRoute,
 ]);
 
 function routerBasepathFromViteBase(baseUrl: string) {
@@ -64,6 +202,7 @@ function routerBasepathFromViteBase(baseUrl: string) {
 export const router = createRouter({
   routeTree,
   basepath: routerBasepathFromViteBase(import.meta.env.BASE_URL),
+  trailingSlash: "preserve",
 });
 
 declare module "@tanstack/react-router" {

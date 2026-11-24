@@ -1,0 +1,228 @@
+"""A bounded display must not strand an admitted lifecycle recovery."""
+from __future__ import annotations
+
+import json
+import shlex
+import subprocess
+from hashlib import sha256
+from pathlib import Path
+
+import pytest
+
+from loopx.control_plane.quota.turn_envelope import build_turn_envelope
+from test_replan_successor_guard_reentry import AGENT, GOAL, _fixture, _guard
+
+
+@pytest.mark.parametrize("new_work", ["after_closeout", "before_closeout", "bound_before_closeout"])
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("later_user_gate", [False, True])
+@pytest.mark.parametrize("large_history", [False, True])
+def test_hidden_completed_source_recovers_its_original_guard_after_new_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str, later_user_gate: bool,
+    large_history: bool, new_work: str,
+) -> None:
+    original_id = "todo_original_lifecycle"
+    completion_key = "local_completion_" + sha256(
+        f"loopx-local-todo-completion-v0\0{GOAL}\0{original_id}".encode()
+    ).hexdigest()[:32]
+    completed = {
+        "schema_version": "todo_item_v0", "archive_state": "active", "source_section": "Agent Todo",
+        "todo_id": original_id, "role": "agent", "index": 1,
+        "text": "Record the independently accepted maintenance outcome.",
+        "status": "done", "done": True, "task_class": "advancement_task",
+        "claimed_by": AGENT, "last_actor_agent_id": AGENT,
+        "note": "The finite maintenance outcome was independently accepted.",
+        "completed_at": "2026-08-01T00:00:00Z", "updated_at": "2026-08-01T00:00:00Z",
+        "completion_turn_key": completion_key, "completion_continuation": "active_goal",
+    }
+    # Enough newer terminal rows to move the original outside display budgets.
+    recent = [{**completed, "todo_id": f"todo_later_{i}", "index": i + 2,
+        "text": f"Accepted independent source {i}.", "no_followup": True,
+        "note": "Synthetic retained evidence. " + ("x" * 96_000 if large_history else ""),
+        "completion_continuation": "no_followup", "completion_turn_key": f"later-{i}",
+        "completed_at": "2026-08-02T00:00:00Z", "updated_at": "2026-08-02T00:00:00Z"}
+        for i in range(24)]
+    watch = {"schema_version": "todo_item_v0", "archive_state": "active", "source_section": "Agent Todo",
+        "todo_id": "todo_future_watch", "role": "agent", "index": 30,
+        "text": "Observe the pending independent source.", "status": "open", "done": False,
+        "task_class": "continuous_monitor", "claimed_by": AGENT,
+        "action_kind": "monitor", "target_key": "independent-source",
+        "cadence": "30m", "next_due_at": "2099-01-01T00:00:00Z",
+        "expires_at": "2099-01-02T00:00:00Z"}
+    source_call, runtime, index = _fixture(tmp_path, monkeypatch, provider,
+        initial_todos=[completed, *recent, watch])
+
+    def call(*args, **kwargs):
+        # This test inspects the explicit inline CLI contract, as does the
+        # affected context-off worker. Progressive reader coverage is separate.
+        return source_call(*args, *(["--context-delivery", "off"]
+            if "should-run" in args else []), **kwargs)
+
+    index.write_text("")
+    turn = "turn-admitted-lifecycle-recovery"
+    admitted = _guard(call, turn)
+    identity = admitted["heartbeat_receipt"]["settlement_identity"]
+    obligation = admitted["autonomous_replan_obligation"]
+    assert obligation["resolution_mode"] == "todo_lifecycle_settlement"
+    assert [row["todo_id"] for row in obligation["triggers"]] == [original_id]
+    # Follow the public recovery command, rather than supplying the missing
+    # identity by hand. The completed Todo's identity belongs to an older Turn.
+    reentry = shlex.split(admitted["interaction_contract"]["cli_channel"]["next_cli_actions"][-1])
+    assert reentry[reentry.index("--turn-instance-id") + 1] == turn
+    assert reentry[reentry.index("--registry") + 1] == str(tmp_path / "registry.json")
+    assert reentry[reentry.index("--runtime-root") + 1] == str(runtime)
+    assert "--codex-app" in reentry
+    assert "--completion-identity-key" not in reentry
+
+    # Independent new work cannot discharge the admitted lifecycle.
+    def add_work():
+        return call("todo", "add", "--goal-id", GOAL, "--role", "agent",
+        "--claimed-by", AGENT, "--text", "Validate the newly requested independent source.",
+        "--task-class", "advancement_task", "--action-kind", "validate",
+        "--target-key", "new-independent-source",
+        *(["--replan-obligation-id", obligation["obligation_id"]]
+          if new_work == "bound_before_closeout" else []))
+    later = None
+    if new_work == "bound_before_closeout":
+        later = add_work()
+        assert later["replan_transition"]["recorded"] is True
+        assert later["replan_transition"]["outcome"] == "new_runnable_successor"
+        pending = _guard(call, turn)
+        assert pending["heartbeat_receipt"]["settlement_identity"] == identity
+        assert pending.get("selected_todo") is None
+        assert pending["autonomous_replan_obligation"]["resolution_mode"] == "receipt_bound_replan_settlement"
+        assert pending["replan_action_packet"]["decision"] == "successor_transition_recorded"
+        assert pending["replan_action_packet"]["successor_todo_id"] == later["todo_id"]
+        denied = call("quota", "spend-slot", "--goal-id", GOAL, "--agent-id", AGENT,
+            "--codex-app", "--turn-instance-id", turn, "--replan-obligation-id",
+            obligation["obligation_id"], "--source", "heartbeat", "--execute", expected_code=1)
+        assert denied.get("appended") is not True
+        actions = pending["interaction_contract"]["cli_channel"]["next_cli_actions"]
+        refreshed = call(*shlex.split(actions[0])[1:], "--no-global-sync", "--suppress-external-sinks")
+        assert refreshed["settlement_progress"]["state"] == "spend_required"
+        assert call(*shlex.split(actions[1])[1:])["settlement_progress"]["state"] == "settled"
+        assert call(*shlex.split(actions[1])[1:])["appended"] is False
+        assert call("todo", "list", "--goal-id", GOAL, "--todo-id", later["todo_id"])["todo"]["status"] == "open"
+        return
+    if new_work == "before_closeout":
+        later = add_work()
+        for _ in range(2):
+            pending = _guard(call, turn)
+            assert pending["heartbeat_receipt"]["settlement_identity"] == identity
+            assert pending.get("selected_todo") is None
+            assert pending["autonomous_replan_obligation"]["resolution_mode"] == "todo_lifecycle_settlement"
+            assert pending["autonomous_replan_obligation"]["triggers"] == obligation["triggers"]
+        denied = call("quota", "spend-slot", "--goal-id", GOAL, "--agent-id", AGENT,
+            "--codex-app", "--turn-instance-id", turn, "--replan-obligation-id",
+            obligation["obligation_id"], "--source", "heartbeat", "--execute", expected_code=1)
+        assert denied.get("appended") is not True
+        rejected = call("refresh-state", "--goal-id", GOAL, "--agent-id", AGENT,
+            "--turn-instance-id", turn, "--replan-obligation-id", obligation["obligation_id"],
+            "--classification", "pending_lifecycle_review", "--delivery-batch-scale", "single_surface",
+            "--delivery-outcome", "outcome_progress", "--vision-unchanged-reason",
+            "Independent work exists but the original lifecycle is still pending.",
+            "--no-global-sync", "--suppress-external-sinks", expected_code=1)
+        assert rejected.get("ok") is not True
+
+    closed = call("todo", "complete", "--goal-id", GOAL, "--todo-id", original_id,
+        "--agent-id", AGENT, "--completion-identity-key", completion_key,
+        "--no-follow-up", "--reason", "The finite maintenance outcome was independently accepted.")
+    assert closed["completion_recovery"] == "lifecycle_reentry_terminal_closeout"
+    assert call("todo", "list", "--goal-id", GOAL, "--todo-id", original_id)["todo"]["note"] == completed["note"]
+    if later is None:
+        later = add_work()
+    user_gate = None
+    if later_user_gate:
+        user_gate = call("todo", "add", "--goal-id", GOAL, "--role", "user",
+            "--agent-id", AGENT, "--task-class", "user_gate", "--global-gate",
+            "--text", "Authorize the separate newly requested source.")
+
+    recovered = call(*reentry[1:])
+    assert recovered["heartbeat_receipt"]["settlement_identity"] == identity
+    assert recovered.get("selected_todo") is None
+    assert recovered["autonomous_replan_obligation"]["resolution_mode"] == "receipt_bound_replan_settlement"
+    assert recovered["replan_action_packet"]["decision"] == "vision_outcome_checkpoint_required"
+    assert recovered["replan_action_packet"]["semantic_delta"] is None
+    if large_history:
+        assert len(json.dumps(recent).encode()) > 2 * 1024 * 1024
+    denied = call("quota", "spend-slot", "--goal-id", GOAL, "--agent-id", AGENT,
+        "--codex-app", "--turn-instance-id", turn, "--replan-obligation-id",
+        obligation["obligation_id"], "--source", "heartbeat", "--execute", expected_code=1)
+    assert denied.get("appended") is not True
+
+    packet = recovered["replan_action_packet"]
+    assert "agent_vision.stride_decision" in packet["writeback_contract"]["required_fields"]
+    stride = packet["stride_control"]["minimal_example"]
+    assert stride["reference_obligation_id"] == obligation["obligation_id"]
+    assert stride["reference_context_id"] == recovered["autonomous_replan_obligation"]["replan_context"]["context_id"]
+    vision = tmp_path / "accepted-review.json"
+    vision.write_text(json.dumps({"schema_version": "goal_vision_replan_contract_v0",
+        "state": "vision_patch_proposed", "vision_patch": {
+            "acceptance_summary": "Finite maintenance is verified; the independent new source remains open."},
+        "stride_decision": stride,
+        "path_delta": {"schema_version": "goal_path_delta_v0", "outcome": "continue",
+            "prior_assumption": "Finite maintenance needed a terminal disposition.",
+            "observed_reality": "Its original outcome and no-follow-up were verified; new work remains independent.",
+            "retained": ["The newly requested source requires its own admission."],
+            "evidence_refs": ["evidence:accepted-maintenance"]}}))
+    refreshed = call("refresh-state", "--goal-id", GOAL, "--agent-id", AGENT,
+        "--turn-instance-id", turn, "--replan-obligation-id", obligation["obligation_id"],
+        "--classification", "verified_lifecycle_outcome", "--delivery-batch-scale", "single_surface",
+        "--delivery-outcome", "outcome_progress", "--agent-vision-json", str(vision),
+        "--no-global-sync", "--suppress-external-sinks")
+    assert refreshed["settlement_progress"]["state"] == "spend_required"
+    spend = ("quota", "spend-slot", "--goal-id", GOAL, "--agent-id", AGENT,
+        "--codex-app", "--turn-instance-id", turn, "--replan-obligation-id",
+        obligation["obligation_id"], "--source", "heartbeat", "--execute")
+    assert call(*spend)["settlement_progress"]["state"] == "settled"
+    assert call(*spend)["appended"] is False
+    assert call("todo", "list", "--goal-id", GOAL, "--todo-id", later["todo_id"])["todo"]["status"] == "open"
+    if user_gate:
+        assert call("todo", "list", "--goal-id", GOAL, "--todo-id", user_gate["todo_id"])["todo"]["status"] == "open"
+        fresh = _guard(call, "turn-independent-source-after-lifecycle")
+        interaction = fresh["interaction_contract"]
+        assert interaction["agent_channel"]["delivery_allowed"] is False
+        assert interaction["agent_channel"]["must_attempt"] is False
+        assert interaction["response_plan"]["decision"] == "ask_user"
+    assert len([row for row in index.read_text().splitlines()
+        if json.loads(row).get("classification") == "quota_slot_spent"]) == 1
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("delivery", ["auto", "off"])
+def test_native_cli_context_exposes_the_same_bound_lifecycle_reentry(
+    tmp_path, monkeypatch, provider, delivery,
+):
+    completed = {"schema_version": "todo_item_v0", "archive_state": "active",
+        "source_section": "Agent Todo", "todo_id": "todo_completed", "role": "agent", "index": 1,
+        "text": "Deliver the accepted finite source audit.", "status": "done", "done": True,
+        "task_class": "advancement_task", "claimed_by": AGENT, "last_actor_agent_id": AGENT,
+        "completed_at": "2026-08-01T00:00:00Z", "updated_at": "2026-08-01T00:00:00Z",
+        "completion_continuation": "active_goal"}
+    call, _, index = _fixture(tmp_path, monkeypatch, provider, initial_todos=[completed])
+    index.write_text("")
+    turn = "turn-captured-lifecycle"
+    entry = call("quota", "should-run", "--runtime-profile", "generic_cli", "--goal-id", GOAL,
+        "--agent-id", AGENT, "--turn-instance-id", turn, "--context-delivery", delivery,
+        "--decision-output-dir", str(tmp_path / "capture"))
+    if delivery == "auto":
+        assert entry["schema_version"] == "context_capture_navigation_v1"
+        selected = call("quota", "context-read", "--reference-file", entry["recovery"]["reference_file"],
+            "--select", "/interaction_contract/cli_channel/next_cli_actions", "--page-bytes", "8000")
+        assert selected["eof"] is True
+        selected_actions = json.loads(selected["content"])["selections"][0]["value"]
+        full_page = call("quota", "context-read", "--reference-file", entry["recovery"]["reference_file"],
+            "--page-bytes", "64000", "--max-page-output-bytes", "64000")
+        assert full_page["eof"] is True
+        projected = json.loads(full_page["content"])
+        assert projected["interaction_contract"]["cli_channel"]["next_cli_actions"] == selected_actions
+    else:
+        projected = entry
+    writer_command = build_turn_envelope(projected)["replan_action_packet"]["writeback"]
+    result = subprocess.run(shlex.split(writer_command), capture_output=True, text=True, check=True)
+    writer = json.loads(result.stdout)
+    actions = writer["writeback"]["next_cli_actions"]
+    guard = shlex.split(actions[-1])
+    assert guard[guard.index("--turn-instance-id") + 1] == turn
+    assert guard[guard.index("--runtime-profile") + 1] == "generic_cli"
+    assert guard[guard.index("--registry") + 1] == str(tmp_path / "registry.json")

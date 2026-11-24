@@ -180,6 +180,16 @@ def test_quiet_monitor_keeps_user_todo_non_blocking() -> None:
     assert "open user todo" in recommendation["spend_policy"]
 
 
+def test_true_monitor_only_lane_keeps_monitor_only_reason() -> None:
+    recommendation = _recommend(
+        lane="continuous_monitor",
+        must_attempt_work=False,
+        agent_open=1,
+    )
+
+    assert "all visible open agent todos are monitor-class" in recommendation["reason"]
+
+
 def test_due_monitor_lane_preempts_first_read_only_map() -> None:
     recommendation = _recommend(
         {
@@ -229,11 +239,12 @@ def test_post_handoff_primary_outcome_preserves_observation_contract() -> None:
     assert recommendation["latest_run"]["progress_scope"] == "primary_goal"
 
 
-def test_default_mode_requires_bounded_steering_audit() -> None:
+def test_default_mode_keeps_compatibility_without_an_operation_limit() -> None:
     recommendation = _recommend(
         {"status": "active-read-only"},
         agent_open=1,
     )
 
     assert recommendation["recommended_mode"] == "steering_audit_then_one_step"
-    assert "bounded progress segment" in recommendation["spend_policy"]
+    assert "scope-bounded work" in recommendation["spend_policy"]
+    assert "not an operation limit" in recommendation["spend_policy"]

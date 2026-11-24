@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from typing import Any, TypedDict, cast
+
 from dataclasses import dataclass
-from typing import Any, TypedDict
 
 from ...state_projection import actions_are_projection_aligned
 from ..goals.contract_health import project_contract_health_for_goal
 from ..goals.goal_frontier import (
-    AUTONOMOUS_REPLAN_REQUIRED_MODE,
-    autonomous_replan_decision_allowed,
+    autonomous_replan_is_required,
+    autonomous_replan_scope_decision,
     goal_frontier_is_terminal_no_followup,
 )
+from ..effect_runtime import effect_runtime_result
+from .effect_program import ReceiptBoundReplayPhase
 from ..todos.contract import normalize_todo_claimed_by
 from ..work_items.work_lane import work_lane_contract_is_due_monitor_attempt
 
@@ -17,7 +20,7 @@ from ..work_items.work_lane import work_lane_contract_is_due_monitor_attempt
 def quota_plan_items(plan: dict[str, Any]) -> list[dict[str, Any]]:
     """Flatten quota plan state groups into ordered goal items."""
 
-    groups = plan.get("groups") if isinstance(plan.get("groups"), dict) else {}
+    groups = cast(dict[str, Any], plan.get("groups")) if isinstance(plan.get("groups"), dict) else {}
     items: list[dict[str, Any]] = []
     for state_items in groups.values():
         if not isinstance(state_items, list):
@@ -46,7 +49,7 @@ class QuotaDecisionPacket(TypedDict):
 
 
 def compact_quota_decision(decision: dict[str, Any]) -> QuotaDecisionPacket:
-    quota = decision.get("quota") if isinstance(decision.get("quota"), dict) else {}
+    quota = cast(dict[str, Any], decision.get("quota")) if isinstance(decision.get("quota"), dict) else {}
     return {
         "should_run": bool(decision.get("should_run")),
         "normal_delivery_allowed": bool(decision.get("normal_delivery_allowed")),
@@ -69,11 +72,46 @@ def compact_quota_decision(decision: dict[str, Any]) -> QuotaDecisionPacket:
 
 def quota_decision_agent_id(decision: dict[str, Any]) -> str | None:
     agent_identity = (
-        decision.get("agent_identity")
+        cast(dict[str, Any], decision.get("agent_identity"))
         if isinstance(decision.get("agent_identity"), dict)
         else {}
     )
     return normalize_todo_claimed_by(agent_identity.get("agent_id"))
+
+
+# A Goal whose declared active state file is gone cannot be advanced by an
+# automatic turn: there is no Goal intent, acceptance or stop condition to read.
+# `loopx status` already reports the per-goal `state_file_missing` finding with
+# its reconnect/retire repair, so the quota gate must not keep authorizing
+# compute for it. Source-registry provenance findings are deliberately shadowed
+# by the status projection and stay out of this guard.
+_GOAL_MISSING_STATE_FINDING = "state_file_missing"
+
+
+def goal_missing_state_blocker(
+    status_payload: dict[str, Any],
+    *,
+    goal_id: str,
+) -> dict[str, Any] | None:
+    """Return the status finding that says this Goal's active state is gone."""
+
+    global_registry = status_payload.get("global_registry")
+    if not isinstance(global_registry, dict):
+        return None
+    findings = global_registry.get("findings")
+    if not isinstance(findings, list):
+        return None
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        kind = finding.get("kind")
+        if (
+            isinstance(kind, str)
+            and kind == _GOAL_MISSING_STATE_FINDING
+            and str(finding.get("goal_id") or "") == goal_id
+        ):
+            return dict(finding)
+    return None
 
 
 def goal_status_health_ok(
@@ -84,8 +122,10 @@ def goal_status_health_ok(
 ) -> bool:
     """Keep global guards fail-closed without importing unrelated goal errors."""
 
+    if goal_missing_state_blocker(status_payload, goal_id=goal_id) is not None:
+        return False
     contract = (
-        status_payload.get("contract")
+        cast(dict[str, Any], status_payload.get("contract"))
         if isinstance(status_payload.get("contract"), dict)
         else {}
     )
@@ -111,6 +151,9 @@ class QuotaRunDecision:
     state: str
     quota: dict[str, Any]
     replan_decision_allowed: bool
+    goal_route_hint_override: dict[str, Any] | None = None
+    agent_scope_frontier: dict[str, Any] | None = None
+    vision_baseline_initialization: bool = False
 
 
 def refine_quota_recommended_action(
@@ -196,6 +239,11 @@ def refine_quota_recommended_action(
     return refined
 
 
+def _guard_strings(guard: dict[str, Any] | None, fields: tuple[str, ...]) -> dict[str, str] | None:
+    # Preserve the compatibility caller's Python string coercion, including whitespace.
+    return {field: str(guard.get(field) or "") for field in fields} if guard else None
+
+
 def resolve_quota_run_decision(
     *,
     normal_delivery_allowed: bool,
@@ -213,219 +261,74 @@ def resolve_quota_run_decision(
     replan_obligation: dict[str, Any] | None,
     goal_health_ok: bool,
     inbox_reply_due: bool,
+    inbox_material_review_due: bool,
     agent_frontier_id: str | None,
     registered_agent_ids: list[str],
     goal_frontier_projection: dict[str, Any] | None,
     task_orchestration_contract: dict[str, Any] | None,
+    receipt_bound_replan_phase: ReceiptBoundReplayPhase | None = None,
+    receipt_bound_replan_execution_pending: bool = False,
+    vision_initialization_context: dict[str, Any] | None = None,
 ) -> QuotaRunDecision:
     """Apply the ordered final guards for one quota run decision."""
 
-    capability_repair_allowed = False
-    workspace_repair_allowed = False
-    if (
-        capability_gate
-        and capability_gate.get("action") != "run"
-        and not capability_monitor_fallback
-    ):
-        normal_delivery_allowed = False
-        recovery_delivery_allowed = False
-        if capability_gate.get("action") == "repair_bridge":
-            capability_repair_allowed = True
-            reason = str(
-                capability_gate.get("reason") or "capability bridge repair required"
-            )
-        else:
-            reason = str(
-                capability_gate.get("reason")
-                or "selected todo capability is unavailable"
-            )
-    if workspace_guard:
-        normal_delivery_allowed = False
-        recovery_delivery_allowed = False
-        self_repair_allowed = False
-        capability_repair_allowed = False
-        workspace_repair_allowed = True
-        reason = str(
-            workspace_guard.get("reason") or "agent workspace guard blocks delivery"
-        )
-    if automation_prompt_upgrade_required:
-        normal_delivery_allowed = False
-        recovery_delivery_allowed = False
-        self_repair_allowed = False
-        capability_repair_allowed = False
-        workspace_repair_allowed = False
-        reason = str(
-            (automation_prompt_upgrade or {}).get("reason")
-            or "identity-aware automation prompt upgrade is required"
-        )
-
-    should_run = bool(
-        normal_delivery_allowed
-        or recovery_delivery_allowed
-        or self_repair_allowed
-        or capability_repair_allowed
-        or workspace_repair_allowed
-    )
-    effective_action = quota_effective_action(
-        normal_delivery_allowed=normal_delivery_allowed,
-        recovery_delivery_allowed=recovery_delivery_allowed,
-        self_repair_allowed=self_repair_allowed,
-        capability_repair_allowed=capability_repair_allowed,
-        workspace_repair_allowed=workspace_repair_allowed,
-        stall_self_repair=stall_self_repair,
-        state=state,
-        quota=quota,
-    )
-    replan_decision_allowed = (
-        not inbox_reply_due
-        and autonomous_replan_decision_allowed(
-            replan_obligation=replan_obligation,
-            plan_ok=goal_health_ok,
-            workspace_blocked=bool(workspace_guard),
-            automation_prompt_upgrade_required=automation_prompt_upgrade_required,
-            agent_id=agent_frontier_id,
-            registered_agent_ids=registered_agent_ids,
-        )
-    )
-    if replan_decision_allowed:
-        normal_delivery_allowed = False
-        recovery_delivery_allowed = False
-        should_run = True
-        effective_action = AUTONOMOUS_REPLAN_REQUIRED_MODE
-        reason = (
-            "autonomous replan obligation is selected before monitor quiet "
-            "or agent-scope wait classification"
-        )
-
-    terminal_no_followup = goal_frontier_is_terminal_no_followup(
-        projection=goal_frontier_projection
-    )
-    if terminal_no_followup and not inbox_reply_due:
-        quota = {
-            **quota,
-            "state": "terminal_no_followup",
-            "reason": (
-                "derived terminal no-follow-up is confirmed by complete todo "
-                "sources and an empty frontier"
-            ),
-        }
-        state = "terminal_no_followup"
-        normal_delivery_allowed = False
-        recovery_delivery_allowed = False
-        self_repair_allowed = False
-        capability_repair_allowed = False
-        workspace_repair_allowed = False
-        should_run = False
-        effective_action = "terminal_no_followup"
-        reason = (
-            "validated closure evidence derives terminal no-follow-up from "
-            "complete todo sources and an empty frontier; stop recurring "
-            "automation until an explicit resume"
-        )
-
-    if automation_prompt_upgrade_required and not terminal_no_followup:
-        should_run = False
-        effective_action = "automation_prompt_upgrade_required"
-    elif inbox_reply_due:
-        should_run = True
-        normal_delivery_allowed = True
-        recovery_delivery_allowed = False
-        self_repair_allowed = False
-        capability_repair_allowed = False
-        workspace_repair_allowed = False
-        effective_action = "lark_inbox_reply_due"
-        reason = (
-            "a direct Lark question, bot mention, or verified reply to the bot "
-            "is pending reply"
-        )
-
-    effective_action, reason = _task_orchestration_effective_action(
-        task_orchestration_contract,
-        should_run=should_run,
-        normal_delivery_allowed=normal_delivery_allowed,
-        effective_action=effective_action,
-        reason=reason,
-    )
+    replan_required = autonomous_replan_is_required(replan_obligation)
+    settlement_packet = (replan_obligation or {}).get("settlement_action_packet")
+    # Scope evaluation can synthesize a legacy identity; preserve its lazy read boundary.
+    scope = autonomous_replan_scope_decision(
+        replan_obligation, agent_id=agent_frontier_id,
+        registered_agent_ids=registered_agent_ids,
+    ) if replan_required and not (inbox_reply_due or inbox_material_review_due) else {}
+    repair_action = (stall_self_repair.get("effective_action")
+        if isinstance(stall_self_repair, dict) else None)
+    task_orchestration_lane_count = 0
+    if task_orchestration_contract is not None:
+        lanes = task_orchestration_contract.get("eligible_child_lanes")
+        if not isinstance(lanes, list):
+            lanes = task_orchestration_contract.get("eligible_peer_lanes")
+        task_orchestration_lane_count = len(lanes) if isinstance(lanes, list) else 0
+    result = effect_runtime_result("quota.run_decision", {
+        "normal_delivery_allowed": normal_delivery_allowed,
+        "recovery_delivery_allowed": recovery_delivery_allowed,
+        "self_repair_allowed": self_repair_allowed,
+        "repair_effective_action": str(repair_action or ""),
+        "state": state, "reason": reason,
+        "quota_allowed_slots": str(quota["allowed_slots"]) if quota.get("allowed_slots") is not None else None,
+        "quota_spent_slots": str(quota["spent_slots"]) if quota.get("spent_slots") is not None else None,
+        "quota_focus_wait": bool(quota.get("focus_wait")),
+        "capability_gate": _guard_strings(capability_gate, ("action", "reason")),
+        "capability_monitor_fallback": bool(capability_monitor_fallback),
+        "workspace_guard": _guard_strings(workspace_guard, ("reason",)),
+        "automation_prompt_upgrade": _guard_strings(automation_prompt_upgrade, ("reason",)),
+        "automation_prompt_upgrade_required": automation_prompt_upgrade_required,
+        "replan_required": replan_required,
+        "replan_applies": bool(scope.get("applies")),
+        "replan_execution_pending": (
+            receipt_bound_replan_execution_pending
+            and (replan_obligation or {}).get("selection_binding") == "heartbeat_receipt"
+        ),
+        "replan_settlement_pending": (
+            receipt_bound_replan_phase is ReceiptBoundReplayPhase.SETTLEMENT_PENDING
+            and (replan_obligation or {}).get("selection_binding") == "heartbeat_receipt"
+            and isinstance(settlement_packet, dict)
+            and settlement_packet.get("settlement_only") is True
+            and settlement_packet.get("decision") == receipt_bound_replan_phase.value
+        ),
+        "vision_initialization_context": vision_initialization_context,
+        "goal_health_ok": goal_health_ok,
+        "inbox_reply_due": inbox_reply_due,
+        "inbox_material_review_due": inbox_material_review_due,
+        "terminal_no_followup": goal_frontier_is_terminal_no_followup(
+            projection=goal_frontier_projection),
+        "task_orchestration_lane_count": task_orchestration_lane_count,
+        "task_orchestration_contract": _guard_strings(
+            task_orchestration_contract, ("execution_state", "mode")),
+    })
+    patch = result.pop("quota_patch")
+    route_hint_override = result.pop("goal_route_hint_override", None)
+    # Only typed edits cross the wire; preserve source numbers and unmodified metadata.
     return QuotaRunDecision(
-        normal_delivery_allowed=normal_delivery_allowed,
-        recovery_delivery_allowed=recovery_delivery_allowed,
-        self_repair_allowed=self_repair_allowed,
-        capability_repair_allowed=capability_repair_allowed,
-        workspace_repair_allowed=workspace_repair_allowed,
-        should_run=should_run,
-        effective_action=effective_action,
-        reason=reason,
-        state=state,
-        quota=quota,
-        replan_decision_allowed=replan_decision_allowed,
+        quota={**quota, **patch} if patch else quota,
+        goal_route_hint_override=route_hint_override,
+        **result,
     )
-
-
-def quota_effective_action(
-    *,
-    normal_delivery_allowed: bool,
-    recovery_delivery_allowed: bool,
-    self_repair_allowed: bool,
-    capability_repair_allowed: bool,
-    workspace_repair_allowed: bool,
-    stall_self_repair: dict[str, Any] | None,
-    state: str,
-    quota: dict[str, Any],
-) -> str:
-    if normal_delivery_allowed:
-        return "normal_run"
-    if recovery_delivery_allowed:
-        return "outcome_floor_recovery"
-    if workspace_repair_allowed:
-        return "agent_workspace_repair"
-    if self_repair_allowed:
-        repair_action = (
-            stall_self_repair.get("effective_action")
-            if isinstance(stall_self_repair, dict)
-            else None
-        )
-        return str(repair_action or "control_plane_repair")
-    if capability_repair_allowed:
-        return "capability_bridge_repair"
-    if state == "operator_gate":
-        return "operator_gate_notify"
-    if state == "blocked_health":
-        return "blocked_health"
-    if state == "throttled":
-        return "throttled_skip"
-    if state in {"focus_wait", "waiting"} or quota.get("focus_wait"):
-        return "blocked_wait"
-    return "quota_skip"
-
-
-def _task_orchestration_effective_action(
-    contract: dict[str, Any] | None,
-    *,
-    should_run: bool,
-    normal_delivery_allowed: bool,
-    effective_action: str,
-    reason: str,
-) -> tuple[str, str]:
-    if (
-        contract
-        and str(contract.get("execution_state") or "ready") == "ready"
-        and should_run
-        and normal_delivery_allowed
-        and effective_action == "normal_run"
-    ):
-        if contract.get("mode") == "adaptive":
-            return (
-                "coordinate_task_bundle",
-                (
-                    "the task coordinator may use admitted child lanes before its "
-                    "own worker-lane delivery"
-                ),
-            )
-        return (
-            "coordinate_task_bundle",
-            (
-                "the explicitly selected task coordinator must activate or resume "
-                "eligible peer lanes before doing its own worker-lane delivery"
-            ),
-        )
-    return effective_action, reason

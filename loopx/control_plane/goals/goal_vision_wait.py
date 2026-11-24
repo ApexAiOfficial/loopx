@@ -1,19 +1,24 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
-from ..todos.contract import (
-    TODO_TASK_CLASS_BLOCKER,
-    normalize_todo_claimed_by,
-    normalize_todo_id,
-    normalize_todo_status,
-)
-from ..todos.deferred_resume import todo_summary_blocked_successor_items
+from ..effect_runtime import effect_runtime_result
+from ..todos.contract import normalize_todo_id
+from ..todos.resume_planning import build_referenced_todo_resume_planning_request
 
 GOAL_VISION_WAIT_STATE_SCHEMA_VERSION = "goal_vision_wait_state_v0"
-VISION_ACCEPTANCE_GAP_KIND = "vision_acceptance_gap"
+
+
+def _vision_wait_blocker_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fields = ("todo_id", "task_class", "status", "priority", "claimed_by", "excluded_agents", "reason", "resume_ready")
+    return [{key: item[key] for key in fields if key in item} for item in items if isinstance(item, dict)]
+
+
+def _vision_wait_lineage_rows(items: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    if items is None:
+        return None
+    fields = ("todo_id", "successor_todo_ids", "resume_condition")
+    return [{key: item[key] for key in fields if key in item} for item in items if isinstance(item, dict)]
 
 
 def exact_blocked_successor_wait_state(value: Any) -> dict[str, Any]:
@@ -21,22 +26,13 @@ def exact_blocked_successor_wait_state(value: Any) -> dict[str, Any]:
         return {}
     candidate = value
     if value.get("schema_version") != GOAL_VISION_WAIT_STATE_SCHEMA_VERSION:
-        candidate = (
-            value.get("vision_wait_state")
-            if isinstance(value.get("vision_wait_state"), dict)
-            else {}
-        )
+        raw_candidate = value.get("vision_wait_state")
+        candidate = raw_candidate if isinstance(raw_candidate, dict) else {}
         if not candidate:
-            projection = (
-                value.get("goal_frontier_projection")
-                if isinstance(value.get("goal_frontier_projection"), dict)
-                else {}
-            )
-            candidate = (
-                projection.get("vision_wait_state")
-                if isinstance(projection.get("vision_wait_state"), dict)
-                else {}
-            )
+            raw_projection = value.get("goal_frontier_projection")
+            projection = raw_projection if isinstance(raw_projection, dict) else {}
+            raw_candidate = projection.get("vision_wait_state")
+            candidate = raw_candidate if isinstance(raw_candidate, dict) else {}
     if (
         candidate.get("schema_version") != GOAL_VISION_WAIT_STATE_SCHEMA_VERSION
         or candidate.get("state") != "waiting"
@@ -49,136 +45,14 @@ def exact_blocked_successor_wait_state(value: Any) -> dict[str, Any]:
     return candidate
 
 
-def exact_blocked_successor_frontier_identity(value: Any) -> str | None:
-    wait = exact_blocked_successor_wait_state(value)
-    if not wait:
-        return None
-    parts = {
-        "agent_id": str(wait.get("agent_id") or "").strip(),
-        "reason_code": "exact_blocked_successor",
-        "selected_todo_id": normalize_todo_id(wait.get("selected_todo_id")),
-        "resume_when": str(wait.get("resume_when") or "").strip(),
-    }
-    return hashlib.sha256(
-        json.dumps(parts, ensure_ascii=True, sort_keys=True).encode("utf-8")
-    ).hexdigest()[:16]
-
-
-def _compact_resume_condition(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {}
-    compact = {
-        key: value.get(key)
-        for key in (
-            "schema_version",
-            "resume_when",
-            "satisfied",
-            "kind",
-            "target",
-            "target_todo_id",
-            "target_status",
-            "target_archive_state",
-            "target_source_section",
-            "target_task_class",
-            "target_claimed_by",
-            "capability",
-            "provider",
-        )
-        if value.get(key) is not None
-    }
-    compact["satisfied"] = False
-    return compact
-
-
-def _acceptance_gap_causal_todo_ids(
-    gaps: list[dict[str, Any]],
-) -> set[str]:
-    todo_ids: set[str] = set()
-    for gap in gaps:
-        for key in (
-            "todo_id",
-            "current_todo_id",
-            "blocked_todo_id",
-            "completed_todo_id",
-            "successor_todo_id",
-        ):
-            todo_id = normalize_todo_id(gap.get(key))
-            if todo_id:
-                todo_ids.add(todo_id)
-        for key in (
-            "vision_todo_ids",
-            "lineage_todo_ids",
-            "successor_todo_ids",
-            "completed_todo_ids",
-        ):
-            values = gap.get(key) if isinstance(gap.get(key), list) else []
-            todo_ids.update(
-                todo_id
-                for value in values
-                if (todo_id := normalize_todo_id(value))
-            )
-    return todo_ids
-
-
-def _causal_blocked_successor_items(
-    candidates: list[dict[str, Any]],
-    *,
-    causal_todo_ids: set[str],
-) -> list[dict[str, Any]]:
-    """Keep only waits in the active vision's explicit Todo lineage."""
-
-    if not causal_todo_ids:
-        return []
-    lineage_ids = set(causal_todo_ids)
-    changed = True
-    while changed:
-        changed = False
-        for item in candidates:
-            todo_id = normalize_todo_id(item.get("todo_id"))
-            condition = (
-                item.get("resume_condition")
-                if isinstance(item.get("resume_condition"), dict)
-                else {}
-            )
-            target_todo_id = normalize_todo_id(
-                condition.get("target_todo_id") or condition.get("target")
-            )
-            successor_todo_ids = {
-                successor_todo_id
-                for value in (
-                    item.get("successor_todo_ids")
-                    if isinstance(item.get("successor_todo_ids"), list)
-                    else []
-                )
-                if (successor_todo_id := normalize_todo_id(value))
-            }
-            if not (
-                (todo_id and todo_id in lineage_ids)
-                or (target_todo_id and target_todo_id in lineage_ids)
-                or successor_todo_ids.intersection(lineage_ids)
-            ):
-                continue
-            expanded = {
-                value
-                for value in (todo_id, target_todo_id, *successor_todo_ids)
-                if value
-            }
-            if not expanded.issubset(lineage_ids):
-                lineage_ids.update(expanded)
-                changed = True
-    return [
-        item
-        for item in candidates
-        if normalize_todo_id(item.get("todo_id")) in lineage_ids
-    ]
-
-
 def build_goal_vision_wait_state(
     *,
     agent_todo_summary: dict[str, Any] | None,
     agent_id: str | None,
     acceptance_gaps: list[dict[str, Any]] | None,
     selectable_advancement_count: int,
+    source_items: list[dict[str, Any]] | None = None,
+    lineage_source_items: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Project a temporary vision wait over an authoritative blocked frontier.
 
@@ -187,104 +61,48 @@ def build_goal_vision_wait_state(
     checkpoints and closed-stage successor requirements remain strict.
     """
 
-    gaps = [gap for gap in (acceptance_gaps or []) if isinstance(gap, dict)]
-    if not gaps or any(gap.get("kind") != VISION_ACCEPTANCE_GAP_KIND for gap in gaps):
-        return None
-    if selectable_advancement_count > 0:
-        return None
-
-    causal_todo_ids = _acceptance_gap_causal_todo_ids(gaps)
-
-    blocker_items = (
-        agent_todo_summary.get("current_agent_blocker_items")
-        if isinstance(agent_todo_summary, dict)
-        and isinstance(agent_todo_summary.get("current_agent_blocker_items"), list)
-        else []
-    )
-    safe_agent_id = normalize_todo_claimed_by(agent_id)
-    blocker_items = [
-        item
-        for item in blocker_items
-        if isinstance(item, dict)
-        and safe_agent_id is not None
-        and item.get("task_class") == TODO_TASK_CLASS_BLOCKER
-        and normalize_todo_status(item.get("status")) == "blocked"
-        and str(item.get("reason") or "").strip()
-        and normalize_todo_claimed_by(item.get("claimed_by"))
-        == safe_agent_id
-        and normalize_todo_id(item.get("todo_id")) in causal_todo_ids
-    ]
-    candidates = []
-    if not blocker_items:
-        candidates = _causal_blocked_successor_items(
-            todo_summary_blocked_successor_items(
-                agent_todo_summary or {},
-                agent_id=agent_id,
-            ),
-            causal_todo_ids=causal_todo_ids,
-        )
-    if candidates:
-        selected = candidates[0]
-        waiting_todo_ids = [
-            todo_id
-            for todo_id in (
-                normalize_todo_id(item.get("todo_id")) for item in candidates[:5]
-            )
-            if todo_id
-        ]
-        payload: dict[str, Any] = {
-            "schema_version": GOAL_VISION_WAIT_STATE_SCHEMA_VERSION,
-            "state": "waiting",
-            "reason_code": "exact_blocked_successor",
-            "agent_id": agent_id,
-            "waiting_todo_count": len(candidates),
-            "waiting_todo_ids": waiting_todo_ids,
-            "selected_todo_id": normalize_todo_id(selected.get("todo_id")),
-            "selected_todo_status": selected.get("status"),
-            "selected_todo_priority": selected.get("priority"),
-            "selected_todo_claimed_by": selected.get("claimed_by"),
-            "resume_when": selected.get("resume_when"),
-            "resume_condition": _compact_resume_condition(
-                selected.get("resume_condition")
-            ),
-            "deferred_acceptance_gap_count": len(gaps),
-            "deferred_acceptance_gap_kinds": [VISION_ACCEPTANCE_GAP_KIND],
-            "automatic_resume": True,
-            "resume_behavior": (
-                "when resume_ready becomes true, restore ordinary open-todo or "
-                "deferred-successor routing without closing the active vision"
-            ),
+    summary = agent_todo_summary if isinstance(agent_todo_summary, dict) else {}
+    from ..todos.summary_item import quota_vision_wait_basis
+    basis = quota_vision_wait_basis(summary, source_items, agent_id) if lineage_source_items is None else None
+    if basis is not None:
+        result = effect_runtime_result("goal.vision_wait.project", {
+            "agent_todo_summary": {"vision_wait_states": summary.get("vision_wait_states"),
+                "current_agent_blocker_items": basis["current_agent_blocker_items"]},
+            "agent_id": agent_id, "acceptance_gaps": acceptance_gaps or [],
+            "selectable_advancement_count": selectable_advancement_count, "wait_basis": basis,
+        }, large_local_snapshot=True)
+        if result is not None and (not isinstance(result, dict)
+                or result.get("schema_version") != GOAL_VISION_WAIT_STATE_SCHEMA_VERSION
+                or result.get("state") != "waiting"):
+            raise RuntimeError("TypeScript vision wait state shape mismatch")
+        return result
+    planning_input = summary
+    if source_items is not None:
+        planning_input = {
+            "items": source_items,
+            "deferred_items": [item for item in source_items if item.get("status") == "deferred"],
+            "resume_blocked_items": [
+                item for item in source_items
+                if item.get("resume_ready") is False and item.get("status") == "open"
+            ],
+            "current_agent_blocker_items": source_items,
         }
-        return {key: value for key, value in payload.items() if value is not None}
-
-    if not blocker_items:
-        return None
-    selected = blocker_items[0]
-    waiting_todo_ids = [
-        todo_id
-        for todo_id in (
-            normalize_todo_id(item.get("todo_id")) for item in blocker_items[:5]
-        )
-        if todo_id
-    ]
-    payload = {
-        "schema_version": GOAL_VISION_WAIT_STATE_SCHEMA_VERSION,
-        "state": "waiting",
-        "reason_code": "current_agent_blocker",
+    blocker_items = source_items if source_items is not None else summary.get("current_agent_blocker_items")
+    wait_summary = {"vision_wait_states": summary.get("vision_wait_states"),
+                    "current_agent_blocker_items": _vision_wait_blocker_rows(blocker_items or [])}
+    lineage_items = lineage_source_items if lineage_source_items is not None else source_items
+    result = effect_runtime_result("goal.vision_wait.project", {
+        "agent_todo_summary": wait_summary,
         "agent_id": agent_id,
-        "waiting_todo_count": len(blocker_items),
-        "waiting_todo_ids": waiting_todo_ids,
-        "selected_todo_id": normalize_todo_id(selected.get("todo_id")),
-        "selected_todo_status": selected.get("status"),
-        "selected_todo_priority": selected.get("priority"),
-        "selected_todo_claimed_by": selected.get("claimed_by"),
-        "blocker_reason": str(selected.get("reason") or "").strip(),
-        "deferred_acceptance_gap_count": len(gaps),
-        "deferred_acceptance_gap_kinds": [VISION_ACCEPTANCE_GAP_KIND],
-        "automatic_resume": False,
-        "resume_behavior": (
-            "re-evaluate the active vision when the blocker is resolved or "
-            "superseded, or when runnable scoped advancement appears"
-        ),
-    }
-    return {key: value for key, value in payload.items() if value is not None}
+        "acceptance_gaps": acceptance_gaps or [],
+        "selectable_advancement_count": selectable_advancement_count,
+        "lineage_source_items": _vision_wait_lineage_rows(lineage_items),
+        "resume_planning_request": build_referenced_todo_resume_planning_request(planning_input, agent_id=agent_id),
+    }, large_local_snapshot=True)
+    if result is not None and (
+        not isinstance(result, dict)
+        or result.get("schema_version") != GOAL_VISION_WAIT_STATE_SCHEMA_VERSION
+        or result.get("state") != "waiting"
+    ):
+        raise RuntimeError("TypeScript vision wait state shape mismatch")
+    return result

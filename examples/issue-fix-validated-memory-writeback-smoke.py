@@ -32,6 +32,47 @@ from loopx.capabilities.issue_fix.repository_memory_provider import (  # noqa: E
 )
 
 
+def _resolve_recovery_ref(repo_root: Path) -> str | None:
+    symbolic = subprocess.run(
+        ["git", "symbolic-ref", "--quiet", "HEAD"],
+        cwd=repo_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        check=False,
+    ).stdout.strip()
+    if symbolic:
+        return symbolic
+    candidates = subprocess.run(
+        [
+            "git",
+            "for-each-ref",
+            "--points-at",
+            "HEAD",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
+        cwd=repo_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        check=False,
+    ).stdout.splitlines()
+    valid = [
+        ref.strip()
+        for ref in candidates
+        if ref.strip() and 4 <= len(ref.strip()) <= 80
+    ]
+    for preferred in ("refs/remotes/origin/main", "refs/heads/main"):
+        if preferred in valid:
+            return preferred
+    for prefix in ("refs/heads/", "refs/remotes/", "refs/tags/"):
+        for ref in valid:
+            if ref.startswith(prefix):
+                return ref
+    return None
+
+
 REVISION = subprocess.run(
     ["git", "rev-parse", "HEAD"],
     cwd=ROOT,
@@ -39,13 +80,7 @@ REVISION = subprocess.run(
     stdout=subprocess.PIPE,
     check=True,
 ).stdout.strip()
-RECOVERY_REF = subprocess.run(
-    ["git", "symbolic-ref", "--quiet", "HEAD"],
-    cwd=ROOT,
-    text=True,
-    stdout=subprocess.PIPE,
-    check=False,
-).stdout.strip() or "refs/remotes/origin/main"
+RECOVERY_REF = _resolve_recovery_ref(ROOT)
 OBSERVED_AT = "2026-07-11T08:40:00+08:00"
 
 
@@ -129,10 +164,10 @@ def merged_lifecycle() -> dict[str, object]:
         "ok": True,
         "schema_version": "issue_fix_pr_lifecycle_monitor_v0",
         "observation": {
-            "repo": "huangruiteng/loopx",
+            "repo": "loopx-project/loopx",
             "pr_ref": "pull_8",
             "number": 8,
-            "permalink": "https://github.com/huangruiteng/loopx/pull/8",
+            "permalink": "https://github.com/loopx-project/loopx/pull/8",
             "state": "MERGED",
             "is_draft": False,
             "checks": {
@@ -159,7 +194,7 @@ def outcome_packet(
     commit_ref: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     feasibility = build_issue_fix_feasibility_packet(
-        url="https://github.com/huangruiteng/loopx/issues/7",
+        url="https://github.com/loopx-project/loopx/issues/7",
         reproduction_status="confirmed",
         reproduction_label="focused worker reproduction",
         scope_class="bounded",
@@ -176,7 +211,7 @@ def outcome_packet(
         "repository_commit_evidence": {
             "schema_version": "issue_fix_repository_commit_evidence_v0",
             "status": "verified",
-            "repo": "huangruiteng/loopx",
+            "repo": "loopx-project/loopx",
             "repository_fingerprint": "sha256:" + "a" * 64,
             "repository_revision": revision,
             "declared_commit_ref": commit_ref or revision,
@@ -192,7 +227,7 @@ def outcome_packet(
         "outputs": [
             {
                 "kind": "pull_request",
-                "url": "https://github.com/huangruiteng/loopx/pull/8",
+                "url": "https://github.com/loopx-project/loopx/pull/8",
             }
         ],
         "risks": ["broader integration validation was not run"],
@@ -664,12 +699,22 @@ def main() -> int:
         fake_ov.write_text(
             "#!/usr/bin/env python3\n"
             "import json, sys\n"
+            "from pathlib import Path\n"
             "args = sys.argv[1:]\n"
+            "state_path = Path(__file__).with_suffix('.state')\n"
+            "try: state = json.loads(state_path.read_text())\n"
+            "except (FileNotFoundError, json.JSONDecodeError): state = {}\n"
             "if args == ['--version']: print('openviking 0.4.9.dev11')\n"
             "elif args and args[0] == 'status': print(json.dumps({'status':'healthy'}))\n"
-            "elif args and args[0] == 'tree': print(json.dumps({'resources':[]}))\n"
-            "elif args and args[0] in {'read','ls'}: sys.exit(1)\n"
-            "elif args and args[0] in {'mkdir','add-resource'}: print(json.dumps({'result':'ok'}))\n"
+            "elif args and args[0] == 'read':\n"
+            "    target = args[1]; content = state.get(target)\n"
+            "    print(json.dumps({'uri': target, 'content': content})) if content is not None else sys.exit(1)\n"
+            "elif args and args[0] in {'tree','ls'}:\n"
+            "    prefix = args[1].rstrip('/') if len(args) > 1 else ''\n"
+            "    print(json.dumps({'resources': [{'uri': key} for key in state if key == prefix or key.startswith(prefix + '/')] }))\n"
+            "elif args and args[0] == 'mkdir': print(json.dumps({'result':'ok'}))\n"
+            "elif args and args[0] == 'add-resource':\n"
+            "    target = args[args.index('--to') + 1]; state[target] = Path(args[1]).read_text(); state_path.write_text(json.dumps(state)); print(json.dumps({'result':'ok'}))\n"
             "else: sys.exit(2)\n",
             encoding="utf-8",
         )
@@ -690,6 +735,34 @@ def main() -> int:
             ),
             encoding="utf-8",
         )
+        repo_path = ROOT
+        recovery_ref = RECOVERY_REF
+        if recovery_ref is None:
+            # Detached HEAD with no matching ref: bind an isolated local ref without mutating ROOT.
+            repo_path = tmp / "detached-recovery-repo"
+            subprocess.run(
+                ["git", "clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(repo_path)],
+                check=True,
+            )
+            remotes = subprocess.run(
+                ["git", "remote"],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout.splitlines()
+            for name in [item.strip() for item in remotes if item.strip()]:
+                url = subprocess.run(
+                    ["git", "remote", "get-url", name],
+                    cwd=ROOT,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    check=True,
+                ).stdout.strip()
+                action = "set-url" if name == "origin" else "add"
+                subprocess.run(["git", "remote", action, name, url], cwd=repo_path, check=True)
+            recovery_ref = "refs/heads/smoke-recovery"
+            subprocess.run(["git", "update-ref", recovery_ref, REVISION], cwd=repo_path, check=True)
         command = [
             sys.executable,
             "-m",
@@ -701,7 +774,7 @@ def main() -> int:
             "--goal-id",
             "public-issue-fix-goal",
             "--repo",
-            "huangruiteng/loopx",
+            "loopx-project/loopx",
             "--issue-ref",
             str(feasibility["observation"]["issue_ref"]),
             "--feasibility-json",
@@ -714,9 +787,9 @@ def main() -> int:
             str(config_path),
             "--write-repository-memory",
             "--repo-path",
-            str(ROOT),
+            str(repo_path),
             "--repository-ref",
-            RECOVERY_REF,
+            recovery_ref,
             "--generated-at",
             OBSERVED_AT,
         ]

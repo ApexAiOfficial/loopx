@@ -1,0 +1,253 @@
+"""History retains control evidence without probing every discarded artifact."""
+from __future__ import annotations
+
+import errno
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+import loopx.history as history_module
+from loopx.history import collect_history, load_index_snapshot
+
+
+@pytest.fixture
+def history_case(tmp_path, monkeypatch):
+    registry = tmp_path / "registry.json"
+    registry.write_text("{}\n")
+    runtime = tmp_path / "runtime"
+    index = runtime / "goals" / "example" / "runs" / "index.jsonl"
+    index.parent.mkdir(parents=True)
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    now = start + timedelta(seconds=1001)
+    monkeypatch.setattr(
+        "loopx.control_plane.runtime.run_context_retention.now_utc_iso",
+        lambda: now.isoformat(),
+    )
+    rows = []
+    for n in range(1000):
+        rows.append({
+            "generated_at": (start + timedelta(seconds=n)).isoformat(),
+            "run_id": f"run-{n}", "classification": "progress",
+            "agent_id": "worker", "json_path": f"artifacts/{n}.json",
+            "markdown_path": f"artifacts/{n}.md",
+            # Persisted booleans are deliberately wrong: each read observes files.
+            "json_exists": True, "markdown_exists": True,
+        })
+    rows[0]["agent_vision"] = {"agent_id": "worker", "revision": "retained"}
+    rows[1]["human_reward"] = {"decision": "revise", "reason_summary": "Keep evidence"}
+    rows[990].update({
+        "todo_id": "todo_blocked_work", "turn_instance_id": "turn-1",
+        "delivery_outcome": "outcome_gap",
+        "progress_observation": {"result_class": "blocked"},
+        "blocked_retry": {
+            "schema_version": "quota_blocked_retry_v0", "source": "turn_settlement",
+            "todo_id": "todo_blocked_work", "observed_at": rows[990]["generated_at"],
+            "due_at": (start + timedelta(seconds=1290)).isoformat(),
+            "resume_when": f"resume_at:{(start + timedelta(seconds=1290)).isoformat()}",
+        },
+    })
+    rows[995]["agent_id"] = "quiet-worker"
+    # Recent neutral records must not hide the latest status-relevant run.
+    rows[999]["classification"] = "quota_slot_spent"
+    rows[998]["classification"] = "quota_slot_spent"
+    # Last duplicate replaces only supplied fields, without another unique Run.
+    duplicate = {**rows[0], "annotation": "merged duplicate"}
+    index.write_text("\n".join(json.dumps(row) for row in [*rows, duplicate]) + "\nnot-json\n[]\n\n")
+    for n in (0, 1, 990, 995, 997, 999):
+        (artifacts / f"{n}.json").write_text("{}\n")
+    return registry, runtime, index, artifacts
+
+
+def _collect(case, *, limit=1, agent_lane_id=None):
+    registry, runtime, _, _ = case
+    return collect_history(registry_path=registry, runtime_root=runtime,
+                           goal_id="example", limit=limit, agent_lane_id=agent_lane_id)
+
+
+@pytest.mark.parametrize("limit", [0, 1, 3])
+def test_history_observes_retained_evidence_after_full_reduction(history_case, monkeypatch, limit):
+    _, _, index, _ = history_case
+    calls = []
+    original = history_module._indexed_artifact_exists
+
+    def observe(value, *, artifact_root, runs_dir=None, goal_id=None, extension=None):
+        calls.append(value)
+        return original(
+            value,
+            artifact_root=artifact_root,
+            runs_dir=runs_dir,
+            goal_id=goal_id,
+            extension=extension,
+        )
+
+    monkeypatch.setattr(history_module, "_indexed_artifact_exists", observe)
+    result = _collect(history_case, limit=limit)
+    goal = result["goals"][0]
+    assert result["run_count"] == goal["unique_runs"] == 1000
+    assert goal["raw_index_records"] == 1003
+    assert goal["index_digest"] == f"sha256:{hashlib.sha256(index.read_bytes()).hexdigest()}"
+    assert len(result["runs"]) == len(goal["latest_runs"]) == limit
+    semantic = goal["semantic_history"]
+    vision = semantic["agents"][0]["latest_agent_vision_run"]
+    correction = semantic["latest_owner_correction_run"]
+    retry = semantic["active_blocked_retry_runs"][0]
+    assert vision["run_id"] == "run-0"
+    assert vision["annotation"] == "merged duplicate"
+    assert correction["run_id"] == "run-1"
+    assert retry["run_id"] == "run-990"
+    assert goal["latest_status_run"]["run_id"] == "run-997"
+    for row in [vision, correction, retry, goal["latest_status_run"]]:
+        assert row["json_exists"] is True
+        assert row["markdown_exists"] is False
+    # Counts depend on retained output, never the 1,000-row historical population.
+    expected = {0, 1, 990, 997, *range(1000 - limit, 1000)}
+    assert set(calls) == {f"artifacts/{n}.{ext}" for n in expected for ext in ("json", "md")}
+    assert len(calls) == len(set(calls))
+
+
+def test_lane_window_artifacts_remain_observed(history_case):
+    result = _collect(history_case, agent_lane_id="quiet-worker")
+    runs = result["goals"][0]["latest_runs"]
+    assert [run["run_id"] for run in runs] == ["run-999", "run-995"]
+    assert all(run["json_exists"] and not run["markdown_exists"] for run in runs)
+
+
+def test_unchanged_index_does_not_cache_artifact_existence(history_case):
+    _, _, index, artifacts = history_case
+    before = index.read_bytes()
+    initial = _collect(history_case)
+    assert initial["runs"][0]["json_exists"] is True
+    assert initial["runs"][0]["markdown_exists"] is False
+    (artifacts / "999.json").unlink()
+    (artifacts / "999.md").write_text("# Delivered\n")
+    (artifacts / "0.json").unlink()
+    reread = _collect(history_case)
+    assert reread["runs"][0]["json_exists"] is False
+    assert reread["runs"][0]["markdown_exists"] is True
+    assert reread["goals"][0]["semantic_history"]["agents"][0]["latest_agent_vision_run"]["json_exists"] is False
+    assert index.read_bytes() == before
+    assert reread["goals"][0]["index_digest"] == initial["goals"][0]["index_digest"]
+
+
+def test_full_index_reader_still_observes_every_row(history_case):
+    registry, _, index, artifacts = history_case
+    (artifacts / "500.md").write_text("# Older artifact\n")
+    (artifacts / "501.json").symlink_to(artifacts / "absent.json")
+    snapshot = load_index_snapshot(index, artifact_root=registry.parent)
+    assert len(snapshot.records) == 1000
+    assert snapshot.records[500]["markdown_exists"] is True
+    assert snapshot.records[501]["json_exists"] is False
+    assert snapshot.records[502]["json_exists"] is False
+
+
+@pytest.mark.parametrize("provider", ["file", "sqlite"])
+@pytest.mark.parametrize("unobservable_artifact", [False, True])
+def test_public_history_and_status_keep_artifacts_with_canonical_todos(history_case, monkeypatch, tmp_path, provider, unobservable_artifact):
+    from tests.control_plane.canonical_authority_fixture import (
+        initialize_canonical_authority, isolate_sqlite_runtime,
+    )
+    from loopx.control_plane.coordination.runtime_shadow import build_todo_runtime_shadow_projection
+    from loopx.control_plane.effect_runtime import restart_effect_runtime
+    from loopx.control_plane.testing.canary_harness import write_fixture_registry
+
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    registry, runtime, index, _ = history_case
+    if unobservable_artifact:
+        rows = [json.loads(line) for line in index.read_text().splitlines() if line.startswith("{")]
+        rows[997]["json_path"] = "x" * 256
+        index.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    original_index = index.read_bytes()
+    state = tmp_path / "state.md"
+    state.write_text("---\nstatus: active\n---\n# Example\n\n## Agent Todo\n")
+    write_fixture_registry(project=tmp_path, registry_path=registry, runtime_root=runtime,
+                           goal_id="example", domain="engineering", state_file=str(state),
+                           adapter_kind="generic_project_goal_v0")
+    initialize_canonical_authority(
+        runtime, "example", build_todo_runtime_shadow_projection(goal_id="example", todos=[]),
+        state_path=state, provider=provider,
+    )
+    try:
+        for command in ("history", "status"):
+            result = subprocess.run(
+                [sys.executable, "-m", "loopx.entrypoint", "--registry", str(registry),
+                 "--runtime-root", str(runtime), "--format", "json", command,
+                 "--goal-id", "example", "--limit", "1"],
+                capture_output=True, text=True, timeout=60,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            payload = json.loads(result.stdout)
+            history = payload if command == "history" else payload["run_history"]
+            goal = history["goals"][0]
+            assert goal["unique_runs"] == 1000
+            assert goal["latest_status_run"]["run_id"] == "run-997"
+            assert goal["latest_status_run"]["json_exists"] is not unobservable_artifact
+            assert goal["latest_status_run"]["markdown_exists"] is False
+            assert index.read_bytes() == original_index
+    finally:
+        restart_effect_runtime()
+
+
+@pytest.mark.parametrize("error_number", [errno.ENAMETOOLONG, errno.EACCES, errno.EIO])
+@pytest.mark.parametrize("artifact_field", ["json_path", "markdown_path"])
+def test_artifact_observation_failure_preserves_history_and_retries(
+    tmp_path, monkeypatch, error_number, artifact_field,
+):
+    artifact = tmp_path / "artifact"
+    artifact.write_text("evidence", encoding="utf-8")
+    row = {"generated_at": "2026-01-01T00:00:00Z", "run_id": "retained",
+           "json_path": str(artifact), "markdown_path": str(artifact)}
+    failed_path = tmp_path / "unobservable"
+    row[artifact_field] = str(failed_path)
+    index = tmp_path / "index.jsonl"
+    index.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    original = index.read_bytes()
+    original_exists = Path.exists
+
+    def unavailable(path):
+        if path == failed_path:
+            raise OSError(error_number, "artifact observation unavailable")
+        return original_exists(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "exists", unavailable)
+        snapshot = load_index_snapshot(index)
+    assert snapshot.raw_count == 1
+    assert snapshot.records[0]["run_id"] == "retained"
+    assert snapshot.records[0][artifact_field.replace("_path", "_exists")] is False
+    other_flag = "markdown_exists" if artifact_field == "json_path" else "json_exists"
+    assert snapshot.records[0][other_flag] is True
+    assert snapshot.digest == f"sha256:{hashlib.sha256(original).hexdigest()}"
+    assert index.read_bytes() == original
+    failed_path.write_text("recovered", encoding="utf-8")
+    recovered = load_index_snapshot(index)
+    assert recovered.records[0]["json_exists"] is True
+    assert recovered.records[0]["markdown_exists"] is True
+    assert recovered.digest == snapshot.digest
+
+
+def test_index_read_errors_still_propagate(tmp_path):
+    index = tmp_path / "index.jsonl"
+    index.mkdir()
+    with pytest.raises(OSError):
+        load_index_snapshot(index)
+
+
+def test_undecodable_run_rows_require_an_explicit_partial_read(tmp_path):
+    index = tmp_path / "index.jsonl"
+    original = b'{"summary":"Verified run"}\n{"summary":"\xe7\x9b\n'
+    index.write_bytes(original)
+
+    with pytest.raises(UnicodeDecodeError):
+        load_index_snapshot(index)
+    partial = load_index_snapshot(index, include_artifact_status=False, skip_invalid_encoding=True)
+    assert partial.records == [{"summary": "Verified run"}]
+    assert (partial.raw_count, partial.invalid_count) == (2, 1)
+    assert partial.digest == f"sha256:{hashlib.sha256(original).hexdigest()}"
+    assert index.read_bytes() == original

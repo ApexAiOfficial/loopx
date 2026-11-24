@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -9,6 +9,7 @@ import {
   loadSchedulerState,
   normalizeSchedulerState,
   schedulerStatePath,
+  schedulerTimestampMilliseconds,
   SCHEDULER_STATE_OPERATION_REQUEST_SCHEMA,
   SCHEDULER_STATE_STORE_REQUEST_SCHEMA,
   writeSchedulerState,
@@ -32,7 +33,7 @@ const scope = {
   goalId: "goal-a",
   agentId: "agent-a",
   surface: "codex_app",
-  stateKey: "scheduler_hint.codex_app.stateful_backoff",
+  stateKey: "scheduler_hint.app_automation.stateful_backoff",
 };
 
 function state(lastAppliedRrule = "FREQ=MINUTELY;INTERVAL=3") {
@@ -160,6 +161,76 @@ test("failure retention accepts the ISO offsets persisted by Python", () => {
   assert.equal((result as unknown[]).length, 1);
 });
 
+function hostUpdateFailure(failedAt: string) {
+  return {
+    schema_version: "scheduler_host_update_failure_v0",
+    target_rrule: "FREQ=MINUTELY;INTERVAL=3",
+    observed_host_rrule: "FREQ=MINUTELY;INTERVAL=30",
+    failure_kind: "timeout",
+    failure_count: 1,
+    failed_at: failedAt,
+  };
+}
+
+test("scheduler timestamp codec rejects illegal calendars and keeps offset instants", () => {
+  assert.equal(schedulerTimestampMilliseconds("2026-02-31T00:00:00Z"), null);
+  assert.equal(schedulerTimestampMilliseconds("2026-02-29T00:00:00Z"), null);
+  assert.equal(schedulerTimestampMilliseconds("2024-02-29T00:00:00Z"), Date.UTC(2024, 1, 29));
+  assert.equal(schedulerTimestampMilliseconds("2026-11-31T10:04:00Z"), null);
+  assert.equal(schedulerTimestampMilliseconds("2026-01-32T12:10:00Z"), null);
+  assert.equal(schedulerTimestampMilliseconds("   "), null);
+  assert.equal(
+    schedulerTimestampMilliseconds("2026-08-25T10:00:00+08:00"),
+    Date.UTC(2026, 7, 25, 2, 0, 0),
+  );
+  assert.equal(
+    schedulerTimestampMilliseconds("2026-01-01T12:00:00"),
+    Date.UTC(2026, 0, 1, 12, 0, 0),
+  );
+  assert.equal(
+    schedulerTimestampMilliseconds("2026-01-01T12:00:00+0000"),
+    Date.UTC(2026, 0, 1, 12, 0, 0),
+  );
+  assert.equal(
+    schedulerTimestampMilliseconds("2026-12-04t01:15:00z"),
+    Date.UTC(2026, 11, 4, 1, 15, 0),
+  );
+  assert.equal(
+    schedulerTimestampMilliseconds("2026-12-04t01:15:00z"),
+    schedulerTimestampMilliseconds("2026-12-04T01:15:00Z"),
+  );
+  assert.equal(
+    schedulerTimestampMilliseconds("2026-08-25t10:00:00+08:00"),
+    schedulerTimestampMilliseconds("2026-08-25T10:00:00+08:00"),
+  );
+  assert.equal(schedulerTimestampMilliseconds("2026-11-31t10:04:00z"), null);
+  assert.equal(schedulerTimestampMilliseconds("2026-02-31t00:00:00z"), null);
+});
+
+test("failure retention does not roll illegal calendar timestamps into the TTL window", () => {
+  for (const [failedAt, referenceTime] of [
+    ["2026-02-31T00:00:00Z", "2026-03-03T00:00:00Z"],
+    ["2026-11-31T10:04:00Z", "2026-12-01T10:04:00Z"],
+  ] as const) {
+    const retained = evaluateSchedulerStateOperation({
+      schema_version: SCHEDULER_STATE_OPERATION_REQUEST_SCHEMA,
+      operation: "retain_failures",
+      value: [hostUpdateFailure(failedAt)],
+      reference_time: referenceTime,
+    }).value;
+    assert.deepEqual(retained, [], failedAt);
+  }
+  assert.throws(
+    () => evaluateSchedulerStateOperation({
+      schema_version: SCHEDULER_STATE_OPERATION_REQUEST_SCHEMA,
+      operation: "retain_failures",
+      value: [hostUpdateFailure("2026-03-03T00:00:00Z")],
+      reference_time: "2026-02-31T00:00:00Z",
+    }),
+    /reference_time must be an ISO timestamp/,
+  );
+});
+
 test("pure scheduler state operations do not mutate caller input", () => {
   const params = fixture.cases[7].params as Record<string, unknown>;
   const before = structuredClone(params);
@@ -182,12 +253,112 @@ test("state path is scoped, sanitized, and stable", () => {
     join(
       "/runtime",
       "goals",
-      "goal-with-spaces",
+      "goal-with-spaces-116e9296329bcdc8",
       "scheduler-state",
-      "agent-..-..-other",
-      "codex_app",
-      "d9ad89d416adc9b2.json",
+      "agent-..-..-other-55571d8866830ec6",
+      "codex_app-b32e6f37f5dad64e",
+      "8a41f410c67e7c0e.json",
     ),
+  );
+});
+
+test("sanitized-equivalent scheduler scopes have distinct bounded paths", () => {
+  const goalPaths = ["a b", "a-b", "非 ASCII", "---"].map((goalId) =>
+    schedulerStatePath("/runtime", { ...scope, goalId })
+  );
+  const agentPaths = ["agent/name", "agent-name"].map((agentId) =>
+    schedulerStatePath("/runtime", { ...scope, agentId })
+  );
+  const surfacePaths = ["codex app", "codex-app"].map((surface) =>
+    schedulerStatePath("/runtime", { ...scope, surface })
+  );
+  assert.equal(new Set(goalPaths).size, goalPaths.length);
+  assert.equal(new Set(agentPaths).size, agentPaths.length);
+  assert.equal(new Set(surfacePaths).size, surfacePaths.length);
+  for (const path of [...goalPaths, ...agentPaths, ...surfacePaths]) {
+    for (const segment of path.split(/[\\/]/)) assert.ok(segment.length <= 64);
+  }
+});
+
+test("legacy scheduler state is migrated once into the collision-safe layout", async (t) => {
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "loopx-scheduler-state-"));
+  t.after(() => rm(runtimeRoot, { recursive: true, force: true }));
+  const legacyPath = join(
+    runtimeRoot,
+    "goals",
+    scope.goalId,
+    "scheduler-state",
+    scope.agentId,
+    scope.surface,
+    "8a41f410c67e7c0e.json",
+  );
+  await writeSchedulerState(storeRequest(runtimeRoot, { state: state() }));
+  const canonicalPath = schedulerStatePath(runtimeRoot, scope);
+  const persisted = await readFile(canonicalPath, "utf8");
+  await rm(canonicalPath);
+  await mkdir(dirname(legacyPath), { recursive: true });
+  await writeFile(legacyPath, persisted, "utf8");
+
+  const migrated = await loadSchedulerState(storeRequest(runtimeRoot));
+
+  assert.deepEqual(migrated.state, state());
+  assert.equal(migrated.path, canonicalPath);
+  assert.deepEqual(JSON.parse(await readFile(canonicalPath, "utf8")), state());
+  await assert.rejects(readFile(legacyPath, "utf8"), { code: "ENOENT" });
+});
+
+test("overlong legacy scope loads as missing state, not an effect rejection", async (t) => {
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "loopx-scheduler-state-"));
+  t.after(() => rm(runtimeRoot, { recursive: true, force: true }));
+  // A legacy scope component beyond the filesystem path-component limit cannot
+  // exist in the legacy layout; the canonical bounded path has no state yet,
+  // so the first load must return missing state instead of ENAMETOOLONG.
+  const overlongGoalId = "g".repeat(300);
+  const request = storeRequest(runtimeRoot, { goal_id: overlongGoalId });
+
+  const result = await loadSchedulerState(request);
+
+  assert.equal(result.state, null);
+  const canonical = schedulerStatePath(runtimeRoot, {
+    ...scope,
+    goalId: overlongGoalId,
+  });
+  assert.ok(
+    !canonical.includes("g".repeat(256)),
+    "canonical path components must stay bounded",
+  );
+  assert.ok(
+    Math.max(...canonical.split(/[\\/]/).map((part) => part.length)) <= 64,
+    "canonical path component must not exceed the scoped-segment bound",
+  );
+});
+
+test("concurrent writes for sanitized-equivalent scopes stay isolated", async (t) => {
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "loopx-scheduler-state-"));
+  t.after(() => rm(runtimeRoot, { recursive: true, force: true }));
+  const firstGoalId = "a b";
+  const secondGoalId = "a-b";
+  const firstState = { ...state(), goal_id: firstGoalId };
+  const secondState = { ...state(), goal_id: secondGoalId };
+
+  await Promise.all([
+    writeSchedulerState(storeRequest(runtimeRoot, {
+      goal_id: firstGoalId,
+      state: firstState,
+    })),
+    writeSchedulerState(storeRequest(runtimeRoot, {
+      goal_id: secondGoalId,
+      state: secondState,
+    })),
+  ]);
+
+  assert.deepEqual(
+    (await loadSchedulerState(storeRequest(runtimeRoot, { goal_id: firstGoalId }))).state,
+    firstState,
+  );
+  assert.deepEqual(
+    (await loadSchedulerState(storeRequest(runtimeRoot, { goal_id: secondGoalId }))).state,
+    secondState,
   );
 });
 
@@ -210,13 +381,58 @@ test("state store writes atomically and recognizes replay", async (t) => {
   );
 });
 
-test("malformed persisted JSON is a missing state, not partial truth", async (t) => {
+test("a missing state is a successful empty read", async (t) => {
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "loopx-scheduler-state-"));
+  t.after(() => rm(runtimeRoot, { recursive: true, force: true }));
+
+  const result = await loadSchedulerState(storeRequest(runtimeRoot));
+
+  assert.equal(result.state, null);
+  assert.equal(result.read_status, "read");
+});
+
+test("malformed persisted JSON is unreadable, not partial truth", async (t) => {
   const runtimeRoot = await mkdtemp(join(tmpdir(), "loopx-scheduler-state-"));
   t.after(() => rm(runtimeRoot, { recursive: true, force: true }));
   const path = schedulerStatePath(runtimeRoot, scope);
   await writeSchedulerState(storeRequest(runtimeRoot, { state: state() }));
   await writeFile(path, "{truncated", "utf8");
-  assert.equal((await loadSchedulerState(storeRequest(runtimeRoot))).state, null);
+  const result = await loadSchedulerState(storeRequest(runtimeRoot));
+  assert.equal(result.state, null);
+  assert.equal(result.read_status, "unreadable");
+});
+
+test("malformed legacy persisted JSON is unreadable, not missing", async (t) => {
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "loopx-scheduler-state-"));
+  t.after(() => rm(runtimeRoot, { recursive: true, force: true }));
+  const legacyPath = join(
+    runtimeRoot,
+    "goals",
+    scope.goalId,
+    "scheduler-state",
+    scope.agentId,
+    scope.surface,
+    "8a41f410c67e7c0e.json",
+  );
+  await mkdir(dirname(legacyPath), { recursive: true });
+  await writeFile(legacyPath, "{truncated", "utf8");
+
+  const result = await loadSchedulerState(storeRequest(runtimeRoot));
+
+  assert.equal(result.state, null);
+  assert.equal(result.read_status, "unreadable");
+});
+
+test("a directory at the persisted state path is unreadable", async (t) => {
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "loopx-scheduler-state-"));
+  t.after(() => rm(runtimeRoot, { recursive: true, force: true }));
+  const path = schedulerStatePath(runtimeRoot, scope);
+  await mkdir(path, { recursive: true });
+
+  const result = await loadSchedulerState(storeRequest(runtimeRoot));
+
+  assert.equal(result.state, null);
+  assert.equal(result.read_status, "unreadable");
 });
 
 test("concurrent same-key writes serialize without partial state", async (t) => {

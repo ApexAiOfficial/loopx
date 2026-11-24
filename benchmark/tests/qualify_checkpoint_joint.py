@@ -1,0 +1,369 @@
+"""Reproduce the existing synthetic native source and fresh-guest receivers.
+
+Requires an explicitly owned Docker daemon and Linux binaries/dependencies.
+No real model endpoint, benchmark task, active Goal or live bank is used.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from xml.etree import ElementTree
+
+
+PROVIDER_REVISION = "071a884012754127f28f5b84be10f533a42db527"
+SYNTHETIC_PHASE_SECONDS = 7200
+# Parent transport waits cover the fixture's original phase and cleanup. They
+# never replace its phase file, individual capture window or native opportunity.
+CONTROLLER_WAIT_SECONDS = SYNTHETIC_PHASE_SECONDS + 60
+
+
+def require_source_checkout(source: Path, expected_revision: str):
+    """Bind qualification to the caller's pin and the Python code actually used.
+
+    PYTHONPATH does not take precedence over Python's current working directory,
+    and already imported submodules can survive a later path correction.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_revision):
+        raise ValueError("Source revision must be an explicit full commit SHA")
+    source = source.resolve(strict=True)
+    revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    if revision != expected_revision:
+        raise ValueError("Source checkout does not match its declared immutable revision")
+    if subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"], text=True).strip():
+        raise ValueError("Use a clean dedicated source checkout and keep it frozen during qualification")
+    packages = ("loopx", "benchmark", "tests")
+    for name in packages:
+        importlib.import_module(name)
+    for name, module in tuple(sys.modules.items()):
+        package = name.split(".", 1)[0]
+        if package not in packages:
+            continue
+        filename = getattr(module, "__file__", None)
+        if filename:
+            matches = Path(filename).resolve(strict=True).is_relative_to(source / package)
+        else:
+            # Namespace search paths may include the native provider's unused
+            # test tree. Verify executable members separately, not unused paths.
+            matches = any(Path(path).resolve(strict=True).is_relative_to(source / package)
+                          for path in getattr(module, "__path__", ()))
+        if not matches:
+            raise ValueError(f"Imported {name} does not match the declared source checkout")
+    return revision
+
+
+def require_one_pass(report):
+    cases = ElementTree.parse(report).findall(".//testcase")
+    if len(cases) != 1 or any(
+        c.find(tag) is not None for c in cases for tag in ("skipped", "failure", "error")
+    ):
+        raise ValueError(f"Qualification requires one actual pass and no skip; inspect {report}")
+
+
+def _stage_source_configuration(container, native, destination):
+    from benchmark.edgebench.checkpoint_worker import _archive
+
+    # The source guest can be root while its controller is an ordinary user.
+    # Read only the bound config through the existing daemon archive seam;
+    # source UID/mode and auth files remain untouched.
+    config = _archive(container, str(Path(native["guest_home"]) / "config.toml"), destination)
+    config.chmod(0o600)
+    if hashlib.sha256(config.read_bytes()).hexdigest() != native["config_sha256"]:
+        raise ValueError("Source native configuration differs from the sealed checkpoint")
+    return config
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-revision", required=True,
+                        help="Exact immutable LoopX commit expected by the caller, not inferred from imports")
+    parser.add_argument("--provider-source", type=Path, required=True)
+    parser.add_argument("--provider-revision", default=PROVIDER_REVISION,
+                        help="Exact caller-selected native provider pin; default is the documented compatibility revision")
+    parser.add_argument("--native-binary", type=Path, required=True)
+    parser.add_argument("--guest-node", type=Path, required=True)
+    parser.add_argument("--guest-dependencies", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--image", default="python:3.12-slim")
+    parser.add_argument("--context-delivery", choices=("off", "on"), default="off",
+                        help="Qualify the existing opt-in context transport through source and fresh receivers")
+    parser.add_argument("--capture-boundary", choices=("fresh_replan", "settled_work", "settled_once"), default="fresh_replan",
+                        help="Qualify the existing automatic pre-replan or explicit settled-wake full capture")
+    parser.add_argument("--reuse-point", type=Path, help="Reuse an already sealed synthetic source; never count its source test as passed")
+    parser.add_argument("--captured-config", type=Path, help="The reused point's matching native fixture configuration")
+    args = parser.parse_args()
+    if bool(args.reuse_point) != bool(args.captured_config):
+        parser.error("--reuse-point and --captured-config must be supplied together")
+    source = Path(__file__).resolve().parents[2]
+    source_revision = require_source_checkout(source, args.source_revision)
+    if sys.platform != "linux" or os.getuid() == 0:
+        parser.error("Run on Linux as the ordinary owner of a disposable Docker daemon")
+    provider = args.provider_source.resolve(strict=True)
+    if subprocess.check_output(["git", "-C", str(provider), "rev-parse", "HEAD"], text=True).strip() != args.provider_revision:
+        parser.error("Provider must match its exact declared immutable revision")
+    if subprocess.check_output(["git", "-C", str(provider), "status", "--porcelain"], text=True).strip():
+        parser.error("Provider source must be clean")
+    binaries = {"native": args.native_binary.resolve(strict=True),
+                "node": args.guest_node.resolve(strict=True)}
+    dependencies = args.guest_dependencies.resolve(strict=True)
+    output = args.output.absolute()
+    output.parent.resolve(strict=True)
+    if output.resolve() != output or output.exists():
+        parser.error("Output must be a fresh physical directory; prior evidence is never overwritten")
+    sys.path.insert(0, str(provider))
+    import docker
+    import pytest
+    import sforge
+    from benchmark.edgebench.checkpoint_supervisor import CheckpointSupervisor
+    from benchmark.edgebench.checkpoint_controller import restore
+    from loopx.control_plane.effect_runtime import effect_runtime_result
+    from benchmark.tests.test_checkpoint_controller import controllers, register, submit
+
+    if Path(sforge.__file__).resolve().parent != provider / "sforge":
+        parser.error("Imported provider does not match the declared source")
+    require_source_checkout(source, source_revision)
+    output.mkdir(mode=0o700)
+    base = {str(source): {"bind": "/source", "mode": "ro"},
+            str(provider): {"bind": "/provider", "mode": "ro"},
+            str(dependencies): {"bind": "/deps", "mode": "ro"},
+            str(binaries["native"]): {"bind": "/native/codex", "mode": "ro"},
+            str(binaries["node"]): {"bind": "/usr/local/bin/node", "mode": "ro"}}
+    # Some development worktrees share node_modules through a physical symlink.
+    # Preserve that existing dependency resolution in the isolated guest too.
+    modules = source / "node_modules"
+    if modules.is_symlink():
+        physical = modules.resolve(strict=True)
+        base[str(physical)] = {"bind": str(physical), "mode": "ro"}
+    environment = {"PYTHONPATH": "/source:/provider:/deps", "LOOPX_USAGE_PING": "0",
+                   "LOOPX_NATIVE_CHECKPOINT_BIN": "/native/codex"}
+    client = docker.from_env(timeout=30)
+    image = client.images.get(args.image).id  # Caller-prepared image, no implicit pull.
+    context_results = {}
+
+    def guest(command, volumes, env, log, *, capture_supervisor=None):
+        container = client.containers.create(image, command, platform="linux/amd64",
+            volumes={**base, **volumes}, working_dir="/source",
+            user=f"{os.getuid()}:{os.getgid()}", environment={**environment, **env},
+            **({"network_mode": "host"} if capture_supervisor else {"network_disabled": True}))
+        try:
+            container.start()
+            if capture_supervisor:
+                capture_supervisor.start(container)
+            status = container.wait(timeout=CONTROLLER_WAIT_SECONDS)
+            log.write_bytes(container.logs())
+            assert status["StatusCode"] == 0, f"Qualification failed; inspect {log}"
+            require_one_pass(log.parent / log.stem / "junit.xml")
+            if env.get("LOOPX_CONTEXT_DELIVERY") == "on":
+                reports = list((log.parent / log.stem).rglob("context-delivery-result.json"))
+                assert len(reports) == 1
+                context_results[log.stem] = json.loads(reports[0].read_bytes())
+                assert context_results[log.stem]["context_delivery"] == "on"
+                assert context_results[log.stem]["reads"][0]["mode"] == "full"
+        finally:
+            if capture_supervisor:
+                capture_supervisor.close()
+            log.write_bytes(container.logs())
+            container.remove(force=True)
+
+    controller = output / "controller"
+    controller.mkdir()
+    source_files = output / "source-files"
+    source_files.mkdir()
+    patch = pytest.MonkeyPatch()
+    fixture = controllers.__wrapped__(controller, patch)
+    supervisor = container = None
+    try:
+        app, _, url, _, files, grades = next(fixture)
+        if args.reuse_point:
+            point = args.reuse_point.absolute()
+            config_source = args.captured_config.absolute()
+            if point.resolve(strict=True) != point or config_source.resolve(strict=True) != config_source:
+                raise ValueError("Reused point/configuration must be physical paths")
+            packet = json.loads((point / "checkpoint.json").read_bytes())
+            verified = effect_runtime_result("runtime.checkpoint_artifacts", {
+                "action": "verify", "root": str(point), "expected_sha256": packet["sha256"]}, large_local_snapshot=True)
+            assert verified["integrity_verified"]
+            metadata = packet["point_metadata"]
+            assert metadata["worker_file_snapshot"]["prepared_source_verified"]
+            assert bool(metadata.get("held_decision_component_id")) == (args.capture_boundary == "fresh_replan")
+            config = output / "native-config"
+            config.write_bytes(config_source.read_bytes())
+            config.chmod(0o600)
+            assert hashlib.sha256(config.read_bytes()).hexdigest() == metadata["native_session"]["config_sha256"]
+        else:
+            token = register(app, url, submission_cooldown=3600, max_agent_submissions=18)
+            assert submit(url, token, 7).status_code == 200
+            script = ("from pathlib import Path; import time,pytest; "
+                      "p=Path('/opt/loopx-benchmark/control'); p.mkdir(parents=True); "
+                      f"(p/'phase-deadline').write_text(str(int(time.time())+{SYNTHETIC_PHASE_SECONDS})); "
+                      "code=pytest.main(["
+                      "'/source/benchmark/tests/test_native_checkpoint_handoff.py::"
+                      f"test_actual_worker_captures_pending_replan_before_native_model[{args.context_delivery}-planning-{args.capture_boundary}]',"
+                      "'-q','-rs','-p','no:cacheprovider','--basetemp=/qualification/source-tmp',"
+                      "'--junitxml=/qualification/source.xml']); ")
+            if args.context_delivery == "on":
+                # Copy the declared report while the source writer is alive;
+                # its root-owned pytest directory stays private to that guest.
+                script += ("\nif code == 0:\n"
+                           " reports=list(Path('/qualification/source-tmp').rglob('controller-result.json'))\n"
+                           " assert len(reports) == 1\n"
+                           " Path('/qualification/context-delivery-source.json').write_bytes(reports[0].read_bytes())\n")
+            script += "\nraise SystemExit(code)"
+            container = client.containers.create(image, ["python", "-c", script],
+                platform="linux/amd64", network_disabled=True,
+                volumes={**base, str(source_files): {"bind": "/qualification", "mode": "rw"}},
+                working_dir="/source", environment={**environment, "NODE_OPTIONS": "--experimental-sqlite",
+                                                   "LOOPX_CHECKPOINT_EXTERNAL_CONTROLLER": "1"})
+            supervisor = CheckpointSupervisor(files[0], output / "points")
+            supervisor.bind({"SFORGE_TOKEN": token})
+            container.start()
+            supervisor.start(container)
+            status = container.wait(timeout=CONTROLLER_WAIT_SECONDS)
+            (output / "source.log").write_bytes(container.logs())
+            supervisor.close()
+            assert status["StatusCode"] == 0, f"Inspect {output / 'source.log'}"
+            require_one_pass(source_files / "source.xml")
+            if args.context_delivery == "on":
+                # The real source writer may be root. Its private pytest
+                # directory is intentionally unreadable to this controller;
+                # stage only the declared result through the daemon seam.
+                from benchmark.edgebench.checkpoint_worker import _archive
+                report = _archive(container, "/qualification/context-delivery-source.json",
+                                  output / "source-context-result.json")
+                report.chmod(0o600)
+                context_results["source"] = json.loads(report.read_bytes())
+                assert context_results["source"]["context_delivery"] == "on"
+                reads = context_results["source"]["context_reads"]
+                assert reads[0]["mode"] == "full" and any(row["mode"] == "delta" for row in reads[1:])
+            points = [p for p in (output / "points").iterdir() if p.is_dir() and not p.name.startswith(".")]
+            assert len(points) == 1 and len(grades) == 1
+            point = points[0]
+            packet = json.loads((point / "checkpoint.json").read_bytes())
+            metadata = packet["point_metadata"]
+            if args.capture_boundary == "fresh_replan":
+                assert metadata["held_decision_component_id"] and metadata["decision_sha256"]
+            else:
+                assert "held_decision_component_id" not in metadata and "replan" not in metadata
+                assert metadata["settlement_effect_id"] and metadata["wake_turn_id"]
+                assert metadata["native_session"]["completed_turn_id"] == metadata["native_session"]["turn_ids"][-1]
+            git_object = point / "components/task_workspace/.git/objects/ab/retained-object"
+            assert git_object.read_text() == "Readonly source evidence" and git_object.stat().st_mode & 0o777 == 0o444
+            config = _stage_source_configuration(container, metadata["native_session"], output / "native-config")
+        for name in ("ordinary", "stride", "recapture"):
+            stride = name != "ordinary"
+            results = output / name
+            results.mkdir()
+            guest_workspace = results / "workspace-root"
+            guest_workspace.mkdir()
+            extra_env = {}
+            extra_volumes = {}
+            capture_supervisor = None
+            if name == "recapture":
+                operator = output / "receiver-controller"
+                operator.mkdir(mode=0o700)
+                phase = operator / "phase-deadline"
+                capsule = point / "components" / metadata["worker_file_snapshot"]["native_capsule_component_id"]
+                activation = restore(files[1], root=capsule,
+                    expected_sha256=metadata["worker_file_snapshot"]["native_capsule_sha256"],
+                    run_id="joint-full-receiver", phase_deadline_file=phase)
+                public = operator / "worker-activation.json"
+                public.write_text(json.dumps({"url": json.loads(files[1].read_bytes())["url"],
+                    "activation": activation, "phase_deadline": phase.read_text()}))
+                public.chmod(0o600)
+                logs, publication, controls = results / "logs", output / "receiver-publication", results / "controls"
+                for folder in (logs, publication, controls):
+                    folder.mkdir(mode=0o700)
+                capture_supervisor = CheckpointSupervisor(files[1], publication / "published")
+                capture_supervisor.bind({"SFORGE_TOKEN": activation["token"]})
+                extra_env = {"LOOPX_JOINT_RECEIVER_NATIVE": "/native-activation.json",
+                    "LOOPX_JOINT_RECAPTURE_ROOT": "/publication/published"}
+                extra_volumes = {str(public): {"bind": "/native-activation.json", "mode": "ro"},
+                    str(logs): {"bind": "/logs/agent", "mode": "rw"},
+                    str(publication): {"bind": "/publication", "mode": "ro"},
+                    str(controls): {"bind": "/opt/loopx-benchmark/control", "mode": "rw"}}
+            guest(["python", "-m", "pytest", "benchmark/tests/test_checkpoint_joint_receiver.py",
+                   "-q", "-rs", "-p", "no:cacheprovider", "--basetemp=/results/test",
+                   "--junitxml=/results/junit.xml"],
+                  {str(point): {"bind": "/point", "mode": "ro"},
+                   str(config): {"bind": "/captured-config.toml", "mode": "ro"},
+                   str(guest_workspace): {"bind": "/qualification", "mode": "rw"},
+                   str(results): {"bind": "/results", "mode": "rw"}, **extra_volumes},
+                  {"LOOPX_JOINT_RECEIVER_POINT": "/point", "LOOPX_JOINT_RECEIVER_CONFIG": "/captured-config.toml",
+                   "LOOPX_RUNTIME_ROOT": "/results/transport-runtime",
+                   "LOOPX_CONTEXT_DELIVERY": args.context_delivery,
+                   **({"LOOPX_JOINT_RECEIVER_STRIDE": "1"} if stride else {}),
+                   **extra_env},
+                  output / f"{name}.log", capture_supervisor=capture_supervisor)
+            if name == "recapture":
+                newer = [p for p in (publication / "published").iterdir() if p.is_dir() and (p / "checkpoint.json").exists()]
+                assert len(newer) == 1
+                recaptured = newer[0]
+                next_packet = json.loads((recaptured / "checkpoint.json").read_bytes())
+                check = effect_runtime_result("runtime.checkpoint_artifacts", {
+                    "action": "verify", "root": str(recaptured), "expected_sha256": next_packet["sha256"]}, large_local_snapshot=True)
+                assert check["integrity_verified"]
+                third = output / "grandreceiver"
+                third.mkdir()
+                third_workspace = third / "workspace-root"
+                third_workspace.mkdir()
+                guest(["python", "-m", "pytest", "benchmark/tests/test_checkpoint_joint_receiver.py",
+                       "-q", "-rs", "-p", "no:cacheprovider", "--basetemp=/results/test", "--junitxml=/results/junit.xml"],
+                    {str(recaptured): {"bind": "/point", "mode": "ro"},
+                     str(config): {"bind": "/captured-config.toml", "mode": "ro"},
+                     str(third_workspace): {"bind": "/qualification", "mode": "rw"},
+                     str(third): {"bind": "/results", "mode": "rw"}},
+                    {"LOOPX_JOINT_RECEIVER_POINT": "/point", "LOOPX_JOINT_RECEIVER_CONFIG": "/captured-config.toml",
+                     "LOOPX_JOINT_RECEIVER_GOAL": "joint-grandreceiver", "LOOPX_JOINT_RECEIVER_AGENT": "joint-grandresearcher",
+                     "LOOPX_RUNTIME_ROOT": "/results/transport-runtime",
+                     "LOOPX_CONTEXT_DELIVERY": args.context_delivery},
+                    output / "grandreceiver.log")
+                assert not grades if args.reuse_point else len(grades) == 1
+        # The same native provider must also complete the public Core journey
+        # with every benchmark import forbidden by its test fixture.
+        results = output / "core"
+        results.mkdir()
+        guest(["python", "-m", "pytest",
+               "tests/control_plane/test_research_checkpoint_cli.py::test_explicit_ordinary_goal_capture_preserves_context_without_activation[True]",
+               "-q", "-rs", "-p", "no:cacheprovider", "--basetemp=/results/test",
+               "--junitxml=/results/junit.xml"],
+              {str(results): {"bind": "/results", "mode": "rw"}},
+              {"LOOPX_RUNTIME_ROOT": "/results/transport-runtime"}, output / "core.log")
+        require_source_checkout(source, source_revision)
+        receipt = {"passed": True, "controller_uid": os.getuid(), "provider_revision": args.provider_revision,
+                   "source_revision": source_revision, "source_tree_dirty": False, "source_imports_verified": True,
+                   "context_delivery": args.context_delivery, "capture_boundary": args.capture_boundary,
+                   "native_context_reads": context_results,
+                   "qualification_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in
+                       [Path(__file__), source / "benchmark/tests/test_native_checkpoint_handoff.py",
+                        source / "benchmark/tests/test_checkpoint_joint_receiver.py",
+                        source / "tests/control_plane/test_research_checkpoint_cli.py",
+                        source / "tests/control_plane/codex_checkpoint_fixture.py"]},
+                   "image_id": image, "point_sha256": packet["sha256"],
+                   "binary_sha256": {k: hashlib.sha256(p.read_bytes()).hexdigest() for k, p in binaries.items()},
+                   "ordinary_and_stride": True, "core_goal_without_benchmark": True,
+                   "source_created_in_this_run": not bool(args.reuse_point),
+                   "source_test_passed_in_this_run": not bool(args.reuse_point),
+                   "automatic_full_recapture_sha256": next_packet["sha256"], "another_receiver_actual_work": True,
+                   "research_point_qualified": False}
+        (output / "result.json").write_text(json.dumps(receipt, indent=2))
+        print(json.dumps(receipt))
+    finally:
+        try:
+            if supervisor is not None:
+                supervisor.close()
+        finally:
+            if container is not None:
+                container.remove(force=True)
+            client.close()
+            fixture.close()
+            patch.undo()
+
+
+if __name__ == "__main__":
+    main()

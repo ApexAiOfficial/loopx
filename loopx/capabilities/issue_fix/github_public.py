@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -20,6 +21,20 @@ GITHUB_PUBLIC_REPLY_MONITOR_PACKET_SCHEMA_VERSION = (
     "github_public_reply_monitor_packet_v0"
 )
 GITHUB_PUBLIC_REPLY_SIGNAL_SCHEMA_VERSION = "github_public_reply_signal_v0"
+GITHUB_PUBLIC_READ_FAILURE_SCHEMA_VERSION = "github_public_read_failure_v0"
+
+# A public read that failed is reported as one of these reasons, never as the
+# provider's own text: the steward answer contract forbids quoting a provider
+# failure into an answer, and a manager that repeats "Cache miss" instead of a
+# typed reason cannot say what is unread or how to repair it.
+GITHUB_PUBLIC_READ_FAILURE_CODES = (
+    "provider_timeout",
+    "provider_network_unavailable",
+    "provider_response_rejected",
+    "provider_result_unreadable",
+    "provider_tool_unavailable",
+    "provider_read_failed",
+)
 
 ALLOWED_GITHUB_REF_TYPES = {"issue", "pull", "discussion"}
 MAINTAINER_ASSOCIATIONS = {"COLLABORATOR", "MEMBER", "OWNER"}
@@ -116,9 +131,48 @@ def _normalise_github_issue_comment_url(url: str) -> tuple[str, dict[str, Any]]:
     }
 
 
-def _compact_error(exc: BaseException) -> str:
-    text = " ".join(str(exc).split())
-    return text[:180]
+def github_public_read_failure_row(exc: BaseException) -> dict[str, Any]:
+    """One failed public read as a typed row the answer can carry.
+
+    The row names the source, a typed reason, the coverage effect of the failed
+    read and the next action. The provider's message is replaced by its digest:
+    it stays correlatable with the provider log without letting an answer quote
+    it, which is what "Cache miss" and "invalid_arguments" leaking into steward
+    answers required.
+    """
+
+    if isinstance(exc, (subprocess.TimeoutExpired, TimeoutError)):
+        code = "provider_timeout"
+    elif isinstance(exc, HTTPError):
+        code = "provider_response_rejected"
+    elif isinstance(exc, URLError):
+        code = "provider_network_unavailable"
+    elif isinstance(exc, json.JSONDecodeError):
+        code = "provider_result_unreadable"
+    elif isinstance(exc, RuntimeError):
+        code = "provider_tool_unavailable"
+    else:
+        code = "provider_read_failed"
+    compact = " ".join(str(exc).split())
+    row: dict[str, Any] = {
+        "schema_version": GITHUB_PUBLIC_READ_FAILURE_SCHEMA_VERSION,
+        "source_id": "github_public_channel",
+        "code": code,
+        "coverage_effect": (
+            "the public GitHub metadata for this target was not read in this "
+            "call; the target is unread rather than inactive"
+        ),
+        "next_action": (
+            "retry with the GitHub CLI or authenticated tooling, or pass the "
+            "metadata explicitly; do not report the target as having no activity"
+        ),
+        "provider_message_digest": "sha256:"
+        + hashlib.sha256(compact.encode("utf-8")).hexdigest(),
+    }
+    status = getattr(exc, "code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        row["provider_status"] = status
+    return row
 
 
 def _fetch_issue_or_pull_metadata(ref: Mapping[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
@@ -196,7 +250,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
             f"number={ref['number']}",
         ],
         check=False,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout_seconds,
@@ -266,7 +320,7 @@ def _fetch_issue_comment_metadata(
             jq_filter,
         ],
         check=False,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout_seconds,
@@ -277,6 +331,81 @@ def _fetch_issue_comment_metadata(
     if not isinstance(comments, list):
         raise RuntimeError("issue comments metadata must be a JSON array")
     return {"comments": comments}
+
+
+def _fetch_body_free_event_list(
+    gh: str, endpoint: str, jq_filter: str, *, timeout_seconds: float
+) -> list[Any]:
+    result = subprocess.run(
+        [
+            gh,
+            "api",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "--paginate",
+            endpoint,
+            "--jq",
+            jq_filter,
+        ],
+        check=False,
+        text=True, encoding="utf-8", errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout_seconds,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("gh pull request event metadata request failed")
+    # --paginate with --jq emits one JSON array per page.
+    events: list[Any] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        page = json.loads(line)
+        if not isinstance(page, list):
+            raise RuntimeError("pull request event metadata must be a JSON array")
+        events.extend(page)
+    return events
+
+
+def fetch_github_pull_request_event_metadata(
+    *, owner: str, repo: str, number: int, timeout_seconds: float
+) -> dict[str, Any]:
+    """Fetch PR issue comments, reviews and review comments without bodies.
+
+    Each item keeps only the provider id, author login, author association,
+    timestamps and html URL so a host-asserted correction can be matched to
+    the event that carried it.
+    """
+
+    gh = shutil.which("gh")
+    if not gh:
+        raise RuntimeError("pull request event metadata fetch requires GitHub CLI `gh`")
+    comment_filter = (
+        "[.[] | {id: .id, author: .user.login, "
+        "author_association: .author_association, created_at: .created_at, "
+        "updated_at: .updated_at, url: .html_url}]"
+    )
+    review_filter = (
+        "[.[] | {id: .id, author: .user.login, "
+        "author_association: .author_association, submitted_at: .submitted_at, "
+        "url: .html_url}]"
+    )
+    base = f"repos/{owner}/{repo}"
+    return {
+        "comments": _fetch_body_free_event_list(
+            gh, f"{base}/issues/{number}/comments?per_page=100", comment_filter,
+            timeout_seconds=timeout_seconds,
+        ),
+        "reviews": _fetch_body_free_event_list(
+            gh, f"{base}/pulls/{number}/reviews?per_page=100", review_filter,
+            timeout_seconds=timeout_seconds,
+        ),
+        "reviewComments": _fetch_body_free_event_list(
+            gh, f"{base}/pulls/{number}/comments?per_page=100", comment_filter,
+            timeout_seconds=timeout_seconds,
+        ),
+        "body_captured": False,
+    }
 
 
 def _parse_github_timestamp(value: Any) -> datetime | None:
@@ -392,7 +521,7 @@ def build_github_public_reply_monitor_packet(
     )
     if not same_target:
         raise ValueError("--issue-url and --after-comment-url must point at the same GitHub thread")
-    read_error: str | None = None
+    read_failure: dict[str, Any] | None = None
     live_payload: Mapping[str, Any] | None = None
     if fetch_metadata:
         try:
@@ -402,7 +531,7 @@ def build_github_public_reply_monitor_packet(
             json.JSONDecodeError,
             subprocess.TimeoutExpired,
         ) as exc:
-            read_error = _compact_error(exc)
+            read_failure = github_public_read_failure_row(exc)
 
     payload_source = live_payload if live_payload is not None else provider_payload
     comments = _provider_comments(payload_source)
@@ -428,7 +557,7 @@ def build_github_public_reply_monitor_packet(
     metadata_collected = bool(comments)
     validation_errors: list[str] = []
     validation_warnings: list[str] = []
-    if read_error:
+    if read_failure:
         validation_errors.append("metadata read failed; retry with gh auth/tooling or use --metadata-json")
     if metadata_collected and anchor_created_at is None:
         validation_errors.append("anchor LoopX comment was not found in comment metadata")
@@ -487,7 +616,7 @@ def build_github_public_reply_monitor_packet(
         "money_signal": money_signal,
         "recommended_action": recommended_action,
         "stop_condition": "do not bump or draft a triage note until public maintainer interest appears",
-        "read_error": read_error,
+        "read_failure": read_failure,
         "validation": {
             "ok": not validation_errors,
             "errors": validation_errors,
@@ -509,7 +638,7 @@ def build_github_public_channel_probe_packet(
 ) -> dict[str, Any]:
     normalised_url, ref = _normalise_github_url(url)
     metadata: dict[str, Any] | None = None
-    read_error: str | None = None
+    read_failure: dict[str, Any] | None = None
     if fetch_metadata:
         try:
             if ref["ref_type"] in {"issue", "pull"}:
@@ -517,7 +646,7 @@ def build_github_public_channel_probe_packet(
             else:
                 metadata = _fetch_discussion_metadata(ref, timeout_seconds=timeout_seconds)
         except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
-            read_error = _compact_error(exc)
+            read_failure = github_public_read_failure_row(exc)
     connector_call = {
         "schema_version": "connector_call_intent_v0",
         "call_id": f"github_{ref['ref_type']}_{ref['number']}_metadata_probe",
@@ -540,7 +669,7 @@ def build_github_public_channel_probe_packet(
         "promotion_target": "value_connector_plan_v0",
     }
     validation_errors: list[str] = []
-    if read_error:
+    if read_failure:
         validation_errors.append("metadata read failed; retry with auth material/tooling or use no-fetch mode")
     return {
         "ok": not validation_errors,
@@ -550,7 +679,7 @@ def build_github_public_channel_probe_packet(
         "ref": ref,
         "connector_call": connector_call,
         "metadata": metadata,
-        "read_error": read_error,
+        "read_failure": read_failure,
         "external_reads_performed": bool(fetch_metadata),
         "external_writes_performed": False,
         "raw_body_captured": False,
@@ -605,8 +734,24 @@ def render_github_public_reply_monitor_markdown(payload: dict[str, Any]) -> str:
             f"maintainer_signal=`{signal.get('is_maintainer_signal')}` "
             f"url={signal.get('url')}"
         )
-    if payload.get("read_error"):
-        lines.extend(["", "## Read Error", "", str(payload.get("read_error"))])
+    failure = (
+        payload.get("read_failure")
+        if isinstance(payload.get("read_failure"), Mapping)
+        else None
+    )
+    if failure:
+        lines.extend(
+            [
+                "",
+                "## Unread Source",
+                "",
+                f"- source_id: `{failure.get('source_id')}`",
+                f"- code: `{failure.get('code')}`",
+                f"- coverage_effect: {failure.get('coverage_effect')}",
+                f"- next_action: {failure.get('next_action')}",
+                f"- provider_message_digest: `{failure.get('provider_message_digest')}`",
+            ]
+        )
     errors = validation.get("errors") if isinstance(validation.get("errors"), list) else []
     warnings = validation.get("warnings") if isinstance(validation.get("warnings"), list) else []
     if errors:
@@ -650,8 +795,24 @@ def render_github_public_channel_probe_markdown(payload: dict[str, Any]) -> str:
                 "",
             ]
         )
-    if payload.get("read_error"):
-        lines.extend(["## Read Error", "", str(payload.get("read_error")), ""])
+    failure = (
+        payload.get("read_failure")
+        if isinstance(payload.get("read_failure"), Mapping)
+        else None
+    )
+    if failure:
+        lines.extend(
+            [
+                "## Unread Source",
+                "",
+                f"- source_id: `{failure.get('source_id')}`",
+                f"- code: `{failure.get('code')}`",
+                f"- coverage_effect: {failure.get('coverage_effect')}",
+                f"- next_action: {failure.get('next_action')}",
+                f"- provider_message_digest: `{failure.get('provider_message_digest')}`",
+                "",
+            ]
+        )
     if payload.get("error"):
         lines.extend(["## Error", "", str(payload.get("error")), ""])
     errors = validation.get("errors") if isinstance(validation.get("errors"), list) else []

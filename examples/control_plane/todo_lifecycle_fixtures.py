@@ -5,9 +5,11 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -15,6 +17,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from loopx.cli import main as loopx_cli_main  # noqa: E402
+from loopx.control_plane.coordination.goal_storage_initialization import (  # noqa: E402
+    initialize_goal_storage_target,
+)
 from loopx.control_plane.testing.canary_harness import (  # noqa: E402
     runtime_root_from_registry,
     write_fixture_registry,
@@ -39,6 +44,7 @@ UNCLAIMED_SUCCESSOR_TODO = "Continue the unclaimed successor routing check."
 
 
 def write_fixture(root: Path) -> tuple[Path, Path]:
+    root = root.resolve()
     project = root / "project"
     runtime = root / "runtime"
     state_file = project / ".codex" / "goals" / GOAL_ID / "ACTIVE_GOAL_STATE.md"
@@ -52,8 +58,9 @@ def write_fixture(root: Path) -> tuple[Path, Path]:
         "# Active Goal State\n\n"
         "## Objective\n\n"
         "Exercise todo lifecycle transitions.\n\n"
+        "## User Todo / Owner Review Reading Queue\n\n"
         "## Agent Todo\n\n"
-        "- [ ] Legacy monitor-only placeholder.\n",
+        "## Completed Work Archive\n",
         encoding="utf-8",
     )
     write_fixture_registry(
@@ -65,7 +72,30 @@ def write_fixture(root: Path) -> tuple[Path, Path]:
         adapter_kind="generic_project_goal_v0",
         registered_agents=["codex-main-control", "codex-side-bypass"],
         quota_allowed_slots=None,
+        extra_goal_fields={
+            "creation_operation_id": f"goal-create:{GOAL_ID}",
+            "coordination": {
+                "agent_model": "peer_v1",
+                "registered_agents": ["codex-main-control", "codex-side-bypass"],
+                "storage_target": {
+                    "schema_version": "loopx_new_goal_storage_target_v1",
+                    "provider": "file",
+                    "handoff_mode": "soft_claim",
+                },
+            },
+        },
     )
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    initialized = initialize_goal_storage_target(
+        runtime,
+        registry["goals"][0],
+        registry_path=registry_path,
+    )
+    if not isinstance(initialized, dict) or (
+        initialized.get("authority_initialized") is not True
+        or initialized.get("legacy_fallback_used") is not False
+    ):
+        raise AssertionError("fixture did not initialize canonical File authority")
     return registry_path, state_file
 
 
@@ -87,7 +117,6 @@ def run_fixture_cli(
     registry_path: Path,
     args: tuple[str, ...],
 ) -> tuple[int, dict]:
-    args = fixture_cli_args(registry_path, args)
     argv = [
         "--registry",
         str(registry_path),
@@ -99,7 +128,11 @@ def run_fixture_cli(
     ]
     stdout = io.StringIO()
     stderr = io.StringIO()
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+    # These fixtures consume machine JSON and read the inline decision fields;
+    # the model-facing capture transport replaces that body with a reader
+    # reference, so opt out in-process the way the canary harness does in argv.
+    with patch.dict(os.environ, {"LOOPX_CONTEXT_DELIVERY": "off"}), \
+            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
         try:
             returncode = loopx_cli_main(argv)
         except SystemExit as exc:
@@ -110,16 +143,6 @@ def run_fixture_cli(
     assert isinstance(payload, dict), payload
     payload["_returncode"] = returncode
     return returncode, payload
-
-
-def fixture_cli_args(registry_path: Path, args: tuple[str, ...]) -> tuple[str, ...]:
-    if (
-        args[:1] == ("quota",)
-        and "--scan-path" not in args
-        and "--scan-root" not in args
-    ):
-        return (*args, "--scan-path", str(registry_path.parent.parent))
-    return args
 
 
 def parsed_items(state_file: Path) -> list[dict]:
@@ -182,7 +205,7 @@ def assert_configured_peer_handoff() -> None:
         assert side_handoff_completed["next_todos"][0]["claimed_by"] == "codex-side-reviewer", (
             side_handoff_completed
         )
-        assert side_handoff_completed["next_todos"][0]["blocks_agent"] is None, side_handoff_completed
+        assert side_handoff_completed["next_todos"][0].get("blocks_agent") is None, side_handoff_completed
         assert side_handoff_completed["next_todos"][0]["unblocks_todo_id"] == side_handoff_added["todo_id"], (
             side_handoff_completed
         )
@@ -248,7 +271,7 @@ def assert_configured_peer_handoff() -> None:
         assert review_successor["action_kind"] == "review_merge", explicit_primary_review
         assert review_successor["continuation_policy"] == "independent_handoff", explicit_primary_review
         assert review_successor["excluded_agents"] == ["codex-side-bypass"], explicit_primary_review
-        assert review_successor["blocks_agent"] is None, explicit_primary_review
+        assert review_successor.get("blocks_agent") is None, explicit_primary_review
         assert review_successor["unblocks_todo_id"] == review_source_added["todo_id"], explicit_primary_review
         review_successor_item = next(
             item for item in parsed_items(state_file) if item["todo_id"] == review_successor["todo_id"]
@@ -301,7 +324,7 @@ def assert_configured_peer_handoff() -> None:
             "--next-excluded-agent",
             "codex-side-bypass",
         )
-        assert "cannot also appear in next_excluded_agents" in (
+        assert "cannot also appear in excluded_agents" in (
             same_agent_handoff["error"]
         ), same_agent_handoff
 
@@ -358,7 +381,7 @@ def assert_configured_peer_handoff() -> None:
         assert profile_handoff_completed["next_todos"][0]["claimed_by"] == "codex-main-control", (
             profile_handoff_completed
         )
-        assert profile_handoff_completed["next_todos"][0]["blocks_agent"] is None, profile_handoff_completed
+        assert profile_handoff_completed["next_todos"][0].get("blocks_agent") is None, profile_handoff_completed
         assert profile_handoff_completed["next_todos"][0]["unblocks_todo_id"] == profile_handoff_added["todo_id"], (
             profile_handoff_completed
         )
@@ -510,7 +533,7 @@ def assert_complete_links_existing_successor() -> None:
             successor_id,
         )
         assert completed["changed"] is True, completed
-        assert completed["self_merged"] is True, completed
+        assert completed["completion_policy"]["self_merged"] is True, completed
         assert completed["next_todos"] == [], completed
         assert completed["successor_todo_ids"] == [successor_id], completed
 
@@ -571,7 +594,7 @@ def assert_same_title_completion_creates_fresh_successor() -> None:
             "state_machine_canary_refactor",
         )
         assert completed["changed"] is True, completed
-        assert completed["next_todos"][0]["added"] is True, completed
+        assert completed["next_todos"][0]["status"] == "open", completed
         successor_id = completed["next_todos"][0]["todo_id"]
         assert successor_id != added["todo_id"], completed
         assert completed["next_todos"][0]["unblocks_todo_id"] == added["todo_id"], completed

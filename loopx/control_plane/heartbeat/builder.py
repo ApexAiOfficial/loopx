@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import shlex
+from functools import partial
 from pathlib import Path
 from typing import Any
 
-from ...agent_registry import normalize_registered_agents
+from ...agent_registry import load_goal_from_registry, normalize_registered_agents
 from ...ark_managed_agent_host import build_ark_managed_agent_host_contract
 from ...execution_profile import (
     TURN_GRANULARITY_FINE,
@@ -18,6 +19,7 @@ from ..quota.spend_sources import (
     VISIBLE_GOAL_SLOT_SPEND_SOURCE,
 )
 from ..scheduler.execution_context import (
+    HostSurface,
     SchedulerRuntimeProfile,
     render_scheduler_execution_args,
 )
@@ -38,6 +40,7 @@ from .budget import (
     build_interface_budget,
 )
 from .host import (
+    resolve_heartbeat_capture_root,
     resolve_exact_heartbeat_turn_identity,
     uses_ark_managed_agent_goal_host,
     uses_native_goal_host_loop,
@@ -45,6 +48,8 @@ from .host import (
 from .rules import (
     DEFAULT_MATERIAL_QUEUE_RULE,
     DEFAULT_PERMISSION_RULE,
+    REWARD_MEMORY_OUTCOME_COMPACT_RULE,
+    REWARD_MEMORY_OUTCOME_RULE,
 )
 from .task_body import (
     bind_exact_turn_settlement_task_body,
@@ -63,6 +68,7 @@ from .visible_goal import (
 from ...project_prompt import (
     render_accountable_progress_refresh_command,
     render_available_capability_args,
+    render_cli_command_prefix,
     render_cli_preflight,
     render_quota_guard_command,
     render_quota_spend_command,
@@ -70,12 +76,12 @@ from ...project_prompt import (
 )
 
 FINE_GRAINED_TURN_RULE = (
-    "Fine-grained planning contract: each Todo must be one small verifiable checkpoint; "
-    "if broader, split before delivery. The turn budget is one coherent decision slice "
+    "Fine-grained planning contract: each Todo must be an independently verifiable checkpoint; "
+    "split independent decisions before delivery. Work follows one coherent direction "
     "and may complete one or more causally related Agent advancement Todos. After each "
     "completion inspect fresh evidence before creating or claiming a successor; continue "
     "only while the direction remains unchanged. Validate and durably complete each Todo, "
-    "then perform accountable refresh and spend to settle the turn once after the slice. "
+    "then perform accountable refresh and spend to settle the turn once after the work. "
     "A direction change or bounded-chain review must use the existing replan obligation/"
     "ACK path before further delivery. Protocol/setup and capability re-entry steps are "
     "inline non-advancement work: never create Todos or settle a turn for them alone."
@@ -90,6 +96,8 @@ def _select_task_body_renderer(
     thin: bool,
     brief: bool,
     compact: bool,
+    resumed_codex_session: bool,
+    turn_instance_id: str | None,
 ) -> Any:
     if traex_visible_goal:
         return render_traex_visible_goal_task_body
@@ -98,6 +106,8 @@ def _select_task_body_renderer(
     if native_goal_host:
         return render_visible_goal_task_body
     if thin:
+        if resumed_codex_session and turn_instance_id:
+            return partial(render_thin_heartbeat_task_body, resumed_codex_session=True)
         return render_thin_heartbeat_task_body
     if brief:
         return render_brief_heartbeat_task_body
@@ -106,9 +116,31 @@ def _select_task_body_renderer(
     return render_heartbeat_task_body
 
 
+def _reward_memory_rule_kwargs(
+    *,
+    full: bool,
+    reward_memory_enabled: bool,
+    native_goal_host: bool,
+    ark_managed_agent_goal: bool,
+) -> dict[str, str]:
+    if native_goal_host or ark_managed_agent_goal:
+        return {}
+    if not reward_memory_enabled:
+        return {"reward_memory_rule": ""}
+    return {
+        "reward_memory_rule": (
+            REWARD_MEMORY_OUTCOME_RULE
+            if full
+            else REWARD_MEMORY_OUTCOME_COMPACT_RULE
+        )
+    }
+
+
 def _heartbeat_regeneration_commands(
     *,
     cli_bin: str,
+    runtime_root: str | Path | None,
+    registry_path: str | Path | None,
     goal_id: str,
     active_state_arg: str,
     agent_args: str,
@@ -120,10 +152,207 @@ def _heartbeat_regeneration_commands(
         f" --goal-id {goal_id}{active_state_arg}{agent_args}"
         f"{capability_args}{scheduler_args}{turn_identity_arg}"
     )
+    command_prefix = render_cli_command_prefix(
+        cli_bin=cli_bin,
+        runtime_root=runtime_root,
+        registry_path=registry_path,
+    )
     return tuple(
-        f"{cli_bin} heartbeat-prompt --{mode}{suffix}"
+        f"{command_prefix} heartbeat-prompt --{mode}{suffix}"
         for mode in ("full", "compact", "brief", "thin")
     )
+
+
+def _heartbeat_prompt_commands(
+    *,
+    goal_id: str,
+    cli_bin: str,
+    runtime_root: str | Path | None,
+    registry_path: str | Path | None,
+    normalized_agent_id: str | None,
+    normalized_available_capabilities: tuple[str, ...],
+    effective_available_capabilities: tuple[str, ...],
+    task_body_available_capabilities: tuple[str, ...],
+    runtime_profile: str | None,
+    scheduler_execution_context: Any,
+    native_goal_host: bool,
+    traex_visible_goal: bool,
+    active_state_arg: str,
+    agent_args: str,
+    capability_args: str,
+    turn_identity_arg: str,
+    decision_output_root: Path | None,
+    decision_handoff_socket: str | None,
+    codex_context_dir: str | None,
+    codex_context_root: str | None,
+    context_delivery: str | None,
+    delta_delivery: str | None = None,
+) -> dict[str, str | None]:
+    quota_guard_command = render_quota_guard_command(
+        goal_id,
+        cli_bin=cli_bin,
+        runtime_root=runtime_root,
+        registry_path=registry_path,
+        agent_id=normalized_agent_id,
+        available_capabilities=normalized_available_capabilities,
+        runtime_profile=runtime_profile,
+        scheduler_execution_context=scheduler_execution_context,
+        heartbeat_turn_receipt=not native_goal_host,
+    )
+    quota_spend_command = render_quota_spend_command(
+        goal_id,
+        source=(
+            VISIBLE_GOAL_SLOT_SPEND_SOURCE
+            if native_goal_host
+            else DEFAULT_SLOT_SPEND_SOURCE
+        ),
+        cli_bin=cli_bin,
+        runtime_root=runtime_root,
+        registry_path=registry_path,
+        agent_id=normalized_agent_id,
+        available_capabilities=normalized_available_capabilities,
+    )
+    task_body_quota_guard_command = quota_guard_command
+    task_body_quota_spend_command = quota_spend_command
+    if traex_visible_goal:
+        task_body_quota_guard_command = render_quota_guard_command(
+            goal_id,
+            cli_bin=cli_bin,
+            runtime_root=runtime_root,
+            registry_path=registry_path,
+            agent_id=normalized_agent_id,
+            available_capabilities=task_body_available_capabilities,
+            runtime_profile=runtime_profile,
+            scheduler_execution_context=scheduler_execution_context,
+        )
+        task_body_quota_spend_command = render_quota_spend_command(
+            goal_id,
+            source=VISIBLE_GOAL_SLOT_SPEND_SOURCE,
+            cli_bin=cli_bin,
+            runtime_root=runtime_root,
+            registry_path=registry_path,
+            agent_id=normalized_agent_id,
+        )
+    scheduler_args = render_scheduler_execution_args(
+        runtime_profile=runtime_profile,
+        scheduler_execution_context=scheduler_execution_context,
+    )
+    (
+        expanded_prompt_command,
+        compact_prompt_command,
+        brief_prompt_command,
+        thin_prompt_command,
+    ) = _heartbeat_regeneration_commands(
+        cli_bin=cli_bin,
+        runtime_root=runtime_root,
+        registry_path=registry_path,
+        goal_id=goal_id,
+        active_state_arg=active_state_arg,
+        agent_args=agent_args,
+        capability_args=capability_args,
+        scheduler_args=scheduler_args,
+        turn_identity_arg=turn_identity_arg,
+    )
+    pr_review_pre_quota_command = (
+        f"{render_cli_command_prefix(cli_bin=cli_bin, runtime_root=runtime_root, registry_path=registry_path)} "
+        f"heartbeat-prequota -g {shlex.quote(goal_id)} "
+        f"-a {shlex.quote(normalized_agent_id)}"
+        if normalized_agent_id
+        and "external_evidence_poll" in effective_available_capabilities
+        else None
+    )
+    commands = {
+        "quota_guard_command": quota_guard_command,
+        "quota_spend_command": quota_spend_command,
+        "task_body_quota_guard_command": task_body_quota_guard_command,
+        "task_body_quota_spend_command": task_body_quota_spend_command,
+        "refresh_state_command": render_refresh_state_command(
+            goal_id,
+            cli_bin=cli_bin,
+            runtime_root=runtime_root,
+            registry_path=registry_path,
+            agent_id=normalized_agent_id,
+        ),
+        "progress_refresh_state_command": render_accountable_progress_refresh_command(
+            goal_id,
+            cli_bin=cli_bin,
+            runtime_root=runtime_root,
+            registry_path=registry_path,
+            agent_id=normalized_agent_id,
+        ),
+        "pr_review_pre_quota_command": pr_review_pre_quota_command,
+        "expanded_prompt_command": expanded_prompt_command,
+        "compact_prompt_command": compact_prompt_command,
+        "brief_prompt_command": brief_prompt_command,
+        "thin_prompt_command": thin_prompt_command,
+    }
+    capture_arg = ""
+    if decision_output_root is not None:
+        capture_arg = " --decision-output-root " + shlex.quote(str(decision_output_root))
+        if context_delivery is not None:
+            capture_arg += " --context-delivery " + shlex.quote(context_delivery)
+        if decision_handoff_socket is not None:
+            capture_arg += " --decision-handoff-socket " + shlex.quote(decision_handoff_socket)
+        if codex_context_dir is not None:
+            capture_arg += " --codex-context-dir " + shlex.quote(codex_context_dir)
+        if codex_context_root is not None:
+            capture_arg += " --codex-context-root " + shlex.quote(codex_context_root)
+    elif context_delivery is not None:
+        capture_arg += " --context-delivery " + shlex.quote(context_delivery)
+    if delta_delivery == "off" or (context_delivery == "off" and delta_delivery == "auto"):
+        capture_arg += " --delta-delivery " + shlex.quote(delta_delivery)
+    if capture_arg:
+        for key in ("quota_guard_command", "task_body_quota_guard_command", "thin_prompt_command"):
+            commands[key] = str(commands[key]) + capture_arg
+    return commands
+
+
+def _heartbeat_context_capture_activation(*, context_delivery: str | None, delta_delivery: str | None,
+        runtime_profile: str | None, scheduler_execution_context: Any, decision_output_root: Path | None,
+        decision_handoff_socket: str | None, codex_context_dir: str | None,
+        codex_context_root: str | None) -> tuple[dict[str, Any], str, str | None, str | None]:
+    from ..turn_driver.codex_context import context_delivery_activation
+    import os
+
+    activation = context_delivery_activation(context_delivery or "off", runtime_profile=runtime_profile,
+        scheduler_execution_context=scheduler_execution_context, delta_delivery=delta_delivery,
+        benchmark_mode=os.environ.get("LOOPX_EXECUTION_MODE")
+            if os.environ.get("LOOPX_CONTEXT_DELIVERY") == "on" else None)
+    if not activation["enabled"]:
+        codex_context_dir = codex_context_root = None
+    effective = "on" if activation["enabled"] else "off"
+    if context_delivery != "on" and not any((decision_output_root, decision_handoff_socket,
+            codex_context_dir, codex_context_root)):
+        effective = "off"  # Rendering a prompt does not start native transport.
+    return activation, effective, codex_context_dir, codex_context_root
+
+
+def _finalize_heartbeat_task_body(
+    task_body: str,
+    *,
+    turn_instance_id: str | None,
+    fine_grained: bool,
+    native_goal_host: bool,
+    ark_managed_agent_goal: bool,
+    traex_visible_goal: bool,
+) -> str:
+    """Bind settlement and check the complete body against the host limit."""
+    task_body = bind_exact_turn_settlement_task_body(task_body, turn_instance_id=turn_instance_id)
+    if fine_grained:
+        task_body = f"{task_body}\n\n{FINE_GRAINED_TURN_RULE}"
+    if native_goal_host and len(task_body) > NATIVE_GOAL_HOST_MAX_CHARS:
+        host_limit = (
+            "Ark Managed Agent goal prompt"
+            if ark_managed_agent_goal
+            else "visible TraeX /goal task body"
+            if traex_visible_goal
+            else "visible Codex /goal task body"
+        )
+        raise ValueError(
+            f"generated {host_limit} exceeds the 4000-character host budget; "
+            "shorten agent scopes or project-specific prompt rules"
+        )
+    return task_body
 
 
 def build_heartbeat_prompt(
@@ -139,16 +368,27 @@ def build_heartbeat_prompt(
     brief: bool = False,
     thin: bool = False,
     cli_bin: str = "loopx",
+    runtime_root: str | Path | None = None,
+    registry_path: str | Path | None = None,
     agent_id: str | None = None,
     agent_scopes: list[str] | tuple[str, ...] | None = None,
     agent_profile: dict[str, Any] | None = None,
     registered_agents: list[str] | tuple[str, ...] | None = None,
     available_capabilities: list[str] | tuple[str, ...] | None = None,
+    effective_available_capabilities: list[str] | tuple[str, ...] | None = None,
     runtime_profile: str | None = None,
     scheduler_execution_context: dict[str, Any] | None = None,
     visible_goal_host: str | None = None,
     turn_granularity: str | None = None,
     turn_instance_id: str | None = None,
+    reward_memory_enabled: bool = True,
+    resumed_codex_session: bool = False,
+    decision_output_root: str | Path | None = None,
+    decision_handoff_socket: str | None = None,
+    codex_context_dir: str | None = None,
+    codex_context_root: str | None = None,
+    context_delivery: str | None = None,
+    delta_delivery: str | None = None,
 ) -> dict[str, Any]:
     if not (full or compact or brief or thin):
         thin = True
@@ -206,13 +446,31 @@ def build_heartbeat_prompt(
         runtime_profile=runtime_profile,
         scheduler_execution_context=scheduler_execution_context,
     )
+    activation, effective_context_delivery, codex_context_dir, codex_context_root = _heartbeat_context_capture_activation(
+        context_delivery=context_delivery, delta_delivery=delta_delivery, runtime_profile=runtime_profile,
+        scheduler_execution_context=scheduler_execution_context,
+        decision_output_root=decision_output_root, decision_handoff_socket=decision_handoff_socket,
+        codex_context_dir=codex_context_dir, codex_context_root=codex_context_root)
+    decision_output_root = resolve_heartbeat_capture_root(
+        decision_output_root,
+        thin=thin, full=full, compact=compact, brief=brief,
+        native_goal_host=native_goal_host,
+        turn_instance_id=normalized_turn_instance_id,
+        decision_handoff_socket=decision_handoff_socket,
+        codex_context_dir=codex_context_dir,
+        codex_context_root=codex_context_root,
+        context_delivery=effective_context_delivery,
+    )
     explicit_agent_scopes = normalize_agent_scopes(agent_scopes)
-    profile_agent_scopes = agent_profile_scopes(agent_profile)
-    normalized_agent_scopes = explicit_agent_scopes or profile_agent_scopes
+    if explicit_agent_scopes:
+        normalized_agent_scopes = explicit_agent_scopes
+        agent_scope_source = "argument"
+    else:
+        normalized_agent_scopes = agent_profile_scopes(agent_profile)
+        agent_scope_source = "agent_profile_v1" if normalized_agent_scopes else None
     if traex_visible_goal:
         for scope in normalized_agent_scopes:
             validate_visible_goal_policy_rule(field="agent_scope", value=scope)
-    agent_scope_source = "argument" if explicit_agent_scopes else "agent_profile_v1" if profile_agent_scopes else None
     if normalized_agent_scopes and not normalized_agent_id:
         raise ValueError("--agent-scope requires --agent-id so claimed_by uses a registered agent")
     normalized_registered_agents = normalize_registered_agents(registered_agents)
@@ -246,6 +504,11 @@ def build_heartbeat_prompt(
     normalized_available_capabilities = normalize_required_capabilities(
         available_capabilities
     )
+    resolved_effective_capabilities = (
+        normalize_required_capabilities(effective_available_capabilities)
+        if effective_available_capabilities is not None
+        else normalized_available_capabilities
+    )
     initial_runtime_capability_projection = (
         build_visible_goal_initial_runtime_capability_projection(
             normalized_available_capabilities
@@ -272,79 +535,31 @@ def build_heartbeat_prompt(
         compact=compact or brief,
         thin=thin,
     )
-    quota_guard_command = render_quota_guard_command(
-        goal_id,
-        cli_bin=cli_bin,
-        agent_id=normalized_agent_id,
-        available_capabilities=normalized_available_capabilities,
-        runtime_profile=runtime_profile,
-        scheduler_execution_context=scheduler_execution_context,
-        heartbeat_turn_receipt=not native_goal_host,
-    )
-    quota_spend_command = render_quota_spend_command(
-        goal_id,
-        source=(
-            VISIBLE_GOAL_SLOT_SPEND_SOURCE
-            if native_goal_host
-            else DEFAULT_SLOT_SPEND_SOURCE
-        ),
-        cli_bin=cli_bin,
-        agent_id=normalized_agent_id,
-        available_capabilities=normalized_available_capabilities,
-    )
-    task_body_quota_guard_command = quota_guard_command
-    task_body_quota_spend_command = quota_spend_command
-    if traex_visible_goal:
-        task_body_quota_guard_command = render_quota_guard_command(
-            goal_id,
-            cli_bin=cli_bin,
-            agent_id=normalized_agent_id,
-            available_capabilities=task_body_available_capabilities,
-            runtime_profile=runtime_profile,
-            scheduler_execution_context=scheduler_execution_context,
-        )
-        task_body_quota_spend_command = render_quota_spend_command(
-            goal_id,
-            source=VISIBLE_GOAL_SLOT_SPEND_SOURCE,
-            cli_bin=cli_bin,
-            agent_id=normalized_agent_id,
-        )
-    refresh_state_command = render_refresh_state_command(
-        goal_id,
-        cli_bin=cli_bin,
-        agent_id=normalized_agent_id,
-    )
-    progress_refresh_state_command = render_accountable_progress_refresh_command(
-        goal_id,
-        cli_bin=cli_bin,
-        agent_id=normalized_agent_id,
-    )
-    cli_preflight = render_cli_preflight(cli_bin=cli_bin)
-    pr_review_pre_quota_command = (
-        f"{cli_bin} heartbeat-prequota -g {shlex.quote(goal_id)} "
-        f"-a {shlex.quote(normalized_agent_id)}"
-        if normalized_agent_id
-        and "external_evidence_poll" in normalized_available_capabilities
-        else ""
-    )
-    scheduler_args = render_scheduler_execution_args(
-        runtime_profile=runtime_profile,
-        scheduler_execution_context=scheduler_execution_context,
-    )
-    (
-        expanded_prompt_command,
-        compact_prompt_command,
-        brief_prompt_command,
-        thin_prompt_command,
-    ) = _heartbeat_regeneration_commands(
-        cli_bin=cli_bin,
+    commands = _heartbeat_prompt_commands(
         goal_id=goal_id,
+        cli_bin=cli_bin,
+        runtime_root=runtime_root,
+        registry_path=registry_path,
+        normalized_agent_id=normalized_agent_id,
+        normalized_available_capabilities=tuple(normalized_available_capabilities),
+        effective_available_capabilities=tuple(resolved_effective_capabilities),
+        task_body_available_capabilities=tuple(task_body_available_capabilities),
+        runtime_profile=runtime_profile,
+        scheduler_execution_context=scheduler_execution_context,
+        native_goal_host=native_goal_host,
+        traex_visible_goal=traex_visible_goal,
         active_state_arg=active_state_arg,
         agent_args=agent_args,
         capability_args=capability_args,
-        scheduler_args=scheduler_args,
         turn_identity_arg=turn_identity_arg,
+        decision_output_root=decision_output_root,
+        decision_handoff_socket=decision_handoff_socket,
+        codex_context_dir=codex_context_dir,
+        codex_context_root=codex_context_root,
+        context_delivery=context_delivery,
+        delta_delivery=delta_delivery,
     )
+    cli_preflight = render_cli_preflight(cli_bin=cli_bin)
     task_body_renderer = _select_task_body_renderer(
         traex_visible_goal=traex_visible_goal,
         ark_managed_agent_goal=ark_managed_agent_goal,
@@ -352,45 +567,58 @@ def build_heartbeat_prompt(
         thin=thin,
         brief=brief,
         compact=compact,
+        resumed_codex_session=resumed_codex_session,
+        turn_instance_id=normalized_turn_instance_id,
+    )
+    reward_memory_rule_kwargs = _reward_memory_rule_kwargs(
+        full=full,
+        reward_memory_enabled=reward_memory_enabled,
+        native_goal_host=native_goal_host,
+        ark_managed_agent_goal=ark_managed_agent_goal,
+    )
+    is_antigravity_app = (
+        runtime_profile == SchedulerRuntimeProfile.ANTIGRAVITY_APP.value
+        or (
+            isinstance(scheduler_execution_context, dict)
+            and scheduler_execution_context.get("host_surface")
+            == HostSurface.ANTIGRAVITY_APP.value
+        )
     )
     task_body = task_body_renderer(
         goal_id=goal_id,
         active_state=active_state_text,
         cli_preflight=cli_preflight,
         pr_review_pre_quota_command=(
-            "" if traex_visible_goal else pr_review_pre_quota_command
+            "" if traex_visible_goal else commands["pr_review_pre_quota_command"] or ""
         ),
-        quota_guard_command=task_body_quota_guard_command,
-        quota_spend_command=task_body_quota_spend_command,
-        refresh_state_command=refresh_state_command,
-        progress_refresh_state_command=progress_refresh_state_command,
+        quota_guard_command=str(commands["task_body_quota_guard_command"]),
+        quota_spend_command=str(commands["task_body_quota_spend_command"]),
+        refresh_state_command=str(commands["refresh_state_command"]),
+        progress_refresh_state_command=str(commands["progress_refresh_state_command"]),
         material_queue_rule=resolved_material_rule,
         permission_rule=resolved_permission_rule,
         cli_bin=cli_bin,
         agent_scope_instruction=agent_scope_instruction,
-        expanded_prompt_command=expanded_prompt_command,
-        compact_prompt_command=compact_prompt_command,
-        brief_prompt_command=brief_prompt_command,
-        thin_prompt_command=thin_prompt_command,
+        expanded_prompt_command=str(commands["expanded_prompt_command"]),
+        compact_prompt_command=str(commands["compact_prompt_command"]),
+        brief_prompt_command=str(commands["brief_prompt_command"]),
+        thin_prompt_command=str(commands["thin_prompt_command"]),
+        **({"captured_context": True} if native_goal_host and effective_context_delivery == "on" else {}),
+        **(
+            {"antigravity_app": True}
+            if is_antigravity_app and not (traex_visible_goal or ark_managed_agent_goal or native_goal_host)
+            else {}
+        ),
+        **reward_memory_rule_kwargs,
     )
-    task_body = bind_exact_turn_settlement_task_body(
+    task_body = _finalize_heartbeat_task_body(
         task_body,
         turn_instance_id=normalized_turn_instance_id,
+        fine_grained=fine_grained,
+        native_goal_host=native_goal_host,
+        ark_managed_agent_goal=ark_managed_agent_goal,
+        traex_visible_goal=traex_visible_goal,
     )
-    if fine_grained:
-        task_body = f"{task_body}\n\n{FINE_GRAINED_TURN_RULE}"
-    if native_goal_host and len(task_body) > NATIVE_GOAL_HOST_MAX_CHARS:
-        host_limit = (
-            "Ark Managed Agent goal prompt"
-            if ark_managed_agent_goal
-            else "visible TraeX /goal task body"
-            if traex_visible_goal
-            else "visible Codex /goal task body"
-        )
-        raise ValueError(
-            f"generated {host_limit} exceeds the 4000-character host budget; "
-            "shorten agent scopes or project-specific prompt rules"
-        )
     payload = {
         "ok": True,
         "goal_id": goal_id,
@@ -411,6 +639,8 @@ def build_heartbeat_prompt(
         "agent_profile": agent_profile_prompt_projection(agent_profile),
         "registered_agents": normalized_registered_agents,
         "runtime_profile": runtime_profile,
+        **({"context_delivery": activation} if effective_context_delivery == "on" else {}),
+        "reward_memory_enabled": reward_memory_enabled,
         "scheduler_execution_context": scheduler_execution_context,
         **(
             {"visible_goal_host": visible_goal_host}
@@ -431,15 +661,15 @@ def build_heartbeat_prompt(
             if ark_managed_agent_goal
             else {}
         ),
-        "expanded_prompt_command": expanded_prompt_command,
-        "compact_prompt_command": compact_prompt_command,
-        "brief_prompt_command": brief_prompt_command,
-        "thin_prompt_command": thin_prompt_command,
-        "pr_review_pre_quota_command": pr_review_pre_quota_command or None,
-        "quota_guard_command": quota_guard_command,
-        "quota_spend_command": quota_spend_command,
-        "refresh_state_command": refresh_state_command,
-        "progress_refresh_state_command": progress_refresh_state_command,
+        "expanded_prompt_command": commands["expanded_prompt_command"],
+        "compact_prompt_command": commands["compact_prompt_command"],
+        "brief_prompt_command": commands["brief_prompt_command"],
+        "thin_prompt_command": commands["thin_prompt_command"],
+        "pr_review_pre_quota_command": commands["pr_review_pre_quota_command"],
+        "quota_guard_command": commands["quota_guard_command"],
+        "quota_spend_command": commands["quota_spend_command"],
+        "refresh_state_command": commands["refresh_state_command"],
+        "progress_refresh_state_command": commands["progress_refresh_state_command"],
         "cli_preflight": cli_preflight,
         "material_queue_rule": resolved_material_rule,
         "permission_rule": resolved_permission_rule,
@@ -447,6 +677,8 @@ def build_heartbeat_prompt(
             task_body=task_body,
             goal_id=goal_id,
             active_state=active_state_text,
+            registry_path=str(registry_path) if registry_path is not None else None,
+            runtime_root=runtime_root,
             full=full,
             compact=compact,
             brief=brief,
@@ -455,10 +687,27 @@ def build_heartbeat_prompt(
         ),
         "task_body": task_body,
     }
+    if runtime_root:
+        payload["runtime_root"] = str(Path(runtime_root).expanduser())
     if fine_grained:
         payload["turn_granularity"] = TURN_GRANULARITY_FINE
         payload["turn_mode"] = "fine_grained"
+    if registry_path:
+        from ..coordination.remote_authority_gateway import (
+            get_remote_authority_projection,
+            remote_authority_config,
+        )
+
+        if cfg := remote_authority_config(load_goal_from_registry(Path(registry_path), goal_id)):
+            payload["remote_authority"] = get_remote_authority_projection(goal_id, cfg)
     payload["agent_model"] = AgentRuntimeModel.PEER_V1.value
+    return _prune_prompt_metadata(payload, thin=thin, brief=brief)
+
+
+def _prune_prompt_metadata(
+    payload: dict[str, Any], *, thin: bool, brief: bool,
+) -> dict[str, Any]:
+    """Trim redundant transport metadata without changing the authored task body."""
     if thin:
         payload.pop("compact_prompt_command", None)
         payload.pop("brief_prompt_command", None)
@@ -476,6 +725,16 @@ def build_heartbeat_prompt(
         ):
             if not payload.get(key):
                 payload.pop(key, None)
+    elif brief:
+        # The brief task body already embeds its compact-detail command. Keep
+        # only the selected brief command as top-level regeneration metadata;
+        # repeating the other mode commands can exceed the registered output
+        # budget when the CLI/runtime paths are long.
+        payload.pop("expanded_prompt_command", None)
+        payload.pop("compact_prompt_command", None)
+        payload.pop("thin_prompt_command", None)
+        if payload.get("pr_review_pre_quota_command") is None:
+            payload.pop("pr_review_pre_quota_command", None)
     return payload
 def build_heartbeat_prompt_error_payload(
     *,
@@ -489,6 +748,8 @@ def build_heartbeat_prompt_error_payload(
     brief: bool = False,
     thin: bool = False,
     cli_bin: str = "loopx",
+    runtime_root: str | Path | None = None,
+    registry_path: str | Path | None = None,
     agent_id: str | None = None,
     agent_scopes: list[str] | tuple[str, ...] | None = None,
     registered_agents: list[str] | tuple[str, ...] | None = None,
@@ -516,10 +777,15 @@ def build_heartbeat_prompt_error_payload(
     capability_args = render_available_capability_args(
         projected_available_capabilities
     )
-    expanded_prompt_command = f"{cli_bin} heartbeat-prompt --full --goal-id {goal_id}{active_state_arg}{agent_args}{capability_args}"
-    compact_prompt_command = f"{cli_bin} heartbeat-prompt --compact --goal-id {goal_id}{active_state_arg}{agent_args}{capability_args}"
-    brief_prompt_command = f"{cli_bin} heartbeat-prompt --brief --goal-id {goal_id}{active_state_arg}{agent_args}{capability_args}"
-    thin_prompt_command = f"{cli_bin} heartbeat-prompt --thin --goal-id {goal_id}{active_state_arg}{agent_args}{capability_args}"
+    command_prefix = render_cli_command_prefix(
+        cli_bin=cli_bin,
+        runtime_root=runtime_root,
+        registry_path=registry_path,
+    )
+    expanded_prompt_command = f"{command_prefix} heartbeat-prompt --full --goal-id {goal_id}{active_state_arg}{agent_args}{capability_args}"
+    compact_prompt_command = f"{command_prefix} heartbeat-prompt --compact --goal-id {goal_id}{active_state_arg}{agent_args}{capability_args}"
+    brief_prompt_command = f"{command_prefix} heartbeat-prompt --brief --goal-id {goal_id}{active_state_arg}{agent_args}{capability_args}"
+    thin_prompt_command = f"{command_prefix} heartbeat-prompt --thin --goal-id {goal_id}{active_state_arg}{agent_args}{capability_args}"
     normalized_registered_agents = normalize_registered_agents(registered_agents)
     payload = {
         "ok": False,
@@ -550,5 +816,7 @@ def build_heartbeat_prompt_error_payload(
         "interface_budget": None,
         "task_body": None,
     }
+    if runtime_root:
+        payload["runtime_root"] = str(Path(runtime_root).expanduser())
     payload["agent_model"] = AgentRuntimeModel.PEER_V1.value
     return payload

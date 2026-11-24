@@ -25,6 +25,83 @@ def write_registry(root: Path) -> Path:
         "# Active Goal State\n\n## Agent Todo\n\n- [ ] Keep this todo during scope migration.\n",
         encoding="utf-8",
     )
+    # Keep the optional Reward Memory pointer usable during configure-goal
+    # preview.  The command validates an exact repo-relative config before it
+    # mutates the registry, so the fixture must provide the same public-safe
+    # config a connected Goal would read.
+    reward_fixture = json.loads(
+        (REPO_ROOT / "examples/fixtures/reward-memory-ingest-event.public.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    reward_config_path = root / "project/.loopx/config/reward-memory/experiment.json"
+    fake_provider = root / "fake-openviking"
+    fake_provider.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "state_path = Path(__file__).with_suffix('.state')\n"
+        "try: state = json.loads(state_path.read_text())\n"
+        "except (FileNotFoundError, json.JSONDecodeError): state = {}\n"
+        "if args == ['--version']: print('openviking 0.4.9.dev11')\n"
+        "elif args and args[0] == 'status': print(json.dumps({'status': 'healthy'}))\n"
+        "elif args and args[0] == 'read':\n"
+        "    target = args[1]; content = state.get(target)\n"
+        "    print(json.dumps({'uri': target, 'content': content})) if content is not None else sys.exit(1)\n"
+        "elif args and args[0] in {'tree', 'ls'}:\n"
+        "    prefix = args[1].rstrip('/') if len(args) > 1 else ''\n"
+        "    print(json.dumps({'resources': [{'uri': key} for key in state if key == prefix or key.startswith(prefix + '/')] }))\n"
+        "elif args and args[0] == 'mkdir': print(json.dumps({'result': 'ok'}))\n"
+        "elif args and args[0] == 'add-resource':\n"
+        "    target = args[args.index('--to') + 1]; state[target] = Path(args[1]).read_text(); state_path.write_text(json.dumps(state)); print(json.dumps({'result': 'ok'}))\n"
+        "else: sys.exit(2)\n",
+        encoding="utf-8",
+    )
+    fake_provider.chmod(0o755)
+    reward_binding = dict(reward_fixture["provider_binding"])
+    reward_binding["provider_binary"] = str(fake_provider)
+    reward_corpus_id = reward_fixture["corpus"]["corpus_id"]
+    reward_config = {
+        "schema_version": "reward_memory_experiment_config_v1",
+        "project_provider_binding": {
+            key: value
+            for key, value in reward_binding.items()
+            if key not in {"corpus_id", "scope_ref"}
+        }
+        | {
+            "corpus_scopes": [
+                {"corpus_id": reward_corpus_id, "scope_ref": reward_binding["scope_ref"]}
+            ]
+        },
+        "corpora": [
+            {
+                "corpus": reward_fixture["corpus"],
+                "standing_policy": reward_fixture["standing_policy"],
+            }
+        ],
+        "surfaces": [
+            {
+                "surface_id": "issue_fix.patch_planning",
+                "adapter": reward_fixture["adapter"],
+                "corpus_ids": [reward_corpus_id],
+                "ingest_corpus_id": reward_corpus_id,
+                "recall_profile": {
+                    "profile_id": "configure_goal_fixture_v1",
+                    "mode": "function_boundary",
+                    "max_queries": 1,
+                    "limit": 3,
+                },
+            }
+        ],
+        "automation": {
+            "automatic_recall": False,
+            "automatic_ingest": False,
+            "fail_open": True,
+        },
+    }
+    reward_config_path.parent.mkdir(parents=True, exist_ok=True)
+    reward_config_path.write_text(json.dumps(reward_config), encoding="utf-8")
     registry_path = root / "registry.json"
     registry_path.write_text(
         json.dumps(
@@ -58,6 +135,8 @@ def write_registry(root: Path) -> Path:
         + "\n",
         encoding="utf-8",
     )
+    from loopx.control_plane.testing.canary_harness import import_fixture_authority
+    import_fixture_authority(registry_path, "configure-goal-fixture", provider="sqlite")
     return registry_path
 
 
@@ -91,7 +170,9 @@ def goal_from_registry(registry_path: Path) -> dict:
 
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="loopx-configure-goal-smoke-") as tmp:
-        root = Path(tmp)
+        # Canonical import binds the physical project path, including when the
+        # temporary directory is reached through a filesystem alias.
+        root = Path(tmp).resolve()
         registry_path = write_registry(root)
         original = registry_path.read_text(encoding="utf-8")
         agent_profile = {
@@ -190,16 +271,20 @@ def main() -> int:
             "enabled": True,
             "config_pointer_registered": True,
             "agent_scoped_count": 0,
+            "agent_scoped_bound_count": 0,
         }, dry
         assert dry["after"]["lark_kanban_heartbeat_sync"] == {
             "enabled": True,
         }, dry
-        assert dry["after"]["reward_memory"] == {
-            "enabled": True,
-            "experimental": True,
-            "config_pointer_registered": True,
-            "enabled_agents": ["codex-side-bypass"],
-        }, dry
+        # The projection now includes binding/automation metadata in addition
+        # to the stable enablement fields.  Keep this smoke focused on the
+        # public contract rather than freezing provider details.
+        assert dry["after"]["reward_memory"]["enabled"] is True, dry
+        assert dry["after"]["reward_memory"]["experimental"] is True, dry
+        assert dry["after"]["reward_memory"]["config_pointer_registered"] is True, dry
+        assert dry["after"]["reward_memory"]["enabled_agents"] == [
+            "codex-side-bypass"
+        ], dry
         assert dry["feature_summary"]["multi_subagent"] == "enabled", dry
         catalog = dry["configuration_catalog"]
         assert catalog["schema_version"] == "loopx_goal_configuration_catalog_v0", catalog
@@ -207,16 +292,83 @@ def main() -> int:
         assert catalog["disclosure_policy"]["first_run_configuration_required"] is False
         features = {item["feature_id"]: item for item in catalog["features"]}
         assert set(features) == {
+            "goal_capability_organization",
+            "todo_replan_cadence",
+            "local_authority_shadow",
+            "coordination_runtime_shadow",
             "multi_subagent",
             "peer_task_coordination",
-            "explore_graph",
+            "progress_review",
             "explore_harness",
             "change_quality_qualification",
             "reward_memory",
             "lark_event_inbox",
             "lark_kanban_heartbeat_sync",
+            "pull_request_review",
+            "periodic_report",
+            "content_ops",
+            "decision_context",
         }
+        references = features["content_ops"]
+        assert references["availability"] == "local_artifact_preview", references
+        assert "default" not in references and "current" not in references, references
+        decision_context = features["decision_context"]
+        assert decision_context["availability"] == "local_artifact_preview", decision_context
+        assert "default" not in decision_context and "current" not in decision_context, decision_context
+        improvement = features["goal_capability_organization"]
+        assert improvement["default"] == {
+            "mode": "off", "discovery_budget_minutes": 5, "max_trials": 1,
+        }, improvement
+        assert "current" not in improvement, improvement
+        assert features["pull_request_review"]["availability"] == "supported"
+        assert features["progress_review"]["availability"] == "supported_opt_in"
+        assert features["progress_review"]["default"]["mode"] == "off"
+        assert features["pull_request_review"]["default"] == {
+            "wait_for_ci": True,
+            "review_order": "forward",
+        }
+        assert features["todo_replan_cadence"]["availability"] == "supported_explicit_override"
+        assert features["todo_replan_cadence"]["default"] == {
+            "count_unit": "effective_turns",
+            "count": 6,
+            "planning_horizon_goal": True,
+            "yardstick_enabled": False,
+        }
+        # Goal-scoped cadence is omitted when no explicit override is present;
+        # the machine default remains discoverable through the default field.
+        assert "current" not in features["todo_replan_cadence"], features[
+            "todo_replan_cadence"
+        ]
+        replan_commands = features["todo_replan_cadence"]["commands"]
+        assert "--execution-replan-after-turns 6" in replan_commands["preview_enable"]
+        assert "--execute" not in replan_commands["preview_enable"]
+        assert "--execute" in replan_commands["apply_enable"]
+        assert "--clear-execution-replan-after-todos" in replan_commands["preview_disable"]
+        assert "--clear-execution-replan-after-turns" in replan_commands["preview_disable"]
+        # Evidence-conditioned stride is always on; no reset flag exists for it.
+        assert "stride" not in replan_commands["preview_disable"]
+        assert "--execute" not in replan_commands["preview_disable"]
+        assert "--execute" in replan_commands["apply_disable"]
+        assert features["local_authority_shadow"]["availability"] == "retired"
+        assert features["local_authority_shadow"]["default"] == {"enabled": False}
+        assert features["local_authority_shadow"]["current"] == {
+            "enabled": False,
+            "mode": None,
+            "status": "disabled",
+        }
+        assert "preview_enable" not in features["local_authority_shadow"]["commands"]
+        assert "apply_enable" not in features["local_authority_shadow"]["commands"]
+        assert features["periodic_report"]["availability"] == "supported_explicit_override"
+        assert features["periodic_report"]["default"] == {"enabled": False, "timezone": "UTC"}
+        # A Goal without an explicit override follows the machine default, so the
+        # catalog reports no Goal-scoped current value instead of a synthetic one.
+        assert "current" not in features["periodic_report"], features["periodic_report"]
+        assert set(features["periodic_report"]["commands"]) == {"verify"}
         assert features["multi_subagent"]["current"]["enabled"] is True
+        assert features["multi_subagent"]["required_inputs"] == {}
+        assert "--allowed-domain" not in features["multi_subagent"]["commands"][
+            "preview_enable"
+        ]
         assert features["peer_task_coordination"]["current"] == {
             "enabled": False,
             "coordinator_agent_id": None,
@@ -224,19 +376,17 @@ def main() -> int:
         assert "--peer-task-coordinator" in features[
             "peer_task_coordination"
         ]["commands"]["preview_enable"]
-        assert features["explore_graph"]["current"]["enabled"] is False
-        assert features["change_quality_qualification"]["current"] == {
-            "enabled": False,
-            "safe_fix": False,
-            "strict_receipt": False,
-        }
+        assert "explore_graph" not in features  # Explore owns one configuration surface
+        assert "current" not in features["change_quality_qualification"], features[
+            "change_quality_qualification"
+        ]
         assert "--change-quality-enabled" in features[
             "change_quality_qualification"
         ]["commands"]["preview_enable"]
         assert "--execute" not in features["explore_harness"]["commands"]["preview_enable"]
         assert "--execute" in features["explore_harness"]["commands"]["apply_enable"]
-        assert "--execute" not in features["explore_graph"]["commands"]["preview_disable"]
-        assert "--execute" in features["explore_graph"]["commands"]["apply_disable"]
+        assert "--execute" not in features["explore_harness"]["commands"]["preview_disable"]
+        assert "--execute" in features["explore_harness"]["commands"]["apply_disable"]
         assert features["lark_event_inbox"]["current"]["enabled"] is True
         assert "--execute" not in features["lark_event_inbox"]["commands"]["preview_enable"]
         assert "--execute" in features["lark_event_inbox"]["commands"]["apply_enable"]
@@ -347,12 +497,15 @@ def main() -> int:
         assert goal["control_plane"]["lark_kanban"] == {
             "heartbeat_sync_enabled": True,
         }, goal
-        assert goal["control_plane"]["reward_memory"] == {
-            "enabled": True,
-            "experimental": True,
-            "config_path": ".loopx/config/reward-memory/experiment.json",
-            "enabled_agents": ["codex-side-bypass"],
-        }, goal
+        reward_memory_control_plane = goal["control_plane"]["reward_memory"]
+        assert reward_memory_control_plane["enabled"] is True, goal
+        assert reward_memory_control_plane["experimental"] is True, goal
+        assert reward_memory_control_plane["config_path"] == (
+            ".loopx/config/reward-memory/experiment.json"
+        ), goal
+        assert reward_memory_control_plane["enabled_agents"] == [
+            "codex-side-bypass"
+        ], goal
         boundary = goal_boundary(goal, registry_path=registry_path)
         assert boundary["capabilities"]["issue_fix_reviewer_notification"] == {
             "enabled": True,
@@ -365,6 +518,16 @@ def main() -> int:
                 f"loopx --registry {registry_path} lark-inbox drain "
                 "--goal-id configure-goal-fixture"
             ),
+            "binding": {
+                "schema_version": "operator_inbox_binding_v0",
+                "status": "unbound",
+                "digest_recorded": False,
+                "config_available": False,
+                "binding_verified": False,
+                "attention_required": False,
+                "private_config_returned": False,
+                "config_digest_returned": False,
+            },
             "urgency": {
                 "schema_version": "lark_event_inbox_urgency_v0",
                 "enabled": True,
@@ -387,6 +550,8 @@ def main() -> int:
                 registry_path,
                 "quota",
                 "should-run",
+                "--context-delivery",
+                "off",
                 "--goal-id",
                 GOAL_ID,
                 "--agent-id",
@@ -774,6 +939,8 @@ def main() -> int:
                 registry_path,
                 "quota",
                 "should-run",
+                "--context-delivery",
+                "off",
                 "--goal-id",
                 GOAL_ID,
             )

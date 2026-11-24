@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { reconcileClientPackage } from './dsh-sdk-client-registry.mjs'
 import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
@@ -15,6 +16,7 @@ const rows = [
   ['loopx-goalbar', packageId],
   ['loopx-init-command', `${packageId}/init-command`],
   ['loopx-driver', `${packageId}/driver`],
+  ['loopx-shadow-observer', `${packageId}/observer`],
 ]
 const packedStaticEntries = new Set([
   'package/LICENSE',
@@ -25,8 +27,12 @@ const packedStaticEntries = new Set([
   'package/lib/driver.js',
   'package/lib/index.js',
   'package/lib/init-command.js',
+  'package/lib/native-operation-context.js',
+  'package/lib/native-operation.js',
+  'package/lib/observer.js',
   'package/lib/types/cli.d.ts',
   'package/lib/types/client/LoopXGoalBar.d.ts',
+  'package/lib/types/client/dashboard.d.ts',
   'package/lib/types/client/index.d.ts',
   'package/lib/types/client/locale.d.ts',
   'package/lib/types/client/rpc.d.ts',
@@ -34,15 +40,20 @@ const packedStaticEntries = new Set([
   'package/lib/types/driver.d.ts',
   'package/lib/types/goalbar/connection-rpc.d.ts',
   'package/lib/types/goalbar/events.d.ts',
+  'package/lib/types/goalbar/project-registry-wire.d.ts',
   'package/lib/types/goalbar/protocol.d.ts',
   'package/lib/types/goalbar/read-model.d.ts',
   'package/lib/types/goalbar/service.d.ts',
   'package/lib/types/index.d.ts',
   'package/lib/types/init-command.d.ts',
+  'package/lib/types/managed-runtime.d.ts',
+  'package/lib/types/native-operation-context.d.ts',
+  'package/lib/types/native-operation.d.ts',
+  'package/lib/types/observer.d.ts',
   'package/package.json',
 ])
 const packedHashedEntries = [
-  ['CLI chunk', /^package\/lib\/cli-[A-Za-z0-9_-]{8}\.js$/u],
+  ['managed runtime chunk', /^package\/lib\/managed-runtime-[A-Za-z0-9_-]{8}\.js$/u],
   ['Driver chunk', /^package\/lib\/driver-[A-Za-z0-9_-]{8}\.js$/u],
 ]
 
@@ -132,21 +143,40 @@ async function assertClientDiscovery(installed, manifest) {
   const registry = Object.create(ClientModuleRegistry.prototype)
   registry.pkgMeta = new Map()
   registry.table = new Map()
-  registry.resolvePkgJson = specifier => installedRequire.resolve(`${specifier}/package.json`)
+  registry.sources = new Map()
+  registry.dirty = new Set()
+  registry.initialRevisionNonce = 'profile-smoke-nonce'
+  registry.nextInitialRevision = 0
+  const baseUrl = pathToFileURL(join(installed, 'package.json')).href
+  // 0.1.5 resolves the mounted row through the Loader's own `internal`
+  // resolver and reads the base URL from the entry's tree context.
   registry.ctx = {
+    logger: { warn() {} },
     loader: {
+      internal: {
+        version: 'v1',
+        resolveSync: specifier => ({
+          url: pathToFileURL(installedRequire.resolve(`${specifier}/package.json`)).href,
+        }),
+      },
       entries: () => [{
         options: { name: packageId },
+        parent: { tree: { ctx: { baseUrl } } },
         fiber: {},
         disabled: false,
       }],
     },
   }
-  const meta = registry.resolveMeta(packageId)
-  assert.equal(meta.clientPath, join(installed, 'lib', 'client.js'))
-  assert.deepEqual(meta.inject, manifest.dsh.client.inject)
-  assert.equal(registry.processOne(packageId), true)
-  assert.match(registry.table.get(packageId)?.entry.rev ?? '', /^[0-9a-f]{12}$/u)
+  // 0.1.5 returns the located manifest beside the parsed client declaration,
+  // and the initial row revision is an opaque allocation rather than a hash.
+  const resolved = registry.resolveMeta(packageId, baseUrl)
+  assert.equal(resolved.meta.clientPath, join(installed, 'lib', 'client.js'))
+  assert.deepEqual(resolved.meta.inject, manifest.dsh.client.inject)
+  assert.equal(reconcileClientPackage(registry, packageId, error => { throw error }), true)
+  const entry = registry.table.get(packageId)?.entry
+  assert.equal(typeof entry?.rev, 'string')
+  assert(entry.rev.length > 0, 'DSH omitted the client revision')
+  assert.equal(new URL(entry.url, 'http://localhost').searchParams.get('rev'), entry.rev)
   const client = await readFile(join(installed, 'lib', 'client.js'), 'utf8')
   assert(client.startsWith('window.__ModuleLoader__.load({'))
   assert(client.includes('id: "dsh-loopx-plugin"'))
@@ -160,11 +190,68 @@ async function exerciseInstalled(installed) {
     import(pathToFileURL(requireFromPlugin.resolve('dsh-loopx-plugin/driver')).href),
   ])
   assert.equal(hostModule.name, packageId)
-  assert.deepEqual(hostModule.inject, ['agents', 'connection'])
+  assert.deepEqual(hostModule.inject, ['agents', 'connection', 'loopxBootstrap'])
   assert.equal(typeof hostModule.createGoalBarService, 'function')
   const commands = new Map()
-  initModule.apply({ commands: { register: definition => commands.set(definition.name, definition) } })
+  const services = new Map()
+  const initCalls = []
+  const initWarnings = []
+  await initModule.apply({
+    commands: { register: definition => commands.set(definition.name, definition) },
+    logger: { warn: message => initWarnings.push(message) },
+    reflect: {
+      provide(name, value) {
+        services.set(name, value)
+        return () => services.delete(name)
+      },
+    },
+  }, {
+    skillsDir: join(installed, '.fixture-skills'),
+    runner: async (_file, args, options) => {
+      initCalls.push([...args])
+      if (options.signal?.aborted) {
+        throw new hostModule.LoopXCliError('aborted', 'cancelled', false)
+      }
+      if (args.at(-1) === '--version') {
+        return { exitCode: 0, stdout: 'loopx 2.4.0\n', stderr: '' }
+      }
+      if (args.includes('--install')) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            ok: true,
+            schema_version: 'loopx_workflow_skill_install_v0',
+            operation: 'install',
+            host_surface: 'deepseek-harness-native',
+            installed: Object.fromEntries([
+              'loopx-project',
+              'loopx-pr-program',
+              'loopx-pr-review',
+              'loopx-doc-registry',
+              'loopx-self-repair',
+            ].map(name => [name, 'unchanged'])),
+            entry: { status: 'unchanged' },
+          }),
+          stderr: '',
+        }
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          ok: true,
+          schema_version: 'loopx_workflow_skill_install_v0',
+          operation: 'inspect',
+          host_surface: 'deepseek-harness-native',
+          install_required: false,
+        }),
+        stderr: '',
+      }
+    },
+  })
   assert.deepEqual([...commands.keys()], ['loopx-init'])
+  assert.deepEqual(services.get('loopxBootstrap'), { state: 'ready' })
+  assert.equal(initWarnings.length, 0)
+  assert.equal(initCalls.filter(args => args.includes('--install')).length, 1)
   const command = commands.get('loopx-init')
   assert.equal(command.recordInput, false)
   const followups = []
@@ -191,7 +278,7 @@ async function exerciseInstalled(installed) {
   assert.equal(followups.length, 1)
   assert.equal(followups[0].role, 'user')
   assert.deepEqual(followups[0].source, {
-    kind: 'plugin',
+    kind: 'loopx-initialization',
     plugin: 'dsh-loopx-plugin/init-command',
   })
   assert.notDeepEqual(followups[0].source, {
@@ -199,7 +286,7 @@ async function exerciseInstalled(installed) {
     plugin: 'dsh-loopx-plugin/driver',
   })
   assert.equal(typeof driverModule.LoopXContinuationDriver, 'function')
-  assert.equal(driverModule.inject.join(','), 'agents')
+  assert.equal(driverModule.inject.join(','), 'agents,loopxBootstrap')
 
   const runnerCalls = []
   const timerCalls = []
@@ -208,13 +295,13 @@ async function exerciseInstalled(installed) {
   const session = {
     id: 'inactive-session',
     header: { id: 'inactive-session', cwd: installed },
-    events: [],
+    snapshotEvents: () => [],
   }
   const inactiveAgent = {
     id: 'inactive-session',
     status: 'idle',
     session,
-    inbox: { hasPending: false },
+    inbox: { nextTurn: [], nextStep: [] },
     followup(message) {
       followupMessages.push(message)
     },

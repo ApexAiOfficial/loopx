@@ -4,13 +4,29 @@ on:
   pull_request:
     paths:
       - ".github/workflows/package-smoke.yml"
+      - "packages/loopx-core/**"
+      - "loopx/**"
+      - "tests/test_core_distribution.py"
+      - "tests/control_plane/test_installed_core_context.py"
       - "packages/loopx-repo-health/**"
+      - "packages/loopx-obelisk/**"
+      - "packages/loopx-codex-provider-routing/**"
+      - "loopx/capabilities/decision_context/extension_provider.py"
+      - "loopx/extensions/runtime.py"
   push:
     branches:
       - main
     paths:
       - ".github/workflows/package-smoke.yml"
+      - "packages/loopx-core/**"
+      - "loopx/**"
+      - "tests/test_core_distribution.py"
+      - "tests/control_plane/test_installed_core_context.py"
       - "packages/loopx-repo-health/**"
+      - "packages/loopx-obelisk/**"
+      - "packages/loopx-codex-provider-routing/**"
+      - "loopx/capabilities/decision_context/extension_provider.py"
+      - "loopx/extensions/runtime.py"
 
 permissions:
   contents: read
@@ -20,6 +36,81 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  core:
+    name: loopx-core
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - uses: astral-sh/setup-uv@v7
+      - name: Prepare source validation environment
+        run: uv sync --extra test
+      - name: Build and separately install the standalone core
+        run: |
+          uv run --extra test python packages/loopx-core/prepare.py --output "$RUNNER_TEMP/core-source"
+          uv build "$RUNNER_TEMP/core-source" --out-dir "$RUNNER_TEMP/core-dist"
+          uv venv "$RUNNER_TEMP/core-env" --python .venv/bin/python
+          uv pip install --python "$RUNNER_TEMP/core-env/bin/python" "$RUNNER_TEMP"/core-dist/loopx_core-*.whl
+          echo "LOOPX_CORE_TEST_PYTHON=$RUNNER_TEMP/core-env/bin/python" >> "$GITHUB_ENV"
+      - name: Qualify installed execution, context, recovery, replay and refusal
+        env:
+          LOOPX_USAGE_PING: "0"
+        run: >-
+          uv run --extra test python -m pytest -q
+          tests/test_core_distribution.py
+          tests/control_plane/test_installed_core_context.py
+
+  codex-provider-routing:
+    name: loopx-codex-provider-routing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install provider and schema validator
+        run: python -m pip install packages/loopx-codex-provider-routing "jsonschema==4.26.0"
+      - name: Validate recovery and existing operator contracts
+        run: |
+          python -m compileall -q packages/loopx-codex-provider-routing/src
+          python packages/loopx-codex-provider-routing/smoke/native_host_smoke.py
+          python packages/loopx-codex-provider-routing/smoke/native_host_clients_smoke.py
+          python packages/loopx-codex-provider-routing/smoke/codex_provider_routing_smoke.py
+          python packages/loopx-codex-provider-routing/smoke/recovery_contracts_smoke.py
+          python packages/loopx-codex-provider-routing/smoke/operator_smoke.py
+      - name: Validate installed entrypoint and example schemas
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          from jsonschema import validate
+          import tomllib
+          from importlib.metadata import version
+          from importlib.resources import files
+          import loopx_codex_provider_routing as provider
+          root = Path("packages/loopx-codex-provider-routing")
+          release = version("loopx-codex-provider-routing")
+          assert provider.__version__ == release
+          for manifest in (root / "extension.toml", files(provider) / "native-extension.toml"):
+              assert tomllib.loads(manifest.read_text(encoding="utf-8"))["version"] == release, manifest
+          request_schema = json.loads((root / "schemas/request.schema.json").read_text())
+          response_schema = json.loads((root / "schemas/response.schema.json").read_text())
+          for example in sorted((root / "examples").glob("*.json")):
+              request = json.loads(example.read_text())
+              validate(request, request_schema)
+              result = subprocess.run(["loopx-codex-provider-routing"], input=json.dumps(request), text=True, capture_output=True, check=True)
+              response = json.loads(result.stdout)
+              validate(response, response_schema)
+              assert response["ok"], example.name
+          PY
+
   repo-health:
     name: loopx-repo-health
     runs-on: ubuntu-latest
@@ -42,3 +133,29 @@ jobs:
         run: >-
           python
           packages/loopx-repo-health/smoke/repo_health_snapshot_smoke.py
+
+  obelisk:
+    name: loopx-obelisk
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install contract validator
+        run: python -m pip install --disable-pip-version-check "jsonschema==4.26.0"
+
+      - name: Compile package modules
+        run: >-
+          python -m py_compile
+          packages/loopx-obelisk/src/loopx_obelisk/*.py
+
+      - name: Run offline contract smoke
+        run: >-
+          python
+          packages/loopx-obelisk/smoke/obelisk_provider_smoke.py

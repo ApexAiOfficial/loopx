@@ -3,20 +3,16 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from ..goals.active_state_metadata import todo_role_for_heading
 from .contract import (
     TODO_STATUS_DONE,
     TODO_STATUS_OPEN,
-    TODO_TASK_PATTERN,
     build_todo_id,
     normalize_todo_status,
-    parse_todo_metadata_line,
     todo_done_for_status,
     todo_marker_for_status,
-    todo_status_from_marker,
 )
-from .text import normalize_new_todo
-from .todo_summary import normalize_todo_text
+from .machine_region import find_todo_source_regions, visible_markdown_lines
+from .todo_block_codec import decode_todo_blocks
 
 
 TODO_SECTION_HEADINGS = {
@@ -27,19 +23,8 @@ COMPLETED_WORK_ARCHIVE_HEADING = "Completed Work Archive"
 
 
 def section_bounds(lines: list[str], role: str) -> tuple[int, int, str] | None:
-    for index, line in enumerate(lines):
-        if not line.startswith("## "):
-            continue
-        heading = line.lstrip("#").strip()
-        if todo_role_for_heading(heading) != role:
-            continue
-        end = len(lines)
-        for next_index in range(index + 1, len(lines)):
-            if lines[next_index].startswith("## "):
-                end = next_index
-                break
-        return index, end, heading
-    return None
+    region = next((region for region in find_todo_source_regions(lines) if region.role == role), None)
+    return (region.start, region.body_end, region.heading) if region else None
 
 
 def find_todo_block(
@@ -68,21 +53,6 @@ def find_todo_block(
     return None
 
 
-def todo_metadata_would_change(
-    lines: list[str],
-    block: dict[str, Any],
-    metadata_line: str | None,
-) -> bool:
-    if not metadata_line:
-        return False
-    start = int(block["start"])
-    end = int(block["end"])
-    for index in range(start + 1, end):
-        if parse_todo_metadata_line(lines[index]) is not None:
-            return lines[index] != metadata_line
-    return True
-
-
 def set_todo_marker(lines: list[str], block: dict[str, Any], status: str) -> bool:
     marker = todo_marker_for_status(status)
     index = int(block["start"])
@@ -98,39 +68,10 @@ def set_todo_marker(lines: list[str], block: dict[str, Any], status: str) -> boo
     return True
 
 
-def set_todo_text(
-    lines: list[str],
-    block: dict[str, Any],
-    text: str,
-    *,
-    status: str,
-) -> bool:
-    normalized = normalize_new_todo(text)
-    if normalize_todo_text(str(block.get("text") or "")) == normalized:
-        return False
-
-    start = int(block["start"])
-    end = int(block["end"])
-    marker = todo_marker_for_status(status)
-    replacement = f"- [{marker}] {normalized}"
-    continuation_indexes = [
-        index
-        for index in range(start + 1, end)
-        if lines[index].startswith((" ", "\t"))
-        and parse_todo_metadata_line(lines[index]) is None
-    ]
-    lines[start] = replacement
-    for index in reversed(continuation_indexes):
-        del lines[index]
-    block["text"] = normalized
-    block["end"] = end - len(continuation_indexes)
-    return True
-
-
 def heading_index(lines: list[str], heading: str) -> int | None:
     needle = f"## {heading}"
-    for index, line in enumerate(lines):
-        if line.strip() == needle:
+    for index in sorted(visible_markdown_lines(lines)):
+        if lines[index].strip() == needle:
             return index
     return None
 
@@ -168,15 +109,8 @@ def insert_new_section(lines: list[str], role: str, todo_line: str) -> None:
 
 
 def archive_section_bounds(lines: list[str]) -> tuple[int, int] | None:
-    start = heading_index(lines, COMPLETED_WORK_ARCHIVE_HEADING)
-    if start is None:
-        return None
-    end = len(lines)
-    for next_index in range(start + 1, len(lines)):
-        if lines[next_index].startswith("## "):
-            end = next_index
-            break
-    return start, end
+    region = next((region for region in find_todo_source_regions(lines) if region.role == "archive"), None)
+    return (region.start, region.body_end) if region else None
 
 
 def ensure_archive_section(lines: list[str]) -> tuple[int, int]:
@@ -220,42 +154,9 @@ def todo_blocks(
     role: str | None = None,
     source_section: str | None = None,
 ) -> list[dict[str, Any]]:
-    blocks: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    todo_index = 0
-    for index in range(start + 1, end):
-        match = TODO_TASK_PATTERN.match(lines[index])
-        if match:
-            if current is not None:
-                current["end"] = index
-                ensure_block_identity(current, role=role, source_section=source_section)
-                blocks.append(current)
-            marker, text = match.groups()
-            todo_index += 1
-            status = todo_status_from_marker(marker)
-            current = {
-                "start": index,
-                "end": end,
-                "index": todo_index,
-                "done": todo_done_for_status(status),
-                "status": status,
-                "text": normalize_todo_text(text),
-            }
-            continue
-        if current is not None and lines[index].startswith((" ", "\t")):
-            metadata = parse_todo_metadata_line(lines[index])
-            if metadata:
-                current.update(metadata)
-                continue
-            continuation = lines[index].strip()
-            if continuation:
-                current["text"] = normalize_todo_text(
-                    f"{current.get('text', '')} {continuation}"
-                )
-    if current is not None:
-        current["end"] = end
-        ensure_block_identity(current, role=role, source_section=source_section)
-        blocks.append(current)
+    blocks = decode_todo_blocks(lines, start, end, visible=visible_markdown_lines(lines))
+    for block in blocks:
+        ensure_block_identity(block, role=role, source_section=source_section)
     return blocks
 
 

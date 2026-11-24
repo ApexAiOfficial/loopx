@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import subprocess
 from pathlib import Path
@@ -17,6 +18,14 @@ from loopx.goal_mode_mcp import (
     create_fastmcp_server,
 )
 from loopx.control_plane.effect_program import SettlementIdentity
+from loopx.control_plane.goals.first_party_host_admission import (
+    FirstPartyHostRuntimeRejected,
+)
+from loopx.control_plane.goals.source_session_registry_state import guard_path
+from loopx.control_plane.projects.registry_codec import (
+    source_session_registry_transaction,
+)
+from loopx.file_lock import exclusive_cross_runtime_file_lock
 from loopx.kunluncode_goal_mode import cli
 from loopx.kunluncode_goal_mode.app_server import (
     NATIVE_GOAL_MODES,
@@ -42,6 +51,7 @@ from loopx.kunluncode_goal_mode.runtime import (
     build_native_goal_objective,
     read_runtime_state,
     run_native_goal,
+    runtime_state_path,
     write_runtime_state,
 )
 
@@ -70,6 +80,29 @@ def _registry(project: Path) -> Path:
     return path
 
 
+@pytest.fixture
+def mock_goal_cli(monkeypatch):
+    """Keep CLI test doubles out of the real Effect runtime subprocess path."""
+
+    def install(runner):
+        monkeypatch.setattr(goal_mode_mcp, "subprocess", SimpleNamespace(run=runner))
+
+    return install
+
+
+def test_goal_cli_mock_preserves_real_node_probe(mock_goal_cli):
+    from loopx.control_plane import effect_runtime
+
+    def fake_cli(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, "not-json", "")
+
+    mock_goal_cli(fake_cli)
+    probe = effect_runtime._probe_node()
+    assert probe.ready
+    assert probe.executable is not None
+    assert probe.version is not None
+
+
 def test_claude_and_kunluncode_bind_distinct_agents(tmp_path: Path) -> None:
     _registry(tmp_path)
     claude_dir = tmp_path / ".claude"
@@ -96,7 +129,7 @@ def test_kunluncode_binding_fails_closed_for_unregistered_agent(tmp_path: Path) 
 
 
 def test_mcp_uses_kunluncode_profile_and_rejects_agent_impersonation(
-    monkeypatch: pytest.MonkeyPatch,
+    mock_goal_cli,
 ) -> None:
     control = GoalModeMCPControlPlane(
         GoalModeMCPConfig(
@@ -146,6 +179,12 @@ def test_mcp_uses_kunluncode_profile_and_rejects_agent_impersonation(
                         ),
                         "settlement_identity": identity.as_dict(),
                         "settlement_result": {"failure": None},
+                        "settlement_progress": {
+                            "schema_version": "quota_settlement_progress_v0",
+                            "state": "settled",
+                            "next_step": None,
+                            "quota_spend_source": "heartbeat",
+                        },
                     }
                 )
             else:
@@ -155,11 +194,17 @@ def test_mcp_uses_kunluncode_profile_and_rejects_agent_impersonation(
                         "appended": True,
                         "settlement_identity": identity.as_dict(),
                         "settlement_result": {"failure": None},
+                        "settlement_progress": {
+                            "schema_version": "quota_settlement_progress_v0",
+                            "state": "settled",
+                            "next_step": None,
+                            "quota_spend_source": "heartbeat",
+                        },
                     }
                 )
         return subprocess.CompletedProcess(command, 0, payload, "")
 
-    monkeypatch.setattr(goal_mode_mcp.subprocess, "run", capture)
+    mock_goal_cli(capture)
 
     assert json.loads(control.claim_task("todo-1", "cc"))["ok"] is False
     assert commands == []
@@ -176,8 +221,7 @@ def test_mcp_uses_kunluncode_profile_and_rejects_agent_impersonation(
         "todo_333333333333",
         "kunlun",
         "focused check passed",
-        task_lease_idempotency_key="lease-fixture",
-        task_lease_expected_version=7,
+        claim_operation_id="claim-fixture",
         no_follow_up=True,
     )
     completed = json.loads(output)
@@ -188,21 +232,22 @@ def test_mcp_uses_kunluncode_profile_and_rejects_agent_impersonation(
     terminal_closeout = settlement_commands[-1]
     assert "--no-follow-up" not in first_completion
     assert "--no-follow-up" in terminal_closeout
-    assert "--task-lease-idempotency-key" in first_completion
-    assert "--task-lease-idempotency-key" in terminal_closeout
+    assert "--claim-operation-id" in first_completion
+    assert "--claim-operation-id" in terminal_closeout
     assert completed["settlement"]["terminal_closeout"][
         "completion_continuation"
     ] == "no_followup"
-    for lease_command in (first_completion, terminal_closeout):
-        version_at = lease_command.index("--task-lease-expected-version")
-        assert lease_command[version_at : version_at + 2] == [
-            "--task-lease-expected-version",
-            "7",
+    for completion in (first_completion, terminal_closeout):
+        reference_at = completion.index("--claim-operation-id")
+        assert completion[reference_at : reference_at + 2] == [
+            "--claim-operation-id", "claim-fixture",
         ]
+        assert not any("task-lease" in part for part in completion)
+
 
 
 def test_fastmcp_complete_task_forwards_complete_task_lease_fence(
-    monkeypatch: pytest.MonkeyPatch,
+    mock_goal_cli,
 ) -> None:
     server, control = create_fastmcp_server(
         GoalModeMCPConfig(
@@ -248,6 +293,12 @@ def test_fastmcp_complete_task_forwards_complete_task_lease_fence(
                         "completion_continuation": "active_goal",
                         "settlement_identity": identity.as_dict(),
                         "settlement_result": {"failure": None},
+                        "settlement_progress": {
+                            "schema_version": "quota_settlement_progress_v0",
+                            "state": "settled",
+                            "next_step": None,
+                            "quota_spend_source": "heartbeat",
+                        },
                     }
                 )
             else:
@@ -257,11 +308,17 @@ def test_fastmcp_complete_task_forwards_complete_task_lease_fence(
                         "appended": True,
                         "settlement_identity": identity.as_dict(),
                         "settlement_result": {"failure": None},
+                        "settlement_progress": {
+                            "schema_version": "quota_settlement_progress_v0",
+                            "state": "settled",
+                            "next_step": None,
+                            "quota_spend_source": "heartbeat",
+                        },
                     }
                 )
         return subprocess.CompletedProcess(command, 0, payload, "")
 
-    monkeypatch.setattr(goal_mode_mcp.subprocess, "run", capture)
+    mock_goal_cli(capture)
 
     result = asyncio.run(
         server.call_tool(
@@ -270,8 +327,7 @@ def test_fastmcp_complete_task_forwards_complete_task_lease_fence(
                 "todo_id": "todo_777777777777",
                 "agent_id": "claude",
                 "evidence": "focused check passed",
-                "task_lease_idempotency_key": "lease-fixture",
-                "task_lease_expected_version": 7,
+                "claim_operation_id": "claim-fixture",
             },
         )
     )
@@ -283,15 +339,13 @@ def test_fastmcp_complete_task_forwards_complete_task_lease_fence(
     assert complete_commands, commands
     for complete_command in complete_commands:
         assert complete_command[
-            complete_command.index("--task-lease-idempotency-key") :
-        ][:2] == ["--task-lease-idempotency-key", "lease-fixture"]
-        assert complete_command[
-            complete_command.index("--task-lease-expected-version") :
-        ][:2] == ["--task-lease-expected-version", "7"]
+            complete_command.index("--claim-operation-id") :
+        ][:2] == ["--claim-operation-id", "claim-fixture"]
+        assert not any("task-lease" in part for part in complete_command)
 
 
 def test_mcp_spends_only_after_typed_completed_state(
-    monkeypatch: pytest.MonkeyPatch,
+    mock_goal_cli,
 ) -> None:
     control = GoalModeMCPControlPlane(
         GoalModeMCPConfig(
@@ -323,7 +377,7 @@ def test_mcp_spends_only_after_typed_completed_state(
         )
         return subprocess.CompletedProcess(command, 0, payload, "")
 
-    monkeypatch.setattr(goal_mode_mcp.subprocess, "run", incomplete)
+    mock_goal_cli(incomplete)
 
     output = control.complete_task("todo_111111111111", "claude", "not yet complete")
 
@@ -333,7 +387,7 @@ def test_mcp_spends_only_after_typed_completed_state(
 
 
 def test_complete_task_spends_bound_to_selected_todo_and_refreshes_state(
-    monkeypatch: pytest.MonkeyPatch,
+    mock_goal_cli,
 ) -> None:
     control = GoalModeMCPControlPlane(
         GoalModeMCPConfig(
@@ -378,6 +432,12 @@ def test_complete_task_spends_bound_to_selected_todo_and_refreshes_state(
                     "status": "done",
                     "settlement_identity": identity.as_dict(),
                     "settlement_result": {"failure": None},
+                    "settlement_progress": {
+                        "schema_version": "quota_settlement_progress_v0",
+                        "state": "settled",
+                        "next_step": None,
+                        "quota_spend_source": "heartbeat",
+                    },
                 }
             )
         else:
@@ -387,11 +447,17 @@ def test_complete_task_spends_bound_to_selected_todo_and_refreshes_state(
                     "appended": True,
                     "settlement_identity": identity.as_dict(),
                     "settlement_result": {"failure": None},
+                    "settlement_progress": {
+                        "schema_version": "quota_settlement_progress_v0",
+                        "state": "settled",
+                        "next_step": None,
+                        "quota_spend_source": "heartbeat",
+                    },
                 }
             )
         return subprocess.CompletedProcess(command, 0, payload, "")
 
-    monkeypatch.setattr(goal_mode_mcp.subprocess, "run", capture)
+    mock_goal_cli(capture)
 
     output = control.complete_task(
         "todo_222222222222", "claude", "focused check passed"
@@ -443,7 +509,7 @@ def test_complete_task_spends_bound_to_selected_todo_and_refreshes_state(
 
 
 def test_complete_task_classifies_terminal_no_selection_and_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
+    mock_goal_cli,
 ) -> None:
     control = GoalModeMCPControlPlane(
         GoalModeMCPConfig(
@@ -472,7 +538,7 @@ def test_complete_task_classifies_terminal_no_selection_and_fails_closed(
         )
         return subprocess.CompletedProcess(command, 0, payload, "")
 
-    monkeypatch.setattr(goal_mode_mcp.subprocess, "run", capture)
+    mock_goal_cli(capture)
 
     output = control.complete_task(
         "todo_222222222222", "claude", "focused check passed"
@@ -485,7 +551,7 @@ def test_complete_task_classifies_terminal_no_selection_and_fails_closed(
 
 
 def test_complete_task_fails_closed_on_unparseable_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
+    mock_goal_cli,
 ) -> None:
     control = GoalModeMCPControlPlane(
         GoalModeMCPConfig(
@@ -506,7 +572,7 @@ def test_complete_task_fails_closed_on_unparseable_snapshot(
         commands.append(command)
         return subprocess.CompletedProcess(command, 0, "not-json", "")
 
-    monkeypatch.setattr(goal_mode_mcp.subprocess, "run", capture)
+    mock_goal_cli(capture)
 
     output = control.complete_task(
         "todo_222222222222", "claude", "focused check passed"
@@ -890,13 +956,12 @@ def test_native_control_plane_scopes_recovery_and_writeback_to_todo(
         runner=capture,
     )
 
-    control.evidence_since("2026-08-18T00:00:00Z", todo_id="todo-native-1")
     control.record_verified_delivery(
         mode="goal-pro", todo_id="todo-native-1"
     )
     control.spend(todo_id="todo-native-1")
 
-    assert len(commands) == 3
+    assert len(commands) == 2
     for command in commands:
         todo_index = command.index("--todo-id")
         assert command[todo_index + 1] == "todo-native-1"
@@ -922,7 +987,7 @@ class _FakeControlPlane:
         self.calls.append("evidence_since")
         if self.evidence_error:
             raise KunlunNativeGoalRuntimeError("evidence ledger unavailable")
-        return {"ok": True, "ledger": list(self.ledger)}
+        return {"ok": True, "schema_version": "agent_scoped_evidence_log_v0", "ledger": list(self.ledger)}
 
     def record_verified_delivery(
         self, *, mode: str, todo_id: str
@@ -1066,6 +1131,48 @@ def _native_context(tmp_path: Path) -> dict[str, str]:
     }
 
 
+def _write_source_native_registry(tmp_path: Path, instance_id: str) -> Path:
+    registry = tmp_path / ".loopx" / "registry.json"
+    payload = {
+        "schema_version": "0.2",
+        "registry_role": "project-local",
+        "profile_id": "source_session_v1",
+        "common_runtime_root": str(tmp_path / "runtime"),
+        "projects": [],
+        "goals": [
+            {
+                "id": "shared-goal",
+                "goal_instance_id": instance_id,
+                "status": "active",
+                "execution_authority": False,
+            }
+        ],
+        "session_bindings": [],
+        "session_receipts": [],
+        "lifetime_receipts": [],
+        "retired_goal_instances": [],
+    }
+    create = None if registry.exists() else lambda: payload
+    with source_session_registry_transaction(
+        registry,
+        operation="kunlun_host_goal_instance_test",
+        create=create,
+    ) as transaction:
+        current = transaction.payload_copy()
+        current["goals"] = payload["goals"]
+        transaction.commit(current)
+    return registry
+
+
+def _replace_source_native_goal(tmp_path: Path, instance_id: str) -> None:
+    registry = tmp_path / ".loopx" / "registry.json"
+    with exclusive_cross_runtime_file_lock(
+        guard_path(registry, "shared-goal"),
+        operation="kunlun_host_goal_instance_test_recreate",
+    ):
+        _write_source_native_registry(tmp_path, instance_id)
+
+
 def _native_todo(*, claimed: bool = False) -> dict[str, object]:
     return {
         "todo_id": "todo-native-1",
@@ -1207,8 +1314,7 @@ def test_native_controller_blocks_model_visible_mcp_mutations(
                 "todo_id": "todo-1",
                 "agent_id": "kunlun",
                 "evidence": "premature evidence",
-                "task_lease_idempotency_key": "lease-fixture",
-                "task_lease_expected_version": 7,
+                "claim_operation_id": "claim-fixture",
             },
         )
     )
@@ -1337,6 +1443,137 @@ def test_native_goal_pro_commits_only_after_verified_terminal_state(
     assert state["writeback"]["quota_spent"] is True
     journal = (tmp_path / ".loopx" / "kunluncode-runtime.json").read_text()
     assert "Implement and verify the native Goal Pro adapter" not in journal
+
+
+def test_native_goal_prepares_released_execution_before_model_launch(
+    tmp_path: Path,
+) -> None:
+    todo = _native_todo(claimed=True)
+
+    class PreparationControl(_FakeControlPlane):
+        def should_run(self) -> dict[str, object]:
+            self.calls.append("should_run")
+            ready = any(call.startswith("claim:") for call in self.calls)
+            return {
+                "ok": True,
+                "should_run": True,
+                "selected_todo": self.todo,
+                "normal_delivery_allowed": ready,
+                "execution_preparation": {
+                    "schema_version": "execution_preparation_v0",
+                    "state": "ready" if ready else "claim_required",
+                    "delivery_allowed": ready,
+                },
+            }
+
+    control = PreparationControl(todo)
+    clients: list[_FakeAppServer] = []
+
+    def factory(command: list[str], **kwargs) -> _FakeAppServer:
+        client = _FakeAppServer(command, **kwargs)
+        clients.append(client)
+        return client
+
+    result = run_native_goal(
+        tmp_path,
+        _native_context(tmp_path),
+        mode="goal-pro",
+        permission_mode="auto",
+        max_duration_secs=60,
+        controller_timeout_secs=120,
+        kunluncode_bin="/usr/bin/kunluncode",
+        control_plane=control,
+        client_factory=factory,
+    )
+
+    assert result["status"] == "committed"
+    assert control.calls[:3] == [
+        "should_run", "claim:todo-native-1", "should_run",
+    ]
+    assert clients and clients[0].calls[0] == "initialize"
+
+
+def test_source_native_goal_rejects_alias_only_runtime_state(
+    tmp_path: Path,
+) -> None:
+    _write_source_native_registry(
+        tmp_path,
+        "ginst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    state = _native_state(_native_todo(claimed=True))
+    write_runtime_state(tmp_path, state)
+    before = runtime_state_path(tmp_path).read_bytes()
+    control = _FakeControlPlane(_native_todo(claimed=True))
+
+    with pytest.raises(FirstPartyHostRuntimeRejected) as exc_info:
+        run_native_goal(
+            tmp_path,
+            _native_context(tmp_path),
+            mode="goal-pro",
+            permission_mode="auto",
+            max_duration_secs=60,
+            controller_timeout_secs=120,
+            kunluncode_bin="/usr/bin/kunluncode",
+            control_plane=control,
+            client_factory=lambda *_args, **_kwargs: pytest.fail(
+                "legacy runtime state must not launch KunlunCode"
+            ),
+        )
+
+    assert exc_info.value.code == "legacy_host_state"
+    assert control.calls == []
+    assert runtime_state_path(tmp_path).read_bytes() == before
+
+
+def test_source_native_goal_rejects_result_after_recreation(
+    tmp_path: Path,
+) -> None:
+    instance_a = "ginst_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    instance_b = "ginst_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    _write_source_native_registry(tmp_path, instance_a)
+    control = _FakeControlPlane(_native_todo())
+
+    class RecreatingAppServer(_FakeAppServer):
+        def wait_for_goal_terminal(
+            self,
+            thread_id: str,
+            *,
+            timeout_seconds: float,
+        ) -> dict[str, object]:
+            result = super().wait_for_goal_terminal(
+                thread_id,
+                timeout_seconds=timeout_seconds,
+            )
+            _replace_source_native_goal(tmp_path, instance_b)
+            return result
+
+    with pytest.raises(FirstPartyHostRuntimeRejected) as exc_info:
+        run_native_goal(
+            tmp_path,
+            _native_context(tmp_path),
+            mode="goal-pro",
+            permission_mode="auto",
+            max_duration_secs=60,
+            controller_timeout_secs=120,
+            kunluncode_bin="/usr/bin/kunluncode",
+            control_plane=control,
+            client_factory=lambda command, **kwargs: RecreatingAppServer(
+                command,
+                **kwargs,
+            ),
+        )
+
+    assert exc_info.value.code == "stale_goal_instance"
+    assert control.calls == ["should_run", "claim:todo-native-1"]
+    state = read_runtime_state(tmp_path)
+    assert state is not None
+    assert state["binding"]["goal_instance_id"] == instance_a
+    assert state["native"]["verified"] is False
+    assert state["writeback"] == {
+        "delivery_recorded": False,
+        "todo_completed": False,
+        "quota_spent": False,
+    }
 
 
 def test_native_goal_reconciles_crash_after_writeback_without_repeating_it(
@@ -1574,3 +1811,21 @@ def test_native_goal_pro_rejects_complete_without_verifier_pass(
     assert state is not None
     assert state["native"]["status"] == "complete"
     assert state["native"]["verified"] is False
+
+
+def test_mcp_pin_has_one_source_of_truth() -> None:
+    """Refs #4447: the `mcp` pin is defined once and derived everywhere else.
+
+    The pin is deliberately exact, not a range: the server imports
+    `mcp.server.fastmcp`, which the MCP SDK 2.x line no longer ships, and the
+    pin was set by a security fix. Before this change the version string was
+    repeated in the requirement, in the compatibility probe and in the
+    user-facing error, so a bump could leave a stale probe behind.
+    """
+    probe_source = inspect.getsource(cli._compatible_python)
+
+    assert cli.MCP_SDK_VERSION
+    assert cli.MCP_REQUIREMENT == f"mcp=={cli.MCP_SDK_VERSION}"
+    assert cli.MCP_REQUIREMENT.startswith("mcp==")
+    assert cli.MCP_SDK_VERSION not in probe_source
+    assert "MCP_SDK_VERSION" in probe_source

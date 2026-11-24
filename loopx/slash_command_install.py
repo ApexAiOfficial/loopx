@@ -1,82 +1,59 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import contextlib
 import json
 import os
+import re
 import sys
 import tempfile
+from collections.abc import Callable
+from enum import Enum
 from pathlib import Path
-from typing import Any
 
+from .agy_goal_mode import (
+    ANTIGRAVITY_HOOKS_CONFIG_FILENAME,
+    ANTIGRAVITY_MCP_CONFIG_FILENAME,
+    agy_home as _agy_home,
+    antigravity_config_home as _antigravity_config_home,
+    build_antigravity_hooks_template,
+)
+from .kiro_cli_goal_mode import (
+    KIRO_CLI_MCP_CONFIG_SUBPATH as _KIRO_MCP_CONFIG_SUBPATH,
+    SKILLS_ROOT_LABEL as _KIRO_SKILLS_ROOT_LABEL,
+    kiro_home as _kiro_home,
+)
 from .opencode_goal_mode import plugin_source, runtime_source
 from .pi_goal_mode import extension_source as pi_extension_source
 from .pi_goal_mode import runtime_source as pi_runtime_source
+from .pi_goal_mode.installation import (
+    _pi_agent_dir,
+    _pi_extension_path,
+    _pi_extension_root,
+    _pi_runtime_path,
+)
+from .slash_command_files import (
+    CommandFacadeSpec,
+    MANAGED_MARKER_PREFIX,
+    front_matter as _front_matter,
+    install_skill_facade as _install_skill_facade,
+    managed_marker as _managed_marker,
+    retire_managed_file as _retire_managed_file,
+    retire_status as _retire_status,
+    skill_body as _skill_body,
+    skill_facade_content,
+    target_status as _target_status,
+)
+from .skill_install_readback import retire_duplicate_managed_skills
 from .slash_commands import build_slash_command_catalog
-from .skill_install_readback import workflow_owned_skill_ids
+from .zcode_goal_mode import zcode_home as _zcode_home
 
 SCHEMA_VERSION = "loopx_slash_command_install_v0"
-MANAGED_MARKER_PREFIX = "<!-- loopx-managed-slash-command:v1"
-LEGACY_UPGRADABLE_SIGNATURES = (
-    "loopx goal-mode setup (NOT Claude Code's built-in /goal)",
-    "The output is loopx control-plane SETUP",
-    "goalmode_cmd.py",
-)
-EXISTING_LOOPX_CAPABILITY_SKILL_SIGNATURES = (
-    "# LoopX PR Review",
-    "Run `loopx pr-review` first",
-)
 OPENCODE_GOAL_DEPENDENCIES = {
     "@opencode-ai/plugin": ">=1.17.15 <2",
     "opencode-goal-plugin": "0.7.0",
 }
-
-
-def _managed_marker(*, command: str, surface: str) -> str:
-    return f"{MANAGED_MARKER_PREFIX} command={command} surface={surface} -->"
-
-
-def _front_matter(*, fields: dict[str, str]) -> str:
-    lines = ["---"]
-    for key, value in fields.items():
-        escaped = value.replace('"', '\\"')
-        lines.append(f'{key}: "{escaped}"')
-    lines.append("---")
-    return "\n".join(lines)
-
-
-def _skill_body(
-    *,
-    command: str,
-    title: str,
-    description: str,
-    argument_hint: str,
-    instructions: list[str],
-    surface: str,
-    front_matter_name: str | None = None,
-) -> str:
-    fields = {
-        "description": description,
-        "argument-hint": argument_hint,
-    }
-    if front_matter_name:
-        fields = {"name": front_matter_name, **fields}
-    surface_label = (
-        "slash command"
-        if surface == "claude-skills"
-        else "DSH workflow skill"
-        if surface == "dsh-skills"
-        else "explicit LoopX command skill"
-    )
-    return "\n\n".join(
-        [
-            _front_matter(fields=fields),
-            _managed_marker(command=command, surface=surface),
-            f"# {title}",
-            f"Treat this as the LoopX `{command}` {surface_label}.",
-            "\n".join(instructions),
-            "Keep public/private boundaries intact and do not perform external writes unless the active LoopX state or owner explicitly authorizes them.",
-        ]
-    ) + "\n"
 
 
 def _openai_skill_metadata(*, command: str, display_name: str, short_description: str) -> str:
@@ -93,7 +70,7 @@ def _openai_skill_metadata(*, command: str, display_name: str, short_description
     )
 
 
-def _opencode_command_body(spec: dict[str, Any]) -> str:
+def _opencode_command_body(spec: CommandFacadeSpec) -> str:
     return "\n\n".join(
         [
             _front_matter(
@@ -127,13 +104,28 @@ def _loopx_start_goal_arguments_instruction(
 ) -> str:
     selected_host = host_surface or "<exact-current-host>"
     instruction = (
-        "If arguments are present, pass the complete visible command arguments "
-        "unchanged as one value to "
+        "If arguments are present and the current host already has a verified "
+        "active LoopX Goal/Agent binding, preserve that exact identity when the "
+        "request continues, corrects, or refines the registered objective. Do "
+        "not call `start-goal` for an ordinary phase, issue, PR, or Todo inside "
+        "that Goal; follow its exact current `interaction_contract` or quota "
+        "command first, then record the request through the typed Todo/writeback "
+        "path for the bound agent. Start another Goal only for a materially "
+        "different objective or an explicit new-Goal request. Otherwise pass "
+        "the complete visible command arguments unchanged as one value to "
         f'`{cli_bin} start-goal --guided --project . --slash-command-arguments='
         f'"<complete visible $ARGUMENTS>" --host-surface {selected_host}`. '
         "The CLI, not the model, owns parsing supported leading switches and "
         "preserving the remaining goal text. Never split or recompose the "
-        "arguments, and never infer a route from issue/PR wording or URLs."
+        "arguments, and never infer a route from issue/PR wording or URLs. "
+        "Use `--new-peer` only when the user explicitly asks for a fresh, new, "
+        "second, or additional Agent identity rather than continuing or taking "
+        "over an existing lane. A stable unbound host thread already defaults to "
+        "fresh registration; on a host without a stable thread id, pass "
+        "`--new-peer` as a separate argument before `--slash-command-arguments`, "
+        "or preserve it when supplied as a leading visible switch. Do not infer "
+        "a fresh identity from ordinary task wording, registry order, or the "
+        "availability of another lane."
     )
     if host_surface is None:
         instruction += (
@@ -198,24 +190,50 @@ def _dsh_native_loopx_instructions(*, cli_bin: str) -> list[str]:
     ]
 
 
-def _command_prompt_specs(*, cli_bin: str, include_legacy_aliases: bool) -> list[dict[str, Any]]:
-    specs: list[dict[str, Any]] = [
+def _command_prompt_specs(
+    *,
+    cli_bin: str,
+    include_legacy_aliases: bool,
+    host_surface: str | None = None,
+) -> list[CommandFacadeSpec]:
+    codex_heartbeat_instruction = (
+        "For a Codex App heartbeat, run the returned activation command, require ok=true, and save its `LoopX managed heartbeat bootstrap v2` task_body through automation_update. The saved loader fetches the current thin contract on every wake; do not persist a raw thin/compact/full execution body. Preserve the current goal, registered agent, task binding and existing schedule; read back the automation through the same App."
+        if host_surface in {None, "codex", "codex-cli", "codex-ide-plugin", "codex-app", "codex-app-ssh"}
+        else None
+    )
+    antigravity_resident_instruction = (
+        f"For an Antigravity App fixed resident session (`antigravity-app` / `agy`), read `<user_information>` `Conversation ID` (or `$ANTIGRAVITY_CONVERSATION_ID`), bind it once via `{cli_bin} bind-agent-thread --goal-id <goal-id> --thread-id <conversation-id> --host-surface agy --agent-id <agent-id> --with-agy-hooks --execute` and `{cli_bin} sync-global` (updating `~/.gemini/config/hooks.json` `Stop` recovery with the active `{cli_bin}` path and `--conversation-id`; do not create a `new-conversation` `sidecar.json` for a fixed session). On every wake, run `{cli_bin} --format json heartbeat-prompt --thin --runtime-profile antigravity_app --goal-id <goal-id> --agent-id <agent-id>`, follow `task_body` only when `ok=true`, perform peer code/doc edits and `quota should-run` inside an isolated `.worktrees/` git worktree (keeping the main checkout clean for `workspace_guard`), and before ending every turn (settled, `waiting_external`, or idle) unless stopped, call `schedule(DurationSeconds=max(180, recommended_interval_minutes * 60), TimerCondition=\"any\", Prompt=...)` (`180`s floor; `3 -> 6 -> 10`m backoff) without shell `sleep`."
+        if host_surface in {"agy", "antigravity-app"}
+        else None
+    )
+    specs: list[CommandFacadeSpec] = [
         {
             "command": "/loopx",
             "name": "loopx",
             "description": "Inspect LoopX state, or start concrete project work when arguments are provided.",
-            "argument_hint": "[--fine-grained] [--capability-route issue-fix] [task text]",
+            "argument_hint": "[--fine-grained] [--new-peer] [--capability-route issue-fix] [task text]",
             "instructions": [
-                "Visible command arguments: `$ARGUMENTS`.",
-                "Identify the exact current host surface (codex-app, codex-app-ssh, codex-ide-plugin, codex-cli-tui, opencode, opencode2, traex-cli, pi, gemini-cli, cursor-agent, deepseek-harness, or ark-managed-agent).",
-                _loopx_start_goal_arguments_instruction(
-                    cli_bin=cli_bin,
-                    host_surface=None,
-                ),
-                "Treat the returned `ordered_steps` and `goal_start_contract` as authoritative. Follow their identity, capability-route, Todo, writeback, host-loop, quota, and stop/gate rules before substantive work; do not reconstruct those rules from skill memory.",
-                "If the packet exposes a goal-selection gate, rerun one exact choice before any mutation.",
-                f"If arguments are empty and the host already identifies an active LoopX goal, follow its exact CLI `interaction_contract` or quota command first; otherwise inspect `{cli_bin} status` and `{cli_bin} bootstrap-command-pack --project .` before changing files.",
-                "If this session cannot mutate the host loop surface, surface the exact pasteable gate instead of claiming autonomous setup.",
+                line
+                for line in [
+                    "Visible command arguments: `$ARGUMENTS`.",
+                    "Identify the exact current host surface (codex-app, trae_app, codex-app-ssh, codex-ide-plugin, codex-cli-tui, opencode, opencode2, traex-cli, pi, gemini-cli, cursor-agent, zcode, antigravity-app, agy, kiro-cli, deepseek-harness, or ark-managed-agent).",
+                    _loopx_start_goal_arguments_instruction(
+                        cli_bin=cli_bin,
+                        host_surface=None,
+                    ),
+                    "Treat the returned `ordered_steps` and `goal_start_contract` as authoritative. Follow their identity, capability-route, Todo, writeback, host-loop, quota, and stop/gate rules before substantive work; do not reconstruct those rules from skill memory.",
+                    "During first planning, follow the shared goal_requirements_guidance: reuse existing owner-approved requirements and declare only missing source-grounded overall requirements through the existing outcome owner, link actual Todos and read back the canonical declaration. Preserve existing requirements on resume; maximum timeout is not a minimum work commitment and independent executable checks stay optional.",
+                    "When the host explicitly supplies a `loopx_task_planning_v0` packet from `loopx todo plan` for a registered Goal/Agent, execute that bounded planning checkpoint instead of starting another Goal. Follow its shared planner, requirement declaration/readback and Todo delta in the same invocation, then return actual Todo ids for readback. Its caller-owned execution_handoff retains host activation and quota; do not create a planning Todo, execute task work, or claim delivery during the checkpoint.",
+                    codex_heartbeat_instruction,
+                    antigravity_resident_instruction,
+                    "If the packet exposes a goal-selection gate, rerun one exact choice before any mutation.",
+                    "When authoring task Todos, treat `--action-kind` as the documented extensible public-safe token: choose a short task-relevant value such as `implement`, `test`, or `review`; do not search the LoopX source for an allowlist.",
+                    "Consume the turn-start quota JSON packet exactly once: read the complete output directly or save it and query it with `jq`; never pipe it through `head` or `tail`, and never rerun the turn-start call to recover hidden fields. A host whose runtime mints Turn identity uses `--begin-turn`; every other host passes its own `--turn-instance-id`. When selection is required, choose the Todo and use `interaction_contract.cli_channel.selection_command` with the returned Turn identity before mutation.",
+                    "Runtime capability flags are host observations, not task requirements or grants; registered Agents reuse supported ones via `loopx agent-capabilities`. Before initial quota, include capabilities already established by this host context or successful task-facing use. Read capability_gate.repair_missing even when should_run is true: when runtime_capability_reentry is projected, verify its real callsite and follow the returned same-Turn command before choosing fallback work. Never infer credentials or production access from network availability, and do not claim a missing declaration proves a missing tool.",
+                    f"If arguments are empty and the host already identifies an active LoopX goal, follow its exact CLI `interaction_contract` or quota command first; otherwise inspect `{cli_bin} status` and `{cli_bin} bootstrap-command-pack --project .` before changing files.",
+                    "If this session cannot mutate the host loop surface, surface the exact pasteable gate instead of claiming autonomous setup.",
+                ]
+                if line is not None
             ],
         },
         {
@@ -269,36 +287,49 @@ def _command_prompt_specs(*, cli_bin: str, include_legacy_aliases: bool) -> list
             "command": "/loopx-pr-review",
             "name": "loopx-pr-review",
             "description": "Run the LoopX PR-review packet first, then review selected PR groups with evidence.",
-            "argument_hint": "[--repo owner/repo] [--state open|merged|all] [--since ISO]",
+            "argument_hint": "[--repo owner/repo] [--state open|merged|all] [--review-priority other-developers-first|owner-first] [--since ISO]",
             "instructions": [
                 "Visible command arguments: `$ARGUMENTS`.",
                 "Use the installed `loopx-pr-review` skill when available.",
-                f"Run `{cli_bin} --format json pr-review $ARGUMENTS` first and keep `agent_response_contract.review_execution_contract`, `review_groups`, `pull_requests[].review_plan`, `pull_requests[].review_template`, and `pull_requests[].evidence_commands` visible.",
+                f"Run `{cli_bin} --format json pr-review $ARGUMENTS` first and keep the full packet visible. The default review priority is `other-developers-first`; pass `--review-priority owner-first` only when the authenticated reviewer's own PRs should lead. Only non-null action rows carry review plans, templates, and evidence commands; null actions are readback-only. A fresh audit requires `--fresh-audit-exact-head NUMBER@HEAD_OID`.",
                 "Do not reconstruct the PR queue manually from ad hoc GitHub calls before reading the LoopX packet.",
                 "This command is read-only; do not comment, approve, merge, rerun CI, or spend quota unless separately authorized.",
             ],
         },
+        {
+            "command": "/loopx-deepresearch",
+            "name": "loopx-deepresearch",
+            "description": "Run a bounded LoopX deep-research loop: packet-driven expeditions, evidence ledgers, citation-auditable report.",
+            "argument_hint": "<research question> [--max-sources N]",
+            "instructions": [
+                "Visible command arguments: `$ARGUMENTS`.",
+                f"Run `{cli_bin} --format json deepresearch status --project .` first; if no research is active, treat `$ARGUMENTS` as the question and run `{cli_bin} --format json deepresearch start --project . --question $ARGUMENTS`.",
+                "Keep `research_contract`, `stop_conditions`, `next_expedition`, and `evidence_commands` from the packet visible; the packet owns what to research next and when to stop.",
+                "Record every finding through the typed subcommands (`add-source`, `add-subquestion`, `resolve-question`); never edit the state file directly, and never fabricate URLs or claims — a claim exists only if a tool you actually ran produced it.",
+                "Resolve a question only with recorded evidence claim ids; an open contradiction blocks resolution until an explicit sides-with claim and rationale are recorded.",
+                "Re-run `status` after every expedition; stop when `stop_conditions.stopped` is true, then run `deepresearch report` and present the report path.",
+                "One active run per project: to research a new question, run `deepresearch close` (or `start --new-run` once stopped) — close marks the terminal state and the next start archives it, never by editing state files.",
+            ],
+        },
     ]
     if include_legacy_aliases:
-        legacy_specs = []
+        catalog = build_slash_command_catalog(cli_bin=cli_bin, include_legacy_aliases=True)
+        aliases = {row["command"]: row.get("legacy_aliases", []) for row in catalog["commands"]}
+        legacy_specs: list[CommandFacadeSpec] = []
         for canonical in specs:
-            name = canonical["name"]
-            if not str(name).startswith("loopx-global-"):
-                continue
-            legacy_name = str(name).replace("loopx-global-", "loop-global-", 1)
-            legacy_specs.append(
-                {
+            for alias in aliases.get(canonical["command"], []):
+                legacy_specs.append({
                     **canonical,
-                    "command": "/" + legacy_name,
-                    "name": legacy_name,
-                    "description": canonical["description"] + " Legacy alias for the canonical /loopx-global-* command.",
-                }
-            )
+                    "command": alias,
+                    "name": alias.removeprefix("/"),
+                    "description": canonical["description"] + f" Legacy alias for {canonical['command']}.",
+                    "alias_for": canonical["command"],
+                })
         specs.extend(legacy_specs)
     return specs
 
 
-def _command_skill_content(spec: dict[str, Any], *, surface: str) -> str:
+def _command_skill_content(spec: CommandFacadeSpec, *, surface: str) -> str:
     instructions = list(spec["instructions"])
     if surface == "codex-skills":
         instructions.insert(
@@ -318,6 +349,102 @@ def _command_skill_content(spec: dict[str, Any], *, surface: str) -> str:
     )
 
 
+class SkillFacadeReadbackStatus(str, Enum):
+    """Local filesystem diagnostics; these do not classify host readiness."""
+
+    READY = "ready"
+    MISSING = "missing"
+    STALE = "stale"
+    USER_OWNED = "user_owned"
+    UNREADABLE = "unreadable"
+
+
+_MAX_SKILL_FACADE_READ_BYTES = 1024 * 1024
+
+
+def inspect_skill_facades(
+    skills_dir: Path,
+    *,
+    host_surface: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Read the canonical facades without changing files or running a host.
+
+    Compare the installer's current rendering, allowing its existing cli_bin
+    parameter to vary consistently. No independent phrase list defines freshness.
+    """
+    cli_placeholder = "__LOOPX_FACADE_CLI_PARAMETER__"
+    summaries: dict[str, dict[str, Any]] = {}
+    for spec in _command_prompt_specs(
+        cli_bin=cli_placeholder,
+        include_legacy_aliases=False,
+        host_surface=host_surface,
+    ):
+        name = str(spec["name"])
+        path = skills_dir / name / "SKILL.md"
+        status = SkillFacadeReadbackStatus.MISSING
+        reason = "The managed command facade is missing; refresh this host's surface."
+        exists = False
+        configured_cli_bin = None
+        try:
+            with path.open("rb") as handle:
+                content = handle.read(_MAX_SKILL_FACADE_READ_BYTES + 1)
+            exists = True
+            if len(content) > _MAX_SKILL_FACADE_READ_BYTES:
+                status = SkillFacadeReadbackStatus.UNREADABLE
+                reason = (
+                    "The command facade exceeds the 1 MiB diagnostic read limit; "
+                    "reduce its size or resolve the command-name collision. The file is preserved."
+                )
+                text = None
+            else:
+                text = content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+            if text is None:
+                pass
+            elif MANAGED_MARKER_PREFIX not in text:
+                status = SkillFacadeReadbackStatus.USER_OWNED
+                reason = (
+                    "A user-owned file occupies this command; the installer preserves it. "
+                    "Resolve the name collision before installing the managed facade."
+                )
+            else:
+                template = skill_facade_content(spec)
+                parts = template.split(cli_placeholder)
+                pattern = re.escape(parts[0])
+                for index, part in enumerate(parts[1:]):
+                    pattern += (
+                        r"(?P<cli_bin>[^\r\n]+?)" if index == 0 else r"(?P=cli_bin)"
+                    ) + re.escape(part)
+                match = re.fullmatch(pattern, text)
+                if match is not None:
+                    status = SkillFacadeReadbackStatus.READY
+                    configured_cli_bin = match.groupdict().get("cli_bin")
+                    reason = "The file matches the current managed facade; runtime skill loading is unverified."
+                else:
+                    status = SkillFacadeReadbackStatus.STALE
+                    reason = "The managed facade differs from the current installer; refresh this host's surface."
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError):
+            exists = True
+            status = SkillFacadeReadbackStatus.UNREADABLE
+            reason = "The command facade cannot be read as UTF-8; check its file type and read access."
+        ready = status is SkillFacadeReadbackStatus.READY
+        summaries[name] = {
+            "path": str(path),
+            "candidate_paths": [str(path)] if exists else [],
+            "route_count": int(exists),
+            "route_conflict": False,
+            "source_root": str(skills_dir) if exists else None,
+            "managed_externally": False,
+            "exists": exists,
+            "required_phrases": ready,
+            "readback_status": status.value,
+            "reason": reason,
+            "cli_bin": configured_cli_bin,
+        }
+    return summaries
+
+
 def materialize_loopx_entry_skill(
     *,
     skills_dir: Path,
@@ -331,6 +458,8 @@ def materialize_loopx_entry_skill(
         None,
         "ark-managed-agent",
         "deepseek-harness-native",
+        "agy",
+        "antigravity-app",
     }:
         raise ValueError(f"unsupported fixed LoopX entry host surface: {host_surface}")
     spec = next(
@@ -338,6 +467,7 @@ def materialize_loopx_entry_skill(
         for item in _command_prompt_specs(
             cli_bin=cli_bin,
             include_legacy_aliases=False,
+            host_surface=host_surface,
         )
         if item["name"] == "loopx"
     )
@@ -373,56 +503,23 @@ def materialize_loopx_entry_skill(
             else "codex-skills"
         ),
     )
-    return {
-        "skill_id": "loopx",
-        "path": str(skill_path),
-        "status": _target_status(skill_path, content, execute=execute),
-    }
-
-
-def _is_legacy_upgradable_loopx_file(existing: str) -> bool:
-    return any(signature in existing for signature in LEGACY_UPGRADABLE_SIGNATURES)
-
-
-def _is_existing_loopx_capability_skill(existing: str) -> bool:
-    return any(signature in existing for signature in EXISTING_LOOPX_CAPABILITY_SKILL_SIGNATURES)
-
-
-def _target_status(path: Path, content: str, *, execute: bool) -> str:
-    if path.exists():
-        existing = path.read_text(encoding="utf-8")
-        if MANAGED_MARKER_PREFIX not in existing:
-            if _is_legacy_upgradable_loopx_file(existing):
-                if execute:
-                    path.write_text(content, encoding="utf-8")
-                return "upgraded_legacy_managed"
-            if path.name == "SKILL.md" and _is_existing_loopx_capability_skill(existing):
-                return "preserved_existing_loopx_skill"
-            return "skipped_user_file"
-        if existing == content:
-            return "unchanged"
-        if execute:
-            path.write_text(content, encoding="utf-8")
-        return "updated"
-    if execute:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-    return "created" if execute else "would_create"
-
-
-def _retire_managed_file(path: Path, *, execute: bool) -> str | None:
-    if not path.exists():
-        return None
-    existing = path.read_text(encoding="utf-8")
-    if MANAGED_MARKER_PREFIX not in existing:
-        return "skipped_user_file"
-    if execute:
-        path.unlink()
-    return "retired_managed_file" if execute else "would_retire_managed_file"
-
-
-def _retire_status(path: Path, *, execute: bool) -> str:
-    return _retire_managed_file(path, execute=execute) or "absent"
+    status = _target_status(skill_path, content, execute=execute)
+    result = {"skill_id": "loopx", "path": str(skill_path), "status": status}
+    # Workflow installs can generate this entry without slash-commands. Keep
+    # the Codex presentation identical, without changing exact managed hosts.
+    if host_surface is None and status not in {
+        "skipped_user_file", "preserved_existing_loopx_skill",
+    }:
+        result["metadata_status"] = _target_status(
+            skill_path.parent / "agents" / "openai.yaml",
+            _openai_skill_metadata(
+                command=str(spec["command"]),
+                display_name="LoopX",
+                short_description=str(spec["description"]),
+            ),
+            execute=execute,
+        )
+    return result
 
 
 def _codex_home(value: str | None = None) -> Path:
@@ -577,9 +674,9 @@ def _opencode_direct_goal_plugin_conflicts(root: Path) -> tuple[list[str], list[
             invalid.append(str(path))
             continue
         plugin_names = [
-            name
+            plugin_name
             for plugin in plugins
-            if (name := _opencode_plugin_name(plugin)) is not None
+            if (plugin_name := _opencode_plugin_name(plugin)) is not None
         ]
         if any(
             plugin == package or plugin.startswith(f"{package}@")
@@ -639,6 +736,14 @@ def _normalize_surfaces(surfaces: list[str] | None) -> list[str]:
             candidates = ["gemini"]
         elif surface in {"cursor-agent", "cursor-cli"}:
             candidates = ["cursor"]
+        elif surface in {"zcode", "z-code"}:
+            candidates = ["zcode"]
+        elif surface in {"agy", "antigravity", "antigravity-cli"}:
+            candidates = ["agy"]
+        elif surface in {"antigravity-app", "antigravity_app", "agy-app", "agy_app"}:
+            candidates = ["antigravity-app"]
+        elif surface in {"kiro", "kiro-cli", "kirocli"}:
+            candidates = ["kiro-cli"]
         else:
             candidates = [surface]
         for candidate in candidates:
@@ -647,25 +752,31 @@ def _normalize_surfaces(surfaces: list[str] | None) -> list[str]:
     return normalized
 
 
-CURSOR_MCP_KEY = "loopx"
+# Every surface that registers the LoopX stdio server shares one key, one
+# ownership marker file name and one merge rule; only the config location, the
+# host-specific server script and the reported status names differ.
+MANAGED_MCP_KEY = "loopx"
 CURSOR_MCP_MARKER_NAME = ".loopx-managed-mcp.json"
 CURSOR_MCP_MARKER_SCHEMA_VERSION = "loopx_managed_cursor_mcp_v0"
+KIRO_CLI_MCP_MARKER_SCHEMA_VERSION = "loopx_managed_kiro_cli_mcp_v0"
+ANTIGRAVITY_MCP_MARKER_SCHEMA_VERSION = "loopx_managed_antigravity_mcp_v0"
+ANTIGRAVITY_HOOKS_MARKER_NAME = ".loopx-managed-hooks.json"
+ANTIGRAVITY_HOOKS_MARKER_SCHEMA_VERSION = "loopx_managed_antigravity_hooks_v0"
+
+McpCommandFactory = Callable[[], tuple[str, str] | None]
 
 
-def _loopx_mcp_command() -> tuple[str, str] | None:
-    """Interpreter and script for the LoopX stdio MCP server, or None.
+def _provisioned_mcp_interpreter() -> str | None:
+    """An interpreter that can import `mcp.server.fastmcp`, or None.
 
-    Reuses the Claude adapter's provisioning so all surfaces share one server
-    and one `mcp` dependency. Returns None when `mcp` cannot be provisioned —
-    the caller records that instead of writing a config that would fail to
-    start.
+    Reuses the Claude adapter's provisioning so every surface shares one
+    dedicated venv and one `mcp` dependency.
     """
     try:
         from loopx.claude_goal_mode.scripts import install as claude_install
     except ImportError:
         return None
     try:
-        script = claude_install._p("mcp", "loopx_mcp.py")
         # Provisioning narrates to stdout ("[deps] creating mcp venv …"), which
         # would land in the middle of `--format json` and make the whole install
         # result unparseable. The narration is still worth keeping — on stderr.
@@ -675,28 +786,45 @@ def _loopx_mcp_command() -> tuple[str, str] | None:
         # Provisioning shells out to venv and pip; a failure there means the
         # surface is skipped, never that the whole install run dies.
         return None
-    if not interpreter or not Path(script).exists():
+    if not interpreter or not claude_install._has_mcp(interpreter):
         return None
-    if not claude_install._has_mcp(interpreter):
-        return None
-    return str(interpreter), str(script)
+    return str(interpreter)
 
 
-def _cursor_mcp_marker_path(cursor_root: Path) -> Path:
-    """Sidecar recording the exact `mcp.json` entry LoopX last wrote.
+def _mcp_command_for_script(script: Path) -> tuple[str, str] | None:
+    """Interpreter and script for one LoopX stdio MCP entrypoint, or None.
 
-    Markdown surfaces carry `MANAGED_MARKER_PREFIX` inside the file, but
-    `mcp.json` belongs to Cursor's schema, so provenance is kept beside it
-    rather than smuggled into an entry the host has to parse.
+    Returns None when `mcp` cannot be provisioned — the caller records that
+    instead of writing a config that would fail to start.
     """
-    return cursor_root / CURSOR_MCP_MARKER_NAME
+    if not script.exists():
+        return None
+    interpreter = _provisioned_mcp_interpreter()
+    if interpreter is None:
+        return None
+    return interpreter, str(script)
 
 
-def _read_cursor_mcp_marker(cursor_root: Path) -> dict[str, Any]:
+def _loopx_mcp_command() -> tuple[str, str] | None:
+    """The shared Claude-profile server Cursor registers."""
     try:
-        payload = json.loads(
-            _cursor_mcp_marker_path(cursor_root).read_text(encoding="utf-8")
-        )
+        from loopx.claude_goal_mode.scripts import install as claude_install
+    except ImportError:
+        return None
+    return _mcp_command_for_script(Path(claude_install._p("mcp", "loopx_mcp.py")))
+
+
+def _kiro_cli_mcp_command() -> tuple[str, str] | None:
+    """The Kiro CLI server: same control plane, Kiro runtime profile and
+    session-bound identity."""
+    from .kiro_cli_goal_mode import mcp_server_script
+
+    return _mcp_command_for_script(mcp_server_script())
+
+
+def _read_mcp_marker(marker_path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     if not isinstance(payload, dict):
@@ -722,24 +850,36 @@ def _write_json_atomic(path: Path, payload: Any) -> None:
         raise
 
 
-def _merge_cursor_mcp(cursor_root: Path, *, uninstall: bool, execute: bool) -> str:
-    """Add or remove the `loopx` entry in CURSOR_HOME/mcp.json — and nothing else.
+def _merge_managed_mcp_json(
+    *,
+    config_path: Path,
+    marker_schema_version: str,
+    invalid_status: str,
+    command_factory: McpCommandFactory,
+    uninstall: bool,
+    execute: bool,
+) -> str:
+    """Add or remove the `loopx` entry in a host's `mcpServers` JSON — and nothing else.
 
-    `mcp.json` is a user-owned file that LoopX did not create, so every path
+    The config is a user-owned file that LoopX did not create, so every path
     here fails closed: an unexpected shape is reported instead of normalized, a
     same-name entry LoopX cannot prove it wrote is left alone, and uninstall
     removes only an entry that still matches what LoopX recorded. Sharing the
     `loopx` name with a user's own server is unlikely but cheap to survive;
     silently replacing that server, or dropping their `mcpServers` list while
     "merging", is not.
+
+    Provenance lives in a sidecar beside the config, because the config belongs
+    to the host's schema and must not carry an entry the host has to parse.
     """
-    path = cursor_root / "mcp.json"
+    marker_path = config_path.parent / CURSOR_MCP_MARKER_NAME
     try:
-        raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        raw = json.loads(text) if text.strip() else {}
     except (OSError, json.JSONDecodeError):
-        return "blocked_invalid_cursor_mcp_json"
+        return invalid_status
     if not isinstance(raw, dict):
-        return "blocked_invalid_cursor_mcp_json"
+        return invalid_status
     servers = raw.get("mcpServers")
     if servers is None:
         servers = {}
@@ -747,10 +887,10 @@ def _merge_cursor_mcp(cursor_root: Path, *, uninstall: bool, execute: bool) -> s
         # A list-valued or scalar `mcpServers` is not something to overwrite:
         # either the file follows a shape LoopX does not understand, or it is
         # damaged. Both are the user's to resolve.
-        return "blocked_invalid_cursor_mcp_json"
+        return invalid_status
 
-    existing = servers.get(CURSOR_MCP_KEY)
-    recorded = _read_cursor_mcp_marker(cursor_root).get(CURSOR_MCP_KEY)
+    existing = servers.get(MANAGED_MCP_KEY)
+    recorded = _read_mcp_marker(marker_path).get(MANAGED_MCP_KEY)
     # Ownership is only demonstrable when the entry still matches what LoopX
     # recorded writing. A hand-edited entry counts as the user's from then on.
     loopx_owned = existing is not None and existing == recorded
@@ -762,7 +902,7 @@ def _merge_cursor_mcp(cursor_root: Path, *, uninstall: bool, execute: bool) -> s
     # being demonstrable — and only in execute mode, so a dry run stays a
     # read-only report.
     if execute and recorded is not None and not loopx_owned:
-        _cursor_mcp_marker_path(cursor_root).unlink(missing_ok=True)
+        marker_path.unlink(missing_ok=True)
 
     if uninstall:
         if existing is None:
@@ -771,10 +911,10 @@ def _merge_cursor_mcp(cursor_root: Path, *, uninstall: bool, execute: bool) -> s
             return "skipped_user_owned_mcp_entry"
         if not execute:
             return "would_retire"
-        servers.pop(CURSOR_MCP_KEY, None)
+        servers.pop(MANAGED_MCP_KEY, None)
         raw["mcpServers"] = servers
-        _write_json_atomic(path, raw)
-        _cursor_mcp_marker_path(cursor_root).unlink(missing_ok=True)
+        _write_json_atomic(config_path, raw)
+        marker_path.unlink(missing_ok=True)
         return "retired"
 
     if existing is not None and not loopx_owned:
@@ -783,31 +923,145 @@ def _merge_cursor_mcp(cursor_root: Path, *, uninstall: bool, execute: bool) -> s
         # A dry run must not touch anything: provisioning `mcp` would create a
         # venv on disk during a run whose only job is to report what would happen.
         return "unchanged" if existing is not None else "would_write"
-    command = _loopx_mcp_command()
+    command = command_factory()
     if command is None:
         return "skipped_mcp_dependency_missing"
     entry = {"command": command[0], "args": [command[1]]}
     if existing == entry:
         return "unchanged"
-    servers[CURSOR_MCP_KEY] = entry
+    servers[MANAGED_MCP_KEY] = entry
     raw["mcpServers"] = servers
-    _write_json_atomic(path, raw)
+    _write_json_atomic(config_path, raw)
     _write_json_atomic(
-        _cursor_mcp_marker_path(cursor_root),
+        marker_path,
         {
-            "schema_version": CURSOR_MCP_MARKER_SCHEMA_VERSION,
-            "servers": {CURSOR_MCP_KEY: entry},
+            "schema_version": marker_schema_version,
+            "servers": {MANAGED_MCP_KEY: entry},
         },
     )
     return "written"
 
 
-def _pi_extension_path(project_root: Path) -> Path:
-    return project_root / ".pi" / "extensions" / "loopx-goal.ts"
+def _merge_managed_hooks_json(
+    *,
+    config_path: Path,
+    cli_bin: str,
+    uninstall: bool,
+    execute: bool,
+    goal_id: str | None = None,
+    agent_id: str | None = None,
+    runtime_root: str | None = None,
+    conversation_id: str | None = None,
+    registry: str | None = None,
+    resolve_local_executable: bool = True,
+) -> str:
+    """Add or remove the managed ``loopx`` Stop recovery hook in Antigravity ``hooks.json``."""
+    marker_path = config_path.parent / ANTIGRAVITY_HOOKS_MARKER_NAME
+    try:
+        text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        raw = json.loads(text) if text.strip() else {}
+    except (OSError, json.JSONDecodeError):
+        return "blocked_invalid_antigravity_hooks_json"
+    if not isinstance(raw, dict):
+        return "blocked_invalid_antigravity_hooks_json"
+    try:
+        marker_payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        marker_payload = {}
+    recorded_hooks = marker_payload.get("hooks") if isinstance(marker_payload, dict) else None
+    if not isinstance(recorded_hooks, dict):
+        recorded_hooks = {}
+    recorded = recorded_hooks.get(MANAGED_MCP_KEY)
+    # Native named hooks live at the top level. Earlier proposals wrote an
+    # ignored `hooks.loopx` wrapper; migrate it only with exact ownership proof.
+    legacy = raw.get("hooks")
+    legacy_entry = legacy.get(MANAGED_MCP_KEY) if isinstance(legacy, dict) else None
+    existing = raw.get(MANAGED_MCP_KEY)
+    legacy_owned = existing is None and legacy_entry is not None and legacy_entry == recorded
+    if legacy_owned:
+        existing = legacy_entry
+    elif existing is None and legacy_entry is not None:
+        return "skipped_user_owned_hooks_entry"
+    loopx_owned = existing is not None and existing == recorded
+    if execute and recorded is not None and not loopx_owned:
+        marker_path.unlink(missing_ok=True)
+
+    if uninstall:
+        if existing is None:
+            return "absent"
+        if not loopx_owned:
+            return "skipped_user_owned_hooks_entry"
+        if not execute:
+            return "would_retire"
+        if legacy_owned:
+            cast(dict[str, Any], legacy).pop(MANAGED_MCP_KEY)
+            if not legacy:
+                raw.pop("hooks")
+        else:
+            raw.pop(MANAGED_MCP_KEY)
+        _write_json_atomic(config_path, raw)
+        marker_path.unlink(missing_ok=True)
+        return "retired"
+
+    if existing is not None and not loopx_owned:
+        return "skipped_user_owned_hooks_entry"
+    entry = build_antigravity_hooks_template(
+        cli_bin=cli_bin,
+        goal_id=goal_id,
+        agent_id=agent_id,
+        runtime_root=runtime_root,
+        conversation_id=conversation_id,
+        registry=registry,
+        resolve_local_executable=resolve_local_executable,
+    )[MANAGED_MCP_KEY]
+    if not execute:
+        return "unchanged" if existing == entry and not legacy_owned else "would_write"
+    if existing == entry and not legacy_owned:
+        return "unchanged"
+    if legacy_owned:
+        cast(dict[str, Any], legacy).pop(MANAGED_MCP_KEY)
+        if not legacy:
+            raw.pop("hooks")
+    raw[MANAGED_MCP_KEY] = entry
+    _write_json_atomic(config_path, raw)
+    _write_json_atomic(
+        marker_path,
+        {
+            "schema_version": ANTIGRAVITY_HOOKS_MARKER_SCHEMA_VERSION,
+            "hooks": {MANAGED_MCP_KEY: entry},
+        },
+    )
+    return "written"
 
 
-def _pi_runtime_path(project_root: Path) -> Path:
-    return project_root / ".pi" / "extensions" / "pi-goal-loop-runtime.mjs"
+def sync_antigravity_hooks(
+    *,
+    cli_bin: str = "loopx",
+    agy_home: str | None = None,
+    uninstall: bool = False,
+    execute: bool,
+    goal_id: str | None = None,
+    agent_id: str | None = None,
+    runtime_root: str | None = None,
+    conversation_id: str | None = None,
+    registry: str | None = None,
+    resolve_local_executable: bool = True,
+) -> dict[str, str]:
+    """Preview or update Antigravity ``hooks.json`` with the managed Stop recovery hook."""
+    config_path = _antigravity_config_home(agy_home) / ANTIGRAVITY_HOOKS_CONFIG_FILENAME
+    status = _merge_managed_hooks_json(
+        config_path=config_path,
+        cli_bin=cli_bin,
+        uninstall=uninstall,
+        execute=execute,
+        goal_id=goal_id,
+        agent_id=agent_id,
+        runtime_root=runtime_root,
+        conversation_id=conversation_id,
+        registry=registry,
+        resolve_local_executable=resolve_local_executable,
+    )
+    return {"path": str(config_path), "status": status}
 
 
 def install_slash_commands(
@@ -815,6 +1069,8 @@ def install_slash_commands(
     execute: bool,
     uninstall: bool = False,
     with_goal_bridge: bool = False,
+    with_agy_mcp: bool = False,
+    with_agy_hooks: bool = False,
     surfaces: list[str] | None = None,
     cli_bin: str = "loopx",
     include_legacy_aliases: bool = True,
@@ -823,16 +1079,45 @@ def install_slash_commands(
     opencode_home: str | None = None,
     gemini_home: str | None = None,
     cursor_home: str | None = None,
+    zcode_home: str | None = None,
+    zcode_agents_home: str | None = None,
+    agy_home: str | None = None,
+    agy_goal_id: str | None = None,
+    agy_agent_id: str | None = None,
+    agy_conversation_id: str | None = None,
+    agy_runtime_root: str | None = None,
+    agy_registry: str | None = None,
+    kiro_home: str | None = None,
     pi_project: str | None = None,
+    pi_scope: str = "project",
+    pi_user_home: str | None = None,
 ) -> dict[str, Any]:
-    specs = _command_prompt_specs(cli_bin=cli_bin, include_legacy_aliases=include_legacy_aliases)
+    facade_specs = _command_prompt_specs(cli_bin=cli_bin, include_legacy_aliases=True)
+    agy_facade_specs = _command_prompt_specs(
+        cli_bin=cli_bin,
+        include_legacy_aliases=True,
+        host_surface="antigravity-app",
+    )
+    canonical_specs = [spec for spec in facade_specs if "alias_for" not in spec]
+    legacy_alias_specs = [spec for spec in facade_specs if "alias_for" in spec]
+    specs = facade_specs if include_legacy_aliases else canonical_specs
     effective_surfaces = _normalize_surfaces(surfaces)
     codex_root = _codex_home(codex_home)
     claude_root = _claude_home(claude_home)
     opencode_root = _opencode_home(opencode_home)
     gemini_root = _gemini_home(gemini_home)
     cursor_root = _cursor_home(cursor_home)
+    zcode_root = _zcode_home(zcode_home or zcode_agents_home)
+    agy_root = _agy_home(agy_home)
+    agy_config_root = _antigravity_config_home(agy_home)
+    kiro_root = _kiro_home(kiro_home)
+    if pi_scope not in {"project", "user"}:
+        raise ValueError("pi_scope must be 'project' or 'user'")
     pi_project_root = Path(pi_project or ".").expanduser().resolve()
+    pi_agent_dir = _pi_agent_dir(pi_user_home)
+    pi_extension_root = _pi_extension_root(
+        pi_project_root, scope=pi_scope, agent_dir=pi_agent_dir
+    )
     installed: list[dict[str, Any]] = []
 
     if with_goal_bridge and "opencode" not in effective_surfaces:
@@ -849,12 +1134,26 @@ def install_slash_commands(
             }
         )
 
+    codex_reconciliation = None
     if "codex" in effective_surfaces:
+        # Codex exposes canonical skills only; retire its older managed facade,
+        # metadata and custom-prompt paths without creating replacements.
+        codex_specs = canonical_specs
+        legacy_specs = legacy_alias_specs
+        for spec in legacy_specs:
+            for path in (codex_root / "skills" / spec["name"] / "SKILL.md",
+                         codex_root / "skills" / spec["name"] / "agents" / "openai.yaml",
+                         codex_root / "prompts" / f"{spec['name']}.md"):
+                status = _retire_managed_file(path, execute=execute)
+                if status:
+                    installed.append({"surface": "codex", "mechanism": "retired_codex_legacy_alias",
+                                      "command": spec["command"], "path": str(path),
+                                      "status": status, "invoke_as": []})
         prompt_dir = codex_root / "prompts"
-        for spec in specs:
+        for spec in codex_specs:
             prompt_path = prompt_dir / f"{spec['name']}.md"
             if uninstall:
-                retire_status = _retire_status(prompt_path, execute=execute)
+                retire_status: str | None = _retire_status(prompt_path, execute=execute)
                 installed.append(
                     {
                         "surface": "codex",
@@ -882,19 +1181,9 @@ def install_slash_commands(
                 )
 
         skill_dir = codex_root / "skills"
-        workflow_owned = workflow_owned_skill_ids(skill_dir)
-        for spec in specs:
+        for spec in codex_specs:
             skill_path = skill_dir / str(spec["name"]) / "SKILL.md"
             metadata_path = skill_path.parent / "agents" / "openai.yaml"
-            owned_by_workflow = str(spec["name"]) in workflow_owned
-            if uninstall and owned_by_workflow:  # its workflow-skill install removes it
-                installed.extend(
-                    {"surface": "codex", "host_surfaces": ["codex-cli", "codex-ide-plugin", "codex-app", "codex-app-ssh"],
-                     "mechanism": mechanism, "command": spec["command"], "path": str(path),
-                     "status": "managed_by_workflow_skills", "invoke_as": [f"${spec['name']}", "/skills"]}
-                    for mechanism, path in (("codex_explicit_skills", skill_path), ("codex_skill_openai_metadata", metadata_path))
-                )
-                continue
             if uninstall:
                 skill_status = _retire_status(skill_path, execute=execute)
                 installed.append(
@@ -921,11 +1210,8 @@ def install_slash_commands(
                     }
                 )
                 continue
-            if owned_by_workflow:  # the workflow-skill install is the authoritative writer
-                skill_status = "managed_by_workflow_skills"
-            else:
-                skill_content = _command_skill_content(spec, surface="codex-skills")
-                skill_status = _target_status(skill_path, skill_content, execute=execute)
+            skill_content = _command_skill_content(spec, surface="codex-skills")
+            skill_status = _target_status(skill_path, skill_content, execute=execute)
             installed.append(
                 {
                     "surface": "codex",
@@ -939,7 +1225,7 @@ def install_slash_commands(
             )
             if skill_status not in {"skipped_user_file", "preserved_existing_loopx_skill"}:
                 display_name = (
-                    "LoopX" if spec["command"] == "/loopx" else f"LoopX {spec['command']}"
+                    "LoopX" if spec["name"] == "loopx" else "LoopX " + str(spec["name"])[6:].replace("-", " ").title().replace("Pr ", "PR ")
                 )
                 metadata = _openai_skill_metadata(
                     command=str(spec["command"]),
@@ -972,7 +1258,7 @@ def install_slash_commands(
                             "invoke_as": [],
                         }
                     )
-        for spec in specs:
+        for spec in codex_specs:
             installed.append(
                 {
                     "surface": "codex",
@@ -997,93 +1283,23 @@ def install_slash_commands(
                 }
             )
 
+        if not uninstall:
+            codex_reconciliation = retire_duplicate_managed_skills(
+                skill_dir, execute=execute, retire_legacy_aliases=True,
+            )
+
     if "claude-code" in effective_surfaces:
-        skills_dir = claude_root / "skills"
-        for spec in specs:
-            path = skills_dir / str(spec["name"]) / "SKILL.md"
-            if uninstall:
-                status = _retire_status(path, execute=execute)
-                installed.append(
-                    {
-                        "surface": "claude-code",
-                        "mechanism": "claude_code_skills",
-                        "command": spec["command"],
-                        "path": str(path),
-                        "status": status,
-                        "invoke_as": [str(spec["command"])],
-                    }
-                )
-                continue
-            content = _skill_body(
-                command=str(spec["command"]),
-                title=f"LoopX {spec['command']}",
-                description=str(spec["description"]),
-                argument_hint=str(spec["argument_hint"]),
-                instructions=list(spec["instructions"]),
-                surface="claude-skills",
-                front_matter_name=str(spec["name"]),
-            )
-            status = _target_status(path, content, execute=execute)
-            installed.append(
-                {
-                    "surface": "claude-code",
-                    "mechanism": "claude_code_skills",
-                    "command": spec["command"],
-                    "path": str(path),
-                    "status": status,
-                    "invoke_as": [str(spec["command"])],
-                }
-            )
-
-    def _install_skill_facade(
-        *,
-        skills_dir: Path,
-        surface: str,
-        host_surfaces: list[str],
-        mechanism: str,
-        invoke_prefix: str = "",
-    ) -> None:
-        """Write the command facade as SKILL.md files under `skills_dir`.
-
-        Claude Code, Gemini CLI and Cursor all discover user skills the same
-        way — a directory per skill with SKILL.md front matter — so the body is
-        identical and only the root differs.
-        """
-        for spec in specs:
-            path = skills_dir / str(spec["name"]) / "SKILL.md"
-            if uninstall:
-                installed.append(
-                    {
-                        "surface": surface,
-                        "host_surfaces": list(host_surfaces),
-                        "mechanism": mechanism,
-                        "command": spec["command"],
-                        "path": str(path),
-                        "status": _retire_status(path, execute=execute),
-                        "invoke_as": [],
-                    }
-                )
-                continue
-            content = _skill_body(
-                command=str(spec["command"]),
-                title=f"LoopX {spec['command']}",
-                description=str(spec["description"]),
-                argument_hint=str(spec["argument_hint"]),
-                instructions=list(spec["instructions"]),
-                surface="claude-skills",
-                front_matter_name=str(spec["name"]),
-            )
-            installed.append(
-                {
-                    "surface": surface,
-                    "host_surfaces": list(host_surfaces),
-                    "mechanism": mechanism,
-                    "command": spec["command"],
-                    "path": str(path),
-                    "status": _target_status(path, content, execute=execute),
-                    "invoke_as": [f"{invoke_prefix}{spec['name']}"],
-                }
-            )
+        _install_skill_facade(
+            specs=facade_specs,
+            installed=installed,
+            skills_dir=claude_root / "skills",
+            surface="claude-code",
+            host_surfaces=["claude-code"],
+            mechanism="claude_code_skills",
+            execute=execute,
+            uninstall=uninstall,
+            invoke_prefix="/",
+        )
 
     if "gemini" in effective_surfaces:
         # Gemini CLI discovers user skills from GEMINI_HOME/skills. Files are
@@ -1093,10 +1309,149 @@ def install_slash_commands(
         # status and the dry run that every other surface reports — and it would
         # need the `gemini` binary on PATH to install a file it already has.
         _install_skill_facade(
+            specs=facade_specs,
+            installed=installed,
             skills_dir=gemini_root / "skills",
             surface="gemini",
             host_surfaces=["gemini-cli"],
             mechanism="gemini_cli_skills",
+            execute=execute,
+            uninstall=uninstall,
+        )
+
+    if "agy" in effective_surfaces:
+        # Antigravity CLI discovers global skills from the fixed
+        # ~/.gemini/antigravity-cli/skills root using the documented flat
+        # layout (one <name>.md per skill). When --agy-home is not explicitly
+        # overriding the root, also populate Antigravity 2.0's directory-based
+        # ~/.gemini/config/skills/<name>/SKILL.md root so both Antigravity App
+        # and legacy CLI work out of the box.
+        _install_skill_facade(
+            specs=agy_facade_specs,
+            installed=installed,
+            skills_dir=agy_root / "skills",
+            surface="agy",
+            host_surfaces=["agy"],
+            mechanism="agy_cli_skills",
+            execute=execute,
+            uninstall=uninstall,
+            flat=True,
+        )
+        if agy_home is None and "antigravity-app" not in effective_surfaces:
+            _install_skill_facade(
+                specs=agy_facade_specs,
+                installed=installed,
+                skills_dir=agy_config_root / "skills",
+                surface="antigravity-app",
+                host_surfaces=["antigravity-app", "agy"],
+                mechanism="antigravity_app_skills",
+                execute=execute,
+                uninstall=uninstall,
+                invoke_prefix="/",
+            )
+
+    if "antigravity-app" in effective_surfaces:
+        _install_skill_facade(
+            specs=agy_facade_specs,
+            installed=installed,
+            skills_dir=agy_config_root / "skills",
+            surface="antigravity-app",
+            host_surfaces=["antigravity-app", "agy"],
+            mechanism="antigravity_app_skills",
+            execute=execute,
+            uninstall=uninstall,
+            invoke_prefix="/",
+        )
+
+    if ("antigravity-app" in effective_surfaces or "agy" in effective_surfaces) and with_agy_mcp:
+        agy_mcp_path = agy_config_root / ANTIGRAVITY_MCP_CONFIG_FILENAME
+        mcp_status = _merge_managed_mcp_json(
+            config_path=agy_mcp_path,
+            marker_schema_version=ANTIGRAVITY_MCP_MARKER_SCHEMA_VERSION,
+            invalid_status="blocked_invalid_antigravity_mcp_json",
+            command_factory=lambda: _loopx_mcp_command(),
+            uninstall=uninstall,
+            execute=execute,
+        )
+        installed.append(
+            {
+                "surface": "antigravity-app",
+                "host_surfaces": ["antigravity-app", "agy"],
+                "mechanism": "antigravity_mcp_server",
+                "command": "loopx",
+                "path": str(agy_mcp_path),
+                "status": mcp_status,
+                "invoke_as": [],
+            }
+        )
+
+    if ("antigravity-app" in effective_surfaces or "agy" in effective_surfaces) and with_agy_hooks:
+        agy_hooks_path = agy_config_root / ANTIGRAVITY_HOOKS_CONFIG_FILENAME
+        hooks_status = _merge_managed_hooks_json(
+            config_path=agy_hooks_path,
+            cli_bin=cli_bin,
+            uninstall=uninstall,
+            execute=execute,
+            goal_id=agy_goal_id,
+            agent_id=agy_agent_id,
+            runtime_root=agy_runtime_root,
+            conversation_id=agy_conversation_id,
+            registry=agy_registry,
+        )
+        installed.append(
+            {
+                "surface": "antigravity-app",
+                "host_surfaces": ["antigravity-app", "agy"],
+                "mechanism": "antigravity_stop_recovery_hook",
+                "command": "loopx",
+                "path": str(agy_hooks_path),
+                "status": hooks_status,
+                "invoke_as": [],
+            }
+        )
+
+    if "kiro-cli" in effective_surfaces:
+        # Kiro CLI discovers global skills from <KIRO_HOME>/skills/<name>/SKILL.md
+        # (workspace skills live in .kiro/skills), and exposes every discovered
+        # skill as a `/<skill-name>` slash command. KIRO_HOME is the host's own
+        # override for that global root, so the resolver honours it: installing
+        # into ~/.kiro while the active profile lives elsewhere would report a
+        # success the running host never discovers. A same-named user prompt in
+        # .kiro/prompts wins over a skill by Kiro's own resolution order; the
+        # installer never touches the prompt directories.
+        _install_skill_facade(
+            specs=facade_specs,
+            installed=installed,
+            skills_dir=kiro_root / "skills",
+            surface="kiro-cli",
+            host_surfaces=["kiro-cli"],
+            mechanism="kiro_cli_skills",
+            execute=execute,
+            uninstall=uninstall,
+            invoke_prefix="/",
+        )
+        # Kiro's default agent loads KIRO_HOME/settings/mcp.json, so the same
+        # session that runs `/loopx` gets the typed should_run/claim/complete
+        # tools without switching agents. Only the `loopx` key is touched.
+        kiro_mcp_path = kiro_root / _KIRO_MCP_CONFIG_SUBPATH
+        status = _merge_managed_mcp_json(
+            config_path=kiro_mcp_path,
+            marker_schema_version=KIRO_CLI_MCP_MARKER_SCHEMA_VERSION,
+            invalid_status="blocked_invalid_kiro_cli_mcp_json",
+            command_factory=lambda: _kiro_cli_mcp_command(),
+            uninstall=uninstall,
+            execute=execute,
+        )
+        installed.append(
+            {
+                "surface": "kiro-cli",
+                "host_surfaces": ["kiro-cli"],
+                "mechanism": "kiro_cli_mcp_server",
+                "command": "loopx",
+                "path": str(kiro_mcp_path),
+                "status": status,
+                "invoke_as": [],
+            }
         )
 
     if "cursor" in effective_surfaces:
@@ -1104,15 +1459,27 @@ def install_slash_commands(
         # include .claude/skills and .codex/skills, but relying on another
         # host's directory would break the moment that host is uninstalled).
         _install_skill_facade(
+            specs=facade_specs,
+            installed=installed,
             skills_dir=cursor_root / "skills",
             surface="cursor",
             host_surfaces=["cursor-agent"],
             mechanism="cursor_skills",
+            execute=execute,
+            uninstall=uninstall,
         )
         # `cursor-agent mcp` can list and enable servers but not add them, so
         # the entry is merged into CURSOR_HOME/mcp.json. Only our own `loopx`
         # key is touched — a user's other servers are left exactly as they are.
-        status = _merge_cursor_mcp(cursor_root, uninstall=uninstall, execute=execute)
+        status = _merge_managed_mcp_json(
+            config_path=cursor_root / "mcp.json",
+            marker_schema_version=CURSOR_MCP_MARKER_SCHEMA_VERSION,
+            invalid_status="blocked_invalid_cursor_mcp_json",
+            # Late-bound so tests can stub provisioning on the module.
+            command_factory=lambda: _loopx_mcp_command(),
+            uninstall=uninstall,
+            execute=execute,
+        )
         installed.append(
             {
                 "surface": "cursor",
@@ -1125,15 +1492,33 @@ def install_slash_commands(
             }
         )
 
+    if "zcode" in effective_surfaces:
+        # ZCode discovers user skills from ZCODE_HOME/skills (default ~/.zcode/skills).
+        _install_skill_facade(
+            specs=facade_specs,
+            installed=installed,
+            skills_dir=zcode_root / "skills",
+            surface="zcode",
+            host_surfaces=["zcode"],
+            mechanism="zcode_skills",
+            execute=execute,
+            uninstall=uninstall,
+            invoke_prefix="$",
+        )
+
     if "opencode" in effective_surfaces:
         # OpenCode reads global skills from OPENCODE_CONFIG_DIR/skills. The
         # static command facade below stays as it is — a command is something
         # the user types, a skill is something the model can reach for itself.
         _install_skill_facade(
+            specs=facade_specs,
+            installed=installed,
             skills_dir=opencode_root / "skills",
             surface="opencode",
             host_surfaces=["opencode"],
             mechanism="opencode_skills",
+            execute=execute,
+            uninstall=uninstall,
         )
         commands_dir = opencode_root / "commands"
         plugin_path = opencode_root / "plugins" / "loopx-goal.js"
@@ -1321,11 +1706,15 @@ def install_slash_commands(
                 )
 
     if "pi" in effective_surfaces:
-        extension_path = _pi_extension_path(pi_project_root)
-        runtime_path = _pi_runtime_path(pi_project_root)
+        extension_path = _pi_extension_path(pi_extension_root, scope=pi_scope)
+        runtime_path = _pi_runtime_path(pi_extension_root)
         extension_content = pi_extension_source()
         runtime_content = pi_runtime_source()
         if uninstall:
+            # Uninstall stays per-file like every other surface: LoopX-managed
+            # files are removed and a user-owned file is reported as skipped.
+            # Aborting the whole scope instead would leave the managed adapter
+            # loaded and remove the only supported way to uninstall it.
             for mechanism, path in (
                 ("pi_goal_extension", extension_path),
                 ("pi_goal_extension_runtime", runtime_path),
@@ -1395,6 +1784,11 @@ def install_slash_commands(
         status = str(item["status"])
         status_counts[status] = status_counts.get(status, 0) + 1
 
+    pi_target_note = (
+        "the user agent dir <agent-dir>/extensions/loopx/ (scope=user)"
+        if pi_scope == "user"
+        else "the project's .pi/extensions/ (scope=project)"
+    )
     return {
         "ok": not any(status.startswith("blocked_") for status in status_counts),
         "schema_version": SCHEMA_VERSION,
@@ -1414,12 +1808,37 @@ def install_slash_commands(
             "gemini_skill_dir": str(gemini_root / "skills") if "gemini" in effective_surfaces else None,
             "cursor_skill_dir": str(cursor_root / "skills") if "cursor" in effective_surfaces else None,
             "cursor_mcp_path": str(cursor_root / "mcp.json") if "cursor" in effective_surfaces else None,
+            "zcode_skill_dir": str(zcode_root / "skills") if "zcode" in effective_surfaces else None,
+            "agy_skill_dir": str(agy_root / "skills") if "agy" in effective_surfaces else None,
+            "antigravity_app_skill_dir": (
+                str(agy_config_root / "skills")
+                if (
+                    "antigravity-app" in effective_surfaces
+                    or ("agy" in effective_surfaces and agy_home is None)
+                )
+                else None
+            ),
+            "antigravity_mcp_path": (
+                str(agy_config_root / ANTIGRAVITY_MCP_CONFIG_FILENAME)
+                if with_agy_mcp
+                and ("antigravity-app" in effective_surfaces or "agy" in effective_surfaces)
+                else None
+            ),
+            "antigravity_hooks_path": (
+                str(agy_config_root / ANTIGRAVITY_HOOKS_CONFIG_FILENAME)
+                if with_agy_hooks
+                and ("antigravity-app" in effective_surfaces or "agy" in effective_surfaces)
+                else None
+            ),
+            "kiro_cli_skill_dir": str(kiro_root / "skills") if "kiro-cli" in effective_surfaces else None,
+            "kiro_cli_mcp_path": str(kiro_root / _KIRO_MCP_CONFIG_SUBPATH) if "kiro-cli" in effective_surfaces else None,
             "opencode_skill_dir": str(opencode_root / "skills") if "opencode" in effective_surfaces else None,
             "opencode_command_dir": str(opencode_root / "commands") if "opencode" in effective_surfaces else None,
             "opencode_plugin_path": str(opencode_root / "plugins" / "loopx-goal.js") if "opencode" in effective_surfaces and with_goal_bridge else None,
             "opencode_package_path": str(opencode_root / "package.json") if "opencode" in effective_surfaces and with_goal_bridge else None,
-            "pi_extension_path": str(_pi_extension_path(pi_project_root)) if "pi" in effective_surfaces else None,
-            "pi_runtime_path": str(_pi_runtime_path(pi_project_root)) if "pi" in effective_surfaces else None,
+            "pi_scope": pi_scope if "pi" in effective_surfaces else None,
+            "pi_extension_path": str(_pi_extension_path(pi_extension_root, scope=pi_scope)) if "pi" in effective_surfaces else None,
+            "pi_runtime_path": str(_pi_runtime_path(pi_extension_root)) if "pi" in effective_surfaces else None,
             "status_counts": status_counts,
             "skip_policy": (
                 "Uninstall removes only LoopX-managed files; user files without a LoopX managed marker are preserved"
@@ -1428,15 +1847,20 @@ def install_slash_commands(
             ),
         },
         "installed": installed,
+        "codex_skill_reconciliation": codex_reconciliation,
         "notes": [
             "Codex does not currently support user-defined native top-level slash commands; use explicit skill invocation through `$loopx` or `/skills`.",
+            "Every host skill root installs canonical facades only and retires managed /loop-global-* alias skills. Use /loopx-global-* instead on skill-backed slash hosts, including Claude Code and Kiro. Only OpenCode retains independently installed native alias command files when legacy aliases are enabled; catalog aliases remain available.",
             "Explicit LoopX command-facade skills use agents/openai.yaml policy allow_implicit_invocation=false and remain distinct from richer workflow skills such as loopx-project.",
             "Claude Code discovers user skills from CLAUDE_HOME/skills and exposes each skill name as a slash command.",
             "Gemini CLI discovers user skills from GEMINI_HOME/skills with the same SKILL.md front matter; files are written directly because `gemini skills install` copies from a git URL or an existing local path and hands the copy to the host, which would lose the managed marker, per-file status and dry-run reporting every other surface has.",
             "Cursor discovers skills from CURSOR_HOME/skills and has no user-defined slash commands, so the cursor surface installs the skill facade and registers the LoopX MCP server in CURSOR_HOME/mcp.json; run `cursor-agent mcp enable loopx` once to approve it.",
+            "ZCode discovers user skills from ZCODE_HOME/skills (default ~/.zcode/skills) and exposes each skill for invocation via `$skill-name` or Settings -> Skills.",
+            "Antigravity CLI discovers global skills from the fixed ~/.gemini/antigravity-cli/skills root using the documented flat layout (one <name>.md per skill); the agy surface is opt-in and offers no home override because the host documents none.",
+            f"Kiro CLI discovers global skills from {_KIRO_SKILLS_ROOT_LABEL}/<name>/SKILL.md (default ~/.kiro/skills) and exposes each as a `/<skill-name>` slash command; the kiro-cli surface is opt-in and resolves KIRO_HOME so install and uninstall target the profile the running host reads. Kiro resolves .kiro/prompts and KIRO_HOME/prompts before skills, so a same-named user prompt shadows the managed skill. The kiro-cli surface also registers the LoopX MCP server in KIRO_HOME/settings/mcp.json; it acts only for a session whose KIRO_SESSION_ID start-goal bound to a registered agent.",
             "OpenCode discovers global skills from OPENCODE_CONFIG_DIR/skills in addition to the static command facade; a command is typed by the user, a skill can be reached by the model itself.",
             "The default all surface installs only OpenCode's static command facade; the executable goal bridge requires --with-goal-bridge.",
-            "The Pi surface is opt-in and installs the self-contained goal extension and its loop runtime into the project's .pi/extensions/; it is not part of the default all surface.",
+            f"The Pi surface is opt-in and installs the self-contained goal extension and its loop runtime into {pi_target_note}; it is not part of the default all surface.",
             "The OpenCode goal bridge uses Bun-managed config-directory dependencies and must replace any direct goal-plugin registration.",
             "OpenCode bridge uninstall preserves package.json dependencies because they may be shared by user-owned local plugins.",
             "Uninstall is fail-closed: it retires only files carrying the LoopX managed marker and leaves user-owned files in place.",
@@ -1457,6 +1881,10 @@ def render_slash_command_install_markdown(payload: dict[str, Any]) -> str:
     codex_prompt_dir = payload.get("summary", {}).get("codex_prompt_dir")
     codex_skill_dir = payload.get("summary", {}).get("codex_skill_dir")
     claude_skill_dir = payload.get("summary", {}).get("claude_skill_dir")
+    gemini_skill_dir = payload.get("summary", {}).get("gemini_skill_dir")
+    cursor_skill_dir = payload.get("summary", {}).get("cursor_skill_dir")
+    zcode_skill_dir = payload.get("summary", {}).get("zcode_skill_dir")
+    kiro_cli_skill_dir = payload.get("summary", {}).get("kiro_cli_skill_dir")
     opencode_command_dir = payload.get("summary", {}).get("opencode_command_dir")
     opencode_plugin_path = payload.get("summary", {}).get("opencode_plugin_path")
     if codex_prompt_dir:
@@ -1465,6 +1893,14 @@ def render_slash_command_install_markdown(payload: dict[str, Any]) -> str:
         lines.append(f"- codex skills: `{codex_skill_dir}`")
     if claude_skill_dir:
         lines.append(f"- claude skills: `{claude_skill_dir}`")
+    if gemini_skill_dir:
+        lines.append(f"- gemini skills: `{gemini_skill_dir}`")
+    if cursor_skill_dir:
+        lines.append(f"- cursor skills: `{cursor_skill_dir}`")
+    if zcode_skill_dir:
+        lines.append(f"- zcode skills: `{zcode_skill_dir}`")
+    if kiro_cli_skill_dir:
+        lines.append(f"- kiro-cli skills: `{kiro_cli_skill_dir}`")
     if opencode_command_dir:
         lines.append(f"- opencode commands: `{opencode_command_dir}`")
     if opencode_plugin_path:

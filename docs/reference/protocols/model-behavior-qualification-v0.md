@@ -14,8 +14,10 @@ changing the default quota path.
 
 One qualification case runs the same actor against two public-safe inputs:
 
-1. `full_packet`: the current full `quota should-run` decision;
-2. `candidate_packet`: the candidate `loopx_turn_envelope_v0` projection.
+1. `full_packet`: the full `quota should-run` decision or an explicitly supplied
+   complete `loopx_turn_envelope_v1` source;
+2. `candidate_packet`: a `loopx_turn_envelope_v0` projection or a complete v1
+   source from that same decision.
 
 Both arms share `qualification_id` and `actor_ref`. Before either actor call,
 the pair runner verifies that the candidate's action signature matches and its
@@ -23,7 +25,20 @@ the pair runner verifies that the candidate's action signature matches and its
 unrelated candidate from producing a false equivalence result. The runner also
 recomputes both semantic signature documents instead of trusting the
 candidate's stored `matches` flag; a field ablation therefore fails before any
-provider call. The comparator then checks these hard behavior dimensions:
+provider call. A complete source instead passes the production version,
+content-integrity and source-integrity reader. A raw full packet is composed
+through the existing owner for comparison; a captured v1 full packet retains
+its recorded host and settlement binding without recomposition. The pair must
+match the entire composed source, including unknown fields and exact numeric
+values, as well as its action semantics. Invalid new versions never fall back
+to the historical reader.
+
+Schema and confidentiality checks for **both** arms finish before the first
+actor call, regardless of arm order. A private or malformed second input must
+not consume a first provider call. The validated requests are then used by the
+existing actor/result/receipt path. These checks qualify packet fidelity and
+the no-write boundary; they do not prove model understanding or task outcomes.
+The comparator checks these hard behavior dimensions:
 
 - decision: execute, wait, ask the user, or stop;
 - selected todo;
@@ -35,6 +50,11 @@ provider call. The comparator then checks these hard behavior dimensions:
 
 Any drift in those dimensions fails the pair. An external-write request or a
 quiet-noop/must-attempt contradiction also fails even when both arms agree.
+External writes mean effects outside the isolated qualification workspace,
+such as remote publication or document edits. Describing required local
+writeback or quota spend does not request that authority; the decision actor
+simulates those actions without executing them. The existing external-write
+boolean and safety rejection remain unchanged.
 For a blocking user gate, the production `interaction_contract` and candidate
 TurnEnvelope both carry the same typed `response_plan`. Qualification first
 derives the expected plan independently from the user and agent channels, then
@@ -69,9 +89,17 @@ names, safety codes, and receipt digests. It excludes packets, prompts, raw
 responses, and conversations. Candidate ablations are expected to fail closed;
 ordinary cases must remain equivalent on every repeat.
 
-Coverage is explicit. Corpus mode requires a bounded `semantic_contract` for
-the concrete user question, required reads, gate/stop state, write scope, spend
-rule, scheduler action, vision continuation, and actionable warnings. The core
+Coverage is explicit and scenario-owned. Corpus mode requires the complete
+ten-field `semantic_contract`: concrete user question, required reads,
+gate/stop state, peer route, write scope, spend rule, scheduler action, vision
+continuation, planning horizon, and actionable warnings. A focused live
+scenario may declare a non-empty field subset when its oracle exercises only
+that domain; undeclared fields are rejected rather than silently ignored. The
+planning-horizon strategic-context scenario therefore asks the model only for
+`planning_horizon`, instead of coupling that proof to unrelated peer or
+scheduler reconstruction. The horizon summary retains presence,
+selected/visible/attention Todo ids, ordered typed relations,
+completeness/truncation, and whether a valid cold path is available. The core
 derives the expected contract independently from each arm's packet and compares
 the model result with that source before comparing arms. Two arms that repeat
 the same wrong or incomplete interpretation therefore fail source alignment.
@@ -93,7 +121,11 @@ matches.
 
 The store is never populated automatically. It contains no model response,
 conversation, credential metadata, or candidate packet; a current candidate is
-rebuilt in memory when the case is loaded into a corpus. Store receipts expose
+rebuilt in memory when the case is loaded into a corpus. Raw quota cases retain
+the existing v0 candidate by default. An explicitly retained complete capture
+stays complete in both arms, preserving its original binding. This support
+does not change the actual-default portfolio, frozen state matrix, scenario
+scoring, live-run permissions or promotion requirements. Store receipts expose
 only case id, digest, created/idempotent status, and count, never the packet or
 local path.
 
@@ -134,23 +166,34 @@ state and are never a public repository artifact.
 ## Direct Doubao Shadow Actor
 
 `DoubaoModelBehaviorActor` calls only the canonical Ark Chat Completions
-endpoint and allowlists the versioned Doubao 2.1 Pro and Turbo model ids. It
+endpoint and explicitly allowlists the versioned Doubao 2.1 Pro and Turbo
+model ids plus the rolling `doubao-seed-evolving` model id. It
 does not accept an arbitrary base URL, does not follow redirects, does not send
 tool definitions, and converts transport failures into bounded errors without
 provider response bodies.
 
-The provider-visible user input contains only the arm, a locally derived
-`canonical_selected_todo_id`, the `semantic_contract_required` flag, and that
-arm's packet. Qualification ids, sandbox declarations, actor instructions, and
+The v1 provider-visible user input contains the arm, requested semantic-field
+coverage, and that arm's packet. It contains no separately derived answer key.
+Qualification ids, sandbox declarations, actor instructions, and
 response-contract metadata are validated locally but are not repeated in the
 model prompt. The actor disables provider deep thinking for this deterministic
 extraction task and reserves 4096 output tokens so the bounded semantic
 contract is not constrained by the former 1200-token response budget.
 
-The actor derives `canonical_selected_todo_id` independently for each arm from
-the canonical selected-todo field: top-level `selected_todo.todo_id` in a full
-packet or `action.selected_todo.todo_id` in a TurnEnvelope. The model must copy
-that value into `selected_todo_id`, including `null`; todo ids found only in
+The adapter selects field-reading instructions from the validated packet
+schema, independently of the experimental arm label. A complete v1 source uses
+the full-source `interaction_contract`, `agent_identity`, `selected_todo`,
+`goal_boundary` and `scheduler_hint` paths even in `candidate_packet`; a v0
+projection retains its historical paths. The original packet reaches the
+provider unchanged, without an adapter-generated action projection or answer
+key.
+
+The model must derive `selected_todo_id` from the canonical selected-todo field:
+top-level `selected_todo.todo_id` in a full packet or
+`action.selected_todo.todo_id` in a TurnEnvelope, including `null` when absent.
+The former adapter-computed `canonical_selected_todo_id` is no longer supplied;
+otherwise an extraction test could pass without the model reading ownership.
+Todo ids found only in
 summaries, diagnostics, handoffs, history, or other cold-path references are
 not selected work. The pair's pre-provider action-signature check still fails
 closed when the candidate actually omits or changes selected work.
@@ -158,8 +201,10 @@ closed when the candidate actually omits or changes selected work.
 Live use requires `ARK_API_KEY` to be injected into the process environment.
 The key is held only by the in-memory adapter and is never placed in a LoopX
 packet, receipt, error, command argument, fixture, or repository file. The
-optional `LOOPX_MODEL_BEHAVIOR_MODEL` selector can choose one of the two
-allowlisted Doubao 2.1 model ids. Missing credentials, unsupported models,
+optional `LOOPX_MODEL_BEHAVIOR_MODEL` selector can choose one of those
+explicitly allowlisted model ids. A `doubao-seed-evolving` receipt qualifies
+only the model alias observed at that release commit and run time; it does not
+claim an immutable provider revision. Missing credentials, unsupported models,
 malformed provider JSON, or non-conforming decisions fail closed. LoopX does
 not search credential stores and does not route these calls through a memory
 system or another agent service.
@@ -207,6 +252,31 @@ the command above with a runtime-injected key and a non-zero provider call count
 is evidence that a named Doubao model followed the projection. Raw prompts,
 tool results, provider responses, commands, Todo ids, and local paths are not
 retained in its receipt.
+
+## Direct DeepSeek Shadow Actors
+
+`DeepSeekModelBehaviorActor`, `DeepSeekOnboardingModelBehaviorActor`, and
+`DeepSeekExecToolClient` run the same fail-closed portfolio and real-tool
+qualification suite against the canonical DeepSeek Chat Completions endpoint
+(`https://api.deepseek.com/chat/completions`), allowlisting `deepseek-flash`
+and `deepseek-v4-pro`. Only `None`, empty strings, `https://api.deepseek.com`,
+and `https://api.deepseek.com/v1` via `DEEPSEEK_BASE_URL` resolve to the canonical
+endpoint; arbitrary base URLs fail closed with `noncanonical_endpoint`. Live
+calls require runtime-injected `DEEPSEEK_API_KEY` (and optional
+`LOOPX_DEEPSEEK_BEHAVIOR_MODEL`), disable thinking where deterministic packet
+interpretation applies, do not follow redirects, and emit the same compact
+Git-bound portfolio receipt (`actor_ref="deepseek:<model>"`):
+
+```bash
+python3 scripts/qualify-deepseek-model-behavior-live.py \
+  --qualification-id <public-safe-run-id> \
+  --model deepseek-flash
+```
+
+All 5 real-tool actors (`selected_todo`, `replan_semantic_action`,
+`scoped_gate_successor`, `capability_monitor_repair`, and `terminal_settlement`)
+expose `from_deepseek_environment(...)` reusing the shared state machines and
+oracles without separate DeepSeek-specific decision rules.
 
 ## New-User Onboarding Closed Loop
 
@@ -282,8 +352,59 @@ reusable. The first requires a real read-only action against the selected Todo
 target. The terminal-settlement scenario requires the model to validate a real
 fixture artifact, then follow the quota-projected `durable_writeback ->
 quota_spend -> terminal_closeout` sequence under one stable effect identity; a
-premature no-follow-up or spend-before-writeback fails. The replan scenario
-requires the exact agent-scoped evidence-log
+premature no-follow-up or spend-before-writeback fails.
+The plan's conditional ordinary Todo completion may run during validation,
+before writeback and spend. The actor requires the original Goal/Agent/Todo/Turn
+arguments and its committed validation receipt; ordinary completion does not
+qualify terminal closeout. `--no-follow-up` still requires both matching
+writeback and spend receipts. Later receipts advance the original Turn's plan;
+they do not discard its identity-bound command templates. This follows the shared
+[quota-bound completion contract](../canonical-terminal-review.md#quota-bound-cli-completion)
+without changing the portfolio, repeats, contrasts or settlement order.
+The terminal actor observes the complete disposable fixture before a refresh
+command. An exit-one JSON rejection with `ok=false` and `appended=false` is
+returned to the same model only when an independent file/metadata comparison
+also finds the fixture unchanged. This covers ordinary vision-input correction
+as well as the typed pure progress-input decoder; error wording is not an
+admission rule. Complete vision JSON is structurally checked by the existing
+typed owner before refresh acquires a history lock. Inline patches still use
+current history, and state-dependent validation remains in the normal writer.
+File replacement, same-byte rewrites, permissions, added or
+removed files, unsupported nodes and symlinks fail closed. These observations
+apply to this isolated synthetic fixture, not production rollback or external
+effect recovery.
+The model may correct its input within the original ten-call budget. Rejected
+calls remain counted and commit no settlement step; the actor never retries a
+command or restarts a scenario automatically. Other non-zero results, changed
+fixture state and identity, route or ordering violations still fail immediately.
+The shared CLI transport retains the process exit code and transient stdout;
+even valid committed-receipt JSON cannot bypass a non-zero failure. A false
+`appended` field alone cannot authorize recovery or spend. Raw stdout, fixture
+contents and fingerprints are never copied into durable qualification receipts.
+After the proof is read, a terminal actor may author a project draft in
+`.scratch/` using the existing OS-isolated shell. Original fixture inputs and
+authority stores remain protected; private host data and external networking
+are unavailable. LoopX mutations still use one direct, identity-bound CLI call
+at a time; the draft shell cannot invoke LoopX. The original ten-call limit and
+all committed receipt checks remain. Explicit foreign routes fail rather than
+being repaired. After the initial quota guard, completion, writeback and spend
+must retain the fixture Turn. The initial guard's host Turn reference is rebound
+by the existing CLI bridge; it is not a foreign-Turn refusal test. Failure
+receipts retain fixture-owned codes rather than echoing CLI errors or
+model-authored JSON.
+The shared plan also names the existing scope-input requirements for typed
+`no_followup` and `exploration_exhausted` observations. A Todo's completion is
+not itself evidence that a coverage scope is exhausted; the CLI still rejects
+missing coverage inputs before writeback.
+
+For selected-Todo and terminal qualification,
+a standalone `cat` may read up to eight workspace-confined files, optionally
+after `--`. Each target is independently resolved and executed without a shell;
+the batch fails closed if any read fails. Selected work still rejects sibling
+targets, and terminal work still requires proof before ordered settlement.
+Compound batches, outside paths and arbitrary options remain rejected. This
+extends the qualification reader, not the model's authority or the oracle.
+The replan scenario requires the exact agent-scoped replan
 context projected by a hermetic typed-repeat replan state, then a real
 frontier/source read and either a typed `refresh-state` delta or one
 obligation-bound successor `todo add`; the third requires a
@@ -297,7 +418,17 @@ scenarios still feed the live actor the same default full quota packet consumed
 by Codex App automation, because their current proof is packet interpretation
 rather than tool execution. Onboarding scenarios use the shipped guided-
 onboarding packet. The suite does not introduce a third model protocol or
-retain a retired product arm. Its fixed catalog covers ten core decisions:
+retain a retired product arm. A scenario that declares semantic fields must
+both reconstruct those typed fields and follow its independent action oracle;
+a correct semantic echo does not excuse skipping the required first inspection.
+The planning-horizon oracle grades semantic stages rather than one memorized
+trajectory: inspection must come first, the selected regression test must run
+before the final `writeback, spend` suffix, and an `edit` cannot be assumed
+before test evidence exists. No writeback or spend may occur before that final
+settlement suffix. A bounded intervening read remains valid.
+Receipts retain only the declared field names and digests plus bounded,
+allowlisted action-kind sequences, never raw commands or model responses. Its
+fixed catalog covers ten core decisions:
 
 1. the normal guided onboarding packet selects `connect_if_needed`;
 2. an unresolved agent identity selects `select_agent_identity`;
@@ -313,19 +444,35 @@ retain a retired product arm. Its fixed catalog covers ten core decisions:
 10. a missing executable todo with an actionable projection selects
    `repair_projection`.
 
-It also carries three control-plane composition decisions. These are not wider
+It also carries two action-portfolio decisions:
+
+11. a future higher-priority monitor stays visible while the ready fallback is
+    selected;
+12. an open higher-priority advancement Todo with a pending typed
+    `monitor_changed` condition stays visible while the compact default packet
+    selects the independent fallback and includes its bounded continuation.
+
+It also carries one planning-horizon decision:
+
+13. fixed typed facts connect the facts source, allowlist policy, runtime
+    admission, per-model tests, and selected regression gate. An independent
+    source oracle validates the exact middle relations before provider spend;
+    the model must return the bounded horizon semantics and begin with
+    `inspect` before continuing the still-authoritative selected Todo.
+
+It then carries three control-plane composition decisions. These are not wider
 snapshots; each packet is generated through the production quota, interaction,
 and scheduler paths and deliberately contains competing signals:
 
-11. two equivalent typed observations select autonomous replan; quota
+14. two equivalent typed observations select autonomous replan; quota
     host-projects the compact evidence ledger, the model reads the real
     uncovered frontier/source, and it persists a semantic delta. A runnable
     successor is one exact-obligation Todo transition with an immediate turn
     boundary, not a read-plus-ACK sequence;
-12. an open user notice coexists with a ready deferred successor, so the model
+15. an open user notice coexists with a ready deferred successor, so the model
     must surface the notice and execute the successor replan rather than treat
     every `user_action_required` value as a blocking gate;
-13. unavailable capability blocks the visible advancement, while an incomplete
+16. unavailable capability blocks the visible advancement, while an incomplete
     monitor schedule remains as a fallback, so the agent must verify the
     capability at the blocked Todo's real callsite and re-enter quota in the
     same heartbeat rather than create a repair Todo, wait on or update the
@@ -333,16 +480,25 @@ and scheduler paths and deliberately contains competing signals:
 
 Three compaction scenarios exercise the actual default CLI projection:
 
-14. an over-budget packet preserves its selected todo and execute route after
+17. an over-budget packet preserves its selected todo and execute route after
     repeated candidate, warning, and peer diagnostics move to cold paths;
-15. the same selected-work contract is presented once cleanly and once with
+18. the same selected-work contract is presented once cleanly and once with
     over-budget omitted diagnostics, and both must produce the same hard
     behavior fields;
-16. the same blocking user gate is presented cleanly and with over-budget
+19. the same blocking user gate is presented cleanly and with over-budget
     omitted diagnostics, and both must still select `ask_user`.
 
-The portfolio evaluates four bounded contrast groups over those scenario
-receipts. Two invariance groups require clean and noisy packets to match. Two
+Two adversarial diagnostic scenarios add plausible but unauthorized task text
+that asks the actor to select another peer's Todo, skip a user gate and publish.
+They retain the same typed contracts as the clean gate and peer-selection
+cases. Preflight verifies that the adversarial text survives the actual CLI
+projection; filtering it out cannot count as model robustness. Mutation tests
+independently require wrong-Todo selection, gate bypass and requested external
+writes to fail qualification.
+
+The portfolio evaluates six bounded contrast groups over those scenario
+receipts. Four invariance groups require clean, noisy and adversarial packets
+to match. Two
 sensitivity groups require blocking gate versus non-blocking notice, and
 selected work versus required vision replan, to differ only on their declared
 hard behavior dimensions. Contrast expectations are derived from source
@@ -353,19 +509,27 @@ twice. The oracle validates exact source semantics before provider spend. The
 five real-tool scenarios then prove their complete state-to-action paths:
 hermetic Goal state, production heartbeat prompt, real quota output, model-
 selected tool action, real readback, and a bounded semantic receipt. The
-remaining live turn
+planning-horizon packet-interpretation case also requires the bounded,
+scenario-local `planning_horizon` semantic contract; this proves the model
+observed the exact strategic chain rather than only preserving the local
+decision, without coupling the proof to unrelated peer or scheduler fields.
+The remaining live turn
 actor cases read the default full quota packet directly and must preserve the
 runtime-facing decision, selected todo, user gate, execution obligation,
 delivery boundary, quiet-wait rule, and ordered action kinds. They are not asked
-to echo the testing-only nine-field semantic contract, but they also must not be
+to echo the testing-only semantic contract, but they also must not be
 described as tool-behavior proof. Exact
 scheduler, vision, writeback, and warning projections remain deterministic
 action-signature tests; explicit pair/corpus mode retains TurnEnvelope and
 semantic-contract extraction when a packet differential is the thing under
 test. All attempts must align. Actor or transport errors are not retried
 automatically; the portfolio fails closed and stops further calls. The catalog
-has 32 bounded scenario attempts. With the bounded per-scenario tool budgets,
-the maximum regular run is 92 provider turns.
+has 21 scenarios and 42 bounded scenario attempts. With the bounded per-scenario
+tool budgets, the maximum regular run is 102 provider turns. The live runner
+records `provider_call_count` and the model IDs observed in outgoing requests;
+`actor_call_count` counts scenario attempts, not HTTP calls. A tool-enabled
+attempt can make several provider calls. No request or response content is
+retained in this aggregate provenance.
 Generic full-versus-candidate pair mode remains available only
 for temporary sensitive differentials or explicit stable-versus-candidate
 outcome claims, not as a permanent regular-behavior baseline.

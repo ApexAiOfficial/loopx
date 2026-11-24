@@ -24,14 +24,16 @@ delivery promise, a release plan, or a replacement for shipped contracts.
   [Current technical directions and known limitations](https://github.com/huangruiteng/loopx/discussions/2851)
   Discussion is the community-facing projection of this page.
 
-Use these maturity terms consistently:
+Merged active RFCs are Accepted and claimable under the [RFC lifecycle contract](../architecture/rfcs/README.md#how-to-read-this-index). Claiming work does not satisfy live qualification, spending, deployment or promotion gates.
+
+Use these delivery maturity terms consistently:
 
 | Stage | Meaning |
 | --- | --- |
 | Shipped / hardening | The behavior or architectural contract is in `main`; work improves reliability, parity, or usability. |
 | Incubating / qualification | A real candidate exists, but compatibility, evidence, or promotion gates remain. |
 | Active research | The program is running evidence-producing experiments; results do not automatically become defaults or product claims. |
-| Draft | Design review is welcome; implementation starts only from an agreed smallest useful slice. |
+| Design accepted / implementation pending | The merged RFC is a qualified design basis and bounded work may be claimed; implementation and promotion evidence remain separate. |
 | Held | The direction remains visible, but implementation should not begin until the stated gate changes. |
 
 ## Stable Foundation: Control-Plane Reliability
@@ -39,18 +41,20 @@ Use these maturity terms consistently:
 Goals, typed todos, quota, scheduler hints, evidence, Effect Program
 settlement, recovery, and host parity remain the shared substrate under every
 strategic program. Their reliability work continues through the
-[Contributor Task Board](https://github.com/huangruiteng/loopx/blob/main/docs/development/contributor-tasks.md)
+[Contributor Task Board](https://github.com/loopx-project/loopx/blob/main/docs/development/contributor-tasks.md)
 and the `control-plane`
 label. It is ongoing product hardening, not a competing source of direction.
+
+Cross-domain ordering, complete RFC coverage and product acceptance are maintained in the [LoopX overall roadmap](../architecture/rfcs/loopx-overall-roadmap-v0.md). This page retains contribution routing; S streams, G milestones and R cards do not replace domain contracts or actual Todos.
 
 ## Strategic Programs
 
 | Direction | Outcome | Stage | Start here |
 | --- | --- | --- | --- |
 | Long-Horizon Benchmarks and Evidence | Produce benchmark-native, reproducible evidence for long-horizon capability and use controlled tasks to study mechanisms. | Active research | [Tracker #3243](https://github.com/huangruiteng/loopx/issues/3243) · [RFC](../architecture/rfcs/long-horizon-harness-benchmark-research-program-v0.md) |
-| Reliability Diagnostics and Governed Delivery | Prove an observer-first product entry that diagnoses long-running workflows without changing agent execution, then adds authority only at accepted seams. | Draft product direction / delivery qualification | [RFC](../architecture/rfcs/long-running-agent-reliability-diagnostics-governed-delivery-v0.md) |
-| Operator Surface and IM Integration | Make goals, sessions, decisions, evidence, and bounded collaboration legible through a coherent operator workspace. | Incubating on an integration branch | [Tracker #3244](https://github.com/huangruiteng/loopx/issues/3244) · [integration branch](https://github.com/huangruiteng/loopx/tree/frontend-control-plane-im-prototype-rfc) |
-| Shared Goal Authority and Cross-host Coordination | Coordinate explicitly shared goals across hosts without turning a provider or host session into control-plane authority. | Draft contract / provider qualification | [Tracker #3245](https://github.com/huangruiteng/loopx/issues/3245) · [RFC](../architecture/rfcs/shared-goal-authority-state-provider-v0.md) |
+| Reliability Diagnostics and Governed Delivery | Prove an observer-first product entry that diagnoses long-running workflows without changing agent execution, then adds authority only at accepted seams. | Design accepted / delivery qualification | [RFC](../architecture/rfcs/long-running-agent-reliability-diagnostics-governed-delivery-v0.md) |
+| Operator Surface and IM Integration | Make goals, sessions, decisions, evidence, and bounded collaboration legible through a coherent operator workspace. | Partial delivery / unified-journey qualification | [Tracker #3244](https://github.com/huangruiteng/loopx/issues/3244) · [integration branch](https://github.com/huangruiteng/loopx/tree/frontend-control-plane-im-prototype-rfc) |
+| Shared Goal Authority and Cross-host Coordination | Coordinate explicitly shared goals across hosts without turning a provider or host session into control-plane authority. | Design accepted / provider qualification | [Tracker #3245](https://github.com/huangruiteng/loopx/issues/3245) · [RFC](../architecture/rfcs/shared-goal-authority-state-provider-v0.md) |
 | Architecture and Research Incubator | Qualify architectural changes and research mechanisms before they expand production scope. | Mixed; see the portfolio below | [Tracker #3246](https://github.com/huangruiteng/loopx/issues/3246) · [RFC index](../architecture/rfcs/README.md) |
 
 ## Long-Horizon Benchmarks And Evidence
@@ -72,7 +76,7 @@ official scoring, and unpublished comparisons remain maintainer-owned.
 
 ## Reliability Diagnostics And Governed Delivery
 
-This product direction turns the broader commercialization thesis into a
+A default-off L1 prototype and DSH event adapter exist in the [capability README](../../loopx/capabilities/reliability_diagnostics/README.md); C0/C1 and overhead qualification remain open. This product direction turns the broader commercialization thesis into a
 bounded entry offer. Its first operating level is a shadow observer between a
 native harness and full LoopX adoption: it consumes one-way events, writes an
 independent diagnostic ledger, and may not inject prompts, schedule, retry,
@@ -89,13 +93,7 @@ service before the promotion gates pass.
 
 ## Operator Surface And IM Integration
 
-The current frontend and IM work is an incubation program, not shipped `main`
-behavior. The primary implementation package is
-[#3167](https://github.com/huangruiteng/loopx/pull/3167), led by
-[`@maxliux5`](https://github.com/maxliux5), on the
-[`frontend-control-plane-im-prototype-rfc`](https://github.com/huangruiteng/loopx/tree/frontend-control-plane-im-prototype-rfc)
-integration branch. [#3200](https://github.com/huangruiteng/loopx/pull/3200)
-is a separate event-driven proposal currently under requested changes.
+At `f1166e81e`, local steward chat, executor settings, team-plan confirmation, attached/managed foundations and partial Lark verticals exist on `main`. The complete cross-entry execution/recovery journey remains unqualified. [#3167](https://github.com/huangruiteng/loopx/pull/3167) and its integration branch are historical incubation inputs, not evidence that every current frontend is unshipped. Use the [Desktop RFC](../architecture/rfcs/desktop-execution-frontends-v0.md), selected release artifact and roadmap S4/S5 entrypoint qualification.
 
 Promotion to `main` follows this ledger:
 
@@ -109,7 +107,7 @@ Promotion to `main` follows this ledger:
 
 `@maxliux5` is the current implementation lead, not a repository-wide
 maintainer appointment. Lark-specific paths follow the subsystem review route
-recorded in [project governance](https://github.com/huangruiteng/loopx/blob/main/.github/GOVERNANCE.md);
+recorded in [project governance](https://github.com/loopx-project/loopx/blob/main/.github/GOVERNANCE.md);
 cross-subsystem
 and mainline promotion decisions remain with the lead maintainer.
 
@@ -121,25 +119,22 @@ the authority itself. Agents do not connect directly to NoKV. Run history,
 status, quota, scheduler state, host sessions, and evidence retain their
 existing owners.
 
-The next qualifying slice is provider-neutral: extract one compact
-command/precondition/receipt/outcome core, qualify a file-backed provider on
-the same `claim_work` contract, and prove target-scoped conflicts plus atomic
-original-receipt replay. Live NoKV qualification, renew/reclaim semantics,
-distributed quota, authentication, high availability, and broader state sync
-remain later explicit decisions.
+Provider-neutral stores, File/SQLite candidates, PostgreSQL conformance and in-process service admission/identity rotation already exist. Next are roadmap R5 local D1–D3 durability qualification and R6 authenticated real cross-host service, distributed budgets and recovery. Do not repeat the initial `claim_work` extraction or treat a service seam as a deployment. NoKV and other provider promotions retain their real-backend, compatibility, retention and explicit-approval gates.
 
 ## Architecture And Research Incubator
 
 | Exploration | Stage | Current entry | Implementation rule |
 | --- | --- | --- | --- |
+| Frontier science research portfolio | Design accepted / proposal only | [Bilingual RFC](../architecture/rfcs/frontier-science-research-program-v0.md) | Route ten tracks through existing owners; qualify sequential evidence, continuation compression and stride shadow experiments before active treatment. No research uplift or resource commitment is implied. |
 | Effect Program and settlement algebra | Accepted / runtime hardening | [RFC](../architecture/rfcs/agent-loop-effect-interpreter-v0.md) | Improve the shared typed contract and negative coverage; keep scheduler ownership and domain-local ACK semantics explicit. |
 | TypeScript control-plane migration | Accepted / transaction-payoff phase | [RFC](../architecture/rfcs/typescript-control-plane-migration-v0.md) | Cut over complete transactions, delete Python semantic/facade debt, and report bridge traffic plus migration economics; preserve delivery/vision decisions as domain-local reducers rather than generic Effect Program steps. |
 | Hierarchical agent stride | Active research | [#3203](https://github.com/huangruiteng/loopx/issues/3203) | Qualify read-only and shadow evidence before adaptive selection. |
-| Research exploration control plane | Draft / typed frontier | [RFC](../architecture/rfcs/research-exploration-control-plane-v0.md) | Keep Explore, goal-frontier, and execution authority separate. |
-| Human Attention Wishlist | Draft / non-blocking sidecar | [#3179](https://github.com/huangruiteng/loopx/issues/3179) | Do not change user gates, selected work, quota, or notification authority. |
-| Goal artifact lifecycle projection | Draft / read model | [RFC](../architecture/rfcs/goal-artifact-lifecycle-projection-v0.md) | Derive milestones and legal next transitions read-only before adding writes. |
-| Post-outcome memory utility | Draft / research | [#3214](https://github.com/huangruiteng/loopx/issues/3214) | Attribute utility only after verified outcomes; retrieval and model judgment remain advisory. |
-| Goal Channel and Agent IM/OpenViking boundaries | Draft / integration exploration | [RFC index](../architecture/rfcs/README.md) | Keep delivery, durable control state, and scoped context under separate owners. |
+| Research exploration control plane | Design accepted / typed frontier | [RFC](../architecture/rfcs/research-exploration-control-plane-v0.md) | Keep Explore, goal-frontier, and execution authority separate. |
+| Human Attention Wishlist | Design accepted / non-blocking sidecar | [#3179](https://github.com/huangruiteng/loopx/issues/3179) | Do not change user gates, selected work, quota, or notification authority. |
+| Goal artifact lifecycle projection | Design accepted / read model | [RFC](../architecture/rfcs/goal-artifact-lifecycle-projection-v0.md) | Derive milestones and legal next transitions read-only before adding writes. |
+| Post-outcome memory utility | Design accepted / research | [#3214](https://github.com/huangruiteng/loopx/issues/3214) | Attribute utility only after verified outcomes; retrieval and model judgment remain advisory. |
+| Goal Channel and Agent IM/OpenViking boundaries | Design accepted / integration exploration | [RFC index](../architecture/rfcs/README.md) | Keep delivery, durable control state, and scoped context under separate owners. |
+| Agent session execution modes | Design accepted / cross-host admission contract | [RFC](../architecture/rfcs/agent-session-execution-modes-v0.md) | Require one explicit per-binding mode, one executor, and validated writeback before a host binds sessions; keep Desktop product flows, service lifecycle, and continuation in their owning documents. |
 
 An exploration becomes implementation-ready only when it has a real caller or
 compatibility contract, an agreed smallest slice, and focused qualification.
@@ -148,10 +143,14 @@ describes a possible future.
 
 ## Contribution And Governance Loop
 
+The [first-review roster](../../.github/GOVERNANCE.md#first-review-responsibilities)
+routes module-level feedback and records pending scope invitations. It does
+not change the stages, promotion gates or implementation authorization here.
+
 1. Choose the closest direction tracker and read its current stage and
    boundary.
 2. Find a bounded task on the
-   [Contributor Task Board](https://github.com/huangruiteng/loopx/blob/main/docs/development/contributor-tasks.md),
+   [Contributor Task Board](https://github.com/loopx-project/loopx/blob/main/docs/development/contributor-tasks.md),
    or open a contributor
    task issue that names the direction, intended base branch, smallest slice,
    non-goals, and validation.

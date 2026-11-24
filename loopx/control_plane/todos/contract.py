@@ -1,20 +1,37 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import TypedDict
 from urllib.parse import quote, unquote
 
 from ...repository_identity import normalize_repository_identity
 from .completion_state import (
     normalize_todo_completion_continuation,
     normalize_todo_completion_recovery,
-    normalize_todo_no_followup,
+    normalize_todo_no_followup as normalize_todo_no_followup,
     require_todo_completion_metadata,
 )
+from .resume_condition import (
+    TODO_RESUME_KIND_CAPACITY_AVAILABLE as TODO_RESUME_KIND_CAPACITY_AVAILABLE,
+    TODO_RESUME_KIND_MONITOR_CHANGED as TODO_RESUME_KIND_MONITOR_CHANGED,
+    TODO_RESUME_KIND_PR_MERGED as TODO_RESUME_KIND_PR_MERGED,
+    TODO_RESUME_KIND_RESUME_AT as TODO_RESUME_KIND_RESUME_AT,
+    TODO_RESUME_KIND_TODO_DONE as TODO_RESUME_KIND_TODO_DONE,
+    TODO_RESUME_KIND_VALUES as TODO_RESUME_KIND_VALUES,
+    normalize_supported_todo_resume_when as normalize_supported_todo_resume_when,
+    normalize_todo_generation as normalize_todo_generation,
+    normalize_todo_resume_when as normalize_todo_resume_when,
+    require_supported_todo_resume_when as require_supported_todo_resume_when,
+)
 
+
+_READ_LEGACY_CODEC = json.loads(Path(__file__).with_name("read_legacy_codec.json").read_text(encoding="utf-8"))
 
 TODO_TASK_PATTERN = re.compile(r"^\s*[-*]\s+\[([ xX-])\]\s+(.+?)\s*$")
 TODO_METADATA_PATTERN = re.compile(r"^\s*<!--\s*loopx:(?:todo\s+)?(?P<body>.*?)\s*-->\s*$")
@@ -31,23 +48,11 @@ TODO_CAPABILITY_BINDING_REF_PATTERN = re.compile(
 )
 TODO_REPLAN_OBLIGATION_ID_PATTERN = re.compile(r"^replan-[a-f0-9]{16}$")
 TODO_EXPLORE_RESULT_NODE_REF_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,95}$")
-TODO_EXPLORE_RESULT_NODE_REF_LIMIT = 8
 TODO_DECISION_SCOPE_KEY_PATTERN = re.compile(r"^(?:\*|[a-z0-9][a-z0-9_.:@*/-]{0,95})$")
-TODO_RESUME_KIND_TODO_DONE = "todo_done"
-TODO_RESUME_KIND_PR_MERGED = "pr_merged"
-TODO_RESUME_KIND_CAPACITY_AVAILABLE = "capacity_available"
-TODO_RESUME_KIND_VALUES = {
-    TODO_RESUME_KIND_TODO_DONE,
-    TODO_RESUME_KIND_PR_MERGED,
-    TODO_RESUME_KIND_CAPACITY_AVAILABLE,
-}
-TODO_RESUME_WHEN_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}(?::[a-z0-9_.:@-]{1,96})?$")
-TODO_RESUME_PR_MERGED_PATTERN = re.compile(
-    r"^pr_merged:(?:(?:[a-z0-9_.-]{1,80})/(?:[a-z0-9_.-]{1,100}))?#[1-9][0-9]{0,8}$"
-)
 TODO_WRITE_SCOPE_MAX_CHARS = 160
 TODO_MONITOR_METADATA_FIELDS = (
     "target_key",
+    "monitor_effect_id",
     "cadence",
     "next_due_at",
     "expires_at",
@@ -55,12 +60,15 @@ TODO_MONITOR_METADATA_FIELDS = (
     "result_hash",
     "consecutive_no_change",
     "material_change",
+    "material_change_generation",
+    "material_change_scope",
+    "material_change_scope_generations",
     "max_no_change_before_replan",
     "watch_only",
 )
 
 
-def normalize_todo_watch_only(value: Any) -> bool | None:
+def normalize_todo_watch_only(value: object) -> bool | None:
     if value is True or str(value or "").strip().lower() == "true":
         return True
     if value is False or str(value or "").strip().lower() == "false":
@@ -137,32 +145,8 @@ TODO_STATUS_VALUES = {
 TODO_TERMINAL_STATUS_VALUES = {TODO_STATUS_DONE, TODO_STATUS_DEFERRED}
 TODO_LEGACY_TERMINAL_STATUS_VALUES = {"completed", "closed", "archived"}
 
-TODO_ACTION_KIND_ADVANCEMENT_VALUES = {
-    "advance",
-    "analyze",
-    "benchmark_run",
-    "codex_run",
-    "compact_blocker_writeback",
-    "compare",
-    "execute",
-    "fix",
-    "implement",
-    "rebuild",
-    "rebuild_score",
-    "repair",
-    "run",
-    "run_eval",
-    "test",
-    "validate",
-    "writeback",
-}
-TODO_ACTION_KIND_MONITOR_VALUES = {
-    "external_evidence",
-    "monitor",
-    "observe",
-    "poll",
-    "watch",
-}
+TODO_ACTION_KIND_ADVANCEMENT_VALUES = set(_READ_LEGACY_CODEC["advancement_actions"])
+TODO_ACTION_KIND_MONITOR_VALUES = set(_READ_LEGACY_CODEC["monitor_actions"])
 
 
 class TodoContinuationPolicy(str, Enum):
@@ -179,44 +163,12 @@ TODO_REMOVED_REVIEW_CONTINUATION_POLICY_VALUES = {
 }
 
 
-TODO_HARD_MONITOR_PATTERNS = (
-    re.compile(r"(?i)\bdo not\b.*\b(?:launch|run|execute|start)\b.*\buntil\b"),
-    re.compile(r"(?i)\b(?:only|just)\b.*\b(?:after|when|once)\b.*\b(?:owner|user|credential|approval|prerequisite|evidence)\b"),
-    re.compile(r"(?i)\b(?:credential|gcp|gcs|gcp_project|gcp_sa_key|gs://)\b.*\b(?:missing|required|provide|proof|prerequisite|gate|gated)\b"),
-    re.compile(r"(?i)\b(?:readiness|proof)\b.*\bbefore any formal\b.*\brun\b"),
-    re.compile(r"(?i)\bremaining formal\b.*\bpath\b"),
-    re.compile(r"(?i)\b(?:route|input)\b.*\babsent\b"),
-    re.compile(r"(?i)\b0\b.*\b(?:candidate|candidates)\b"),
-)
+TODO_HARD_MONITOR_PATTERNS = tuple(re.compile(pattern) for pattern in _READ_LEGACY_CODEC["TODO_HARD_MONITOR_PATTERNS"])
 
-TODO_ADVANCEMENT_OVERRIDE_PATTERNS = (
-    re.compile(
-        r"(?i)(?:^|[:：]\s*)(?:implement|add|make|fix|build|wire|define|compare|run|"
-        r"execute|test|validate|rebuild|repair|archive|publish|merge|write|attribute|"
-        r"collect|aggregate|generate|produce|materialize|rerun|repeat|eval|evaluate|score)\b"
-    ),
-    re.compile(
-        r"(?i)\b(?:implementation slice|validation-backed patch|smoke fixture|"
-        r"regression suite|readiness scan|source preflight|setup-readiness scan)\b"
-    ),
-)
-TODO_BLOCKED_MONITOR_PATTERNS = (
-    *TODO_HARD_MONITOR_PATTERNS,
-    re.compile(r"(?i)\b(?:blocked|gated|waiting)\b.*\b(?:owner|user|credential|substrate|proof|prerequisite|evidence)\b"),
-)
-TODO_MONITOR_PATTERNS = (
-    re.compile(r"(?i)\bdependency monitor\b"),
-    re.compile(r"(?i)\bobservation lane\b"),
-    re.compile(r"(?i)(?:^|[:：]\s*)observe\b"),
-    re.compile(r"(?i)(?:^|[:：]\s*)poll\b"),
-    re.compile(r"(?i)(?:^|[:：]\s*)watch\b"),
-    re.compile(r"(?i)\bmonitor-only\b"),
-    *TODO_BLOCKED_MONITOR_PATTERNS,
-)
-TODO_ADVANCEMENT_PATTERNS = (
-    *TODO_ADVANCEMENT_OVERRIDE_PATTERNS,
-    re.compile(r"(?i)\b(?:task|validation hypothesis|validation step|bounded step|learning run)\b"),
-)
+TODO_ADVANCEMENT_OVERRIDE_PATTERNS = tuple(re.compile(pattern) for pattern in _READ_LEGACY_CODEC["TODO_ADVANCEMENT_OVERRIDE_PATTERNS"])
+TODO_BLOCKED_MONITOR_PATTERNS = tuple(re.compile(pattern) for pattern in _READ_LEGACY_CODEC["TODO_BLOCKED_MONITOR_PATTERNS"])
+TODO_MONITOR_PATTERNS = tuple(re.compile(pattern) for pattern in _READ_LEGACY_CODEC["TODO_MONITOR_PATTERNS"])
+TODO_ADVANCEMENT_PATTERNS = tuple(re.compile(pattern) for pattern in _READ_LEGACY_CODEC["TODO_ADVANCEMENT_PATTERNS"])
 
 NEXT_ACTION_HARD_MONITOR_PATTERNS = (
     re.compile(r"(?i)\bdo not\b.*\b(?:launch|run|execute|start)\b.*\buntil\b"),
@@ -245,47 +197,74 @@ NEXT_ACTION_ADVANCEMENT_HINT_PATTERNS = (
 )
 
 
-def compact_todo_text(value: Any) -> str:
+def compact_todo_text(value: object) -> str:
     return " ".join(str(value or "").strip().split())
 
 
-def normalize_todo_action_kind(value: Any) -> str | None:
-    candidate = str(value or "").strip().lower()
-    if not candidate:
-        return None
-    if TODO_ACTION_KIND_PATTERN.match(candidate):
-        return candidate
-    return None
-
-
-def normalize_todo_task_domain(value: Any) -> str | None:
-    candidate = str(value or "").strip().lower()
-    if not candidate:
-        return None
-    if TODO_TASK_DOMAIN_PATTERN.fullmatch(candidate):
-        return candidate
-    return None
-
-
-def normalize_todo_replan_obligation_id(value: Any) -> str | None:
+def _match_token(
+    value: object,
+    pattern: re.Pattern[str],
+    *,
+    lower: bool = True,
+    full: bool = False,
+) -> str | None:
     candidate = str(value or "").strip()
+    if lower:
+        candidate = candidate.lower()
     if not candidate:
         return None
-    if TODO_REPLAN_OBLIGATION_ID_PATTERN.fullmatch(candidate):
-        return candidate
-    return None
+    matched = pattern.fullmatch(candidate) if full else pattern.match(candidate)
+    return candidate if matched else None
 
 
-def normalize_todo_capability_binding_ref(value: Any) -> str | None:
+def _choice_token(value: object, choices: set[str] | frozenset[str]) -> str | None:
     candidate = str(value or "").strip().lower()
-    if not candidate:
-        return None
-    if TODO_CAPABILITY_BINDING_REF_PATTERN.fullmatch(candidate):
-        return candidate
-    return None
+    return candidate if candidate in choices else None
 
 
-def normalize_todo_task_repository(value: Any) -> str | None:
+def _split_delimited_items(value: object, *, split_regex: bool = True) -> list[object]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    if split_regex:
+        return list(re.split(r"[,;|]", str(value or "")))
+    if isinstance(value, str):
+        return list(value.split(","))
+    return [value]
+
+
+def _dedupe_normalized(
+    raw_items: Iterable[object],
+    normalize: Callable[[object], str | None],
+) -> list[str]:
+    seen: set[str] = set()
+    items: list[str] = []
+    for raw in raw_items:
+        item = normalize(raw)
+        if item and item not in seen:
+            seen.add(item)
+            items.append(item)
+    return items
+
+
+def normalize_todo_action_kind(value: object) -> str | None:
+    return _match_token(value, TODO_ACTION_KIND_PATTERN)
+
+
+def normalize_todo_task_domain(value: object) -> str | None:
+    return _match_token(value, TODO_TASK_DOMAIN_PATTERN, full=True)
+
+
+def normalize_todo_replan_obligation_id(value: object) -> str | None:
+    return _match_token(value, TODO_REPLAN_OBLIGATION_ID_PATTERN, lower=False, full=True)
+
+
+def normalize_todo_capability_binding_ref(value: object) -> str | None:
+    return _match_token(value, TODO_CAPABILITY_BINDING_REF_PATTERN, full=True)
+
+
+def normalize_todo_task_repository(value: object) -> str | None:
     candidate = str(value or "").strip()
     if not candidate:
         return None
@@ -295,131 +274,63 @@ def normalize_todo_task_repository(value: Any) -> str | None:
         return None
 
 
-def normalize_todo_continuation_policy(value: Any) -> str | None:
-    candidate = str(value or "").strip().lower()
-    if candidate in TODO_CONTINUATION_POLICY_VALUES:
-        return candidate
-    return None
+def normalize_todo_continuation_policy(value: object) -> str | None:
+    return _choice_token(value, TODO_CONTINUATION_POLICY_VALUES)
 
 
-def normalize_removed_todo_continuation_policy(value: Any) -> str | None:
-    candidate = str(value or "").strip().lower()
-    if candidate in TODO_REMOVED_REVIEW_CONTINUATION_POLICY_VALUES:
-        return candidate
-    return None
+def normalize_removed_todo_continuation_policy(value: object) -> str | None:
+    return _choice_token(value, TODO_REMOVED_REVIEW_CONTINUATION_POLICY_VALUES)
 
 
-def resolve_todo_continuation_policy(
-    value: Any,
-    *,
-    action_kind: Any = None,
-) -> TodoContinuationPolicy:
-    del action_kind
-    explicit = normalize_todo_continuation_policy(value)
-    if explicit:
-        return TodoContinuationPolicy(explicit)
-    return TodoContinuationPolicy.INDEPENDENT_HANDOFF
-
-
-def normalize_todo_claimed_by(value: Any) -> str | None:
+def normalize_todo_claimed_by(value: object) -> str | None:
     candidate = compact_todo_text(value).lower().replace(" ", "-")
-    if candidate and TODO_AGENT_CLAIM_PATTERN.match(candidate):
-        return candidate
-    return None
+    return candidate if candidate and TODO_AGENT_CLAIM_PATTERN.match(candidate) else None
 
 
-def normalize_todo_blocks_agent(value: Any) -> str | None:
+def normalize_todo_blocks_agent(value: object) -> str | None:
     return normalize_todo_claimed_by(value)
 
 
-def normalize_todo_bound_agent(value: Any) -> str | None:
+def normalize_todo_bound_agent(value: object) -> str | None:
     return normalize_todo_claimed_by(value)
 
 
-def normalize_todo_goal_bound(value: Any) -> bool | None:
+def normalize_todo_goal_bound(value: object) -> bool | None:
     return normalize_todo_global_gate(value)
 
 
-def normalize_todo_excluded_agents(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        candidates = value.split(",")
-    elif isinstance(value, (list, tuple, set)):
-        candidates = list(value)
-    else:
-        candidates = [value]
-    return sorted(
-        {
-            agent_id
-            for candidate in candidates
-            for agent_id in [normalize_todo_claimed_by(candidate)]
-            if agent_id
-        }
-    )
-
-
-def require_todo_excluded_agents(
-    value: Any,
+def _normalize_todo_excluded_agents(
+    value: object,
     *,
+    strict: bool,
     field: str = "excluded_agents",
 ) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        candidates = value.split(",")
-    elif isinstance(value, (list, tuple, set)):
-        candidates = list(value)
-    else:
-        candidates = [value]
     normalized: set[str] = set()
-    for candidate in candidates:
+    for candidate in _split_delimited_items(value, split_regex=False):
         agent_id = normalize_todo_claimed_by(candidate)
         if not agent_id:
-            raise ValueError(
-                f"{field} must contain public-safe agent tokens such as codex-side-bypass"
-            )
+            if strict:
+                raise ValueError(
+                    f"{field} must contain public-safe agent tokens such as codex-side-bypass"
+                )
+            continue
         normalized.add(agent_id)
     return sorted(normalized)
 
 
-def normalize_todo_resume_when(value: Any) -> str | None:
-    candidate = compact_todo_text(value).lower()
-    if candidate and TODO_RESUME_PR_MERGED_PATTERN.match(candidate):
-        return candidate
-    if candidate and TODO_RESUME_WHEN_PATTERN.match(candidate):
-        return candidate
-    return None
+def normalize_todo_excluded_agents(value: object) -> list[str]:
+    return _normalize_todo_excluded_agents(value, strict=False)
 
 
-def normalize_supported_todo_resume_when(value: Any) -> str | None:
-    """Normalize resume conditions that LoopX can safely evaluate."""
-    candidate = normalize_todo_resume_when(value)
-    if not candidate:
-        return None
-    kind, separator, target = candidate.partition(":")
-    if kind == TODO_RESUME_KIND_TODO_DONE:
-        return candidate if separator and normalize_todo_id(target) else None
-    if kind == TODO_RESUME_KIND_PR_MERGED:
-        return candidate if TODO_RESUME_PR_MERGED_PATTERN.match(candidate) else None
-    if kind == TODO_RESUME_KIND_CAPACITY_AVAILABLE:
-        return candidate if separator and TODO_CAPABILITY_PATTERN.match(target) else None
-    return None
+def require_todo_excluded_agents(
+    value: object,
+    *,
+    field: str = "excluded_agents",
+) -> list[str]:
+    return _normalize_todo_excluded_agents(value, strict=True, field=field)
 
 
-def require_supported_todo_resume_when(value: Any) -> str | None:
-    if value is None or not str(value).strip():
-        return None
-    normalized = normalize_supported_todo_resume_when(value)
-    if normalized:
-        return normalized
-    raise ValueError(
-        "resume_when must use a supported condition: todo_done:<todo_id>, "
-        "pr_merged:[owner/repo]#<number>, or capacity_available:<capability>"
-    )
-
-
-def normalize_todo_global_gate(value: Any) -> bool | None:
+def normalize_todo_global_gate(value: object) -> bool | None:
     if isinstance(value, bool):
         return value
     candidate = compact_todo_text(value).lower()
@@ -430,14 +341,11 @@ def normalize_todo_global_gate(value: Any) -> bool | None:
     return None
 
 
-def normalize_todo_id(value: Any) -> str | None:
-    candidate = str(value or "").strip().lower()
-    if candidate and TODO_ID_PATTERN.match(candidate):
-        return candidate
-    return None
+def normalize_todo_id(value: object) -> str | None:
+    return _match_token(value, TODO_ID_PATTERN)
 
 
-def normalize_todo_id_list(value: Any) -> list[str]:
+def normalize_todo_id_list(value: object) -> list[str]:
     if value is None:
         return []
     raw_values = value if isinstance(value, (list, tuple, set)) else [value]
@@ -453,7 +361,7 @@ def normalize_todo_id_list(value: Any) -> list[str]:
     return todo_ids
 
 
-def merge_todo_id_lists(*values: Any) -> list[str]:
+def merge_todo_id_lists(*values: object) -> list[str]:
     todo_ids: list[str] = []
     for value in values:
         for todo_id in normalize_todo_id_list(value):
@@ -462,85 +370,59 @@ def merge_todo_id_lists(*values: Any) -> list[str]:
     return todo_ids
 
 
-def normalize_required_write_scopes(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        raw_values = [str(item or "") for item in value]
-    else:
-        raw_values = re.split(r"[,;|]", str(value or ""))
-    scopes: list[str] = []
-    seen: set[str] = set()
-    for raw in raw_values:
-        scope = compact_todo_text(raw)
-        if not scope:
-            continue
-        if len(scope) > TODO_WRITE_SCOPE_MAX_CHARS:
-            continue
-        if scope.startswith(("/", "~")) or ".." in scope.split("/"):
-            continue
-        if re.search(r"[\s<>]", scope):
-            continue
-        if scope in seen:
-            continue
-        seen.add(scope)
-        scopes.append(scope)
-    return scopes
+def _normalize_single_write_scope(raw: object) -> str | None:
+    scope = compact_todo_text(raw)
+    if (
+        not scope
+        or len(scope) > TODO_WRITE_SCOPE_MAX_CHARS
+        or scope.startswith(("/", "~"))
+        or ".." in scope.split("/")
+        or re.search(r"[\s<>]", scope)
+    ):
+        return None
+    return scope
 
 
-def normalize_required_capabilities(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        raw_values = [str(item or "") for item in value]
-    else:
-        raw_values = re.split(r"[,;|]", str(value or ""))
-    capabilities: list[str] = []
-    seen: set[str] = set()
-    for raw in raw_values:
-        capability = compact_todo_text(raw).lower().replace("-", "_").replace(" ", "_")
-        if not capability:
-            continue
-        if not TODO_CAPABILITY_PATTERN.match(capability):
-            continue
-        if capability in seen:
-            continue
-        seen.add(capability)
-        capabilities.append(capability)
-    return capabilities
+def _normalize_single_capability(raw: object) -> str | None:
+    capability = compact_todo_text(raw).lower().replace("-", "_").replace(" ", "_")
+    return capability if capability and TODO_CAPABILITY_PATTERN.match(capability) else None
 
 
-def normalize_target_capabilities(value: Any) -> list[str]:
+def _normalize_single_explore_ref(raw: object) -> str | None:
+    ref = compact_todo_text(raw)
+    return ref if ref and TODO_EXPLORE_RESULT_NODE_REF_PATTERN.match(ref) else None
+
+
+def normalize_required_write_scopes(value: object) -> list[str]:
+    return _dedupe_normalized(_split_delimited_items(value), _normalize_single_write_scope)
+
+
+def normalize_required_capabilities(value: object) -> list[str]:
+    return _dedupe_normalized(_split_delimited_items(value), _normalize_single_capability)
+
+
+def normalize_target_capabilities(value: object) -> list[str]:
     return normalize_required_capabilities(value)
 
 
-def normalize_explore_result_node_refs(value: Any) -> list[str]:
+def normalize_explore_result_node_refs(value: object) -> list[str]:
     """Normalize explicit public-safe Explore node ids attached to a todo."""
 
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        raw_values = [str(item or "") for item in value]
-    else:
-        raw_values = re.split(r"[,;|]", str(value or ""))
-    refs: list[str] = []
-    for raw in raw_values:
-        ref = compact_todo_text(raw)
-        if not ref or not TODO_EXPLORE_RESULT_NODE_REF_PATTERN.match(ref):
-            continue
-        if ref not in refs:
-            refs.append(ref)
-        if len(refs) >= TODO_EXPLORE_RESULT_NODE_REF_LIMIT:
-            break
-    return refs
+    return _dedupe_normalized(_split_delimited_items(value), _normalize_single_explore_ref)
+
+
+class ReplanSuccessorSemanticBinding(TypedDict, total=False):
+    action_kind: str
+    target_key: str
+    explore_result_node_refs: list[str]
 
 
 def replan_successor_semantic_binding(
     *,
-    action_kind: Any,
-    target_key: Any,
-    explore_result_node_refs: Any,
-) -> dict[str, Any] | None:
+    action_kind: object,
+    target_key: object,
+    explore_result_node_refs: object,
+) -> ReplanSuccessorSemanticBinding | None:
     """Return the typed executable identity of a replan successor.
 
     An obligation id establishes causality, but it does not turn a planning
@@ -555,7 +437,7 @@ def replan_successor_semantic_binding(
     )
     if not safe_action_kind or not (safe_target_key or safe_explore_refs):
         return None
-    binding: dict[str, Any] = {"action_kind": safe_action_kind}
+    binding: ReplanSuccessorSemanticBinding = {"action_kind": safe_action_kind}
     if safe_target_key:
         binding["target_key"] = safe_target_key
     if safe_explore_refs:
@@ -563,7 +445,11 @@ def replan_successor_semantic_binding(
     return binding
 
 
-def normalize_todo_decision_scope(value: Any) -> dict[str, str] | None:
+def _format_scope_identity(scope: Mapping[str, object]) -> str:
+    return f"{scope['kind']}:{scope['granularity']}:{scope['scope_key']}"
+
+
+def normalize_todo_decision_scope(value: object) -> dict[str, str] | None:
     """Normalize the compact decision-scope metadata token.
 
     Markdown todo metadata stores the v0 shape as
@@ -571,10 +457,10 @@ def normalize_todo_decision_scope(value: Any) -> dict[str, str] | None:
     active-state comments. Status and quota expose the normalized object.
     """
 
-    raw_kind: Any = None
-    raw_granularity: Any = None
-    raw_scope_key: Any = None
-    raw_decision_id: Any = None
+    raw_kind: object = None
+    raw_granularity: object = None
+    raw_scope_key: object = None
+    raw_decision_id: object = None
     if isinstance(value, dict):
         raw_kind = value.get("kind")
         raw_granularity = value.get("granularity")
@@ -609,12 +495,11 @@ def normalize_todo_decision_scope(value: Any) -> dict[str, str] | None:
     return payload
 
 
-def normalize_todo_decision_outcome(value: Any) -> str | None:
-    candidate = compact_todo_text(value).lower()
-    return candidate if candidate in TODO_DECISION_OUTCOME_VALUES else None
+def normalize_todo_decision_outcome(value: object) -> str | None:
+    return _choice_token(value, TODO_DECISION_OUTCOME_VALUES)
 
 
-def require_todo_decision_outcome(value: Any) -> str:
+def require_todo_decision_outcome(value: object) -> str:
     outcome = normalize_todo_decision_outcome(value)
     if not outcome:
         raise ValueError(
@@ -624,7 +509,7 @@ def require_todo_decision_outcome(value: Any) -> str:
     return outcome
 
 
-def require_todo_decision_scope(value: Any) -> dict[str, str]:
+def require_todo_decision_scope(value: object) -> dict[str, str]:
     scope = normalize_todo_decision_scope(value)
     if not scope:
         raise ValueError(
@@ -635,19 +520,13 @@ def require_todo_decision_scope(value: Any) -> dict[str, str]:
 
 
 def _normalize_todo_required_decision_scopes(
-    value: Any,
+    value: object,
     *,
     strict: bool,
 ) -> list[dict[str, str]]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        raw_values = list(value)
-    else:
-        raw_values = re.split(r"[,;|]", str(value or ""))
     scopes: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
-    for raw in raw_values:
+    for raw in _split_delimited_items(value):
         scope = normalize_todo_decision_scope(raw)
         if not scope:
             if strict:
@@ -664,45 +543,33 @@ def _normalize_todo_required_decision_scopes(
     return scopes
 
 
-def normalize_todo_required_decision_scopes(value: Any) -> list[dict[str, str]]:
+def normalize_todo_required_decision_scopes(value: object) -> list[dict[str, str]]:
     return _normalize_todo_required_decision_scopes(value, strict=False)
 
 
-def require_todo_required_decision_scopes(value: Any) -> list[dict[str, str]]:
+def require_todo_required_decision_scopes(value: object) -> list[dict[str, str]]:
     return _normalize_todo_required_decision_scopes(value, strict=True)
 
 
-def decision_scope_metadata_value(value: Any) -> str | None:
-    if value is None:
-        return None
-    scope = require_todo_decision_scope(value)
-    return f"{scope['kind']}:{scope['granularity']}:{scope['scope_key']}"
+def decision_scope_metadata_value(value: object) -> str | None:
+    return None if value is None else _format_scope_identity(require_todo_decision_scope(value))
 
 
-def required_decision_scopes_metadata_value(value: Any) -> str | None:
+def required_decision_scopes_metadata_value(value: object) -> str | None:
     if value is None:
         return None
     scopes = require_todo_required_decision_scopes(value)
-    if not scopes:
-        return None
-    return ",".join(
-        f"{scope['kind']}:{scope['granularity']}:{scope['scope_key']}"
-        for scope in scopes
-    )
+    return ",".join(_format_scope_identity(scope) for scope in scopes) or None
 
 
-def normalize_todo_decision_scope_outcomes(value: Any) -> list[dict[str, Any]]:
-    if value is None:
-        return []
-    raw_values = list(value) if isinstance(value, (list, tuple, set)) else [value]
-    if isinstance(value, str):
-        raw_values = [item for item in value.split(",") if item]
-    outcomes: list[dict[str, Any]] = []
+def normalize_todo_decision_scope_outcomes(value: object) -> list[dict[str, object]]:
+    raw_values = _split_delimited_items(value, split_regex=False)
+    outcomes: list[dict[str, object]] = []
     positions: dict[tuple[str, str, str], int] = {}
     for raw in raw_values:
-        raw_outcome: Any = None
-        raw_scope: Any = None
-        raw_source_todo_id: Any = None
+        raw_outcome: object = None
+        raw_scope: object = None
+        raw_source_todo_id: object = None
         if isinstance(raw, dict):
             raw_outcome = raw.get("outcome")
             raw_scope = raw.get("decision_scope") or raw.get("scope")
@@ -716,7 +583,7 @@ def normalize_todo_decision_scope_outcomes(value: Any) -> list[dict[str, Any]]:
         source_todo_id = normalize_todo_id(raw_source_todo_id)
         if not outcome or not scope or not source_todo_id:
             continue
-        payload = {
+        payload: dict[str, object] = {
             "schema_version": TODO_DECISION_SCOPE_OUTCOME_SCHEMA_VERSION,
             "outcome": outcome,
             "decision_scope": scope,
@@ -731,58 +598,47 @@ def normalize_todo_decision_scope_outcomes(value: Any) -> list[dict[str, Any]]:
     return outcomes
 
 
-def decision_scope_outcomes_metadata_value(value: Any) -> str | None:
+def _format_decision_scope_outcome_token(item: Mapping[str, object]) -> str:
+    raw_scope = item.get("decision_scope")
+    scope = raw_scope if isinstance(raw_scope, Mapping) else {}
+    return f"{item.get('outcome', '')}|{_format_scope_identity(scope)}|{item.get('source_todo_id', '')}"
+
+
+def decision_scope_outcomes_metadata_value(value: object) -> str | None:
     outcomes = normalize_todo_decision_scope_outcomes(value)
     if not outcomes:
         return None
-    return ",".join(
-        "|".join(
-            (
-                item["outcome"],
-                ":".join(
-                    (
-                        item["decision_scope"]["kind"],
-                        item["decision_scope"]["granularity"],
-                        item["decision_scope"]["scope_key"],
-                    )
-                ),
-                item["source_todo_id"],
-            )
-        )
-        for item in outcomes
-    )
+    return ",".join(_format_decision_scope_outcome_token(item) for item in outcomes)
 
 
 def build_todo_id(
     *,
-    role: Any,
-    source_section: Any,
-    index: Any,
-    text: Any,
+    role: object,
+    source_section: object,
+    index: object,
+    text: object,
 ) -> str:
     identity = "|".join(str(part or "") for part in (role, source_section, index, compact_todo_text(text)))
     return f"todo_{hashlib.sha1(identity.encode('utf-8')).hexdigest()[:12]}"
 
 
-def normalize_explicit_todo_task_class(value: Any) -> str | None:
-    candidate = str(value or "").strip().lower()
-    if candidate in TODO_TASK_CLASS_VALUES:
-        return candidate
-    return None
+def normalize_explicit_todo_task_class(value: object) -> str | None:
+    return _choice_token(value, TODO_TASK_CLASS_VALUES)
 
 
-def normalize_todo_status(value: Any) -> str | None:
-    candidate = str(value or "").strip().lower()
-    if candidate in TODO_STATUS_VALUES:
-        return candidate
-    return None
+def normalize_todo_status(value: object) -> str | None:
+    return _choice_token(value, TODO_STATUS_VALUES)
 
 
-def todo_done_for_status(status: Any) -> bool:
+def normalize_todo_role(value: object) -> str | None:
+    return _choice_token(value, {"user", "agent"})
+
+
+def todo_done_for_status(status: object) -> bool:
     return normalize_todo_status(status) in TODO_TERMINAL_STATUS_VALUES
 
 
-def todo_terminal_for_status(status: Any) -> bool:
+def todo_terminal_for_status(status: object) -> bool:
     candidate = str(status or "").strip().lower()
     return (
         normalize_todo_status(candidate) in TODO_TERMINAL_STATUS_VALUES
@@ -790,7 +646,7 @@ def todo_terminal_for_status(status: Any) -> bool:
     )
 
 
-def todo_status_from_marker(marker: Any) -> str:
+def todo_status_from_marker(marker: object) -> str:
     candidate = str(marker or "").strip().lower()
     if candidate == "x":
         return TODO_STATUS_DONE
@@ -799,7 +655,7 @@ def todo_status_from_marker(marker: Any) -> str:
     return TODO_STATUS_OPEN
 
 
-def todo_marker_for_status(status: Any) -> str:
+def todo_marker_for_status(status: object) -> str:
     normalized = normalize_todo_status(status) or TODO_STATUS_OPEN
     if normalized == TODO_STATUS_DEFERRED:
         return "-"
@@ -808,60 +664,56 @@ def todo_marker_for_status(status: Any) -> str:
     return " "
 
 
-def encode_metadata_value(value: Any) -> str:
-    compact = compact_todo_text(value)
-    return quote(compact, safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-")
+def encode_metadata_value(value: object, *, preserve_whitespace: bool = False) -> str:
+    text = str(value or "") if preserve_whitespace else compact_todo_text(value)
+    return quote(text, safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-")
 
 
-def decode_metadata_value(value: Any) -> str:
-    return compact_todo_text(unquote(str(value or "")))
+def decode_metadata_value(value: object, *, preserve_whitespace: bool = False) -> str:
+    text = unquote(str(value or ""))
+    return text if preserve_whitespace else compact_todo_text(text)
 
 
-def parse_todo_metadata_tokens(line: str) -> list[tuple[str, str]] | None:
-    match = TODO_METADATA_PATTERN.match(line)
-    if not match:
-        return None
-    return [
-        (
-            token.group("key"),
-            decode_metadata_value(token.group("value")),
-        )
-        for token in TODO_METADATA_TOKEN_PATTERN.finditer(match.group("body"))
-    ]
+MetadataValueNormalizer = Callable[[object], object]
+MetadataValueEncoder = Callable[[object], str | None]
+MetadataInvalidPredicate = Callable[[object], bool]
 
 
-MetadataValueNormalizer = Callable[[Any], Any]
-MetadataValueEncoder = Callable[[Any], str | None]
-MetadataInvalidPredicate = Callable[[Any], bool]
-
-
-def _truthy_value(value: Any) -> Any:
+def _truthy_value(value: object) -> object:
     return value if value else None
 
 
-def _nonempty_metadata_text(value: Any) -> str | None:
-    text = compact_todo_text(value)
-    return text or None
+def _nonempty_metadata_text(value: object) -> str | None:
+    return compact_todo_text(value) or None
 
 
-def _optional_output_bool(value: Any) -> bool | None:
+def _nonblank_verbatim_metadata_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        text = str(value or "")
+        return text if text.strip() else None
+    return value if value.strip() else None
+
+
+def _optional_output_bool(value: object) -> bool | None:
     return None if value is None else bool(value)
 
 
-def _metadata_bool_text(value: Any) -> str:
+def _metadata_bool_text(value: object) -> str:
     return "true" if value else "false"
 
 
-def _metadata_csv(value: Any) -> str:
-    return ",".join(str(item) for item in value)
+def _metadata_csv(value: object) -> str:
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+        return ",".join(str(item) for item in value)
+    return str(value or "")
 
 
-def _normalize_optional_decision_scope_for_write(value: Any) -> dict[str, str] | None:
+def _normalize_optional_decision_scope_for_write(value: object) -> dict[str, str] | None:
     return None if value is None else require_todo_decision_scope(value)
 
 
 def _normalize_optional_required_decision_scopes_for_write(
-    value: Any,
+    value: object,
 ) -> list[dict[str, str]]:
     return [] if value is None else require_todo_required_decision_scopes(value)
 
@@ -877,8 +729,9 @@ class _TodoMetadataField:
     read_fallback_key: str | None = None
     read_fallback_normalizer: MetadataValueNormalizer | None = None
     block_field: bool = True
+    preserve_whitespace: bool = False
 
-    def normalize_for_write(self, value: Any) -> Any:
+    def normalize_for_write(self, value: object) -> object:
         normalizer = self.write_normalizer or self.read_normalizer
         normalized = normalizer(value)
         if (
@@ -890,283 +743,206 @@ class _TodoMetadataField:
         return normalized
 
 
-def _metadata_value_is_present(value: Any) -> bool:
+def _metadata_value_is_present(value: object) -> bool:
     return value is not None and value != "" and value != []
 
 
+def _bool_field(key: str, read_normalizer: MetadataValueNormalizer) -> _TodoMetadataField:
+    return _TodoMetadataField(
+        key,
+        read_normalizer,
+        write_normalizer=_optional_output_bool,
+        encoder=_metadata_bool_text,
+        invalid_when=lambda value: value is not None,
+    )
+
+
+def _todo_id_message(key: str) -> str:
+    return f"{key} must use the public token shape todo_<letters-digits-underscore-hyphen>"
+
+
+def _csv_field(
+    key: str,
+    read_normalizer: MetadataValueNormalizer,
+    *,
+    write_normalizer: MetadataValueNormalizer | None = None,
+    invalid_message: str | None = None,
+) -> _TodoMetadataField:
+    return _TodoMetadataField(
+        key,
+        read_normalizer,
+        write_normalizer=write_normalizer,
+        encoder=_metadata_csv,
+        invalid_message=invalid_message,
+    )
+
+
 _TODO_METADATA_FIELD_SCHEMA = (
+    _TodoMetadataField("todo_id", normalize_todo_id, invalid_message=_todo_id_message("todo_id")),
     _TodoMetadataField(
-        "todo_id",
-        normalize_todo_id,
-        invalid_message=(
-            "todo_id must use the public token shape "
-            "todo_<letters-digits-underscore-hyphen>"
-        ),
+        "status", normalize_todo_status,
+        invalid_message="todo status must be one of: " + ", ".join(sorted(TODO_STATUS_VALUES)),
+    ),
+    _TodoMetadataField("role", normalize_todo_role, invalid_message="todo role must be one of: agent, user"),
+    _TodoMetadataField(
+        "task_class", normalize_explicit_todo_task_class,
+        invalid_message="todo task_class must be one of: " + ", ".join(sorted(TODO_TASK_CLASS_VALUES)),
     ),
     _TodoMetadataField(
-        "status",
-        normalize_todo_status,
-        invalid_message=(
-            "todo status must be one of: " + ", ".join(sorted(TODO_STATUS_VALUES))
-        ),
+        "action_kind", normalize_todo_action_kind,
+        invalid_message="todo action_kind must be a public-safe token: lowercase letters, digits, '_' or '-'",
     ),
     _TodoMetadataField(
-        "task_class",
-        normalize_explicit_todo_task_class,
-        invalid_message=(
-            "todo task_class must be one of: "
-            + ", ".join(sorted(TODO_TASK_CLASS_VALUES))
-        ),
+        "task_domain", normalize_todo_task_domain,
+        invalid_message="todo task_domain must be a public-safe token: lowercase letters, digits, '_', '-' or '.'",
     ),
     _TodoMetadataField(
-        "action_kind",
-        normalize_todo_action_kind,
-        invalid_message=(
-            "todo action_kind must be a public-safe token: lowercase letters, "
-            "digits, '_' or '-'"
-        ),
+        "capability_binding_ref", normalize_todo_capability_binding_ref,
+        invalid_message="capability_binding_ref must be a public-safe namespaced token",
     ),
     _TodoMetadataField(
-        "task_domain",
-        normalize_todo_task_domain,
-        invalid_message=(
-            "todo task_domain must be a public-safe token: lowercase letters, "
-            "digits, '_', '-' or '.'"
-        ),
+        "task_repository", normalize_todo_task_repository,
+        invalid_message="todo task_repository must be a credential-free Git remote or canonical git:<host>/<path> identity",
     ),
     _TodoMetadataField(
-        "capability_binding_ref",
-        normalize_todo_capability_binding_ref,
-        invalid_message=(
-            "capability_binding_ref must be a public-safe namespaced token"
-        ),
-    ),
-    _TodoMetadataField(
-        "task_repository",
-        normalize_todo_task_repository,
-        invalid_message=(
-            "todo task_repository must be a credential-free Git remote or canonical "
-            "git:<host>/<path> identity"
-        ),
-    ),
-    _TodoMetadataField(
-        "continuation_policy",
-        normalize_todo_continuation_policy,
-        invalid_message=(
-            "todo continuation_policy must be one of: "
-            + ", ".join(sorted(TODO_CONTINUATION_POLICY_VALUES))
-        ),
+        "continuation_policy", normalize_todo_continuation_policy,
+        invalid_message="todo continuation_policy must be one of: " + ", ".join(sorted(TODO_CONTINUATION_POLICY_VALUES)),
         read_fallback_key="removed_continuation_policy",
         read_fallback_normalizer=normalize_removed_todo_continuation_policy,
     ),
     _TodoMetadataField(
-        "removed_continuation_policy",
-        normalize_removed_todo_continuation_policy,
+        "removed_continuation_policy", normalize_removed_todo_continuation_policy,
         invalid_message=(
             "removed_continuation_policy must be one of: "
             + ", ".join(sorted(TODO_REMOVED_REVIEW_CONTINUATION_POLICY_VALUES))
         ),
         block_field=False,
     ),
-    _TodoMetadataField(
-        "required_write_scopes",
-        normalize_required_write_scopes,
-        encoder=_metadata_csv,
-        invalid_message=(
-            "required_write_scopes must contain public-safe relative scope tokens"
-        ),
+    _csv_field(
+        "required_write_scopes", normalize_required_write_scopes,
+        invalid_message="required_write_scopes must contain public-safe relative scope tokens",
+    ),
+    _csv_field(
+        "required_capabilities", normalize_required_capabilities,
+        invalid_message="required_capabilities must contain public-safe capability tokens",
+    ),
+    _csv_field(
+        "target_capabilities", normalize_target_capabilities,
+        invalid_message="target_capabilities must contain public-safe capability tokens",
+    ),
+    _csv_field(
+        "explore_result_node_refs", normalize_explore_result_node_refs,
+        invalid_message="explore_result_node_refs must contain public-safe Explore node ids",
     ),
     _TodoMetadataField(
-        "required_capabilities",
-        normalize_required_capabilities,
-        encoder=_metadata_csv,
-        invalid_message=(
-            "required_capabilities must contain public-safe capability tokens"
-        ),
-    ),
-    _TodoMetadataField(
-        "target_capabilities",
-        normalize_target_capabilities,
-        encoder=_metadata_csv,
-        invalid_message=(
-            "target_capabilities must contain public-safe capability tokens"
-        ),
-    ),
-    _TodoMetadataField(
-        "explore_result_node_refs",
-        normalize_explore_result_node_refs,
-        encoder=_metadata_csv,
-        invalid_message=(
-            "explore_result_node_refs must contain public-safe Explore node ids"
-        ),
-    ),
-    _TodoMetadataField(
-        "decision_scope",
-        normalize_todo_decision_scope,
+        "decision_scope", normalize_todo_decision_scope,
         write_normalizer=_normalize_optional_decision_scope_for_write,
         encoder=decision_scope_metadata_value,
         invalid_when=lambda value: value is not None,
     ),
     _TodoMetadataField(
-        "required_decision_scopes",
-        normalize_todo_required_decision_scopes,
+        "required_decision_scopes", normalize_todo_required_decision_scopes,
         write_normalizer=_normalize_optional_required_decision_scopes_for_write,
         encoder=required_decision_scopes_metadata_value,
     ),
     _TodoMetadataField(
-        "decision_outcome",
-        normalize_todo_decision_outcome,
-        invalid_message=(
-            "decision_outcome must be one of: "
-            + ", ".join(sorted(TODO_DECISION_OUTCOME_VALUES))
-        ),
+        "decision_outcome", normalize_todo_decision_outcome,
+        invalid_message="decision_outcome must be one of: " + ", ".join(sorted(TODO_DECISION_OUTCOME_VALUES)),
     ),
     _TodoMetadataField(
-        "decision_scope_outcomes",
-        normalize_todo_decision_scope_outcomes,
+        "decision_scope_outcomes", normalize_todo_decision_scope_outcomes,
         encoder=decision_scope_outcomes_metadata_value,
+        invalid_message="decision_scope_outcomes must contain outcome, decision_scope, and source_todo_id",
+    ),
+    _TodoMetadataField(
+        "claimed_by", normalize_todo_claimed_by,
+        invalid_message="claimed_by must be a public-safe agent token such as codex-main-control",
+    ),
+    _TodoMetadataField(
+        "last_actor_agent_id", normalize_todo_claimed_by,
+        invalid_message="last_actor_agent_id must be a public-safe agent token",
+    ),
+    _TodoMetadataField(
+        "bound_agent", normalize_todo_bound_agent,
+        invalid_message="bound_agent must be a public-safe agent token such as codex-main-control",
+    ),
+    _bool_field("goal_bound", normalize_todo_goal_bound),
+    _TodoMetadataField(
+        "blocks_agent", normalize_todo_blocks_agent,
+        invalid_message="blocks_agent must be a public-safe agent token such as codex-side-bypass",
+    ),
+    _csv_field("excluded_agents", normalize_todo_excluded_agents, write_normalizer=require_todo_excluded_agents),
+    _bool_field("global_gate", normalize_todo_global_gate),
+    _TodoMetadataField("unblocks_todo_id", normalize_todo_id, invalid_message=_todo_id_message("unblocks_todo_id")),
+    _csv_field(
+        "successor_todo_ids", normalize_todo_id_list,
+        invalid_message="successor_todo_ids must contain public todo_<letters-digits-underscore-hyphen> tokens",
+    ),
+    _TodoMetadataField(
+        "completion_continuation", normalize_todo_completion_continuation,
+        invalid_message="completion_continuation must be one of: active_goal, successor, no_followup",
+    ),
+    _TodoMetadataField(
+        "completion_recovery", normalize_todo_completion_recovery,
+        invalid_message="completion_recovery must be same_turn_terminal_closeout or lifecycle_reentry_terminal_closeout",
+    ),
+    _TodoMetadataField(
+        "replan_obligation_id", normalize_todo_replan_obligation_id,
+        invalid_message="replan_obligation_id must use the current replan-<16 lowercase hex> identity",
+    ),
+    _TodoMetadataField(
+        "resume_when", normalize_todo_resume_when,
         invalid_message=(
-            "decision_scope_outcomes must contain outcome, decision_scope, and "
-            "source_todo_id"
+            "resume_when must be public-safe, e.g. todo_done:todo_ab12cd34ef56, "
+            "monitor_changed:todo_monitor123, pr_merged:#532, or capacity_available:short_pool"
         ),
     ),
     _TodoMetadataField(
-        "claimed_by",
-        normalize_todo_claimed_by,
-        invalid_message=(
-            "claimed_by must be a public-safe agent token such as codex-main-control"
-        ),
+        "resume_monitor_generation", normalize_todo_generation,
+        invalid_message="resume_monitor_generation must be a non-negative integer",
     ),
-    _TodoMetadataField(
-        "bound_agent",
-        normalize_todo_bound_agent,
-        invalid_message=(
-            "bound_agent must be a public-safe agent token such as codex-main-control"
-        ),
-    ),
-    _TodoMetadataField(
-        "goal_bound",
-        normalize_todo_goal_bound,
-        write_normalizer=_optional_output_bool,
-        encoder=_metadata_bool_text,
-        invalid_when=lambda value: value is not None,
-    ),
-    _TodoMetadataField(
-        "blocks_agent",
-        normalize_todo_blocks_agent,
-        invalid_message=(
-            "blocks_agent must be a public-safe agent token such as codex-side-bypass"
-        ),
-    ),
-    _TodoMetadataField(
-        "excluded_agents",
-        normalize_todo_excluded_agents,
-        write_normalizer=require_todo_excluded_agents,
-        encoder=_metadata_csv,
-    ),
-    _TodoMetadataField(
-        "global_gate",
-        normalize_todo_global_gate,
-        write_normalizer=_optional_output_bool,
-        encoder=_metadata_bool_text,
-        invalid_when=lambda value: value is not None,
-    ),
-    _TodoMetadataField(
-        "unblocks_todo_id",
-        normalize_todo_id,
-        invalid_message=(
-            "unblocks_todo_id must use the public token shape "
-            "todo_<letters-digits-underscore-hyphen>"
-        ),
-    ),
-    _TodoMetadataField(
-        "successor_todo_ids",
-        normalize_todo_id_list,
-        encoder=_metadata_csv,
-        invalid_message=(
-            "successor_todo_ids must contain public "
-            "todo_<letters-digits-underscore-hyphen> tokens"
-        ),
-    ),
-    _TodoMetadataField(
-        "completion_continuation",
-        normalize_todo_completion_continuation,
-        invalid_message=(
-            "completion_continuation must be one of: active_goal, successor, "
-            "no_followup"
-        ),
-    ),
-    _TodoMetadataField(
-        "completion_recovery",
-        normalize_todo_completion_recovery,
-        invalid_message=(
-            "completion_recovery must be same_turn_terminal_closeout or "
-            "lifecycle_reentry_terminal_closeout"
-        ),
-    ),
-    _TodoMetadataField(
-        "replan_obligation_id",
-        normalize_todo_replan_obligation_id,
-        invalid_message=(
-            "replan_obligation_id must use the current replan-<16 lowercase hex> "
-            "identity"
-        ),
-    ),
-    _TodoMetadataField(
-        "resume_when",
-        normalize_todo_resume_when,
-        invalid_message=(
-            "resume_when must be public-safe, e.g. "
-            "todo_done:todo_ab12cd34ef56 or pr_merged:#532"
-        ),
-    ),
-    _TodoMetadataField(
-        "no_followup",
-        normalize_todo_no_followup,
-        write_normalizer=_optional_output_bool,
-        encoder=_metadata_bool_text,
-        invalid_when=lambda value: value is not None,
-    ),
+    _bool_field("no_followup", normalize_todo_no_followup),
     *(
         _TodoMetadataField(
-            key,
-            _nonempty_metadata_text,
-            write_normalizer=_truthy_value,
+            key, _nonempty_metadata_text,
+            write_normalizer=normalize_todo_generation if key == "material_change_generation" else _truthy_value,
         )
         for key in TODO_MONITOR_METADATA_FIELDS
     ),
     *(
-        _TodoMetadataField(
-            key,
-            _nonempty_metadata_text,
-            write_normalizer=_truthy_value,
-        )
-        for key in (
-            "note",
-            "evidence",
-            "reason",
-            "completed_at",
-            "updated_at",
-            "completion_turn_key",
-            "validation_command",
-            "validation_command_argv",
-            "validation_label",
-            "validation_timeout_seconds",
-        )
+        _TodoMetadataField(key, _nonempty_metadata_text, write_normalizer=_truthy_value)
+        for key in ("note", "evidence", "reason", "completed_at", "updated_at", "completion_turn_key", "completion_receipt_id")
     ),
-    _TodoMetadataField(
-        "superseded_by",
-        normalize_todo_id,
-        invalid_message=(
-            "superseded_by must use the public token shape "
-            "todo_<letters-digits-underscore-hyphen>"
-        ),
+    # The declaration digest includes exact command arguments and label text.
+    # Percent encoding keeps these values within one Markdown comment line.
+    *(
+        _TodoMetadataField(key, _nonblank_verbatim_metadata_text, write_normalizer=_truthy_value, preserve_whitespace=True)
+        for key in ("validation_command", "validation_command_argv")
     ),
+    _TodoMetadataField("validation_label", _truthy_value, preserve_whitespace=True),
+    _TodoMetadataField("validation_timeout_seconds", _nonempty_metadata_text, write_normalizer=_truthy_value),
+    _TodoMetadataField("superseded_by", normalize_todo_id, invalid_message=_todo_id_message("superseded_by")),
 )
 
 _TODO_METADATA_FIELD_BY_TOKEN = {
     field.key: field for field in _TODO_METADATA_FIELD_SCHEMA
 }
+
+
+def parse_todo_metadata_tokens(line: str) -> list[tuple[str, str]] | None:
+    match = TODO_METADATA_PATTERN.match(line)
+    if not match:
+        return None
+    tokens = []
+    for token in TODO_METADATA_TOKEN_PATTERN.finditer(match.group("body")):
+        key = token.group("key")
+        field = _TODO_METADATA_FIELD_BY_TOKEN.get(key)
+        value = decode_metadata_value(
+            token.group("value"),
+            preserve_whitespace=field is not None and field.preserve_whitespace,
+        )
+        tokens.append((key, value))
+    return tokens
 
 
 def _todo_metadata_block_fields() -> tuple[str, ...]:
@@ -1185,11 +961,11 @@ def _todo_metadata_block_fields() -> tuple[str, ...]:
 TODO_METADATA_FIELDS = _todo_metadata_block_fields()
 
 
-def parse_todo_metadata_line(line: str) -> dict[str, Any] | None:
+def parse_todo_metadata_line(line: str) -> dict[str, object] | None:
     tokens = parse_todo_metadata_tokens(line)
     if tokens is None:
         return None
-    metadata: dict[str, Any] = {}
+    metadata: dict[str, object] = {}
     for key, value in tokens:
         field = _TODO_METADATA_FIELD_BY_TOKEN.get(key)
         if field is None:
@@ -1208,8 +984,8 @@ def parse_todo_metadata_line(line: str) -> dict[str, Any] | None:
     return metadata or None
 
 
-def _normalize_todo_metadata_for_write(values: dict[str, Any]) -> dict[str, Any]:
-    normalized: dict[str, Any] = {}
+def _normalize_todo_metadata_for_write(values: Mapping[str, object]) -> dict[str, object]:
+    normalized: dict[str, object] = {}
     for field in _TODO_METADATA_FIELD_SCHEMA:
         value = field.normalize_for_write(values.get(field.key))
         if _metadata_value_is_present(value):
@@ -1221,25 +997,37 @@ def _normalize_todo_metadata_for_write(values: dict[str, Any]) -> dict[str, Any]
             raise ValueError(
                 "continuation_policy and removed_continuation_policy are mutually exclusive"
             )
-        if (
-            field.key == "excluded_agents"
-            and normalized.get("claimed_by")
-            and normalized["claimed_by"] in normalized.get("excluded_agents", [])
-        ):
-            raise ValueError(
-                f"claimed_by={normalized['claimed_by']!r} cannot also appear in "
-                "excluded_agents"
-            )
+        if field.key == "excluded_agents":
+            claimed_by = normalized.get("claimed_by")
+            excluded = normalized.get("excluded_agents")
+            if (
+                isinstance(claimed_by, str)
+                and claimed_by
+                and isinstance(excluded, list)
+                and claimed_by in excluded
+            ):
+                raise ValueError(
+                    f"claimed_by={claimed_by!r} cannot also appear in excluded_agents"
+                )
     return normalized
 
 
-def _format_todo_metadata_values(values: dict[str, Any]) -> str | None:
+def normalize_todo_metadata_for_write(values: Mapping[str, object]) -> dict[str, object]:
+    """Return canonical typed Todo metadata without Markdown encoding."""
+
+    return _normalize_todo_metadata_for_write(values)
+
+
+def _format_todo_metadata_values(values: Mapping[str, object]) -> str | None:
     normalized = _normalize_todo_metadata_for_write(values)
-    fields = [
-        f"{field.key}={encode_metadata_value(field.encoder(normalized[field.key]))}"
-        for field in _TODO_METADATA_FIELD_SCHEMA
-        if field.key in normalized
-    ]
+    fields = []
+    for field in _TODO_METADATA_FIELD_SCHEMA:
+        if field.key in normalized:
+            value = encode_metadata_value(
+                field.encoder(normalized[field.key]),
+                preserve_whitespace=field.preserve_whitespace,
+            )
+            fields.append(f"{field.key}={value}")
     if not fields:
         return None
     return f"  <!-- loopx:todo {' '.join(fields)} -->"
@@ -1249,6 +1037,7 @@ def format_todo_metadata_line(
     *,
     todo_id: str | None = None,
     status: str | None = None,
+    role: str | None = None,
     task_class: str | None = None,
     action_kind: str | None = None,
     task_domain: str | None = None,
@@ -1256,28 +1045,32 @@ def format_todo_metadata_line(
     task_repository: str | None = None,
     continuation_policy: str | None = None,
     removed_continuation_policy: str | None = None,
-    required_write_scopes: Any = None,
-    required_capabilities: Any = None,
-    target_capabilities: Any = None,
-    explore_result_node_refs: Any = None,
-    decision_scope: Any = None,
-    required_decision_scopes: Any = None,
+    required_write_scopes: object = None,
+    required_capabilities: object = None,
+    target_capabilities: object = None,
+    explore_result_node_refs: object = None,
+    decision_scope: object = None,
+    required_decision_scopes: object = None,
     decision_outcome: str | None = None,
-    decision_scope_outcomes: Any = None,
+    decision_scope_outcomes: object = None,
     claimed_by: str | None = None,
+    last_actor_agent_id: str | None = None,
     bound_agent: str | None = None,
     goal_bound: bool | None = None,
     blocks_agent: str | None = None,
-    excluded_agents: Any = None,
+    excluded_agents: object = None,
     global_gate: bool | None = None,
     unblocks_todo_id: str | None = None,
-    successor_todo_ids: Any = None,
+    successor_todo_ids: object = None,
     completion_continuation: str | None = None,
     completion_recovery: str | None = None,
+    completion_receipt_id: str | None = None,
     replan_obligation_id: str | None = None,
     resume_when: str | None = None,
+    resume_monitor_generation: int | str | None = None,
     no_followup: bool | None = None,
     target_key: str | None = None,
+    monitor_effect_id: str | None = None,
     cadence: str | None = None,
     next_due_at: str | None = None,
     expires_at: str | None = None,
@@ -1285,6 +1078,9 @@ def format_todo_metadata_line(
     result_hash: str | None = None,
     consecutive_no_change: str | None = None,
     material_change: str | None = None,
+    material_change_generation: int | str | None = None,
+    material_change_scope: str | None = None,
+    material_change_scope_generations: str | None = None,
     max_no_change_before_replan: str | None = None,
     watch_only: str | None = None,
     note: str | None = None,
@@ -1303,183 +1099,146 @@ def format_todo_metadata_line(
     return _format_todo_metadata_values(values)
 
 
-def todo_block_metadata(block: dict[str, Any]) -> dict[str, Any]:
-    metadata: dict[str, Any] = {}
+_BLOCK_READ_NORMALIZERS: dict[str, MetadataValueNormalizer] = {
+    "required_write_scopes": normalize_required_write_scopes,
+    "task_domain": normalize_todo_task_domain,
+    "task_repository": normalize_todo_task_repository,
+    "required_capabilities": normalize_required_capabilities,
+    "target_capabilities": normalize_target_capabilities,
+    "excluded_agents": normalize_todo_excluded_agents,
+    "explore_result_node_refs": normalize_explore_result_node_refs,
+    "continuation_policy": normalize_todo_continuation_policy,
+    "decision_scope": normalize_todo_decision_scope,
+    "required_decision_scopes": normalize_todo_required_decision_scopes,
+    "decision_outcome": normalize_todo_decision_outcome,
+    "decision_scope_outcomes": normalize_todo_decision_scope_outcomes,
+    "no_followup": normalize_todo_no_followup,
+    "completion_continuation": normalize_todo_completion_continuation,
+    "completion_recovery": normalize_todo_completion_recovery,
+    "global_gate": normalize_todo_global_gate,
+    "goal_bound": normalize_todo_global_gate,
+}
+
+_BLOCK_TRUTHY_OR_POP_NORMALIZERS: dict[str, MetadataValueNormalizer] = {
+    "required_write_scopes": normalize_required_write_scopes,
+    "task_repository": normalize_todo_task_repository,
+    "required_capabilities": normalize_required_capabilities,
+    "target_capabilities": normalize_target_capabilities,
+    "excluded_agents": normalize_todo_excluded_agents,
+    "explore_result_node_refs": normalize_explore_result_node_refs,
+    "required_decision_scopes": require_todo_required_decision_scopes,
+    "decision_scope_outcomes": normalize_todo_decision_scope_outcomes,
+    "successor_todo_ids": normalize_todo_id_list,
+}
+
+_BLOCK_OPTIONAL_BOOL_NORMALIZERS: dict[str, Callable[[object], bool | None]] = {
+    "no_followup": normalize_todo_no_followup,
+    "global_gate": normalize_todo_global_gate,
+    "goal_bound": normalize_todo_global_gate,
+}
+
+_BLOCK_STRICT_SETTERS: dict[str, MetadataValueNormalizer] = {
+    "task_domain": _TODO_METADATA_FIELD_BY_TOKEN["task_domain"].normalize_for_write,
+    "decision_scope": require_todo_decision_scope,
+    "decision_outcome": require_todo_decision_outcome,
+}
+
+
+def todo_block_metadata(block: Mapping[str, object]) -> dict[str, object]:
+    metadata: dict[str, object] = {}
     for key in TODO_METADATA_FIELDS:
         value = block.get(key)
         if value is None:
             continue
-        normalized: Any
-        if key == "required_write_scopes":
-            normalized = normalize_required_write_scopes(value)
-        elif key == "task_domain":
-            normalized = normalize_todo_task_domain(value)
-        elif key == "task_repository":
-            normalized = normalize_todo_task_repository(value)
-        elif key == "required_capabilities":
-            normalized = normalize_required_capabilities(value)
-        elif key == "target_capabilities":
-            normalized = normalize_target_capabilities(value)
-        elif key == "excluded_agents":
-            normalized = normalize_todo_excluded_agents(value)
-        elif key == "explore_result_node_refs":
-            normalized = normalize_explore_result_node_refs(value)
-        elif key == "continuation_policy":
-            normalized = normalize_todo_continuation_policy(value)
-        elif key == "decision_scope":
-            normalized = normalize_todo_decision_scope(value)
-        elif key == "required_decision_scopes":
-            normalized = normalize_todo_required_decision_scopes(value)
-        elif key == "decision_outcome":
-            normalized = normalize_todo_decision_outcome(value)
-        elif key == "decision_scope_outcomes":
-            normalized = normalize_todo_decision_scope_outcomes(value)
-        elif key == "no_followup":
-            normalized = normalize_todo_no_followup(value)
-        elif key == "completion_continuation":
-            normalized = normalize_todo_completion_continuation(value)
-        elif key == "completion_recovery":
-            normalized = normalize_todo_completion_recovery(value)
-        elif key in {"global_gate", "goal_bound"}:
-            normalized = normalize_todo_global_gate(value)
+        normalizer = _BLOCK_READ_NORMALIZERS.get(key)
+        if normalizer is not None:
+            normalized = normalizer(value)
+        elif _TODO_METADATA_FIELD_BY_TOKEN[key].preserve_whitespace:
+            normalized = value
         else:
             normalized = str(value).strip()
-        if normalized is not None and normalized != [] and normalized != "":
+        if _metadata_value_is_present(normalized):
             metadata[key] = normalized
     return metadata
 
 
+def _apply_todo_block_update(
+    metadata: dict[str, object],
+    key: str,
+    value: object,
+) -> None:
+    if value is None:
+        metadata.pop(key, None)
+    elif (truthy_norm := _BLOCK_TRUTHY_OR_POP_NORMALIZERS.get(key)) is not None:
+        normalized = truthy_norm(value)
+        if normalized:
+            metadata[key] = normalized
+        else:
+            metadata.pop(key, None)
+    elif (strict_setter := _BLOCK_STRICT_SETTERS.get(key)) is not None:
+        metadata[key] = strict_setter(value)
+    elif key == "continuation_policy":
+        normalized_policy = normalize_todo_continuation_policy(value)
+        if normalized_policy:
+            metadata[key] = normalized_policy
+        elif value:
+            raise ValueError(
+                "todo continuation_policy must be one of: "
+                + ", ".join(sorted(TODO_CONTINUATION_POLICY_VALUES))
+            )
+        else:
+            metadata.pop(key, None)
+    elif (bool_norm := _BLOCK_OPTIONAL_BOOL_NORMALIZERS.get(key)) is not None:
+        normalized_bool = bool_norm(value)
+        if normalized_bool is not None:
+            metadata[key] = normalized_bool
+        else:
+            metadata.pop(key, None)
+    elif key in {"completion_continuation", "completion_recovery"}:
+        normalized_completion = require_todo_completion_metadata(key, value)
+        if normalized_completion:
+            metadata[key] = normalized_completion
+        else:
+            metadata.pop(key, None)
+    elif _TODO_METADATA_FIELD_BY_TOKEN[key].preserve_whitespace:
+        metadata[key] = value
+    elif str(value).strip():
+        metadata[key] = str(value).strip()
+
+
 def metadata_line_for_todo_block(
-    block: dict[str, Any],
-    updates: dict[str, Any],
+    block: Mapping[str, object],
+    updates: Mapping[str, object],
 ) -> str | None:
     metadata = todo_block_metadata(block)
     for key, value in updates.items():
-        if key not in TODO_METADATA_FIELDS:
-            continue
-        if value is None:
-            metadata.pop(key, None)
-        elif key == "required_write_scopes":
-            normalized = normalize_required_write_scopes(value)
-            if normalized:
-                metadata[key] = normalized
-            else:
-                metadata.pop(key, None)
-        elif key == "task_domain":
-            metadata[key] = _TODO_METADATA_FIELD_BY_TOKEN[
-                key
-            ].normalize_for_write(value)
-        elif key == "task_repository":
-            normalized = normalize_todo_task_repository(value)
-            if normalized:
-                metadata[key] = normalized
-            else:
-                metadata.pop(key, None)
-        elif key == "required_capabilities":
-            normalized = normalize_required_capabilities(value)
-            if normalized:
-                metadata[key] = normalized
-            else:
-                metadata.pop(key, None)
-        elif key == "target_capabilities":
-            normalized = normalize_target_capabilities(value)
-            if normalized:
-                metadata[key] = normalized
-            else:
-                metadata.pop(key, None)
-        elif key == "excluded_agents":
-            normalized = normalize_todo_excluded_agents(value)
-            if normalized:
-                metadata[key] = normalized
-            else:
-                metadata.pop(key, None)
-        elif key == "explore_result_node_refs":
-            normalized = normalize_explore_result_node_refs(value)
-            if normalized:
-                metadata[key] = normalized
-            else:
-                metadata.pop(key, None)
-        elif key == "continuation_policy":
-            normalized = normalize_todo_continuation_policy(value)
-            if normalized:
-                metadata[key] = normalized
-            elif value:
-                raise ValueError(
-                    "todo continuation_policy must be one of: "
-                    + ", ".join(sorted(TODO_CONTINUATION_POLICY_VALUES))
-                )
-            else:
-                metadata.pop(key, None)
-        elif key == "decision_scope":
-            metadata[key] = require_todo_decision_scope(value)
-        elif key == "required_decision_scopes":
-            normalized = require_todo_required_decision_scopes(value)
-            if normalized:
-                metadata[key] = normalized
-            else:
-                metadata.pop(key, None)
-        elif key == "decision_outcome":
-            metadata[key] = require_todo_decision_outcome(value)
-        elif key == "decision_scope_outcomes":
-            normalized_scope_outcomes = normalize_todo_decision_scope_outcomes(value)
-            if normalized_scope_outcomes:
-                metadata[key] = normalized_scope_outcomes
-            else:
-                metadata.pop(key, None)
-        elif key == "no_followup":
-            normalized = normalize_todo_no_followup(value)
-            if normalized is not None:
-                metadata[key] = normalized
-            else:
-                metadata.pop(key, None)
-        elif key == "successor_todo_ids":
-            normalized = normalize_todo_id_list(value)
-            if normalized:
-                metadata[key] = normalized
-            else:
-                metadata.pop(key, None)
-        elif key in {"completion_continuation", "completion_recovery"}:
-            normalized = require_todo_completion_metadata(key, value)
-            if normalized:
-                metadata[key] = normalized
-            else:
-                metadata.pop(key, None)
-        elif key in {"global_gate", "goal_bound"}:
-            normalized = normalize_todo_global_gate(value)
-            if normalized is not None:
-                metadata[key] = normalized
-            else:
-                metadata.pop(key, None)
-        elif str(value).strip():
-            metadata[key] = str(value).strip()
+        if key in TODO_METADATA_FIELDS:
+            _apply_todo_block_update(metadata, key, value)
     if "todo_id" not in metadata and block.get("todo_id"):
         metadata["todo_id"] = str(block["todo_id"])
     if "status" not in metadata:
         metadata["status"] = TODO_STATUS_DONE if block.get("done") else TODO_STATUS_OPEN
-    return format_todo_metadata_line(**metadata)
+    return _format_todo_metadata_values(metadata)
+
+
+_TODO_TEXT_CLASS_RULES: tuple[tuple[tuple[re.Pattern[str], ...], str], ...] = (
+    (TODO_HARD_MONITOR_PATTERNS, TODO_TASK_CLASS_MONITOR),
+    (TODO_ADVANCEMENT_OVERRIDE_PATTERNS, TODO_TASK_CLASS_ADVANCEMENT),
+    (TODO_BLOCKED_MONITOR_PATTERNS, TODO_TASK_CLASS_MONITOR),
+    (TODO_MONITOR_PATTERNS, TODO_TASK_CLASS_MONITOR),
+    (TODO_ADVANCEMENT_PATTERNS, TODO_TASK_CLASS_ADVANCEMENT),
+)
 
 
 def todo_task_class_for_text(text: str) -> str:
     compact = compact_todo_text(text)
-    for pattern in TODO_HARD_MONITOR_PATTERNS:
-        if pattern.search(compact):
-            return TODO_TASK_CLASS_MONITOR
-    for pattern in TODO_ADVANCEMENT_OVERRIDE_PATTERNS:
-        if pattern.search(compact):
-            return TODO_TASK_CLASS_ADVANCEMENT
-    for pattern in TODO_BLOCKED_MONITOR_PATTERNS:
-        if pattern.search(compact):
-            return TODO_TASK_CLASS_MONITOR
-    for pattern in TODO_MONITOR_PATTERNS:
-        if pattern.search(compact):
-            return TODO_TASK_CLASS_MONITOR
-    for pattern in TODO_ADVANCEMENT_PATTERNS:
-        if pattern.search(compact):
-            return TODO_TASK_CLASS_ADVANCEMENT
+    for patterns, task_class in _TODO_TEXT_CLASS_RULES:
+        if any(pattern.search(compact) for pattern in patterns):
+            return task_class
     return TODO_TASK_CLASS_ADVANCEMENT
 
 
-def normalize_todo_task_class(value: Any, *, text: str, action_kind: Any = None) -> str:
+def normalize_todo_task_class(value: object, *, text: str, action_kind: object = None) -> str:
     candidate = normalize_explicit_todo_task_class(value)
     if candidate:
         return candidate

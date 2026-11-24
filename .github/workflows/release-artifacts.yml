@@ -5,20 +5,37 @@ on:
     paths:
       - ".github/workflows/release-artifacts.yml"
       - "examples/release-artifacts-smoke.py"
+      - "examples/personal-workspace-browser/**"
+      - "examples/personal-workspace-browser-smoke.mjs"
       - "loopx/**"
       - "package.json"
       - "package-lock.json"
       - "pyproject.toml"
+      - "setup.py"
+      - "MANIFEST.in"
+      - "apps/presentation/dashboard/**"
+      - "scripts/chat_bundle.py"
+      - "scripts/verify_installed_chat.py"
       - "README.md"
       - "scripts/release_artifacts.py"
+      - "scripts/runtime_artifact.py"
+      - "scripts/qualify_runtime_artifact.py"
       - "tsconfig.control-plane.json"
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing GitHub Release tag containing this release tooling"
+        description: "Existing GitHub Release tag to build without changing its product source"
         required: true
+        type: string
+      browser_fixture_commit:
+        description: "Optional full merged commit supplying corrected browser fixtures"
+        required: false
+        type: string
+      validated_run_id:
+        description: "Publication only: reuse the successful build of an existing tagged release run"
+        required: false
         type: string
 
 permissions:
@@ -26,19 +43,23 @@ permissions:
 
 concurrency:
   group: release-artifacts-${{ github.event.release.tag_name || inputs.tag || github.ref }}
-  cancel-in-progress: false
+  # Superseded PR validation may stop; publication retains its serialized lane.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build:
-    if: github.repository == 'huangruiteng/loopx'
+  prepare:
+    if: github.repository == 'loopx-project/loopx' && inputs.validated_run_id == ''
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Keep the existing deadline; browser partitions consume this exact candidate
+    # after all non-browser qualification, rather than delaying snapshot checks.
+    timeout-minutes: 30
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     outputs:
       release-tag: ${{ steps.identity.outputs.release-tag }}
+      product-commit: ${{ steps.identity.outputs.product-commit }}
+      sources-sha256: ${{ steps.sources.outputs.sources-sha256 }}
+      candidate-artifact-id: ${{ steps.candidate.outputs.artifact-id }}
     steps:
       - name: Check out release source
         uses: actions/checkout@v7
@@ -55,7 +76,7 @@ jobs:
       - name: Set up the packaged TypeScript control-plane runtime
         uses: actions/setup-node@v6
         with:
-          node-version: "22.6"
+          node-version: "24"
 
       - name: Resolve and validate release identity
         id: identity
@@ -71,9 +92,15 @@ jobs:
           python scripts/release_artifacts.py validate-tag "${release_tag}"
           source_date_epoch="$(git show -s --format=%ct HEAD)"
           echo "release-tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+          echo "product-commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
           echo "RELEASE_TAG=${release_tag}" >> "${GITHUB_ENV}"
           echo "SOURCE_DATE_EPOCH=${source_date_epoch}" >> "${GITHUB_ENV}"
           echo "PYTHONHASHSEED=0" >> "${GITHUB_ENV}"
+
+      - name: Build exact release frontend with previous delivery assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/chat_bundle.py release-build --tag "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
 
       - name: Install release build tools
         run: python -m pip install --disable-pip-version-check build==1.4.4 twine==6.2.0
@@ -123,6 +150,12 @@ jobs:
           from tempfile import TemporaryDirectory
 
           turn_key = "sha256:" + "a" * 64
+          journal_identity = SettlementIdentity(
+              goal_id="fixture-goal",
+              agent_id="fixture-agent",
+              todo_id="fixture-todo",
+              turn_instance_id=turn_key,
+          )
           journal = {
               "schema_version": "loopx_turn_journal_v0",
               "goal_id": "fixture-goal",
@@ -141,14 +174,15 @@ jobs:
                   "turn_envelope": {
                       "goal_id": "fixture-goal",
                       "agent_id": "fixture-agent",
+                      "action": {
+                          "selected_todo": {"todo_id": "fixture-todo"},
+                      },
                   },
                   "transaction": {
                       "turn_key": turn_key,
                       "settlement_plan": {
-                          "identity": {
-                              "goal_id": "fixture-goal",
-                              "agent_id": "fixture-agent",
-                          }
+                          "schema_version": "quota_settlement_plan_v1",
+                          "identity": journal_identity.as_dict(),
                       },
                   },
               },
@@ -174,20 +208,11 @@ jobs:
           assert readiness["status"] == "ready", readiness
           assert readiness["semantic_probe"] == "passed", readiness
           with TemporaryDirectory() as temporary_directory:
-              effect_id = identity.effect_id
+              effect_id = journal_identity.effect_id
               writable_journal = {
-                  "schema_version": "loopx_turn_journal_v0",
-                  "goal_id": "fixture-goal",
-                  "turn_key": turn_key,
+                  **journal,
                   "status": "in_progress",
-                  "completed_phases": ["host_execute"],
-                  "plan": {
-                      "transaction": {
-                          "settlement_plan": {
-                              "identity": {"effect_id": effect_id}
-                          }
-                      }
-                  },
+                  "completed_phases": [],
               }
               committed = write_turn_journal(
                   str(Path(temporary_directory) / "turn.json"),
@@ -197,7 +222,97 @@ jobs:
               assert committed["appended"] is True, committed
               assert committed["replayed"] is False, committed
           PY
-          skills_dir="${RUNNER_TEMP}/loopx-wheel-skills"
+
+      - name: Verify installed frontend and sdist rebuild
+        run: |
+          python scripts/verify_installed_chat.py --python "${RUNNER_TEMP}/loopx-wheel/bin/python"
+          python -m pip wheel --no-deps dist/packages/*.tar.gz --wheel-dir "${RUNNER_TEMP}/sdist-wheel"
+          "${RUNNER_TEMP}/loopx-wheel/bin/python" -m pip install --force-reinstall --no-deps "${RUNNER_TEMP}"/sdist-wheel/*.whl
+          python scripts/verify_installed_chat.py --python "${RUNNER_TEMP}/loopx-wheel/bin/python"
+
+      - name: Resolve browser fixture correction without rebuilding product bytes
+        env:
+          BROWSER_FIXTURE_COMMIT: ${{ inputs.browser_fixture_commit }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          product = git("rev-parse", "HEAD")
+          fixture = os.environ.get("BROWSER_FIXTURE_COMMIT", "") or product
+          if not re.fullmatch(r"[0-9a-f]{40}", fixture):
+              raise SystemExit("browser fixture correction requires a full commit SHA")
+          if git("rev-parse", fixture + "^{commit}") != fixture:
+              raise SystemExit("browser fixture correction must name a commit")
+          allowed = {
+              "examples/personal-workspace-browser/fixture.mjs",
+              "examples/personal-workspace-browser/typed-actions.mjs",
+              "examples/personal-workspace-browser/goal-work-map.mjs",
+              "examples/personal-workspace-browser/goal-workspace-m2.mjs",
+              "examples/personal-workspace-browser/lark-cli-missing.mjs",
+              "examples/personal-workspace-browser/pr-review-agent-order.mjs",
+              "apps/presentation/dashboard/smoke/workspace-locale-browser-smoke.mjs",
+          }
+          changed = set(git("diff", "--name-only", product, fixture, "--", *sorted(allowed)).splitlines())
+          if fixture != product and not changed:
+              raise SystemExit("browser fixture commit contains no correction in the fixture owners")
+          if fixture != product:
+              subprocess.run(["git", "merge-base", "--is-ancestor", fixture, "origin/main"], check=True)
+              corrections = {}
+              for path in sorted(changed):
+                  entry = git("ls-tree", fixture, "--", path).split()
+                  if not entry or entry[0] != "100644":
+                      raise SystemExit("browser fixture correction must retain a regular source file")
+                  corrections[path] = subprocess.check_output(["git", "show", fixture + ":" + path])
+              for path, content in corrections.items():
+                  Path(path).write_bytes(content)
+          Path("dist/RELEASE-SOURCES.json").write_text(json.dumps({
+              "product_tag": os.environ["RELEASE_TAG"],
+              "product_commit": product,
+              "browser_fixture_commit": fixture,
+              "browser_fixture_paths": sorted(changed),
+              "workflow_commit": os.environ["GITHUB_SHA"],
+              "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+          }, indent=2) + "\n")
+          PY
+
+      - name: Verify wheel through the DSH managed-runtime install shape
+        run: |
+          set -euo pipefail
+          target="${RUNNER_TEMP}/loopx-wheel-target"
+          skills_dir="${RUNNER_TEMP}/loopx-wheel-target-skills"
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            --target "${target}" \
+            dist/packages/*.whl
+          (
+            cd "${RUNNER_TEMP}"
+            PYTHONPATH="${target}" python -m loopx.cli --format json \
+              workflow-skills --skills-dir "${skills_dir}" \
+              --host-surface deepseek-harness-native \
+              > "${RUNNER_TEMP}/loopx-wheel-target-inspect.json"
+          )
+          python - "${RUNNER_TEMP}/loopx-wheel-target-inspect.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert payload["ok"] is True, payload
+          assert payload["operation"] == "inspect", payload
+          assert payload["host_surface"] == "deepseek-harness-native", payload
+          assert payload["source"]["kind"] == "python_distribution", payload
+          assert payload["install_required"] is True, payload
+          PY
+          export CODEX_HOME="${RUNNER_TEMP}/loopx-wheel-codex"
+          skills_dir="${CODEX_HOME}/skills"
           "${RUNNER_TEMP}/loopx-wheel/bin/loopx" --format json \
             workflow-skills --install --skills-dir "${skills_dir}" \
             > "${RUNNER_TEMP}/loopx-workflow-skills-install.json"
@@ -212,30 +327,369 @@ jobs:
           assert payload["source"]["kind"] == "python_distribution", payload
           assert payload["after"]["ready"] is True, payload
           PY
-          "${RUNNER_TEMP}/loopx-wheel/bin/loopx" --format json \
-            workflow-skills --uninstall --skills-dir "${skills_dir}" \
-            > "${RUNNER_TEMP}/loopx-workflow-skills-uninstall.json"
+          conflicting_bin="${RUNNER_TEMP}/loopx-conflicting-bin"
+          mkdir -p "${conflicting_bin}"
+          ln -s /usr/bin/false "${conflicting_bin}/loopx"
+          PATH="${conflicting_bin}:${PATH}" \
+            "${RUNNER_TEMP}/loopx-wheel/bin/loopx" --format json \
+            doctor --deep > "${RUNNER_TEMP}/loopx-wheel-doctor.json"
           "${RUNNER_TEMP}/loopx-wheel/bin/python" - \
-            "${RUNNER_TEMP}/loopx-workflow-skills-uninstall.json" <<'PY'
+            "${RUNNER_TEMP}/loopx-wheel-doctor.json" <<'PY'
           import json
           from pathlib import Path
           import sys
 
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           assert payload["ok"] is True, payload
-          assert sorted(payload["result"]["removed"]) == [
-              "loopx",
-              "loopx-benchmark",
-              "loopx-doc-registry",
-              "loopx-pr-program",
-              "loopx-pr-review",
-              "loopx-project",
-              "loopx-self-repair",
-          ], payload
+          assert payload["package"]["install_kind"] == "python_distribution", payload
+          assert payload["path"]["loopx"] != payload["path"]["current_invocation"]
+          validation = payload["release_candidate"]
+          checks = {item["id"]: item for item in validation["checks"]}
+          assert validation["schema_version"] == "loopx_python_distribution_checks_v0"
+          assert checks["command_package_same_distribution"]["ok"] is True, payload
+          assert checks["representative_distribution_paths"]["ok"] is True, payload
+          assert "scripts/loopx" not in validation["representative_cli"][
+              "package_paths"
+          ]["required"]
+          PY
+          "${RUNNER_TEMP}/loopx-wheel/bin/loopx" --format json \
+            workflow-skills --uninstall --skills-dir "${skills_dir}" \
+            > "${RUNNER_TEMP}/loopx-workflow-skills-uninstall.json"
+          "${RUNNER_TEMP}/loopx-wheel/bin/python" - \
+            "${RUNNER_TEMP}/loopx-workflow-skills-uninstall.json" \
+            "${RUNNER_TEMP}/loopx-workflow-skills-install.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert payload["ok"] is True, payload
+          installed = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          expected = installed["after"]["required_skill_ids"]
+          assert expected and installed["after"]["ready"] is True, installed
+          assert sorted(payload["result"]["removed"]) == sorted(expected), payload
           PY
 
       - name: Exercise release contract smoke
         run: python examples/release-artifacts-smoke.py
+
+      - name: Restore browser fixtures and bind verified package checksums
+        run: |
+          git restore -- examples/personal-workspace-browser apps/presentation/dashboard/smoke/workspace-locale-browser-smoke.mjs
+          python scripts/release_artifacts.py verify-checksums --dist-dir dist/packages --checksum-file dist/SHA256SUMS
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          identity = Path("dist/RELEASE-SOURCES.json")
+          record = json.loads(identity.read_text())
+          record["sha256"] = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in [*sorted(Path("dist/packages").iterdir()), Path("dist/SHA256SUMS")]
+          }
+          identity.write_text(json.dumps(record, indent=2) + "\n")
+          PY
+
+      - name: Build and qualify the stable snapshot runtime
+        run: |
+          python scripts/runtime_artifact.py --channel stable
+          python scripts/qualify_runtime_artifact.py dist/runtime > dist/runtime/qualification.json
+
+      - name: Bind qualified snapshot provenance
+        id: sources
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          identity = Path("dist/RELEASE-SOURCES.json")
+          record = json.loads(identity.read_text())
+          record["runtime_sha256"] = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in sorted(Path("dist/runtime").iterdir())
+          }
+          identity.write_text(json.dumps(record, indent=2) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("sources-sha256=" + hashlib.sha256(identity.read_bytes()).hexdigest() + "\n")
+          PY
+
+      - name: Upload release candidate pending browser qualification
+        id: candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  browser:
+    if: github.repository == 'loopx-project/loopx' && inputs.validated_run_id == ''
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1/3", "2/3", "3/3"]
+    env:
+      RELEASE_SOURCES_SHA256: ${{ needs.prepare.outputs.sources-sha256 }}
+      RELEASE_CANDIDATE_ARTIFACT_ID: ${{ needs.prepare.outputs.candidate-artifact-id }}
+      RELEASE_PRODUCT_COMMIT: ${{ needs.prepare.outputs.product-commit }}
+      LOOPX_PERSONAL_WORKSPACE_SHARD: ${{ matrix.shard }}
+    steps:
+      - name: Check out the exact candidate source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.product-commit }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Download the unchanged release candidate
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.candidate-artifact-id }}
+          path: dist
+
+      - name: Verify candidate provenance and adopt only selected fixture corrections
+        run: |
+          set -euo pipefail
+          python scripts/release_artifacts.py verify-checksums --dist-dir dist/packages --checksum-file dist/SHA256SUMS
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          identity = Path("dist/RELEASE-SOURCES.json")
+          assert hashlib.sha256(identity.read_bytes()).hexdigest() == os.environ["RELEASE_SOURCES_SHA256"]
+          record = json.loads(identity.read_text())
+          product = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          assert product == record["product_commit"] == os.environ["RELEASE_PRODUCT_COMMIT"]
+          artifacts = [*sorted(Path("dist/packages").iterdir()), Path("dist/SHA256SUMS")]
+          assert record["sha256"] == {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in artifacts}
+          # The producer owns the allowlist and merged-commit decision. Its exact
+          # digest binds this consumer to that selection, rather than re-resolving it.
+          corrections = {}
+          for path in record["browser_fixture_paths"]:
+              entry = subprocess.check_output(["git", "ls-tree", record["browser_fixture_commit"], "--", path], text=True).split()
+              assert entry[0] == "100644"
+              corrections[path] = subprocess.check_output(["git", "show", record["browser_fixture_commit"] + ":" + path])
+          for path, content in corrections.items():
+              Path(path).write_bytes(content)
+          PY
+          python -m venv "${RUNNER_TEMP}/loopx-browser-wheel"
+          "${RUNNER_TEMP}/loopx-browser-wheel/bin/python" -m pip install --disable-pip-version-check --no-deps dist/packages/*.whl
+          python scripts/verify_installed_chat.py --python "${RUNNER_TEMP}/loopx-browser-wheel/bin/python"
+          # Some catalog scenarios start real source-side fixture authorities.
+          # Supply their frontend from this same wheel; never rebuild it here.
+          "${RUNNER_TEMP}/loopx-browser-wheel/bin/python" -I - <<'PY'
+          from pathlib import Path
+          import shutil
+          from loopx.chat_server import default_chat_assets_dir
+          from loopx.presentation.chat_bundle import validate_bundle
+
+          target = Path("loopx/web/chat")
+          shutil.copytree(default_chat_assets_dir(), target, dirs_exist_ok=True)
+          validate_bundle(target, source_root=Path.cwd())
+          PY
+
+      - name: Install browser validation dependencies
+        working-directory: apps/presentation/dashboard
+        run: |
+          npm ci --ignore-scripts
+          ./node_modules/.bin/playwright install --with-deps chromium
+
+      - name: Exercise the installed page in a real browser
+        working-directory: apps/presentation/dashboard
+        env:
+          LOOPX_PYTHON_BIN: ${{ runner.temp }}/loopx-browser-wheel/bin/python
+          LOOPX_RELEASE_SOURCES_FILE: ${{ github.workspace }}/dist/RELEASE-SOURCES.json
+        run: |
+          set -euo pipefail
+          npm run smoke:personal-workspace-packaged:catalog
+          # Preserve all original companions once; craft also qualifies its
+          # existing command-palette companion. All use the same installed wheel.
+          if [[ "$LOOPX_PERSONAL_WORKSPACE_SHARD" == "1/3" ]]; then
+            npm run smoke:personal-workspace-packaged:team
+          elif [[ "$LOOPX_PERSONAL_WORKSPACE_SHARD" == "2/3" ]]; then
+            npm run smoke:personal-workspace-packaged:craft
+          fi
+
+      - name: Bind the successful browser partition to the unchanged candidate
+        id: receipt
+        run: |
+          set -euo pipefail
+          git restore -- examples/personal-workspace-browser apps/presentation/dashboard/smoke/workspace-locale-browser-smoke.mjs
+          python scripts/release_artifacts.py verify-checksums --dist-dir dist/packages --checksum-file dist/SHA256SUMS
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          identity = Path("dist/RELEASE-SOURCES.json")
+          source_sha256 = hashlib.sha256(identity.read_bytes()).hexdigest()
+          assert source_sha256 == os.environ["RELEASE_SOURCES_SHA256"]
+          shard = os.environ["LOOPX_PERSONAL_WORKSPACE_SHARD"]
+          companions = {"1/3": ["team"], "2/3": ["craft"], "3/3": []}[shard]
+          output = Path("output/playwright/personal-workspace")
+          acceptance = output / "acceptance-results.json"
+          results = json.loads(acceptance.read_text())
+          # Tagged runners predating inline provenance still ran against this
+          # digest-verified installed wheel. Bind their unchanged result fields here.
+          assert results.get("release_sources_sha256", source_sha256) == source_sha256
+          results["release_sources_sha256"] = source_sha256
+          acceptance.write_text(json.dumps(results, indent=2) + "\n")
+          (output / "qualification.json").write_text(json.dumps({
+              "shard": shard, "release_sources_sha256": source_sha256,
+              "companions": companions,
+              "candidate_artifact_id": os.environ["RELEASE_CANDIDATE_ARTIFACT_ID"],
+          }, indent=2) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as result:
+              result.write("shard-index=" + shard.split("/")[0] + "\n")
+          PY
+
+      - name: Upload successful browser qualification
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-browser-${{ steps.receipt.outputs.shard-index }}
+          # A rerun replaces only that partition; the original candidate id is retained.
+          overwrite: true
+          path: |
+            output/playwright/personal-workspace/acceptance-results.json
+            output/playwright/personal-workspace/qualification.json
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    # A failed/skipped prerequisite must produce a failed gate, never a green
+    # skipped build. Publication-only recovery retains the original skipped build.
+    if: >-
+      !cancelled() && github.repository == 'loopx-project/loopx' &&
+      inputs.validated_run_id == ''
+    needs: [prepare, browser]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      release-tag: ${{ needs.prepare.outputs.release-tag }}
+    env:
+      RELEASE_SOURCES_SHA256: ${{ needs.prepare.outputs.sources-sha256 }}
+      RELEASE_CANDIDATE_ARTIFACT_ID: ${{ needs.prepare.outputs.candidate-artifact-id }}
+    steps:
+      - name: Require every qualification job to succeed
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          BROWSER_RESULT: ${{ needs.browser.result }}
+        run: |
+          test "$PREPARE_RESULT" = success
+          test "$BROWSER_RESULT" = success
+
+      - name: Check out the exact candidate source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.product-commit }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Download the unchanged release candidate
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.candidate-artifact-id }}
+          path: dist
+
+      - name: Download browser qualification partitions
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-browser-*
+          path: browser-qualification
+          merge-multiple: false
+
+      - name: Require exact catalog coverage and common package provenance
+        run: |
+          node --input-type=module - <<'JS'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { readFileSync, readdirSync, writeFileSync, unlinkSync } from "node:fs";
+          import { resolve } from "node:path";
+          import { pathToFileURL } from "node:url";
+          import { execFileSync } from "node:child_process";
+          import { selectScenarioShard } from "./examples/personal-workspace-browser/shard.mjs";
+
+          const read = path => JSON.parse(readFileSync(path, "utf8"));
+          const digest = path => createHash("sha256").update(readFileSync(path)).digest("hex");
+          const sourceDigest = digest("dist/RELEASE-SOURCES.json");
+          assert.equal(sourceDigest, process.env.RELEASE_SOURCES_SHA256);
+          const sources = read("dist/RELEASE-SOURCES.json");
+          assert.equal(execFileSync("git", ["rev-parse", "HEAD"], {encoding: "utf8"}).trim(), sources.product_commit);
+          const runtimeNames = readdirSync("dist/runtime").sort();
+          assert.ok(runtimeNames.includes("qualification.json"));
+          assert.deepEqual(Object.keys(sources.runtime_sha256).sort(), runtimeNames);
+          for (const name of runtimeNames) assert.equal(digest(`dist/runtime/${name}`), sources.runtime_sha256[name]);
+          const artifactNames = readdirSync("dist/packages").sort();
+          assert.deepEqual(Object.keys(sources.sha256).sort(), [...artifactNames, "SHA256SUMS"].sort());
+          for (const name of artifactNames) assert.equal(digest(`dist/packages/${name}`), sources.sha256[name]);
+          assert.equal(digest("dist/SHA256SUMS"), sources.sha256.SHA256SUMS);
+          assert.deepEqual(readdirSync("browser-qualification").sort(), ["release-browser-1", "release-browser-2", "release-browser-3"]);
+          // Existing immutable tags have an unconditional final await main().
+          // Import only their definitions through a temporary sibling module;
+          // preserve the actual catalog/imports and never alter product bytes.
+          const entry = "examples/personal-workspace-browser-smoke.mjs";
+          const entrySource = readFileSync(entry, "utf8").trimEnd();
+          const legacyInvocation = "await main();";
+          let catalogEntry = entry;
+          if (entrySource.endsWith(legacyInvocation)) {
+            catalogEntry = `${entry}.release-catalog.mjs`;
+            writeFileSync(catalogEntry, entrySource.slice(0, -legacyInvocation.length) + "\nexport { scenarioCatalog };\n");
+          }
+          let scenarioCatalog;
+          try {
+            ({scenarioCatalog} = await import(pathToFileURL(resolve(catalogEntry)).href));
+          } finally {
+            if (catalogEntry !== entry) unlinkSync(catalogEntry);
+          }
+          const catalogIds = scenarioCatalog.map(scenario => scenario.id);
+          assert.equal(new Set(catalogIds).size, catalogIds.length);
+          const observed = [];
+          for (const index of [1, 2, 3]) {
+            const shard = `${index}/3`;
+            const directory = `browser-qualification/release-browser-${index}`;
+            const receipt = read(`${directory}/qualification.json`);
+            const results = read(`${directory}/acceptance-results.json`);
+            assert.equal(receipt.candidate_artifact_id, process.env.RELEASE_CANDIDATE_ARTIFACT_ID);
+            assert.equal(receipt.shard, shard);
+            assert.equal(results.shard, shard);
+            assert.equal(receipt.release_sources_sha256, sourceDigest);
+            assert.equal(results.release_sources_sha256, sourceDigest);
+            assert.deepEqual(receipt.companions, index === 1 ? ["team"] : index === 2 ? ["craft"] : []);
+            const expected = selectScenarioShard(scenarioCatalog, shard).map(scenario => scenario.id);
+            assert.equal(results.catalog_count, catalogIds.length);
+            assert.deepEqual(results.selected, expected);
+            assert.deepEqual(Object.keys(results.scenarios).sort(), [...expected].sort());
+            for (const id of expected) assert.equal(results.scenarios[id].status, "PASS", id);
+            observed.push(...results.selected);
+          }
+          assert.equal(new Set(observed).size, observed.length);
+          assert.deepEqual([...observed].sort(), [...catalogIds].sort());
+          JS
 
       - name: Attest release packages and checksum manifest
         if: github.event_name != 'pull_request'
@@ -244,33 +698,62 @@ jobs:
           subject-path: |
             dist/packages/*
             dist/SHA256SUMS
+            dist/RELEASE-SOURCES.json
+            dist/runtime/*
 
       - name: Upload validated release bundle
         uses: actions/upload-artifact@v7
         with:
-          name: loopx-${{ steps.identity.outputs.release-tag }}
+          name: loopx-${{ needs.prepare.outputs.release-tag }}
           path: dist
           if-no-files-found: error
           retention-days: 30
 
   upload-release:
-    if: github.event_name != 'pull_request'
+    if: >-
+      !cancelled() && github.repository == 'loopx-project/loopx' &&
+      github.event_name != 'pull_request' &&
+      (needs.build.result == 'success' ||
+       (inputs.validated_run_id != '' && needs.build.result == 'skipped'))
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+      actions: read
+      attestations: read
     steps:
       - name: Check out release source
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.build.outputs.release-tag }}
+          ref: ${{ needs.build.outputs.release-tag || inputs.tag }}
+
+      - name: Check out reviewed publication tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: publication-tooling
+
+      - name: Verify the original tagged build before recovery
+        if: inputs.validated_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATED_RUN_ID: ${{ inputs.validated_run_id }}
+          BROWSER_FIXTURE_COMMIT: ${{ inputs.browser_fixture_commit }}
+        run: |
+          set -euo pipefail
+          test -z "${BROWSER_FIXTURE_COMMIT}"
+          python publication-tooling/scripts/release_artifacts.py verify-publication-run \
+            --repo "$GITHUB_REPOSITORY" --run-id "$VALIDATED_RUN_ID" \
+            --commit "$(git rev-parse HEAD)"
 
       - name: Download validated release bundle
         uses: actions/download-artifact@v7
         with:
-          name: loopx-${{ needs.build.outputs.release-tag }}
+          name: loopx-${{ needs.build.outputs.release-tag || inputs.tag }}
           path: dist
+          run-id: ${{ inputs.validated_run_id || github.run_id }}
+          github-token: ${{ github.token }}
 
       - name: Verify checksums before upload
         run: >-
@@ -281,26 +764,25 @@ jobs:
       - name: Upload immutable GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.build.outputs.release-tag }}
+          VALIDATED_RUN_ID: ${{ inputs.validated_run_id }}
         run: |
           set -euo pipefail
-          gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null
-          gh release upload "${RELEASE_TAG}" \
-            dist/packages/* \
-            dist/SHA256SUMS \
-            --repo "${GITHUB_REPOSITORY}"
+          recovery=()
+          if [[ -n "$VALIDATED_RUN_ID" ]]; then recovery=(--recover); fi
+          python publication-tooling/scripts/release_artifacts.py upload-immutable \
+            --dist-dir dist --repo "$GITHUB_REPOSITORY" "${recovery[@]}"
 
   publish-pypi:
     if: >-
-      github.event_name != 'pull_request' &&
+      !cancelled() && github.event_name != 'pull_request' &&
+      needs.upload-release.result == 'success' &&
       vars.PYPI_PUBLISH_ENABLED == 'true'
-    needs:
-      - build
-      - upload-release
+    needs: upload-release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       id-token: write
+      actions: read
     environment:
       name: pypi
       url: https://pypi.org/project/loopx/
@@ -308,10 +790,61 @@ jobs:
       - name: Download validated release bundle
         uses: actions/download-artifact@v7
         with:
-          name: loopx-${{ needs.build.outputs.release-tag }}
+          name: loopx-${{ github.event.release.tag_name || inputs.tag }}
           path: dist
+          run-id: ${{ inputs.validated_run_id || github.run_id }}
+          github-token: ${{ github.token }}
 
       - name: Publish distributions with PyPI Trusted Publishing
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist/packages
+
+      - name: Verify the published package from PyPI
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          verify_target="${RUNNER_TEMP}/loopx-pypi-target-${version}"
+          skills_dir="${RUNNER_TEMP}/loopx-pypi-skills-${version}"
+          for attempt in {1..12}; do
+            if python -m pip install \
+              --disable-pip-version-check \
+              --index-url https://pypi.org/simple \
+              --no-cache-dir \
+              --no-deps \
+              --target "${verify_target}" \
+              "loopx==${version}"; then
+              if (
+                cd "${RUNNER_TEMP}"
+                test "$(PYTHONPATH="${verify_target}" python -m loopx.cli --version)" = \
+                  "loopx ${version}"
+                PYTHONPATH="${verify_target}" python -m loopx.cli --format json \
+                  workflow-skills --install --skills-dir "${skills_dir}" \
+                  --host-surface deepseek-harness-native \
+                  > "${RUNNER_TEMP}/loopx-pypi-workflow-skills.json"
+              ); then
+                python - "${RUNNER_TEMP}/loopx-pypi-workflow-skills.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert payload["ok"] is True, payload
+          assert payload["operation"] == "install", payload
+          assert payload["host_surface"] == "deepseek-harness-native", payload
+          assert payload["source"]["kind"] == "python_distribution", payload
+          assert payload["after"]["ready"] is True, payload
+          PY
+                exit 0
+              fi
+            fi
+            if [[ "${attempt}" -eq 12 ]]; then
+              break
+            fi
+            echo "PyPI has not exposed loopx ${version} yet; retrying in 10 seconds"
+            sleep 10
+          done
+          echo "loopx ${version} is still not installable from PyPI" >&2
+          exit 1

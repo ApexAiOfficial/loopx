@@ -30,8 +30,10 @@ _PROJECT_ASSET_CANONICAL_FIELDS = (
     "agent_reward_memory",
     "autonomous_replan_ack",
     "autonomous_replan_obligation",
+    "bounded_research_frontier",
     "completed_todo_archive_warning",
     "control_plane",
+    "external_progress_review",
     "goal_frontier_projection",
     "latest_run_recommended_action",
     "latest_run_recommended_action_source",
@@ -203,6 +205,7 @@ def _compact_vision_audit(value: Any) -> dict[str, Any] | None:
             "selected_todo_is_goal_completion",
             "closeout_allowed_without_evidence",
             "recommended_action",
+            "outcome_checkpoint_diagnostics",
         )
         if value.get(key) is not None
     }
@@ -263,6 +266,9 @@ def _compact_goal_frontier(value: Any) -> dict[str, Any] | None:
                     "source",
                     "agent_id",
                     "replan_trigger_source",
+                    "reason_code",
+                    "component_checks",
+                    "resolution_hint",
                 )
                 if gap.get(key) is not None
             }

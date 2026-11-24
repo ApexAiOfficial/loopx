@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
+from ..quota.effective_action import EffectiveAction
+
 
 from ..agents.agent_scope_frontier import (
     AgentScopeFrontierAction,
@@ -14,12 +16,12 @@ AUTOMATION_LIVENESS_SCHEMA_VERSION = "automation_liveness_v0"
 
 def build_automation_liveness(payload: dict[str, Any]) -> dict[str, Any]:
     heartbeat_recommendation = (
-        payload.get("heartbeat_recommendation")
+        cast(dict[str, Any], payload.get("heartbeat_recommendation"))
         if isinstance(payload.get("heartbeat_recommendation"), dict)
         else {}
     )
     execution_obligation = (
-        payload.get("execution_obligation")
+        cast(dict[str, Any], payload.get("execution_obligation"))
         if isinstance(payload.get("execution_obligation"), dict)
         else {}
     )
@@ -64,7 +66,7 @@ def build_automation_liveness(payload: dict[str, Any]) -> dict[str, Any]:
             "next_trigger": "explicit quota resume with quota.compute > 0",
             "spend_policy": "no quota spend for paused automation shutdown",
         }
-    if effective_action == "agent_monitor_only":
+    if effective_action == EffectiveAction.AGENT_MONITOR_ONLY.value:
         return {
             **base,
             "keep_active": True,
@@ -81,7 +83,7 @@ def build_automation_liveness(payload: dict[str, Any]) -> dict[str, Any]:
             ),
             "spend_policy": "no quota spend without a validated material transition",
         }
-    if effective_action == "terminal_no_followup":
+    if effective_action == EffectiveAction.TERMINAL_NO_FOLLOWUP.value:
         return {
             **base,
             "keep_active": False,
@@ -98,8 +100,22 @@ def build_automation_liveness(payload: dict[str, Any]) -> dict[str, Any]:
             "next_trigger": "explicit goal resume or newly projected work",
             "spend_policy": "no quota spend for terminal automation shutdown",
         }
+    if effective_action == EffectiveAction.PEER_COORDINATION_BLOCKED.value:
+        return {
+            **base,
+            "automation_action": "keep_active_peer_coordination_backoff",
+            "reason": (
+                "peer coordination is recoverable from asynchronous peer, runtime, "
+                "configuration, or local-frontier changes"
+            ),
+            "next_trigger": (
+                "peer activation capability, peer runtime readiness, coordinator "
+                "configuration, or newly projected local work"
+            ),
+            "spend_policy": "no quota spend while explicit peer coordination is blocked",
+        }
     if (
-        effective_action == "monitor_quiet_skip"
+        effective_action == EffectiveAction.MONITOR_QUIET_SKIP.value
         or recommended_mode == "monitor_quiet_until_material_transition"
     ):
         return {
@@ -115,7 +131,7 @@ def build_automation_liveness(payload: dict[str, Any]) -> dict[str, Any]:
             ),
             "spend_policy": "no quota spend for unchanged monitor-only polls",
         }
-    if effective_action == "heartbeat_settled_skip":
+    if effective_action == EffectiveAction.HEARTBEAT_SETTLED_SKIP.value:
         return {
             **base,
             "automation_action": "keep_active_quiet",
@@ -126,7 +142,7 @@ def build_automation_liveness(payload: dict[str, Any]) -> dict[str, Any]:
             "next_trigger": "next heartbeat turn with a fresh turn identity",
             "spend_policy": "no quota spend for an already-settled heartbeat turn",
         }
-    if effective_action == "automation_prompt_upgrade_required":
+    if effective_action == EffectiveAction.AUTOMATION_PROMPT_UPGRADE_REQUIRED.value:
         return {
             **base,
             "automation_action": "repair_automation_prompt_identity",
@@ -138,7 +154,7 @@ def build_automation_liveness(payload: dict[str, Any]) -> dict[str, Any]:
         }
     if effective_action == AgentScopeFrontierAction.SUCCESSOR_REPLAN_REQUIRED.value:
         agent_scope_frontier = (
-            payload.get("agent_scope_frontier")
+            cast(dict[str, Any], payload.get("agent_scope_frontier"))
             if isinstance(payload.get("agent_scope_frontier"), dict)
             else {}
         )

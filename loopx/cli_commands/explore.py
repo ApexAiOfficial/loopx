@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+from functools import partial
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from ..capabilities.explore.result_log import (
     DEFAULT_FINDING_LIMIT,
@@ -19,8 +20,9 @@ from ..capabilities.explore.result_log import (
     build_explore_node_event,
     build_explore_result_projection,
     explore_result_log_path,
-    load_explore_result_events,
+    load_explore_result_events_strict,
 )
+from ..capabilities.explore.research_evidence import append_research_observation
 from ..capabilities.explore.harness_gate import GATE_STATE_DISABLED
 from ..capabilities.explore.resource_portfolio import parse_resource_counts
 from ..capabilities.explore.source_history_reconcile import (
@@ -53,7 +55,7 @@ from ..extensions.runtime import (
 )
 from ..history import load_registry
 from ..paths import resolve_runtime_root
-from ..todos import list_goal_todos
+from ..control_plane.todos.list_readback import list_goal_todos
 from .explore_feishu_commands import (
     FEISHU_SINK_EXPLORE_COMMANDS,
     handle_explore_feishu_command,
@@ -78,6 +80,16 @@ def register_explore_commands(
         help="Record the exploration topology and project it into a Feishu/Lark result board.",
     )
     sub = parser.add_subparsers(dest="explore_command", required=True)
+
+    context = sub.add_parser("turn-context", help="Read bounded enabled Explore evidence and planning guidance for an agent turn.")
+    add_subcommand_format(context)
+    context.add_argument("--goal-id", required=True)
+    context.add_argument("--agent-id", required=True)
+    context.add_argument("--todo-id", help="Prioritize this current task's explicit question links; does not select or claim work.")
+    context.add_argument("--result-limit", type=int, default=3, help="Evidence details and measurement groups per page (1..20); default 3.")
+    context.add_argument("--result-offset", type=int, default=0, help="Continue using the previous page's result_revision.")
+    context.add_argument("--result-node", help="Read evidence for one question node.")
+    context.add_argument("--result-revision", help="Evidence revision returned by the previous page; rejects changed evidence.")
 
     schema = sub.add_parser("schema", help="Print the result-board schema and LoopX mapping.")
     add_subcommand_format(schema)
@@ -117,12 +129,18 @@ def register_explore_commands(
     )
     add_subcommand_format(finding)
     finding.add_argument("--goal-id", required=True)
-    finding.add_argument("--title", required=True, help="Compact public-safe finding statement.")
+    finding_input = finding.add_mutually_exclusive_group(required=True)
+    finding_input.add_argument("--title", help="Compact public-safe finding statement.")
+    finding_input.add_argument("--result-json", help="Record a Todo-bound result attachment and return its measurement feedback.")
+    finding.add_argument("--todo-id", help="Open claimed Todo for --result-json.")
+    finding.add_argument("--turn-instance-id", help="Current Turn identity for --result-json.")
     finding.add_argument("--finding-id", help="Stable finding id; reuse it to update the same finding.")
     finding.add_argument("--node", dest="node_id", help="Node id this finding belongs to.")
     finding.add_argument("--status", choices=sorted(FINDING_STATUSES))
     finding.add_argument("--summary", help="Optional compact public-safe detail.")
     finding.add_argument("--confidence", type=float, help="0..1 confidence.")
+    finding.add_argument("--measurements-json", help="JSON file containing one to eight sourced measurements for this node.")
+    finding.add_argument("--measurement-context-json", help="Reuse explicit comparison_scope, input_revision and evaluation_ref from this JSON file; --measurements-json then supplies only metric/result fields.")
     _add_common_record_args(finding)
 
     summary = sub.add_parser(
@@ -132,6 +150,13 @@ def register_explore_commands(
     add_subcommand_format(summary)
     summary.add_argument("--goal-id", required=True)
     _add_projection_limit_args(summary)
+    summary.add_argument("--agent-id", help="Registered agent whose live research lineage is displayed.")
+
+    observe = sub.add_parser("observe", help="Record typed research evidence on an existing Explore node; grants no execution or closure authority.")
+    add_subcommand_format(observe)
+    observe.add_argument("--goal-id", required=True)
+    observe.add_argument("--observation-json", required=True, help="File containing a typed_research_observation_v0 envelope.")
+    observe.add_argument("--agent-id")
 
     presentation = sub.add_parser(
         "presentation",
@@ -140,6 +165,7 @@ def register_explore_commands(
     add_subcommand_format(presentation)
     presentation.add_argument("--goal-id", required=True)
     _add_projection_limit_args(presentation)
+    presentation.add_argument("--agent-id", help="Registered agent whose live research lineage is displayed.")
 
     source_reconcile = sub.add_parser(
         "source-history-reconcile",
@@ -165,6 +191,7 @@ def register_explore_commands(
     add_subcommand_format(graph)
     graph.add_argument("--goal-id", required=True)
     _add_projection_limit_args(graph)
+    graph.add_argument("--agent-id", help="Registered agent whose live research lineage is displayed.")
     graph.add_argument(
         "--graph-format",
         choices=["mermaid", "json"],
@@ -237,9 +264,11 @@ def _projection_for(
     *,
     runtime_root: Path,
     finding_limit_override: int | None = None,
+    registry: dict[str, Any] | None = None,
+    source_registry: Path | None = None,
 ) -> dict[str, object]:
     log_path = explore_result_log_path(runtime_root, args.goal_id)
-    events = load_explore_result_events(log_path, goal_id=args.goal_id)
+    events = load_explore_result_events_strict(log_path, goal_id=args.goal_id)
     finding_limit = (
         int(args.finding_limit)
         if finding_limit_override is None
@@ -254,6 +283,12 @@ def _projection_for(
         mermaid_node_limit=max(1, int(args.mermaid_node_limit)),
     )
     projection["log_path"] = str(log_path)
+    if source_registry is not None:
+        registry = load_registry(source_registry)
+    if registry is not None:
+        from ..capabilities.explore.research_frontier import attach_research_execution_projection
+        attach_research_execution_projection(projection, events=events, registry=registry,
+            runtime_root=runtime_root, agent_id=getattr(args, "agent_id", None))
     return projection
 
 
@@ -264,15 +299,25 @@ def _append_event_payload(event: dict[str, object], *, runtime_root: Path, goal_
     return payload
 
 
-def _goal_orchestration_boundary(registry: dict[str, object], *, goal_id: str) -> dict[str, object] | None:
-    """Per-goal orchestration policy from the registered goal's spawn_policy.
+def _record_work_finding(args: argparse.Namespace, *, registry_path: Path, runtime_root: Path) -> dict[str, object]:
+    from ..capabilities.explore.result_writeback import record_work_finding
 
-    spawn_policy is the single writable source that the live quota/status
-    pipeline projects into goal_boundary.orchestration (enrich_project_asset
-    derives project_asset.orchestration from it too), so the planner gate must
-    read exactly it -- honoring any other registry key would create a second
-    authorization surface invisible to `quota should-run`. An unregistered
-    goal has no boundary, which the planners treat as opt-out.
+    if any(getattr(args, field) not in (None, [])
+           for field in ("finding_id", "node_id", "status", "summary", "confidence", "run_id",
+                         "measurements_json", "measurement_context_json", "evidence_ref", "tag", "supersedes")):
+        raise ValueError("--result-json cannot be combined with unscoped finding fields")
+    return record_work_finding(
+        json.loads(Path(args.result_json).expanduser().read_text(encoding="utf-8")),
+        registry_path=registry_path, runtime_root=runtime_root, goal_id=args.goal_id,
+        agent_id=args.agent_id, todo_id=args.todo_id, turn_instance_id=args.turn_instance_id,
+    )
+
+
+def _goal_orchestration_boundary(registry: dict[str, object], *, goal_id: str, runtime_root: Path | None = None) -> dict[str, object] | None:
+    """Read the Goal boundary with the same live Explore preference as quota.
+
+    Machine mode enables guidance only; spawn permissions remain Goal-owned.
+    Unregistered Goals retain the disabled planner response.
     """
 
     goals = registry.get("goals")
@@ -281,6 +326,9 @@ def _goal_orchestration_boundary(registry: dict[str, object], *, goal_id: str) -
     for goal in goals:
         if not isinstance(goal, dict) or str(goal.get("id") or "") != goal_id:
             continue
+        if runtime_root is not None:
+            from ..capabilities.explore.machine_defaults import resolve_explore_goal
+            goal = resolve_explore_goal(goal, runtime_root)
         spawn_policy = goal.get("spawn_policy")
         return spawn_policy if isinstance(spawn_policy, dict) else None
     return None
@@ -299,6 +347,8 @@ def _tree_lines(tree: object, *, indent: int = 0) -> list[str]:
 
 
 def render_explore_markdown(payload: dict[str, object]) -> str:
+    if "graph_enabled" in payload and "harness_enabled" in payload:
+        return "# Explore Harness turn context\n\n```json\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n```\n"
     lines = ["# LoopX Explore", ""]
     if not payload.get("ok"):
         lines.extend([f"- ok: `{payload.get('ok')}`", f"- error: `{payload.get('error')}`", ""])
@@ -310,6 +360,8 @@ def render_explore_markdown(payload: dict[str, object]) -> str:
         "event_kind",
         "result_id",
         "event_id",
+        "finding_id",
+        "node_id",
         "sink_visibility",
         "message_id",
         "card_file",
@@ -319,7 +371,40 @@ def render_explore_markdown(payload: dict[str, object]) -> str:
     ):
         if payload.get(key) not in (None, ""):
             lines.append(f"- {key}: `{payload.get(key)}`")
+    feedback = payload.get("measurement_feedback")
+    if isinstance(feedback, list):
+        for group in feedback:
+            measurement = group["latest"]["measurement"]
+            previous = group["previous_best"]
+            lines.append(
+                f"- {group['metric']}: {measurement['value']} {group['unit']} "
+                f"(previous best: {previous['value'] if previous else 'unknown'}, "
+                f"improvement: {group['improvement']})"
+            )
+    comparison = payload.get("search_comparison")
+    if isinstance(comparison, dict):
+        lines.append(f"- {comparison['guidance']}")
     counts = payload.get("counts")
+    research = payload.get("research_frontier")
+    live_research = payload.get("research_execution_frontier")
+    if isinstance(live_research, dict):
+        lines.append(f"- research execution ({live_research['agent_id']}): {live_research['pending_count']} pending, "
+                     f"{live_research['scheduled_count']} scheduled, {live_research['observed_count']} observed, "
+                     f"{live_research['ineligible_count']} ineligible, {live_research['dismissed_count']} dismissed, "
+                     f"{live_research['deferred_count']} deferred")
+        for gap in live_research["gaps"]:
+            lines.append(f"  - {gap['gap_id']}: {gap['status']}")
+    if isinstance(research, dict):
+        lines.append(f"- research composition (read-only): {research['pending_count']} pending, "
+                     f"{research['observed_count']} observed, {research['ineligible_count']} ineligible")
+        for gap in research["gaps"]:
+            lines.append(f"  - {gap['gap_id']}: {gap['state']} ({gap['reason']})")
+        if research["omitted_count"]:
+            lines.append(f"  - {research['omitted_count']} additional candidates omitted from this bounded view")
+    observation = payload.get("observation")
+    if isinstance(observation, dict):
+        lines.append(f"- research observation: `{observation['explore_node_id']}`; "
+                     f"replayed={payload.get('replayed')}; written={payload.get('written')}")
     if isinstance(counts, dict):
         lines.append(
             f"- map: `{counts.get('node_count')} nodes, {counts.get('edge_count')} edges, "
@@ -464,17 +549,24 @@ def handle_explore_command(
                 registry=registry,
             )
             runtime_root = Path(str(source_runtime_route["source_runtime_root"]))
+        source_registry = Path(str(source_runtime_route["source_registry"])) if source_runtime_route else registry_path
+        same_source = source_registry.resolve() == registry_path.resolve()
+        projection_for = partial(_projection_for, registry=registry if same_source else None,
+                                 source_registry=None if same_source else source_registry)
         config_path = (
             Path(args.config_path).expanduser()
             if getattr(args, "config_path", None)
-            else default_lark_explore_config_path(
-                Path(str(source_runtime_route["source_registry"]))
-                if source_runtime_route is not None
-                else registry_path
-            )
+            else default_lark_explore_config_path(source_registry)
         )
         if args.explore_command == "schema":
             payload = lark_explore_schema_payload()
+        elif args.explore_command == "turn-context":
+            from ..capabilities.explore.turn_context import explore_turn_context
+            payload = explore_turn_context(registry_path=source_registry, runtime_root=runtime_root,
+                                           goal_id=args.goal_id, agent_id=args.agent_id,
+                                           todo_id=args.todo_id,
+                                           result_limit=args.result_limit, result_offset=args.result_offset,
+                                           result_node=args.result_node, result_revision=args.result_revision)
         elif args.explore_command == "node":
             event = build_explore_node_event(
                 goal_id=args.goal_id,
@@ -504,7 +596,20 @@ def handle_explore_command(
                 run_id=args.run_id,
             )
             payload = _append_event_payload(event, runtime_root=runtime_root, goal_id=args.goal_id)
+        elif args.explore_command == "finding" and args.result_json:
+            payload = _record_work_finding(args, registry_path=source_registry, runtime_root=runtime_root)
         elif args.explore_command == "finding":
+            if args.todo_id or args.turn_instance_id:
+                raise ValueError("--todo-id and --turn-instance-id require --result-json")
+            measurements = (json.loads(Path(args.measurements_json).read_text(encoding="utf-8"))
+                            if args.measurements_json else None)
+            if args.measurement_context_json:
+                if measurements is None:
+                    raise ValueError("--measurement-context-json requires --measurements-json")
+                from ..capabilities.explore.measurements import normalize_measurements
+
+                measurements = normalize_measurements(measurements, measurement_context=json.loads(
+                    Path(args.measurement_context_json).read_text(encoding="utf-8")))
             event = build_explore_finding_event(
                 goal_id=args.goal_id,
                 title=args.title,
@@ -518,12 +623,23 @@ def handle_explore_command(
                 evidence_refs=args.evidence_ref,
                 tags=args.tag,
                 supersedes=args.supersedes,
+                measurements=measurements,
             )
             payload = _append_event_payload(event, runtime_root=runtime_root, goal_id=args.goal_id)
+        elif args.explore_command == "observe":
+            observation = json.loads(Path(args.observation_json).read_text(encoding="utf-8"))
+            if not isinstance(observation, dict):
+                raise ValueError("research observation must be an object")
+            payload = append_research_observation(
+                explore_result_log_path(runtime_root, args.goal_id), goal_id=args.goal_id,
+                observation=observation, agent_id=args.agent_id,
+                registry_path=source_registry,
+                runtime_root=runtime_root,
+            )
         elif args.explore_command == "summary":
-            payload = _projection_for(args, runtime_root=runtime_root)
+            payload = projection_for(args, runtime_root=runtime_root)
         elif args.explore_command == "presentation":
-            projection = _projection_for(
+            projection = projection_for(
                 args,
                 runtime_root=runtime_root,
                 finding_limit_override=-1,
@@ -546,7 +662,7 @@ def handle_explore_command(
                 execute=bool(args.execute),
             )
         elif args.explore_command == "graph":
-            projection = _projection_for(args, runtime_root=runtime_root)
+            projection = projection_for(args, runtime_root=runtime_root)
             graph_view = build_explore_graph_view(
                 projection.get("nodes") or [],
                 projection.get("edges") or [],
@@ -594,7 +710,9 @@ def handle_explore_command(
                 args.resource_usage,
                 flag_name="--resource-usage",
             )
-            orchestration = _goal_orchestration_boundary(registry, goal_id=args.goal_id)
+            orchestration = _goal_orchestration_boundary(
+                registry if same_source else load_registry(source_registry),
+                goal_id=args.goal_id, runtime_root=runtime_root)
             gate = resolve_todo_branch_plan_gate(orchestration, requested_width=args.width)
             if gate["state"] == GATE_STATE_DISABLED:
                 # Short-circuit before goal-state projection so disabled and
@@ -610,7 +728,7 @@ def handle_explore_command(
                     resource_usage=resource_usage,
                 )
             else:
-                projection = _projection_for(args, runtime_root=runtime_root)
+                projection = projection_for(args, runtime_root=runtime_root)
                 todo_payload = list_goal_todos(
                     registry_path=registry_path,
                     goal_id=args.goal_id,
@@ -645,7 +763,9 @@ def handle_explore_command(
                 args.resource_usage,
                 flag_name="--resource-usage",
             )
-            orchestration = _goal_orchestration_boundary(registry, goal_id=args.goal_id)
+            orchestration = _goal_orchestration_boundary(
+                registry if same_source else load_registry(source_registry),
+                goal_id=args.goal_id, runtime_root=runtime_root)
             gate = resolve_explore_harness_gate(orchestration, requested_width=args.worker_width)
             if gate["state"] == GATE_STATE_DISABLED:
                 # Short-circuit before goal-state projection so disabled and
@@ -661,7 +781,7 @@ def handle_explore_command(
                     resource_usage=resource_usage,
                 )
             else:
-                projection = _projection_for(args, runtime_root=runtime_root)
+                projection = projection_for(args, runtime_root=runtime_root)
                 todo_payload = list_goal_todos(
                     registry_path=registry_path,
                     goal_id=args.goal_id,
@@ -703,7 +823,7 @@ def handle_explore_command(
                 args,
                 config_path=config_path,
                 runtime_root=runtime_root,
-                projection_for=_projection_for,
+                projection_for=projection_for,
             )
         else:
             raise ValueError(f"unknown explore command: {args.explore_command}")

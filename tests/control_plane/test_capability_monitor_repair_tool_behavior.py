@@ -13,6 +13,7 @@ from loopx.control_plane.testing.capability_monitor_repair_tool_behavior import 
     _build_capability_repair_fixture,
 )
 from loopx.control_plane.testing.model_tool_behavior import (
+    QuotaToolContext,
     scripted_assistant_response as _scripted_assistant_response,
     scripted_exec_tool_response as _tool_response,
 )
@@ -31,10 +32,10 @@ def _projected_reentry_command(request: Mapping[str, Any]) -> str:
         if not isinstance(message, Mapping) or message.get("role") != "tool":
             continue
         try:
-            packet = json.loads(str(message.get("content") or ""))
+            packet = QuotaToolContext.from_output(str(message.get("content") or "")).packet
         except json.JSONDecodeError:
             continue
-        reentry = packet.get("runtime_capability_reentry")
+        reentry = (packet.get("interaction_contract") or {}).get("cli_channel", {}).get("runtime_capability_reentry")
         if isinstance(reentry, Mapping):
             return str(reentry["candidates"][0]["command"])
     raise AssertionError("quota result did not project runtime capability re-entry")
@@ -50,8 +51,7 @@ def test_real_quota_capability_repair_executes_before_monitor_fallback(
     assert "--available-capability network" in fixture.quota_guard_command
     assert "--available-capability private_read" not in fixture.quota_guard_command
     assert fixture.task_body.index(
-        "Run quota; execute interaction_contract.cli_channel.next_cli_actions[0] "
-        "verbatim."
+        "use selection_command when required"
     ) < fixture.task_body.index(fixture.quota_guard_command)
     requests: list[dict[str, Any]] = []
 
@@ -123,8 +123,13 @@ def test_real_quota_capability_repair_executes_before_monitor_fallback(
     )
     assert fixture.task_body in trigger_message
 
-    quota_result = json.loads(requests[1]["messages"][-1]["content"])
-    assert list(quota_result).index("interaction_contract") <= 7
+    quota_result = QuotaToolContext.from_output(requests[1]["messages"][-1]["content"]).packet
+    # Native output is navigation, not an ordering of duplicated inline keys.
+    # Preserve receipt metadata and validate the canonical repair owner below;
+    # capability repair does not itself establish admission or settlement.
+    assert isinstance(quota_result["heartbeat_receipt"], Mapping)
+    assert quota_result["interaction_contract"]["cli_channel"][
+        "runtime_capability_reentry"]["candidates"]
     assert quota_result.get("selected_todo") is None
     assert quota_result["interaction_contract"]["mode"] == (
         "capability_bridge_repair"
@@ -133,9 +138,19 @@ def test_real_quota_capability_repair_executes_before_monitor_fallback(
     assert CAPABILITY_REPAIR_TARGET_CAPABILITY in quota_result[
         "capability_gate"
     ]["repair_missing"]
-    assert quota_result["agent_todo_summary"]["monitor_schedule_gap_items"][0][
-        "todo_id"
-    ] == CAPABILITY_REPAIR_MONITOR_TODO_ID
+    from loopx.control_plane.todos.todo_semantics import (
+        todo_summary_monitor_schedule_gap_items,
+    )
+
+    summary = quota_result["agent_todo_summary"]
+    gap_items = summary.get("monitor_schedule_gap_items")
+    if gap_items is None:
+        assert (
+            summary["monitor_schedule_gap_items_ref"]
+            == "$.agent_todo_summary.monitor_open_items"
+        )
+        gap_items = todo_summary_monitor_schedule_gap_items(summary)
+    assert gap_items[0]["todo_id"] == CAPABILITY_REPAIR_MONITOR_TODO_ID
 
 
 def test_actor_rejects_capability_repair_before_quota(tmp_path: Path) -> None:
@@ -193,10 +208,15 @@ def test_actor_rejects_bounded_json_registry_preview_after_quota(
 
 
 def test_actor_allows_bounded_fixture_layout_preview_before_repair(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
     fixture_root = tmp_path / "actor"
     fixture = _build_capability_repair_fixture(fixture_root)
+    # Construct canonical authority once; the actor reuses this prepared fixture.
+    monkeypatch.setattr(
+        "loopx.control_plane.testing.capability_monitor_repair_tool_behavior._build_capability_repair_fixture",
+        lambda root: fixture,
+    )
     state_path = (
         fixture.project_root
         / ".codex/goals/portfolio-goal/ACTIVE_GOAL_STATE.md"

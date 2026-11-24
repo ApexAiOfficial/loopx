@@ -1,5 +1,10 @@
 # Cross-Runtime Implement/Review Demo
 
+> **Early design / dry-run example.** This page preserves the Claude Code / Codex
+> role contract and fixture path; it is not a live end-to-end qualification.
+> Start with the [Agent collaboration guide](README.md) for the current runnable
+> three-Agent example and its supported scope.
+
 This note defines a LoopX-native demo path for the pattern "Claude Code
 implements, Codex reviews" without making either runtime the source of truth.
 
@@ -10,8 +15,7 @@ LoopX's control-plane boundary.
 
 ## Demo Claim
 
-LoopX can coordinate an implementation/review loop across different agent
-runtimes:
+The proposed cross-runtime pattern assigns these responsibilities:
 
 - Claude Code owns an implementation todo and writes a bounded patch.
 - Codex owns a review todo and produces a structured review verdict.

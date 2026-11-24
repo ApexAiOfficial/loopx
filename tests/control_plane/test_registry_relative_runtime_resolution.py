@@ -8,6 +8,7 @@ import sys
 
 import pytest
 
+from canonical_authority_fixture import advance_canonical_fixture_authority
 from examples.control_plane.quota_plan_fixtures import write_cli_fixture
 from loopx.capabilities.explore.result_log import (
     append_explore_result_event,
@@ -16,6 +17,9 @@ from loopx.capabilities.explore.result_log import (
 )
 from loopx.capabilities.issue_fix.explore_projection import (
     project_issue_fix_explore_graph,
+)
+from loopx.control_plane.coordination.runtime_shadow import (
+    build_todo_runtime_shadow_projection,
 )
 
 
@@ -105,16 +109,75 @@ def test_history_and_quota_anchor_relative_runtime_to_registry_project(
         str(registry_path),
         "quota",
         "should-run",
+        "--context-delivery",
+        "off",
         "--goal-id",
         "half-speed",
-        "--scan-path",
-        str(project),
         cwd=independent_worktree,
     )
 
     assert decision["should_run"] is True
     assert decision["normal_delivery_allowed"] is True
     assert decision["decision"] == "run"
+
+
+def test_todo_list_anchors_promoted_authority_to_registry_project(
+    tmp_path: Path,
+) -> None:
+    registry_path, runtime_root, project = write_cli_fixture(tmp_path / "fixture")
+    target_runtime = _make_runtime_paths_project_relative(
+        registry_path=registry_path,
+        runtime_root=runtime_root,
+        project=project,
+    )
+    state_path = (
+        project / ".codex" / "goals" / "half-speed" / "ACTIVE_GOAL_STATE.md"
+    )
+    state_path.write_text(
+        "# half-speed\n\n"
+        "## Agent Todo\n\n"
+        "- [ ] Stale Markdown work\n"
+        "  <!-- loopx:todo todo_id=todo_stale status=open -->\n",
+        encoding="utf-8",
+    )
+    projection = build_todo_runtime_shadow_projection(
+        goal_id="half-speed",
+        todos=[
+            {
+                "schema_version": "todo_item_v0",
+                "todo_id": "todo_canonical",
+                "index": 1,
+                "role": "agent",
+                "status": "open",
+                "done": False,
+                "text": "Canonical provider work",
+                "archive_state": "active",
+                "source_section": "Agent Todo",
+            }
+        ],
+    )
+    advance_canonical_fixture_authority(
+        target_runtime, "half-speed", projection, operation_id="canonical-relative-runtime",
+    )
+    independent_worktree = tmp_path / "independent-worktree"
+    independent_worktree.mkdir()
+
+    payload = _run_cli(
+        "--format",
+        "json",
+        "--registry",
+        str(registry_path),
+        "todo",
+        "list",
+        "--goal-id",
+        "half-speed",
+        cwd=independent_worktree,
+    )
+
+    assert [todo["todo_id"] for todo in payload["todos"]] == ["todo_canonical"]
+    assert payload["authority_read"]["decision_read_from_provider"] is True
+    assert payload["authority_read"]["legacy_fallback_used"] is False
+    assert not (independent_worktree / ".loopx" / "runtime").exists()
 
 
 def test_issue_fix_explore_projection_anchors_relative_runtime_to_registry_project(

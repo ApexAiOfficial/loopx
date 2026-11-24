@@ -6,43 +6,34 @@ from pathlib import Path
 import pytest
 
 from loopx.cli import build_parser, main, output_format, resolve_global_output_format
+from loopx.cli_commands import doctor as doctor_command
 from loopx.cli_commands import todo as todo_command
 from loopx.cli_commands.quota_request import validate_quota_command_request
 from loopx.cli_commands.todo_argument_validation import (
     validate_todo_add_options,
     validate_todo_archive_completed_options,
-    validate_todo_capture_followups_options,
     validate_todo_claim_options,
     validate_todo_complete_options,
     validate_todo_list_options,
-    validate_todo_suggest_options,
     validate_todo_supersede_options,
     validate_todo_update_options,
+    validate_shared_todo_options,
 )
+from loopx.control_plane.work_items.task_lease import TaskLeaseError
 
 
-def test_todo_handler_expands_shared_paths_and_keeps_suggest_project_only(
+def test_todo_list_handler_expands_shared_paths(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     captured_list: dict[str, object] = {}
-    captured_suggest: dict[str, object] = {}
 
     def fake_list_goal_todos(**kwargs: object) -> dict[str, object]:
         captured_list.update(kwargs)
         return {"ok": True, "dry_run": True}
 
-    def fake_suggestion_packet(**kwargs: object) -> dict[str, object]:
-        captured_suggest.update(kwargs)
-        return {"ok": True}
-
     monkeypatch.setattr(todo_command, "list_goal_todos", fake_list_goal_todos)
-    monkeypatch.setattr(
-        todo_command,
-        "build_todo_suggestion_prompt_packet",
-        fake_suggestion_packet,
-    )
     common = {
         "registry_path": tmp_path / "registry.json",
         "runtime_root_arg": None,
@@ -65,20 +56,6 @@ def test_todo_handler_expands_shared_paths_and_keeps_suggest_project_only(
     assert todo_command.handle_todo_command(list_args, **common) == 0
     assert captured_list["project"] == tmp_path / "project"
     assert captured_list["state_file"] == tmp_path / "ACTIVE_GOAL_STATE.md"
-
-    suggest_args = build_parser().parse_args(
-        [
-            "todo",
-            "suggest",
-            "--goal-id",
-            "example-goal",
-            "--project",
-            "~/project",
-        ]
-    )
-    assert todo_command.handle_todo_command(suggest_args, **common) == 0
-    assert captured_suggest["project"] == tmp_path / "project"
-    assert "state_file" not in captured_suggest
 
 
 def test_todo_requires_explicit_command_without_mutating_state(
@@ -159,7 +136,7 @@ def test_quota_include_detail_rejects_unknown_section(
     assert "--include-detail" in stderr
 
 
-def test_quota_include_detail_rejects_non_should_run_command(
+def test_quota_status_rejects_scheduler_detail(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     exit_code = main(
@@ -178,8 +155,7 @@ def test_quota_include_detail_rejects_non_should_run_command(
     assert payload["ok"] is False
     assert payload["error_code"] == "QUOTA_VALIDATION_FAILED"
     assert payload["error"] == (
-        "--include-detail is only valid with `quota should-run` or "
-        "`quota monitor-poll`"
+        "`quota status` does not accept --include-detail scheduler"
     )
 
 
@@ -238,7 +214,8 @@ def test_todo_list_validation_preserves_exact_unsupported_diagnostic() -> None:
 
     assert str(exc_info.value) == (
         "todo list only accepts --goal-id, optional --role, --status, --todo-id, "
-        "--agent-id, --limit, --project, --state-file, --dry-run, and --format; "
+        "--agent-id, --limit, --thin, --summary, --include-archived, --project, "
+        "--state-file, --dry-run, and --format; "
         "unsupported: --note, --evidence"
     )
 
@@ -284,8 +261,6 @@ def test_todo_list_validation_accepts_read_filters() -> None:
                 "Continue.",
                 "--decision-outcome",
                 "approve",
-                "--follow-up",
-                "Later.",
             ],
             "todo add does not accept --decision-outcome; record it on completion",
         ),
@@ -374,7 +349,9 @@ def test_deprecated_scheduler_detail_alias_is_hidden_from_help(
     assert "--include-scheduler-detail" not in help_text
 
 
+@pytest.mark.parametrize("mode", ["status", "plan"])
 def test_quota_collection_failure_payload_is_path_free_by_default(
+    mode: str,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -385,7 +362,7 @@ def test_quota_collection_failure_payload_is_path_free_by_default(
 
     monkeypatch.setattr(quota_command, "collect_status", fail_collect_status)
 
-    exit_code = main(["--format", "json", "quota", "status"])
+    exit_code = main(["--format", "json", "quota", mode])
 
     assert exit_code == 1
     payload = json.loads(capsys.readouterr().out)
@@ -512,6 +489,43 @@ def test_quota_command_request_validation_preserves_exact_diagnostics(
     assert str(exc_info.value) == expected
 
 
+def test_quota_action_selection_requires_turn_identity() -> None:
+    args = build_parser().parse_args(
+        [
+            "quota",
+            "should-run",
+            "--goal-id",
+            "goal",
+            "--todo-id",
+            "todo_candidate001",
+        ]
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        validate_quota_command_request(args)
+
+    assert str(exc_info.value) == (
+        "`loopx quota should-run --todo-id` requires --turn-instance-id or --begin-turn"
+    )
+
+
+def test_monitor_change_scope_requires_material_transition() -> None:
+    args = build_parser().parse_args(
+        [
+            "quota",
+            "monitor-poll",
+            "--goal-id",
+            "goal",
+            "--material-change-scope",
+            "case-a/run-1",
+        ]
+    )
+    with pytest.raises(ValueError, match="requires quota monitor-poll --material-change"):
+        validate_quota_command_request(args)
+    args.material_change = True
+    validate_quota_command_request(args)
+
+
 @pytest.mark.parametrize(
     ("extra_args", "expected"),
     [
@@ -542,7 +556,8 @@ def test_quota_command_request_validation_preserves_exact_diagnostics(
                 "Continue the work.",
             ],
             "todo claim only accepts --todo-id, --claimed-by, --agent-id, optional --role, "
-            "--project, --state-file, and --dry-run; unsupported: "
+            "--claim-operation-id, --ttl-seconds, --task-lease-idempotency-key, "
+            "--task-lease-expected-version, --project, --state-file, --dry-run, and --thin; unsupported: "
             "--decision-outcome, --next-agent-todo",
         ),
     ],
@@ -559,6 +574,57 @@ def test_todo_claim_validation_preserves_exact_diagnostics(
         validate_todo_claim_options(args)
 
     assert str(exc_info.value) == expected
+
+
+@pytest.mark.parametrize("command", ["add", "list"])
+@pytest.mark.parametrize("operation_id", ["retry-one", ""])
+def test_claim_operation_id_is_not_silently_ignored_by_other_commands(command, operation_id):
+    args = build_parser().parse_args([
+        "todo", command, "--goal-id", "example-goal", "--claim-operation-id", operation_id,
+    ])
+    with pytest.raises(ValueError, match="supported only by todo claim"):
+        validate_shared_todo_options(args)
+
+
+@pytest.mark.parametrize("command", ["update", "complete", "supersede"])
+@pytest.mark.parametrize("operation_id", ["retry-one", ""])
+def test_managed_claim_reference_is_retained_for_the_execution_owner(command, operation_id):
+    args = build_parser().parse_args([
+        "todo", command, "--goal-id", "example-goal", "--claim-operation-id", operation_id,
+    ])
+    validate_shared_todo_options(args)
+    # Scope validation admits the supported caller without dropping its raw
+    # reference. The native owner still rejects an invalid empty value.
+    assert args.claim_operation_id == operation_id
+
+
+@pytest.mark.parametrize("command", ["add", "list", "update", "complete", "supersede"])
+def test_ttl_seconds_is_rejected_on_non_claim_todo_commands(command):
+    args = build_parser().parse_args([
+        "todo", command, "--goal-id", "example-goal", "--ttl-seconds", "7200",
+    ])
+    with pytest.raises(ValueError, match="--ttl-seconds is supported only by todo claim"):
+        validate_shared_todo_options(args)
+
+
+@pytest.mark.parametrize("bad_ttl", [0, 86401])
+def test_todo_claim_rejects_out_of_range_ttl_seconds(bad_ttl):
+    args = build_parser().parse_args([
+        "todo", "claim", "--goal-id", "example-goal", "--todo-id", "todo_example",
+        "--claimed-by", "codex-example", "--agent-id", "codex-example",
+        "--ttl-seconds", str(bad_ttl),
+    ])
+    with pytest.raises(ValueError, match="ttl seconds must be between 1 and 86400"):
+        validate_todo_claim_options(args)
+
+
+def test_todo_claim_ttl_seconds_requires_managed_or_explicit_lease():
+    args = build_parser().parse_args([
+        "todo", "claim", "--goal-id", "example-goal", "--todo-id", "todo_example",
+        "--claimed-by", "codex-example", "--ttl-seconds", "7200",
+    ])
+    with pytest.raises(ValueError, match="--ttl-seconds requires managed execution"):
+        validate_todo_claim_options(args)
 
 
 @pytest.mark.parametrize(
@@ -618,6 +684,46 @@ def test_todo_claim_validation_preserves_exact_diagnostics(
             ],
             "todo update does not support --next-required-capability",
         ),
+        (
+            [
+                "--todo-id",
+                "todo_example",
+                "--validation-command-json",
+                '["pytest","-q"]',
+            ],
+            "todo update validation revision requires --update-operation-id "
+            "and --update-expected-provider-revision",
+        ),
+        (
+            [
+                "--todo-id",
+                "todo_example",
+                "--validation-command-json",
+                '["pytest","-q"]',
+                "--update-operation-id",
+                "validator-revision-1",
+                "--update-expected-provider-revision",
+                "file:1",
+            ],
+            "todo update validation revision requires a registered --agent-id",
+        ),
+        (
+            [
+                "--todo-id",
+                "todo_example",
+                "--validation-command-json",
+                '["pytest","-q"]',
+                "--update-operation-id",
+                "validator-revision-1",
+                "--update-expected-provider-revision",
+                "file:1",
+                "--agent-id",
+                "agent-a",
+                "--note",
+                "also edit prose",
+            ],
+            "todo update validation revision cannot be combined with another Todo edit",
+        ),
     ],
 )
 def test_todo_update_validation_preserves_exact_diagnostics(
@@ -645,6 +751,31 @@ def test_todo_update_validation_accepts_a_mutable_field() -> None:
             "todo_example",
             "--note",
             "validated",
+        ]
+    )
+
+    validate_todo_update_options(args)
+
+
+def test_todo_update_validation_accepts_a_validator_revision() -> None:
+    args = build_parser().parse_args(
+        [
+            "todo",
+            "update",
+            "--goal-id",
+            "example-goal",
+            "--todo-id",
+            "todo_example",
+            "--agent-id",
+            "agent-a",
+            "--validation-command-json",
+            '["pytest","-q","tests/test_target.py"]',
+            "--validation-label",
+            "focused validation",
+            "--update-operation-id",
+            "validator-revision-1",
+            "--update-expected-provider-revision",
+            "file:1",
         ]
     )
 
@@ -707,6 +838,27 @@ def test_todo_update_validation_accepts_a_mutable_field() -> None:
             "--no-follow-up requires --note or --evidence",
         ),
         (
+            [
+                "--todo-id",
+                "todo_example",
+                "--completion-identity-key",
+                "local_completion_example",
+            ],
+            "--completion-identity-key is only valid with --no-follow-up",
+        ),
+        (
+            [
+                "--todo-id",
+                "todo_example",
+                "--completion-identity-key",
+                "local_completion_example",
+                "--no-follow-up",
+                "--evidence",
+                "replacement evidence",
+            ],
+            "--completion-identity-key reentry preserves the original note and evidence",
+        ),
+        (
             ["--todo-id", "todo_example", "--continuation-policy", "same_agent_non_delivery"],
             "todo complete does not update --continuation-policy; use todo update first",
         ),
@@ -740,7 +892,7 @@ def test_todo_complete_preserves_typed_task_lease_error(
     tmp_path: Path,
 ) -> None:
     def reject_stale_instance(**_kwargs: object) -> dict[str, object]:
-        raise todo_command.TaskLeaseError(
+        raise TaskLeaseError(
             "todo has an active task lease",
             code="lease_fence_required",
             payload={"lease_version": 3},
@@ -835,9 +987,16 @@ def test_todo_complete_validation_accepts_no_follow_up_with_evidence() -> None:
             "use todo update first",
         ),
         (
-            ["--todo-id", "todo_example", "--successor-todo-id", "todo_successor"],
-            "todo supersede does not support --successor-todo-id; "
-            "use --next-agent-todo or update the source todo before supersede",
+            ["--todo-id", "todo_example", "--successor-todo-id", "todo_successor",
+             "--next-agent-todo", "Continue."],
+            "--successor-todo-id links existing work and cannot be combined "
+            "with --next-agent-todo or --next-user-todo",
+        ),
+        (
+            ["--todo-id", "todo_example", "--successor-todo-id", "todo_successor",
+             "--next-user-todo", "Approve.", "--next-user-task-class", "user_gate"],
+            "--successor-todo-id links existing work and cannot be combined "
+            "with --next-agent-todo or --next-user-todo",
         ),
         (
             ["--todo-id", "todo_example", "--target-key", "monitor"],
@@ -860,7 +1019,14 @@ def test_todo_supersede_validation_preserves_exact_diagnostics(
     assert str(exc_info.value) == expected
 
 
-def test_todo_supersede_validation_accepts_successor_creation() -> None:
+@pytest.mark.parametrize("successor_args", [
+    [],
+    ["--next-agent-todo", "Continue."],
+    ["--successor-todo-id", "todo_successor", "--successor-todo-id", "todo_second"],
+])
+def test_todo_supersede_validation_accepts_omitted_generated_or_existing_successors(
+    successor_args: list[str],
+) -> None:
     args = build_parser().parse_args(
         [
             "todo",
@@ -869,8 +1035,7 @@ def test_todo_supersede_validation_accepts_successor_creation() -> None:
             "example-goal",
             "--todo-id",
             "todo_example",
-            "--next-agent-todo",
-            "Continue.",
+            *successor_args,
         ]
     )
 
@@ -909,11 +1074,6 @@ def test_todo_supersede_validation_accepts_successor_creation() -> None:
             "todo archive-completed does not support --no-follow-up",
         ),
         (
-            ["--follow-up", "Continue."],
-            "todo archive-completed does not support --follow-up; "
-            "use `todo capture-followups`",
-        ),
-        (
             ["--successor-todo-id", "todo_successor"],
             "todo archive-completed does not support --successor-todo-id",
         ),
@@ -950,120 +1110,33 @@ def test_todo_archive_completed_validation_accepts_role_and_limit() -> None:
     validate_todo_archive_completed_options(args)
 
 
-def test_todo_suggest_validation_preserves_exact_unsupported_diagnostic(
+@pytest.mark.parametrize("command", ["capture-followups", "suggest"])
+def test_retired_todo_command_is_rejected_before_state_access(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    exit_code = main(
-        [
-            "--format",
-            "json",
-            "todo",
-            "suggest",
-            "--goal-id",
-            "example-goal",
-            "--todo-id",
-            "todo_example",
-            "--note",
-            "not accepted",
-        ]
-    )
+    def unexpected_dispatch(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("retired command reached the Todo handler")
 
-    assert exit_code == 1
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["error"] == (
-        "todo suggest only accepts --goal-id, optional --project, --agent-id, "
-        "--from, --limit, --trigger, --dry-run, and --format; unsupported: "
-        "--todo-id, --note"
-    )
+    monkeypatch.setattr(todo_command, "handle_todo_command", unexpected_dispatch)
+    with pytest.raises(SystemExit) as exc_info:
+        main(["todo", command, "--goal-id", "example-goal"])
+
+    assert exc_info.value.code == 2
+    diagnostic = capsys.readouterr().err
+    assert "invalid choice" in diagnostic
+    assert command in diagnostic
 
 
-def test_todo_suggest_validation_accepts_suggestion_scope_options() -> None:
-    args = build_parser().parse_args(
-        [
-            "todo",
-            "suggest",
-            "--goal-id",
-            "example-goal",
-            "--agent-id",
-            "codex-example",
-            "--from",
-            "recent-repo",
-            "--limit",
-            "3",
-            "--trigger",
-            "quality-watch",
-        ]
-    )
-
-    validate_todo_suggest_options(args)
-
-
-@pytest.mark.parametrize(
-    ("extra_args", "expected"),
-    [
-        (
-            ["--role", "agent"],
-            "todo capture-followups always records agent todos; do not pass --role",
-        ),
-        (
-            ["--claimed-by", "codex-example"],
-            "todo capture-followups writes unclaimed todos; do not pass --claimed-by",
-        ),
-        (
-            ["--todo-id", "todo_example", "--note", "not accepted"],
-            "todo capture-followups only accepts --goal-id, --follow-up, optional "
-            "--text shorthand, --evidence, routing metadata, --project, --state-file, "
-            "and --dry-run; unsupported: --todo-id, --note",
-        ),
-    ],
-)
-def test_todo_capture_followups_validation_preserves_exact_diagnostics(
-    extra_args: list[str],
-    expected: str,
+@pytest.mark.parametrize("option,value", [("--from", "recent-repo"), ("--trigger", "quality-watch")])
+def test_retired_suggestion_options_are_not_silently_accepted(
+    option: str, value: str, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    args = build_parser().parse_args(
-        ["todo", "capture-followups", "--goal-id", "example-goal", *extra_args]
-    )
-
-    with pytest.raises(ValueError) as exc_info:
-        validate_todo_capture_followups_options(args)
-
-    assert str(exc_info.value) == expected
-
-
-def test_todo_capture_followups_validation_accepts_routing_options() -> None:
-    args = build_parser().parse_args(
-        [
-            "todo",
-            "capture-followups",
-            "--goal-id",
-            "example-goal",
-            "--follow-up",
-            "Continue.",
-            "--text",
-            "Then validate.",
-            "--evidence",
-            "tests/test_cli_argument_diagnostics.py",
-            "--task-class",
-            "advancement_task",
-            "--action-kind",
-            "implement",
-            "--continuation-policy",
-            "same_agent_non_delivery",
-            "--required-write-scope",
-            "tests/**",
-            "--required-capability",
-            "shell",
-            "--target-capability",
-            "quality",
-            "--required-decision-scope",
-            "merge",
-            "--state-file",
-            "ACTIVE_GOAL_STATE.md",
-        ]
-    )
-
-    validate_todo_capture_followups_options(args)
+    with pytest.raises(SystemExit) as exc_info:
+        main(["todo", "list", "--goal-id", "example-goal", option, value])
+    assert exc_info.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -1101,3 +1174,25 @@ def test_subcommand_format_keeps_precedence_over_resolved_global_default() -> No
     args.format = resolve_global_output_format(args)
 
     assert output_format(args) == "json"
+
+
+def test_doctor_accepts_subcommand_json_format(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        doctor_command,
+        "collect_doctor",
+        lambda *, deep=False, agent_type=None, installation_only=False,
+        registry_path=None, runtime_root_override=None: {
+            "ok": True,
+            "deep": deep,
+            "agent_type": agent_type,
+        },
+    )
+
+    exit_code = main(["doctor", "--format", "json"])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"ok": True, "deep": False, "agent_type": None}

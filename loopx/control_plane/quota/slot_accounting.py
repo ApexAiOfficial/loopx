@@ -1,50 +1,68 @@
 from __future__ import annotations
 
+from typing import Any, cast
+from .effective_action import EffectiveAction
+
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
 
 from ..agents.workspace_guard import (
     build_delivery_workspace_guard,
-    delivery_workspace_repository,
+    delivery_workspace_identity,
 )
-from ..runtime.run_artifacts import (
-    next_run_artifact_paths,
-    reserve_run_artifact_paths,
-    run_file_stem,
-)
-from ..runtime.time import now_local_iso
 from ..todos.contract import (
     normalize_todo_claimed_by,
     normalize_todo_id,
     normalize_todo_replan_obligation_id,
 )
 from ..work_items.delivery_outcome import (
-    ACCOUNTABLE_DELIVERY_OUTCOMES,
     normalize_delivery_outcome,
+    qualifies_turn_scoped_settlement,
 )
-from .decision_summary import compact_quota_decision, quota_decision_agent_id
 from .monitor_poll import QUOTA_MONITOR_POLL_CLASSIFICATION
 from .scheduler_ack import QUOTA_SCHEDULER_ACK_CLASSIFICATION
+from ...paths import validate_goal_id_path_segment as _validate_goal_id_path_segment
+from ..effect_program import SettlementBindingKind
 from .settlement import (
+    SettlementFailure,
+    SettlementFailureKind,
     SettlementIdentity,
-    infer_persisted_heartbeat_settlement_identity,
-    require_settlement_writeback,
-    resolve_heartbeat_settlement_identity,
-    resolve_settlement_delivery_workspace_causality,
+    SettlementResult,
+    SettlementStepKind,
+    read_heartbeat_settlement,
     settlement_result_payload,
 )
 from .settlement_workspace_causality import (
+    LEGACY_SETTLEMENT_RECEIPT_EVIDENCE_SCHEMA_VERSION,
     completed_todo_workspace_causality,
     missing_delivery_workspace_resolution,
+    resolve_settlement_workspace_requirement,
 )
 from .settlement_validation import completion_validation_spend_error
-from .spend_sources import DEFAULT_SLOT_SPEND_SOURCE, VALID_SLOT_SPEND_SOURCES
-
-QUOTA_SLOT_SPENT_CLASSIFICATION = "quota_slot_spent"
-QUOTA_SLOT_VOIDED_CLASSIFICATION = "quota_slot_voided"
+from .spend_sources import (
+    DEFAULT_SLOT_SPEND_SOURCE,
+    TURN_SCOPED_SLOT_SPEND_SOURCES,
+    VISIBLE_GOAL_SLOT_SPEND_SOURCE,
+)
+from .spend_commit import (
+    build_quota_slot_spend_event as build_quota_slot_spend_event,
+    record_quota_slot_spend_from_preview as record_quota_slot_spend_from_preview,
+)
+from .void_commit import (
+    build_quota_slot_void_event as build_quota_slot_void_event,
+    build_quota_slot_void_preview_for_decision as build_quota_slot_void_preview_for_decision,
+    record_quota_slot_void_from_preview as record_quota_slot_void_from_preview,
+)
+from .ledger_readback import (
+    QUOTA_SLOT_SPENT_CLASSIFICATION as QUOTA_SLOT_SPENT_CLASSIFICATION,
+    QUOTA_SLOT_VOIDED_CLASSIFICATION as QUOTA_SLOT_VOIDED_CLASSIFICATION,
+    _int_number,
+    load_quota_event_from_run as load_quota_event_from_run,
+    net_quota_slot_spend as net_quota_slot_spend,
+    quota_slot_contribution as quota_slot_contribution,
+)
 
 QuotaDecisionBuilder = Callable[[dict[str, Any]], dict[str, Any]]
 QuotaStatusBuilder = Callable[..., dict[str, Any]]
@@ -60,9 +78,10 @@ def _todo_binding_error(
     requested_replan_obligation_id: str | None,
     agent_id: str | None,
     settlement_identity: SettlementIdentity | None = None,
+    delivery_run: dict[str, Any] | None = None,
 ) -> str | None:
     selected = (
-        before.get("selected_todo")
+        cast(dict[str, Any], before.get("selected_todo"))
         if isinstance(before.get("selected_todo"), dict)
         else {}
     )
@@ -83,6 +102,7 @@ def _todo_binding_error(
             todo_id=requested_todo_id,
             agent_id=agent_id,
             selected_todo=selected,
+            delivery_run=delivery_run,
         )
     selected_todo_id = normalize_todo_id(selected.get("todo_id"))
     if requested_todo_id and selected_todo_id and requested_todo_id != selected_todo_id:
@@ -107,6 +127,21 @@ def _todo_binding_error(
         todo_id=requested_todo_id,
         agent_id=agent_id,
         selected_todo=selected,
+        delivery_run=None,
+    )
+
+
+def _receipt_committed(
+    result: SettlementResult[Any] | None,
+    step_kind: SettlementStepKind,
+) -> bool:
+    """Report whether one settlement step already owns a committed receipt."""
+
+    if result is None or result.failure is not None:
+        return False
+    return any(
+        receipt.step_kind is step_kind and receipt.status == "committed"
+        for receipt in result.receipts
     )
 
 
@@ -119,89 +154,155 @@ def _resolve_preview_settlement(
     todo_id: str | None,
     replan_obligation_id: str | None,
     turn_instance_id: str | None,
+    registry_path: Path | None,
+    goal_ref: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    if turn_instance_id and source != DEFAULT_SLOT_SPEND_SOURCE:
-        return {"reason": "turn-scoped settlement is valid only for heartbeat spend"}
+    if turn_instance_id and source not in TURN_SCOPED_SLOT_SPEND_SOURCES:
+        result: SettlementResult[Any] = SettlementResult.failed(
+            kind=SettlementFailureKind.INVALID_IDENTITY,
+            step_kind=SettlementStepKind.VALIDATION,
+            reason=(
+                "turn-scoped settlement is valid only for heartbeat or "
+                "visible-goal spend"
+            ),
+        )
+        return {"reason": cast(SettlementFailure, result.failure).reason, "result": result}
     if turn_instance_id and not raw_runtime_root:
         return {"reason": "status payload does not include runtime_root"}
-    if source != DEFAULT_SLOT_SPEND_SOURCE or not raw_runtime_root:
+    if source not in TURN_SCOPED_SLOT_SPEND_SOURCES or not raw_runtime_root:
         return {}
 
     runtime_root = Path(str(raw_runtime_root)).expanduser()
-    result = (
-        resolve_heartbeat_settlement_identity(
-            runtime_root,
-            goal_id=goal_id,
-            agent_id=agent_id,
-            todo_id=todo_id,
-            turn_instance_id=turn_instance_id,
-            replan_obligation_id=replan_obligation_id,
-        )
-        if turn_instance_id
-        else infer_persisted_heartbeat_settlement_identity(
-            runtime_root,
-            goal_id=goal_id,
-            agent_id=agent_id,
-            todo_id=todo_id,
-        )
+    readback = read_heartbeat_settlement(
+        runtime_root,
+        goal_id=goal_id,
+        agent_id=agent_id,
+        todo_id=todo_id,
+        turn_instance_id=turn_instance_id,
+        replan_obligation_id=replan_obligation_id,
+        infer_turn_instance_id=not bool(turn_instance_id),
+        allow_unbound_binding=(
+            source == VISIBLE_GOAL_SLOT_SPEND_SOURCE
+            and not todo_id
+            and not replan_obligation_id
+        ),
+        registry_path=registry_path,
+        goal_ref=goal_ref,
     )
-    if result is None:
+    if readback is None:
         return {}
+    if (
+        isinstance(readback.progress, dict)
+        and readback.progress.get("closeout_kind")
+        in {"typed_blocked_writeback_no_spend", "capability_duty_retired_no_spend"}
+    ):
+        return {
+            "identity": readback.identity.value,
+            "result": readback.settlement,
+            "delivery_run": readback.writeback_run,
+            "reason": (
+                "this exact capability duty was retired and must not consume a quota slot; reassess the current frontier in a new Turn"
+                if readback.progress.get("closeout_kind") == "capability_duty_retired_no_spend" else
+                "this Turn already closed with an exact typed blocked writeback "
+                "and must not consume a quota slot; retry the Todo only after "
+                "its external blocker changes or a bounded backoff"
+            ),
+        }
+    result = readback.identity
     identity = result.value if result.failure is None else None
-    delivery_workspace_causality = (
-        resolve_settlement_delivery_workspace_causality(runtime_root, identity)
-        if identity is not None
-        else None
-    )
     if identity is not None:
-        result = result.bind(
-            lambda resolved: require_settlement_writeback(
-                runtime_root,
-                resolved,
-            )
-        )
+        result = readback.delivery
     return {
         "identity": identity,
         "result": result,
         "delivery_run": result.value if result.failure is None else None,
-        "delivery_workspace_causality": delivery_workspace_causality,
+        "delivery_workspace_causality": readback.workspace_causality,
         "reason": result.failure.reason if result.failure is not None else None,
+        "writeback_committed": _receipt_committed(
+            readback.writeback, SettlementStepKind.DURABLE_WRITEBACK
+        ),
+        "spend_committed": _receipt_committed(
+            readback.spend, SettlementStepKind.QUOTA_SPEND
+        ),
     }
 
 
-def _now_local() -> str:
-    return now_local_iso()
+def _unbound_visible_goal_settlement_failure(
+    *,
+    source: str,
+    before: dict[str, Any],
+    requested_todo_id: str | None,
+    requested_replan_obligation_id: str | None,
+    turn_instance_id: str | None,
+) -> SettlementResult[SettlementIdentity] | None:
+    if (
+        source != VISIBLE_GOAL_SLOT_SPEND_SOURCE
+        or before.get("normal_delivery_allowed") is not True
+    ):
+        return None
+    selected = (
+        cast(dict[str, Any], before.get("selected_todo"))
+        if isinstance(before.get("selected_todo"), dict)
+        else {}
+    )
+    selected_todo_id = normalize_todo_id(selected.get("todo_id"))
+    if not selected_todo_id:
+        return None
+    if bool(requested_todo_id) == bool(requested_replan_obligation_id):
+        reason = (
+            "visible Goal settlement requires exactly one todo_id or "
+            "replan_obligation_id binding"
+        )
+    elif not turn_instance_id:
+        reason = (
+            "visible Goal settlement for selected Todo "
+            f"{selected_todo_id} requires turn_instance_id from quota should-run; "
+            "rerun the guard with --begin-turn"
+        )
+    else:
+        return None
+    return SettlementResult.failed(
+        kind=SettlementFailureKind.IDENTITY_MISMATCH,
+        step_kind=SettlementStepKind.VALIDATION,
+        reason=reason,
+        details={
+            "source": source,
+            "selected_todo_id": selected_todo_id,
+            "requested_todo_id": requested_todo_id,
+            "requested_replan_obligation_id": requested_replan_obligation_id,
+            "turn_instance_id": turn_instance_id,
+        },
+    )
 
 
-def _validate_goal_id_path_segment(goal_id: str) -> str:
-    value = goal_id.strip()
-    if not value:
-        raise ValueError("goal id is required")
-    if value in {".", ".."} or "/" in value or "\\" in value:
-        raise ValueError("goal id must be a single path segment")
-    if Path(value).name != value:
-        raise ValueError("goal id must not include path traversal")
-    return value
-
-
-def _int_number(value: Any, *, default: int) -> int:
-    if isinstance(value, bool):
-        return default
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(float(value.strip()))
-        except ValueError:
-            return default
-    return default
+def _repair_settlement_workspace_causality(
+    status_payload: dict[str, Any],
+    *,
+    goal_id: str,
+    settlement_identity: SettlementIdentity | None,
+    causality: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    requirement = str((causality or {}).get("requirement") or "")
+    if settlement_identity is None or requirement not in {"", "unknown"}:
+        return causality
+    repaired = completed_todo_workspace_causality(
+        status_payload,
+        goal_id=goal_id,
+        todo_id=settlement_identity.todo_id,
+        source=(
+            "current_todo_contract_repair"
+            if requirement == "unknown"
+            else "completed_todo_contract_fallback"
+        ),
+    )
+    if str((repaired or {}).get("requirement") or "") == "unknown":
+        return causality
+    return repaired or causality
 
 
 def _queue_item_for_goal(status_payload: dict[str, Any], *, goal_id: str) -> dict[str, Any]:
-    queue = status_payload.get("attention_queue") if isinstance(status_payload.get("attention_queue"), dict) else {}
-    queue_items = queue.get("items") if isinstance(queue.get("items"), list) else []
+    queue = cast(dict[str, Any], status_payload.get("attention_queue")) if isinstance(status_payload.get("attention_queue"), dict) else {}
+    queue_items = cast(list[Any], queue.get("items")) if isinstance(queue.get("items"), list) else []
     return next(
         (
             item
@@ -213,18 +314,18 @@ def _queue_item_for_goal(status_payload: dict[str, Any], *, goal_id: str) -> dic
 
 
 def _set_quota_for_goal(status_payload: dict[str, Any], *, goal_id: str, quota: dict[str, Any]) -> None:
-    run_history = status_payload.get("run_history") if isinstance(status_payload.get("run_history"), dict) else {}
-    run_goals = run_history.get("goals") if isinstance(run_history.get("goals"), list) else []
+    run_history = cast(dict[str, Any], status_payload.get("run_history")) if isinstance(status_payload.get("run_history"), dict) else {}
+    run_goals = cast(list[Any], run_history.get("goals")) if isinstance(run_history.get("goals"), list) else []
     for goal in run_goals:
         if isinstance(goal, dict) and str(goal.get("id") or "") == goal_id:
             goal["quota"] = dict(quota)
 
-    queue = status_payload.get("attention_queue") if isinstance(status_payload.get("attention_queue"), dict) else {}
-    queue_items = queue.get("items") if isinstance(queue.get("items"), list) else []
+    queue = cast(dict[str, Any], status_payload.get("attention_queue")) if isinstance(status_payload.get("attention_queue"), dict) else {}
+    queue_items = cast(list[Any], queue.get("items")) if isinstance(queue.get("items"), list) else []
     for item in queue_items:
         if isinstance(item, dict) and str(item.get("goal_id") or "") == goal_id:
             item["quota"] = dict(quota)
-            project_asset = item.get("project_asset") if isinstance(item.get("project_asset"), dict) else {}
+            project_asset = cast(dict[str, Any], item.get("project_asset")) if isinstance(item.get("project_asset"), dict) else {}
             if project_asset:
                 project_asset["quota"] = dict(quota)
 
@@ -235,7 +336,7 @@ def _load_goal_run_index_records(runtime_root: Path, goal_id: str) -> list[dict[
         return []
     records: list[dict[str, Any]] = []
     try:
-        lines = index_path.read_text(encoding="utf-8").splitlines()
+        lines = index_path.read_text(encoding="utf-8").split("\n")
     except OSError:
         return []
     for line in lines:
@@ -264,23 +365,29 @@ def _is_quota_neutral_state_refresh(run: dict[str, Any]) -> bool:
     )
 
 
-def _latest_unspent_accountable_delivery_run(
+def _latest_unspent_turn_settlement_run(
     runtime_root: Path,
     goal_id: str,
     *,
     agent_id: str | None = None,
+    goal_ref: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Return the latest same-agent delivery that still needs accounting.
+    """Return the latest same-agent Turn settlement that still needs accounting.
 
     Unchanged monitor polls, scheduler acknowledgements, and plain state
     refreshes are quota-neutral. They may occur after validation and before
     accounting, so they must not hide the accountable run. A state refresh
-    with an explicit non-accountable delivery outcome and other non-delivery
-    events remain fail closed.
+    with a non-settling delivery outcome and other non-delivery events remain
+    fail closed. A typed blocked ``outcome_gap`` settles the Turn without being
+    reclassified as delivery progress.
     """
 
     safe_agent_id = normalize_todo_claimed_by(agent_id)
     for run in reversed(_load_goal_run_index_records(runtime_root, goal_id)):
+        if goal_ref is None and "goal_ref" in run:
+            continue
+        if goal_ref is not None and run.get("goal_ref") != dict(goal_ref):
+            continue
         run_agent_id = normalize_todo_claimed_by(run.get("agent_id"))
         if safe_agent_id and run_agent_id and safe_agent_id != run_agent_id:
             continue
@@ -299,35 +406,96 @@ def _latest_unspent_accountable_delivery_run(
         if _is_quota_neutral_state_refresh(run):
             continue
         delivery_outcome = normalize_delivery_outcome(run.get("delivery_outcome"))
-        if delivery_outcome in ACCOUNTABLE_DELIVERY_OUTCOMES:
+        if qualifies_turn_scoped_settlement(
+            delivery_outcome,
+            cast(dict[str, Any], run.get("progress_observation"))
+            if isinstance(run.get("progress_observation"), dict)
+            else None,
+            work_item_id=normalize_todo_id(run.get("todo_id")),
+            replan_obligation_id=normalize_todo_replan_obligation_id(
+                run.get("replan_obligation_id")
+            ),
+        ):
             return run
         return None
     return None
 
 
+def _settlement_workspace_requirement(
+    delivery_workspace_causality: dict[str, Any] | None,
+    settlement_identity: SettlementIdentity | None,
+    settlement_result: SettlementResult[dict[str, Any]] | None,
+    delivery_completion_run: dict[str, Any] | None,
+) -> dict[str, str] | None:
+    if settlement_identity is None:
+        return None
+    return resolve_settlement_workspace_requirement(
+        delivery_workspace_causality,
+        settlement_binding_kind=settlement_identity.binding_kind.value,
+        legacy_settlement_evidence=(
+            {
+                "schema_version": (
+                    LEGACY_SETTLEMENT_RECEIPT_EVIDENCE_SCHEMA_VERSION
+                ),
+                "settlement_effect_id": settlement_identity.effect_id,
+                "delivery_workspace_present": bool(
+                    isinstance(delivery_completion_run, dict)
+                    and delivery_completion_run.get("delivery_workspace") is not None
+                ),
+                "receipts": [
+                    {
+                        "step_kind": receipt.step_kind.value,
+                        "status": receipt.status,
+                        "effect_id": receipt.effect_id,
+                    }
+                    for receipt in settlement_result.receipts
+                ],
+            }
+            if settlement_result is not None
+            and settlement_result.failure is None
+            else None
+        ),
+    )
+
+
+def _workspace_requirement_value(
+    settlement_workspace_requirement: dict[str, Any] | None,
+    delivery_workspace_causality: dict[str, Any] | None,
+) -> str:
+    return str(
+        (settlement_workspace_requirement or {}).get("requirement")
+        or (delivery_workspace_causality or {}).get("requirement")
+        or ""
+    )
+
+
 def _missing_delivery_workspace_preview(
     *,
     delivery_workspace_causality: dict[str, Any] | None,
+    settlement_workspace_requirement: dict[str, Any] | None,
     delivery_workspace: dict[str, Any] | None,
     goal_id: str,
     slots: int,
     agent_id: str | None,
     before: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if not delivery_workspace_causality or delivery_workspace_repository(
-        delivery_workspace
-    ):
+    if delivery_workspace_identity(delivery_workspace):
+        return None
+    requirement = _workspace_requirement_value(
+        settlement_workspace_requirement, delivery_workspace_causality
+    )
+    if not requirement or requirement == "not_required":
         return None
     resolution = missing_delivery_workspace_resolution(
         delivery_workspace_causality
     )
-    if resolution is None or resolution["decision"] == "omit_snapshot":
+    if resolution is not None and resolution["decision"] == "omit_snapshot":
         return None
-    requirement = resolution["requirement"]
     reason = (
         "quota spend requires a valid delivery workspace snapshot for "
         f"settlement causality requirement {requirement}"
-        if resolution["decision"] == "require_snapshot"
+        if resolution is not None
+        and resolution["decision"] == "require_snapshot"
         else (
             "quota spend requires an explicit Todo delivery contract; declare "
             "repository/write requirements or mark the Todo as explicit "
@@ -346,11 +514,74 @@ def _missing_delivery_workspace_preview(
         "reason": reason,
         "delivery_workspace": delivery_workspace,
         "delivery_workspace_causality": delivery_workspace_causality,
+        "settlement_workspace_requirement": settlement_workspace_requirement,
         "delivery_workspace_resolution": resolution,
         "delivery_workspace_validated": False,
         "before": before,
         "after": None,
     }
+
+
+DELIVERY_COMPLETION_SPEND_STATES = frozenset(
+    {"waiting", "focus_wait", "operator_gate", "eligible"}
+)
+TERMINAL_NO_FOLLOWUP_DECISION_STATE = "terminal_no_followup"
+
+
+def _admits_delivery_completion_spend_state(
+    *,
+    before: Mapping[str, Any],
+    identity: SettlementIdentity | None,
+    settlement: Mapping[str, Any],
+) -> bool:
+    """Admit the decision states one delivery-completion spend may settle from.
+
+    ``terminal_no_followup`` is admitted only for the autonomous-replan
+    settlement whose own durable writeback derived that frontier and which has
+    not yet recorded its spend. The terminal guard therefore stays strict for
+    every new, unrelated, or already-accounted spend, while the remaining step
+    of the settlement that produced the terminal frontier is no longer
+    stranded. See the ``terminal_settlement_ordering_gap`` repair pattern.
+    """
+
+    state = str(before.get("state") or "")
+    if state in DELIVERY_COMPLETION_SPEND_STATES:
+        return True
+    if state != TERMINAL_NO_FOLLOWUP_DECISION_STATE:
+        return False
+    return (
+        identity is not None
+        and identity.binding_kind is SettlementBindingKind.AUTONOMOUS_REPLAN
+        and settlement.get("writeback_committed") is True
+        and settlement.get("spend_committed") is not True
+    )
+
+
+def _workspace_repair_blocks_spend(
+    before: Mapping[str, Any],
+    *,
+    delivery_workspace_validated: bool,
+    delivery_run: Mapping[str, Any] | None,
+    settlement_identity: SettlementIdentity | None,
+    workspace_requirement: str,
+) -> bool:
+    """Keep the current workspace guard separate from an original settlement.
+
+    The existing typed requirement owner decides whether that settlement needs
+    a workspace. This adapter only applies the recovered result to the guard;
+    an unbound or unwritten settlement cannot waive it.
+    """
+    settlement_does_not_require_workspace = (
+        delivery_run is not None
+        and settlement_identity is not None
+        and workspace_requirement == "not_required"
+    )
+    return (
+        before.get("effective_action") == EffectiveAction.AGENT_WORKSPACE_REPAIR.value
+        and before.get("workspace_repair_allowed") is True
+        and not delivery_workspace_validated
+        and not settlement_does_not_require_workspace
+    )
 
 
 def build_quota_slot_preview_for_decision(
@@ -368,6 +599,8 @@ def build_quota_slot_preview_for_decision(
     replan_obligation_id: str | None = None,
     turn_instance_id: str | None = None,
     source: str = DEFAULT_SLOT_SPEND_SOURCE,
+    registry_path: Path | None = None,
+    goal_ref: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     safe_goal_id = _validate_goal_id_path_segment(str(goal_id or ""))
     safe_slots = max(1, _int_number(slots, default=1))
@@ -376,6 +609,33 @@ def build_quota_slot_preview_for_decision(
     normalized_replan_obligation_id = normalize_todo_replan_obligation_id(
         replan_obligation_id
     )
+    unbound_visible_goal_failure = _unbound_visible_goal_settlement_failure(
+        source=source,
+        before=before,
+        requested_todo_id=normalized_todo_id,
+        requested_replan_obligation_id=normalized_replan_obligation_id,
+        turn_instance_id=turn_instance_id,
+    )
+    if unbound_visible_goal_failure is not None:
+        return {
+            "ok": False,
+            "mode": "spend-slot",
+            "dry_run": True,
+            "goal_id": safe_goal_id,
+            "slots": safe_slots,
+            "agent_id": safe_requested_agent_id,
+            "appended": False,
+            "registry_mutated": False,
+            "reason": cast(SettlementFailure, unbound_visible_goal_failure.failure).reason,
+            "settlement_result": settlement_result_payload(
+                unbound_visible_goal_failure
+            ),
+            "delivery_workspace": None,
+            "delivery_workspace_causality": None,
+            "delivery_workspace_validated": False,
+            "before": before,
+            "after": None,
+        }
     raw_runtime_root = status_payload.get("runtime_root")
     settlement_identity = None
     settlement_result = None
@@ -389,6 +649,8 @@ def build_quota_slot_preview_for_decision(
         todo_id=normalized_todo_id,
         replan_obligation_id=normalized_replan_obligation_id,
         turn_instance_id=turn_instance_id,
+        registry_path=registry_path,
+        goal_ref=goal_ref,
     )
     settlement_identity = settlement.get("identity")
     settlement_result = settlement.get("result")
@@ -424,6 +686,9 @@ def build_quota_slot_preview_for_decision(
         requested_replan_obligation_id=normalized_replan_obligation_id,
         agent_id=safe_requested_agent_id,
         settlement_identity=settlement_identity,
+        delivery_run=(
+            delivery_completion_run if settlement_identity is not None else None
+        ),
     )
     if binding_error:
         return {
@@ -443,30 +708,37 @@ def build_quota_slot_preview_for_decision(
         (
             before.get("state") == "operator_gate"
             or before.get("recovery_delivery_allowed") is True
-            or before.get("effective_action") == "outcome_floor_recovery"
+            or before.get("effective_action") == EffectiveAction.OUTCOME_FLOOR_RECOVERY.value
         )
         and before.get("safe_bypass_allowed") is True
     )
     self_repair_spend = before.get("effective_action") in self_repair_spend_actions
     capability_repair_spend = (
-        before.get("effective_action") == "capability_bridge_repair"
+        before.get("effective_action") == EffectiveAction.CAPABILITY_BRIDGE_REPAIR.value
         and before.get("capability_repair_allowed") is True
     )
     delivery_completion_run = delivery_completion_run or (
-        _latest_unspent_accountable_delivery_run(
+        _latest_unspent_turn_settlement_run(
             Path(str(raw_runtime_root)).expanduser(),
             safe_goal_id,
             agent_id=safe_requested_agent_id,
+            goal_ref=goal_ref,
         )
         if raw_runtime_root
         else None
     )
-    if settlement_identity is not None and not delivery_workspace_causality:
-        delivery_workspace_causality = completed_todo_workspace_causality(
-            status_payload,
-            goal_id=safe_goal_id,
-            todo_id=settlement_identity.todo_id,
-        )
+    delivery_workspace_causality = _repair_settlement_workspace_causality(
+        status_payload,
+        goal_id=safe_goal_id,
+        settlement_identity=settlement_identity,
+        causality=delivery_workspace_causality,
+    )
+    settlement_workspace_requirement = _settlement_workspace_requirement(
+        delivery_workspace_causality,
+        settlement_identity,
+        settlement_result,
+        delivery_completion_run,
+    )
     safe_bypass_without_delivery = (
         safe_bypass_requested and delivery_completion_run is None
     )
@@ -482,20 +754,21 @@ def build_quota_slot_preview_for_decision(
             "registry_mutated": False,
             "reason": (
                 "safe-bypass quota spend requires a latest "
-                "unspent accountable delivery writeback"
+                "unspent Turn settlement writeback"
             ),
             "before": before,
             "after": None,
         }
     safe_bypass_spend = safe_bypass_requested
     raw_delivery_workspace = (
-        delivery_completion_run.get("delivery_workspace")
+        cast(dict[str, Any], delivery_completion_run.get("delivery_workspace"))
         if isinstance(delivery_completion_run, dict)
         and isinstance(delivery_completion_run.get("delivery_workspace"), dict)
         else None
     )
     missing_delivery_workspace_preview = _missing_delivery_workspace_preview(
         delivery_workspace_causality=delivery_workspace_causality,
+        settlement_workspace_requirement=settlement_workspace_requirement,
         delivery_workspace=raw_delivery_workspace,
         goal_id=safe_goal_id,
         slots=safe_slots,
@@ -504,15 +777,15 @@ def build_quota_slot_preview_for_decision(
     )
     if missing_delivery_workspace_preview:
         return missing_delivery_workspace_preview
-    workspace_requirement = str(
-        (delivery_workspace_causality or {}).get("requirement") or ""
+    workspace_requirement = _workspace_requirement_value(
+        settlement_workspace_requirement, delivery_workspace_causality
     )
-    raw_delivery_workspace_repository = delivery_workspace_repository(
+    raw_delivery_workspace_identity = delivery_workspace_identity(
         raw_delivery_workspace
     )
     delivery_workspace = (
         raw_delivery_workspace
-        if raw_delivery_workspace_repository
+        if raw_delivery_workspace_identity
         and workspace_requirement != "not_required"
         else None
     )
@@ -544,12 +817,13 @@ def build_quota_slot_preview_for_decision(
             "after": None,
         }
     delivery_workspace_validated = bool(delivery_workspace)
-    workspace_repair_no_spend = (
-        before.get("effective_action") == "agent_workspace_repair"
-        and before.get("workspace_repair_allowed") is True
-        and not delivery_workspace_validated
-    )
-    if workspace_repair_no_spend:
+    if _workspace_repair_blocks_spend(
+        before,
+        delivery_workspace_validated=delivery_workspace_validated,
+        delivery_run=delivery_completion_run,
+        settlement_identity=settlement_identity,
+        workspace_requirement=workspace_requirement,
+    ):
         return {
             "ok": False,
             "mode": "spend-slot",
@@ -575,16 +849,22 @@ def build_quota_slot_preview_for_decision(
         and (
             settlement_identity is not None
             or not before.get("should_run")
-            or before.get("effective_action") == "external_evidence_observe"
+            or before.get("effective_action") == EffectiveAction.EXTERNAL_EVIDENCE_OBSERVE.value
             or (
-                before.get("effective_action") == "agent_workspace_repair"
+                before.get("effective_action") == EffectiveAction.AGENT_WORKSPACE_REPAIR.value
                 and delivery_workspace_validated
             )
         )
-        and before.get("effective_action") != "automation_prompt_upgrade_required"
+        and before.get("effective_action") != EffectiveAction.AUTOMATION_PROMPT_UPGRADE_REQUIRED.value
         and not safe_bypass_spend
-        and str(before.get("state") or "") in {"waiting", "focus_wait", "operator_gate", "eligible"}
+        and _admits_delivery_completion_spend_state(
+            before=before,
+            identity=settlement_identity,
+            settlement=settlement,
+        )
     )
+    if delivery_completion_spend:
+        capability_repair_spend = False
     if not before.get("ok") or (
         not before.get("should_run")
         and not safe_bypass_spend
@@ -601,10 +881,14 @@ def build_quota_slot_preview_for_decision(
             "appended": False,
             "registry_mutated": False,
             "reason": before.get("reason") or "goal is not eligible for quota accounting preview",
+            # Transport the actual rejecting action, not an incidental quota
+            # snapshot on an earlier validation/workspace refusal. TS owns the
+            # mapping to settlement failure kinds; prose carries no such rule.
+            "quota_rejection_action": before.get("effective_action") if before.get("ok") is True else None,
             "before": before,
             "after": None,
         }
-    before_quota = before.get("quota") if isinstance(before.get("quota"), dict) else {}
+    before_quota = cast(dict[str, Any], before.get("quota")) if isinstance(before.get("quota"), dict) else {}
     if not before_quota:
         return {
             "ok": False,
@@ -661,10 +945,18 @@ def build_quota_slot_preview_for_decision(
                 f"{safe_goal_id} from {before.get('state')} to {after.get('state')}"
             )
         ),
+        "accounting_projection": {
+            "schema_version": "quota_slot_accounting_projection_v0",
+            "settlement_event_semantics": "append_only",
+            "spent_slots_semantics": "rolling_window_aggregate",
+            "before_after_semantics": "same_status_payload_projection",
+            "window_hours": _int_number(before_quota.get("window_hours"), default=0),
+        },
         "rolling_window_note": (
             "before -> after is a same-status-payload projection. Later quota status "
             "recomputes spent_slots from quota_slot_spent events still inside window_hours, "
-            "so the visible total can stay flat if an older spend expires."
+            "so the visible total can stay flat or decrease as older spends expire; that "
+            "does not replay or undo the appended settlement event."
         ),
         "todo_id": normalized_todo_id,
         "replan_obligation_id": normalized_replan_obligation_id,
@@ -701,468 +993,6 @@ def build_quota_slot_preview_for_decision(
         else None,
         "delivery_workspace": delivery_workspace,
         "delivery_workspace_causality": delivery_workspace_causality,
+        "settlement_workspace_requirement": settlement_workspace_requirement,
         "delivery_workspace_validated": delivery_workspace_validated,
     }
-
-
-def build_quota_slot_spend_event(
-    preview: dict[str, Any],
-    *,
-    self_repair_spend_actions: set[str] | frozenset[str],
-    source: str = DEFAULT_SLOT_SPEND_SOURCE,
-    generated_at: str | None = None,
-) -> dict[str, Any]:
-    if not preview.get("ok"):
-        raise ValueError(preview.get("reason") or "quota slot spend requires an eligible preview")
-    safe_source = str(source or DEFAULT_SLOT_SPEND_SOURCE).strip()
-    if safe_source not in VALID_SLOT_SPEND_SOURCES:
-        raise ValueError(f"quota slot spend source must be one of: {', '.join(sorted(VALID_SLOT_SPEND_SOURCES))}")
-    before = preview.get("before") if isinstance(preview.get("before"), dict) else {}
-    after = preview.get("after") if isinstance(preview.get("after"), dict) else {}
-    safe_agent_id = normalize_todo_claimed_by(preview.get("agent_id")) or quota_decision_agent_id(before)
-    slots = max(1, _int_number(preview.get("slots"), default=1))
-    before_compact = compact_quota_decision(before)
-    after_compact = compact_quota_decision(after)
-    if _int_number(after_compact.get("spent_slots"), default=0) != _int_number(
-        before_compact.get("spent_slots"), default=0
-    ) + slots:
-        raise ValueError("after.spent_slots must equal before.spent_slots + slots")
-    self_repair_spend = (
-        before_compact["should_run"] is True
-        and before_compact["effective_action"] in self_repair_spend_actions
-        and before_compact["self_repair_allowed"] is True
-    )
-    capability_repair_spend = (
-        before_compact["should_run"] is True
-        and before_compact["effective_action"] == "capability_bridge_repair"
-        and before_compact["capability_repair_allowed"] is True
-    )
-    delivery_completion_spend = bool(preview.get("delivery_completion_spend"))
-    eligible_spend = (
-        before_compact["should_run"] is True
-        and before_compact["state"] == "eligible"
-        and before_compact["effective_action"] != "external_evidence_observe"
-        and not self_repair_spend
-        and not capability_repair_spend
-        and before_compact["workspace_repair_allowed"] is not True
-        and not delivery_completion_spend
-    )
-    safe_bypass_spend = bool(preview.get("safe_bypass_spend")) and (
-        (
-            before_compact["state"] == "operator_gate"
-            or before_compact["recovery_delivery_allowed"] is True
-            or before_compact["effective_action"] == "outcome_floor_recovery"
-        )
-        and before_compact["safe_bypass_allowed"] is True
-    )
-    if (
-        not eligible_spend
-        and not safe_bypass_spend
-        and not self_repair_spend
-        and not capability_repair_spend
-        and not delivery_completion_spend
-    ):
-        raise ValueError(
-            "quota slot spend requires an eligible, safe-bypass, control-plane self-repair, "
-            "capability bridge repair, or latest validated delivery-completion quota should-run decision"
-        )
-
-    delivery_run_action = str(preview.get("delivery_run_recommended_action") or "").strip()
-    record = {
-        "generated_at": generated_at or _now_local(),
-        "goal_id": preview.get("goal_id"),
-        "classification": QUOTA_SLOT_SPENT_CLASSIFICATION,
-        "recommended_action": (
-            delivery_run_action
-            if delivery_completion_spend and delivery_run_action
-            else after.get("recommended_action") or "inspect next quota should-run decision"
-        ),
-        "health_check": (
-            "quota should-run eligible; quota slot spend event public-safe"
-            if eligible_spend
-            else (
-                "quota outcome-floor recovery safe-bypass; quota slot spend event public-safe"
-                if before_compact.get("effective_action") == "outcome_floor_recovery"
-                else (
-                    "quota control-plane self-repair; quota slot spend event public-safe"
-                    if self_repair_spend
-                    else (
-                        "quota capability bridge repair; quota slot spend event public-safe"
-                        if capability_repair_spend
-                        else (
-                            "quota validated delivery completion; quota slot spend event public-safe"
-                            if delivery_completion_spend
-                            else "quota safe-bypass delivery; quota slot spend event public-safe"
-                        )
-                    )
-                )
-            )
-        ),
-        "quota_event": {
-            "event_type": QUOTA_SLOT_SPENT_CLASSIFICATION,
-            "source": safe_source,
-            "todo_id": preview.get("todo_id"),
-            "replan_obligation_id": preview.get("replan_obligation_id"),
-            "turn_instance_id": preview.get("turn_instance_id"),
-            "settlement_identity": preview.get("settlement_identity"),
-            "effect_ref": preview.get("effect_ref"),
-            "slots": slots,
-            "reason_summary": (
-                f"{slots} automatic agent slot(s) completed under an eligible quota guard"
-                if eligible_spend
-                else (
-                    f"{slots} automatic agent slot(s) completed as outcome-floor recovery safe-bypass work"
-                    if before_compact.get("effective_action") == "outcome_floor_recovery"
-                    else (
-                        f"{slots} automatic agent slot(s) completed as control-plane self-repair work"
-                        if self_repair_spend
-                        else (
-                            f"{slots} automatic agent slot(s) completed as capability bridge repair work"
-                            if capability_repair_spend
-                            else (
-                                f"{slots} automatic agent slot(s) accounted after validated delivery "
-                                f"{preview.get('delivery_run_classification')}"
-                                if delivery_completion_spend
-                                else f"{slots} automatic agent slot(s) completed as safe-bypass work"
-                            )
-                        )
-                    )
-                )
-            ),
-            "delivery_run_generated_at": preview.get("delivery_run_generated_at"),
-            "delivery_run_classification": preview.get("delivery_run_classification"),
-            "delivery_run_agent_id": preview.get("delivery_run_agent_id"),
-            "delivery_run_recommended_action": delivery_run_action or None,
-            "delivery_workspace": preview.get("delivery_workspace"),
-            "delivery_workspace_causality": preview.get(
-                "delivery_workspace_causality"
-            ),
-            "delivery_workspace_validated": bool(
-                preview.get("delivery_workspace_validated")
-            ),
-            "before": before_compact,
-            "after": after_compact,
-        },
-    }
-    if safe_agent_id:
-        record["agent_id"] = safe_agent_id
-        record["quota_event"]["agent_id"] = safe_agent_id
-    if preview.get("effect_ref"):
-        record["effect_ref"] = preview["effect_ref"]
-    if preview.get("turn_instance_id"):
-        record["turn_instance_id"] = preview["turn_instance_id"]
-        if preview.get("todo_id"):
-            record["todo_id"] = preview["todo_id"]
-        if preview.get("replan_obligation_id"):
-            record["replan_obligation_id"] = preview[
-                "replan_obligation_id"
-            ]
-        record["settlement_identity"] = preview.get("settlement_identity")
-    return record
-
-
-def _find_quota_spend_run(
-    runtime_root: Path,
-    *,
-    goal_id: str,
-    generated_at: str,
-) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    for run in reversed(_load_goal_run_index_records(runtime_root, goal_id)):
-        if str(run.get("goal_id") or goal_id) != goal_id:
-            continue
-        if str(run.get("generated_at") or "") != generated_at:
-            continue
-        if str(run.get("classification") or "") != QUOTA_SLOT_SPENT_CLASSIFICATION:
-            continue
-        event = load_quota_event_from_run(run)
-        if not event or str(event.get("event_type") or "") != QUOTA_SLOT_SPENT_CLASSIFICATION:
-            continue
-        return run, event
-    return None
-
-
-def load_quota_event_from_run(run: dict[str, Any]) -> dict[str, Any] | None:
-    if str(run.get("classification") or "") not in {
-        QUOTA_SLOT_SPENT_CLASSIFICATION,
-        QUOTA_SLOT_VOIDED_CLASSIFICATION,
-    }:
-        return None
-    event = run.get("quota_event") if isinstance(run.get("quota_event"), dict) else None
-    if event:
-        return event
-
-    raw_json_path = str(run.get("json_path") or "")
-    if not raw_json_path:
-        return None
-    json_path = Path(raw_json_path).expanduser()
-    if not json_path.exists():
-        return None
-    try:
-        record = json.loads(json_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(record, dict):
-        return None
-    event = record.get("quota_event") if isinstance(record.get("quota_event"), dict) else None
-    return event
-
-
-def build_quota_slot_void_preview_for_decision(
-    status_payload: dict[str, Any],
-    *,
-    goal_id: str,
-    voided_run_generated_at: str,
-    before: dict[str, Any],
-) -> dict[str, Any]:
-    safe_goal_id = _validate_goal_id_path_segment(str(goal_id or ""))
-    safe_voided_at = str(voided_run_generated_at or "").strip()
-    if not safe_voided_at:
-        return {
-            "ok": False,
-            "mode": "void-slot",
-            "dry_run": True,
-            "goal_id": safe_goal_id,
-            "appended": False,
-            "registry_mutated": False,
-            "reason": "`quota void-slot` requires --void-generated-at",
-        }
-
-    raw_runtime_root = status_payload.get("runtime_root")
-    if not raw_runtime_root:
-        raise ValueError("status payload does not include runtime_root")
-    runtime_root = Path(str(raw_runtime_root)).expanduser()
-    target = _find_quota_spend_run(runtime_root, goal_id=safe_goal_id, generated_at=safe_voided_at)
-    if target is None:
-        return {
-            "ok": False,
-            "mode": "void-slot",
-            "dry_run": True,
-            "goal_id": safe_goal_id,
-            "voided_run_generated_at": safe_voided_at,
-            "appended": False,
-            "registry_mutated": False,
-            "reason": "target quota_slot_spent run was not found in the goal runtime index",
-        }
-    target_run, target_event = target
-    slots = max(1, _int_number(target_event.get("slots"), default=1))
-    before_quota = before.get("quota") if isinstance(before.get("quota"), dict) else {}
-    after = deepcopy(before)
-    after_quota = deepcopy(before_quota)
-    after_quota["spent_slots"] = max(0, _int_number(before_quota.get("spent_slots"), default=0) - slots)
-    after["quota"] = after_quota
-    return {
-        "ok": True,
-        "mode": "void-slot",
-        "dry_run": True,
-        "goal_id": safe_goal_id,
-        "slots": slots,
-        "voided_run_generated_at": safe_voided_at,
-        "voided_run_classification": target_run.get("classification"),
-        "voided_run_json_path": target_run.get("json_path"),
-        "appended": False,
-        "registry_mutated": False,
-        "before": before,
-        "after": after,
-        "would_throttle": False,
-        "reason": (
-            f"dry-run preview: voiding {slots} slot(s) from {safe_goal_id} "
-            f"quota spend run {safe_voided_at}"
-        ),
-        "rolling_window_note": (
-            "quota void-slot appends a quota_slot_voided accounting event. It does not delete the "
-            "original spend event; rolling-window ledgers subtract the void only when the target "
-            "spend event is inside the same accounting window."
-        ),
-        "classification": QUOTA_SLOT_VOIDED_CLASSIFICATION,
-    }
-
-
-def build_quota_slot_void_event(
-    preview: dict[str, Any],
-    *,
-    source: str = DEFAULT_SLOT_SPEND_SOURCE,
-    reason_summary: str | None = None,
-    generated_at: str | None = None,
-) -> dict[str, Any]:
-    if not preview.get("ok"):
-        raise ValueError(preview.get("reason") or "quota slot void requires a valid preview")
-    safe_source = str(source or DEFAULT_SLOT_SPEND_SOURCE).strip()
-    if safe_source not in VALID_SLOT_SPEND_SOURCES:
-        raise ValueError(f"quota slot void source must be one of: {', '.join(sorted(VALID_SLOT_SPEND_SOURCES))}")
-    safe_reason = str(reason_summary or "").strip() or "void duplicate or invalid quota slot spend event"
-    before = preview.get("before") if isinstance(preview.get("before"), dict) else {}
-    after = preview.get("after") if isinstance(preview.get("after"), dict) else {}
-    safe_agent_id = quota_decision_agent_id(before)
-    record = {
-        "generated_at": generated_at or _now_local(),
-        "goal_id": preview.get("goal_id"),
-        "classification": QUOTA_SLOT_VOIDED_CLASSIFICATION,
-        "recommended_action": safe_reason,
-        "health_check": "quota slot void event public-safe; original spend preserved for audit",
-        "quota_event": {
-            "event_type": QUOTA_SLOT_VOIDED_CLASSIFICATION,
-            "source": safe_source,
-            "slots": max(1, _int_number(preview.get("slots"), default=1)),
-            "reason_summary": safe_reason,
-            "voided_run_generated_at": preview.get("voided_run_generated_at"),
-            "voided_run_classification": preview.get("voided_run_classification"),
-            "before": compact_quota_decision(before) if before else {},
-            "after": compact_quota_decision(after) if after else {},
-        },
-    }
-    if safe_agent_id:
-        record["agent_id"] = safe_agent_id
-        record["quota_event"]["agent_id"] = safe_agent_id
-    return record
-
-
-def record_quota_slot_void_from_preview(
-    preview: dict[str, Any],
-    status_payload: dict[str, Any],
-    *,
-    goal_id: str,
-    render_markdown: Callable[[dict[str, Any]], str],
-    execute: bool = False,
-    source: str = DEFAULT_SLOT_SPEND_SOURCE,
-    reason_summary: str | None = None,
-) -> dict[str, Any]:
-    safe_goal_id = _validate_goal_id_path_segment(str(goal_id or ""))
-    if not preview.get("ok"):
-        return preview
-
-    generated_at = _now_local()
-    record = build_quota_slot_void_event(
-        preview,
-        source=source,
-        reason_summary=reason_summary,
-        generated_at=generated_at,
-    )
-    raw_runtime_root = status_payload.get("runtime_root")
-    if not raw_runtime_root:
-        raise ValueError("status payload does not include runtime_root")
-    runtime_root = Path(str(raw_runtime_root)).expanduser()
-    runs_dir = runtime_root / "goals" / safe_goal_id / "runs"
-    stem = run_file_stem(generated_at)
-    path_allocator = reserve_run_artifact_paths if execute else next_run_artifact_paths
-    json_path, markdown_path = path_allocator(runs_dir, stem, "quota-slot-voided")
-    index_path = runs_dir / "index.jsonl"
-    index_record = {
-        "generated_at": generated_at,
-        "goal_id": safe_goal_id,
-        "classification": QUOTA_SLOT_VOIDED_CLASSIFICATION,
-        "recommended_action": record["recommended_action"],
-        "health_check": record["health_check"],
-        "json_path": str(json_path),
-        "markdown_path": str(markdown_path),
-    }
-    if record.get("agent_id"):
-        index_record["agent_id"] = record["agent_id"]
-    payload = {
-        **preview,
-        "dry_run": not execute,
-        "appended": execute,
-        "registry_mutated": False,
-        "source": record["quota_event"]["source"],
-        "classification": QUOTA_SLOT_VOIDED_CLASSIFICATION,
-        "generated_at": generated_at,
-        "agent_id": record.get("agent_id"),
-        "quota_event": record["quota_event"],
-        "json_path": str(json_path),
-        "markdown_path": str(markdown_path),
-        "index_path": str(index_path),
-        "reason": (
-            f"{'appended' if execute else 'dry-run preview'} quota slot void event: "
-            f"{safe_goal_id} voided {record['quota_event']['slots']} slot(s) from "
-            f"{record['quota_event']['voided_run_generated_at']}"
-        ),
-    }
-    if execute:
-        payload["before"] = record["quota_event"]["before"]
-        payload["after"] = record["quota_event"]["after"]
-    if execute:
-        json_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        markdown_path.write_text(render_markdown(payload) + "\n", encoding="utf-8")
-        with index_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(index_record, ensure_ascii=False) + "\n")
-    return payload
-
-
-def record_quota_slot_spend_from_preview(
-    preview: dict[str, Any],
-    status_payload: dict[str, Any],
-    *,
-    goal_id: str,
-    self_repair_spend_actions: set[str] | frozenset[str],
-    render_markdown: Callable[[dict[str, Any]], str],
-    execute: bool = False,
-    source: str = DEFAULT_SLOT_SPEND_SOURCE,
-) -> dict[str, Any]:
-    safe_goal_id = _validate_goal_id_path_segment(str(goal_id or ""))
-    if not preview.get("ok"):
-        return preview
-
-    generated_at = _now_local()
-    record = build_quota_slot_spend_event(
-        preview,
-        self_repair_spend_actions=self_repair_spend_actions,
-        source=source,
-        generated_at=generated_at,
-    )
-    raw_runtime_root = status_payload.get("runtime_root")
-    if not raw_runtime_root:
-        raise ValueError("status payload does not include runtime_root")
-    runtime_root = Path(str(raw_runtime_root)).expanduser()
-    runs_dir = runtime_root / "goals" / safe_goal_id / "runs"
-    stem = run_file_stem(generated_at)
-    path_allocator = reserve_run_artifact_paths if execute else next_run_artifact_paths
-    json_path, markdown_path = path_allocator(runs_dir, stem, "quota-slot-spent")
-    index_path = runs_dir / "index.jsonl"
-    index_record = {
-        "generated_at": generated_at,
-        "goal_id": safe_goal_id,
-        "classification": QUOTA_SLOT_SPENT_CLASSIFICATION,
-        "recommended_action": record["recommended_action"],
-        "health_check": record["health_check"],
-        "json_path": str(json_path),
-        "markdown_path": str(markdown_path),
-    }
-    if record.get("agent_id"):
-        index_record["agent_id"] = record["agent_id"]
-    for field in (
-        "effect_ref",
-        "turn_instance_id",
-        "todo_id",
-        "replan_obligation_id",
-        "settlement_identity",
-    ):
-        if record.get(field):
-            index_record[field] = record[field]
-
-    payload = {
-        **preview,
-        "dry_run": not execute,
-        "appended": execute,
-        "registry_mutated": False,
-        "source": record["quota_event"]["source"],
-        "classification": QUOTA_SLOT_SPENT_CLASSIFICATION,
-        "generated_at": generated_at,
-        "agent_id": record.get("agent_id"),
-        "quota_event": record["quota_event"],
-        "json_path": str(json_path),
-        "markdown_path": str(markdown_path),
-        "index_path": str(index_path),
-        "reason": (
-            f"{'appended' if execute else 'dry-run preview'} quota slot spend event: "
-            f"{safe_goal_id} {record['quota_event']['before']['spent_slots']}->"
-            f"{record['quota_event']['after']['spent_slots']} slots"
-        ),
-    }
-    if execute:
-        payload["before"] = record["quota_event"]["before"]
-        payload["after"] = record["quota_event"]["after"]
-    if execute:
-        json_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        markdown_path.write_text(render_markdown(payload) + "\n", encoding="utf-8")
-        with index_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(index_record, ensure_ascii=False) + "\n")
-    return payload

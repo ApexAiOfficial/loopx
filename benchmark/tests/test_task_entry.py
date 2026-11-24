@@ -1,0 +1,1493 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from benchmark.runtime.codex import Execution
+from benchmark.runtime.planning import validate_plan_readback
+from benchmark.runtime.worker import run_once
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"task_entry": "unknown"},
+        {"mode": "plain", "task_entry": "loopx-planned"},
+        {"mode": "native-goal", "task_entry": "loopx-planned"},
+        {"mode": "plain", "complete_turn": True},
+        {"complete_turn": True, "turn_envelope": True},
+        {"complete_turn": "true"},
+    ],
+)
+def test_invalid_entry_rejected_before_model_call(kwargs):
+    with pytest.raises(ValueError):
+        Execution(**kwargs)
+
+
+@pytest.mark.parametrize("mode", ["heartbeat", "turn", "loopx-goal", "plain", "native-goal"])
+def test_task_entry_defaults_to_planning_only_for_loopx_modes(mode):
+    kwargs = {"mode": mode}
+    if mode == "turn":
+        kwargs["validation_command"] = ("python", "validate.py")
+    expected = "loopx-planned" if mode in {"heartbeat", "turn", "loopx-goal"} else "seeded-todo"
+    assert Execution(**kwargs).task_entry == expected
+    assert Execution(**kwargs, task_entry="seeded-todo").task_entry == "seeded-todo"
+
+
+@pytest.mark.parametrize("entry", ["loopx-planned", "seeded-todo"])
+def test_execution_observation_keeps_task_entry_and_stride_independent(tmp_path, entry):
+    pytest.importorskip("harbor")
+    from benchmark.runtime.harbor import BenchmarkCodex
+
+    agent = BenchmarkCodex(logs_dir=tmp_path, model_name="fixture", task_entry=entry,
+        execution_observation="local_probe")
+    env = agent._worker_env(cwd=str(tmp_path))
+    assert agent.execution.task_entry == entry
+    assert agent.stride_strategy == "evidence_conditioned_v1"
+    assert env["LOOPX_EXECUTION_OBSERVATION"] == "local_probe"
+    assert "LOOPX_RESEARCH_LOOP" not in env
+
+
+@pytest.mark.parametrize("settings", [
+    {"execution_observation": True},
+    {"execution_observation": False},
+    {"execution_observation": ""},
+    {"execution_observation": "unavailable-producer"},
+    {"execution_observation": "local_probe", "execution_mode": "plain"},
+    {"execution_observation": "local_probe", "execution_mode": "native-goal"},
+    {"execution_observation": "local_probe", "execution_mode": "loopx-goal"},
+    {"execution_observation": "local_probe", "execution_mode": "turn",
+     "validation_command": ["python", "validate.py"]},
+])
+def test_execution_observation_rejects_ambiguous_or_unsupported_treatments(tmp_path, settings):
+    pytest.importorskip("harbor")
+    from benchmark.runtime.harbor import BenchmarkCodex
+
+    with pytest.raises(ValueError, match="execution_observation"):
+        BenchmarkCodex(logs_dir=tmp_path, model_name="fixture", **settings)
+
+
+@pytest.mark.parametrize("retired", [True, False, None, "true"])
+def test_retired_research_setting_fails_before_adapter_setup(tmp_path, monkeypatch, retired):
+    pytest.importorskip("harbor")
+    from benchmark.runtime.harbor import BenchmarkCodex, CodexOffline
+
+    def unexpected_setup(*args, **kwargs):
+        pytest.fail("A retired treatment cannot initialize the underlying runner")
+
+    monkeypatch.setattr(CodexOffline, "__init__", unexpected_setup)
+    with pytest.raises(ValueError, match="research_loop has been removed"):
+        BenchmarkCodex(logs_dir=tmp_path, model_name="fixture", research_loop=retired)
+
+
+def test_observation_guidance_is_optional_without_a_research_stage(tmp_path):
+    pytest.importorskip("harbor")
+    from benchmark.runtime.harbor import BenchmarkCodex
+    from benchmark.runtime.planning import render_planning_prompt
+    from benchmark.runtime.research_probe import execution_observation_guidance
+
+    ordinary = BenchmarkCodex(logs_dir=tmp_path / "ordinary", model_name="fixture")
+    plain_env = ordinary._worker_env(cwd=str(tmp_path))
+    assert "LOOPX_RESEARCH_LOOP" not in plain_env
+    assert "LOOPX_EXECUTION_OBSERVATION" not in plain_env
+    assert ordinary.stride_strategy == "evidence_conditioned_v1"
+    observed = BenchmarkCodex(logs_dir=tmp_path / "observed", model_name="fixture",
+        execution_observation="local_probe")
+    observed_env = observed._worker_env(cwd=str(tmp_path))
+    assert observed.execution.task_entry == ordinary.execution.task_entry
+    assert observed.stride_strategy == ordinary.stride_strategy
+    packet = {"input_digest": "original", "text": "Test the supplied candidate."}
+    ordinary_prompt = render_planning_prompt(packet, plain_env)
+    observed_prompt = render_planning_prompt(packet, observed_env)
+    guidance = execution_observation_guidance()
+    assert guidance not in ordinary_prompt
+    assert observed_prompt.count(guidance) == 1
+    assert observed_prompt.replace(guidance, "") == ordinary_prompt
+
+
+@pytest.mark.parametrize("selection", [
+    {"LOOPX_EXECUTION_OBSERVATION": "unknown"},
+    {"LOOPX_EXECUTION_OBSERVATION": "local_probe", "LOOPX_EXECUTION_MODE": "plain"},
+    *({"LOOPX_RESEARCH_LOOP": value} for value in ("1", "0", "")),
+    {"LOOPX_EXECUTION_OBSERVATION": "local_probe", "LOOPX_RESEARCH_LOOP": "1"},
+])
+def test_raw_worker_rejects_invalid_observation_before_creating_a_wake(tmp_path, selection):
+    wakes = tmp_path / "wakes"
+    with pytest.raises(ValueError, match="execution_observation|LOOPX_EXECUTION_OBSERVATION|LOOPX_RESEARCH_LOOP has been removed"):
+        run_once({"LOOPX_EXECUTION_MODE": "heartbeat", "LOOPX_WAKE_LOG_DIR": str(wakes), **selection})
+    assert not wakes.exists()
+
+
+@pytest.mark.parametrize("entry", ["omitted", "ready", "workspace-shadow", "symlink", "missing-interpreter"])
+def test_install_records_and_exposes_only_the_selected_observation_producer(tmp_path, monkeypatch, entry):
+    pytest.importorskip("harbor")
+    if not Path("/bin/sh").is_file():
+        pytest.skip("requires a POSIX shell for the actual worker entrypoint")
+    from benchmark.runtime import harbor
+
+    selected = entry != "omitted"
+    profile = tmp_path / "profile"
+    bin_dir = profile / "bin"
+    bin_dir.mkdir(parents=True)
+    interpreter_dir = tmp_path / "python" / "bin"
+    interpreter_dir.mkdir(parents=True)
+    if entry != "missing-interpreter":
+        (interpreter_dir / "python3").symlink_to(sys.executable)
+    wrapper = bin_dir / "loopx-research-probe"
+    sentinel = tmp_path / "untouched"
+    if entry == "symlink":
+        sentinel.write_text("unchanged")
+        wrapper.symlink_to(sentinel)
+    if entry == "workspace-shadow":
+        shadow = tmp_path / "benchmark"
+        (shadow / "runtime").mkdir(parents=True)
+        (shadow / "__init__.py").write_text("")
+        (shadow / "runtime" / "research_probe.py").write_text(
+            "from pathlib import Path\nPath('shadow-called').touch()\nprint('--candidate-file --memory-limit-bytes')\n")
+        shadow_loopx = tmp_path / "loopx"
+        shadow_loopx.mkdir()
+        (shadow_loopx / "__init__.py").write_text("from pathlib import Path\nPath('shadow-called').touch()\n")
+    monkeypatch.setattr(harbor, "_PROFILE", str(profile))
+    monkeypatch.setattr(harbor, "_PYTHON", str(interpreter_dir.parent))
+    monkeypatch.setattr(harbor, "_SRC", str(Path(__file__).resolve().parents[2]))
+    agent = harbor.BenchmarkCodex(logs_dir=tmp_path, model_name="fixture",
+                                 execution_observation="local_probe" if selected else None)
+    commands = []
+    wrapper_reads = []
+
+    async def no_op(*args, **kwargs):
+        pass
+
+    async def stage(*args, **kwargs):
+        agent._runner_commit = "fixture"
+        return "fixture"
+
+    async def execute(*args, **kwargs):
+        command = kwargs["command"]
+        commands.append(command)
+        if "benchmark/runtime/research_probe.py" in command:
+            result = subprocess.run(["/bin/sh", "-c", command], cwd=tmp_path,
+                                    env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(tmp_path),
+                                         "PYTHONDONTWRITEBYTECODE": "1"},
+                                    text=True, capture_output=True, timeout=10)
+            wrapper_reads.append(result)
+            return SimpleNamespace(stdout=result.stdout, stderr=result.stderr, return_code=result.returncode)
+        return SimpleNamespace(stdout='{"ok":true}', stderr="", return_code=0)
+
+    async def task_exec(**kwargs):
+        return SimpleNamespace(stdout="/usr/local/bin:/usr/bin:/bin", return_code=0)
+
+    async def execute_root(*args, **kwargs):
+        assert "benchmark/runtime/research_probe.py" not in kwargs["command"]
+        return await execute(*args, **kwargs)
+
+    for key in ("LOOPX_SRC_DIR", "LOOPX_PORTABLE_PYTHON", "LOOPX_NODE_DIR"):
+        monkeypatch.setenv(key, str(tmp_path))
+    monkeypatch.setattr(harbor.CodexOffline, "install", no_op)
+    monkeypatch.setattr(agent, "_stage_source", stage)
+    monkeypatch.setattr(agent, "exec_as_root", execute_root)
+    monkeypatch.setattr(agent, "exec_as_agent", execute)
+    monkeypatch.setattr(agent, "_get_env", lambda key: None)
+    environment = SimpleNamespace(default_user="fixture", upload_dir=no_op, exec=task_exec)
+    if entry in {"symlink", "missing-interpreter"}:
+        with pytest.raises(RuntimeError, match="Local execution probe is unavailable"):
+            asyncio.run(agent.install(environment))
+        assert len(wrapper_reads) == 1 and wrapper_reads[0].returncode != 0
+        assert not any("> /logs/agent/loopx-install.json" in command for command in commands)
+        if entry == "symlink":
+            assert wrapper.is_symlink() and sentinel.read_text() == "unchanged"
+        return
+
+    asyncio.run(agent.install(environment))
+    assert any("benchmark/runtime/research_probe.py" in command for command in commands) is selected
+    assert len(wrapper_reads) == int(selected)
+    if selected:
+        assert os.access(wrapper, os.X_OK) and "--memory-limit-bytes" in wrapper_reads[0].stdout
+    else:
+        assert not wrapper.exists()
+    command = next(command for command in commands if "> /logs/agent/loopx-install.json" in command)
+    receipt = json.loads(shlex.split(command)[2])
+    assert receipt.get("execution_observation") == ("local_probe" if selected else None)
+    assert "research_loop" not in receipt
+    assert receipt["task_entry"] == "loopx-planned"
+    assert receipt["stride_strategy"] == "evidence_conditioned_v1"
+    if entry == "workspace-shadow":
+        candidate = tmp_path / "candidate.py"
+        candidate.write_text("print('real probe kept the task cwd')")
+        invocation = subprocess.run([str(wrapper),
+            "--candidate-file", candidate.name, "--output", "probe.json", "--input-revision", "inputs-v1",
+            "--planned-method-id", "method:local", "--executed-method-id", "method:local",
+            "--evidence-ref", "probe:trusted", "--limit-seconds", "5", "--memory-limit-bytes", "8388608",
+            "--", sys.executable, candidate.name],
+            cwd=tmp_path, env={**os.environ, "PYTHONPATH": str(tmp_path)},
+            capture_output=True, text=True, timeout=12)
+        assert invocation.returncode == 0, invocation.stderr
+        observation = json.loads(invocation.stdout)
+        assert observation == json.loads((tmp_path / "probe.json").read_text())
+        memory = json.loads((tmp_path / "probe.json.memory.json").read_text())
+        assert memory["reference_memory_bytes"] == 8388608 and memory["candidate_sha256"] == observation["candidate_sha256"]
+        assert (tmp_path / "probe.json.stdout").read_text().strip() == "real probe kept the task cwd"
+        assert not (tmp_path / "shadow-called").exists()
+
+
+@pytest.fixture
+def planning_env(tmp_path):
+    from loopx.control_plane.coordination.runtime_shadow import (
+        build_todo_runtime_shadow_projection,
+    )
+    from tests.control_plane.canonical_authority_fixture import (
+        initialize_canonical_authority,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    task = tmp_path / "task.md"
+    task.write_text("Repair the failure and preserve a regression test.\n")
+    state = tmp_path / "state.md"
+    state.write_text(
+        "# Active Goal State\n\n"
+        "## User Todo / Owner Review Reading Queue\n\n"
+        "## Agent Todo\n\n"
+        "## Completed Work Archive\n"
+    )
+    runtime = tmp_path / "runtime"
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "schema_version": "0.1",
+                "common_runtime_root": str(runtime),
+                "goals": [
+                    {
+                        "id": "planning-goal",
+                        "repo": str(project),
+                        "domain": "project",
+                        "state_file": str(state),
+                        "status": "active",
+                        "adapter": {"kind": "read_only_project_map_v0", "status": "connected-read-only"},
+                        "coordination": {"registered_agents": ["planner"]},
+                    }
+                ],
+            }
+        )
+    )
+    initialize_canonical_authority(
+        runtime,
+        "planning-goal",
+        build_todo_runtime_shadow_projection(
+            goal_id="planning-goal", todos=[], handoff_mode="soft_claim"
+        ),
+        state_path=state,
+        provider="file",
+    )
+    cli = tmp_path / "loopx"
+    cli.write_text(
+        f"#!{sys.executable}\nfrom loopx.cli import main\nraise SystemExit(main())\n"
+    )
+    cli.chmod(0o755)
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    binary = tmp_path / "codex"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        + """
+import json, os, pathlib, subprocess, sys
+print(json.dumps({"type": "thread.started", "thread_id": "planning-fixture-session"}), flush=True)
+packet = json.loads(sys.stdin.read().split("Host-supplied planning checkpoint:\\n", 1)[1])
+prefix = [os.environ["LOOPX_CLI"], "--format", "json", "--registry", os.environ["LOOPX_REGISTRY"],
+          "--runtime-root", os.environ["LOOPX_RUNTIME_ROOT"], "goal-acceptance"]
+route = ["--goal-id", "planning-goal", "--agent-id", "planner"]
+current = packet["goal_acceptance"]
+own = [o for o in current["goal_acceptance_contract"].get("outcome_requirements", {}).get("outcomes", []) if o["owner_agent_id"] == "planner"]
+refinement = pathlib.Path(os.environ["LOOPX_PLANNING_RESULT"]).with_name("agent-requirements.json")
+if not own:
+    document = {"outcome_id": "repair", "owner_agent_id": "planner", "objective": "Repair the failure and preserve a regression test.",
+                "requirements": [{"id": "repair", "description": "The failure is repaired and a regression test retained."}],
+                "source": {"ref": "user-task", "summary": packet["text"].strip()}}
+    refinement.write_text(json.dumps(document))
+    subprocess.run(prefix + ["refine"] + route + ["--document", str(refinement),
+                   "--expected-provider-revision", current["provider_revision"], "--operation-id", "planner-requirements", "--execute"],
+                   check=True, capture_output=True, text=True)
+command = [os.environ["LOOPX_CLI"], "--format", "json", "--registry", os.environ["LOOPX_REGISTRY"],
+           "--runtime-root", os.environ["LOOPX_RUNTIME_ROOT"], "todo", "add", "--goal-id", "planning-goal",
+           "--role", "agent", "--claimed-by", "planner",
+           "--text", "[P0] Reproduce and repair the failure, then pass the regression.",
+           "--task-class", "advancement_task", "--action-kind", "implement", "--execute"]
+if not packet["runnable_todo_ids"]:
+    written = json.loads(subprocess.run(command, check=True, capture_output=True, text=True).stdout)
+    todo_id = written["todo_id"]
+else:
+    todo_id = packet["runnable_todo_ids"][0]
+if not own or todo_id not in own[0]["todo_ids"]:
+    current = json.loads(subprocess.run(prefix + ["inspect"] + route, check=True, capture_output=True, text=True).stdout)
+    document = {"outcome_id": "repair", "todo_ids": [todo_id]}
+    refinement.write_text(json.dumps(document))
+    subprocess.run(prefix + ["refine"] + route + ["--document", str(refinement),
+                   "--expected-provider-revision", current["provider_revision"], "--operation-id", "planner-requirements-work", "--execute"],
+                   check=True, capture_output=True, text=True)
+result = {"input_digest": packet["input_digest"], "status": "ready", "todo_ids": [todo_id]}
+pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1]).write_text(json.dumps(result))
+pathlib.Path(os.environ["CODEX_HOME"], "seen-argv.json").write_text(json.dumps(sys.argv))
+"""
+    )
+    binary.chmod(0o755)
+    return dict(os.environ) | {
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        "LOOPX_EXECUTION_MODE": "heartbeat",
+        "LOOPX_TASK_ENTRY": "loopx-planned",
+        "LOOPX_TASK_STAGE": "plan",
+        "LOOPX_PHASE_DEADLINE_EPOCH": str(time.time() + 600),
+        "LOOPX_PLANNING_RESULT": str(tmp_path / "planning.json"),
+        "LOOPX_GOAL_ID": "planning-goal",
+        "LOOPX_AGENT_ID": "planner",
+        "LOOPX_REGISTRY": str(registry),
+        "LOOPX_RUNTIME_ROOT": str(runtime),
+        "LOOPX_CLI": str(cli),
+        "CODEX_BIN": str(binary),
+        "LOOPX_PROJECT": str(project),
+        "LOOPX_TASK_DOC": str(task),
+        "LOOPX_CODEX_HOME": str(tmp_path / "home"),
+        "LOOPX_SHARED_SKILLS": str(skills),
+        "LOOPX_WAKE_LOG_DIR": str(tmp_path / "logs" / "wakes"),
+        "MODEL_NAME": "fixture",
+        "REASONING_EFFORT": "high",
+        "OPENAI_BASE_URL": "http://localhost:8123/v1",
+        "OPENAI_API_KEY": "fixture-key",
+    }
+
+
+@pytest.mark.parametrize("context", ["fresh", "resume"])
+@pytest.mark.parametrize("phase_clock", [True, False], ids=["bounded", "natural"])
+def test_planning_writes_real_todo_then_reuses_it_without_executing_task(
+    planning_env, context, phase_clock
+):
+    if not phase_clock:
+        planning_env.pop("LOOPX_PHASE_DEADLINE_EPOCH")
+    planning_env["LOOPX_ITERATION_CONTEXT"] = context
+    if context == "fresh":
+        planning_env.pop("LOOPX_TASK_ENTRY")  # Omitted worker setting uses the same planner.
+    ids = []
+    for invocation in range(2):
+        receipt = run_once(planning_env)
+        assert receipt["ok"] and receipt["planning"]["state_readback_verified"]
+        # Planning cannot attest to an execution that has not happened yet.
+        assert "planning_session_reused_for_execution" not in receipt["planning"]
+        persisted = json.loads(Path(planning_env["LOOPX_PLANNING_RESULT"]).read_text())
+        assert persisted == receipt["planning"]
+        expected_action = "resume" if context == "resume" and invocation else "start_new"
+        assert receipt["session"]["action"] == expected_action
+        assert receipt["session"]["session_id"] == "planning-fixture-session"
+        ids.append(receipt["planning"]["todo_ids"])
+    state = Path(planning_env["LOOPX_REGISTRY"]).with_name("state.md").read_text()
+    assert ids[0] == ids[1] and len(ids[0]) == 1
+    assert state.count("todo_id=" + ids[0][0]) == 1
+    assert not list(Path(planning_env["LOOPX_PROJECT"]).iterdir())
+    argv = json.loads(
+        (Path(planning_env["LOOPX_CODEX_HOME"]) / "seen-argv.json").read_text()
+    )
+    assert "features.goals=false" in argv
+    assert ("resume" in argv) == (context == "resume")
+    assert not list(
+        Path(planning_env["LOOPX_RUNTIME_ROOT"]).rglob("benchmark-pending-turn.json")
+    )
+
+
+def test_real_planning_rejects_todos_without_agent_requirements(planning_env):
+    binary = Path(planning_env["CODEX_BIN"])
+    source = binary.read_text().replace("if not own:", "if False:").replace(
+        'if not own or todo_id not in own[0]["todo_ids"]:', "if False:")
+    binary.write_text(source)
+    with pytest.raises(ValueError, match="canonical overall requirements"):
+        run_once(planning_env)
+    assert not Path(planning_env["LOOPX_PLANNING_RESULT"]).exists()
+    receipts = list(Path(planning_env["LOOPX_WAKE_LOG_DIR"]).glob("*/receipt.json"))
+    assert len(receipts) == 1 and not json.loads(receipts[0].read_text())["ok"]
+    from benchmark.runtime.planning import task_plan_packet
+    from benchmark.runtime.worker import loopx_command
+    packet = task_plan_packet(planning_env, loopx_command(planning_env))
+    assert len(packet["runnable_todo_ids"]) == 1, "An actual task alone cannot satisfy ready"
+    assert not packet["goal_acceptance"]["planning_requirements"]["declaration_current"]
+
+
+@pytest.mark.parametrize("native_child_limit", [None, 3])
+def test_stopped_goal_cannot_launch_first_planner_or_fabricate_requirements(planning_env, native_child_limit):
+    from loopx.control_plane.goals.first_party_host_admission import FirstPartyHostRuntimeRejected
+    from benchmark.runtime.planning import task_plan_packet
+    from benchmark.runtime.worker import loopx_command
+
+    if native_child_limit is not None:
+        planning_env["LOOPX_NATIVE_CHILD_LIMIT"] = str(native_child_limit)
+
+    command = loopx_command(planning_env) + ["goal-lifecycle", "--goal-id", "planning-goal", "--operation", "stop"]
+    preview = json.loads(subprocess.run(command, env=planning_env, capture_output=True,
+        text=True, check=True).stdout)
+    stopped = subprocess.run(command + ["--actor-kind", "owner", "--expected-state-fingerprint",
+        preview["observed_state_fingerprint"], "--execute"], env=planning_env, capture_output=True,
+        text=True, check=True)
+    assert json.loads(stopped.stdout)["after_state"] == "stopped"
+    with pytest.raises(FirstPartyHostRuntimeRejected, match="goal_stopped"):
+        run_once(planning_env)
+    packet = task_plan_packet(planning_env, loopx_command(planning_env))
+    assert not packet["existing_todos"]
+    assert not packet["goal_acceptance"]["planning_requirements"]["declaration_current"]
+    assert not Path(planning_env["LOOPX_PLANNING_RESULT"]).exists()
+    assert not (Path(planning_env["LOOPX_CODEX_HOME"]) / "seen-argv.json").exists()
+
+
+def test_prose_or_fabricated_todo_does_not_qualify_planning(planning_env):
+    binary = Path(planning_env["CODEX_BIN"])
+    binary.write_text(
+        binary.read_text().replace(
+            '"status": "ready", "todo_ids": [todo_id]',
+            '"status": "ready", "todo_ids": ["todo_fabricated"]'
+        )
+    )
+    with pytest.raises(ValueError, match="missing or unrelated"):
+        run_once(planning_env)
+    assert not Path(planning_env["LOOPX_PLANNING_RESULT"]).exists()
+    receipt = json.loads(
+        next(
+            Path(planning_env["LOOPX_WAKE_LOG_DIR"]).glob("*/receipt.json")
+        ).read_text()
+    )
+    # A zero host exit must not be mistaken for qualified planning.
+    assert (
+        not receipt["ok"]
+        and receipt.get("planning") is None
+        and receipt["error_kind"] == "ValueError"
+    )
+
+
+@pytest.mark.parametrize("producer", [None, "local_probe"])
+def test_planner_delivers_product_contract_and_only_opted_in_tool_context(planning_env, producer):
+    from benchmark.runtime.planning import task_plan_packet
+    from benchmark.runtime.planning_batch import planning_batch_guidance
+    from benchmark.runtime.research_probe import execution_observation_guidance
+    from benchmark.runtime.worker import loopx_command
+
+    deadline = str(time.time() + 600)
+    env = planning_env | {"LOOPX_PHASE_DEADLINE_EPOCH": deadline}
+    if producer is not None:
+        env["LOOPX_EXECUTION_OBSERVATION"] = producer
+    before = task_plan_packet(env, loopx_command(env))
+    receipt = run_once(env)
+    assert receipt["ok"] and receipt["planning"]["state_readback_verified"]
+    assert receipt.get("execution_observation") == producer
+    body = next(Path(env["LOOPX_WAKE_LOG_DIR"]).glob("*/planning-input.json")).read_text()
+    assert deadline not in body
+    assert "Host execution window" not in body
+    assert "Existing execution reserve" not in body
+    assert body.count(execution_observation_guidance()) == int(producer is not None)
+    assert "Research-loop execution evidence:" not in body
+    packet = json.loads(body.split("Host-supplied planning checkpoint:\n", 1)[1])
+    assert packet == before
+    prefix = body.split("Host-supplied planning checkpoint:\n", 1)[0]
+    assert prefix.count(planning_batch_guidance()) == 1
+    assert prefix.replace(execution_observation_guidance(), "").replace(planning_batch_guidance(), "").strip() == "$loopx"
+    assert receipt["planning"]["input_digest"] == before["input_digest"]
+    assert env["LOOPX_PHASE_DEADLINE_EPOCH"] == deadline
+    assert not list(Path(env["LOOPX_PROJECT"]).iterdir())
+
+
+def test_planning_input_is_clock_independent_but_preserves_task_time_constraints():
+    from benchmark.runtime.planning import render_planning_prompt
+
+    packet = {"input_digest": "unchanged", "text": "Task constraint: inference under 30 seconds."}
+    body = render_planning_prompt(packet, {})
+    for deadline in ["100", "1600", "9999999999"]:
+        env = {"LOOPX_PHASE_DEADLINE_EPOCH": deadline}
+        assert render_planning_prompt(packet, env) == body
+        assert env == {"LOOPX_PHASE_DEADLINE_EPOCH": deadline}
+    assert json.loads(body.split("Host-supplied planning checkpoint:\n", 1)[1]) == packet
+    assert body.split("Host-supplied planning checkpoint:\n", 1)[0].strip() == "$loopx"
+    assert "Host deadline" not in body and "remaining" not in body
+    assert packet == {"input_digest": "unchanged", "text": "Task constraint: inference under 30 seconds."}
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1", "not-a-clock"])
+def test_planning_window_rejects_invalid_host_clock(value):
+    from benchmark.runtime.planning import render_planning_prompt
+
+    with pytest.raises(ValueError):
+        render_planning_prompt({"input_digest": "unchanged"},
+                               {"LOOPX_PHASE_DEADLINE_EPOCH": value})
+
+
+def test_retired_planning_limit_fails_before_host_invocation(planning_env):
+    with pytest.raises(ValueError, match="Remove LOOPX_PLANNING_TIMEOUT_SEC"):
+        run_once(planning_env | {"LOOPX_PLANNING_TIMEOUT_SEC": "30"})
+    assert not Path(planning_env["LOOPX_PLANNING_RESULT"]).exists()
+    assert not Path(planning_env["LOOPX_CODEX_HOME"], "seen-argv.json").exists()
+
+
+def test_plan_readback_rejects_stale_input_unclaimed_work_and_false_blockers():
+    packet = {
+        "input_digest": "input-a",
+        "goal_id": "goal",
+        "agent_id": "agent",
+        "existing_todos": [
+            {"todo_id": "todo_owned"},
+            {"todo_id": "todo_unclaimed"},
+            {"todo_id": "todo_gate"},
+        ],
+        "runnable_todo_ids": ["todo_owned"],
+        "blocking_todo_ids": ["todo_gate"],
+        "goal_acceptance": {"planning_requirements": {
+            "agent_id": "agent", "declaration_current": True,
+            "outcome_ids": ["repair"], "linked_todo_ids": ["todo_owned"],
+        }},
+    }
+    result = {"input_digest": "input-a", "status": "ready", "todo_ids": ["todo_owned"]}
+    assert validate_plan_readback(result, packet, packet)["status"] == "ready"
+    assert (
+        validate_plan_readback(
+            result | {"status": "blocked", "todo_ids": ["todo_gate"]}, packet, packet
+        )["status"]
+        == "blocked"
+    )
+    for invalid in [
+        result | {"input_digest": "old"},
+        result | {"todo_ids": ["todo_unclaimed"]},
+        result | {"status": "blocked"},
+        result | {"todo_ids": ["todo_owned", "todo_owned"]},
+    ]:
+        with pytest.raises(ValueError):
+            validate_plan_readback(invalid, packet, packet)
+    for bad in ({}, {"declaration_current": False}, {"agent_id": "peer"}, {"linked_todo_ids": []}):
+        after = packet | {"goal_acceptance": {"planning_requirements": packet["goal_acceptance"]["planning_requirements"] | bad}}
+        if not bad:
+            after["goal_acceptance"] = {}
+        with pytest.raises(ValueError, match="canonical overall requirements"):
+            validate_plan_readback(result, packet, after)
+        assert validate_plan_readback(result | {"status": "blocked", "todo_ids": ["todo_gate"]}, packet, after)["status"] == "blocked"
+
+
+def test_planned_phase_preserves_waits_and_does_not_prewrite_a_todo(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("harbor")
+    from benchmark.runtime.harbor import BenchmarkCodex
+
+    agent = BenchmarkCodex(
+        logs_dir=tmp_path, model_name="openai/fixture", task_entry="loopx-planned"
+    )
+    calls = []
+
+    async def prepared(*args, **kwargs):
+        return True
+
+    async def cli(environment, args, **kwargs):
+        calls.append(args)
+        return {
+            "after": {
+                "execution_profile": {
+                    "replan_after_effective_turns": 6,
+                    "planning_horizon_goal": True,
+                }
+            }
+        }
+
+    async def no_pending(**kwargs):
+        return SimpleNamespace(return_code=1)
+
+    monkeypatch.setattr(agent, "_write_task_document", prepared)
+    monkeypatch.setattr(agent, "_registry_exists", prepared)
+    monkeypatch.setattr(agent, "_loopx", cli)
+    asyncio.run(
+        agent._prepare_phase(
+            SimpleNamespace(exec=no_pending), "new feedback", cwd=str(tmp_path)
+        )
+    )
+    assert all(args[:2] != ["todo", "add"] for args in calls)
+    assert all(
+        "--clear-waiting-on" not in args and "--agent-work-mode" not in args
+        for args in calls
+    )
+
+
+@pytest.mark.parametrize("producer,objective", [
+    pytest.param(None, None, id="ordinary-default"),
+    pytest.param("local_probe", None, id="ordinary-observed"),
+    pytest.param(None, "Validate the supplied candidate once.", id="explicit-objective"),
+    pytest.param("local_probe", "Compare a validated alternative against the supplied candidate.",
+        id="observed-objective"),
+])
+def test_goal_bootstrap_preserves_original_objective_without_inventing_stages(
+    tmp_path, monkeypatch, producer, objective
+):
+    pytest.importorskip("harbor")
+    from benchmark.runtime import harbor
+    from benchmark.runtime.planning import task_plan_packet
+    from tests.control_plane.canonical_authority_fixture import isolate_sqlite_runtime
+    from loopx.control_plane.goals.active_state_metadata import split_state_frontmatter
+
+    isolate_sqlite_runtime(tmp_path, monkeypatch)
+    project, control, home = (tmp_path / name for name in ("project", "control", "home"))
+    for directory in (project, control, home):
+        directory.mkdir()
+    candidate = project / "solution.py"
+    candidate.write_text("print(5)\n")
+    before = candidate.read_bytes()
+    cli = tmp_path / "loopx"
+    cli.write_text(f"#!{sys.executable}\nfrom loopx.cli import main\nraise SystemExit(main())\n")
+    cli.chmod(0o755)
+    for key, value in {"_CONTROL": control, "_TASK_DOC": control / "task.md",
+        "_REGISTRY": control / "registry.json", "_LOOPX_RUNTIME": tmp_path / "runtime",
+        "_CLI": cli, "_SRC": Path(__file__).resolve().parents[2]}.items():
+        monkeypatch.setattr(harbor, key, str(value))
+    env = dict(os.environ) | {"HOME": str(home), "CODEX_HOME": str(home / "codex"),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]), "LOOPX_USAGE_PING": "0"}
+
+    class Environment:
+        async def exec(self, command, *, env=None, cwd=None, **kwargs):
+            result = subprocess.run(["/bin/bash", "-c", command], env=env,
+                cwd=cwd, text=True, capture_output=True, timeout=90)
+            return SimpleNamespace(return_code=result.returncode, stdout=result.stdout, stderr=result.stderr)
+
+        async def upload_file(self, source, target):
+            Path(target).write_bytes(Path(source).read_bytes())
+
+    agent = harbor.BenchmarkCodex(logs_dir=tmp_path / "logs", model_name="fixture",
+        execution_observation=producer, task_objective=objective)
+    monkeypatch.setattr(agent, "_profile_env", lambda: env)
+    task = ("Start from the supplied solution.py and compare one alternative against it.\n"
+        "First preserve correctness, then minimize operations. Retain useful negative results.\n"
+        "The final comparison must keep both priorities and this trailing requirement.")
+
+    try:
+        asyncio.run(agent._prepare_phase(Environment(), task, cwd=str(project)))
+        registry = json.loads(Path(harbor._REGISTRY).read_text())
+        state = Path(registry["goals"][0]["state_file"])
+        if not state.is_absolute():
+            state = project / state
+        assert split_state_frontmatter(state.read_text())[0]["objective"] == (objective or task)
+        prefix = [str(cli), "--format", "json", "--registry", harbor._REGISTRY,
+            "--runtime-root", harbor._LOOPX_RUNTIME]
+        packet = task_plan_packet(agent._worker_env(cwd=str(project)), prefix)
+        assert packet["text"].endswith(task + "\n")
+        assert packet["existing_todos"] == []
+        assert agent._seeded_todo_id is None
+        assert packet["execution_handoff"]["spends_quota"] is False
+        agent._phase_number += 1
+        feedback = "Released feedback is available; retain the original priorities and constraints."
+        asyncio.run(agent._prepare_phase(Environment(), feedback, cwd=str(project)))
+        next_packet = task_plan_packet(agent._worker_env(cwd=str(project)), prefix)
+        assert next_packet["text"].endswith(feedback + "\n")
+        assert next_packet["existing_todos"] == []
+        assert split_state_frontmatter(state.read_text())[0]["objective"] == (objective or task)
+        assert candidate.read_bytes() == before
+    finally:
+        from loopx.control_plane.effect_runtime import restart_effect_runtime
+
+        restart_effect_runtime(wait_for_exit=True)
+
+
+@pytest.mark.parametrize("status", ["ready", "blocked"])
+def test_planning_budget_and_blocked_handoff_use_the_real_adapter_run(
+    tmp_path, monkeypatch, status
+):
+    pytest.importorskip("harbor")
+    from benchmark.runtime import harbor
+
+    agent = harbor.BenchmarkCodex(
+        logs_dir=tmp_path,
+        model_name="openai/fixture",
+        turn_timeout_sec=250,
+        scheduler_timeout_sec=500,
+    )
+    clock = [0.0]
+    executions = []
+
+    async def prepare(*args, **kwargs):
+        pass
+
+    async def execute(environment, *, command, env=None, **kwargs):
+        if command == "pwd":
+            return SimpleNamespace(stdout="/workspace", return_code=0)
+        if env.get("LOOPX_TASK_STAGE") == "plan":
+            clock[0] = 200
+        else:
+            executions.append((command, env))
+        return SimpleNamespace(stdout="", return_code=0)
+
+    async def read_result(**kwargs):
+        return SimpleNamespace(
+            stdout=json.dumps({"status": status, "state_readback_verified": True})
+        )
+
+    monkeypatch.setattr(harbor.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(agent, "_prepare_phase", prepare)
+    monkeypatch.setattr(agent, "exec_as_agent", execute)
+    monkeypatch.setattr(agent, "_populate_context", lambda *args: None)
+    environment = SimpleNamespace(exec=read_result, is_mounted=True)
+    asyncio.run(agent.run("Synthetic task", environment, SimpleNamespace()))
+    assert len(executions) == (1 if status == "ready" else 0)
+    if executions:
+        command, env = executions[0]
+        assert "--kill-after=30 300s" in command
+        assert float(env["LOOPX_CODEX_TURN_TIMEOUT_SEC"]) == 250
+        assert "LOOPX_PHASE_DEADLINE_EPOCH=$(( $(date +%s) + 300 ))" in command
+
+
+def test_pending_turn_prevents_phase_input_replacement(tmp_path, monkeypatch):
+    pytest.importorskip("harbor")
+    from benchmark.runtime.harbor import BenchmarkCodex
+
+    agent = BenchmarkCodex(logs_dir=tmp_path, model_name="openai/fixture")
+
+    async def pending(**kwargs):
+        return SimpleNamespace(return_code=0)
+
+    async def unexpected_write(*args, **kwargs):
+        pytest.fail("pending transaction input must not be replaced")
+
+    monkeypatch.setattr(agent, "_write_task_document", unexpected_write)
+    with pytest.raises(RuntimeError, match="pending Turn"):
+        asyncio.run(
+            agent._prepare_phase(
+                SimpleNamespace(exec=pending), "next task", cwd=str(tmp_path)
+            )
+        )
+
+
+def test_late_scheduler_wake_does_not_open_an_unfinishable_turn(planning_env, monkeypatch):
+    from benchmark.runtime import worker
+
+    env = planning_env | {
+        "LOOPX_EXECUTION_MODE": "turn",
+        "LOOPX_TASK_STAGE": "execute",
+        "LOOPX_VALIDATION_COMMAND_JSON": '["python", "check.py"]',
+        "LOOPX_CODEX_TURN_TIMEOUT_SEC": "60",
+        "LOOPX_PHASE_DEADLINE_EPOCH": "260",
+    }
+    monkeypatch.setattr(worker.time, "time", lambda: 100)
+    monkeypatch.setattr(worker, "prepare_codex_home", lambda *a, **kw: pytest.fail("late wake must not launch a host"))
+    for entry in ("seeded-todo", "loopx-planned"):
+        receipt = run_once(env | {"LOOPX_TASK_ENTRY": entry})
+        assert receipt["budget_exhausted"] and receipt["host_invoked"] is False
+        assert receipt.get("turn_execution") is None
+    assert not (Path(env["LOOPX_RUNTIME_ROOT"]) / "benchmark-pending-turn.json").exists()
+
+
+@pytest.mark.parametrize("mode", ["heartbeat", "turn", "plain", "native-goal", "loopx-goal"])
+def test_real_scheduler_stops_after_one_budget_exhausted_wake(planning_env, mode):
+    from benchmark.runtime.scheduler import worker_command
+
+    env = planning_env | {
+        "LOOPX_EXECUTION_MODE": mode, "LOOPX_TASK_STAGE": "execute",
+        "LOOPX_TASK_ENTRY": "seeded-todo",
+        "LOOPX_PHASE_DEADLINE_EPOCH": str(time.time() + (0 if mode == "heartbeat" else 100)),
+    }
+    if mode == "turn":
+        env["LOOPX_VALIDATION_COMMAND_JSON"] = '["python", "check.py"]'
+    registry = Path(env["LOOPX_REGISTRY"])
+    registered = json.loads(registry.read_text())
+    registered["goals"][0]["domain"] = "project"
+    registered["goals"][0]["adapter"] = {
+        "kind": "read_only_project_map_v0", "status": "connected-read-only",
+    }
+    registry.write_text(json.dumps(registered))
+    # An isolated File authority remains runnable: only the benchmark owner
+    # knows its separate phase deadline. Exercise the real quota CLI, not a
+    # synthetic scheduler decision that happens to terminate on the next read.
+    cli = [env["LOOPX_CLI"], "--format", "json", "--registry", env["LOOPX_REGISTRY"],
+           "--runtime-root", env["LOOPX_RUNTIME_ROOT"]]
+    subprocess.run([*cli, "todo", "add", "--goal-id", env["LOOPX_GOAL_ID"],
+                    "--role", "agent", "--claimed-by", env["LOOPX_AGENT_ID"],
+                    "--text", "[P0] Complete synthetic task", "--execute"],
+                   env=env, check=True, capture_output=True, text=True)
+    def quota():
+        # The worker reads the direct control result, even when progressive
+        # context delivery is the default for agent-facing reads.
+        result = subprocess.run([
+            *cli, "quota", "should-run", "--goal-id", env["LOOPX_GOAL_ID"],
+            "--agent-id", env["LOOPX_AGENT_ID"], "--runtime-profile", "generic_cli",
+            "--context-delivery", "off", "--include-detail", "scheduler",
+        ], env=env, text=True, capture_output=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return json.loads(result.stdout)
+    before = quota()
+    assert before["should_run"] is True
+    command = worker_command(env, python=sys.executable,
+        source=str(Path(__file__).resolve().parents[2]),
+        state_file=str(Path(env["LOOPX_RUNTIME_ROOT"]) / "scheduler.json"),
+        host_timeout=500)
+    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+    if mode in {"heartbeat", "turn"}:
+        assert "status=wake_requested_stop" in result.stdout
+    receipts = list(Path(env["LOOPX_WAKE_LOG_DIR"]).glob("*/receipt.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text())
+    assert receipt["budget_exhausted"] and receipt["host_invoked"] is False
+    assert not Path(env["LOOPX_CODEX_HOME"]).exists()
+    assert not (Path(env["LOOPX_RUNTIME_ROOT"]) / "benchmark-pending-turn.json").exists()
+    after = quota()
+    assert after["should_run"] is True
+    assert after["quota"]["spent_slots"] == before["quota"]["spent_slots"]
+
+
+def test_remaining_phase_time_caps_later_host_windows(planning_env, monkeypatch):
+    from benchmark.runtime import worker
+
+    class CapturedWindow(Exception):
+        pass
+
+    def capture(home, *, execution, **kwargs):
+        assert execution.timeout_seconds == 60
+        raise CapturedWindow
+
+    monkeypatch.setattr(worker.time, "time", lambda: 100)
+    monkeypatch.setattr(worker, "prepare_codex_home", capture)
+    with pytest.raises(CapturedWindow):
+        run_once(planning_env | {
+            "LOOPX_TASK_STAGE": "execute",
+            "LOOPX_CODEX_TURN_TIMEOUT_SEC": "60",
+            "LOOPX_PHASE_DEADLINE_EPOCH": "300",
+        })
+
+
+@pytest.mark.parametrize("status", ["open", "blocked", "done", "deferred"])
+def test_seeded_task_acceptance_survives_phase_update_without_reviving_terminal_work(
+    planning_env, tmp_path, monkeypatch, status
+):
+    import contextlib
+    import io
+    pytest.importorskip("harbor")
+    from benchmark.runtime import harbor
+    from loopx.cli import main
+
+    agent = harbor.BenchmarkCodex(logs_dir=tmp_path, model_name="openai/fixture",
+                                 goal_id="planning-goal", agent_id="planner")
+
+    async def cli(environment, args, **kwargs):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = main([
+                "--format", "json", "--registry", planning_env["LOOPX_REGISTRY"],
+                "--runtime-root", planning_env["LOOPX_RUNTIME_ROOT"], *args,
+            ])
+        assert code == 0, output.getvalue()
+        return json.loads(output.getvalue())
+
+    monkeypatch.setattr(agent, "_loopx", cli)
+
+    async def scenario():
+        agent._phase_number = 1
+        await agent._seed_phase(None, cwd=planning_env["LOOPX_PROJECT"])
+        original = agent._seeded_todo_id
+        first = await cli(None, ["todo", "list", "--goal-id", "planning-goal",
+                                "--role", "agent", "--todo-id", original])
+        initial_text = first["todo"]["text"]
+        transition = (["complete", "--no-follow-up", "--note", "Synthetic task independently validated; no remaining work"]
+                      if status == "done" else ["update", "--status", status])
+        if status == "deferred":
+            transition += ["--resume-when", "capacity_available:fixture_pool"]
+        await cli(None, ["todo", *transition, "--goal-id", "planning-goal",
+                        "--todo-id", original, "--agent-id", "planner", "--execute"])
+        agent._phase_number = 2
+        await agent._seed_phase(None, cwd=planning_env["LOOPX_PROJECT"])
+        listed = await cli(None, ["todo", "list", "--goal-id", "planning-goal", "--role", "agent"])
+        todos = {t["todo_id"]: t for t in listed["todos"]}
+        # Both the first task and a later phase keep the native task's full
+        # acceptance in scope, without preplanning a successor or reviving work.
+        assert todos[agent._seeded_todo_id]["text"] == (
+            "[P0] Complete the task in /opt/loopx-benchmark/control/task-phase-002.md. "
+            "Inspect the workspace, implement and validate against the task's full "
+            "requirements and acceptance criteria. Keep unmet requirements explicit "
+            "when judging task completion."
+        )
+        assert initial_text == todos[agent._seeded_todo_id]["text"].replace(
+            "task-phase-002.md", "task-phase-001.md"
+        )
+        if status in {"open", "blocked"}:
+            assert agent._seeded_todo_id == original and len(todos) == 1
+            assert todos[original]["status"] == status
+            assert "task-phase-002.md" in todos[original]["text"]
+        else:
+            assert agent._seeded_todo_id != original and len(todos) == 2
+            assert todos[original]["status"] == status
+            assert "task-phase-001.md" in todos[original]["text"]
+
+    asyncio.run(scenario())
+
+
+def test_sforge_planning_entry_runs_inside_native_process_and_reuses_receipt(planning_env):
+    from benchmark.runtime.sforge_entry import prepare_entry
+    env = planning_env | {"LOOPX_PHASE_DEADLINE_EPOCH": str(time.time() + 600)}
+    assert prepare_entry(env)
+    initial = list(Path(env["LOOPX_WAKE_LOG_DIR"]).glob("*/receipt.json"))
+    assert len(initial) == 1
+    assert prepare_entry(env)
+    assert list(Path(env["LOOPX_WAKE_LOG_DIR"]).glob("*/receipt.json")) == initial
+    # Real process boundary retains the native transport environment and deadline.
+    marker = Path(env["LOOPX_PROJECT"]) / "handoff.json"
+    target = "import os,json,pathlib; pathlib.Path(%r).write_text(json.dumps({k:os.environ[k] for k in ['HTTPS_PROXY','LOOPX_PHASE_DEADLINE_EPOCH','LOOPX_TASK_STAGE']}))" % str(marker)
+    proxy = "http://api-only.invalid:9090"
+    result = subprocess.run([sys.executable, "-m", "benchmark.runtime.sforge_entry",
+                             sys.executable, "-c", target], env=env | {"HTTPS_PROXY": proxy},
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert Path(env["LOOPX_PLANNING_RESULT"]).with_name("execution-started").exists()
+    assert json.loads(marker.read_text()) == {"HTTPS_PROXY": proxy,
+        "LOOPX_PHASE_DEADLINE_EPOCH": env["LOOPX_PHASE_DEADLINE_EPOCH"],
+        "LOOPX_TASK_STAGE": "execute"}
+    saved = Path(env["LOOPX_PLANNING_RESULT"])
+    valid = json.loads(saved.read_text())
+    for mutation in ({"state_readback_verified": False}, {"todo_ids": ["missing"]},
+                     {"status": "blocked"}, {"todo_ids": valid["todo_ids"] * 2}):
+        saved.write_text(json.dumps(valid | mutation))
+        with pytest.raises(ValueError):
+            prepare_entry(env)
+    changed = valid | {"input_digest": "stale"}
+    saved.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="current task"):
+        prepare_entry(env)
+
+
+def test_sforge_planner_uses_trial_deadline_instead_of_a_stage_cap(planning_env, monkeypatch):
+    from benchmark.runtime.sforge_entry import prepare_entry
+
+    communicate = subprocess.Popen.communicate
+    observed = []
+
+    def capture(process, *args, **kwargs):
+        if process.args[0] == planning_env["CODEX_BIN"]:
+            observed.append(kwargs["timeout"])
+        return communicate(process, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", capture)
+    # Even an inherited shared-worker cap cannot shorten native SForge planning.
+    env = planning_env | {"LOOPX_PHASE_DEADLINE_EPOCH": str(time.time() + 1200),
+                          "LOOPX_PLANNING_TIMEOUT_SEC": "30"}
+    assert prepare_entry(env)
+    assert len(observed) == 1 and 1100 < observed[0] <= 1200
+    assert Path(env["LOOPX_PLANNING_RESULT"]).exists()
+
+
+@pytest.mark.parametrize("legacy_limit", [0, 30, 300, float("inf")])
+def test_shared_harbor_rejects_retired_planning_limit(tmp_path, legacy_limit):
+    pytest.importorskip("harbor")
+    from benchmark.runtime.harbor import BenchmarkCodex
+
+    with pytest.raises(ValueError, match="Remove planning_timeout_sec"):
+        BenchmarkCodex(logs_dir=tmp_path, model_name="openai/fixture",
+                       planning_timeout_sec=legacy_limit)
+    BenchmarkCodex(logs_dir=tmp_path, model_name="openai/fixture", planning_timeout_sec=None)
+
+
+@pytest.mark.parametrize("mode,planning_elapsed,host_timeout", [
+    ("heartbeat", 400, 500), ("heartbeat", 850, 150), ("heartbeat", 1000, None),
+    ("turn", 400, 440), ("turn", 840, None), ("turn", 850, None),
+])
+def test_harbor_planning_uses_the_phase_deadline_without_a_stage_cap(
+    tmp_path, monkeypatch, mode, planning_elapsed, host_timeout,
+):
+    pytest.importorskip("harbor")
+    from benchmark.runtime import harbor
+
+    agent = harbor.BenchmarkCodex(logs_dir=tmp_path, model_name="fixture",
+                                 execution_mode=mode,
+                                 validation_command=["trusted-validator"] if mode == "turn" else (),
+                                 turn_timeout_sec=500, scheduler_timeout_sec=1000)
+    clock = [0.0]
+    planning = []
+    execution = []
+
+    async def prepare(*args, **kwargs):
+        pass
+
+    async def execute(environment, *, command, env=None, **kwargs):
+        if command == "pwd":
+            return SimpleNamespace(stdout="/workspace", return_code=0)
+        if env.get("LOOPX_TASK_STAGE") == "plan":
+            planning.append((command, env, kwargs))
+            # A valid plan may exceed the removed 300-second stage cap.
+            clock[0] = float(planning_elapsed)
+        else:
+            execution.append((command, env, kwargs))
+        return SimpleNamespace(stdout="", return_code=0)
+
+    async def result(**kwargs):
+        return SimpleNamespace(stdout=json.dumps({"status": "ready", "state_readback_verified": True}))
+
+    monkeypatch.setattr(harbor.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(agent, "_prepare_phase", prepare)
+    monkeypatch.setattr(agent, "exec_as_agent", execute)
+    monkeypatch.setattr(agent, "_populate_context", lambda *args: None)
+    invocation = agent.run("Synthetic task", SimpleNamespace(exec=result, is_mounted=True), SimpleNamespace())
+    # Heartbeat retains the whole solver window; Turn reserves 160 seconds.
+    # These expected budgets are independent of the helper under test.
+    if host_timeout is None:
+        with pytest.raises(TimeoutError, match="before execution handoff"):
+            asyncio.run(invocation)
+        assert len(planning) == 1 and not execution
+        return
+    asyncio.run(invocation)
+
+    assert len(planning) == len(execution) == 1
+    command, env, options = planning[0]
+    assert "LOOPX_PLANNING_TIMEOUT_SEC" not in env
+    assert "LOOPX_PHASE_DEADLINE_EPOCH=$(( $(date +%s) + 1000 ))" in command
+    assert options["timeout_sec"] >= 1000
+    assert f"--kill-after=30 {1000 - planning_elapsed}s" in execution[0][0]
+    assert float(execution[0][1]["LOOPX_CODEX_TURN_TIMEOUT_SEC"]) == host_timeout
+
+
+def test_sforge_post_plan_deadline_never_marks_execution_started(tmp_path, monkeypatch):
+    from benchmark.runtime import sforge_entry
+
+    monkeypatch.setattr(sforge_entry, "prepare_entry", lambda env: True)
+    monkeypatch.setenv("LOOPX_PHASE_DEADLINE_EPOCH", str(time.time() - 1))
+    monkeypatch.setenv("LOOPX_PLANNING_RESULT", str(tmp_path / "planning.json"))
+    monkeypatch.setattr(sys, "argv", ["sforge-entry", "execution-must-not-start"])
+    monkeypatch.setattr(os, "execvpe", lambda *args: pytest.fail("Execution after exhausted planning"))
+    assert sforge_entry.main() == 1
+    assert not (tmp_path / "execution-started").exists()
+
+
+def test_sforge_planning_exhausted_budget_never_invokes_host(planning_env):
+    from benchmark.runtime.sforge_entry import prepare_entry
+    env = planning_env | {"LOOPX_PHASE_DEADLINE_EPOCH": str(time.time() - 1)}
+    assert not prepare_entry(env)
+    assert not Path(env["LOOPX_PLANNING_RESULT"]).exists()
+    assert not Path(env["LOOPX_WAKE_LOG_DIR"]).exists()
+    result = subprocess.run([sys.executable, "-m", "benchmark.runtime.sforge_entry",
+        sys.executable, "-c", "raise SystemExit('execution must not start')"],
+        env=env, capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "execution must not start" not in result.stderr
+    assert not Path(env["LOOPX_PLANNING_RESULT"]).with_name("execution-started").exists()
+
+
+def test_sforge_planning_failed_host_has_no_execution_handoff(planning_env):
+    from benchmark.runtime.sforge_entry import prepare_entry
+    Path(planning_env["CODEX_BIN"]).write_text(f"#!{sys.executable}\nraise SystemExit(1)\n")
+    with pytest.raises(RuntimeError):
+        prepare_entry(planning_env | {"LOOPX_PHASE_DEADLINE_EPOCH": str(time.time() + 600)})
+    assert not Path(planning_env["LOOPX_PLANNING_RESULT"]).exists()
+
+
+@pytest.mark.parametrize("settings,field,value", [
+    ({}, "replan_after_effective_turns", 6),
+    ({"planning_horizon_goal": True}, "replan_after_effective_turns", 6),
+    ({"planning_horizon_goal": False}, "replan_after_effective_turns", 6),
+    ({"replan_after_turns": 2}, "replan_after_effective_turns", 2),
+    ({"replan_after_todos": 3}, "replan_after_completed_todos", 3),
+    ({"replan_after_todos": 2}, "replan_after_completed_todos", 2),
+])
+def test_runner_cadence_persists_through_real_configure_goal(
+    planning_env, tmp_path, monkeypatch, settings, field, value
+):
+    import contextlib
+    import io
+    pytest.importorskip("harbor")
+    from benchmark.runtime import harbor
+    from loopx.cli import main
+
+    agent = harbor.BenchmarkCodex(logs_dir=tmp_path, model_name="fixture",
+                                 goal_id="planning-goal", agent_id="planner", **settings)
+
+    async def cli(environment, args, **kwargs):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = main([
+                "--format", "json", "--registry", planning_env["LOOPX_REGISTRY"],
+                "--runtime-root", planning_env["LOOPX_RUNTIME_ROOT"], *args,
+            ])
+        assert code == 0, output.getvalue()
+        return json.loads(output.getvalue())
+
+    async def prepared(*args, **kwargs):
+        return True
+
+    async def no_pending(**kwargs):
+        return SimpleNamespace(return_code=1)
+
+    monkeypatch.setattr(agent, "_loopx", cli)
+    monkeypatch.setattr(agent, "_registry_exists", prepared)
+    monkeypatch.setattr(agent, "_write_task_document", prepared)
+    asyncio.run(agent._prepare_phase(SimpleNamespace(exec=no_pending), "Synthetic task",
+                                     cwd=planning_env["LOOPX_PROJECT"]))
+    readback = asyncio.run(cli(None, ["configure-goal", "--goal-id", "planning-goal"]))
+    profile = readback["after"]["execution_profile"]
+    assert profile[field] == value
+    other = ("replan_after_completed_todos" if field == "replan_after_effective_turns"
+             else "replan_after_effective_turns")
+    assert other not in profile
+    # Cadence-pinned Goals no longer fall back to "off"; any recorded value is v1.
+    assert profile.get("stride_strategy", "evidence_conditioned_v1") == "evidence_conditioned_v1"
+    horizon = settings.get("planning_horizon_goal", True)
+    assert profile["planning_horizon_goal"] is horizon
+    assert agent._replan_receipt() == {field: value,
+        "planning_horizon_goal": horizon, "stride_strategy": "evidence_conditioned_v1"}
+
+
+def test_sforge_planning_entry_retries_a_dropped_planning_wake_within_budget(planning_env, monkeypatch):
+    import benchmark.runtime.sforge_entry as entry
+
+    real = entry.run_once
+    seen = []
+
+    def flaky(env):
+        seen.append(env["LOOPX_TASK_STAGE"])
+        if len(seen) == 1:
+            # The native process died without a plan or a harness error.
+            return {"ok": False, "timed_out": False, "return_code": 1}
+        return real(env)
+
+    monkeypatch.setattr(entry, "run_once", flaky)
+    env = planning_env | {"LOOPX_PHASE_DEADLINE_EPOCH": str(time.time() + 600)}
+    assert entry.prepare_entry(env)
+    assert seen == ["plan", "plan"]
+    attempts = json.loads(Path(env["LOOPX_PLANNING_RESULT"]).with_name("planning-attempts.json").read_text())
+    assert [a["ok"] for a in attempts] == [False, True]
+    assert attempts[0]["return_code"] == 1
+    assert len(list(Path(env["LOOPX_WAKE_LOG_DIR"]).glob("*/receipt.json"))) == 1
+
+
+@pytest.mark.parametrize("receipt", [
+    {"ok": False, "timed_out": True, "return_code": 124},
+    {"ok": False, "timed_out": False, "return_code": 1, "error_kind": "ValueError"},
+    {"ok": False, "timed_out": False, "return_code": 0},
+])
+def test_sforge_planning_entry_does_not_retry_timeouts_or_harness_failures(planning_env, monkeypatch, receipt):
+    import benchmark.runtime.sforge_entry as entry
+
+    calls = []
+    monkeypatch.setattr(entry, "run_once", lambda env: calls.append(env["LOOPX_TASK_STAGE"]) or dict(receipt))
+    env = planning_env | {"LOOPX_PHASE_DEADLINE_EPOCH": str(time.time() + 600)}
+    with pytest.raises(RuntimeError, match="Planning failed"):
+        entry.prepare_entry(env)
+    assert calls == ["plan"]
+    attempts = json.loads(Path(env["LOOPX_PLANNING_RESULT"]).with_name("planning-attempts.json").read_text())
+    assert len(attempts) == 1 and attempts[0]["ok"] is False
+
+
+def test_sforge_planning_entry_stops_retrying_after_the_attempt_limit(planning_env, monkeypatch):
+    import benchmark.runtime.sforge_entry as entry
+
+    calls = []
+    monkeypatch.setattr(entry, "run_once", lambda env: calls.append(1) or {"ok": False, "timed_out": False, "return_code": 1})
+    env = planning_env | {"LOOPX_PHASE_DEADLINE_EPOCH": str(time.time() + 600)}
+    with pytest.raises(RuntimeError, match="Planning failed"):
+        entry.prepare_entry(env)
+    assert len(calls) == entry.PLANNING_WAKE_ATTEMPTS
+
+
+@pytest.mark.parametrize("context", ["fresh", "resume"])
+@pytest.mark.parametrize("producer", [None, "local_probe"])
+@pytest.mark.parametrize("checkpoint_preflight", [False, True])
+def test_execute_wake_keeps_host_clocks_out_of_fresh_and_resumed_input(
+        planning_env, context, producer, checkpoint_preflight):
+    """Exercise the real worker/heartbeat CLI and capture its model transport input."""
+    from benchmark.runtime.research_probe import execution_observation_guidance
+
+    env = planning_env | {"LOOPX_ITERATION_CONTEXT": context}
+    if producer is not None:
+        env["LOOPX_EXECUTION_OBSERVATION"] = producer
+    if checkpoint_preflight:
+        root = Path(env["LOOPX_WAKE_LOG_DIR"]).parent
+        root.mkdir(parents=True, exist_ok=True)
+        request = root / "checkpoint-request.json"
+        request.write_text(json.dumps({"destination": str(root / "checkpoints"),
+            "trigger": "fresh_replan", "native_session": True, "loopx_state": True,
+            "evaluation_opportunity": True, "controller_handoff": True,
+            "components": [{"id": "workspace", "source_path": env["LOOPX_PROJECT"]}], "point_metadata": {}}))
+        env["LOOPX_CHECKPOINT_REQUEST"] = str(request)
+    assert run_once(env)["ok"]
+    binary = Path(env["CODEX_BIN"])
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "pathlib.Path(os.environ['CODEX_HOME'], 'execute-input.txt').write_text(sys.stdin.read())\n"
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 'planning-fixture-session'}))\n"
+    )
+    before = Path(env["LOOPX_REGISTRY"]).with_name("state.md").read_bytes()
+    old_deadline = env["LOOPX_PHASE_DEADLINE_EPOCH"]
+    for offset in [900, 500]:
+        deadline = str(time.time() + offset)
+        current = env | {"LOOPX_TASK_STAGE": "execute",
+                         "LOOPX_PHASE_DEADLINE_EPOCH": deadline,
+                         "LOOPX_CODEX_TURN_TIMEOUT_SEC": "120"}
+        receipt = run_once(current)
+        assert receipt["ok"]
+        assert receipt.get("execution_observation") == producer
+        body = (Path(env["LOOPX_CODEX_HOME"]) / "execute-input.txt").read_text()
+        assert deadline not in body
+        assert "Absolute phase deadline" not in body
+        assert old_deadline not in body
+        assert "Current wake execution limit" not in body
+        assert "Existing execution reserve" not in body
+        assert "The Host enforces runtime limits externally" not in body
+        assert "heartbeat-prompt" in body or "quota" in body
+        assert body.count(execution_observation_guidance()) == int(producer is not None)
+        assert "Research-loop execution evidence:" not in body
+        assert receipt["session"]["action"] == ("resume" if context == "resume" else "start_new")
+        assert "turn_envelope" not in receipt
+        assert "complete_turn" not in receipt
+        assert "--complete-turn" not in body and "--turn-envelope" not in body
+        assert ("--decision-output-root" in body) is checkpoint_preflight
+        if checkpoint_preflight:
+            original = Path(env["LOOPX_WAKE_LOG_DIR"]) / receipt["turn_id"] / "checkpoint-start-guard.json"
+            assert json.loads(original.read_bytes())["schema_version"] == "loopx_turn_envelope_v1"
+            assert "Do not repeat the initial guard below" in body
+        assert current["LOOPX_PHASE_DEADLINE_EPOCH"] == deadline
+    # Runtime clocks remain internal and never change task/completion authority.
+    assert Path(env["LOOPX_REGISTRY"]).with_name("state.md").read_bytes() == before
+
+
+def test_plan_native_command_exposes_runtime_root_only_during_workspace_write_plan(tmp_path):
+    from types import SimpleNamespace
+    from benchmark.runtime.codex import Execution
+    from benchmark.runtime.worker import native_command
+
+    project = tmp_path / "project"
+    runtime_root = tmp_path / "runtime"
+    wake = tmp_path / "wake"
+    codex_bin = tmp_path / "codex"
+    codex_bin.write_text("#!/bin/sh\nexit 0\n")
+    codex_bin.chmod(0o755)
+    for directory in (project, runtime_root, wake):
+        directory.mkdir()
+    env = {
+        "CODEX_BIN": str(codex_bin),
+        "LOOPX_PROJECT": str(project),
+        "LOOPX_RUNTIME_ROOT": str(runtime_root),
+        "MODEL_NAME": "gpt-5.4",
+        "REASONING_EFFORT": "low",
+    }
+    expected_flag = f"sandbox_workspace_write.writable_roots={json.dumps([str(runtime_root.resolve())])}"
+    ws_exec = Execution(mode="turn", context="fresh", sandbox="workspace-write", validation_command=("true",))
+    for session_wake in (None, SimpleNamespace(session_id="sess-1")):
+        plan_cmd = native_command(env, ws_exec, "plan", wake, session_wake)
+        assert expected_flag in plan_cmd
+        execute_cmd = native_command(env, ws_exec, "execute", wake, session_wake)
+        assert not any("writable_roots" in arg for arg in execute_cmd)
+    ro_exec = Execution(mode="turn", context="fresh", sandbox="read-only", validation_command=("true",))
+    assert not any("writable_roots" in arg for arg in native_command(env, ro_exec, "plan", wake, None))
+    dfa_exec = Execution(mode="heartbeat", context="resume", sandbox="danger-full-access")
+    assert not any("writable_roots" in arg for arg in native_command(env, dfa_exec, "plan", wake, None))
+
+
+def _run_plan_runtime_root_probe(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    context: str,
+    project: Path,
+    raw_runtime_root: str,
+    expected_abs: str,
+    forbidden_roots: list[str],
+):
+    from types import SimpleNamespace
+    from benchmark.runtime.codex import Execution
+    from benchmark.runtime.worker import native_command, run_once
+
+    wake = tmp_path / "wake"
+    home = tmp_path / "home"
+    logs = tmp_path / "logs"
+    task_doc = tmp_path / "task.md"
+    codex_bin = tmp_path / "codex"
+    loopx_cli = tmp_path / "loopx"
+    skills = tmp_path / "skills"
+    registry = tmp_path / "registry.json"
+    for d in (wake, home, logs, skills):
+        d.mkdir(parents=True, exist_ok=True)
+    task_doc.write_text("# Task\n", encoding="utf-8")
+    registry.write_text("{}", encoding="utf-8")
+
+    expected_roots = [expected_abs]
+    expected_flag = f"sandbox_workspace_write.writable_roots={json.dumps(expected_roots)}"
+
+    ws_exec = Execution(mode="turn", context=context, sandbox="workspace-write", validation_command=("true",))
+    session = None if context == "fresh" else SimpleNamespace(session_id="sess-1")
+    cmd = native_command(
+        {
+            "CODEX_BIN": str(codex_bin),
+            "LOOPX_PROJECT": str(project),
+            "LOOPX_RUNTIME_ROOT": raw_runtime_root,
+            "MODEL_NAME": "gpt-5.4",
+            "REASONING_EFFORT": "low",
+        },
+        ws_exec,
+        "plan",
+        wake,
+        session,
+    )
+    assert expected_flag in cmd
+    for forbidden in forbidden_roots:
+        assert forbidden not in json.dumps(cmd)
+
+    observed: dict[str, object] = {}
+    codex_bin.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        f"pathlib.Path({json.dumps(str(tmp_path / 'codex-observed.json'))}).write_text("
+        "json.dumps({'argv': sys.argv[1:], 'runtime_root': os.environ.get('LOOPX_RUNTIME_ROOT')}))\n"
+        "if '--output-last-message' in sys.argv:\n"
+        "    out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+        "    pathlib.Path(out).write_text('{\"input_digest\":\"d1\",\"status\":\"ready\",\"todo_ids\":[\"t1\"]}')\n",
+        encoding="utf-8",
+    )
+    codex_bin.chmod(0o755)
+    loopx_cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    loopx_cli.chmod(0o755)
+
+    monkeypatch.setattr("benchmark.runtime.worker.prepare_codex_home", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        "benchmark.runtime.planning.task_plan_packet",
+        lambda env, cli: observed.setdefault("packets", []).append(
+            {"env_rt": env["LOOPX_RUNTIME_ROOT"], "cli": list(cli)}
+        )
+        or {
+            "input_digest": "d1",
+            "existing_todos": [{"todo_id": "t1", "status": "pending"}],
+            "runnable_todo_ids": ["t1"],
+            "blocking_todo_ids": [],
+            "goal_acceptance": {"planning_requirements": {"agent_id": "a1", "declaration_current": True, "linked_todo_ids": ["t1"]}},
+            "goal_id": "g1",
+            "agent_id": "a1",
+            "result_schema": {},
+            "goal_acceptance_prompt": "",
+        },
+    )
+    monkeypatch.setattr(
+        "benchmark.runtime.planning.render_planning_prompt",
+        lambda packet, env: "plan prompt",
+    )
+    monkeypatch.setattr(
+        "benchmark.runtime.planning.validate_plan_readback",
+        lambda result, before, after: {"status": "ready", "todo_ids": ["t1"], "state_readback_verified": True},
+    )
+
+    def _fake_session_wake(wake_env, *a, **kw):
+        observed["wake_rt"] = wake_env["LOOPX_RUNTIME_ROOT"]
+        return SimpleNamespace(
+            session_id="sess-" + context,
+            binding={"session_id": "sess-resume"} if context == "resume" else None,
+            receipt={"action": "start_new" if context == "fresh" else "resume", "session_id": "sess-" + context},
+            goal_ref=None,
+            admission=None,
+            observe=lambda *_: None,
+            host_launch_decision=lambda *_: None,
+        )
+
+    monkeypatch.setattr("benchmark.runtime.sessions.BenchmarkSessionWake", _fake_session_wake)
+    monkeypatch.setattr("benchmark.runtime.worker.heartbeat_launch_check", lambda *a, **kw: None)
+
+    plan_result = tmp_path / "plan-result.json"
+    receipt = run_once(
+        {
+            "CODEX_BIN": str(codex_bin),
+            "LOOPX_CLI": str(loopx_cli),
+            "LOOPX_REGISTRY": str(registry),
+            "LOOPX_RUNTIME_ROOT": raw_runtime_root,
+            "LOOPX_PROJECT": str(project),
+            "LOOPX_CODEX_HOME": str(home),
+            "LOOPX_WAKE_LOG_DIR": str(logs),
+            "LOOPX_SHARED_SKILLS": str(skills),
+            "LOOPX_TASK_DOC": str(task_doc),
+            "LOOPX_GOAL_ID": "g1",
+            "LOOPX_AGENT_ID": "a1",
+            "LOOPX_EXECUTION_MODE": "turn",
+            "LOOPX_ITERATION_CONTEXT": context,
+            "LOOPX_VALIDATION_COMMAND_JSON": '["true"]',
+            "LOOPX_TASK_ENTRY": "loopx-planned",
+            "LOOPX_TASK_STAGE": "plan",
+            "LOOPX_PLANNING_RESULT": str(plan_result),
+            "LOOPX_PHASE_DEADLINE_EPOCH": str(time.time() + 120),
+            "LOOPX_CODEX_SANDBOX": "workspace-write",
+            "LOOPX_CONTEXT_DELIVERY": "off",
+            "MODEL_NAME": "gpt-5.4",
+            "REASONING_EFFORT": "low",
+        }
+    )
+    assert receipt["ok"] is True
+    assert len(observed["packets"]) == 2
+    for packet in observed["packets"]:
+        assert packet["env_rt"] == expected_abs
+        assert packet["cli"][packet["cli"].index("--runtime-root") + 1] == expected_abs
+    assert observed["wake_rt"] == expected_abs
+    codex_seen = json.loads((tmp_path / "codex-observed.json").read_text(encoding="utf-8"))
+    assert codex_seen["runtime_root"] == expected_abs
+    assert expected_flag in codex_seen["argv"]
+    for forbidden in forbidden_roots:
+        assert forbidden not in json.dumps(codex_seen)
+
+
+@pytest.mark.parametrize("context", ["fresh", "resume"])
+def test_relative_runtime_root_binds_consistently_across_launcher_cwd(tmp_path, monkeypatch, context):
+    launcher = tmp_path / "launcher"
+    project = tmp_path / "project"
+    launcher.mkdir()
+    project.mkdir()
+    rel_rt = "rel-runtime"
+    (project / rel_rt).mkdir()
+    launcher_rt = launcher / rel_rt
+    launcher_rt.mkdir()
+    monkeypatch.chdir(launcher)
+    expected_abs = os.path.realpath(os.path.join(os.path.realpath(project), rel_rt))
+    _run_plan_runtime_root_probe(
+        tmp_path, monkeypatch,
+        context=context,
+        project=project,
+        raw_runtime_root=rel_rt,
+        expected_abs=expected_abs,
+        forbidden_roots=[str(launcher_rt), str(launcher_rt.resolve())],
+    )
+
+
+@pytest.mark.parametrize("context", ["fresh", "resume"])
+@pytest.mark.parametrize("path_kind", ["absolute", "relative"])
+def test_symlink_parent_runtime_root_resolves_in_filesystem_order(tmp_path, monkeypatch, context, path_kind):
+    from benchmark.runtime.worker import _normalize_runtime_root
+
+    project = tmp_path / "project"
+    decoy_parent = tmp_path / "isolated_decoy"
+    real_parent = tmp_path / "isolated_real"
+    decoy_target = decoy_parent / "target"
+    real_sub = real_parent / "sub"
+    real_target = real_parent / "target"
+    for directory in (project, decoy_parent, decoy_target, real_sub, real_target):
+        directory.mkdir(parents=True)
+
+    # Folding '..' before expanding the symlink would jump into decoy_target /
+    # project/target instead of resolving through real_sub into real_target.
+    decoy_link = decoy_parent / "link_to_sub"
+    decoy_link.symlink_to(real_sub)
+    project_link = project / "link_to_sub"
+    project_link.symlink_to(real_sub)
+    (project / "target").mkdir()
+
+    expected_physical = str(real_target.resolve())
+    assert str(decoy_target.resolve()) != expected_physical
+    assert str((project / "target").resolve()) != expected_physical
+
+    if path_kind == "absolute":
+        raw_rt = str(decoy_link / ".." / "target")
+        decoy_lexical = os.path.abspath(raw_rt)
+        forbidden = [raw_rt, decoy_lexical, str(decoy_target.resolve())]
+    else:
+        raw_rt = "link_to_sub/../target"
+        decoy_lexical = os.path.abspath(os.path.join(os.path.abspath(project), raw_rt))
+        forbidden = [raw_rt, decoy_lexical, str((project / "target").resolve())]
+
+    assert _normalize_runtime_root(raw_rt, str(project)) == expected_physical
+    _run_plan_runtime_root_probe(
+        tmp_path, monkeypatch,
+        context=context,
+        project=project,
+        raw_runtime_root=raw_rt,
+        expected_abs=expected_physical,
+        forbidden_roots=forbidden,
+    )

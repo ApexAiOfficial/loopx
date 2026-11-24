@@ -10,35 +10,18 @@ CLI_COMMANDS = ROOT / "loopx" / "cli_commands"
 
 DEFAULT_MAX_LINES = 1000
 STARTER_MODULE_LIMITS = {
+    # Legacy command owners are frozen at their current baseline while each
+    # cohesive extraction lands; the default budget still catches new growth.
     "starter.py": 180,
     "starter_bootstrap.py": 220,
     "starter_bootstrap_registration.py": 240,
-    "starter_runtime_idle.py": 160,
-    "starter_scheduler.py": 240,
-    "starter_session_runtime.py": 220,
-    "starter_visible_common.py": 120,
-    "starter_visible_driver.py": 220,
-    "starter_visible_pilot.py": 340,
 }
 STARTER_COMMAND_OWNERS = {
     "start-goal": "start_goal.py",
+    "prepare-operation": "goal_channel_operation.py",
+    "deliver-operation": "goal_channel_operation.py",
     "new-project-prompt": "starter_bootstrap_registration.py",
     "codex-cli-bootstrap-message": "starter_bootstrap_registration.py",
-    "codex-cli-tui-bootstrap-smoke-bundle": "starter_bootstrap_registration.py",
-    "codex-cli-exec-handoff": "starter_bootstrap_registration.py",
-    "codex-cli-one-message-loop-pilot": "starter_visible_pilot.py",
-    "codex-cli-visible-local-driver-pilot": "starter_visible_pilot.py",
-    "codex-cli-bounded-visible-pilot-adapter": "starter_visible_pilot.py",
-    "codex-cli-visible-first-response-capture-plan": "starter_visible_pilot.py",
-    "codex-cli-visible-attach-acceptance": "starter_visible_pilot.py",
-    "codex-cli-visible-driver-plan": "starter_visible_driver.py",
-    "codex-cli-local-driver-plan": "starter_visible_driver.py",
-    "codex-cli-visible-driver-run": "starter_visible_driver.py",
-    "codex-cli-session-probe": "starter_session_runtime.py",
-    "codex-cli-visible-session-proof": "starter_session_runtime.py",
-    "codex-cli-runtime-idle-detector": "starter_session_runtime.py",
-    "codex-cli-local-scheduler-tick": "starter_scheduler.py",
-    "codex-cli-local-scheduler-exec": "starter_scheduler.py",
 }
 
 ADD_PARSER_RE = re.compile(
@@ -71,7 +54,9 @@ def module_limit(module_name: str) -> int:
 def assert_module_size_budgets() -> None:
     module_names = {path.name for path in python_modules()}
     stale_budgets = sorted(set(STARTER_MODULE_LIMITS) - module_names)
-    require(not stale_budgets, f"size budgets reference missing modules: {stale_budgets}")
+    require(
+        not stale_budgets, f"size budgets reference missing modules: {stale_budgets}"
+    )
 
     for path in python_modules():
         count = line_count(path)

@@ -28,10 +28,196 @@ for custom or unattended operation. Enabled custom profiles declare:
 - one or more renderer bindings;
 - zero or more required, optional, or disabled extension sink bindings.
 
-Use a host Automation only when the report must run unattended on an RRULE.
-The Automation schedule and project profile must agree; ordinary in-session
-generation does not need an Automation. External delivery still requires an
-explicit sink binding and its independent runtime authority/readback checks.
+For unattended reports, keep the existing general-purpose host wakeup and
+configure the optional calendar in the `periodic_report` subscription. The
+capability checks calendar boundaries when that host wakes; it does not create
+a separate report Automation or promise delivery at an exact wall-clock time.
+External delivery still requires an explicit sink binding and its independent
+runtime authority/readback checks.
+
+### Optional daily or weekly calendar
+
+In Personal Workspace, open **Settings → Capability Center**. Choose **Device
+defaults** or **One Goal** and select the target Goal, then choose **Periodic
+reports**. Enable the subscription, choose its profile and Goal
+Channel route, then turn on **Calendar reports**. Choose daily or weekly,
+the weekday for weekly reports, a local time, and an optional start date. The existing subscription
+timezone also owns the calendar timezone. Preview and apply use the same
+revision-checked configuration API as other capability settings.
+
+The corresponding subscription configuration is:
+
+```json
+{
+  "enabled": true,
+  "profile_preset": "weekly-progress",
+  "route_ref": "report-channel",
+  "timezone": "Asia/Shanghai",
+  "schedule": {
+    "schema_version": "periodic_report_schedule_v0",
+    "schedule_id": "weekly-report",
+    "rrule": "FREQ=WEEKLY;BYDAY=FR;BYHOUR=18;BYMINUTE=0",
+    "timezone": "Asia/Shanghai"
+  }
+}
+```
+
+The local evaluator accepts one daily or weekly occurrence, a real IANA
+timezone, and one weekday for weekly schedules. Unsupported recurrence fields
+and mismatched timezones are rejected before configuration is applied. A
+spring-forward time that does not exist is skipped; a repeated fall-back time
+occurs once, at its first offset.
+
+`schedule.start_date`, when present, is a real ISO `YYYY-MM-DD` date in the
+schedule's timezone. It is the earliest permitted **report due date**. Before
+the first matching occurrence, admission returns `not_due` and its next eligible
+deadline without reserving a report window or invoking generation. A weekly
+schedule starts on the first matching weekday on or after that date; nonexistent
+DST occurrences retain the skip rule above. The first report still covers the
+complete preceding calendar interval, including time before the start date.
+Omitting the field preserves the existing latest-completed-interval behavior.
+Clearing the date in the form removes only this bound; changing the frequency,
+time or timezone preserves it. Preview/apply and effective subscription revisions
+include the date.
+
+A future start-date edit does not delete an already admitted window, generation,
+unknown delivery or publication receipt. Prepared work with a changed
+subscription remains explicitly unavailable under its original identity;
+unprepared work is retained until a new window can be admitted. Clock rollback
+does not turn an already admitted window into a new report.
+
+Turning off **Calendar reports** submits `schedule: null`. The stored
+subscription then has no calendar and retains existing stage-boundary behavior.
+A Goal override is a complete configuration: clearing its calendar does not
+silently inherit the machine calendar. **Restore machine defaults** removes
+the whole Goal override. Disabling the subscription prevents automatic
+generation and delivery, including when a calendar remains saved.
+Stopped, paused and archived Goals likewise have no active standing delivery
+subscription; an already-admitted calendar cannot reactivate their work.
+
+The first eligible wake freezes the latest completed calendar interval. An
+unfinished interval remains unchanged across restarts and later wakeups; after
+its verified delivery, missed intervals coalesce to the latest completed one.
+The journal records admission and references the existing publication cursor;
+it is not another source of report progress. A generated report or a delivery
+Todo does not acknowledge publication. Only the exact covered trigger in a
+verified publication cursor does so.
+
+Registration reordering retains the frozen reporter. A subscription edit can
+supersede an unprepared window: admission archives the predecessor before
+replacing it, under the same lock used by editorial preparation. Restarting
+between those writes repeats the replacement safely; it does not record a
+publication. The replacement uses the current subscription and elected reporter.
+Admission resolves registration, lifecycle and subscription again under its
+journal lock; a previously constructed hook is not current authority.
+
+Once any editorial or generation artifact exists, a subscription change or
+reporter removal produces an explicit unavailable state and preserves the old
+window. Restoring the reporter and matching subscription resumes it. Reporter
+removal alone also preserves an unprepared window until the subscription is
+updated or the reporter restored. The runtime never silently retargets prepared
+work. Invalid journal or conflicting predecessor contents fail closed rather
+than starting a second report.
+
+Explicit requests retain first priority, followed by validated stage reports,
+then automatic calendar work. A calendar waiting for authored text cannot hide
+an existing request or stage intent. A corrupt calendar fails its own hook and
+does not suppress other valid report intents; when none remain, the consumer
+surfaces the calendar error rather than claiming an empty healthy queue.
+
+Calendar source coverage currently includes readable facts for the reporting
+Agent, with completed facts restricted to the frozen interval. Reports must
+disclose this partial coverage; no readable completion is not proof of no work,
+and a Goal calendar does not imply exhaustive history for all its Agents.
+
+### Report modes: weekly digest and automatic update
+
+The product has two report modes under one capability; they are not mutually
+exclusive switches and they do not create two delivery pipelines:
+
+- A **cadence digest** is retrospective. `cadence_due` is only the eligibility
+  signal. The run must cover the latest completed interval as a half-open
+  window, `[period_window.start_at, period_window.end_at)`, and the end of that
+  window must not be later than `generated_at`. Restarting or a late wake may
+  coalesce missed calendar boundaries, but it never turns an in-progress
+  interval into a report.
+- An **automatic update** is event-driven. Material blockers, recoveries,
+  decisions, validated outcomes, and bounded milestones map to
+  `exception_update` or `milestone_update` (and an explicit request maps to
+  `manual_update`). Its window is the bounded evidence context for that event,
+  not an implied week, and it may bypass the normal cooldown only where the
+  trigger policy allows it.
+
+Both modes use the same trigger decision, generation bundle, publication
+candidate, sink receipts, and publication cursor. If a due calendar boundary
+and a material event are observed together, the trigger decision coalesces them
+into one idempotent run and the higher-priority event selects the report kind;
+it does not emit a second weekly message. A profile may enable either mode or
+both by listing the corresponding trigger kinds in `enabled_kinds`. The
+recipient may still choose a single channel or audience, but that is a routing
+choice rather than a second source of report state.
+
+Late-arriving facts after a cadence window has been published belong to the
+next eligible event/update (or an explicitly labelled correction), and must not
+silently rewrite the already verified publication cursor. This keeps a weekly
+report useful as a stable look-back while automatic updates remain timely.
+
+### Composition with Todo continuation
+
+The revision-guarded `loopx handoff prepare/inspect/adopt` flow transfers a
+canonical Todo between execution sessions or registered Agents. It does not
+transfer a report subscription, a prepared calendar window, a publication
+cursor, or a manager request's return audience. Successful Todo adoption is
+not evidence that a report was delivered.
+
+A manager forwarding new context should keep using the manager inbox and let
+the receiving Agent decide whether to revise its plan. It must not invoke
+Todo ownership transfer merely to deliver a message. When a real worker
+replacement is requested, reuse the existing continuation note (summary,
+attempts, next steps, decisions, source references) and revision-guarded
+transfer authority rather than introducing another task store.
+
+A same-Agent session replacement can resume the frozen calendar window and
+its delivery artifacts. A cross-Agent replacement cannot currently adopt a
+prepared calendar window: its original reporter remains part of the window
+identity. Such a replacement stays explicitly unavailable until the original
+reporter is restored; transferring its delivery Todo alone does not resolve
+this boundary. Supporting that case requires a separately reviewed migration
+that binds the old window, subscription revision, artifact identity and
+verified sink receipts. It must reconcile partial sends before changing the
+reporter and preserve the original manager request and return audience.
+
+Any future migration should appear through the existing frontend and Lark
+request tracking, with the same receipt and evidence references exposed by
+the CLI. Neither UI may turn a successful ownership claim into a completion
+badge. This paragraph describes the integration boundary, not a shipped
+cross-Agent report migration.
+
+### Host handoff boundary
+
+`quota should-run` exposes the capability-owned pending intent before normal
+host work. `turn plan` and `turn run-once` represent it as
+`capability_action_required`, with no host invocation or host transaction. The
+CLI includes a command/argv handoff bound to the invoked registry and runtime.
+The command is part of the signed action projection and cannot be replaced by
+an older replan command during envelope compaction.
+
+`turn plan` and `turn run-once` without `--execute` inspect already-admitted
+intents without dispatching mutating inbox/calendar hooks. They do not reserve
+a new due window. An executing wake (`quota should-run` or
+`turn run-once --execute`) admits it and recomputes the live decision before
+host work. When that preflight writes private state, its plan reports
+`effects.state_written: true` and `boundary.read_only: false`; admission is not
+generation, delivery, or quota spend.
+
+This is a capability adapter handoff, not a completed report or a user approval
+gate. Even `turn run-once --execute` does not execute this command as a shell
+or pretend that it ran a host turn. An agent-managed wake can consume it through
+the existing capability CLI. The consumer first prepares an editorial request;
+the reasoning agent authors the required response, then consumes again to
+freeze a generation and queue the existing delivery Todo. A fully unattended
+managed Turn runner still needs an adapter for that editorial handoff; the
+calendar setting alone does not supply one.
 
 `periodic_report_activation_v0` is the effect-free inspection receipt. It
 records whether generation is allowed, the normalized profile digest, and the
@@ -66,14 +252,70 @@ artifact/document digest, or mention markup authored into report content,
 title, or footer fails closed before send. This keeps relevance in the core
 contract and provider identity on the extension side.
 
+The shipped execution path is `loopx periodic-report deliver-goal-channel`.
+Its delivery intent must contain exactly two ordered HTTPS announcements: the
+hosted report entry, then the Lark document entry. They are sent as two
+independently idempotent messages and each one must pass exact readback. Before
+each write, the provider scans the complete Goal Channel history from the frozen
+generation time and reuses an exact card, chat, and Bot-sender match. An incomplete
+history read fails closed; the provider's stable one-hour idempotency key covers
+the remaining concurrent-send race. That provider key is versioned and bound to
+the final announcement kind, title, body, and footer, so a renderer change after
+an interrupted send cannot return an older, semantically different card under
+the new retry. The command does not accept a chat, profile, App identity, or
+sender override. Its route authority has two explicit, non-interchangeable
+forms. When the Goal has a durable Goal Channel binding, that binding's
+`target_ref` must match the effective periodic-report subscription. When no
+Goal Channel binding exists, an enabled effective `periodic_report`
+subscription with an explicit `route_ref` is the independent standing
+authority, and the named target registry entry supplies the project-Bot route.
+This unbound path constructs only an adapter-local resolved route; it neither
+creates a durable Goal Channel binding nor authorizes `operation.execute` or
+another Goal Channel producer. Both forms require `mode=project_bot`, Bot
+sender identity, a non-default profile, exact Bot App id and display name, and
+an enabled Lark channel.
+Before sending, it live-verifies that the bound profile authenticates as the
+same Bot App and can reach the same chat. After sending, it reads back the
+exact interactive card from that chat and requires the provider-native message
+sender to be an `app` whose id equals the bound Bot App id. Revalidating the
+profile alone is not sender proof.
+Missing route authority, local-user mode, identity drift, or incomplete
+readback fail closed; no environment-default or user-identity fallback exists.
+
+路由授权只有两种显式且不可混用的来源：若 Goal 已存在持久化 Goal Channel
+binding，其 `target_ref` 必须与当前生效的周期报告订阅一致；若不存在 binding，
+则必须由已启用且显式配置 `route_ref` 的 `periodic_report` 订阅提供独立的持续授权，
+并从具名 target registry 解析 project Bot 路由。后一条路径只生成适配器内存中的
+resolved route，不会写入 Goal Channel binding，也不能授权 `operation.execute` 或
+其他 Goal Channel producer。缺少上述任一授权、使用本地用户身份、身份漂移或
+读回不完整时都必须在写入前关闭失败；环境变量默认路由和用户身份都不能兜底。
+
+The governed pending-intent consumer persists the normalized generation bundle
+and writes one runnable, agent-owned delivery successor. The current effective
+`periodic_report` subscription is re-read before consumption; `enabled: true`
+with an explicit `route_ref` is the standing authority for this automatic
+stage-boundary or configured calendar delivery. Its Goal, source, effective revision, and route are
+frozen into `periodic_report_delivery_authority_v0` and must still match before
+each external message write. Disabling the subscription or changing its effective
+revision/route suppresses the queued action even when a separate explicit Goal
+Channel binding still exists.
+The successor remains bound to the frozen generation digest, current Goal,
+required provider capabilities, configured Goal Channel, project Bot identity,
+and exact readback. This makes the external action visible to quota without a
+second per-report approval while still failing closed on route or identity
+drift.
+
 `periodic_report_project_progress_projection_v0` is the built-in,
 domain-neutral source input. It groups typed project facts into progress,
 capability evolution, risks, next actions, and supporting evidence, with no
-more than eight primary audience items. Issue Fix has no special standing in
-either schema. It may register a peer source adapter under the same contract as
-release, research, operations, or another domain. OpenViking is likewise an
-optional archive/query provider behind a sink extension; it does not own
-trigger, selection, rendering, or delivery.
+more than eight primary audience items. The snapshot covers the whole Goal:
+facts produced by any Agent lane are selectable, the requesting `agent_id`
+ranks that Agent's own outcomes and next action ahead of a peer lane's, so the
+audience-item cap cannot evict the reporter's own progress, and a row no Agent
+claimed stays out because it has no producer. Issue Fix has no special standing in either schema. It may register a
+peer source adapter under the same contract as release, research, operations, or
+another domain. OpenViking is likewise an optional archive/query provider behind
+a sink extension; it does not own trigger, selection, rendering, or delivery.
 
 `periodic_report_v0` is the LoopX control contract for one bounded report run.
 It binds a period window and a profile to typed source snapshots, one rendered
@@ -119,6 +361,45 @@ local report generation independent from provider availability:
   generation and readiness receipts. A sent sink is accepted only with an
   idempotency key, compact receipt reference, and verified exact readback.
 
+## Personal Workspace publication projection
+
+`periodic_report_workspace_projection_v0` is the built-in, read-only
+`milestone_report` view model for the Personal Workspace. It is frozen from the
+same typed document and progress facts as the generated report; the browser
+does not parse rendered Markdown or infer titles from fingerprints. Its
+interaction semantics are `attention_kind=progress`, `interaction=inform`,
+`delivery=surface`, and `writable=false`. Compact counts distinguish facts
+added since the preceding verified publication from facts whose semantic
+fingerprint changed. "Already published" is a Goal-level property: every cursor
+file the Goal recorded contributes its published fingerprints, so a fact another
+lane delivered is not announced again by this lane, including by a lane that has
+never published. Each lane's own baseline still decides what counts as changed.
+
+Generation alone does not expose this projection. The publication candidate
+binds its exact SHA-256, and the Goal Channel sink may advance that binding into the
+publication cursor only after delivery readback succeeds. The compact
+`periodic_report_workspace_index_v0` hot path contains identity, delivery time,
+predecessor lineage, and an exact content-addressed detail reference, but no
+report prose. A request that explicitly supplies `limit` or `offset` opts into
+the bounded window response; this keeps an old strict v0 reader compatible with
+a newer service, while a new reader accepts both the legacy and windowed v0
+shapes during staggered upgrades. The window returns the newest 100 items by
+default, accepts `limit` in 0..200 and `offset` in 0..10000, and reports
+`returned_count`, `total_count`, and `truncated`. `count` means the number of
+items returned in this window. Items sort by `delivered_at` newest-first using
+chronological timestamp comparison, then by cursor path descending for a stable
+tie-break. The 10000 offset cap makes this a finite browsing window, not an
+unbounded historical traversal. The full projection is a loopback-only cold read and must match
+the current publication cursor. Approval-pending, generation-only, stale, or
+digest-mismatched projections therefore fail closed instead of appearing as
+published.
+
+The Personal Workspace projection does not generate, approve, publish, acknowledge, or
+edit a report. The periodic-report capability remains the only owner of report
+trigger, document, delivery, and publication-cursor state. This is a bounded
+implementation of the intelligent presentation RFC for milestone reports, not
+the generic cross-capability compiler described by that RFC.
+
 The dependency policy is `required`, `optional`, or `disabled`. Required sinks
 block formal delivery when unavailable. Optional sinks degrade without
 invalidating the generation receipt. Disabled sinks are skipped. Provider
@@ -159,8 +440,9 @@ candidate facts. The built-in kinds are:
   and a successor is established or the goal is terminal;
 - `primary_goal_outcome`: the primary delivery outcome is validated and has a
   durable writeback;
-- `bounded_segment_milestone`: a named, bounded work segment completed or
-  entered replan and was durably written back, even when open todos remain;
+- `bounded_segment_milestone`: an evidence-linked material checkpoint closed
+  the current vision and the resulting successor frontier or terminal Goal was
+  durably settled, even when unrelated Todos remain open;
 - `material_decision`: an approved, rejected, or cancelled decision changed
   the execution route and was durably recorded;
 - `material_blocker`: a new or escalated P0 blocker stops the primary path;
@@ -181,20 +463,184 @@ the selected and coalesced ids, every suppression reason, cooldown state, and
 the report kind (`cadence_digest`, `milestone_update`, `exception_update`, or
 `manual_update`).
 
-`bounded_segment_milestone` accepts only `segment_ref`, `transition`,
-`delivered_count`, `remaining_todo_count`, and `durable_writeback` facts.
-`segment_ref` and `transition` are required. Counts are non-negative and
-default to zero when omitted. A `segment_completed` or `replan_entered`
-transition is material only after `durable_writeback=true`;
-`vision_checkpoint` remains non-material. Remaining todos do not suppress an
-otherwise material segment milestone. The trigger has priority 40, between
-`material_decision` and `cadence_due`, maps to `milestone_update`, and obeys
-the normal profile cooldown.
+`bounded_segment_milestone` is derived from the same goal-vision and frontier
+facts that drive autonomous replan, but it is a stricter success-path result.
+It requires a satisfied evidence-linked material outcome checkpoint, a closed
+current vision, durable writeback, and one of these continuation settlements:
+
+- the Goal is terminal; or
+- an active Goal emitted the existing `vision_successor_required` transition,
+  the matching replan semantic delta was accepted, and the successor vision
+  plus its owned frontier were durably established.
+
+The producer deduplicates by the closed-vision revision and settled continuation
+identity. Native Vision-successor ACKs use the matching accepted
+`semantic_delta.obligation_id`; they do not require a monitor's optional
+`frontier_identity`. Existing explicit frontier identities retain their receipt
+identity. The native ACK and successor Vision must occupy the same persisted
+run; a separate unacknowledged Vision edit cannot reuse that acceptance even
+when both writes share a timestamp.
+Only the exact refresh that durably wrote the selected accepted successor
+Vision and ACK may emit its successor milestone. A later Todo completion or
+ordinary refresh cannot first report that older boundary; terminal settlement
+may still follow a later Todo completion while the closed Vision remains current.
+Exact-source retry uses the run-index append prefix through that refresh, so
+a later Vision edit does not displace the original successor. Legacy
+unpromoted Todo state does not yet provide historical frontier readback, so
+retry after later Todo mutation remains dependent on current frontier facts.
+Ordinary Todo completion, Todo-count thresholds, elapsed time, setup work, and
+generic replan causes such as blockers, succession gaps, long Todo chains, or
+monitor exhaustion are evidence or control-plane context only; they never
+prove stage completion. No Todo declaration or second Stage lifecycle is
+introduced. Remaining unrelated Todos do not suppress an otherwise valid
+closed-vision milestone. The trigger has priority 40, maps to
+`milestone_update`, and obeys the normal profile cooldown.
 
 An eligible decision may be embedded as `trigger_receipt` in a
 `periodic_report_run_request_v0`. Its `report_key` and `report_kind` then
 participate in run identity, so a milestone update and a scheduled digest over
 the same evidence window cannot collide.
+
+### Agent-semantic Goal Channel requests
+
+An Agent that has read and semantically interpreted one Goal Channel inbox item
+may explicitly invoke the provider-neutral action:
+
+```text
+loopx periodic-report request \
+  --goal-id <goal-id> \
+  --agent-id <agent-id> \
+  --source-ref <opaque-provider-message-id> \
+  --execute
+```
+
+One complete active source adapter is selected automatically. If several
+provider adapters are active, a new request must include
+`--source-adapter-id <adapter-id>`. Replay of an already journaled request does
+not require the selector when exactly one journal entry matches the source
+reference; a source reference already owned by multiple providers requires an
+explicit selector. The adapter id participates in request identity together
+with Goal, Agent, and the provider-local source reference, so equal opaque ids
+from different providers remain independent. Settlement reads the owner
+`adapter_id` from that journal and resolves only the matching discovered
+settler; discovery order cannot change ownership, and another provider is
+never used as a fallback.
+
+This action is the report-intent decision. Neither LoopX Core nor the provider
+adapter classifies message strings, searches for report keywords, or scans the
+inbox for candidate requests. The provider adapter receives the exact opaque
+source reference selected by the Agent and verifies only source existence,
+user authorship, provider-native addressing, the registered Goal/Agent
+connection, the current provider target, and inbox identity. It returns a
+content-free `periodic_report_source_binding_receipt_v0`; raw message content
+never enters the capability intent or public output.
+
+An executed request writes one replay-safe local-private
+`periodic_report_request_journal_entry_v0`. The pending-intent projection reads
+that typed journal and existing post-writeback intents only; it never calls a
+provider reader. The request becomes an authorized `manual` trigger and then
+reuses the existing editorial, generation bundle, Workspace projection,
+publication candidate, and delivery-Todo pipeline. Repeating the same
+Goal/Agent/adapter/source action returns the existing request and cannot create
+another journal entry.
+
+Source binding and settlement ports are dynamically discovered from enabled,
+doctor-ready extension manifests through a `capability_action`
+`[[hook_adapters]]` declaration. Generic discovery and the periodic-report
+composition import no Lark implementation. The bundled Lark adapter is
+therefore optional provider code, not a quota or decision-kernel branch.
+
+The adapter ACKs the selected inbox item only after the `delivery_ready`
+receipt and delivery Todo are durable. If ACK fails or the adapter is
+temporarily unavailable, the typed request stays pending. A later
+`consume-pending` call loads the durable receipt, retries settlement only, and
+does not regenerate artifacts or add another delivery Todo. Exact ACK replay
+is idempotent. A provider may instead return a typed `terminal_failure` when
+the bound source is gone or its binding/receipt identity has drifted. LoopX
+then records `settlement_failed`, leaves the provider source un-ACKed, and
+removes that request from automatic retry projection. After repairing the
+provider binding or retention problem, the operator must obtain a new provider
+event and issue a new typed request with that event's opaque source reference.
+
+### Post-writeback hook boundary
+
+The optional automatic path uses the provider-neutral TypeScript
+`post_writeback` capability-hook contract. The CLI composition root registers
+`periodic_report.runtime_trigger` only when the Goal's local control-plane
+configuration explicitly enables a periodic-report profile. Core dispatches
+only after the primary `refresh-state` or `todo complete` durable writeback and exact settlement
+readback have succeeded with complete Goal, Agent, Turn, and effect identity.
+Todo-bound settlements carry a non-empty Todo id; Todo-less autonomous replans
+carry an explicit `null` Todo id rather than inventing a Todo identity. The
+best-effort rollout-event log is not dispatch authority.
+
+New Todo completions checkpoint a TypeScript-owned `completion_receipt_id` in
+the primary transaction. Ordinary completion and same-Turn terminal closeout
+have distinct ids even when their timestamps are equal. Hook dispatch and
+composition recovery use that committed id, so a later timestamp change cannot
+create a duplicate intent. Existing completions without the field retain their
+original timestamp-derived identity; replay does not migrate or rewrite them.
+Canonical receipt replay also recovers the optional hook after primary commit
+if its sidecar was not checkpointed. These ids grant no additional authority.
+
+Direct `turn run-once` execution and replay drain the same optional hook after
+returning from the primary Turn driver. Canonical refresh runs retain the
+source authority, store identity, provider revision and cursor of the Todo
+snapshot consumed by planning. The TypeScript source reader reconstructs that
+retained transaction; the report adapter uses run history only through the
+original refresh, including when later writes share its timestamp. The optional
+`todo_source` metadata is retained whether reporting is enabled or disabled;
+it activates no hook and adds no caller input requirement. Disabled reporting
+performs no optional settlement/source read or hook-sidecar write. Terminal
+closeout has its own operation and completion receipt, bound to the same
+Goal, Agent, Todo, Turn and original store lineage. An earlier refresh cannot
+inherit a later terminal frontier. Large historical snapshots use the existing
+private, digest-checked runtime transport with its unchanged 64 MiB cap; an
+oversized source fails closed rather than returning partial rows.
+
+A terminal receipt requires a closed current Vision. A newer Vision from
+the same Agent supersedes an earlier closed stage; completing its Todo cannot
+settle that earlier stage again. File and SQLite public CLI qualification covers
+this rejection, enabled/off Turn behavior, optional-source failure, later Todo
+mutation and exact replay without repeating host execution, refresh or quota
+spend. The existing ordered CLI completion/refresh journey also qualifies a
+genuine closed-current-Vision milestone and pending-intent readback.
+Exact refresh recovery after interrupted hook dispatch and a later open Todo
+recovers that milestone from the original source without another refresh or
+quota spend. Direct Turn milestone production remains partial: its host contract
+permits Vision changes
+for replanning, and native accepted-successor production requires the separate
+producer correction. These source tests do not qualify that positive journey.
+
+PostgreSQL qualifies the shared historical-source read against an isolated real
+database; its full Turn journey is separate. Anchored refresh and direct Turn
+recovery reject missing retained history. Direct Turn runs backed by legacy
+Markdown or without an anchor report `source_projection_failed`; they never
+substitute the latest Goal state. The existing legacy CLI projection remains a
+compatibility path, not evidence of qualified historical recovery. The
+refresh anchor identifies its planning snapshot, not an atomic transaction
+spanning refresh history and Todo storage. Frontend/Lark integration and those
+unqualified source paths remain separate delivery boundaries.
+
+The hook input contains only the committed receipt identity, stable state
+revision, and derived `periodic_report_stage_completion_receipt_v0`. Its result
+is an idempotent `periodic_report.trigger_evaluation` intent with an empty write
+scope. Core validates registration, input, result, and the sidecar receipt in
+TypeScript, then stores the bounded receipt separately from the primary
+transaction. Terminal replay skips provider invocation. A transient provider
+or result-contract failure persists a `retryable_failure` receipt with a stable
+dispatch reference and monotonic attempt count; exact replay may atomically
+advance that receipt to `intent_recorded` or `not_applicable`. Conflicts and
+optional hook failures remain isolated and cannot roll back the primary
+writeback or alter quota-spend eligibility. A Python-to-TypeScript runtime
+failure additionally projects a bounded typed phase, error kind, and diagnostic
+code; it never includes raw provider or private state.
+
+Recorded trigger intent means neither report generation nor publication. A
+later governed executor must evaluate the intent. Composition, rendering, and
+content checks remain separate from external delivery; an enabled effective
+subscription supplies standing delivery authority, while the extension and
+exact sink readback retain effect authority.
 
 ## Request and identity
 

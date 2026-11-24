@@ -1,987 +1,504 @@
 #!/usr/bin/env node
-// Browser-level smoke for the read-only goal channel frontstage route.
-
+// Exercise replacement surfaces and old bookmarks through the real browser router.
+import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdir, readFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { createRequire } from "node:module";
-import { existsSync, readFileSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, extname } from "node:path";
 import { fileURLToPath } from "node:url";
-
-const require = createRequire(import.meta.url);
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const dashboardDir = resolve(repoRoot, "apps/presentation/dashboard");
-const fixtureName = "status.frontstage.browser-smoke.json";
-const fixturePath = resolve(dashboardDir, "public", fixtureName);
-const privateTrapFixtureName = "status.frontstage.private-trap.json";
-const privateTrapFixturePath = resolve(dashboardDir, "public", privateTrapFixtureName);
-const privateTrapSourcePath = resolve(repoRoot, "examples/fixtures/frontstage-private-status-trap.public.json");
-const showcaseCatalogPath = resolve(repoRoot, "docs/showcases/showcase-catalog.json");
-const visualOutputDir = resolve(repoRoot, "output/playwright/dashboard-frontstage-visual-acceptance");
-const port = Number(process.env.LOOPX_DASHBOARD_FRONTSTAGE_SMOKE_PORT ?? "5197");
-const showcaseCatalog = JSON.parse(readFileSync(showcaseCatalogPath, "utf8"));
-const publicShowcaseCaseCount = showcaseCatalog.cases.filter((item) => item.frontend_card).length;
-const allShowcaseCasesText = `Showing ${publicShowcaseCaseCount} of ${publicShowcaseCaseCount} public-safe cases`;
-const selfIterationFilterText = `Showing 1 of ${publicShowcaseCaseCount} public-safe cases`;
-const fakePrivateTrapMarkers = [
-  "GH_FAKE_PRIVATE_STATUS_ALPHA",
-  "GH_FAKE_PRIVATE_PLAN_SUMMARY_ALPHA",
-  "GH_FAKE_LIVE_STATUS_FEED_BETA",
-  "GH_FAKE_PRIVATE_REGISTRY_SUMMARY_GAMMA",
-  "GH_FAKE_PRIVATE_TODO_GAMMA",
-  "GH_FAKE_PRIVATE_EVENT_DELTA",
-  "GH_FAKE_PRIVATE_LEDGER_SOURCE_EPSILON",
-  "GH_FAKE_PRIVATE_SPEND_POLICY_ZETA",
-  "GH_FAKE_PRIVATE_ARTIFACT_ETA",
-  "GH_FAKE_PRIVATE_RUNTIME_ROOT_THETA",
-  "GH_FAKE_PRIVATE_ARTIFACT_PATH_IOTA",
-];
-
-function projectionFor(goalId, displayName, claimedBy, todoTitle) {
-  return {
-    schema_version: "goal_channel_projection_v0",
-    mode: "read_only",
-    goal_id: goalId,
-    display_name: displayName,
-    generated_at: "2026-06-20T09:00:00Z",
-    latest_status: "live_fixture_loaded",
-    waiting_on: "codex",
-    next_action: `${displayName} live next action for FAKE_PRIVATE_STATUS_ALPHA`,
-    source_refs: {
-      status_generated_at: "2026-06-20T09:00:00Z",
-      event_ledger_source: "browser-smoke-fixture",
-      private_marker: "FAKE_INTERNAL_TABLE_BETA",
-    },
-    decision_frame: {
-      user_action_required: false,
-      agent_action_required: true,
-      quiet_noop_allowed: false,
-    },
-    quota: {
-      allowed_slots: 10,
-      spend_policy: "spend after validated live writeback",
-      spent_slots: 3,
-      state: "eligible",
-    },
-    user_todos: [
-      {
-        todo_id: `${goalId}_user_gate`,
-        priority: "P0",
-        status: "open",
-        task_class: "user_gate",
-        title: `Review live handoff gate before delivery for ${displayName}.`,
-      },
-      {
-        todo_id: `${goalId}_user_evidence`,
-        priority: "P1",
-        status: "open",
-        task_class: "evidence_review",
-        title: `Confirm external evidence packet for ${displayName}.`,
-      },
-    ],
-    agent_todos: [
-      {
-        todo_id: `${goalId}_todo`,
-        priority: "P1",
-        status: "open",
-        claimed_by: claimedBy,
-        action_kind: "frontstage_render",
-        task_class: "advancement_task",
-        title: `${todoTitle} FAKE_PRIVATE_TODO_GAMMA`,
-      },
-      {
-        todo_id: `${goalId}_todo_filter`,
-        priority: "P2",
-        status: "open",
-        claimed_by: claimedBy,
-        action_kind: "frontstage_filter",
-        task_class: "productization_task",
-        title: `Document filtered ops route for ${displayName}.`,
-      },
-    ],
-    open_gates: [
-      {
-        gate_id: `${goalId}_gate`,
-        kind: "user_channel",
-        status: "clear",
-        blocks: [],
-      },
-    ],
-    active_leases: [
-      {
-        owner_agent: claimedBy,
-        status: "soft_claim",
-        todo_id: `${goalId}_todo`,
-      },
-    ],
-    artifacts: [
-      {
-        kind: "fixture",
-        label: "browser smoke statusUrl",
-        path: "docs/showcases/showcase-catalog.json",
-      },
-    ],
-    recent_events: [
-      {
-        generated_at: "2026-06-20T09:00:00Z",
-        classification: "live_fixture_event",
-        summary: `${displayName} rendered from statusUrl with FAKE_PRIVATE_EVENT_DELTA`,
-      },
-    ],
-    source_warnings: [
-      {
-        kind: "browser_smoke_public_fixture",
-        message: "fixture contains compact public-safe fields only",
-      },
-    ],
-    truth_contract: {
-      event_ledger_is_source_of_truth: true,
-      projection_is_writable: false,
-      recompute_rule: "reload statusUrl and parse attention_queue.items[].goal_channel_projection",
-      write_authority: "none",
-    },
-  };
-}
-
-const statusFixture = {
-  ok: true,
-  registry: "./fixtures/registry.global.json",
-  runtime_root: "./fixtures/runtime",
-  goal_count: 2,
-  run_count: 2,
-  status_contract: {
-    schema_version: 2,
-    minimum_dashboard_schema_version: 2,
-    producer: "loopx status",
-    reload_hint: "scripts/macos-dashboard-launchagent.sh restart",
-  },
-  local_dashboard_api: {
-    source: "serve-status",
-    reward_dry_run_url: "/reward/dry-run",
-    reward_append_url: null,
-    reward_write_enabled: false,
-    configure_goal_dry_run_url: "/control-plane/configure-goal/dry-run",
-    configure_goal_apply_url: null,
-    control_plane_write_enabled: false,
-  },
-  contract: {
-    ok: true,
-    summary: { errors: 0, warnings: 0, checks: 1 },
-    errors: [],
-    warnings: [],
-    checks: ["public-safe frontstage browser fixture"],
-  },
-  attention_queue: {
-    available: true,
-    item_count: 2,
-    needs_user_or_controller: 0,
-    needs_controller: 0,
-    needs_codex: 2,
-    watching_external_evidence: 0,
-    autonomous_backlog_candidates: null,
-    items: [
-      {
-        goal_id: "live-goal-a",
-        status: "frontstage_live_fixture",
-        waiting_on: "codex",
-        severity: "action",
-        recommended_action: "render live goal A",
-        source: "fixture",
-        goal_channel_projection: projectionFor(
-          "live-goal-a",
-          "Live Goal Channel",
-          "codex-side-bypass",
-          "Render live statusUrl channel projection.",
-        ),
-      },
-      {
-        goal_id: "live-goal-b",
-        status: "frontstage_live_fixture",
-        waiting_on: "codex",
-        severity: "watch",
-        recommended_action: "render live goal B",
-        source: "fixture",
-        goal_channel_projection: projectionFor(
-          "live-goal-b",
-          "Second Live Channel",
-          "codex-main-control",
-          "Keep second live channel selectable.",
-        ),
-      },
-    ],
-  },
-};
-
-function loadPlaywright() {
-  const candidates = [
-    process.env.LOOPX_PLAYWRIGHT_PACKAGE,
-    resolve(homedir(), ".cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright"),
-  ].filter(Boolean);
-
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const dashboard = resolve(root, "apps/presentation/dashboard");
+const require = createRequire(resolve(dashboard, "package.json"));
+const { chromium } = require("playwright");
+const exportSite = process.env.LOOPX_PUBLIC_SITE_DIR ?? "/tmp/loopx-frontstage-share-bundle-smoke/site";
+const output = resolve(root, "output/playwright/home-navigation");
+await mkdir(output, { recursive: true });
+const child = spawn(process.execPath, [resolve(dashboard, "node_modules/vite/bin/vite.js"), "--host", "127.0.0.1", "--port", "5197", "--strictPort"], { cwd: dashboard, stdio: "pipe" });
+let logs = "";
+child.stdout.on("data", (v) => { logs += v; });
+child.stderr.on("data", (v) => { logs += v; });
+const staticServer = createServer(async (req, res) => {
+  const path = new URL(req.url, "http://localhost").pathname;
+  if (!path.startsWith("/loopx/")) { res.writeHead(404).end(); return; }
+  const file = resolve(exportSite, path.slice(7) + (path.endsWith("/") ? "index.html" : ""));
+  if (!file.startsWith(resolve(exportSite) + "/")) { res.writeHead(403).end(); return; }
   try {
-    return require("playwright");
-  } catch {
-    // Try explicit or bundled local packages below.
-  }
-
-  for (const candidate of candidates) {
-    if (!candidate || !existsSync(candidate)) {
-      continue;
-    }
-    try {
-      return require(candidate);
-    } catch {
-      // Keep looking.
-    }
-  }
-
-  throw new Error("Playwright package not found; install playwright or set LOOPX_PLAYWRIGHT_PACKAGE");
-}
-
-async function launchBrowser(chromium) {
-  try {
-    return await chromium.launch({ channel: "chrome", headless: true });
-  } catch {
-    return chromium.launch({ headless: true });
-  }
-}
-
-async function waitForDashboard(url) {
-  const deadline = Date.now() + 20_000;
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(url);
-      if (response.ok) {
-        return;
-      }
-      lastError = new Error(`HTTP ${response.status}`);
-    } catch (error) {
-      lastError = error;
-    }
-    await new Promise((resolveTimeout) => setTimeout(resolveTimeout, 250));
-  }
-  throw lastError ?? new Error(`Timed out waiting for ${url}`);
-}
-
-function startDashboardServer() {
-  const viteBin = resolve(dashboardDir, "node_modules/vite/bin/vite.js");
-  if (!existsSync(viteBin)) {
-    throw new Error(`Vite package not installed: ${viteBin}`);
-  }
-  const nodeBin = [
-    process.env.LOOPX_NODE_BIN,
-    "/opt/homebrew/bin/node",
-    "/usr/local/bin/node",
-    process.execPath,
-  ].find((candidate) => candidate && existsSync(candidate));
-  return spawn(nodeBin, [viteBin, "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
-    cwd: dashboardDir,
-    env: {
-      ...process.env,
-      PATH: ["/opt/homebrew/bin", "/usr/local/bin", process.env.PATH].filter(Boolean).join(":"),
-    },
-    stdio: "ignore",
+    const body = await readFile(file);
+    res.setHeader("Content-Type", ({ ".html": "text/html", ".md": "text/plain; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml" })[extname(file)] ?? "application/octet-stream");
+    res.end(body);
+  } catch { res.writeHead(404).end(); }
+});
+await new Promise((done) => staticServer.listen(0, "127.0.0.1", done));
+const publicOrigin = `http://127.0.0.1:${staticServer.address().port}`;
+async function assertAnchorInView(page, id) {
+  await page.waitForFunction((id) => {
+    const section = document.getElementById(id);
+    if (!section) return false;
+    const rect = section.getBoundingClientRect();
+    const top = rect.top;
+    const heading = section.querySelector("h1, h2, h3")?.getBoundingClientRect();
+    // A short final section cannot align at the top. Font reflow can leave a
+    // few pixels below the viewport; require the whole section, not scroll-end
+    // equality, so the assertion matches what the reader actually sees.
+    const finalSection = section.closest("main")?.lastElementChild;
+    const finalSectionVisible = finalSection?.contains(section) && rect.bottom <= innerHeight;
+    const header = document.querySelector(".bm-topbar")?.getBoundingClientRect();
+    const headerBottom = header?.bottom ?? 0;
+    const reveal = section.closest(".reveal-block");
+    // Chromium can leave a few pixels above the viewport after fragment
+    // alignment and font reflow; the heading must still be fully visible.
+    return (!header || Math.abs(header.top) < 2) && top >= -8 && (top < 80 || finalSectionVisible) &&
+      (!heading || (heading.top >= Math.max(0, headerBottom) && heading.bottom < innerHeight)) &&
+      (!reveal || getComputedStyle(reveal).opacity === "1");
+  }, id, { timeout: 4000 }).catch(async (error) => {
+    const viewport = await page.locator(`[id="${id}"]`).evaluate((section) => ({
+      scrollY, top: section.getBoundingClientRect().top,
+      headingTop: section.querySelector("h1, h2, h3")?.getBoundingClientRect().top,
+    }));
+    throw new Error(`Anchor ${id} at ${page.url()}: ${JSON.stringify(viewport)}`, { cause: error });
   });
 }
 
-function formatOverflowOffender(offender) {
-  const id = offender.testid ? `[data-testid="${offender.testid}"]` : offender.tag;
-  return `${id} left=${offender.left} right=${offender.right} width=${offender.width} "${offender.text}"`;
+async function assertTimeMachineJourney(page, lang) {
+  await page.goto(`${publicOrigin}/loopx/?lang=${lang}`);
+  const entry = page.locator('#explore .resource-card[href*="/lab/time-machine/"]');
+  await entry.focus();
+  await Promise.all([
+    page.waitForURL(`${publicOrigin}/loopx/lab/time-machine/${lang === "zh" ? "?lang=zh" : ""}`),
+    entry.press("Enter"),
+  ]);
+  // Anchors come from the three public captures, independently of the UI scene copy.
+  const captures = [
+    ["portfolio", 76, "finding_5b6717a721136e001cd0cd18d38ac167431bbe265445e669bac92c72d990aef2", /13\.84/, /20\.53/],
+    ["graph", 134, "finding_b5860e437b2905fbc0b9db2bbdc3ba567783817eee67e0ecc433bf4e65c00b1a", /32%/],
+    ["ad", 105, "finding_c652328314cf9ac2757f85dfcbdb9907bb719cf1a1e36185926640694663a9f2", /32/],
+  ];
+  for (const [index, [id, count, findingId, ...metrics]] of captures.entries()) {
+    if (index) {
+      await page.locator(".tm-cases button").nth(index).click();
+      await page.waitForURL((url) => url.searchParams.get("case") === id);
+    }
+    const capture = JSON.parse(await readFile(resolve(exportSite, `lab/time-machine/data/${id}.json`), "utf8"));
+    assert.equal(capture.events.length, count);
+    const finding = capture.events.find((row) => row.result_id === findingId);
+    assert.equal(finding?.event_kind, "finding");
+    const choice = page.locator(".tm-choices button:not([disabled])").first();
+    await choice.focus();
+    await choice.press("Enter");
+    await page.locator(".tm-revealed").waitFor();
+    for (const metric of metrics) assert.match(await page.locator(".tm-revealed").innerText(), metric);
+    const title = await page.locator(".tm-revealed h3").innerText();
+    await page.locator(".tm-choices button").nth(1).click();
+    assert.equal(await page.locator(".tm-revealed h3").innerText(), title, "either choice reveals the same historical outcome");
+    await page.getByRole("button", { name: lang === "zh" ? "核对这条发现" : "Inspect this finding", exact: true }).click();
+    await page.locator(".tm-original").waitFor({ state: "visible" });
+    // Inspect queues a focus transfer; finish it before sending the next key.
+    await page.waitForFunction(() => document.querySelector(".tm-original h3") === document.activeElement);
+    assert.equal(await page.locator(".tm-record-body").textContent(), finding.summary, "the outcome opens its original finding");
+    assert.equal(await page.locator(".tm-source").getAttribute("href"), `/loopx/lab/time-machine/data/${id}.json`);
+    const cursor = page.locator("#tm-cursor");
+    assert.equal(await cursor.getAttribute("max"), String(count));
+    await cursor.press("End");
+    await page.waitForFunction((summary) => document.querySelector(".tm-record-body")?.textContent === summary, capture.events.at(-1).summary);
+    assert.equal(await cursor.inputValue(), String(count));
+    await page.locator(".tm-return").click();
+    assert.ok(await page.locator("#tm-question").evaluate((heading) => heading === document.activeElement));
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "Time Machine fits the viewport");
+  }
+  // A real missing HTTP capture must hide outcomes and disable choices; retry
+  // then reads the actual exported bytes through the production verifier.
+  await page.route("**/lab/time-machine/data/portfolio.json", (route) => route.fulfill({ status: 404, body: "Missing capture" }), { times: 1 });
+  await page.reload();
+  await page.locator(".tm-cases button").first().click();
+  await page.locator(".tm-error [role=alert]").waitFor();
+  assert.equal(await page.locator(".tm-revealed").count(), 0);
+  assert.equal(await page.locator(".tm-choices button:disabled").count(), 2);
+  await page.locator(".tm-error button").click();
+  await page.locator(".tm-choices button:not([disabled])").first().click();
+  await page.locator(".tm-revealed").waitFor();
+  assert.match(await page.locator(".tm-revealed").innerText(), /13\.84/);
+  await assertLocalTimeMachineLog(page, lang);
 }
 
-async function assertNoHorizontalOverflow(page, label) {
-  const report = await page.evaluate(() => {
-    const viewportWidth = window.innerWidth;
-    const root = document.documentElement;
-    const body = document.body;
-    const scrollWidth = Math.max(root.scrollWidth, body?.scrollWidth ?? 0);
-    const offenders = [];
-    for (const element of Array.from(document.body.querySelectorAll("*"))) {
-      const style = window.getComputedStyle(element);
-      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
-        continue;
-      }
-      const rect = element.getBoundingClientRect();
-      if (rect.width < 1 || rect.height < 1) {
-        continue;
-      }
-      if (rect.left < -2 || rect.right > viewportWidth + 2) {
-        offenders.push({
-          tag: element.tagName.toLowerCase(),
-          testid: element.getAttribute("data-testid"),
-          left: Math.round(rect.left),
-          right: Math.round(rect.right),
-          width: Math.round(rect.width),
-          text: (element.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 90),
-        });
-      }
-      if (offenders.length >= 8) {
-        break;
-      }
-    }
-    return {
-      viewportWidth,
-      scrollWidth,
-      overflowPx: Math.max(0, scrollWidth - viewportWidth),
-      offenders,
+async function assertLocalTimeMachineLog(page, lang) {
+  const row = (extra = {}) => ({schema_version: "loopx_explore_result_event_v0", goal_id: "public-local-example",
+    event_id: "question", result_id: "question", event_kind: "node", node_kind: "question", status: "open",
+    title: "Synthetic question", summary: "Source text, not a scored result.", recorded_at: "2026-01-01T00:00:00Z", ...extra});
+  const negative = "Original counterevidence <b>literal, not HTML</b>";
+  const records = [row(), row({event_id: "early-negative", result_id: "finding", event_kind: "finding", node_id: "question", status: "refuted",
+    title: "Earlier counterevidence", summary: negative, evidence_refs: ["https://example.invalid/do-not-fetch-local-evidence"], recorded_at: "2026-01-01T04:00:00Z"}),
+    row({event_id: "revision", result_id: "finding", event_kind: "finding", node_id: "question", title: "Later tentative revision", status: "tentative", recorded_at: "2026-01-01T18:00:00Z"}),
+    row({event_id: "backfill", status: "exploring", recorded_at: "2026-01-01T03:00:00Z"}),
+    row({event_id: "unattached", result_id: "unattached", event_kind: "finding", node_id: "missing", title: "Unattached finding", status: "refuted", recorded_at: "unknown"})];
+  const file = (name, rows = records) => ({name, mimeType: "application/x-ndjson", buffer: Buffer.from(rows.map(row => JSON.stringify(row)).join("\n"))});
+  const input = page.locator("#tm-log-file");
+  await page.evaluate(() => {
+    window.__tmLocalAudit = {requests: [], writes: []};
+    const audit = window.__tmLocalAudit;
+    const fetch = window.fetch;
+    window.fetch = function (...args) { audit.requests.push(String(args[0])); return fetch.apply(this, args); };
+    const send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function (...args) { audit.requests.push("xhr"); return send.apply(this, args); };
+    const beacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = (...args) => { audit.requests.push(String(args[0])); return beacon(...args); };
+    const set = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (...args) { audit.writes.push(String(args[0])); return set.apply(this, args); };
+    const open = indexedDB.open.bind(indexedDB);
+    indexedDB.open = (...args) => { audit.writes.push("indexedDB"); return open(...args); };
+  });
+  // The ordinary entry opens the actual browser file chooser, not a command-copy path.
+  const chooser = page.waitForEvent("filechooser");
+  await page.locator("#tm-open-log").focus();
+  await page.locator("#tm-open-log").press("Enter");
+  await (await chooser).setFiles(file("research.jsonl"));
+  await page.locator(".tm-log-reading").waitFor();
+  assert.equal(await page.locator(".tm-log-match strong").textContent(), "5");
+  assert.match(await page.locator(".tm-log-span").textContent(), /00:00.*18:00/);
+  assert.equal(await page.locator(".tm-revealed,.tm-metrics,.tm-source").count(), 0, "local bytes inherit no curated claim");
+  await page.locator(".tm-log-filter-disclosure > summary").click();
+  await page.locator("#tm-log-label").selectOption(JSON.stringify("refuted"));
+  assert.equal(await page.locator(".tm-log-match strong").textContent(), "2");
+  assert.equal(await page.locator(".tm-log-detail .tm-record-body").textContent(), negative);
+  assert.equal(await page.locator(".tm-record-body b").count(), 0);
+  await page.locator(".tm-log-source > summary").click();
+  assert.equal(await page.locator(".tm-log-source a").count(), 0, "external evidence references remain text");
+  await page.locator(".tm-log-source > summary").click();
+  await page.locator("#tm-log-search").fill("absent phrase");
+  assert.equal(await page.locator(".tm-log-reading").count(), 0, "no stale original when filters have no match");
+  await page.locator(".tm-log-match button").click();
+  assert.equal(await page.evaluate(() => document.activeElement.id), "tm-log-search");
+  await page.locator("#tm-log-time").selectOption("unknown");
+  assert.equal(await page.locator(".tm-log-match strong").textContent(), "1");
+  assert.equal(await page.locator(".tm-log-detail h2").textContent(), "Unattached finding");
+  await input.setInputFiles({name: "bad.jsonl", mimeType: "application/x-ndjson", buffer: Buffer.from(`${JSON.stringify(records[0])}\n{broken`)});
+  await page.locator(".tm-log-error [role=alert]").waitFor();
+  assert.match(await page.locator(".tm-log-error [role=alert]").textContent(), /2/);
+  assert.equal(await page.locator(".tm-log-reading").count(), 0);
+  await input.setInputFiles(file("research.jsonl"));
+  await page.locator(".tm-log-reading").waitFor();
+  await input.setInputFiles(file("research.jsonl"));
+  await page.locator(".tm-log-reading").waitFor();
+  await page.evaluate(() => {
+    const read = File.prototype.arrayBuffer;
+    File.prototype.arrayBuffer = function () {
+      if (this.name === "slow.jsonl") return new Promise((resolve, reject) => { window.__tmReleaseSlow = () => read.call(this).then(resolve, reject); });
+      return read.call(this);
     };
   });
-  if (report.overflowPx > 2) {
-    const offenders = report.offenders.map(formatOverflowOffender).join(" | ");
-    throw new Error(`${label} horizontal overflow: viewport=${report.viewportWidth} scroll=${report.scrollWidth} offenders=${offenders || "none"}`);
+  await input.setInputFiles(file("slow.jsonl"));
+  await page.waitForFunction(() => typeof window.__tmReleaseSlow === "function");
+  await input.setInputFiles(file("newer.jsonl", [row({title: "New file only"})]));
+  await page.locator(".tm-log-reading").waitFor();
+  await page.evaluate(() => window.__tmReleaseSlow());
+  assert.equal(await page.locator(".tm-log-detail h2").textContent(), "New file only");
+  const structured = "Input revision: synthetic-v2 Applicability: this fixture only Observation: The new input refutes the earlier route. Interpretation: Outcome: continue\nretained:\n- original scope\nstopped:\n- the failed route";
+  await input.setInputFiles(file("structured.jsonl", [row({event_id: "structured", event_kind: "finding", status: "refuted", summary: structured})]));
+  await page.locator(".tm-log-decision").waitFor();
+  assert.match(await page.locator(".tm-log-decision").textContent(), /original scope/);
+  assert.match(await page.locator(".tm-log-decision").textContent(), /the failed route/);
+  await page.locator(".tm-log-context > summary").click();
+  assert.match(await page.locator(".tm-log-context").textContent(), /this fixture only.*The new input refutes the earlier route\./s);
+  await page.locator(".tm-log-finding > details:not(.tm-log-context) > summary").click();
+  assert.equal(await page.locator(".tm-record-body").textContent(), structured, "structured reading does not replace the complete original text");
+
+  const portfolio = JSON.parse(await readFile(resolve(exportSite, "lab/time-machine/data/portfolio.json"), "utf8"));
+  await input.setInputFiles(file("public-research.jsonl", portfolio.events));
+  await page.locator(".tm-log-decision").waitFor();
+  assert.equal(await page.locator(".tm-log-match strong").textContent(), "37");
+  await page.locator("#tm-log-outcome").selectOption(JSON.stringify("replan"));
+  assert.equal(await page.locator(".tm-log-match strong").textContent(), "29");
+  await page.locator("#tm-log-outcome").selectOption(JSON.stringify("continue"));
+  assert.equal(await page.locator(".tm-log-match strong").textContent(), "8");
+  await page.locator(".tm-log-filter-disclosure > summary").click();
+  await page.locator("#tm-log-search").fill("absent-decision-text");
+  assert.equal(await page.locator(".tm-log-reading").count(), 0, "filtered decision cannot leave a stale readout");
+  await page.locator(".tm-log-match button").click();
+  assert.equal(await page.locator(".tm-log-match strong").textContent(), "37");
+  for (let index = 0; index < 37; index++) {
+    await page.locator(".tm-log-index li button").nth(index).click();
+    await page.waitForFunction(() => document.querySelector(".tm-log-detail h2") === document.activeElement);
+    const source = page.locator(".tm-log-source");
+    if (!await source.getAttribute("open").then(value => value !== null)) await source.locator(":scope > summary").click();
+    const line = Number(await source.locator("dd").first().textContent());
+    const original = page.locator(".tm-log-finding > details:not(.tm-log-context)");
+    if (!await original.getAttribute("open").then(value => value !== null)) await original.locator(":scope > summary").click();
+    assert.equal(await page.locator(".tm-record-body").textContent(), portfolio.events[line - 1].summary, "each decision returns to its exact source row");
   }
+  const allRecords = page.locator(".tm-log-views > button").first();
+  await allRecords.focus(); await allRecords.press("Enter");
+  assert.equal(await page.locator(".tm-log-match strong").textContent(), "76");
+  assert.equal(await page.locator("#tm-log-outcome").count(), 0);
+  const unknown = structured.replace("Outcome: continue", "Outcome: __proto__");
+  await input.setInputFiles(file("unknown.jsonl", [row({event_id: "unknown-decision", event_kind: "finding", summary: unknown})]));
+  await page.locator(".tm-log-decision").waitFor();
+  assert.match(await page.locator(".tm-log-decision-outcome").textContent(), /__proto__/);
+  await page.locator("#tm-log-outcome").selectOption(JSON.stringify("__proto__"));
+  assert.equal(await page.locator(".tm-log-match strong").textContent(), "1");
+  await input.setInputFiles(file("no-decisions.jsonl"));
+  await page.locator(".tm-log-reading").waitFor();
+  await page.locator(".tm-log-views > button").nth(1).click();
+  assert.equal(await page.locator(".tm-log-reading").count(), 0);
+  assert.equal(await page.locator("#tm-log-outcome").count(), 0);
+  await page.locator(".tm-log-message button").click();
+  assert.equal(await page.locator(".tm-log-match strong").textContent(), "5");
+  assert.deepEqual(await page.evaluate(() => window.__tmLocalAudit), {requests: [], writes: []});
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "local reader fits the viewport");
+  await page.locator(".tm-log-actions button").last().click();
+  await page.waitForFunction(() => document.activeElement.id === "tm-open-log");
+  await page.locator(".tm-revealed").waitFor();
+  assert.equal(await page.locator(".tm-log").count(), 0);
+  assert.match(await page.locator(".tm-revealed").innerText(), /13\.84/);
+  assert.equal(await page.locator("html").getAttribute("lang"), lang === "zh" ? "zh-CN" : "en");
 }
 
-async function captureFrontstage(page, url, label, requiredText = [], options = {}) {
-  await page.goto(url, { waitUntil: "networkidle" });
-  await page.waitForSelector(options.rootSelector ?? '[data-testid="goal-channel-frontstage-route"]', { timeout: 10_000 });
-
-  const body = await page.locator("body").innerText();
-  const frontstageRequired = [
-    "LoopX",
-    "Efficiency Evidence",
-    "AI-ASSISTED BASELINE",
-    "SINGLE-ENGINEER COMPRESSION",
-    "maturity-adjusted",
-    "PUBLIC GIT FACTS",
-    "Async Work Loop",
-    "Case-driven motion board",
-    "Case source",
-    "docs/showcases/showcase-catalog.json",
-    "multiple worker lanes converging through one shared control plane",
-    "Showcase Cases",
-    "Public-safe case pack",
-    "Blocked P0 with safe P1/P2 rotation",
-    "LoopX self-iteration loop",
-    "Dynamic workflow for hardware-agent development",
-  ];
-  const required = options.includeFrontstageRequired === false
-    ? requiredText
-    : [...frontstageRequired, ...requiredText];
-  const missing = required.filter((text) => !body.includes(text));
-  if (missing.length) {
-    throw new Error(`Missing frontstage text: ${missing.join(", ")}`);
+let browser;
+try {
+  for (let i = 0; ; i++) {
+    try { if ((await fetch("http://127.0.0.1:5197/")).ok) break; } catch {}
+    if (i > 100 || child.exitCode !== null) throw new Error(`Vite did not start: ${logs}`);
+    await new Promise((done) => setTimeout(done, 200));
   }
-
-  const forbidden = [
-    "[plugin:vite:oxc]",
-    "Transform failed",
-    "onclick=",
-    "method=",
-  ];
-  const present = forbidden.filter((text) => body.includes(text));
-  if (present.length) {
-    throw new Error(`Frontstage leaked debug/write text: ${present.join(", ")}`);
+  browser = await chromium.launch({ headless: true });
+  // Crawlers and readers without JavaScript receive actual route content.
+  const staticContext = await browser.newContext({ javaScriptEnabled: false });
+  const staticPage = await staticContext.newPage();
+  for (const [path, subject] of [["", "long-running"], ["benchmarks/swe-marathon/", "SWE-Marathon"], ["benchmarks/lhtb/", "LHTB"]]) {
+    await staticPage.goto(`${publicOrigin}/loopx/${path}`);
+    assert.match(await staticPage.title(), new RegExp(subject, "i"));
+    assert(await staticPage.locator("h1").isVisible(), "primary heading is visible without JavaScript");
+    assert.match(await staticPage.locator("main").innerText(), new RegExp(subject, "i"));
+    assert(await staticPage.locator("main a[href]").count() > 0, "static content includes crawlable links");
+    assert.equal(await staticPage.locator('link[rel="canonical"]').getAttribute("href"), `https://loopx-project.github.io/loopx/${path}`);
   }
-
-  const forms = await page.locator("form").count();
-  if (forms !== 0) {
-    throw new Error(`Read-only frontstage should not render forms; found ${forms}`);
+  await staticContext.close();
+  // Serve the real bundled font behind a controlled delay. Check both late
+  // reflow correction and its cancellation when a reader scrolls away.
+  const font = await readFile(resolve(dashboard, "node_modules/@fontsource-variable/geist/files/geist-latin-wght-normal.woff2"));
+  for (const width of [1440, 390]) {
+    for (const [path, id] of [["", "learn"], ["benchmarks/swe-marathon/", "mechanism"]]) {
+      for (const userScrolls of [false, true]) {
+        const fontContext = await browser.newContext({ reducedMotion: "reduce", viewport: { width, height: 900 } });
+        const fontPage = await fontContext.newPage();
+        let releaseFont;
+        const fontGate = new Promise((resolve) => { releaseFont = resolve; });
+        await fontPage.route("https://fonts.googleapis.com/**", (route) => route.fulfill({
+          contentType: "text/css",
+          body: '@font-face { font-family: Geist; src: url(https://fonts.gstatic.com/navigation-test.woff2) format("woff2"); font-weight: 100 900; font-display: swap; }',
+        }));
+        await fontPage.route("https://fonts.gstatic.com/navigation-test.woff2", async (route) => {
+          await fontGate;
+          await route.fulfill({ contentType: "font/woff2", body: font });
+        });
+        await fontPage.goto(`${publicOrigin}/loopx/${path}#${id}`, { waitUntil: "domcontentloaded" });
+        await fontPage.waitForFunction(() => document.fonts.status === "loading");
+        await assertAnchorInView(fontPage, id);
+        if (userScrolls) {
+          await fontPage.mouse.wheel(0, -20000);
+          await fontPage.waitForFunction(() => scrollY === 0);
+        }
+        releaseFont();
+        await fontPage.evaluate(async () => {
+          await document.fonts.ready;
+          await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        });
+        if (userScrolls) assert.equal(await fontPage.evaluate(() => scrollY), 0, "late fonts must not undo reader scrolling");
+        else await assertAnchorInView(fontPage, id);
+        await fontContext.close();
+      }
+    }
   }
-
-  await assertNoHorizontalOverflow(page, label);
-  await page.screenshot({
-    path: resolve(visualOutputDir, `${label}.png`),
-    fullPage: true,
-    animations: "disabled",
-  });
-}
-
-async function captureDeveloperFrontstage(page, url, label) {
-  await page.goto(url, { waitUntil: "networkidle" });
-  await page.waitForSelector('[data-testid="goal-channel-frontstage-route"]', { timeout: 10_000 });
-  await page.waitForSelector('[data-testid="frontstage-developer-onboarding"]', { timeout: 10_000 });
-
-  const body = await page.locator("body").innerText();
-  const required = [
-    "Developer Onboarding Frontstage",
-    "Start the loop from one TUI message",
-    "developer mode",
-    "Developer mode ignores statusUrl",
-    "Developer Onboarding",
-    "Open the project and send one LoopX bootstrap message in Codex CLI.",
-    "workspace_guard isolates peer writes",
-    "quota/status agree on user todos",
-    "TUI steering stays visible",
-    "Public Boundary",
-    "None in browser",
-  ];
-  const missing = required.filter((text) => !body.includes(text));
-  if (missing.length) {
-    throw new Error(`Missing developer frontstage text: ${missing.join(", ")}`);
-  }
-
-  const forbidden = [
-    "Live Goal Channel",
-    "Second Live Channel",
-    "Render live statusUrl channel projection",
-    "FAKE_PRIVATE_STATUS_ALPHA",
-    "FAKE_INTERNAL_TABLE_BETA",
-    "FAKE_PRIVATE_TODO_GAMMA",
-    "FAKE_PRIVATE_EVENT_DELTA",
-    "[plugin:vite:oxc]",
-    "Transform failed",
-  ];
-  const present = forbidden.filter((text) => body.includes(text));
-  if (present.length) {
-    throw new Error(`Developer frontstage loaded live/debug text: ${present.join(", ")}`);
-  }
-
-  const forms = await page.locator("form").count();
-  if (forms !== 0) {
-    throw new Error(`Read-only developer frontstage should not render forms; found ${forms}`);
-  }
-
-  await assertNoHorizontalOverflow(page, label);
-  await page.screenshot({
-    path: resolve(visualOutputDir, `${label}.png`),
-    fullPage: true,
-    animations: "disabled",
-  });
-}
-
-async function main() {
-  const { chromium } = loadPlaywright();
-  await writeFile(fixturePath, JSON.stringify(statusFixture, null, 2) + "\n", "utf-8");
-  await writeFile(privateTrapFixturePath, await readFile(privateTrapSourcePath, "utf8"), "utf-8");
-  await mkdir(visualOutputDir, { recursive: true });
-
-  const server = startDashboardServer();
-  let browser;
-  const pageErrors = [];
-  try {
-    const baseUrl = `http://127.0.0.1:${port}`;
-    await waitForDashboard(baseUrl);
-    browser = await launchBrowser(chromium);
-
-    const desktopPage = await browser.newPage({ viewport: { width: 1440, height: 1100 } });
-    desktopPage.on("pageerror", (error) => pageErrors.push(error.message));
-    try {
-      await captureFrontstage(desktopPage, `${baseUrl}/frontstage`, "desktop-frontstage", [
-        "Loop engineering for long-running AI agents",
-        "Public cases first. Live registry state stays behind explicit ops mode.",
-        "Explore cases",
-        "Quick Start",
-        "Share feedback",
-        "public cases",
-        "story beats",
-        "showcase mode",
-        "Showcase mode ignores statusUrl",
-        "STATE FLOW CONTROL PLANE",
-        "Work keeps moving. Judgment stays in charge.",
-        "safe work moves",
-        "Self-Iteration Timeline",
-        "Three-lane control-plane story",
-        "Release validation",
-        "Product capability",
-        "Implementation lane",
-        "human gate: decision_frontstage_to_implementation_lane",
-        "INFERRED DISPLAY BRIDGE",
-        "Truth source: event ledger",
-        "ROLLOUT PROJECTION",
-        "Review mesh over a 30-PR public batch",
-        "PUBLIC SAMPLE",
-        "30 PRs",
-        "Projection model:",
-        "Overnight PR batch with reviewable control",
-        "A wall-clock rollout map, all at once",
-        "OVERNIGHT WALL-CLOCK TIMELINE",
-        "#746 -> #775 / 13:24-21:30 Asia/Shanghai",
-        "wall_clock",
-        "node.started_at positions each work unit",
-        "TIMELINE LINKS",
-        "LANE-FLOW LINKS",
-        "EXPLICIT REVIEW LINKS",
-        "REQUIREMENT ROLLOUT SPINE",
-        "One demand unlocks the next",
-        "Show frontstage trajectory as a reusable projection",
-        "Monitor tasks become due work instead of hidden polling",
-        "PROJECTION CAPABILITY MAP",
-        "Evidence becomes state, lanes, edges, and operator decisions",
-        "Source intake",
-        "State projection",
-        "Lane routing",
-        "Edge reasoning",
-        "Operator readout",
-        "FLOW SIGNALS",
-        "RELATIONSHIP GRAMMAR",
-        "ATTENTION HOTSPOTS",
-        "ACTOR / STATE STAGES",
-        "ROLLOUT LANE GRAPH",
-        "REVIEW EDGE MESH",
-        "Anchor #674",
-        "ASYNCHRONOUS AGENT RHYTHM",
-        "Agent teams work across turns and off-hours",
-        "SEARCH PUBLIC SHOWCASES",
-        allShowcaseCasesText,
-        "Public Boundary",
-        "Ops live only",
-        "None in browser",
-      ]);
-      const publicShellSidebars = await desktopPage
-        .locator('[data-testid="frontstage-live-source-panel"], [data-testid="frontstage-source-warnings"]')
-        .count();
-      if (publicShellSidebars !== 0) {
-        throw new Error(`Showcase homepage rendered ops side panels: ${publicShellSidebars}`);
-      }
-      const stateFlowTrackCount = await desktopPage.locator('[data-testid="frontstage-state-flow-track"]').count();
-      const stateFlowBeamBox = await desktopPage.locator('[data-testid="frontstage-state-flow-beam"]').boundingBox();
-      if (stateFlowTrackCount !== 1 || !stateFlowBeamBox || stateFlowBeamBox.width < 20) {
-        throw new Error("Showcase state-flow animation rail did not render");
-      }
-      const selfIterationLaneCount = await desktopPage
-        .locator('[data-testid="frontstage-self-iteration-lane"]')
-        .count();
-      if (selfIterationLaneCount !== 3) {
-        throw new Error(`Self-iteration timeline should render three lanes; saw ${selfIterationLaneCount}`);
-      }
-      const selfIterationEventCount = await desktopPage
-        .locator('[data-testid="frontstage-self-iteration-event"]')
-        .count();
-      if (selfIterationEventCount < 6) {
-        throw new Error(`Self-iteration timeline should render at least six events; saw ${selfIterationEventCount}`);
-      }
-      const selfIterationBridgeCount = await desktopPage
-        .locator('[data-testid="frontstage-self-iteration-dashed-bridge"]')
-        .count();
-      if (selfIterationBridgeCount < 1) {
-        throw new Error("Self-iteration timeline did not render the inferred dashed bridge");
-      }
-      const showcaseMotionBeamBox = await desktopPage
-        .locator('[data-testid="frontstage-showcase-motion-beam"]')
-        .boundingBox();
-      if (!showcaseMotionBeamBox || showcaseMotionBeamBox.width < 20) {
-        throw new Error("Showcase motion traffic beam did not render");
-      }
-      const trajectoryParticles = await desktopPage
-        .locator('[data-testid="frontstage-rollout-node-particles"] span')
-        .count();
-      if (trajectoryParticles !== 30) {
-        throw new Error(`Rollout projection should render 30 public PR nodes; saw ${trajectoryParticles}`);
-      }
-      const timelinePointCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-timeline-point"]')
-        .count();
-      if (timelinePointCount !== 30) {
-        throw new Error(`Rollout timeline should render all 30 ordered work units; saw ${timelinePointCount}`);
-      }
-      const timelineTickCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-timeline-tick"]')
-        .count();
-      if (timelineTickCount < 8) {
-        throw new Error(`Rollout wall-clock timeline should render hour ticks; saw ${timelineTickCount}`);
-      }
-      const firstTimelinePointTime = await desktopPage
-        .locator('[data-testid="frontstage-rollout-timeline-point"]')
-        .first()
-        .getAttribute("data-node-time");
-      if (!firstTimelinePointTime?.includes("13:24")) {
-        throw new Error(`Rollout first timeline point should expose a concrete start time; saw ${firstTimelinePointTime}`);
-      }
-      const meshTimeTickCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-mesh-time-tick"]')
-        .count();
-      if (meshTimeTickCount < 8) {
-        throw new Error(`Rollout mesh should render wall-clock grid ticks; saw ${meshTimeTickCount}`);
-      }
-      const timelineMilestoneText = await desktopPage
-        .locator('[data-testid="frontstage-rollout-time-milestones"]')
-        .innerText();
-      if (
-        !timelineMilestoneText.includes("13:24") ||
-        !timelineMilestoneText.includes("tail done") ||
-        !timelineMilestoneText.includes("21:30")
-      ) {
-        throw new Error(`Rollout wall-clock milestones did not expose concrete time anchors: ${timelineMilestoneText}`);
-      }
-      const prMeshNodeCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-mesh-node"]')
-        .count();
-      if (prMeshNodeCount !== 30) {
-        throw new Error(`Rollout relationship mesh should render all 30 PR nodes; saw ${prMeshNodeCount}`);
-      }
-      const prMeshNodeTooltipCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-mesh-node-tooltip"]')
-        .count();
-      if (prMeshNodeTooltipCount !== 30) {
-        throw new Error(`Rollout relationship mesh should render hover content for all 30 nodes; saw ${prMeshNodeTooltipCount}`);
-      }
-      const firstMeshNodeTime = await desktopPage
-        .locator('[data-testid="frontstage-rollout-mesh-node"]')
-        .first()
-        .getAttribute("data-node-time");
-      if (!firstMeshNodeTime?.includes("13:24")) {
-        throw new Error(`Rollout mesh nodes should expose concrete time attributes; saw ${firstMeshNodeTime}`);
-      }
-      const prMeshEdgeCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-mesh-edge"]')
-        .count();
-      if (prMeshEdgeCount < 40) {
-        throw new Error(`Rollout relationship mesh should render a dense link graph; saw ${prMeshEdgeCount}`);
-      }
-      const firstMeshEdge = desktopPage.locator('[data-testid="frontstage-rollout-mesh-edge"]').first();
-      const firstMeshEdgeKind = await firstMeshEdge.getAttribute("data-edge-kind");
-      const firstMeshEdgeLabel = await firstMeshEdge.getAttribute("data-edge-label");
-      const firstMeshEdgeTitle = await firstMeshEdge.getAttribute("data-edge-title");
-      if (!firstMeshEdgeKind || !firstMeshEdgeLabel || !firstMeshEdgeTitle?.includes("->")) {
-        throw new Error("Rollout mesh edge did not expose hover/data relationship properties");
-      }
-      const prMeshEdgeHotspotCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-mesh-edge-hotspot"]')
-        .count();
-      if (prMeshEdgeHotspotCount !== prMeshEdgeCount) {
-        throw new Error(`Rollout mesh should expose one hover hotspot per edge; saw ${prMeshEdgeHotspotCount}`);
-      }
-      await desktopPage.locator('[data-testid="frontstage-rollout-mesh-edge-hotspot"]').first().hover({ force: true });
-      await desktopPage.waitForFunction(
-        ({ kind, label }) => {
-          const card = document.querySelector('[data-testid="frontstage-rollout-mesh-edge-hover-card"]');
-          return Boolean(card?.textContent?.includes(kind) && card.textContent.includes(label));
-        },
-        { kind: firstMeshEdgeKind, label: firstMeshEdgeLabel },
-      );
-      const edgeHoverText = await desktopPage.locator('[data-testid="frontstage-rollout-mesh-edge-hover-card"]').innerText();
-      if (!edgeHoverText.toLowerCase().includes(firstMeshEdgeKind) || !edgeHoverText.includes(firstMeshEdgeLabel)) {
-        throw new Error("Rollout mesh edge hover card did not show relationship details");
-      }
-      if (!/\d{2}:\d{2}/.test(edgeHoverText) || !edgeHoverText.includes("from:") || !edgeHoverText.includes("to:")) {
-        throw new Error(`Rollout mesh edge hover card did not show from/to time details: ${edgeHoverText}`);
-      }
-      const prMeshLaneCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-mesh-lane"]')
-        .count();
-      if (prMeshLaneCount < 5) {
-        throw new Error(`Rollout relationship mesh should render five lane labels; saw ${prMeshLaneCount}`);
-      }
-      const rolloutSequenceChipCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-sequence-chip"]')
-        .count();
-      if (rolloutSequenceChipCount < 7) {
-        throw new Error(`Rollout sequence ribbon should render at least seven chips; saw ${rolloutSequenceChipCount}`);
-      }
-      const rolloutRequirementCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-requirement-unit"]')
-        .count();
-      if (rolloutRequirementCount < 7) {
-        throw new Error(`Rollout sequence should render at least seven requirement units; saw ${rolloutRequirementCount}`);
-      }
-      const rolloutRequirementStepCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-requirement-step"]')
-        .count();
-      if (rolloutRequirementStepCount < rolloutRequirementCount * 3) {
-        throw new Error(
-          `Rollout sequence should render several stage steps per requirement; saw ${rolloutRequirementStepCount}`,
-        );
-      }
-      const mappingLayerCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-mapping-layer"]')
-        .count();
-      if (mappingLayerCount < 5) {
-        throw new Error(`Rollout capability map should render five mapping layers; saw ${mappingLayerCount}`);
-      }
-      const flowSignalText = await desktopPage.locator('[data-testid="frontstage-rollout-flow-signals"]').innerText();
-      if (!flowSignalText.includes("Throughput") || !flowSignalText.includes("Review resolution")) {
-        throw new Error("Rollout capability map did not surface the expected flow signals");
-      }
-      const singleAgentStateCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-stage"]')
-        .count();
-      if (singleAgentStateCount < 6) {
-        throw new Error(`Rollout stage flow should render at least six stages; saw ${singleAgentStateCount}`);
-      }
-      const multiAgentLaneCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-lane"]')
-        .count();
-      if (multiAgentLaneCount < 5) {
-        throw new Error(`Rollout lane graph should render at least five lanes; saw ${multiAgentLaneCount}`);
-      }
-      const reviewEdgeCount = await desktopPage
-        .locator('[data-testid="frontstage-rollout-edge"]')
-        .count();
-      if (reviewEdgeCount < 10) {
-        throw new Error(`Rollout review mesh should render ten review edges; saw ${reviewEdgeCount}`);
-      }
-      const spotlight = desktopPage.locator('[data-testid="frontstage-showcase-spotlight"]');
-      const initialSpotlightText = await spotlight.innerText();
-      if (!initialSpotlightText.includes("Overnight PR batch with reviewable control")) {
-        throw new Error("Showcase spotlight did not default to the first public case");
-      }
-      await desktopPage
-        .locator('[data-testid="frontstage-showcase-motion-card"]')
-        .filter({ hasText: "Dynamic workflow for hardware-agent development" })
-        .click();
-      await desktopPage.waitForFunction(() =>
-        document
-          .querySelector('[data-testid="frontstage-showcase-spotlight"]')
-          ?.textContent?.includes("Dynamic workflow for hardware-agent development"),
-      );
-      const hardwareSpotlightText = await spotlight.innerText();
-      if (!hardwareSpotlightText.includes("Public-safe interactive artifact")) {
-        throw new Error("Showcase spotlight did not expose the selected hardware-agent evidence boundary");
-      }
-      const spotlightCaseHref = await desktopPage
-        .locator('[data-testid="frontstage-showcase-spotlight-case-page"]')
-        .getAttribute("href");
-      if (!spotlightCaseHref?.includes("huangruiteng.github.io/loopx/docs/showcases/")) {
-        throw new Error(`Showcase spotlight case link points outside public showcases: ${spotlightCaseHref}`);
-      }
-      await desktopPage.locator('[data-testid="frontstage-showcase-search"]').fill("self-iteration");
-      await desktopPage.waitForFunction((text) => document.body.innerText.includes(text), selfIterationFilterText);
-      const filteredCaseText = await desktopPage.locator('[data-testid="frontstage-showcase-cases"]').innerText();
-      if (!filteredCaseText.includes("LoopX self-iteration loop")) {
-        throw new Error("Showcase search did not keep the self-iteration case visible");
-      }
-      if (filteredCaseText.includes("Blocked P0 with safe P1/P2 rotation")) {
-        throw new Error("Showcase search did not filter unrelated cases");
-      }
-      await desktopPage.locator('[data-testid="frontstage-showcase-search"]').fill("no-matching-showcase");
-      await desktopPage.waitForFunction(() => document.body.innerText.includes("No public showcase matched the current filters."));
-      await desktopPage.locator('[data-testid="frontstage-showcase-search"]').fill("");
-      await desktopPage.waitForFunction((text) => document.body.innerText.includes(text), allShowcaseCasesText);
-      await captureFrontstage(
-        desktopPage,
-        `${baseUrl}/frontstage?statusUrl=/${fixtureName}&goalId=live-goal-a`,
-        "desktop-frontstage-showcase-ignores-status-url",
-        [
-          "Loop engineering for long-running AI agents",
-          "showcase mode",
-          "Showcase mode ignores statusUrl",
-          "statusUrl ignored",
-          "Public Boundary",
-          "Ops live only",
-        ],
-      );
-      const publicModeText = await desktopPage.locator("body").innerText();
-      const publicModeForbidden = [
-        "Live Goal Channel",
-        "Second Live Channel",
-        "Render live statusUrl channel projection",
-        "FAKE_PRIVATE_STATUS_ALPHA",
-        "FAKE_INTERNAL_TABLE_BETA",
-        "FAKE_PRIVATE_TODO_GAMMA",
-        "FAKE_PRIVATE_EVENT_DELTA",
-      ];
-      const publicModePresent = publicModeForbidden.filter((text) => publicModeText.includes(text));
-      if (publicModePresent.length) {
-        throw new Error(`Showcase frontstage loaded live statusUrl text: ${publicModePresent.join(", ")}`);
-      }
-      await captureDeveloperFrontstage(
-        desktopPage,
-        `${baseUrl}/frontstage?mode=developer&statusUrl=/${fixtureName}&goalId=live-goal-a`,
-        "desktop-frontstage-developer",
-      );
-      await captureFrontstage(
-        desktopPage,
-        `${baseUrl}/frontstage?statusUrl=/${privateTrapFixtureName}&goalId=fake-private-trap-goal`,
-        "desktop-frontstage-showcase-private-trap-ignored",
-        [
-          "Loop engineering for long-running AI agents",
-          "showcase mode",
-          "Showcase mode ignores statusUrl",
-          "statusUrl ignored",
-          "Public Boundary",
-          "docs/showcases",
-        ],
-      );
-      const privateTrapPublicText = await desktopPage.locator("body").innerText();
-      const leakedTrapMarkers = fakePrivateTrapMarkers.filter((text) => privateTrapPublicText.includes(text));
-      if (leakedTrapMarkers.length) {
-        throw new Error(`Showcase mode rendered fake-private status trap markers: ${leakedTrapMarkers.join(", ")}`);
-      }
-      await captureFrontstage(
-        desktopPage,
-        `${baseUrl}/frontstage?mode=ops&statusUrl=/${privateTrapFixtureName}&goalId=fake-private-trap-goal`,
-        "desktop-frontstage-ops-private-trap-explicit",
-        [
-          "ops live",
-          "live status feed",
-          "Fake Private Trap Goal",
-          "GH_FAKE_PRIVATE_PLAN_SUMMARY_ALPHA",
-          "GH_FAKE_PRIVATE_TODO_GAMMA",
-          "GH_FAKE_PRIVATE_EVENT_DELTA",
-        ],
-      );
-      const privateTrapOpsText = await desktopPage.locator("body").innerText();
-      for (const marker of [
-        "GH_FAKE_PRIVATE_PLAN_SUMMARY_ALPHA",
-        "GH_FAKE_PRIVATE_TODO_GAMMA",
-        "GH_FAKE_PRIVATE_EVENT_DELTA",
-      ]) {
-        if (!privateTrapOpsText.includes(marker)) {
-          throw new Error(`Explicit ops mode did not render fake-private status trap marker: ${marker}`);
+  console.log("Delayed font reflow and reader-scroll cancellation: ok");
+  // A shared fragment URL must land on its section without any test-driven
+  // scroll or focus. Use cold pages and delayed JS to cover pre-React parsing.
+  for (const reducedMotion of ["no-preference", "reduce"]) {
+    for (const width of [1440, 390]) {
+      const entryContext = await browser.newContext({ reducedMotion, viewport: { width, height: 900 } });
+      const entry = await entryContext.newPage();
+      const entryErrors = [];
+      entry.on("pageerror", (error) => entryErrors.push(error.message));
+      await entry.route("**/site-assets/*.js", async (route) => {
+        await new Promise((done) => setTimeout(done, 250));
+        await route.continue();
+      });
+      for (const path of ["", "benchmarks/swe-marathon/"]) {
+        const anchors = path
+          ? ["top", "summary", "background", "mechanism", "zstd", "official-comparison", "boundary", "sources"]
+          : ["top", "main", "product", "workflow", "showcases", "explore", "learn", "quickstart"];
+        for (const lang of ["en", "zh"]) {
+          for (const id of anchors) {
+            await entry.goto("about:blank");
+            await entry.goto(`${publicOrigin}/loopx/${path}?lang=${lang}#${id}`);
+            await assertAnchorInView(entry, id);
+            await entry.reload();
+            await assertAnchorInView(entry, id);
+          }
+          await entry.goto(`${publicOrigin}/loopx/${path}index.html?lang=${lang}#${anchors[2]}`);
+          await assertAnchorInView(entry, anchors[2]);
+        }
+        for (const fragment of ["", "missing-section", "%zz"]) {
+          await entry.goto("about:blank");
+          await entry.goto(`${publicOrigin}/loopx/${path}?lang=zh#${fragment}`);
+          await entry.locator("h1").first().waitFor();
+          assert.equal(await entry.evaluate(() => scrollY), 0, "missing fragments must preserve normal page entry");
         }
       }
-      await captureFrontstage(
-        desktopPage,
-        `${baseUrl}/frontstage/developer`,
-        "desktop-frontstage-developer-cockpit",
-        [
-          "LoopX Projection Developer Cockpit",
-          "Status Contract Explorer",
-          "Projection Diffing",
-          "Fixture Generation",
-          "Smoke Checklist",
-          "Component Examples",
-          "Extension Boundary",
-          "apps/presentation/dashboard/src/data/status.ts",
-          "apps/presentation/dashboard/src/data/goal-channel-frontstage.ts",
-          "examples/status.example.json",
-          "loopx check --scan-path apps/presentation/dashboard",
-          "read-only contributor workbench",
-          "live status feeds, registry files, and browser write APIs stay outside",
-        ],
-        {
-          includeFrontstageRequired: false,
-          rootSelector: '[data-testid="frontstage-developer-cockpit"]',
-        },
-      );
-      await captureFrontstage(
-        desktopPage,
-        `${baseUrl}/frontstage?mode=ops&statusUrl=/${fixtureName}&goalId=live-goal-a`,
-        "desktop-frontstage-live",
-        [
-          "ops live",
-          "live status feed",
-          "TanStack Query",
-          "read-only default",
-          "local_dashboard_api: serve-status",
-          "reward dry-run advertised; append disabled",
-          "control-plane dry-run advertised; apply disabled",
-          "Write affordances require explicit loopback opt-in",
-          "Ops statusUrl accepts only relative or loopback sources.",
-          "Live Goal Channel",
-          "goal_channel_projection_v0",
-          "Always-on agent operations",
-          "Render live statusUrl channel projection",
-          "Decision Frame",
-          "Quota Guard",
-          "Source Freshness",
-          "User Todo Lane",
-          "Agent Todo Lane",
-          "Run Timeline",
-          "Role Map",
-          "Active Claims",
-          "Open Gates",
-          "Artifacts",
-          "Truth Contract",
-          "CLAIMED LANES",
-          "EVIDENCE LOOP",
-          "SEARCH TODO PROJECTION",
-          "Showing 4 of 4 projected todos",
-          "Review live handoff gate before delivery",
-          "Document filtered ops route",
-          "live-goal-a_gate",
-          "browser smoke statusUrl",
-          "browser_smoke_public_fixture",
-        ],
-      );
-      await desktopPage.locator('[data-testid="frontstage-todo-search"]').fill("filtered ops");
-      await desktopPage.waitForFunction(() => document.body.innerText.includes("Showing 1 of 4 projected todos"));
-      const filteredTodoText = await desktopPage.locator('[data-testid="frontstage-agent-todos"]').innerText();
-      if (!filteredTodoText.includes("Document filtered ops route")) {
-        throw new Error("Todo search did not keep the matching agent todo visible");
-      }
-      const filteredUserTodoText = await desktopPage.locator('[data-testid="frontstage-user-todos"]').innerText();
-      if (!filteredUserTodoText.includes("No user todos match the current filters.")) {
-        throw new Error("Todo search did not show the user-lane empty state");
-      }
-      const filteredTodoUrl = new URL(desktopPage.url());
-      if (filteredTodoUrl.searchParams.get("todoQuery") !== "filtered ops") {
-        throw new Error(`Todo search did not update URL: ${desktopPage.url()}`);
-      }
-      await desktopPage.locator('[data-testid="frontstage-todo-search"]').fill("");
-      await desktopPage.locator('[data-testid="frontstage-todo-lane-filter"]').selectOption("user");
-      await desktopPage.waitForFunction(() => document.body.innerText.includes("Showing 2 of 4 projected todos"));
-      const userLaneText = await desktopPage.locator('[data-testid="frontstage-user-todos"]').innerText();
-      const agentLaneText = await desktopPage.locator('[data-testid="frontstage-agent-todos"]').innerText();
-      if (!userLaneText.includes("Review live handoff gate before delivery")) {
-        throw new Error("User lane filter did not keep user todos visible");
-      }
-      if (!agentLaneText.includes("No agent todos match the current filters.")) {
-        throw new Error("User lane filter did not hide agent todos");
-      }
-      const filteredLaneUrl = new URL(desktopPage.url());
-      if (filteredLaneUrl.searchParams.get("todoLane") !== "user") {
-        throw new Error(`Todo lane filter did not update URL: ${desktopPage.url()}`);
-      }
-      await desktopPage.locator('[data-testid="frontstage-goal-select"]').selectOption("live-goal-b");
-      await desktopPage.waitForFunction(() => document.body.innerText.includes("Second Live Channel"));
-      const selectedUrl = new URL(desktopPage.url());
-      if (selectedUrl.searchParams.get("goalId") !== "live-goal-b") {
-        throw new Error(`Goal selector did not update URL: ${desktopPage.url()}`);
-      }
-      await desktopPage.locator('[data-testid="frontstage-status-url-input"]').fill("https://example.com/status.json");
-      await desktopPage.locator('[data-testid="frontstage-load-status-url"]').click();
-      const loadErrorText = await desktopPage.locator('[data-testid="frontstage-load-error"]').innerText();
-      if (!loadErrorText.includes("Ops statusUrl must be relative or loopback")) {
-        throw new Error(`External ops statusUrl was not rejected locally: ${loadErrorText}`);
-      }
-      await desktopPage.locator('[data-testid="frontstage-reset-demo"]').click();
-      await captureFrontstage(desktopPage, `${baseUrl}/frontstage`, "desktop-frontstage-after-ops-reset", [
-        "Loop engineering for long-running AI agents",
-        "showcase mode",
-        "Showcase mode ignores statusUrl",
-        "Public Boundary",
-      ]);
-      const resetText = await desktopPage.locator("body").innerText();
-      const resetForbidden = [
-        "Live Goal Channel",
-        "Second Live Channel",
-        "Render live statusUrl channel projection",
-        "FAKE_PRIVATE_STATUS_ALPHA",
-        "FAKE_INTERNAL_TABLE_BETA",
-        "FAKE_PRIVATE_TODO_GAMMA",
-        "FAKE_PRIVATE_EVENT_DELTA",
-      ];
-      const resetPresent = resetForbidden.filter((text) => resetText.includes(text));
-      if (resetPresent.length) {
-        throw new Error(`Showcase frontstage retained prior ops live text: ${resetPresent.join(", ")}`);
-      }
-    } finally {
-      await desktopPage.close();
+      await entry.goto(`${publicOrigin}/loopx/?lang=zh#%65xplore`);
+      await assertAnchorInView(entry, "explore");
+      // Language changes must keep the section, and history must restore both
+      // URL and rendered language. Clicks exercise real controls, not JS scroll.
+      await entry.goto(`${publicOrigin}/loopx/`);
+      const navigateHome = async (id) => {
+        if (width === 390) {
+          await entry.getByRole("button", { name: "Open navigation" }).click();
+          await entry.locator(`.mobile-nav a[href="#${id}"]`).click();
+          assert.equal(await entry.locator(".mobile-nav").count(), 0);
+        } else await entry.locator(`.desktop-nav a[href="#${id}"]`).click();
+        await assertAnchorInView(entry, id);
+      };
+      await navigateHome("product");
+      await entry.locator(".language-toggle").click();
+      await entry.waitForFunction(() => document.documentElement.lang === "zh-CN");
+      await assertAnchorInView(entry, "product");
+      await navigateHome("workflow");
+      await navigateHome("explore");
+      await navigateHome("explore"); // Clicking the current fragment still navigates.
+      // Opening the header menu can scroll to the top before a click. History
+      // restores that user position, so do not force it to the fragment again.
+      await entry.goBack();
+      assert.equal(new URL(entry.url()).hash, "#workflow");
+      await entry.goBack();
+      assert.equal(new URL(entry.url()).hash, "#product");
+      await entry.goBack();
+      await entry.waitForFunction(() => document.documentElement.lang === "en");
+      await entry.goForward();
+      await entry.waitForFunction(() => document.documentElement.lang === "zh-CN");
+      assert.equal(new URL(entry.url()).hash, "#product");
+      await entry.locator('.hero a[href="#showcases"]').click();
+      await assertAnchorInView(entry, "showcases");
+      await entry.goBack();
+      assert.equal(new URL(entry.url()).hash, "#product", "section CTA must preserve previous history entry");
+      await entry.goForward();
+      assert.equal(new URL(entry.url()).hash, "#showcases");
+      await entry.locator('.site-footer a[href="#top"]').click();
+      await assertAnchorInView(entry, "top");
+      await entry.getByRole('link', { name: 'LoopX home', exact: true }).click();
+      assert.equal(new URL(entry.url()).searchParams.get("lang"), "zh", "home link must preserve language");
+      await entry.goto(`${publicOrigin}/loopx/benchmarks/swe-marathon/#mechanism`);
+      await entry.getByRole("button", { name: "中文", exact: true }).click();
+      await assertAnchorInView(entry, "mechanism");
+      await entry.locator('.bm-footer a[href="#top"]').click();
+      await assertAnchorInView(entry, "top");
+      await entry.goBack();
+      assert.equal(new URL(entry.url()).hash, "#mechanism");
+      await entry.locator('.bm-home-link').click();
+      await entry.locator("#explore").waitFor();
+      assert.equal(new URL(entry.url()).searchParams.get("lang"), "zh");
+      assert.deepEqual(entryErrors, [], "fragment entry must not raise runtime errors");
+      console.log(`Fragment/history matrix: ${width}px, ${reducedMotion}: ok`);
+      await entryContext.close();
     }
-
-    const mobilePage = await browser.newPage({
-      isMobile: true,
-      viewport: { width: 390, height: 900 },
-    });
-    mobilePage.on("pageerror", (error) => pageErrors.push(`mobile: ${error.message}`));
-    try {
-      await captureFrontstage(mobilePage, `${baseUrl}/frontstage`, "mobile-frontstage", [
-        "Loop engineering for long-running AI agents",
-        "Public cases first. Live registry state stays behind explicit ops mode.",
-        "showcase mode",
-        "Showcase mode ignores statusUrl",
-        "Public Boundary",
-        "Ops live only",
-      ]);
-      await captureDeveloperFrontstage(
-        mobilePage,
-        `${baseUrl}/frontstage?mode=developer&statusUrl=/${fixtureName}`,
-        "mobile-frontstage-developer",
-      );
-    } finally {
-      await mobilePage.close();
-    }
-
-    if (pageErrors.length) {
-      throw new Error(`Frontstage page errors: ${pageErrors.join(" | ")}`);
-    }
-
-    console.log("dashboard-frontstage-browser-smoke ok");
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
-    server.kill("SIGTERM");
-    await rm(fixturePath, { force: true });
-    await rm(privateTrapFixturePath, { force: true });
   }
+  const context = await browser.newContext({ reducedMotion: "reduce" });
+  const page = await context.newPage();
+  await page.route((url) => url.pathname === "/status.example.json", async (route) => route.fulfill({ contentType: "application/json", body: await readFile(resolve(root, "examples/status.example.json"), "utf8") }));
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const privateRequests = [];
+  await page.route((url) => url.pathname === "/private-status.json", (route) => { privateRequests.push(route.request().url()); return route.abort(); });
+  // Resolve the public destination to the actual exported case directory in this test.
+  await page.route("https://loopx-project.github.io/loopx/**", (route) => {
+    return route.fulfill({ status: 200, contentType: "text/html", body: "<h1>Public destination</h1>" });
+  });
+  for (const route of ["/frontstage?statusUrl=/private-status.json", "/frontstage?mode=showcase&statusUrl=https://example.com/private-status.json"]) {
+    await page.goto(`http://127.0.0.1:5197${route}`);
+    await page.waitForURL("https://loopx-project.github.io/loopx/docs/showcases/index.en.html");
+  }
+  for (const route of ["/frontstage?mode=developer", "/frontstage/developer"]) {
+    await page.goto(`http://127.0.0.1:5197${route}`);
+    await page.waitForURL("**/developers/projections");
+    await page.locator('[data-testid="frontstage-developer-cockpit"]').waitFor();
+  }
+  for (const route of ["/frontstage?mode=ops&", "/deprecated/frontstage/ops?"]) {
+    await page.goto(`http://127.0.0.1:5197${route}goalId=demo&statusUrl=https://example.com/private-status.json`);
+    await page.getByRole("alert").filter({ hasText: "relative or loopback" }).waitFor();
+    await page.goto(`http://127.0.0.1:5197${route}goalId=demo&statusUrl=/status.example.json`);
+    await page.waitForURL((url) => url.pathname === "/" && url.searchParams.get("goalId") === "demo" && url.searchParams.get("statusUrl") === "/status.example.json");
+    await page.locator(".personal-workspace-shell").waitFor();
+  }
+  assert.deepEqual(privateRequests, [], "retired/public URLs must not read rejected status sources");
+  for (const [route, target] of [
+    ["frontstage/?mode=ops&statusUrl=/private-status.json", "/loopx/docs/showcases/index.en.html"],
+    ["frontstage/developer/", "/loopx/developers/projections/"],
+  ]) {
+    await page.goto(`${publicOrigin}/loopx/${route}`);
+    await page.waitForURL(`${publicOrigin}${target}`);
+  }
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    for (const lang of ["en", "zh"]) {
+      await page.goto(`${publicOrigin}/loopx/?lang=${lang}`);
+      await page.locator("#explore").waitFor();
+      assert.equal(await page.locator("html").getAttribute("lang"), lang === "zh" ? "zh-CN" : "en");
+      assert.equal(await page.locator('a[href*="deprecated"], a[href*="frontstage/"]').count(), 0);
+      const expected = ["docs/guides/personal-workspace-user-guide/", `benchmarks/swe-marathon/${lang === "zh" ? "?lang=zh" : ""}`, `benchmarks/lhtb/${lang === "zh" ? "?lang=zh" : ""}`, "benchmarks/deepswe/behavior-discovery/", "benchmarks/deepswe-sol/", `lab/time-machine/${lang === "zh" ? "?lang=zh" : ""}`];
+      assert.deepEqual(await page.locator("#explore .resource-card").evaluateAll((links) => links.map((a) => a.getAttribute("href"))), expected.map((path) => `/loopx/${path}`));
+      if (width === 390) {
+        await page.getByRole("button", { name: "Open navigation" }).click();
+        await page.locator('.mobile-nav a[href="#explore"]').click();
+        assert.equal(await page.locator(".mobile-nav").count(), 0);
+      } else {
+        await page.screenshot({ path: resolve(output, `home-${lang}-desktop.png`) });
+        await page.locator('.desktop-nav a[href="#explore"]').click();
+      }
+      await assertAnchorInView(page, "explore");
+      await page.locator("#explore .resource-card").first().focus();
+      assert.ok(await page.locator("#explore .resource-card").first().evaluate((a) => a === document.activeElement));
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "horizontal overflow");
+      await page.screenshot({ path: resolve(output, `explore-${lang}-${width}.png`) });
+      const skillLink = page.locator('.site-footer a[href="/loopx/skill.md"]');
+      assert.equal(await skillLink.innerText(), lang === "zh" ? "Agent 使用指南" : "Agent skill guide");
+      await skillLink.focus();
+      assert.ok(await skillLink.evaluate((a) => a === document.activeElement), "skill link accepts keyboard focus");
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "footer fits narrow screens");
+      await page.screenshot({ path: resolve(output, `skill-footer-${lang}-${width}.png`) });
+      await Promise.all([page.waitForURL(`${publicOrigin}/loopx/skill.md`), skillLink.press("Enter")]);
+      assert.equal(await page.locator("body").innerText(), await readFile(resolve(exportSite, "skill.md"), "utf8"), "footer opens raw Markdown");
+      const missingSkill = await page.request.get(`${publicOrigin}/loopx/missing-skill.md`);
+      assert.equal(missingSkill.status(), 404, "missing Markdown must not masquerade as the homepage");
+      // Follow the actual research and case links; the guide is built by MkDocs later.
+      for (let i = process.env.LOOPX_PUBLIC_SITE_DIR ? 0 : 1; i < expected.length; i++) {
+        await page.goto(`${publicOrigin}/loopx/${expected[i]}`);
+        await page.locator("h1").first().waitFor();
+      }
+      await assertTimeMachineJourney(page, lang);
+      console.log(`Time Machine discovery, three outcomes, original records and retry: ${width}px, ${lang}: ok`);
+    }
+  }
+  if (process.env.LOOPX_PUBLIC_SITE_DIR) {
+    // Check the assembled publication, including the separately built books.
+    const checked = new Set();
+    for (const path of ["", "?lang=zh", "benchmarks/swe-marathon/", "benchmarks/lhtb/", "benchmarks/lhtb/?lang=zh", "benchmarks/deepswe/behavior-discovery/", "benchmarks/deepswe-sol/", "lab/time-machine/", "lab/time-machine/?lang=zh", "docs/showcases/index.html", "docs/showcases/index.en.html", "docs/guides/personal-workspace-user-guide/", "docs/book/", "docs/book/en/", "blog/", "blog/zh/"]) {
+      await page.goto(`${publicOrigin}/loopx/${path}`);
+      await page.locator("h1").first().waitFor();
+      const links = await page.locator("a[href]").evaluateAll((links) => links.map((link) => link.href));
+      for (const href of links) {
+        const url = new URL(href);
+        if (![publicOrigin, "https://huangruiteng.github.io"].includes(url.origin) || !url.pathname.startsWith("/loopx/")) continue;
+        const target = `${publicOrigin}${url.pathname}${url.search}`;
+        if (checked.has(target)) continue;
+        checked.add(target);
+        const response = await page.request.get(target);
+        assert.ok(response.ok(), `Broken publication link from ${path}: ${href}`);
+      }
+    }
+    console.log(`Published entry links checked: ${checked.size}`);
+  }
+  assert.deepEqual(errors, [], "browser runtime errors");
+  console.log("public navigation and Frontstage migration browser smoke: ok");
+} finally {
+  await browser?.close();
+  child.kill("SIGTERM");
+  staticServer.closeAllConnections();
+  await new Promise((done) => staticServer.close(done));
 }
-
-main().catch((error) => {
-  console.error(error.message);
-  process.exit(1);
-});

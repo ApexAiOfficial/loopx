@@ -9,3 +9,12 @@
 
     - id: loopx-driver
       name: dsh-loopx-plugin/driver
+
+    # Loaded as its own default-off Cordis row. It has no Driver or Agent
+    # injection and registers only session publication hooks when fully pinned.
+    - id: loopx-shadow-observer
+      name: dsh-loopx-plugin/observer
+
+# DSH waits for the Loader tree before announcing its Web URL. Bootstrap gates
+# only LoopX's Host and Driver; shared Web rows must survive disabling or
+# uninstalling this optional package.

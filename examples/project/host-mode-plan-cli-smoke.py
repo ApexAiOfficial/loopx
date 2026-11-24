@@ -66,11 +66,16 @@ def test_cli_selects_headless_turn_and_scopes_agent_id() -> None:
     assert payload["selected_capability_ready"] is True, payload
     command = payload["next_preview_command"]
     assert "loopx turn plan" in command, command
-    assert "--host generic-cli" in command, command
+    # The preview keeps the shipped host resolution instead of pinning the
+    # compatibility adapter host; the pinned variant stays available as the
+    # mode's rollback command.
+    assert "--host" not in command, command
     assert "--execution-mode isolated-headless" in command, command
     assert "--scheduler-owner outer_controller" in command, command
     assert "--agent-id codex-main-control" in command, command
     assert "--available-capability shell" in command, command
+    rollback = payload["selected_turn_mapping"]["plan_command_rollback"]
+    assert "--host generic-cli" in rollback, rollback
     assert payload["selected_missing_host_capabilities"] == [], payload
     assert payload["selected_blocking_reasons"] == [], payload
     assert payload["operator_next_steps"][0]["kind"] == "state_preview", payload
@@ -232,6 +237,24 @@ def test_cli_fails_closed_on_bad_intent() -> None:
     assert payload["suggestions"], payload
 
 
+def test_cli_rejects_dsh_as_a_visible_host_identity() -> None:
+    proc = run_cli(
+        "--format",
+        "json",
+        "host-mode-plan",
+        "--goal-id",
+        "host-mode-plan-cli-fixture",
+        "--intent",
+        "watch_each_turn",
+        "--host-capability",
+        "visible_session",
+        "--host-identity",
+        "dsh",
+    )
+    assert proc.returncode == 2, (proc.stdout, proc.stderr)
+    assert "invalid choice" in proc.stderr, proc.stderr
+
+
 def test_cli_reports_missing_capabilities_and_stop_steps() -> None:
     proc = run_cli(
         "--format",
@@ -273,6 +296,7 @@ def main() -> int:
     test_cli_visible_mode_maps_opencode_to_goal_loop_connector()
     test_cli_shell_service_fails_closed_without_adapter_and_validator()
     test_cli_fails_closed_on_bad_intent()
+    test_cli_rejects_dsh_as_a_visible_host_identity()
     test_cli_reports_missing_capabilities_and_stop_steps()
     test_command_is_discoverable()
     print("host-mode-plan-cli-smoke ok")

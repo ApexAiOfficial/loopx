@@ -1,0 +1,965 @@
+from __future__ import annotations
+
+import argparse
+from functools import partial
+import sys as _sys
+from collections.abc import Callable, Mapping
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+from typing import TYPE_CHECKING as _TYPE_CHECKING
+from typing import Any
+
+from ..capabilities.explore.composition_frontier import (
+    project_live_explore_composition_frontier,
+)
+from ..capabilities.turn_context import configured_post_settlement
+from ..cli_rollout import append_cli_rollout_event
+from ..control_plane.agents.workspace_guard import capture_delivery_workspace
+from ..control_plane.goals.first_party_host_admission import (
+    FirstPartyHostGoalAdmission,
+)
+from ..control_plane.quota.execution_preparation import (
+    prepared_lease_receipt_fields,
+    read_active_task_lease_epoch,
+)
+from ..control_plane.quota.heartbeat_receipt import (
+    ensure_turn_heartbeat_settlement_receipt,
+)
+from ..control_plane.quota.live_decision import build_live_quota_should_run_decision
+from ..control_plane.quota.settlement import (
+    SettlementIdentity,
+    SettlementStepKind,
+    read_heartbeat_settlement,
+)
+from ..control_plane.quota.spend_sources import quota_spend_source_for_execution_context
+from ..control_plane.work_items.autonomous_replan_obligation import (
+    replan_obligation_id_from_packet,
+)
+from ..control_plane.todos.durable_completion import read_durable_completion_evidence
+from ..control_plane.turn_driver import (
+    build_loopx_turn_command_validator,
+    codex_cli_session_binding,
+    inspect_loopx_turn_journal,
+    run_codex_cli_host,
+    run_loopx_turn_once,
+)
+from ..quota import spend_quota_slot
+from ..state_refresh import refresh_state_run
+from ..control_plane.todos.path_resolution import resolve_todo_state_path
+from .turn_cadence import managed_cadence_start, uses_effect_bound_start_identity
+from .turn_host_request import build_codex_cli_host_runner, prepare_turn_host_request
+from .turn_decision import collect_turn_status_payload, current_turn_host_launch_decision
+from .turn_rendering import build_turn_error_payload
+from .turn_post_writeback import drain_committed_turn_post_writeback_hooks
+from .turn_settlement_probes import (
+    EXACT_SETTLEMENT_READBACK_NOT_FOUND as EXACT_SETTLEMENT_READBACK_NOT_FOUND,
+    append_turn_settlement_event,
+    build_turn_settlement_resolvers,
+    finish_turn_explore_delivery,
+    require_settlement_effect_ref,
+)
+from .turn_todo_writeback import write_turn_validated_completion
+from .project_lifecycle_inputs import split_explore_result_input
+
+if _TYPE_CHECKING:
+    from .turn_dsh_host import (
+        build_dsh_host_runner as build_dsh_host_runner,
+        build_dsh_operation_host_runner as build_dsh_operation_host_runner,
+    )
+
+# Keep the existing import and patch seams without loading an unselected host.
+_DSH_HOST_EXPORTS = ("build_dsh_host_runner", "build_dsh_operation_host_runner")
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _DSH_HOST_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from . import turn_dsh_host
+
+    value = getattr(turn_dsh_host, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_DSH_HOST_EXPORTS))
+
+
+def execute_turn_run_once(
+    args: argparse.Namespace,
+    *,
+    payload: dict[str, Any],
+    decision: Mapping[str, Any] | None = None,
+    registry_path: Path,
+    runtime_root: Path,
+    runtime_root_arg: str | None,
+    goal_ref: Mapping[str, object] | None,
+    goal_admission: FirstPartyHostGoalAdmission | None,
+    operator_environ: Mapping[str, str],
+    operator_inbox_urgency_projector: Callable[..., dict[str, Any]],
+    turn_start_hook_dispatch: Mapping[str, Any] | None = None,
+    native_host_runner: Callable[..., dict[str, Any]] | None = None,
+    native_session_binding_resolver: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
+    native_completion_lease_resolver: Callable[[], Mapping[str, Any]] | None = None,
+    native_task_validator: Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Adapt one prepared CLI Turn plan to the bounded Turn driver."""
+    execution_started = False
+    try:
+        if args.execute and goal_admission is None:
+            # Cached-result recovery still requires the current Goal lifetime.
+            goal_admission = FirstPartyHostGoalAdmission.for_plan(
+                registry_path=registry_path, goal_id=args.goal_id,
+                planned_goal_ref=goal_ref, agent_id=args.agent_id,
+            )
+        project, raw_argv, task_validator, execution_context = prepare_turn_host_request(
+            args, payload, native_host_runner=native_host_runner,
+            native_session_binding_resolver=native_session_binding_resolver,
+            native_task_validator=native_task_validator,
+            validator_builder=build_loopx_turn_command_validator,
+        )
+        selected_todo = execution_context["selected_todo"]
+        expected_todo_text_sha256 = execution_context["sha256"]
+        initial_lease_proof = execution_context.get("task_lease_proof") or None
+        initial_lease_epoch = execution_context.get("task_lease_epoch")
+        task_lease_proof = initial_lease_proof
+        task_lease_epoch = initial_lease_epoch
+        rebound_lease_active = False
+        cached_completion_lease: dict[str, Any] | None = None
+
+        def resolve_completion_lease() -> dict[str, Any]:
+            nonlocal cached_completion_lease
+            if cached_completion_lease is None:
+                if native_completion_lease_resolver is not None:
+                    cached_completion_lease = dict(native_completion_lease_resolver())
+                else:
+                    proof = execution_context.get("task_lease_proof") or {}
+                    cached_completion_lease = {
+                        "task_lease_idempotency_key": proof.get("idempotency_key"),
+                        "task_lease_expected_version": proof.get("expected_version"),
+                    }
+            return dict(cached_completion_lease)
+
+        def rebind_resumed_settlement_lease() -> None:
+            nonlocal task_lease_proof, task_lease_epoch, rebound_lease_active
+            if (
+                rebound_lease_active
+                or not args.execute
+                or not getattr(args, "resume_turn_key", None)
+                or native_completion_lease_resolver is None
+                or not selected_todo.get("todo_id")
+            ):
+                return
+            resolved_lease = resolve_completion_lease()
+            if resolved_lease.get("task_lease_idempotency_key") is None:
+                return
+            rebound_proof = {
+                "idempotency_key": resolved_lease["task_lease_idempotency_key"],
+                "expected_version": resolved_lease["task_lease_expected_version"],
+            }
+            task_lease_epoch = read_active_task_lease_epoch(
+                runtime_root=runtime_root,
+                goal_id=args.goal_id,
+                todo_id=str(selected_todo["todo_id"]),
+                agent_id=args.agent_id,
+                requested_proof=rebound_proof,
+            )
+            task_lease_proof = rebound_proof
+            rebound_lease_active = True
+            bind_heartbeat_settlement_receipt()
+        transaction = (
+            payload.get("transaction")
+            if isinstance(payload.get("transaction"), Mapping)
+            else {}
+        )
+        settlement_plan = (
+            transaction.get("settlement_plan")
+            if isinstance(transaction.get("settlement_plan"), Mapping)
+            else {}
+        )
+        raw_identity = (
+            settlement_plan.get("identity")
+            if isinstance(settlement_plan.get("identity"), Mapping)
+            else {}
+        )
+        settlement_identity = SettlementIdentity(
+            goal_id=str(raw_identity.get("goal_id") or args.goal_id),
+            agent_id=str(raw_identity.get("agent_id") or args.agent_id),
+            todo_id=str(
+                raw_identity.get("todo_id") or selected_todo.get("todo_id") or ""
+            ),
+            turn_instance_id=str(
+                raw_identity.get("turn_instance_id")
+                or transaction.get("turn_instance_id")
+                or transaction.get("turn_key")
+                or ""
+            ),
+            replan_obligation_id=(raw_identity.get("replan_obligation_id")
+                                  if isinstance(raw_identity, Mapping) else None),
+            request_subject=raw_identity.get("request_subject"),
+        )
+        persisted_effect_id = str(raw_identity.get("effect_id") or "")
+        if (
+            persisted_effect_id
+            and persisted_effect_id != settlement_identity.effect_id
+        ):
+            raise ValueError("Turn settlement identity effect_id is inconsistent")
+        replan_guard_scoped = execution_context["replan_guard_scoped"]
+        replan_obligation_id = (
+            replan_obligation_id_from_packet(
+                execution_context["replan_action_packet"]
+            )
+            if replan_guard_scoped
+            else None
+        )
+
+        def require_effect_ref(
+            effect_ref: str,
+            step_kind: SettlementStepKind,
+        ) -> None:
+            require_settlement_effect_ref(
+                effect_ref, step_kind, settlement_identity=settlement_identity
+            )
+
+        def append_settlement_event(
+            effect_payload: Mapping[str, object],
+            *,
+            event_kind: str,
+            status: str,
+            details: Mapping[str, object],
+        ) -> None:
+            append_turn_settlement_event(
+                effect_payload,
+                event_kind=event_kind,
+                status=status,
+                details=details,
+                goal_id=args.goal_id,
+                registry_path=registry_path,
+                runtime_root=runtime_root,
+                runtime_root_arg=runtime_root_arg,
+                goal_ref=goal_ref,
+                settlement_identity=settlement_identity,
+                append_cli_rollout_event=append_cli_rollout_event,
+            )
+
+        writeback_contract = execution_context["writeback"]
+        delivery_workspace_path = (
+            project
+            if isinstance(
+                writeback_contract.get("delivery_workspace_causality"), dict
+            ) and not (settlement_identity.replan_obligation_id and not selected_todo)
+            else None
+        )
+        completion_delivery_workspace = (
+            capture_delivery_workspace(
+                delivery_workspace_path,
+                peer_independent_worktree_required=bool(
+                    selected_todo.get("task_repository")
+                ),
+                repository_source="turn.delivery_workspace",
+            )
+            if delivery_workspace_path is not None
+            else None
+        )
+
+        def finish_explore_delivery(refresh: dict[str, object]) -> dict[str, object]:
+            return finish_turn_explore_delivery(
+                refresh,
+                registry_path=registry_path,
+                runtime_root=runtime_root,
+                settlement_identity=settlement_identity,
+            )
+
+        def split_candidate_vision(
+            result: dict[str, object],
+        ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+            return split_explore_result_input(
+                dict(result["agent_vision"]) if isinstance(result.get("agent_vision"), dict) else None,
+                None,
+                scope_context=dict(
+                    registry_path=registry_path, runtime_root_override=str(runtime_root),
+                    goal_id=settlement_identity.goal_id, agent_id=settlement_identity.agent_id,
+                    todo_id=settlement_identity.todo_id,
+                    turn_instance_id=settlement_identity.turn_instance_id,
+                ),
+            )
+
+        def refresh_candidate(
+            result: dict[str, object],
+            *,
+            completion_todo_id: str | None = None,
+            completion_turn_key: str | None = None,
+            dry_run: bool = False,
+        ) -> dict[str, object]:
+            # The host workspace is execution context, not state authority.
+            state_project = None
+            result_kind = str(result.get("result_kind") or "")
+            if result_kind in {"repair_required", "replan_required"}:
+                todo_id = str(selected_todo.get("todo_id") or "")
+                if not todo_id and not settlement_identity.replan_obligation_id:
+                    raise ValueError(
+                        f"{result_kind} requires one selected todo for typed writeback"
+                    )
+            # Diagnostics already live in the journal's typed host_result.
+            # Do not overwrite task context before refresh can reject a result.
+            progress_observation = result.get("progress_observation")
+            vision, explore_result = split_candidate_vision(result)
+            recovery_turn_instance_id = (
+                settlement_identity.turn_instance_id
+                if (
+                    bool(args.retry_failed_turn)
+                    and not dry_run
+                    and completion_turn_key == settlement_identity.turn_instance_id
+                )
+                else None
+            )
+            refresh_task_lease_proof = (
+                None
+                if completion_todo_id is not None and (recovery_turn_instance_id is None or rebound_lease_active)
+                else task_lease_proof
+            )
+            return refresh_state_run(
+                registry_path=registry_path,
+                runtime_root_override=runtime_root_arg,
+                goal_id=args.goal_id,
+                project=state_project,
+                state_file=None,
+                classification=str(result["classification"]),
+                recommended_action=str(result["recommended_action"]),
+                # A host's next_action is follow-up guidance, not refresh-state's
+                # explicit within-task step edit (which requires a runnable Todo).
+                # Keep both host texts in the durable host_result, including for
+                # completion/repair, without decorating a completed or blocked task.
+                delivery_batch_scale=str(result["delivery_batch_scale"]),
+                delivery_outcome=str(result["delivery_outcome"]),
+                delivery_workspace_path=delivery_workspace_path,
+                todo_id=settlement_identity.todo_id,
+                replan_obligation_id=settlement_identity.replan_obligation_id,
+                turn_instance_id=settlement_identity.turn_instance_id,
+                agent_id=args.agent_id,
+                progress_scope="goal",
+                autonomous_replan_recorded=result_kind == "replan_required",
+                progress_observation=(
+                    dict(progress_observation)
+                    if isinstance(progress_observation, dict) else None
+                ),
+                agent_vision_packet=vision,
+                explore_result=explore_result,
+                vision_unchanged_reason=(
+                    str(result.get("vision_unchanged_reason") or "") or None
+                ),
+                completion_todo_id=completion_todo_id,
+                completion_turn_key=completion_turn_key,
+                dry_run=dry_run,
+                sync_global=not bool(args.no_global_sync),
+                goal_ref=goal_ref,
+                task_lease_proof=refresh_task_lease_proof,
+                allow_same_generation_lease_renewal=refresh_task_lease_proof is not None,
+                validation_recovery_turn_instance_id=recovery_turn_instance_id,
+            )
+        # A Todo-less native governance Turn has no business artifact/argv.
+        # Its independent validator is the canonical semantic writeback preview,
+        # with the same captured obligation and fresh authority as the commit.
+        # Never treat a model's progress/completion assertion as that validation.
+        if task_validator is None and settlement_identity.replan_obligation_id and not selected_todo:
+            def validate_replan(_plan: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any]:
+                passed = (result.get("result_kind") == "replan_required"
+                    and refresh_candidate(dict(result), dry_run=True).get("ok") is True)
+                return {"status": "passed" if passed else "failed", "validator_kind": "callback",
+                    "summary": "independent native semantic replan preview " + ("passed" if passed else "failed"),
+                    **({"recovery_kind": "repair_required"} if not passed else {})}
+            task_validator = validate_replan
+
+        def writeback(
+            result: dict[str, object],
+            *,
+            completion_todo_id: str | None = None,
+            completion_turn_key: str | None = None,
+            effect_ref: str,
+        ) -> dict[str, object]:
+            require_effect_ref(effect_ref, SettlementStepKind.DURABLE_WRITEBACK)
+            if args.execute and completion_todo_id is None:
+                rebind_resumed_settlement_lease()
+            refresh = refresh_candidate(result, completion_todo_id=completion_todo_id,
+                completion_turn_key=completion_turn_key)
+            if refresh.get("ok") and (
+                refresh.get("appended")
+                or refresh.get("idempotent_replay")
+                or refresh.get("receipt_repair_required")
+            ):
+                # Receipt repair returns the verified original Run without
+                # appending it again. Its committed payload can deliver the
+                # requested attachment before repairing the quota receipt.
+                refresh = finish_explore_delivery({
+                    **refresh, "appended": True,
+                    "idempotent_replay": bool(
+                        refresh.get("idempotent_replay") or refresh.get("receipt_repair_required")
+                    ),
+                })
+                if refresh.get("ok") is True:
+                    # The shared quota owner treats this receipt as proof of
+                    # completed writeback. Keep it absent while a requested
+                    # attachment is still pending, even though the Run exists.
+                    append_settlement_event(
+                        refresh,
+                        event_kind="refresh_state",
+                        status="appended",
+                        details={"command": "turn run-once"},
+                    )
+                    # Turn callbacks acknowledge committed data, including
+                    # the original primary record returned on receipt repair.
+                    return {**refresh, "appended": True}
+            return refresh
+
+        def completion_intent(_result: dict[str, object]) -> dict[str, object]:
+            todo_id = str(selected_todo.get("todo_id") or "")
+            if not todo_id:
+                raise ValueError(
+                    "validated_completion requires one selected todo for lifecycle writeback"
+                )
+            _state_project, state_file = resolve_todo_state_path(
+                registry_path=registry_path,
+                goal_id=args.goal_id,
+                project=None,
+                state_file=None,
+            )
+            return read_durable_completion_evidence(
+                state_file, todo_id=todo_id, registry_path=registry_path,
+                goal_id=args.goal_id, runtime_root=runtime_root, operation="intent",
+            )
+
+        def todo_completion(
+            result: dict[str, object],
+            *,
+            effect_ref: str,
+        ) -> dict[str, object]:
+            todo_id = str(selected_todo.get("todo_id") or "")
+            if not todo_id:
+                raise ValueError(
+                    "validated_completion requires one selected todo for lifecycle writeback"
+                )
+            completion = write_turn_validated_completion(
+                registry_path=registry_path,
+                runtime_root_arg=runtime_root_arg,
+                goal_id=args.goal_id,
+                todo_id=todo_id,
+                completion_turn_key=settlement_identity.turn_instance_id,
+                expected_todo_text_sha256=expected_todo_text_sha256,
+                evidence=(
+                    "LoopX Turn validated completion: "
+                    + str(result.get("summary") or result["classification"])
+                ),
+                note=str(result["next_action"]),
+                agent_id=args.agent_id,
+                completion_delivery_workspace=completion_delivery_workspace,
+                completion_validation_workspace_path=delivery_workspace_path,
+                **resolve_completion_lease(),
+            )
+            if completion.get("ok") is not True:
+                return completion
+            # Project the continuation the Todo lifecycle durably recorded,
+            # never a host-normalized continuation. Contradictory or
+            # dangling durable state fails closed before any further
+            # writeback so the typed settlement sees the truthful outcome.
+            state_file = completion.get("state_file")
+            if not isinstance(state_file, str) or not state_file:
+                return {
+                    "ok": False,
+                    "appended": False,
+                    "reason": (
+                        "validated completion lifecycle did not report its "
+                        "durable Todo state file"
+                    ),
+                }
+            try:
+                completion_outcome = read_durable_completion_evidence(
+                    Path(state_file), todo_id=todo_id, registry_path=registry_path,
+                    goal_id=args.goal_id, runtime_root=runtime_root, operation="outcome",
+                )
+            except ValueError as exc:
+                return {
+                    "ok": False,
+                    "appended": False,
+                    "reason": f"durable completion projection failed: {exc}",
+                }
+            completion_payload = {
+                "ok": bool(completion.get("ok")),
+                # A completed Todo is idempotent under Turn replay: after an
+                # interrupted journal write, the retry may observe it done.
+                "appended": bool(completion.get("completed"))
+                and bool(
+                    completion.get("changed") or completion.get("idempotent_replay")
+                ),
+                "completion": completion_outcome,
+            }
+            if completion_payload["ok"] and completion_payload["appended"]:
+                append_settlement_event(
+                    completion_payload,
+                    event_kind="todo_complete",
+                    status=(
+                        "terminal_no_followup"
+                        if completion_outcome.get("continuation") == "no_followup"
+                        else "completed"
+                    ),
+                    details={
+                        "command": "turn run-once",
+                        "no_followup": (
+                            completion_outcome.get("continuation") == "no_followup"
+                        ),
+                    },
+                )
+            return completion_payload
+
+        def require_isolated_codex_writeback() -> None:
+            if args.host != "codex-cli" or not getattr(args, "codex_operation_tools", False):
+                return
+            from ..control_plane.turn_driver.codex_worker_identity import worker_isolation_requested
+
+            if worker_isolation_requested():
+                if goal_admission is None:
+                    raise ValueError("isolated managed Codex writeback requires current Goal authority")
+                goal_admission.require_running(operation="isolated_codex_durable_writeback")
+
+        def completion_writeback(
+            result: dict[str, object],
+            *,
+            effect_ref: str,
+        ) -> dict[str, object]:
+            nonlocal rebound_lease_active
+            require_effect_ref(effect_ref, SettlementStepKind.DURABLE_WRITEBACK)
+            require_isolated_codex_writeback()
+            prior = completion_readback()
+            if prior is None:
+                if args.execute:
+                    rebind_resumed_settlement_lease()
+                # A rejected attachment must not leave the Todo completed.
+                # The primary writer still rechecks the same capability owner
+                # before commit; this preview authorizes no later effects.
+                _, attachment = split_candidate_vision(result)
+                if attachment is not None:
+                    from ..capabilities.explore.result_writeback import prepare_result_attachment
+
+                    prepare_result_attachment(
+                        attachment, registry_path=registry_path, runtime_root=runtime_root,
+                        goal_id=settlement_identity.goal_id, agent_id=settlement_identity.agent_id,
+                        todo_id=settlement_identity.todo_id,
+                        turn_instance_id=settlement_identity.turn_instance_id,
+                    )
+                completion = todo_completion(result, effect_ref=effect_ref)
+            else:
+                # Completion may have atomically retired the execution lease
+                # before refresh failed. Read its exact canonical Turn receipt;
+                # resubmitting completion with a different/missing old fence is
+                # neither a new execution grant nor an idempotent request.
+                retained = read_heartbeat_settlement(runtime_root,
+                    goal_id=settlement_identity.goal_id, agent_id=settlement_identity.agent_id,
+                    todo_id=settlement_identity.todo_id, turn_instance_id=settlement_identity.turn_instance_id,
+                    replan_obligation_id=settlement_identity.replan_obligation_id,
+                    registry_path=registry_path, goal_ref=goal_ref)
+                if retained is None:
+                    raise RuntimeError(EXACT_SETTLEMENT_READBACK_NOT_FOUND)
+                if retained.prepared_lease is not None:
+                    if not isinstance(initial_lease_proof, Mapping):
+                        rebound_lease_active = True
+                    else:
+                        initial_epoch_int = (
+                            int(initial_lease_epoch)
+                            if isinstance(initial_lease_epoch, int)
+                            and not isinstance(initial_lease_epoch, bool)
+                            else None
+                        )
+                        initial_fields = prepared_lease_receipt_fields(
+                            initial_lease_proof, lease_epoch=initial_epoch_int,
+                        )
+                        if (
+                            retained.prepared_lease.get("prepared_lease_key_sha256")
+                            != initial_fields.get("prepared_lease_key_sha256")
+                            or retained.prepared_lease.get("prepared_lease_epoch")
+                            != initial_fields.get("prepared_lease_epoch")
+                        ):
+                            rebound_lease_active = True
+                if retained.completion_event is None:
+                    append_settlement_event({"ok": True, "appended": True}, event_kind="todo_complete",
+                        status="terminal_no_followup" if prior["continuation"] == "no_followup" else "completed",
+                        details={"command": "turn recovery probe", "no_followup": prior["continuation"] == "no_followup"})
+                completion = {"ok": True, "appended": True, "completion": prior}
+            if not completion.get("ok"):
+                return completion
+            todo_id = str(selected_todo.get("todo_id") or "")
+            refresh = writeback(
+                result,
+                completion_todo_id=todo_id,
+                completion_turn_key=settlement_identity.turn_instance_id,
+                effect_ref=effect_ref,
+            )
+            return {
+                "ok": bool(refresh.get("ok")),
+                "appended": bool(completion.get("appended"))
+                and bool(refresh.get("appended")),
+                "classification": refresh.get("classification"),
+                "completion": completion["completion"],
+            }
+
+        def terminal_closeout(
+            result: dict[str, object],
+            *,
+            effect_ref: str,
+        ) -> dict[str, object]:
+            require_effect_ref(effect_ref, SettlementStepKind.TERMINAL_CLOSEOUT)
+            if args.host == "codex-cli":
+                # Builtin completion has already retired the original lease.
+                # Verify the exact terminal receipt; never start another completion.
+                observed = terminal_closeout_resolver(effect_ref)
+                receipt = observed.get("payload")
+                if observed.get("kind") == "committed" and isinstance(receipt, dict):
+                    return receipt
+                return {
+                    "ok": False,
+                    "appended": False,
+                    "reason": observed.get("reason") or "Builtin terminal completion receipt is missing",
+                }
+            return todo_completion(result, effect_ref=effect_ref)
+
+        def codex_writeback(
+            result: dict[str, object], *, effect_ref: str,
+        ) -> dict[str, object]:
+            # Accountable refresh requires durable controller validation even for
+            # a predeclared terminal Todo. Other hosts keep their existing order.
+            if result.get("result_kind") == "validated_completion":
+                return completion_writeback(result, effect_ref=effect_ref)
+            require_isolated_codex_writeback()
+            return writeback(result, effect_ref=effect_ref)
+
+        def current_status() -> dict[str, object]:
+            return collect_turn_status_payload(
+                args,
+                registry_path=registry_path,
+                runtime_root_arg=runtime_root_arg,
+            )
+
+        def spend(*, effect_ref: str) -> dict[str, object]:
+            require_effect_ref(effect_ref, SettlementStepKind.QUOTA_SPEND)
+            spent = spend_quota_slot(
+                current_status(),
+                goal_id=args.goal_id,
+                slots=1,
+                execute=True,
+                source=(quota_spend_source_for_execution_context(
+                    payload.get("scheduler_execution_context"),
+                ) if settlement_identity.replan_obligation_id or settlement_identity.request_subject is not None else "adapter"),
+                agent_id=args.agent_id,
+                workspace_path=delivery_workspace_path,
+                replan_obligation_id=settlement_identity.replan_obligation_id,
+                turn_instance_id=(settlement_identity.turn_instance_id
+                                  if settlement_identity.replan_obligation_id or settlement_identity.request_subject is not None else None),
+                available_capabilities=args.available_capabilities,
+                scheduler_execution_context=(
+                    payload.get("scheduler_execution_context")
+                    if isinstance(payload.get("scheduler_execution_context"), dict)
+                    else None
+                ),
+                operator_inbox_urgency_projector=operator_inbox_urgency_projector,
+                effect_ref=effect_ref,
+                registry_path=registry_path,
+                goal_ref=goal_ref,
+            )
+            if spent.get("ok") and (
+                spent.get("appended")
+                or spent.get("idempotent_replay")
+                or spent.get("receipt_repair_required")
+            ):
+                readback = read_heartbeat_settlement(
+                    runtime_root,
+                    goal_id=settlement_identity.goal_id,
+                    agent_id=settlement_identity.agent_id,
+                    todo_id=settlement_identity.todo_id,
+                    turn_instance_id=settlement_identity.turn_instance_id,
+                    replan_obligation_id=settlement_identity.replan_obligation_id,
+                    registry_path=registry_path,
+                    goal_ref=goal_ref,
+                )
+                if readback is None:
+                    raise RuntimeError(EXACT_SETTLEMENT_READBACK_NOT_FOUND)
+                event = readback.spend_event
+                if event is None:
+                    append_settlement_event(
+                        spent,
+                        event_kind="quota_spend",
+                        status="appended",
+                        details={"command": "turn run-once"},
+                    )
+                return {**spent, "appended": True, "effect_ref": effect_ref}
+            return spent
+
+        (
+            completion_readback,
+            writeback_resolver,
+            spend_resolver,
+            terminal_closeout_resolver,
+        ) = build_turn_settlement_resolvers(
+            goal_id=args.goal_id,
+            registry_path=registry_path,
+            runtime_root=runtime_root,
+            goal_ref=goal_ref,
+            selected_todo=selected_todo,
+            settlement_identity=settlement_identity,
+            require_effect_ref=require_effect_ref,
+            append_settlement_event=append_settlement_event,
+            finish_explore_delivery=finish_explore_delivery,
+        )
+
+        def scheduler(_spend_payload: dict[str, object]) -> dict[str, object]:
+            turn_scheduler_context = (
+                payload.get("scheduler_execution_context")
+                if isinstance(payload.get("scheduler_execution_context"), dict)
+                else None
+            )
+            latest = build_live_quota_should_run_decision(
+                current_status(),
+                goal_id=args.goal_id,
+                agent_id=args.agent_id,
+                available_capabilities=args.available_capabilities,
+                include_scheduler_detail=False,
+                codex_app_current_rrule=None,
+                registry_path=registry_path,
+                runtime_root=runtime_root,
+                route_source="loopx_turn_run_once",
+                scheduler_execution_context=turn_scheduler_context,
+                operator_inbox_urgency_projector=operator_inbox_urgency_projector,
+                bounded_research_frontier_projector=(
+                    project_live_explore_composition_frontier
+                ),
+                goal_ref=goal_ref,
+            )
+            hint = (
+                latest.get("scheduler_hint")
+                if isinstance(latest.get("scheduler_hint"), dict)
+                else {}
+            )
+            phase = hint.get("execution_phase")
+            return (
+                dict(phase)
+                if isinstance(phase, dict)
+                else {
+                    "disposition": "contract_error",
+                    "completed": False,
+                    "acknowledged": False,
+                    "apply_needed": False,
+                }
+            )
+
+        host_runner: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None
+        session_binding_resolver = None
+
+        def current_launch_decision(current_registry: Path) -> Mapping[str, Any]:
+            # Native and stdio transports recheck the original work at launch.
+            # A global route checks its source even if the mirror is unchanged.
+            return current_turn_host_launch_decision(
+                args, registry_path=current_registry, runtime_root=runtime_root,
+                identity=settlement_identity,
+                planned_effective_action=execution_context["effective_action"],
+                planned_selected_work_basis=execution_context.get("selected_work_basis"),
+                scheduler_execution_context=payload.get("scheduler_execution_context") or {},
+                operator_inbox_urgency_projector=operator_inbox_urgency_projector,
+                turn_start_hook_dispatch=turn_start_hook_dispatch, goal_ref=goal_ref,
+            )
+
+        if args.host == "codex-app-server":
+            native_admission = (goal_admission or FirstPartyHostGoalAdmission.for_plan(
+                registry_path=registry_path, goal_id=args.goal_id, planned_goal_ref=goal_ref,
+            )).with_launch_decision(current_launch_decision)
+
+            def run_native_host(request: Mapping[str, Any]) -> dict[str, Any]:
+                return native_host_runner(request, lambda: native_admission.launch_lifetime(
+                    operation="native_conversation_turn_launch"))
+
+            host_runner = run_native_host
+            session_binding_resolver = native_session_binding_resolver
+        elif args.host == "codex-cli":
+            host_runner = build_codex_cli_host_runner(
+                args, runtime_root=runtime_root, project=project,
+                registry_path=registry_path, goal_ref=goal_ref,
+                goal_admission=goal_admission,
+                current_launch_decision=current_launch_decision,
+                run_codex_cli_host=run_codex_cli_host,
+            )
+
+            def resolve_built_in_session_binding(
+                turn_envelope: Mapping[str, Any],
+            ) -> dict[str, str] | None:
+                session_scope = str((payload.get("session", {}).get("context_policy") or {}).get("binding_scope") or "todo")
+                return codex_cli_session_binding(
+                    runtime_root, goal_admission=goal_admission,
+                    session_scope=session_scope,
+                    **({"work_contract": payload["work_contract"]} if "work_contract" in payload
+                       else {"turn_envelope": turn_envelope}),
+                )
+
+            session_binding_resolver = resolve_built_in_session_binding
+        elif args.host == "dsh":
+            if getattr(args, "dsh_operation_module", None):
+                host_runner = getattr(_sys.modules[__name__], "build_dsh_operation_host_runner")(
+                    args, runtime_root=runtime_root, registry_path=registry_path,
+                    workspace=project, environ=operator_environ,
+                    goal_admission=goal_admission,
+                )
+
+                def resolve_dsh_operation_session(envelope: Mapping[str, Any]) -> dict[str, str] | None:
+                    return codex_cli_session_binding(
+                        runtime_root, goal_admission=goal_admission, host="dsh",
+                        **({"work_contract": payload["work_contract"]} if "work_contract" in payload
+                           else {"turn_envelope": envelope}),
+                    )
+
+                session_binding_resolver = resolve_dsh_operation_session
+            else:
+                host_runner = getattr(_sys.modules[__name__], "build_dsh_host_runner")(
+                    args, workspace=project, environ=operator_environ,
+                )
+
+        request_locator = payload.get("delegation_operation_locator")
+        settlement_admission = None
+        if settlement_identity.request_subject is not None:
+            if not isinstance(request_locator, dict):
+                raise ValueError("request Turn is missing its original delegation locator")
+            from ..control_plane.collaboration.delegation_context import (
+                require_current_request_operation, request_settlement_lifetime,
+            )
+            def settlement_admission():
+                return request_settlement_lifetime(request_locator, settlement_identity,
+                    registry_path=registry_path, runtime_root=runtime_root, workspace=project)
+
+        if args.host == "codex-cli" and goal_admission is not None:
+            request_lifetime = settlement_admission or nullcontext
+
+            @contextmanager
+            def codex_settlement_admission():
+                with request_lifetime():
+                    # Independent validation can outlive the running Goal.
+                    # Check the original authority before any settlement effect.
+                    goal_admission.require_running(operation="codex_cli_turn_settle")
+                    yield
+
+            settlement_admission = codex_settlement_admission
+
+        def bind_heartbeat_settlement_receipt() -> None:
+            replan_packet = execution_context["replan_action_packet"]
+            capability_guard = (
+                replan_packet.get("capability_guard")
+                if isinstance(replan_packet, Mapping)
+                else None
+            )
+            ensure_turn_heartbeat_settlement_receipt(
+                runtime_root,
+                settlement_identity,
+                semantic_replan_guard_scoped=replan_guard_scoped,
+                semantic_replan_obligation_id=replan_obligation_id,
+                semantic_replan_capability_guard=capability_guard,
+                quota_spend_source=(
+                    quota_spend_source_for_execution_context(payload.get("scheduler_execution_context"))
+                    if settlement_identity.replan_obligation_id or settlement_identity.request_subject is not None
+                    else None
+                ),
+                goal_ref=goal_ref,
+                task_lease_proof=task_lease_proof,
+                task_lease_epoch=task_lease_epoch,
+            )
+
+        def on_managed_start_admitted() -> None:
+            if settlement_identity.request_subject is not None:
+                require_current_request_operation(request_locator, settlement_identity,
+                    registry_path=registry_path, runtime_root=runtime_root, workspace=project)
+            # A Host retry is new work: retain the recorded preparation so the
+            # shared launch/requalification owner can reject a replaced lease.
+            # Only a validated settlement effect may resolve and bind a
+            # recovery lease for an existing frozen result.
+            bind_heartbeat_settlement_receipt()
+
+        managed_cadence = managed_cadence_start(
+            runtime_root=runtime_root,
+            goal_id=args.goal_id,
+            agent_id=args.agent_id,
+            automation_id=args.automation_id,
+            manual_reason=args.manual_interval_bypass_reason,
+            on_admitted=on_managed_start_admitted,
+            request_id=settlement_identity.effect_id if uses_effect_bound_start_identity(
+                args.host,
+                getattr(args, "host_adapter_request_schema", None),
+                getattr(args, "validation_command_json", None),
+            ) else None,
+        )
+
+        execution_started = bool(args.execute)
+        result = run_loopx_turn_once(
+            payload,
+            decision_capture_payload=decision,
+            require_decision_capture=True,
+            host_argv=raw_argv,
+            host_adapter_request_schema=getattr(args, "host_adapter_request_schema", None),
+            host_runner=host_runner,
+            session_binding_resolver=session_binding_resolver,
+            project=project,
+            runtime_root=runtime_root,
+            goal_id=args.goal_id,
+            timeout_seconds=args.timeout_seconds,
+            execute=bool(args.execute),
+            retry_failed=bool(args.retry_failed_turn),
+            resume_existing_turn=args.host == "generic-cli" and bool(getattr(args, "resume_turn_key", None)),
+            task_validator=task_validator,
+            settlement_admission=settlement_admission,
+            writeback=(codex_writeback if args.host == "codex-cli" else writeback)
+            if args.execute else None,
+            completion_writeback=completion_writeback if args.execute else None,
+            completion_intent=completion_intent if args.execute else None,
+            terminal_closeout=terminal_closeout if args.execute else None,
+            spend=spend if args.execute else None,
+            writeback_resolver=writeback_resolver if args.execute else None,
+            spend_resolver=spend_resolver if args.execute else None,
+            terminal_closeout_resolver=(
+                terminal_closeout_resolver if args.execute else None
+            ),
+            scheduler=scheduler if args.execute else None,
+            post_settlement=(configured_post_settlement(
+                payload, registry_path=registry_path, goal_id=args.goal_id, agent_id=args.agent_id,
+            ) if args.execute else None),
+            admit_start=managed_cadence.admit if args.execute else None,
+            confirm_start=managed_cadence.confirm if args.execute else None,
+            goal_admission=goal_admission,
+            host_launch_guard=(partial(
+                goal_admission.with_launch_decision(current_launch_decision).launch_lifetime,
+                operation="turn_external_host_launch",
+            ) if raw_argv is not None and goal_admission is not None else None),
+        )
+        if args.execute:
+            result.update(drain_committed_turn_post_writeback_hooks(
+                registry_path=registry_path, runtime_root=runtime_root,
+                identity=settlement_identity, goal_ref=goal_ref,
+                available_capabilities=args.available_capabilities,
+            ))
+        return result
+    except Exception as exc:  # noqa: BLE001 - CLI boundary renders typed JSON failure
+        from ..usage_ping import capture_failure
+
+        capture_failure(exc)
+        journal_readback = None
+        if execution_started:
+            transaction = payload.get("transaction") or {}
+            try:
+                journal_readback = inspect_loopx_turn_journal(
+                    runtime_root,
+                    goal_id=args.goal_id,
+                    agent_id=args.agent_id,
+                    turn_key=str(transaction.get("turn_key") or ""),
+                )
+            except Exception:  # noqa: BLE001 - retain original error and unknown effects
+                pass
+        return build_turn_error_payload(
+            payload,
+            exc,
+            turn_command="run-once",
+            execution_started=execution_started,
+            journal_readback=journal_readback,
+        )
+
+
+__all__ = [name for name in globals() if not name.startswith("_")] + list(_DSH_HOST_EXPORTS)

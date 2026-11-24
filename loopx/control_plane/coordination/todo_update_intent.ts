@@ -1,0 +1,261 @@
+import {claimExecutionReference} from "./claim_execution.ts";
+/** Canonical edit decoding and materialization shared by ordinary updates and
+ * User completion. Admission, validation effects and commits stay with callers. */
+import {decodeTaskLeaseProof} from "./task_lease_proof.ts";
+import {isBlockedLifecycleTransition} from "./todo_blocked_lifecycle.ts";
+import {isDeferredReopen} from "./todo_deferred_lifecycle.ts";
+import {planTodoPriority} from "../todos/priority.ts";
+import type {JsonObject} from "../effect_program.ts";
+import {AuthorityStoreProtocolError, canonicalAuthorityObject, canonicalAuthorityBytes,
+  requireAuthorityBoolean, requireAuthorityDate, requireAuthorityStoreId} from "./authority_store_codec.ts";
+import {normalizeRegisteredTodoAgents, normalizeTodoAgent} from "./todo_agents.ts";
+import {canonicalTodoRecord} from "./todo_presentation.ts";
+import {planTodoAuthoringScope, TODO_AUTHORING_SCOPE_REQUEST_SCHEMA} from "../todos/authoring_scope.ts";
+import {shouldRecordTodoMutationActor} from "../todos/public_update.ts";
+import {normalizeNativePlanningIntent, planNativeTodoUpdate} from "../todos/native_update_plan.ts";
+import {decodeMonitorPollObservation, type MonitorPollObservation} from "../todos/monitor_metadata.ts";
+import {validateLegacyContinuationPolicyRepair, removedTodoContinuationPolicy} from "../todos/legacy_continuation_policy_migration.ts";
+import {
+  decodeCompletionValidationRevision,
+  type CompletionValidationRevision,
+} from "../todos/completion_validation_revision.ts";
+import { BARE_SHA256_PATTERN } from "../content_digest.ts";
+const UPDATE_FIELDS = new Set(["text", "note"]);
+
+export interface CoordinationTodoUpdateInput {
+  readonly goal_id: string;
+  readonly todo_id: string;
+  readonly expected_role: string | null;
+  readonly actor_agent_id: string | null;
+  readonly registered_agents: readonly string[];
+  readonly operation_id: string;
+  readonly expected_provider_revision?: string;
+  readonly expected_registry_sha256?: string;
+  readonly lifecycle_grants?: readonly JsonObject[];
+  readonly authority_reason?: string | null;
+  readonly patch: JsonObject;
+  readonly clear_fields: readonly string[];
+  readonly dry_run: boolean;
+  readonly now: Date;
+  readonly claim_operation_id?: string;
+  readonly lease_idempotency_key?: string | null;
+  readonly lease_expected_version?: number | null;
+  readonly planning_intent?: JsonObject;
+  readonly completion?: JsonObject;
+  readonly monitor_observation?: JsonObject;
+  readonly completion_validation_revision?: CompletionValidationRevision;
+}
+
+export type NormalizedCoordinationTodoUpdateInput =
+  Omit<CoordinationTodoUpdateInput, "monitor_observation"> & {
+    readonly monitor_observation?: MonitorPollObservation;
+  };
+
+/** Only edit intent crosses into the terminal owner; actor/lease authority is
+ * carried once, in the enclosing terminal request. */
+export type TodoCompletionEdit = Pick<CoordinationTodoUpdateInput,
+  "patch" | "clear_fields" | "planning_intent" | "expected_provider_revision" | "expected_registry_sha256"> & {
+  readonly validation_source_provider_revision?: string;
+};
+
+export function normalizeTodoUpdateEnvelope(
+  raw: CoordinationTodoUpdateInput,
+): CoordinationTodoUpdateInput {
+  if (raw.expected_provider_revision !== undefined) {
+    requireAuthorityStoreId(raw.expected_provider_revision, "expected_provider_revision");
+  }
+  if (raw.expected_registry_sha256 !== undefined && !BARE_SHA256_PATTERN.test(raw.expected_registry_sha256)) {
+    throw new AuthorityStoreProtocolError("expected_registry_sha256 must be a SHA-256 digest");
+  }
+  if (raw.authority_reason != null && typeof raw.authority_reason !== "string") {
+    throw new AuthorityStoreProtocolError("authority_reason must be a string");
+  }
+  const completion = raw.completion === undefined ? undefined : canonicalAuthorityObject(raw.completion, "Todo completion update payload");
+  if (completion !== undefined) {
+    if (Object.keys(completion).some(field => ![
+      "validation_declaration", "validation_receipt", "source_provider_revision",
+      "completion_policy_request", "goal_acceptance_source_binding", "goal_acceptance_validation_receipts",
+    ].includes(field))) throw new AuthorityStoreProtocolError("Unknown Todo completion update field");
+    for (const field of ["validation_declaration", "validation_receipt", "completion_policy_request", "goal_acceptance_source_binding"]) {
+      if (completion[field] != null) canonicalAuthorityObject(completion[field], field);
+    }
+    if (completion.source_provider_revision != null) {
+      requireAuthorityStoreId(completion.source_provider_revision, "completion source provider revision");
+    }
+  }
+  const planningIntent = normalizeNativePlanningIntent(raw.planning_intent);
+  if (completion !== undefined && typeof planningIntent.status === "string") {
+    planningIntent.status = planningIntent.status.toLowerCase();
+  }
+  if (raw.completion !== undefined && planningIntent.status !== "done") {
+    throw new AuthorityStoreProtocolError("Completion payload requires status=done");
+  }
+  claimExecutionReference(raw.claim_operation_id, raw.lease_idempotency_key, raw.lease_expected_version);
+  if (raw.claim_operation_id != null && raw.actor_agent_id === null) throw new AuthorityStoreProtocolError("A task claim reference requires its actor");
+  const key = raw.lease_idempotency_key ?? null;
+  const version = raw.lease_expected_version ?? null;
+  if (key !== null && (typeof key !== "string" || !key.trim() || key !== key.trim())) {
+    throw new AuthorityStoreProtocolError("lease_idempotency_key must be a non-empty unpadded string");
+  }
+  if (version !== null && (!Number.isSafeInteger(version) || version < 0)) {
+    throw new AuthorityStoreProtocolError("lease_expected_version must be a non-negative safe integer");
+  }
+  const patch = canonicalAuthorityObject(raw.patch, "Todo update patch");
+  const clearFields = raw.clear_fields.map((field, index) =>
+    requireAuthorityStoreId(field, `clear_fields[${index}]`));
+  const observation = raw.monitor_observation === undefined
+    ? undefined
+    : canonicalAuthorityObject(raw.monitor_observation, "Monitor observation");
+  const validationRevision = raw.completion_validation_revision === undefined
+    ? undefined
+    : decodeCompletionValidationRevision(raw.completion_validation_revision);
+  if (observation !== undefined) {
+    // Both public observation transports use the same proof decoder. A partial
+    // proof must never be collapsed to absence during admission.
+    decodeTaskLeaseProof(key === null && version === null ? null :
+      {idempotency_key: key, expected_version: version});
+    if (completion !== undefined || Object.keys(patch).length || clearFields.length ||
+        Object.keys(planningIntent).some(key => !["status", "reason", "no_followup"].includes(key)) ||
+        (planningIntent.status != null && planningIntent.status !== "open") ||
+        (planningIntent.no_followup != null && planningIntent.no_followup !== false)) {
+      throw new AuthorityStoreProtocolError("Monitor observation accepts only reason and explicit reactivation; not copy, ownership, configuration or completion edits");
+    }
+  }
+  if (validationRevision !== undefined &&
+      (completion !== undefined || observation !== undefined ||
+       Object.keys(patch).length + clearFields.length + Object.keys(planningIntent).length > 0)) {
+    throw new AuthorityStoreProtocolError(
+      "completion validation revision cannot be combined with another Todo edit",
+    );
+  }
+  if (observation === undefined && validationRevision === undefined &&
+      Object.keys(patch).length + clearFields.length + Object.keys(planningIntent).length === 0) {
+    throw new AuthorityStoreProtocolError("Todo update requires a non-empty patch");
+  }
+  if (new Set(clearFields).size !== clearFields.length) {
+    throw new AuthorityStoreProtocolError("clear_fields must be unique");
+  }
+  const unsupported = [...Object.keys(patch), ...clearFields]
+    .find((field) => !UPDATE_FIELDS.has(field));
+  if (unsupported !== undefined) {
+    throw new AuthorityStoreProtocolError(`Todo update does not own field ${unsupported}`);
+  }
+  if (Object.keys(patch).some((field) => clearFields.includes(field))) {
+    throw new AuthorityStoreProtocolError("Todo update cannot patch and clear the same field");
+  }
+  if (raw.expected_role !== null && !["agent", "user"].includes(raw.expected_role)) {
+    throw new AuthorityStoreProtocolError("expected_role must be agent or user");
+  }
+  requireAuthorityBoolean(raw.dry_run, "dry_run");
+  requireAuthorityDate(raw.now, "now");
+  return {...raw, ...(completion === undefined ? {} : {completion}),
+    ...(observation === undefined ? {} : {monitor_observation: observation}),
+    ...(validationRevision === undefined ? {} : {completion_validation_revision: validationRevision}),
+    planning_intent: planningIntent, lease_idempotency_key: key, lease_expected_version: version,
+    goal_id: requireAuthorityStoreId(raw.goal_id, "goal id"),
+    todo_id: requireAuthorityStoreId(raw.todo_id, "todo id"),
+    operation_id: requireAuthorityStoreId(raw.operation_id, "operation id"),
+    actor_agent_id: raw.actor_agent_id === null ? null :
+      normalizeTodoAgent(raw.actor_agent_id, "actor_agent_id"),
+    registered_agents: normalizeRegisteredTodoAgents(raw.registered_agents),
+    patch, clear_fields: clearFields};
+}
+
+export function normalizeTodoUpdateInput(
+  raw: CoordinationTodoUpdateInput,
+): NormalizedCoordinationTodoUpdateInput {
+  const envelope = normalizeTodoUpdateEnvelope(raw);
+  const observation = envelope.monitor_observation === undefined
+    ? undefined
+    : decodeMonitorPollObservation(envelope.monitor_observation);
+  const {monitor_observation: _rawObservation, ...normalized} = envelope;
+  return {
+    ...normalized,
+    ...(observation === undefined ? {} : {monitor_observation: observation}),
+  };
+}
+
+export function prepareUpdatedTodo(
+  todo: JsonObject, input: NormalizedCoordinationTodoUpdateInput, head: JsonObject, kind: "planning" | "user_completion" = "planning",
+): {next: JsonObject; changed: boolean; clearFields: string[]; monitorTransition?: JsonObject} {
+  // Copy-only edits must honor the same imported-policy repair as field plans.
+  // Receipt replay is handled before materialization by the transaction owner.
+  validateLegacyContinuationPolicyRepair(todo, input.planning_intent ?? {}, input.todo_id);
+  const removedContinuationPolicy = removedTodoContinuationPolicy(todo.removed_continuation_policy);
+  if (removedContinuationPolicy !== null &&
+      (Object.keys(input.patch).length > 0 || input.clear_fields.length > 0)) {
+    throw new AuthorityStoreProtocolError(
+      "removed continuation policy repair must be submitted without copy edits",
+    );
+  }
+  const next: JsonObject = {...todo, ...input.patch};
+  for (const field of input.clear_fields) delete next[field];
+  // Preserve the public planner's legacy metadata semantics. Raw copy edits
+  // already carry actor attribution, while planning-only updates historically
+  // leave last_actor_agent_id untouched.
+  if (shouldRecordTodoMutationActor(todo, input.patch, input.clear_fields,
+      input.planning_intent ?? {}, input.monitor_observation)) {
+    next.last_actor_agent_id = input.actor_agent_id;
+  }
+  next.updated_at = input.now.toISOString().replace(/\.\d{3}Z$/u, "Z");
+  const clearFields = new Set(input.clear_fields);
+  if (removedContinuationPolicy !== null) {
+    delete next.removed_continuation_policy;
+    clearFields.add("removed_continuation_policy");
+  }
+  let monitorTransition: JsonObject | undefined;
+  if (Object.keys(input.planning_intent ?? {}).length || input.monitor_observation !== undefined) {
+    const clearLifecycleWait = input.planning_intent?.resume_when == null &&
+      (isBlockedLifecycleTransition(input, todo) || isDeferredReopen(input, todo));
+    const intent = clearLifecycleWait ? {...input.planning_intent, clear_resume_when: true}
+      : input.planning_intent ?? {};
+    const plan = planNativeTodoUpdate(todo, intent, head,
+      input.actor_agent_id, input.registered_agents, String(next.updated_at), kind, input.monitor_observation);
+    const updates = plan.updates;
+    monitorTransition = plan.monitorTransition;
+    for (const [field, value] of Object.entries(updates)) {
+      // Markdown compatibility omits empty scalar metadata. Treat an
+      // explicit empty planning scalar as a clear in the canonical record as
+      // well; omission and clear are no longer conflated by the planner.
+      if (value === null || value === "") { delete next[field]; clearFields.add(field); }
+      else next[field] = value;
+    }
+    if (intent.clear_resume_when === true) {
+      // These are observations of the old condition, not independent resume
+      // authority. Keeping either after an explicit clear resurrects a stale
+      // wait in canonical readback even though resume_when is absent.
+      delete next.resume_condition;
+      delete next.resume_ready;
+      clearFields.add("resume_condition");
+      clearFields.add("resume_ready");
+    }
+    next.done = next.status === "done" || next.status === "deferred";
+  }
+  // Derive text/title/priority together from the original record and caller intent.
+  // This runs within the same admitted head/CAS and never rewrites receipt intent.
+  const priorityUpdate = planTodoPriority(todo, {
+    ...input.planning_intent, ...(Object.hasOwn(input.patch, "text") ? {text: input.patch.text} : {}),
+  });
+  Object.assign(next, priorityUpdate);
+  if (priorityUpdate.priority === null) {
+    delete next.priority; delete next.title; clearFields.add("priority"); clearFields.add("title");
+  }
+  if (kind === "user_completion" && (todo.status !== "done" || Object.hasOwn(input.planning_intent ?? {}, "task_class"))) {
+    planTodoAuthoringScope({schema_version: TODO_AUTHORING_SCOPE_REQUEST_SCHEMA, command: "class", role: "user", todo: next,
+      intent: {task_class: next.task_class, blocks_agent: next.blocks_agent ?? null, global_gate: next.global_gate ?? null}});
+  }
+  canonicalTodoRecord(next, "updated Todo");
+  const changedBeforeAudit = {...next};
+  delete changedBeforeAudit.last_actor_agent_id;
+  delete changedBeforeAudit.updated_at;
+  const originalBeforeAudit = {...todo};
+  delete originalBeforeAudit.last_actor_agent_id;
+  delete originalBeforeAudit.updated_at;
+  const changed = !canonicalAuthorityBytes(changedBeforeAudit).equals(
+    canonicalAuthorityBytes(originalBeforeAudit));
+  if (!changed) {
+    next.last_actor_agent_id = todo.last_actor_agent_id;
+    next.updated_at = todo.updated_at;
+  }
+  return {next, changed, clearFields: [...clearFields], ...(monitorTransition ? {monitorTransition} : {})};
+}

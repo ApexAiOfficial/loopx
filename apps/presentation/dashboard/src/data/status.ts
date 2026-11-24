@@ -1,6 +1,8 @@
 import rawStatus from "../../../../../examples/status.example.json";
 import { z } from "zod";
 
+import { goalAcceptanceObservationSchema } from "./goal-acceptance-observation";
+
 import { goalChannelProjectionSchema } from "./goal-channel-frontstage";
 
 export const quotaSchema = z.object({
@@ -41,6 +43,9 @@ export const controlPlaneSchema = z.object({
 }).passthrough();
 
 export const orchestrationPolicySchema = z.object({
+  model_config: z.object({ model: z.string(), reasoning_effort: z.string().optional() }).optional(),
+  execution_config: z.string().optional(),
+
   mode: z.string().optional().default("default"),
   orchestration_mode: z.string().optional().nullable(),
   spawn_allowed: z.boolean().optional().default(false),
@@ -58,36 +63,82 @@ export const reviewMaterialSchema = z.object({
 });
 
 export const todoItemSchema = z.object({
-  index: z.number(),
+  // Legacy Markdown Todos have a source index. Native Todos are addressed by
+  // todo_id and intentionally have no synthetic index.
+  index: z.number().optional().nullable(),
   done: z.boolean(),
   text: z.string(),
   schema_version: z.string().optional().nullable(),
   todo_id: z.string().optional().nullable(),
   role: z.string().optional().nullable(),
   status: z.string().optional().nullable(),
+  resume_when: z.string().optional().nullable(),
+  resume_ready: z.boolean().optional().nullable(),
+  resume_condition: z.record(z.string(), z.unknown()).optional().nullable(),
   priority: z.string().optional().nullable(),
   title: z.string().optional().nullable(),
   archive_state: z.string().optional().nullable(),
   source_section: z.string().optional().nullable(),
   task_class: z.string().optional().nullable(),
+  cadence: z.string().optional().nullable(),
+  next_due_at: z.string().optional().nullable(),
+  expires_at: z.string().optional().nullable(),
+  last_checked_at: z.string().optional().nullable(),
+  target_key: z.string().optional().nullable(),
+  watch_only: z.union([z.boolean(), z.string()]).optional().nullable(),
+  task_domain: z.string().optional().nullable(),
   action_kind: z.string().optional().nullable(),
+  capability_binding_ref: z.string().optional().nullable(),
+  // Canonical author provenance, distinct from the Agent authorized to reply.
+  created_by: z.string().optional().nullable(),
   claimed_by: z.string().optional().nullable(),
   required_capabilities: z.array(z.string()).optional(),
   note: z.string().optional().nullable(),
   evidence: z.string().optional().nullable(),
+  // Public-safe blocker cause; producers project it only for blocked work.
+  reason: z.string().optional().nullable(),
+  completed_at: z.string().optional().nullable(),
   updated_at: z.string().optional().nullable(),
+  completion_validation_required: z.boolean().optional().nullable(),
+  completion_validation_sha256: z.string().optional().nullable(),
+  completion_validation_revision: z.number().int().nonnegative().optional().nullable(),
+  completion_validation_revision_history: z.array(z.object({
+    revision: z.number().int().positive(),
+    previous_declaration_sha256: z.string().nullable(),
+    declaration_sha256: z.string(),
+    actor_agent_id: z.string(),
+    revised_at: z.string(),
+  }).passthrough()).optional().default([]),
   review_materials: z.array(reviewMaterialSchema).optional().default([]),
-}).passthrough();
+}).passthrough().refine(
+  (todo) => todo.index != null || Boolean(todo.todo_id?.trim()),
+  { path: ["todo_id"], message: "Todo without a source index requires todo_id" },
+);
+
+export const todoCapabilityActionsSchema = z.object({
+  schema_version: z.literal("todo_capability_actions_v0"),
+  total_count: z.number().int().nonnegative(),
+  groups: z.array(z.object({
+    action_kind: z.string().min(1),
+    count: z.number().int().nonnegative(),
+    latest_at: z.string().optional().nullable(),
+    items: z.array(todoItemSchema).max(3),
+  })).default([]),
+});
 
 export const todoGroupSchema = z.object({
   source_section: z.string().optional().nullable(),
   total_count: z.number().optional().default(0),
-  open_count: z.number().optional().default(0),
-  done_count: z.number().optional().default(0),
+  open_count: z.number().optional(),
+  done_count: z.number().optional(),
+  advancement_done_count: z.number().optional(),
   items: z.array(todoItemSchema).optional().default([]),
+  deferred_items: z.array(todoItemSchema).optional(),
+  recent_completed_advancement_items: z.array(todoItemSchema).optional(),
+  capability_actions: todoCapabilityActionsSchema.optional(),
 });
 
-export const todoIndexItemSchema = todoItemSchema.extend({
+export const todoIndexItemSchema = todoItemSchema.safeExtend({
   goal_id: z.string(),
   source: z.string().optional().nullable(),
   event_count: z.number().optional().default(0),
@@ -105,6 +156,8 @@ export const todoIndexSchema = z.object({
   current_projected_count: z.number().optional().default(0),
   rollout_event_count: z.number().optional().default(0),
   item_limit: z.number().optional().nullable(),
+  complete: z.boolean().optional(),
+  unavailable_goal_ids: z.array(z.string()).optional(),
   items: z.array(todoIndexItemSchema).optional().default([]),
 });
 
@@ -196,6 +249,16 @@ export const goalChannelNotificationRowSchema = z.object({
   configured: z.boolean().optional().default(false),
   enabled: z.boolean().optional().default(false),
   human_gate_auto_notify_enabled: z.boolean().optional().default(false),
+  blocked_notice_auto_notify_enabled: z.boolean().optional().default(false),
+  steward_notice_delivery: z.object({
+    pending_count: z.number(),
+    failed_count: z.number(),
+  }).optional(),
+  blocked_notice_delivery: z.object({
+    delivered_count: z.number(),
+    unverified_count: z.number(),
+    resolved_count: z.number(),
+  }).optional(),
   target_ref: z.string().optional().nullable(),
   receipt_count: z.number().optional().default(0),
   last_notified_at: z.string().optional().nullable(),
@@ -209,12 +272,15 @@ export const goalChannelNotificationProjectionSchema = z.object({
 
 export const projectAssetTodoSummarySchema = z.object({
   source_section: z.string().optional().nullable(),
-  open: z.number().optional().default(0),
-  done: z.number().optional().default(0),
+  open: z.number().optional(),
+  done: z.number().optional(),
   total: z.number().optional().default(0),
+  advancement_done_count: z.number().optional(),
   next: z.string().optional().nullable(),
   next_index: z.number().optional().nullable(),
   items: z.array(todoItemSchema).optional().default([]),
+  recent_completed_advancement_items: z.array(todoItemSchema).optional().default([]),
+  capability_actions: todoCapabilityActionsSchema.optional(),
 });
 
 export const dependencyBlockerSchema = z.object({
@@ -313,6 +379,19 @@ export const projectAssetTodoProjectionGapSchema = z.object({
   recommended_action: z.string().optional().nullable(),
 });
 
+export const nativeChildActivitySchema = z.object({
+  schema_version: z.literal("native_subagent_activity_v0"),
+  observation: z.enum(["unknown", "coordinator_reported", "host_observed", "mixed"]),
+  host_attested: z.boolean(),
+  configured_limit: z.number().int().nonnegative(),
+  launched_count: z.number().int().nonnegative(),
+  skipped_count: z.number().int().nonnegative(),
+  capacity_rejected_count: z.number().int().nonnegative(),
+  host_failed_count: z.number().int().nonnegative(),
+  parent_accepted_count: z.number().int().nonnegative(),
+  turn_instance_id: z.string(),
+});
+
 export const projectAssetSchema = z.object({
   owner: z.string(),
   gate: z.string(),
@@ -323,6 +402,7 @@ export const projectAssetSchema = z.object({
   quota: quotaSchema.optional().nullable(),
   control_plane: controlPlaneSchema.optional().nullable(),
   orchestration: orchestrationPolicySchema.optional().nullable(),
+  native_child_activity: nativeChildActivitySchema.optional().nullable(),
   latest_validation: projectAssetLatestValidationSchema.optional().nullable(),
   stale_latest_run_warning: staleLatestRunWarningSchema.optional().nullable(),
   todo_projection_gap: projectAssetTodoProjectionGapSchema.optional().nullable(),
@@ -453,8 +533,15 @@ export const projectMapSchema = z.object({
 });
 
 export const runRecordSchema = z.object({
+  agent_id: z.string().nullish().catch(null),
   generated_at: z.string(),
   goal_id: z.string(),
+  turn_instance_id: z.string().nullish().catch(null),
+  agent_vision: z.record(z.string(), z.unknown()).nullish().catch(null),
+  vision_checkpoint: z.object({
+    schema_version: z.literal("vision_checkpoint_v0"),
+    decision: z.string(),
+  }).nullish().catch(null),
   classification: z.string().optional().nullable(),
   lifecycle_phase: z.string().optional().nullable(),
   lifecycle_flags: z.array(z.string()).optional().default([]),
@@ -473,6 +560,22 @@ export const runRecordSchema = z.object({
 });
 
 export const runGoalSchema = z.object({
+  source_access: z.object({namespace: z.string(), label: z.string(), read_only: z.literal(true), original_goal_id: z.string().optional()}).optional(),
+  parent_goal_id: z.string().nullable().optional().catch(null),
+  goal_objective: z.string().nullable().optional().catch(null),
+  zcode_goal_eligible_agent_ids: z.array(z.string()).optional().default([]).catch([]),
+  acceptance_observation: goalAcceptanceObservationSchema.optional().nullable().catch(null),
+  host_worker_observations: z.object({
+    goal_id: z.string(),
+    read_status: z.enum(["read", "stale", "unreadable"]),
+    rows: z.array(z.object({
+      agent_id: z.string(),
+      status: z.enum(["replan_paused", "replan_outcome_unknown"]),
+      obligation_id: z.string(),
+      turn_instance_id: z.string().nullable(),
+      observed_at: z.string(),
+    })),
+  }).optional().nullable().catch({goal_id: "", read_status: "unreadable", rows: []}),
   id: z.string(),
   activation_state: z.enum(["active", "stopped"]).optional().default("active"),
   display_name: z.string().optional().nullable(),
@@ -489,10 +592,57 @@ export const runGoalSchema = z.object({
   control_plane: controlPlaneSchema.optional().nullable(),
   spawn_policy: orchestrationPolicySchema.optional().nullable(),
   orchestration: orchestrationPolicySchema.optional().nullable(),
+  coordination: z.object({
+    agent_model: z.string().optional().nullable(),
+    registered_agents: z.array(z.string()).optional().default([]),
+    // Opaque host thread ids stay out of the App state.
+    thread_agent_bindings: z.array(z.object({
+      agent_id: z.string().optional().nullable(),
+      host_surface: z.string().optional().nullable(),
+    })).optional().default([]).catch([]),
+  }).optional().nullable(),
+  host_thread_activity: z.object({
+    observed_at: z.string().optional().nullable(),
+    // Older or malformed observations cannot prove that every binding was read.
+    completeness: z.enum(["complete", "incomplete"]).catch("incomplete").default("incomplete"),
+    threads: z.array(z.object({
+      agent_id: z.string().optional().nullable(),
+      host_surface: z.string(),
+      state: z.enum(["turn_open", "idle", "archived", "unknown"]).catch("unknown"),
+      reason: z.string().optional().nullable(),
+      turn_started_at: z.string().optional().nullable(),
+      last_turn_ended_at: z.string().optional().nullable(),
+      last_event_at: z.string().optional().nullable(),
+
+      delivery_window: z.object({
+        schema_version: z.string().optional(),
+        state: z.enum(["fresh", "stale", "missing", "unknown"]).catch("unknown"),
+        reason: z.enum(["no_expectation", "no_observation", "unparseable_observation"]).optional().nullable(),
+        last_observed_at: z.string().optional().nullable(),
+        age_seconds: z.number().optional().nullable(),
+        age_hours: z.number().optional().nullable(),
+        expected_interval_minutes: z.number().optional().nullable(),
+        window_minutes: z.number().optional().nullable(),
+        tolerance: z.number().optional().nullable(),
+        source: z.string().optional().nullable(),
+      }).optional().nullable(),
+    })).optional().default([]),
+  }).optional().nullable().catch(null),
   index_exists: z.boolean().optional().default(false),
   raw_index_records: z.number().optional().default(0),
   unique_runs: z.number().optional().default(0),
   latest_runs: z.array(runRecordSchema).optional().default([]),
+  semantic_history: z.object({
+    agents: z.array(z.object({
+      latest_agent_vision_run: z.object({
+        generated_at: z.string(),
+        agent_vision: z.object({
+          vision_patch: z.object({vision_summary: z.string().nullish()}).nullish(),
+          path_delta: z.object({observed_reality: z.string().nullish()}).nullish().catch(null),
+        }),
+      }).nullish().catch(null),
+    })),
+  }).nullish().catch(null),
 });
 
 export const runHistorySchema = z.object({
@@ -542,16 +692,18 @@ export const usageTotalsSchema = z.object({
   automation_run_count_7d: z.number().optional().default(0),
   progress_signal_run_count_24h: z.number().optional().default(0),
   progress_signal_run_count_7d: z.number().optional().default(0),
-  input_tokens_24h: z.number().optional().default(0),
-  input_tokens_7d: z.number().optional().default(0),
-  output_tokens_24h: z.number().optional().default(0),
-  output_tokens_7d: z.number().optional().default(0),
-  cache_tokens_24h: z.number().optional().default(0),
-  cache_tokens_7d: z.number().optional().default(0),
-  cost_usd_24h: z.number().optional().default(0),
-  cost_usd_7d: z.number().optional().default(0),
-  duration_ms_24h: z.number().optional().default(0),
-  duration_ms_7d: z.number().optional().default(0),
+  // Measurement fields are absent when no sampled run reported them. A zero is
+  // meaningful only after a runtime has actually measured that metric.
+  input_tokens_24h: z.number().optional(),
+  input_tokens_7d: z.number().optional(),
+  output_tokens_24h: z.number().optional(),
+  output_tokens_7d: z.number().optional(),
+  cache_tokens_24h: z.number().optional(),
+  cache_tokens_7d: z.number().optional(),
+  cost_usd_24h: z.number().optional(),
+  cost_usd_7d: z.number().optional(),
+  duration_ms_24h: z.number().optional(),
+  duration_ms_7d: z.number().optional(),
 });
 
 export const usageGoalSchema = usageTotalsSchema.extend({
@@ -568,16 +720,6 @@ const defaultUsageTotals = {
   automation_run_count_7d: 0,
   progress_signal_run_count_24h: 0,
   progress_signal_run_count_7d: 0,
-  input_tokens_24h: 0,
-  input_tokens_7d: 0,
-  output_tokens_24h: 0,
-  output_tokens_7d: 0,
-  cache_tokens_24h: 0,
-  cache_tokens_7d: 0,
-  cost_usd_24h: 0,
-  cost_usd_7d: 0,
-  duration_ms_24h: 0,
-  duration_ms_7d: 0,
 };
 
 export const usageSummarySchema = z.object({
@@ -723,6 +865,17 @@ export const statusContractSchema = z.object({
   reload_hint: "scripts/macos-dashboard-launchagent.sh restart",
 });
 
+export const goalProjectionScopeSchema = z.object({
+  schema_version: z.literal("loopx_goal_projection_scope_v0"),
+  scope: z.enum(["all", "active", "stopped"]),
+  complete: z.boolean(),
+  projected_goal_count: z.number().int().nonnegative(),
+  registry_goal_count: z.number().int().nonnegative(),
+  // Stable fingerprint of the registry's goal activation partition. Two
+  // scoped snapshots are safe to merge only when their revisions match.
+  registry_revision: z.string().optional().nullable(),
+});
+
 export const localDashboardApiSchema = z.object({
   source: z.string().optional().default("serve-status"),
   status_url: z.string().optional().nullable(),
@@ -730,6 +883,8 @@ export const localDashboardApiSchema = z.object({
   review_material_url: z.string().optional().nullable(),
   presentation_surfaces_url: z.string().optional().nullable(),
   presentation_detail_url: z.string().optional().nullable(),
+  periodic_report_index_url: z.string().optional().nullable(),
+  periodic_report_detail_url: z.string().optional().nullable(),
   ssh_hosts_url: z.string().optional().nullable(),
   reward_dry_run_url: z.string().optional().nullable(),
   reward_append_url: z.string().optional().nullable(),
@@ -737,6 +892,12 @@ export const localDashboardApiSchema = z.object({
   configure_goal_dry_run_url: z.string().optional().nullable(),
   configure_goal_apply_url: z.string().optional().nullable(),
   control_plane_write_enabled: z.boolean().optional().default(false),
+  // Ephemeral, owner-prepared read sources; never execution registry entries.
+  read_only_sources: z.array(z.object({
+    id: z.string().min(1).max(96),
+    label: z.string().min(1).max(48),
+    status_url: z.string().min(1),
+  })).max(12).optional(),
 }).optional().nullable();
 
 // Core keeps the presentation status contract provider-neutral. A ready/
@@ -816,6 +977,108 @@ export const presentationSurfaceCollectionResponseSchema = z.object({
   presentation_surfaces: presentationSurfaceCollectionSchema,
 }).strict();
 
+export const periodicReportDetailRefSchema = z.object({
+  goal_id: z.string().min(1),
+  agent_id: z.string().min(1),
+  generation_id: z.string().min(1),
+  content_sha256: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+}).strict();
+
+export const periodicReportIndexItemSchema = z.object({
+  goal_id: z.string().min(1),
+  agent_id: z.string().min(1),
+  generation_id: z.string().min(1),
+  publication_id: z.string().min(1),
+  delivered_at: z.string().min(1),
+  predecessor_publication_id: z.string().min(1).nullable().optional(),
+  detail_ref: periodicReportDetailRefSchema,
+}).strict();
+
+const periodicReportIndexBaseSchema = z.object({
+  schema_version: z.literal("periodic_report_workspace_index_v0"),
+  count: z.number().int().nonnegative(),
+  items: z.array(periodicReportIndexItemSchema),
+});
+
+const periodicReportWindowedIndexSchema = periodicReportIndexBaseSchema.extend({
+  returned_count: z.number().int().nonnegative(),
+  total_count: z.number().int().nonnegative(),
+  limit: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+}).strict();
+
+const periodicReportLegacyIndexSchema = periodicReportIndexBaseSchema.strict().transform((value) => ({
+  ...value,
+  returned_count: value.count,
+  total_count: value.count,
+  limit: value.count,
+  offset: 0,
+  truncated: false,
+}));
+
+export const periodicReportIndexResponseSchema = z.object({
+  ok: z.literal(true),
+  periodic_reports: z.union([
+    periodicReportWindowedIndexSchema,
+    periodicReportLegacyIndexSchema,
+  ]),
+}).strict();
+
+export const periodicReportProjectionSchema = z.object({
+  schema_version: z.literal("periodic_report_workspace_projection_v0"),
+  goal_id: z.string().min(1),
+  agent_id: z.string().min(1),
+  generation_id: z.string().min(1),
+  generated_at: z.string().min(1),
+  title: z.string().min(1),
+  summary: z.string().min(1),
+  content_sha256: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+  period_window: z.object({
+    start_at: z.string().min(1),
+    end_at: z.string().min(1),
+  }).strict(),
+  interaction: z.object({
+    attention_kind: z.literal("progress"),
+    interaction: z.literal("inform"),
+    delivery: z.literal("surface"),
+    form: z.literal("milestone_report"),
+    writable: z.literal(false),
+  }).strict(),
+  delta: z.object({
+    added_count: z.number().int().nonnegative(),
+    changed_count: z.number().int().nonnegative(),
+    item_count: z.number().int().positive(),
+    items: z.array(z.object({
+      fact_id: z.string().min(1),
+      source_ref: z.string().min(1),
+      title: z.string().min(1),
+      summary: z.string().min(1),
+      status: z.string().min(1),
+      content_kind: z.string().min(1),
+      change_kind: z.enum(["added", "changed"]),
+      previous_status: z.string().min(1).optional(),
+    }).strict()),
+  }).strict(),
+  publication: z.object({
+    publication_id: z.string().min(1),
+    delivered_at: z.string().min(1),
+    predecessor_publication_id: z.string().min(1).nullable().optional(),
+    cursor_id: z.string().min(1),
+  }).strict(),
+  truth_contract: z.object({
+    published_cursor_is_source_of_truth: z.literal(true),
+    generation_receipt_is_delivery_receipt: z.literal(false),
+    projection_is_writable: z.literal(false),
+    browser_write_api: z.literal(false),
+  }).strict(),
+}).strict();
+
+export const periodicReportProjectionResponseSchema = z.object({
+  ok: z.literal(true),
+  projection: periodicReportProjectionSchema,
+}).strict();
+
 export const statusPayloadSchema = z.object({
   ok: z.boolean(),
   registry: z.string(),
@@ -823,6 +1086,7 @@ export const statusPayloadSchema = z.object({
   goal_count: z.number(),
   run_count: z.number(),
   status_contract: statusContractSchema,
+  goal_projection: goalProjectionScopeSchema.optional().nullable().default(null),
   local_dashboard_api: localDashboardApiSchema,
   contract: z.object({
     ok: z.boolean(),
@@ -910,8 +1174,11 @@ export const rewardDryRunResponseSchema = z.object({
 });
 
 export type StatusPayload = z.infer<typeof statusPayloadSchema>;
+export type PeriodicReportDetailRef = z.infer<typeof periodicReportDetailRefSchema>;
+export type PeriodicReportProjection = z.infer<typeof periodicReportProjectionSchema>;
 export type GoalActivationState = "active" | "stopped";
 export type StatusContract = NonNullable<z.infer<typeof statusContractSchema>>;
+export type GoalProjectionScope = z.infer<typeof goalProjectionScopeSchema>;
 export type QueueItem = z.infer<typeof queueItemSchema>;
 export type HumanReward = z.infer<typeof humanRewardSchema>;
 export type OperatorGate = z.infer<typeof operatorGateSchema>;
@@ -954,6 +1221,19 @@ export function withGoalActivationState(
       : payload.run_history,
   };
 }
+export function withoutGoal(payload: StatusPayload, goalId: string): StatusPayload {
+  const goals = payload.run_history.goals.filter((goal) => goal.id !== goalId);
+  const queueItems = payload.attention_queue.items.filter((item) => item.goal_id !== goalId);
+  if (goals.length === payload.run_history.goals.length && queueItems.length === payload.attention_queue.items.length) {
+    return payload;
+  }
+  return {
+    ...payload,
+    attention_queue: { ...payload.attention_queue, items: queueItems },
+    run_history: { ...payload.run_history, goals },
+  };
+}
+
 export type TodoGroup = z.infer<typeof todoGroupSchema>;
 export type TodoItem = z.infer<typeof todoItemSchema>;
 export type TodoIndexItem = z.infer<typeof todoIndexItemSchema>;

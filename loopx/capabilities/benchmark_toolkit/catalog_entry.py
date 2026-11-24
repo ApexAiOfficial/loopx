@@ -78,12 +78,33 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
         },
         {
             "command": (
+                "loopx benchmark continuation-decision "
+                "--progress-json <public-progress.json> "
+                "--expected-first-prompt-sha256 <sha256> "
+                "--observed-first-prompt-sha256 <sha256> "
+                "--expected-total-unit-count <n> "
+                "--previous-completed-unit-count <n> "
+                "--completed-segment-count <n> --max-agent-segments <n> "
+                "--elapsed-ms <ms> --total-budget-ms <ms> --format json"
+            ),
+            "purpose": (
+                "Choose a bounded next agent segment from public progress while "
+                "preserving first-prompt parity and the total time budget."
+            ),
+            "write_boundary": (
+                "read-only decision; caller owns progress observation, process "
+                "lifecycle, continuation prompt construction, and evidence capture"
+            ),
+        },
+        {
+            "command": (
                 "loopx benchmark experiment-board-show --goal-id <goal-id> "
-                "--format json"
+                "[--four-arm-contract-json <compact-contract.json>] --format json"
             ),
             "purpose": (
                 "Read baseline, treatment, explore, countability, effort, and "
-                "insight status before selecting or launching another arm."
+                "insight status before selecting or launching another arm; an "
+                "explicit four-arm contract also projects conditional effects."
             ),
             "write_boundary": "read-only project-local public-safe domain state",
         },
@@ -122,32 +143,13 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
         },
         {
             "command": (
-                "loopx benchmark plan-fidelity "
-                "--action-kind implementation "
-                "--action-kind independent_validation "
-                "--role-action-kind technical_work=implementation "
-                "--role-action-kind independent_validation=independent_validation "
-                "--required-role-count technical_work=1 "
-                "--required-role-count independent_validation=1 "
-                "--require-qualified --format json"
-            ),
-            "purpose": (
-                "Reduce a provider's exact public-safe Todo action kinds to stable "
-                "treatment-plan roles before closeout."
-            ),
-            "write_boundary": (
-                "read-only typed plan facts; emits semantic counts and blockers, "
-                "never Todo text or raw action-kind values"
-            ),
-        },
-        {
-            "command": (
                 "loopx benchmark experiment-board-upsert --goal-id <goal-id> "
                 "--row-json <compact-row.json> --execute --format json"
             ),
             "purpose": (
                 "Idempotently record one planned, running, or terminal compact run "
-                "row; omit --execute for a no-write preview."
+                "row, including optional provider-neutral orchestrator runtime "
+                "revision provenance; omit --execute for a no-write preview."
             ),
             "write_boundary": (
                 "explicit project-local domain-state write; rejects raw paths, "
@@ -174,7 +176,8 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
                 "loopx benchmark concurrency-configure --goal-id <goal-id> "
                 "--max-active-cases <n> --target-active-cases <n> "
                 "--max-baseline-cases <n> --max-test-cases <n> "
-                "--reserved-test-cases <n> --execute --format json"
+                "--reserved-test-cases <n> "
+                "[--require-resource-headroom-receipt] --execute --format json"
             ),
             "purpose": (
                 "Configure one combined capacity envelope across baseline, control, "
@@ -189,6 +192,7 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
             "command": (
                 "loopx benchmark concurrency-admit --goal-id <goal-id> "
                 "--run-id <run-id> --case-id <case-id> --arm-role <role> "
+                "[--resource-headroom-json <receipt.json>] "
                 "--execute --format json"
             ),
             "purpose": (
@@ -196,8 +200,87 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
                 "before an independently authorized runner launch."
             ),
             "write_boundary": (
-                "compact project-local run identities only; launch, liveness, and "
-                "termination remain runner-owned"
+                "compact project-local run identities only; resource receipts and "
+                "raw metrics are not persisted, and launch, liveness, and termination "
+                "remain runner-owned"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark token-capacity-configure --goal-id <goal-id> "
+                "--quota-tokens-per-minute <tpm> "
+                "--target-utilization-basis-points <bps> "
+                "--cold-start-reserve-tokens-per-minute <tpm> "
+                "--evaluator-reserve-tokens-per-minute <tpm> "
+                "--execute --format json"
+            ),
+            "purpose": (
+                "Configure a durable rolling token-capacity envelope with explicit "
+                "burst and evaluator reserves."
+            ),
+            "write_boundary": (
+                "project-local aggregate policy and reservations only; provider "
+                "routes, credentials, request text, and launch authority remain "
+                "runner-owned"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark token-capacity-observe --goal-id <goal-id> "
+                "--sample-json <token-usage-sample.json> --execute --format json"
+            ),
+            "purpose": (
+                "Record disjoint cached, uncached, and output token counts or an "
+                "explicit unmetered request in the exact trailing minute."
+            ),
+            "write_boundary": (
+                "typed aggregate usage only; no provider payload, prompt, response, "
+                "credential, endpoint, or raw log is accepted"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark token-capacity-admit --goal-id <goal-id> "
+                "--run-id <run-id> --workload-class <solver|evaluator> "
+                "--tokens-per-minute <forecast-tpm> --execute --format json"
+            ),
+            "purpose": (
+                "Atomically reserve forecast throughput and emit a fresh provider-"
+                "capacity headroom receipt for case-slot admission."
+            ),
+            "write_boundary": (
+                "compact run reservation only; callers own usage collection, "
+                "case-slot rollback, launch, liveness reconciliation, and release"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark token-capacity-reject --goal-id <goal-id> "
+                "[--retry-after-seconds <seconds>] --execute --format json"
+            ),
+            "purpose": (
+                "Persist a bounded provider-capacity cooldown after an HTTP 429 or "
+                "equivalent typed rejection."
+            ),
+            "write_boundary": (
+                "timestamp and bounded cooldown only; no error body, provider "
+                "identity, route, or credential is persisted"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark concurrency-tune --goal-id <goal-id> "
+                "--feedback-json <feedback.json> "
+                "--resource-headroom-json <receipt.json> "
+                "[--execute] --format json"
+            ),
+            "purpose": (
+                "Adapt desired occupancy inside the operator-owned hard ceiling "
+                "from compact runner health and resource headroom."
+            ),
+            "write_boundary": (
+                "preview by default; execute changes only target occupancy, never "
+                "hard or role caps, active runs, raw metrics, or launch authority"
             ),
         },
         {
@@ -205,15 +288,51 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
                 "loopx benchmark integrity-qualification "
                 "--trajectory-json <private.json> "
                 "--runtime-attestation-json <attestation.json> "
+                "[--restricted-access-adjudication-json <compact.json>] "
                 "--require-qualified --format json"
             ),
             "purpose": (
                 "Reduce private ATIF tool evidence and runner-owned isolation "
-                "facts to a compact integrity qualification receipt."
+                "facts to a compact integrity qualification receipt; scanner "
+                "suspicion remains eligible unless post-run causal review confirms "
+                "restricted disclosure and use."
             ),
             "write_boundary": (
                 "read-only private local inputs; emits hashes, counts, and "
                 "reason codes only"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark traex-evidence "
+                "--source-jsonl <private-stdout.jsonl> "
+                "--route-source-jsonl <private-session.jsonl> "
+                "--atif-output <private-trajectory.json> "
+                "--route-receipt-output <public-route.json> "
+                "--requested-model <model> --execute --format json"
+            ),
+            "purpose": (
+                "Convert TraeX stdout or archived tool events into private ATIF "
+                "and independently reduce archived runtime route evidence."
+            ),
+            "write_boundary": (
+                "writes caller-selected local evidence files only; the command "
+                "receipt and route receipt omit prompts, tool content, and paths"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark treatment-continuation-receipt "
+                "--observation-json <compact-post-run-observation.json> "
+                "--format json"
+            ),
+            "purpose": (
+                "Separate qualified treatment startup from post-start semantic "
+                "control persistence and terminal settlement."
+            ),
+            "write_boundary": (
+                "read-only compact post-run mechanism facts; changes no score, "
+                "countability, integrity, or treatment-fidelity decision"
             ),
         },
         {
@@ -233,6 +352,84 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
             "write_boundary": (
                 "read-only local reward file; emits stable counts, labels, and "
                 "reason codes only, never raw reward values"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark study-validate "
+                "--manifest-json <study-manifest.json> --format json"
+            ),
+            "purpose": (
+                "Validate provider-neutral case, arm, factor, native-metric, and "
+                "source-revision intent before producing upload records."
+            ),
+            "write_boundary": (
+                "read-only local manifest validation; grants no runner, scorer, "
+                "network, upload, or publication authority"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark upload-envelope "
+                "--payload-json <public-safe-record.json> "
+                "--record-kind <allowlisted-kind> --producer-id <adapter-id> "
+                "--producer-version <version> --benchmark-id <benchmark-id> "
+                "--study-id <study-id> --idempotency-key <stable-key> "
+                "--observed-at <timestamp> --source-revision <revision> "
+                "--format json"
+            ),
+            "purpose": (
+                "Normalize one allowlisted record and bind it to stable producer, "
+                "study, idempotency, source, and payload-digest identity."
+            ),
+            "write_boundary": (
+                "read-only envelope construction; accepts no credentials and "
+                "performs no local or external write"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark upload-local "
+                "--envelope-json <public-safe-envelope.json> "
+                "--store <simulation.jsonl> [--execute] --format json"
+            ),
+            "purpose": (
+                "Preview or locally simulate digest-bound upload and readback "
+                "before implementing an independently authorized provider."
+            ),
+            "write_boundary": (
+                "preview by default; execute writes only the caller-selected local "
+                "JSONL simulation store and performs no network or external write"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark study-dashboard "
+                "--manifest-json <study-manifest.json> "
+                "--store <simulation.jsonl> "
+                "[--four-arm-contract-json <compact-contract.json>] --format json"
+            ),
+            "purpose": (
+                "Derive campaign, arm, case, run, matched-pair, and optional "
+                "factorial projections with explicit denominators."
+            ),
+            "write_boundary": (
+                "read-only local reducer; experiment-board and factorial contracts "
+                "remain the scoring and comparison authorities"
+            ),
+        },
+        {
+            "command": (
+                "loopx benchmark upload-readback --store <simulation.jsonl> "
+                "--record-id <record-id> --format json"
+            ),
+            "purpose": (
+                "Verify the exact record id, payload digest, provider revision, "
+                "and supersession state in the local simulation."
+            ),
+            "write_boundary": (
+                "read-only local receipt; returns no store path and performs no "
+                "network or external write"
             ),
         },
         {
@@ -259,22 +456,28 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
             "read_experiment_board_before_launch_or_case_selection",
             "qualify_four_arm_contract_when_domain_guidance_is_a_factor",
             "configure_or_read_concurrency_envelope_before_launch",
+            "configure_or_read_token_capacity_when_provider_throughput_is_shared",
             "reconcile_admission_ledger_with_real_runner_liveness",
             "backfill_when_concurrency_status_reports_underfilled",
             "qualify_source_revision_before_each_new_run_admission",
+            "qualify_resource_headroom_when_the_envelope_requires_a_receipt",
+            "record_complete_or_explicitly_unmetered_token_usage_when_token_capacity_is_configured",
+            "tune_target_occupancy_from_fresh_runner_feedback_when_opted_in",
+            "atomically_reserve_token_capacity_before_case_slot_admission_when_token_capacity_is_configured",
             "atomically_admit_case_slot_before_runner_launch",
             "upsert_preregistered_or_running_row_when_a_run_starts",
             "classify_exact_runtime_observation_during_active_monitor_cycles",
             "require_runtime_continuity_before_terminal_closeout_write",
-            "qualify_treatment_plan_roles_from_typed_action_kinds",
+            "adjudicate_restricted_access_suspicion_after_solver_and_score_terminal",
             "upsert_terminal_score_countability_effort_and_insight_status",
             "release_case_slot_after_terminal_or_runner_invalid_transition",
+            "release_token_capacity_after_terminal_or_runner_invalid_transition_when_token_capacity_is_configured",
             "read_matched_comparisons_before_selecting_the_next_arm",
         ],
         "board_commands": {
             "read": (
                 "loopx benchmark experiment-board-show --goal-id <goal-id> "
-                "--format json"
+                "[--four-arm-contract-json <compact-contract.json>] --format json"
             ),
             "preview": (
                 "loopx benchmark experiment-board-upsert --goal-id <goal-id> "
@@ -297,42 +500,104 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
                 "loopx benchmark concurrency-configure --goal-id <goal-id> "
                 "--max-active-cases <n> --target-active-cases <n> "
                 "--max-baseline-cases <n> --max-test-cases <n> "
-                "--reserved-test-cases <n> --execute --format json"
+                "--reserved-test-cases <n> "
+                "[--require-resource-headroom-receipt] --execute --format json"
             ),
             "admit": (
                 "loopx benchmark concurrency-admit --goal-id <goal-id> "
                 "--run-id <run-id> --case-id <case-id> --arm-role <role> "
+                "[--resource-headroom-json <receipt.json>] "
                 "--execute --format json"
             ),
             "release": (
                 "loopx benchmark concurrency-release --goal-id <goal-id> "
                 "--run-id <run-id> --execute --format json"
             ),
+            "tune": (
+                "loopx benchmark concurrency-tune --goal-id <goal-id> "
+                "--feedback-json <feedback.json> "
+                "--resource-headroom-json <receipt.json> "
+                "[--execute] --format json"
+            ),
         },
         "concurrency_boundary": (
             "The envelope owns capacity admission only. A benchmark runner remains "
-            "responsible for launch, liveness, termination, and score transitions."
+            "responsible for resource observation, launch, liveness, termination, "
+            "and score transitions. When configured, admission requires a fresh "
+            "public-safe resource-headroom receipt but never persists raw metrics."
+        ),
+        "token_capacity_commands": {
+            "status": (
+                "loopx benchmark token-capacity-status --goal-id <goal-id> "
+                "--format json"
+            ),
+            "configure": (
+                "loopx benchmark token-capacity-configure --goal-id <goal-id> "
+                "--quota-tokens-per-minute <tpm> "
+                "--target-utilization-basis-points <bps> "
+                "--cold-start-reserve-tokens-per-minute <tpm> "
+                "--evaluator-reserve-tokens-per-minute <tpm> "
+                "--execute --format json"
+            ),
+            "observe": (
+                "loopx benchmark token-capacity-observe --goal-id <goal-id> "
+                "--sample-json <token-usage-sample.json> --execute --format json"
+            ),
+            "admit": (
+                "loopx benchmark token-capacity-admit --goal-id <goal-id> "
+                "--run-id <run-id> --workload-class <solver|evaluator> "
+                "--tokens-per-minute <forecast-tpm> --execute --format json"
+            ),
+            "reject": (
+                "loopx benchmark token-capacity-reject --goal-id <goal-id> "
+                "[--retry-after-seconds <seconds>] --execute --format json"
+            ),
+            "release": (
+                "loopx benchmark token-capacity-release --goal-id <goal-id> "
+                "--run-id <run-id> --execute --format json"
+            ),
+        },
+        "token_capacity_boundary": (
+            "Only campaigns with a configured token envelope require token usage "
+            "observation, reservation, cooldown reporting, and release; other "
+            "campaigns retain case-slot admission without token configuration. "
+            "The token envelope owns aggregate metering, forecast reservations, and "
+            "provider cooldown only. The runner owns provider adaptation, complete "
+            "coverage, job discovery, launch, rollback, liveness, and termination."
         ),
         "selection_rule": (
             "Keep diagnostic-only explore rows separate and make paired claims "
             "only from matched_pair_countable comparisons."
         ),
-        "treatment_plan_fidelity": {
-            "stable_roles": [
-                "technical_work",
-                "independent_validation",
-                "review_refine",
+        "study_projection_workflow": {
+            "sequence": [
+                "validate_provider_neutral_study_manifest",
+                "wrap_one_allowlisted_public_safe_record_per_envelope",
+                "upload_exact_terminal_run_before_its_redacted_case_insight",
+                "preview_local_upload_without_writing",
+                "execute_local_simulation_when_explicitly_requested",
+                "verify_record_id_digest_and_provider_revision_by_readback",
+                "derive_read_only_dashboard_packet",
             ],
-            "matching": "provider_declared_exact_action_kind_tokens",
-            "required_boundary": (
-                "Use typed action_kind values through the benchmark plan-fidelity "
-                "reducer; do not infer semantic roles from Todo title text, "
-                "substrings, or one provider's preferred spelling."
-            ),
-            "authority_boundary": (
-                "Plan-role qualification proves only declared Todo shape; it does "
-                "not prove ordering, task coverage, validation independence, "
-                "technical correctness, integrity, or score countability."
+            "case_insight_upload": {
+                "schema_version": "benchmark_case_insight_projection_v0",
+                "precondition": (
+                    "one active exact-run board record is terminal, has complete "
+                    "post-run analysis status, and matches case/run/outcome identity"
+                ),
+                "authority_boundary": (
+                    "the projection contains no score, countability, integrity, or "
+                    "treatment-fidelity fields and cannot mutate run authority"
+                ),
+                "evidence_boundary": (
+                    "only bounded redacted analysis and public-safe evidence handles "
+                    "or digests; raw trajectory and evaluator material stay private"
+                ),
+            },
+            "external_provider_boundary": (
+                "The local simulation proves contract and readback behavior only. "
+                "Authentication, remote transport, retention, and publication need "
+                "a separately activated provider and explicit authority."
             ),
         },
     },
@@ -377,6 +642,47 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
             "The monitor may launch replacements only under separately granted "
             "runner authority; the envelope grants no model, verifier, upload, or "
             "submission authority."
+        ),
+    },
+    "campaign_monitor_handoff": {
+        "lane_boundary": (
+            "A continuous_monitor observes and records campaign transitions; "
+            "repository delivery, runner repair, experiment redesign, and other "
+            "bounded work belong in an independent advancement_task."
+        ),
+        "material_transition_command": (
+            "loopx quota monitor-poll --goal-id <goal-id> "
+            "--todo-id <monitor-todo-id> --agent-id <registered-agent> "
+            "--result-hash <public-safe-hash> --material-change "
+            "--material-change-scope <case-id>/<run-id> "
+            '--next-agent-todo "<bounded public-safe work>" '
+            "--next-action-kind <action-kind> "
+            "--next-task-repository <git-repository> "
+            "--next-required-capability <capability> --execute --format json"
+        ),
+        "material_transition_result": {
+            "monitor_status": "open",
+            "successor_task_class": "advancement_task",
+            "successor_relationship": "independent_runnable_work",
+            "quota_spend": False,
+        },
+        "external_wait_command": (
+            "loopx todo update --goal-id <goal-id> "
+            "--todo-id <waiting-advancement-todo-id> "
+            "--agent-id <registered-agent> --status open "
+            "--resume-when monitor_changed:<monitor-todo-id>@<case-id>/<run-id> "
+            "--successor-todo-id <independent-runnable-successor-id> "
+            '--reason "<public-safe external-wait rationale>" --format json'
+        ),
+        "external_wait_result": (
+            "Keep the waiting advancement Todo visible but non-runnable until the "
+            "matching case/run scope generation advances. Unrelated cohort "
+            "transitions do not wake it. Do not mark it blocked, and do not use "
+            "the monitor itself as executable delivery work."
+        ),
+        "unchanged_policy": (
+            "An unchanged poll records monitor evidence only; it creates no "
+            "successor and spends no delivery quota."
         ),
     },
     "post_run_case_analysis": {
@@ -425,13 +731,88 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
                 "matched_pair_count",
                 "aggregate_primary_metric_by_arm",
                 "binary_outcome_by_arm_when_available",
+                "feature_metric_by_arm_when_available",
+                "preservation_guardrail_by_arm_when_available",
                 "improved_flat_regressed_pair_counts",
+                "baseline_effort_strata_when_available",
                 "new_case_insights_and_next_probe",
             ],
+            "effort_stratification": {
+                "default_reference_arm": "baseline",
+                "default_reference_field": "effort.duration_ms",
+                "candidate_duration_affects_bucket": False,
+                "interpretation": "descriptive_sensitivity_only",
+                "report_per_stratum": [
+                    "matched_pair_count",
+                    "binary_outcome_by_arm_when_available",
+                    "aggregate_primary_metric_by_arm",
+                    "feature_metric_by_arm_when_available",
+                    "preservation_guardrail_by_arm_when_available",
+                    "improved_flat_regressed_pair_counts",
+                ],
+                "boundary_policy": (
+                    "Preregister benchmark-appropriate fixed boundaries before "
+                    "reading candidate durations. Use the same baseline-side case "
+                    "bucket for every arm in a matched comparison; never define "
+                    "difficulty from treatment duration."
+                ),
+            },
             "unchanged_policy": (
                 "Do not send a repetitive user update when no score, coverage, "
                 "direction, insight, or material runner state changed."
             ),
+        },
+        "treatment_continuation_receipt": {
+            "command": (
+                "loopx benchmark treatment-continuation-receipt "
+                "--observation-json <compact-post-run-observation.json> "
+                "--format json"
+            ),
+            "classifications": [
+                "sustained",
+                "startup_only",
+                "unknown",
+                "not_applicable",
+            ],
+            "analysis_boundary": (
+                "The receipt describes mechanism persistence only. It does not "
+                "change score countability, integrity qualification, treatment "
+                "fidelity, or the experiment-board matched-pair decision."
+            ),
+            "absence_rule": (
+                "Classify startup_only only after a complete authorized post-run "
+                "review observes qualified startup and zero post-start semantic "
+                "control transitions; otherwise absence remains unknown."
+            ),
+            "persistence_rule": (
+                "Only task-facing Todo transitions and technical replans that "
+                "change the solving course before the result is fixed establish "
+                "sustained control. Terminal-only Todo settlement, replan "
+                "bookkeeping, and closeout remain recorded as closeout events but "
+                "do not establish persistence."
+            ),
+            "observation_template": {
+                "schema_version": (
+                    "benchmark_treatment_continuation_observation_v0"
+                ),
+                "treatment_applicable": "<true-or-false>",
+                "startup_state": (
+                    "<qualified-not_qualified-unknown-or-not_applicable>"
+                ),
+                "observation_complete": "<true-or-false>",
+                "post_start_control_events": {
+                    "todo_transition_count": "<non-negative-integer>",
+                    "technical_replan_count": "<non-negative-integer>",
+                    "control_closeout_count": "<non-negative-integer>",
+                },
+                "terminal_control_state": (
+                    "<settled-unsettled-unknown-or-not_applicable>"
+                ),
+                "precommit_validation_state": (
+                    "<observed-not_observed-unknown-or-not_applicable>"
+                ),
+            },
+            "score_semantics": "unchanged",
         },
         "active_progress_readback": {
             "workspace_basis": [
@@ -472,6 +853,51 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
                 "raw_log_error_count_alone",
             ],
         },
+        "active_case_observation": {
+            "status": "provisional_only",
+            "purpose": (
+                "Preserve traceable runtime evidence while a case or campaign is "
+                "still active without presenting it as an official scored insight."
+            ),
+            "artifact_template": {
+                "schema_version": "benchmark_case_observation_v0",
+                "case": {
+                    "benchmark_id": "<public-id>",
+                    "case_id": "<public-id>",
+                    "arm": "<baseline-or-treatment>",
+                },
+                "run_status": "<planned-running-or-terminal>",
+                "runtime_outcome": "<ok-error-in_progress-or-unknown>",
+                "duration_ms": "<non-negative-integer-or-null>",
+                "evidence_refs": [
+                    {
+                        "kind": "<trace-log-artifact-report-or-other>",
+                        "trace_id": "<opaque-id-or-null>",
+                        "span_id": "<opaque-id-or-null>",
+                        "env": "<environment-token-or-null>",
+                        "artifact_ref": "<private-pointer-or-null>",
+                    }
+                ],
+                "hypothesis": "<provisional-causal-explanation>",
+                "confidence": "<high-medium-or-low>",
+                "promotion_state": "pending_terminal_score_review",
+            },
+            "score_boundary": (
+                "A provisional observation must not invent an official score or "
+                "treat request success, progress, or runtime status as case quality."
+            ),
+            "promotion_rule": (
+                "After terminal scoring, re-read the complete authorized evidence "
+                "and write a separate benchmark_case_insight_v0; do not relabel the "
+                "provisional artifact as final."
+            ),
+            "privacy_boundary": (
+                "Keep raw evidence references in private benchmark storage. The "
+                "public experiment board may expose only a compact classification "
+                "or private artifact handle, never trace IDs, spans, URLs, paths, "
+                "or provider-specific session identifiers."
+            ),
+        },
         "hint": (
             "After the solver has stopped and scoring is complete, read the task, "
             "real trajectory, final patch or workspace, hidden tests, grader or "
@@ -479,10 +905,117 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
             "evidence, why the outcome happened, whether it was expected, and what "
             "LoopX should test or change next."
         ),
+        "restricted_access_adjudication": {
+            "hint": (
+                "When the integrity scan marks restricted access as suspected, "
+                "inspect the real solver trajectory, tool results, and final "
+                "workspace after terminal scoring. Keep the run countable unless "
+                "restricted material was actually disclosed and causally entered "
+                "a solving or validation decision."
+            ),
+            "artifact_template": {
+                "schema_version": "benchmark_restricted_access_adjudication_v0",
+                "decision": "<qualified_with_warning-or-confirmed_cheating>",
+                "reviewer_role": "post_run_analyst",
+                "reviewed_surfaces": [
+                    "solver_trajectory",
+                    "tool_results",
+                    "final_workspace",
+                ],
+                "restricted_material_disclosed": "<true-or-false>",
+                "causal_use_observed": "<true-or-false>",
+                "evidence_id": "<public-safe-pointer>",
+            },
+            "decision_rule": (
+                "Only disclosed=true plus causal_use=true may be "
+                "confirmed_cheating; all other reviewed suspicion remains "
+                "qualified_with_warning."
+            ),
+        },
+        "task_environment_access": {
+            "policy_schema": "benchmark_task_environment_access_v0",
+            "receipt_schema": "benchmark_task_environment_access_receipt_v0",
+            "authority": "benchmark_task",
+            "purpose": "task_submission",
+            "hint": (
+                "Declare an exact task-owned namespace and variable-name set only "
+                "when the benchmark task contract exposes a solver submission "
+                "capability. Access must use the runner-owned typed read operation, "
+                "and the runner must separately attest that provider credentials "
+                "are excluded from the solver shell."
+            ),
+            "fail_closed_on": [
+                "broad_environment_enumeration",
+                "undeclared_variable_name",
+                "dynamic_namespace_filter",
+                "provider_credential_value",
+                "missing_provider_credential_isolation_attestation",
+            ],
+            "public_receipt_boundary": (
+                "authorization id and digest, purpose, counts and a variable-name "
+                "digest only; raw names and values stay private"
+            ),
+        },
+        "task_service_access": {
+            "policy_schema": "benchmark_task_service_access_v0",
+            "receipt_schema": "benchmark_task_service_access_receipt_v0",
+            "authority": "runner",
+            "purpose": "benchmark_task_service",
+            "hint": (
+                "Declare exact container-host HTTP origins only when the runner "
+                "proves that each origin is the isolated benchmark task service."
+            ),
+            "fail_closed_on": [
+                "undeclared_origin",
+                "wrong_port",
+                "lookalike_host",
+                "userinfo",
+                "mixed_external_request",
+            ],
+            "public_receipt_boundary": (
+                "authorization id and digest, request and origin counts, and an "
+                "origin-set digest only; raw origins stay private"
+            ),
+        },
+        "declared_feedback_protocol": {
+            "default": "official_feedback_blinded",
+            "opt_in": {
+                "feedback": "declared",
+                "timing": "during_solving",
+            },
+            "mixed_background_opt_in": {
+                "feedback": "declared",
+                "timing": "during_solving",
+                "background_evaluation": {
+                    "feedback": "blinded",
+                    "timing": "during_solving",
+                },
+            },
+            "required_runner_attestations": [
+                "evaluation_protocol_enforced",
+                "evaluation_log_complete",
+                "verifier_started_after_submission",
+            ],
+            "evidence_binding": [
+                "exact_policy_sha256",
+                "exact_trajectory_sha256",
+                "ordered_submissions",
+                "declared_channel_deliveries",
+                "acknowledged_feedback_transport",
+                "complete_blinded_background_evaluation_log_when_declared",
+            ],
+            "boundary": (
+                "Only a preregistered policy plus complete private runner evidence "
+                "replaces the blind-protocol attestations. Mixed protocols keep "
+                "background results blinded and bind their complete evaluation "
+                "log separately from declared deliveries; prose or partial score "
+                "logs remain unqualified."
+            ),
+        },
         "role_boundary": {
             "solver": (
                 "must not access hidden tests, grader or verifier sources, expected "
-                "answers, or official feedback during the solving phase"
+                "answers, or undeclared official feedback during the solving phase"
             ),
             "active_campaign_monitor": (
                 "may inspect the solver-owned trajectory and exact-job runtime while "
@@ -514,6 +1047,15 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
                 "grader_or_verifier",
                 "failure_and_score_details",
             ],
+            "evidence_refs": [
+                {
+                    "kind": "<trace-log-artifact-report-or-other>",
+                    "trace_id": "<opaque-id-or-null>",
+                    "span_id": "<opaque-id-or-null>",
+                    "env": "<environment-token-or-null>",
+                    "artifact_ref": "<private-pointer-or-null>",
+                }
+            ],
             "insight": {
                 "approach_summary": "<what-the-solver-tried>",
                 "decisive_evidence": ["<specific-observation>"],
@@ -531,6 +1073,50 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
     },
     "implemented_protocols": [
         {
+            "schema_version": "benchmark_study_manifest_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.study_projection",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_upload_envelope_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.study_projection",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_upload_readback_receipt_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.study_projection",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_case_insight_projection_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.study_projection",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_study_dashboard_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.study_projection",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_treatment_continuation_receipt_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.treatment_continuation",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_public_progress_v0",
+            "purpose": (
+                "Carry aggregate completed and total unit counts without unit ids, "
+                "paths, task text, or verifier output."
+            ),
+        },
+        {
+            "schema_version": "benchmark_continuation_decision_v0",
+            "purpose": (
+                "Choose a bounded continue or stop disposition without invoking "
+                "the host, writing state, or owning benchmark lifecycle."
+            ),
+        },
+        {
             "schema_version": "benchmark_four_arm_contract_v0",
             "module": "loopx.capabilities.benchmark_toolkit.four_arm_contract",
             "doc": "loopx/capabilities/benchmark_toolkit/README.md",
@@ -538,6 +1124,36 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
         {
             "schema_version": "benchmark_concurrency_envelope_v0",
             "module": "loopx.capabilities.benchmark_toolkit.concurrency_envelope",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_token_capacity_policy_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.token_capacity",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_token_usage_sample_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.token_capacity",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_token_capacity_state_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.token_capacity",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_token_capacity_decision_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.token_capacity",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_adaptive_concurrency_policy_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.adaptive_concurrency",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_concurrency_feedback_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.adaptive_concurrency",
             "doc": "loopx/capabilities/benchmark_toolkit/README.md",
         },
         {
@@ -557,6 +1173,41 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
         },
         {
             "schema_version": "benchmark_integrity_qualification_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.integrity",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_task_environment_access_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.integrity",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_task_environment_access_receipt_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.integrity",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_task_service_access_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.integrity",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_task_service_access_receipt_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.integrity",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_task_environment_read_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.environment_access",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_task_environment_read_result_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.environment_access",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
+            "schema_version": "benchmark_restricted_access_adjudication_v0",
             "module": "loopx.capabilities.benchmark_toolkit.integrity",
             "doc": "loopx/capabilities/benchmark_toolkit/README.md",
         },
@@ -581,6 +1232,11 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
             "doc": "loopx/capabilities/benchmark_toolkit/README.md",
         },
         {
+            "schema_version": "benchmark_case_observation_v0",
+            "module": "loopx.capabilities.benchmark_toolkit.catalog_entry",
+            "doc": "loopx/capabilities/benchmark_toolkit/README.md",
+        },
+        {
             "schema_version": "benchmark_case_insight_v0",
             "module": "loopx.capabilities.benchmark_toolkit.catalog_entry",
             "doc": "loopx/capabilities/benchmark_toolkit/README.md",
@@ -590,6 +1246,7 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
         (
             "python -m pytest tests/capabilities/test_benchmark_toolkit.py "
             "tests/capabilities/test_benchmark_concurrency_envelope.py "
+            "tests/capabilities/test_benchmark_token_capacity.py "
             "tests/capabilities/test_benchmark_experiment_board.py "
             "tests/capabilities/test_benchmark_source_revision_fence.py -q"
         )
@@ -601,11 +1258,13 @@ BENCHMARK_TOOLKIT_CATALOG_ENTRY: dict[str, Any] = {
         "Source revision qualification is read-only and caller-observed: it does not fetch, install, update a checkout, or rewrite an already admitted run.",
         "Raw trajectories are private local inputs to integrity qualification and are never copied into receipts, ledgers, docs, or PR artifacts.",
         "A clean trajectory scan is not isolation proof: runner-owned permission and verifier-order attestations are mandatory and fail closed when absent.",
+        "Automated restricted-access matches are countable suspicion only; confirmed cheating requires post-run agent evidence of both disclosure and causal use.",
         "Concurrent Docker runs must bind runtime evidence to one exact job-owned container; image-only discovery is not sufficient.",
         "Admission-ledger occupancy never proves runner liveness; active health requires a resolved exact-job receipt and a live exact runner owner after startup grace.",
         "Integrity qualification establishes countability eligibility only; an independent official result and matched experiment contract are still required.",
         "Post-run analyst access never widens the solving agent's evidence boundary or grants feedback reuse in another scored run.",
         "Concurrency reservations are not runtime liveness: runners must reconcile exact processes before release or backfill.",
+        "Token reservations are not runtime liveness or provider attribution: runners must report complete metering coverage, roll back a token reservation after case-slot denial, and reconcile exact processes before release.",
         "The experiment board is a compact projection, not a score authority: benchmark-family runners and scoring adapters remain outside the active capability.",
     ],
     "next_real_step": (

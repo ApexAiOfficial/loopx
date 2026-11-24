@@ -1,0 +1,31 @@
+{
+  "schema_version": "reliability_diagnostics_public_safety_counterfactuals_v0",
+  "unsafe_summary_tokens": [
+    "sk-abcdefghijklmnop0123",
+    "ghp_\u0061bcdefghijklmnopqrstuvwx",
+    "eyJ\u0061bcdefghijk.abcdefghijk.abcdefghijk",
+    "C:/Users/alice/private.txt",
+    "path:/Users/alice/private.txt",
+    "file:///Users/alice/private.txt",
+    "file:/Users/alice/private.txt"
+  ],
+  "unsafe_identity_tokens": [
+    "sk-abcdefghijklmnop0123",
+    "ghp_\u0061bcdefghijklmnopqrstuvwx",
+    "eyJ\u0061bcdefghijk.abcdefghijk.abcdefghijk"
+  ],
+  "invalid_source_ref_tokens": [
+    "C:/Users/alice/private.txt"
+  ],
+  "safe_summary_tokens": [
+    "skill-python",
+    "token_count",
+    "tool/read-file",
+    "error-timeout"
+  ],
+  "safe_identity_tokens": [
+    "skill-python",
+    "token_count",
+    "call-123"
+  ]
+}

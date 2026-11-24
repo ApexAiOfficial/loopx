@@ -24,7 +24,7 @@ def _fixture() -> dict:
     external = make_fact(
         fact_type="external_discussion",
         source="github",
-        source_url="https://github.com/huangruiteng/loopx/issues/1",
+        source_url="https://github.com/loopx-project/loopx/issues/1",
         title="Question: how do I set a stop condition?",
         author="external-user",
         published_at="2026-08-17T00:00:00Z",
@@ -32,7 +32,7 @@ def _fixture() -> dict:
     maintainer = make_fact(
         fact_type="maintainer_signal",
         source="github",
-        source_url="https://github.com/huangruiteng/loopx/issues/2",
+        source_url="https://github.com/loopx-project/loopx/issues/2",
         title="RFC: typed handoff packets",
         author="huangruiteng",
         published_at="2026-08-16T00:00:00Z",
@@ -58,7 +58,7 @@ def _fixture() -> dict:
     duplicate = make_fact(
         fact_type="external_discussion",
         source="github",
-        source_url="https://github.com/huangruiteng/loopx/issues/1",
+        source_url="https://github.com/loopx-project/loopx/issues/1",
         title="Question: how do I set a stop condition?",
         author="external-user",
         published_at="2026-08-17T00:00:00Z",
@@ -68,7 +68,7 @@ def _fixture() -> dict:
         "schema_version": SCAN_SCHEMA_VERSION,
         "scan_at": "2026-08-17T00:00:00+00:00",
         "window_days": 14,
-        "repo": {"owner": "huangruiteng", "name": "loopx"},
+        "repo": {"owner": "loopx-project", "name": "loopx"},
         "stats": {
             "raw_facts": 5,
             "deduped_facts": len(facts),
@@ -80,7 +80,63 @@ def _fixture() -> dict:
     }
 
 
+def _pre_and_post_transfer_addresses_are_both_strong() -> int:
+    """The move must not downgrade the project's own canonical pages."""
+
+    current = make_fact(
+        fact_type="external_discussion",
+        source="github",
+        source_url="https://github.com/loopx-project/loopx/issues/7",
+        title="Question from a new user",
+        author="external-user",
+        published_at="2026-09-19T00:00:00Z",
+    )
+    archived = make_fact(
+        fact_type="external_discussion",
+        source="github",
+        source_url="https://github.com/huangruiteng/loopx/issues/8",
+        title="Archived question that still cites the old address",
+        author="external-user",
+        published_at="2026-09-18T00:00:00Z",
+    )
+    generic = make_fact(
+        fact_type="external_discussion",
+        source="github",
+        source_url="https://github.com/example/other-tool/issues/3",
+        title="How do we schedule background jobs",
+        author="someone",
+        published_at="2026-09-16T00:00:00Z",
+        text="a question with no project identity in it",
+    )
+    noise = make_fact(
+        fact_type="ecosystem_signal",
+        source="hacker_news",
+        source_url="https://news.ycombinator.com/item?id=9",
+        title="We loopear the backlog every sprint",
+        author="someone",
+        published_at="2026-09-17T00:00:00Z",
+    )
+    for label, fact in (("current", current), ("archived", archived)):
+        if fact is None or fact["relevance"] != "strong":
+            print(f"FAIL: {label} project address should classify strong, got {fact}")
+            return 1
+    if noise is not None:
+        print(f"FAIL: noise term must stay dropped, got {noise}")
+        return 1
+    if generic is None or generic["relevance"] != "weak":
+        print(
+            "FAIL: a fact with no project identity must stay weak rather than be "
+            f"promoted or dropped, got {generic}"
+        )
+        return 1
+    return 0
+
+
 def _run_offline() -> int:
+    status = _pre_and_post_transfer_addresses_are_both_strong()
+    if status:
+        return status
+
     fixture = _fixture()
     if len(fixture["facts"]) != 4:
         print(f"FAIL: dedupe should collapse duplicate facts, got {len(fixture['facts'])}", file=sys.stderr)
@@ -131,7 +187,7 @@ def _run_offline() -> int:
         return 1
 
     md = render_markdown(fixture)
-    if "## External discussions" not in md or "https://github.com/huangruiteng/loopx/issues/1" not in md:
+    if "## External discussions" not in md or "https://github.com/loopx-project/loopx/issues/1" not in md:
         print("FAIL: markdown digest missing external discussion section", file=sys.stderr)
         return 1
     if "## Public adoption & recommendations" not in md or "we-standardize-on-loopx" not in md:

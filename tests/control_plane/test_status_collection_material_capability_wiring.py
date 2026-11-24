@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -22,21 +23,28 @@ def _context(
     tmp_path: Path,
     *,
     notification_projection: dict[str, Any] | None = None,
+    registry_goals: list[dict[str, Any]] | None = None,
 ) -> status_collection.StatusCollectionContext:
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir()
     return status_collection.StatusCollectionContext(
-        load_registry=lambda _path: {"common_runtime_root": str(runtime_root)},
+        load_registry=lambda _path: {
+            "common_runtime_root": str(runtime_root),
+            "goals": registry_goals or [],
+        },
         resolve_runtime_root=lambda _registry, _override, **_kwargs: runtime_root,
         collect_global_registry_health=lambda **_kwargs: {
             "ok": True,
             "current_registry_is_global": True,
         },
-        collect_history=lambda **_kwargs: {
-            "goal_count": 1,
-            "run_count": 0,
-            "goals": [],
-        },
+        collect_status_history=lambda **_kwargs: SimpleNamespace(
+            status_history={
+                "goal_count": 1,
+                "run_count": 0,
+                "goals": [],
+            },
+            contract_audit=object(),
+        ),
         check_contract=lambda **_kwargs: {
             "ok": True,
             "summary": "ok",
@@ -125,7 +133,6 @@ def _collect(
     return status_collection.collect_status(
         registry_path=tmp_path / "registry.json",
         runtime_root_override=None,
-        scan_roots=[tmp_path],
         limit=5,
         context=_context(
             tmp_path,
@@ -230,13 +237,149 @@ def test_status_collection_keeps_configured_goal_channel_rows(
     assert payload["goal_channel_notification_projection"] == projection
 
 
+def test_stopped_scope_filters_goal_channel_rows_and_requests_archive_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        status_collection,
+        "collect_runtime_projection_route_diagnostics",
+        lambda **_kwargs: {"available": False},
+    )
+    queue_calls: list[dict[str, Any]] = []
+    context = _context(
+        tmp_path,
+        registry_goals=[
+            {"id": "active-goal", "activation_state": "active"},
+            {"id": "stopped-goal", "activation_state": "stopped"},
+        ],
+        notification_projection={
+            "schema_version": "loopx_goal_channel_notification_projection_v0",
+            "goals": [
+                {"goal_id": "active-goal", "configured": True},
+                {"goal_id": "stopped-goal", "configured": True},
+            ],
+        },
+    )
+    base_builder = context.build_attention_queue
+    context = status_collection.StatusCollectionContext(
+        **{
+            **context.__dict__,
+            "build_attention_queue": lambda **kwargs: (
+                queue_calls.append(kwargs),
+                base_builder(**kwargs),
+            )[1],
+        }
+    )
+
+    payload = status_collection.collect_status(
+        registry_path=tmp_path / "registry.json",
+        runtime_root_override=None,
+        limit=5,
+        context=context,
+        activation_state_filter="stopped",
+    )
+
+    assert queue_calls[0]["include_stopped_goal_context"] is True
+    assert payload["goal_channel_notification_projection"]["goals"] == [
+        {"goal_id": "stopped-goal", "configured": True}
+    ]
+
+
+def _collect_recording_presentation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    **collect_kwargs: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    monkeypatch.setattr(
+        status_collection,
+        "collect_runtime_projection_route_diagnostics",
+        lambda **_kwargs: {"available": False},
+    )
+    queue_calls: list[dict[str, Any]] = []
+    gate_calls: list[dict[str, Any]] = []
+    context = _context(tmp_path)
+    base_builder = context.build_attention_queue
+    context = status_collection.StatusCollectionContext(
+        **{
+            **context.__dict__,
+            "build_attention_queue": lambda **kwargs: (
+                queue_calls.append(kwargs),
+                base_builder(**kwargs),
+            )[1],
+            "build_promotion_gate": lambda **kwargs: (
+                gate_calls.append(kwargs),
+                {"gate_state": "fixture"},
+            )[1],
+        }
+    )
+    payload = status_collection.collect_status(
+        registry_path=tmp_path / "registry.json",
+        runtime_root_override=None,
+        limit=5,
+        context=context,
+        goal_id=GOAL_ID,
+        **collect_kwargs,
+    )
+    return payload, queue_calls, gate_calls
+
+
+def test_status_collection_builds_presentation_projections_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload, queue_calls, gate_calls = _collect_recording_presentation(
+        tmp_path, monkeypatch
+    )
+
+    assert queue_calls[0]["include_goal_channel_projection"] is True
+    assert len(gate_calls) == 1
+    assert payload["promotion_gate"] == {"gate_state": "fixture"}
+
+
+def test_decision_status_read_skips_presentation_projections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload, queue_calls, gate_calls = _collect_recording_presentation(
+        tmp_path, monkeypatch, include_presentation_projections=False
+    )
+
+    assert queue_calls[0]["include_goal_channel_projection"] is False
+    assert gate_calls == []
+    assert "promotion_gate" not in payload
+    # Decision inputs stay in the reduced payload.
+    assert payload["attention_queue"] == {"items": [], "item_count": 0}
+    assert payload["agent_management_projection"]["agents"]
+
+
+def test_status_projection_cache_separates_presentation_scope(
+    tmp_path: Path,
+) -> None:
+    kwargs = {
+        "registry_path": tmp_path / "registry.json",
+        "runtime_root": tmp_path / "runtime",
+        "limit": 5,
+        "include_task_graph": False,
+        "goal_id": GOAL_ID,
+    }
+
+    default_key = status_projection_cache_key(**kwargs)
+
+    assert default_key == status_projection_cache_key(
+        **kwargs, include_presentation_projections=True
+    )
+    assert default_key != status_projection_cache_key(
+        **kwargs, include_presentation_projections=False
+    )
+
+
 def test_status_projection_cache_separates_capability_envelopes(
     tmp_path: Path,
 ) -> None:
     kwargs = {
         "registry_path": tmp_path / "registry.json",
         "runtime_root": tmp_path / "runtime",
-        "scan_roots": [tmp_path],
         "limit": 5,
         "include_task_graph": False,
         "goal_id": GOAL_ID,

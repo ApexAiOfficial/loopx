@@ -24,6 +24,7 @@ from ..context_providers.base import (
 )
 from ...repository_identity import resolve_project_identity
 from ...control_plane.runtime.public_safety import public_safe_compact_text
+from ...public_safe_text import COMPACT_LABEL_PATTERN as _LABEL
 from .repository_memory import (
     ISSUE_FIX_REPOSITORY_MEMORY_READ_RESULT_SCHEMA_VERSION,
     MAX_MEMORY_RESULTS,
@@ -66,7 +67,6 @@ _REMOVED_REVISION_LIFECYCLE_FIELDS = {
     "active_repository_revision",
     "active_scope_ref",
 }
-_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}$")
 _FORBIDDEN_WRITEBACK_FIELDS = {
     "credential",
     "credentials",
@@ -744,7 +744,7 @@ def write_issue_fix_validated_outcome_memory(
             result = subprocess.run(
                 ["git", *args],
                 cwd=checkout,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,

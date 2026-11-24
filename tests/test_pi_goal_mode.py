@@ -45,7 +45,9 @@ def test_pi_guided_start_goal_delivers_packet_without_editor_box() -> None:
     # agent (same followUp/triggerTurn pattern as heartbeat injection) instead
     # of prefilling the editor: no popup box, no manual Enter step before the
     # agent follows the ordered transaction.
-    assert 'pi.sendUserMessage(stdout, { deliverAs: "followUp", triggerTurn: true })' in text
+    assert 'pi.sendUserMessage(JSON.stringify(deliveredPacket), {' in text
+    assert 'deliverAs: "followUp"' in text
+    assert 'triggerTurn: true' in text
     # The editor-prefill flow must not remain anywhere in the extension: it is
     # the mechanism that pops a box and forces the user to press Enter.
     assert "setEditorText" not in text
@@ -99,6 +101,36 @@ def test_pi_extension_runtime_is_managed_and_directly_executable() -> None:
     assert "export function waitPlan" in text
 
 
+def test_pi_task_lease_facade_exposes_typed_cli_boundary() -> None:
+    text = runtime_source()
+    # The Pi host owns only binding/transport and argv construction. Lease
+    # state, transitions, and conflict decisions stay in the CLI contract.
+    assert "export function buildTaskLeaseArgs" in text
+    assert "export async function runPiTaskLease" in text
+    assert '"task-lease"' in text
+    assert '"task_lease_v0"' in text
+    assert "availableCapabilities" in text
+    assert "write_scope_conflict" not in text
+    assert "lease_cas_mismatch" not in text
+    assert "returncode" in text
+
+
+def test_pi_extension_registers_task_lease_as_an_explicit_tool() -> None:
+    text = extension_source()
+    assert 'name: "loopx_task_lease"' in text
+    assert "runPiTaskLease" in text
+    assert "registerTool" in text
+    assert "task_lease_v0" in text
+
+
+def test_pi_activation_uses_host_locked_session_authority() -> None:
+    text = extension_source()
+    assert "pi_session_authority" in text
+    assert "activationToken" in text
+    assert "establishSessionAuthority" in text
+    assert "LoopX host authority cannot change within one Pi session" in text
+
+
 def test_pi_extension_uses_ephemeral_identity_without_a_session_file() -> None:
     adapter = extension_source()
     runtime = runtime_source()
@@ -131,9 +163,65 @@ def test_pi_extension_binding_state_stays_private_and_scoped() -> None:
     assert "0o700" in runtime
 
 
+def test_pi_extension_never_infers_prompt_origin_from_compaction() -> None:
+    adapter = extension_source()
+    runtime = runtime_source()
+    # Pi compacts before it emits before_agent_start for a submitted prompt, so a
+    # preceding session_compact says nothing about who submitted the next prompt.
+    # The adapter must not exempt a prompt from the pause on that basis, and the
+    # runtime must accept no caller flag that skips the pause.
+    assert "session_compact" not in adapter
+    assert "hostGenerated" not in adapter
+    assert "hostGenerated" not in runtime
+    # Every pause keeps a durable reason, and both pause paths report it: the
+    # previous silent user-prompt pause is what made a stalled loop look healthy.
+    assert 'pauseReason: "user_prompt"' in runtime
+    assert 'pauseReason: "aborted"' in runtime
+    assert 'pauseReason: ""' in runtime
+    assert "auto-continuation paused by user input" in runtime
+
+
+def test_pi_extension_declares_the_packet_fields_it_reads() -> None:
+    adapter = extension_source()
+    # buildLoopxStatusWidget reads the bootstrap-command-pack top-level
+    # project_connection / recommended_next_step fields, so the declared packet
+    # type has to carry them there too; declaring them only under command_pack
+    # makes the widget fail typecheck.
+    top_level = adapter.split("command_pack?: {", 1)[0]
+    assert "project_connection?: { registry?: unknown; connection_state?: unknown };" in top_level
+    assert "recommended_next_step?: { kind?: unknown; summary?: unknown };" in top_level
+
+
+def test_pi_extension_status_widget_stays_compact() -> None:
+    adapter = extension_source()
+    # A widget is a fixed-height area near the editor: the full packet preview
+    # must not be dumped into it (it was truncated mid-sentence and covered the
+    # working indicator). Keep a summarized status instead and store the full
+    # text in the session entry.
+    assert "buildLoopxStatusWidget" in adapter
+    assert 'placement: "belowEditor"' in adapter
+    assert "setWidget(\"loopx\", undefined)" in adapter
+    assert 'pi.appendEntry("loopx-packet"' in adapter
+    assert 'setWidget("loopx", display.split' not in adapter
+
+
 def test_pi_goal_loop_runtime_contract() -> None:
     node = shutil.which("node")
     if not node:
         pytest.skip("Node.js is required for the Pi goal loop runtime contract")
     test_file = Path(__file__).with_name("pi_goal_loop_runtime.test.mjs")
+    subprocess.run([node, "--test", str(test_file)], check=True)
+
+
+def test_pi_goal_adapter_authority_contract() -> None:
+    node = shutil.which("node")
+    assert node, "Node.js >=22.22.3 is required for the shipped Pi adapter"
+    test_file = Path(__file__).with_name("pi_goal_adapter_authority.test.mjs")
+    subprocess.run([node, "--test", str(test_file)], check=True)
+
+
+def test_pi_goal_adapter_input_contract() -> None:
+    node = shutil.which("node")
+    assert node, "Node.js >=22.22.3 is required for the shipped Pi adapter"
+    test_file = Path(__file__).with_name("pi_goal_adapter_input.test.mjs")
     subprocess.run([node, "--test", str(test_file)], check=True)

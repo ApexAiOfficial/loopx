@@ -1,13 +1,44 @@
+import { normalizeHostFailure, hostFailureRetryCheck } from "./host_failure.ts";
 import transactionContract from "../turn_transaction_contract.json" with {
   type: "json",
 };
 
-import type { EffectTurn } from "../effect_program.ts";
+import {
+  SCOPED_SETTLEMENT_IDENTITY_SCHEMA_VERSION,
+  SETTLEMENT_IDENTITY_SCHEMA_VERSION,
+  SETTLEMENT_PLAN_SCHEMA_VERSION,
+  settlementIdentityFromPlan,
+  type EffectObservation,
+  type EffectTurn,
+} from "../effect_program.ts";
+import { EffectRuntimeRequestError } from "../effect_runtime_errors.ts";
+import { parseExactGoalRef } from "../goals/goal_instance_identity.ts";
+import { preparedAttemptViolation } from "./turn_journal_attempt_contract.ts";
+import { recordedTurnEffects, type RecordedTurnEffects } from "./turn_journal_effect_readback.ts";
+import { selectedWorkTodoId } from "../work_items/interaction_contract.ts";
+import { turnPlanWorkSource, turnEnvelopeScopedSettlementIdentity } from "../quota/turn_envelope.ts";
+import { sourceNumberTokens } from "../runtime_decode.ts";
 
 export const TURN_JOURNAL_INSPECTION_SCHEMA_VERSION =
-  "loopx_turn_journal_inspection_v0";
+  "loopx_turn_journal_inspection_v1";
 
 type JsonObject = Record<string, unknown>;
+
+type WireGoalRef = Readonly<{
+  goal_id: string;
+  goal_instance_id: string;
+}>;
+
+export type TurnJournalGoalBinding =
+  | Readonly<{ kind: "legacy" }>
+  | Readonly<{ kind: "exact"; goal_ref: WireGoalRef }>
+  | Readonly<{
+    kind: "invalid";
+    violation:
+      | "goal_ref_binding_incomplete"
+      | "goal_ref_binding_invalid"
+      | "goal_ref_binding_mismatch";
+  }>;
 
 export interface TurnJournalInspectionRequest {
   schema_version: "loopx_turn_journal_interpretation_request_v0";
@@ -15,6 +46,42 @@ export interface TurnJournalInspectionRequest {
   goal_id: string;
   agent_id: string;
   turn_key: string;
+  retry_failed?: boolean;
+  session_recovery_check?: TurnRecoveryCheck | null;
+  source_number_tokens?: unknown;
+}
+
+export interface TurnRecoveryCheck {
+  kind:
+    | "journal_consistency"
+    | "host_retry_policy"
+    | "host_session_binding"
+    | "prepared_effect_readback";
+  outcome: "passed" | "failed" | "required";
+  reason?: string;
+  step_kind?: string;
+}
+
+export interface TurnRecoveryDecision {
+  schema_version: "loopx_turn_recovery_decision_v0";
+  action: "continue" | "return_existing" | "blocked";
+  can_continue: boolean;
+  resume_from: string | null;
+  reinvoke_host: boolean;
+  reason: string;
+  retry_failed: boolean;
+  checks: TurnRecoveryCheck[];
+}
+
+export interface TurnRecoveryAudit {
+  schema_version: "loopx_turn_recovery_audit_v0";
+  planned: TurnRecoveryDecision;
+  actual: {
+    status: "started" | "finished";
+    journal_status: string;
+    completed_phases: string[];
+    host_invoked: boolean | null;
+  };
 }
 
 export interface TurnJournalInspection {
@@ -30,6 +97,10 @@ export interface TurnJournalInspection {
   completed_phases: string[];
   tombstone_retained: boolean;
   violations: string[];
+  journal_consistent: boolean;
+  recovery_decision: TurnRecoveryDecision;
+  last_recovery: TurnRecoveryAudit | null;
+  recorded_effects: RecordedTurnEffects;
   effects: [];
 }
 
@@ -43,19 +114,90 @@ export interface TurnJournalEffectContext {
   tombstone_retained: boolean;
   completed_phases: string[];
   violations: string[];
+  journal_consistent: boolean;
+  recovery_decision: TurnRecoveryDecision;
+  last_recovery: TurnRecoveryAudit | null;
+  recorded_effects: RecordedTurnEffects;
 }
 
-export type TurnJournalEffect = EffectTurn<
+// Replay has its own verdict. It is not a quota decision and must not manufacture
+// a second action vocabulary in the should-run effective_action slot.
+export type TurnJournalEffect = Omit<EffectTurn<
   TurnJournalEffectContext,
   "replay_legal" | "replay_blocked"
->;
+>, "observation"> & {
+  observation: Omit<EffectObservation<"replay_legal" | "replay_blocked">, "effective_action">;
+};
 
-const transactionPhases = Object.freeze([...transactionContract.phases]);
+export const transactionPhases = Object.freeze([...transactionContract.phases]);
+export const supportedJournalStatuses: ReadonlySet<string> = new Set([
+  "in_progress",
+  "scheduler_action_required",
+  "committed",
+  "stopped",
+  "failed",
+]);
+/** Snapshot constraints shared by write admission and historical readback. */
+export function journalPhaseViolation(
+  status: string, completedPhases: readonly string[], failedPhase: string | null,
+): string | null {
+  if (status === "committed" && completedPhases.length !== transactionPhases.length) {
+    return "Committed Turn journal must contain the complete transaction prefix";
+  }
+  if (status === "stopped" && completedPhases.length !== 3) {
+    return "Stopped Turn journal must end after validation";
+  }
+  if (status === "scheduler_action_required" && completedPhases.length !== 5) {
+    return "Scheduler-pending Turn journal must end after quota spend";
+  }
+  if (status === "in_progress" && completedPhases.length > 5) {
+    return "In-progress Turn journal cannot claim scheduler completion";
+  }
+  if (status === "failed") {
+    const nextPhase = transactionPhases[completedPhases.length] ?? null;
+    const terminalCloseoutFailure = failedPhase === "terminal_closeout" && completedPhases.length === 5;
+    if (!failedPhase || (failedPhase !== nextPhase && !terminalCloseoutFailure)) {
+      return "Failed Turn journal must name the next uncompleted phase";
+    }
+  }
+  return null;
+}
+
 
 function asObject(value: unknown): JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as JsonObject)
     : {};
+}
+
+export function parseTurnJournalGoalBinding(
+  journal: JsonObject,
+): TurnJournalGoalBinding {
+  const plan = asObject(journal.plan);
+  const transaction = asObject(plan.transaction);
+  const hasPlanRef = Object.hasOwn(plan, "goal_ref");
+  const hasTransactionRef = Object.hasOwn(transaction, "goal_ref");
+  if (!hasPlanRef && !hasTransactionRef) return { kind: "legacy" };
+  if (!hasPlanRef || !hasTransactionRef) {
+    return { kind: "invalid", violation: "goal_ref_binding_incomplete" };
+  }
+  const planned = parseExactGoalRef(plan.goal_ref);
+  const transactionPlanned = parseExactGoalRef(transaction.goal_ref);
+  if (planned.kind === "invalid" || transactionPlanned.kind === "invalid") {
+    return { kind: "invalid", violation: "goal_ref_binding_invalid" };
+  }
+  const goalRef = {
+    goal_id: planned.value.goalId.value,
+    goal_instance_id: planned.value.goalInstanceId.value,
+  };
+  if (
+    goalRef.goal_id !== transactionPlanned.value.goalId.value
+    || goalRef.goal_instance_id !==
+      transactionPlanned.value.goalInstanceId.value
+  ) {
+    return { kind: "invalid", violation: "goal_ref_binding_mismatch" };
+  }
+  return { kind: "exact", goal_ref: goalRef };
 }
 
 function isValidIdentity(value: unknown): value is string {
@@ -79,6 +221,52 @@ function identityState(
   return [complete, complete && new Set(observed).size === 1];
 }
 
+function typedSettlementIdentityState(
+  envelope: JsonObject,
+  transaction: JsonObject,
+  settlement: JsonObject,
+  identity: JsonObject,
+  scopedIdentity?: JsonObject | null,
+): [valid: boolean, turnInstanceMatches: boolean, bindingMatches: boolean] {
+  if (
+    settlement.schema_version !== SETTLEMENT_PLAN_SCHEMA_VERSION ||
+    ![
+      SETTLEMENT_IDENTITY_SCHEMA_VERSION,
+      SCOPED_SETTLEMENT_IDENTITY_SCHEMA_VERSION,
+    ].includes(String(identity.schema_version))
+  ) {
+    return [false, false, false];
+  }
+  const parsed = settlementIdentityFromPlan(transaction);
+  if (parsed.failure !== null || parsed.value === null) {
+    return [false, false, false];
+  }
+  const expectedTurnInstance = isValidIdentity(transaction.turn_instance_id)
+    ? transaction.turn_instance_id
+    : transaction.turn_key;
+  const selectedTodoId = selectedWorkTodoId({
+    selected_todo: asObject(envelope.action).selected_todo,
+    task_orchestration_contract: envelope.task_orchestration_contract,
+  });
+  let bindingMatches = selectedTodoId !== null && parsed.value.binding_kind === "todo"
+    && parsed.value.todo_id === selectedTodoId && parsed.value.binding_id === selectedTodoId;
+  if (selectedTodoId === null && ["autonomous_replan", "request"].includes(parsed.value.binding_kind)) {
+    try {
+      bindingMatches = (scopedIdentity === undefined
+        ? turnEnvelopeScopedSettlementIdentity(envelope, expectedTurnInstance) : scopedIdentity)?.effect_id
+        === parsed.value.effect_id;
+    } catch {
+      bindingMatches = false; // Corrupt evidence remains a refusal, never a surrogate task.
+    }
+  }
+  return [
+    true,
+    isValidIdentity(expectedTurnInstance) &&
+      parsed.value.turn_instance_id === expectedTurnInstance,
+    bindingMatches,
+  ];
+}
+
 function stringifyPhase(value: unknown): string {
   if (value === null) return "None";
   if (value === true) return "True";
@@ -86,20 +274,301 @@ function stringifyPhase(value: unknown): string {
   return String(value);
 }
 
+function recoveryResumePhase(
+  journal: JsonObject,
+  completedPhases: string[],
+  journalStatus: string,
+): string | null {
+  const receipt = asObject(journal.receipt);
+  const failedPhase = typeof receipt.failed_phase === "string" ? receipt.failed_phase : "";
+  const validationStage = typeof journal.validation_stage === "string"
+    ? journal.validation_stage
+    : "";
+  if (
+    journalStatus === "failed" &&
+    failedPhase === "validation" &&
+    validationStage !== "task_postcondition"
+  ) {
+    return "host_execute";
+  }
+  if (journalStatus === "failed" && failedPhase === "terminal_closeout") {
+    return "terminal_closeout";
+  }
+  if (journalStatus === "failed" && transactionPhases.includes(failedPhase)) {
+    return failedPhase;
+  }
+  if (journalStatus === "scheduler_action_required") return "scheduler_apply";
+  return transactionPhases[completedPhases.length] ?? null;
+}
+
+function preparedEffectCheck(
+  journal: JsonObject,
+  resumeFrom: string | null,
+): TurnRecoveryCheck | null {
+  if (!resumeFrom) return null;
+  const attempts = asObject(journal.effect_attempts);
+  const attempt = asObject(attempts[resumeFrom]);
+  if (
+    attempt.status !== "prepared" ||
+    typeof attempt.effect_ref !== "string" ||
+    attempt.effect_ref.length === 0
+  ) {
+    return null;
+  }
+  return {
+    kind: "prepared_effect_readback",
+    outcome: "required",
+    step_kind: resumeFrom,
+  };
+}
+
+function hostRetryPolicyCheck(journal: JsonObject): TurnRecoveryCheck | null {
+  if (!Object.hasOwn(journal, "host_failure")) return null;
+  let failure: JsonObject;
+  try { failure = normalizeHostFailure(journal.host_failure); }
+  catch (error) {
+    if (!(error instanceof EffectRuntimeRequestError)) throw error;
+    return {kind: "host_retry_policy", outcome: "failed", reason: "host_retry_contract_invalid"};
+  }
+  const attempt = failure.attempt;
+  if (journal.host_attempt_count !== attempt)
+    return {kind: "host_retry_policy", outcome: "failed", reason: "host_retry_contract_invalid"};
+  return hostFailureRetryCheck(failure, true) as TurnRecoveryCheck | null;
+}
+
+function recoveryDecision(
+  request: TurnJournalInspectionRequest,
+  journal: JsonObject,
+  completedPhases: string[],
+  journalStatus: string,
+  journalConsistent: boolean,
+): TurnRecoveryDecision {
+  const retryFailed = request.retry_failed === true;
+  const checks: TurnRecoveryCheck[] = [{
+    kind: "journal_consistency",
+    outcome: journalConsistent ? "passed" : "failed",
+  }];
+  const base = {
+    schema_version: "loopx_turn_recovery_decision_v0" as const,
+    retry_failed: retryFailed,
+    checks,
+  };
+  if (!journalConsistent) {
+    return {
+      ...base,
+      action: "blocked",
+      can_continue: false,
+      resume_from: null,
+      reinvoke_host: false,
+      reason: "journal_inconsistent",
+    };
+  }
+  if (["committed", "stopped"].includes(journalStatus)) {
+    return {
+      ...base,
+      action: "return_existing",
+      can_continue: false,
+      resume_from: null,
+      reinvoke_host: false,
+      reason: "terminal_result_retained",
+    };
+  }
+
+  const resumeFrom = recoveryResumePhase(journal, completedPhases, journalStatus);
+  // A durable dispatch intent without its result cannot prove non-execution.
+  if (journalStatus === "in_progress" && completedPhases.length < 2
+    && journal.host_attempt_count !== 0) {
+    return {
+      ...base,
+      action: "blocked",
+      can_continue: false,
+      resume_from: resumeFrom,
+      reinvoke_host: false,
+      reason: "host_outcome_unknown",
+    };
+  }
+  if (journalStatus === "failed" && !retryFailed) {
+    return {
+      ...base,
+      action: "return_existing",
+      can_continue: false,
+      resume_from: resumeFrom,
+      reinvoke_host: false,
+      reason: "failed_retry_not_requested",
+    };
+  }
+
+  if (journalStatus === "failed") {
+    const retryPolicyCheck = hostRetryPolicyCheck(journal);
+    if (retryPolicyCheck) {
+      checks.push(retryPolicyCheck);
+      if (retryPolicyCheck.outcome !== "passed") {
+        return {
+          ...base,
+          action: "blocked",
+          can_continue: false,
+          resume_from: resumeFrom,
+          reinvoke_host: false,
+          reason: retryPolicyCheck.reason ?? "host_retry_policy_rejected",
+        };
+      }
+    }
+  }
+
+  if (journalStatus === "failed" && Object.hasOwn(journal, "host_recovery")) {
+    const sessionCheck = request.session_recovery_check;
+    const normalizedCheck: TurnRecoveryCheck = sessionCheck?.kind === "host_session_binding"
+      ? {
+          kind: "host_session_binding",
+          outcome: sessionCheck.outcome,
+          ...(sessionCheck.reason ? { reason: sessionCheck.reason } : {}),
+        }
+      : {
+          kind: "host_session_binding",
+          outcome: "failed",
+          reason: "binding_check_unavailable",
+        };
+    checks.push(normalizedCheck);
+    if (normalizedCheck.outcome !== "passed") {
+      return {
+        ...base,
+        action: "blocked",
+        can_continue: false,
+        resume_from: resumeFrom,
+        reinvoke_host: false,
+        reason: normalizedCheck.reason ?? "host_session_binding_rejected",
+      };
+    }
+  }
+  if (!resumeFrom) {
+    return {
+      ...base,
+      action: "blocked",
+      can_continue: false,
+      resume_from: null,
+      reinvoke_host: false,
+      reason: "recovery_phase_unavailable",
+    };
+  }
+  const preparedCheck = preparedEffectCheck(journal, resumeFrom);
+  if (preparedCheck) checks.push(preparedCheck);
+  return {
+    ...base,
+    action: "continue",
+    can_continue: true,
+    resume_from: resumeFrom,
+    reinvoke_host: ["host_execute", "typed_result"].includes(resumeFrom),
+    reason: preparedCheck
+      ? "resolve_prepared_effect"
+      : journalStatus === "scheduler_action_required"
+        ? "resume_scheduler"
+        : journalStatus === "failed"
+          ? "retry_failed_phase"
+          : "resume_in_progress",
+  };
+}
+
+function projectRecoveryDecision(value: unknown): TurnRecoveryDecision | null {
+  const decision = asObject(value);
+  const action = decision.action;
+  const checks = Array.isArray(decision.checks)
+    ? decision.checks.map((item) => asObject(item))
+    : [];
+  if (
+    decision.schema_version !== "loopx_turn_recovery_decision_v0" ||
+    !["continue", "return_existing", "blocked"].includes(String(action)) ||
+    typeof decision.can_continue !== "boolean" ||
+    !(typeof decision.resume_from === "string" || decision.resume_from === null) ||
+    typeof decision.reinvoke_host !== "boolean" ||
+    typeof decision.reason !== "string" ||
+    typeof decision.retry_failed !== "boolean"
+  ) return null;
+  return {
+    schema_version: "loopx_turn_recovery_decision_v0",
+    action: action as TurnRecoveryDecision["action"],
+    can_continue: decision.can_continue,
+    resume_from: decision.resume_from as string | null,
+    reinvoke_host: decision.reinvoke_host,
+    reason: decision.reason,
+    retry_failed: decision.retry_failed,
+    checks: checks.flatMap((check) => {
+      if (
+        ![
+          "journal_consistency",
+          "host_retry_policy",
+          "host_session_binding",
+          "prepared_effect_readback",
+        ].includes(
+          String(check.kind),
+        ) ||
+        !["passed", "failed", "required"].includes(String(check.outcome))
+      ) return [];
+      return [{
+        kind: check.kind as TurnRecoveryCheck["kind"],
+        outcome: check.outcome as TurnRecoveryCheck["outcome"],
+        ...(typeof check.reason === "string" ? { reason: check.reason } : {}),
+        ...(typeof check.step_kind === "string" ? { step_kind: check.step_kind } : {}),
+      }];
+    }),
+  };
+}
+
+function projectRecoveryAudit(value: unknown): TurnRecoveryAudit | null {
+  const audit = asObject(value);
+  const planned = projectRecoveryDecision(audit.planned);
+  const actual = asObject(audit.actual);
+  if (
+    audit.schema_version !== "loopx_turn_recovery_audit_v0" ||
+    planned === null ||
+    !["started", "finished"].includes(String(actual.status)) ||
+    typeof actual.journal_status !== "string" ||
+    !Array.isArray(actual.completed_phases) ||
+    !actual.completed_phases.every((phase) => typeof phase === "string") ||
+    !(typeof actual.host_invoked === "boolean" || actual.host_invoked === null)
+  ) return null;
+  return {
+    schema_version: "loopx_turn_recovery_audit_v0",
+    planned,
+    actual: {
+      status: actual.status as "started" | "finished",
+      journal_status: actual.journal_status,
+      completed_phases: [...actual.completed_phases],
+      host_invoked: actual.host_invoked,
+    },
+  };
+}
+
 export function interpretTurnJournalEffect(
   request: TurnJournalInspectionRequest,
 ): TurnJournalEffect {
   if (request.schema_version !== "loopx_turn_journal_interpretation_request_v0") {
-    throw new Error("Turn-journal interpretation request schema mismatch");
+    throw new EffectRuntimeRequestError("Turn-journal interpretation request schema mismatch");
   }
   const journal = asObject(request.journal);
   const plan = asObject(journal.plan);
-  const envelope = asObject(plan.turn_envelope);
+  let envelope = asObject(plan.turn_envelope);
+  let workContractValid = true;
+  let scopedIdentity: JsonObject | null | undefined;
+  try {
+      const tokens = sourceNumberTokens(journal, request.source_number_tokens)
+        .filter(({path}) => path[0] === "plan" && path[1] === "work_contract")
+        .map(({path, token}) => [path.slice(2), token]);
+      // Current journals consume the same checked source as Host dispatch.
+      // Keep transport/signature metadata, but derive execution fields from
+      // its owner. Only historical absence retains adapter-only decoding.
+      const checked = turnPlanWorkSource(plan, tokens);
+      envelope = checked.work;
+      scopedIdentity = checked.scopedIdentity;
+  } catch (error) {
+    if (!(error instanceof EffectRuntimeRequestError)) throw error;
+    workContractValid = false;
+  }
   const transaction = asObject(plan.transaction);
   const settlement = asObject(transaction.settlement_plan);
   const identity = asObject(settlement.identity);
   const hostResult = asObject(journal.host_result);
   const receipt = asObject(journal.receipt);
+  const goalBinding = parseTurnJournalGoalBinding(journal);
 
   const [goalComplete, goalMatches] = identityState(
     [journal.goal_id, envelope.goal_id, identity.goal_id],
@@ -119,12 +588,33 @@ export function interpretTurnJournalEffect(
     ],
     request.turn_key,
   );
+  const [
+    settlementIdentityValid,
+    settlementTurnInstanceMatches,
+    settlementBindingMatches,
+  ] = typedSettlementIdentityState(envelope, transaction, settlement, identity, scopedIdentity);
 
   const violations: string[] = [];
+  if (!workContractValid) violations.push("work_contract_invalid");
   if (!goalComplete) violations.push("goal_identity_missing");
   else if (!goalMatches) violations.push("goal_mismatch");
+  if (goalBinding.kind === "invalid") {
+    violations.push(goalBinding.violation);
+  } else if (
+    goalBinding.kind === "exact"
+    && goalBinding.goal_ref.goal_id !== request.goal_id
+  ) {
+    violations.push("goal_ref_binding_mismatch");
+  }
   if (!ownerComplete) violations.push("owner_identity_missing");
   else if (!ownerMatches) violations.push("owner_mismatch");
+  if (!settlementIdentityValid) violations.push("settlement_identity_invalid");
+  else if (!settlementTurnInstanceMatches) {
+    violations.push("settlement_turn_instance_mismatch");
+  }
+  if (settlementIdentityValid && !settlementBindingMatches) {
+    violations.push("settlement_binding_mismatch");
+  }
   if (!turnKeyComplete) violations.push("turn_key_identity_missing");
   else if (!turnKeyMatches) violations.push("turn_key_mismatch");
 
@@ -143,6 +633,11 @@ export function interpretTurnJournalEffect(
   }
 
   const journalStatus = journal.status ? String(journal.status) : "";
+  const statusViolation = journalPhaseViolation(
+    journalStatus, completedPhases,
+    typeof receipt.failed_phase === "string" ? receipt.failed_phase : null,
+  );
+  if (statusViolation !== null) violations.push("journal_status_phase_mismatch");
   const tombstoneRetained = ["committed", "stopped", "failed"].includes(
     journalStatus,
   );
@@ -152,8 +647,37 @@ export function interpretTurnJournalEffect(
     violations.push("journal_status_unsupported");
   }
 
+  const lineageConsistent =
+    workContractValid &&
+    goalMatches &&
+    goalBinding.kind !== "invalid" &&
+    (
+      goalBinding.kind !== "exact"
+      || goalBinding.goal_ref.goal_id === request.goal_id
+    ) &&
+    ownerMatches &&
+    settlementIdentityValid &&
+    settlementTurnInstanceMatches &&
+    settlementBindingMatches &&
+    turnKeyMatches &&
+    phasesFormOrderedPrefix &&
+    supportedJournalStatuses.has(journalStatus) && statusViolation === null;
+  const attemptViolation = preparedAttemptViolation(journal, {
+    status: journalStatus,
+    completedPhases,
+    effectId: settlementIdentityFromPlan(transaction).value?.effect_id ?? "",
+  });
+  if (attemptViolation) violations.push(attemptViolation.code);
   const replayLegal = violations.length === 0;
+  const journalConsistent = lineageConsistent && attemptViolation === null;
   const decision = replayLegal ? "replay_legal" : "replay_blocked";
+  const turnRecoveryDecision = recoveryDecision(
+    request,
+    journal,
+    completedPhases,
+    journalStatus,
+    journalConsistent,
+  );
   return {
     request: {
       kind: "turn_journal",
@@ -171,6 +695,12 @@ export function interpretTurnJournalEffect(
         tombstone_retained: tombstoneRetained,
         completed_phases: completedPhases,
         violations,
+        journal_consistent: journalConsistent,
+        recovery_decision: turnRecoveryDecision,
+        last_recovery: projectRecoveryAudit(journal.recovery_audit),
+        recorded_effects: recordedTurnEffects(
+          journal, completedPhases, lineageConsistent, attemptViolation === null,
+        ),
       },
     },
     interpretation: {
@@ -183,11 +713,11 @@ export function interpretTurnJournalEffect(
     observation: {
       decision,
       should_run: false,
-      effective_action: replayLegal ? "observe_replay" : "block_replay",
       recommended_action: replayLegal
         ? "Retain the terminal Turn journal tombstone."
         : "Inspect the structured Turn journal violations before replay.",
       action_portfolio: null,
+      planning_horizon: null,
       protocol_summary: replayLegal
         ? "Turn journal replay is legal and effect-free."
         : `Turn journal replay is blocked by ${violations.length} structured violation(s).`,
@@ -220,6 +750,10 @@ export function projectTurnJournalInspection(
     completed_phases: context.completed_phases,
     tombstone_retained: context.tombstone_retained,
     violations: context.violations,
+    journal_consistent: context.journal_consistent,
+    recovery_decision: context.recovery_decision,
+    last_recovery: context.last_recovery,
+    recorded_effects: context.recorded_effects,
     effects: [],
   };
 }

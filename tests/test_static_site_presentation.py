@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -103,6 +104,67 @@ def test_package_is_semantically_idempotent_and_rollback_restores_previous_revis
     assert len((state / RECEIPT_LOG_FILE).read_text(encoding="utf-8").splitlines()) == 3
 
 
+def test_rollback_rejects_revision_paths_outside_the_retained_revision(
+    tmp_path: Path,
+) -> None:
+    site = _site(tmp_path)
+    output = tmp_path / "publish"
+    state = tmp_path / "state"
+    _package(site, output, state)
+    (site / "index.html").write_text("second\n", encoding="utf-8")
+    _package(site, output, state, revision="rev-b")
+
+    escaped_content = b"copied from output\n"
+    escaped_source = output / "escaped.txt"
+    escaped_source.write_bytes(escaped_content)
+    victim = tmp_path / "escaped.txt"
+    victim.write_text("must remain unchanged\n", encoding="utf-8")
+    metadata_path = output / REVISION_DIR / "rev-a" / REVISION_FILE
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["files"] = [
+        {
+            "path": "../../escaped.txt",
+            "sha256": hashlib.sha256(escaped_content).hexdigest(),
+            "size": len(escaped_content),
+        }
+    ]
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(StaticSiteContractError, match="revision file path"):
+        rollback_static_site(
+            output_dir=output,
+            revision="rev-a",
+            state_dir=state,
+            execute=True,
+        )
+
+    assert victim.read_text(encoding="utf-8") == "must remain unchanged\n"
+
+
+def test_rollback_rejects_retained_revision_content_drift(tmp_path: Path) -> None:
+    site = _site(tmp_path)
+    output = tmp_path / "publish"
+    state = tmp_path / "state"
+    _package(site, output, state)
+    (site / "index.html").write_text("second\n", encoding="utf-8")
+    _package(site, output, state, revision="rev-b")
+    (output / REVISION_DIR / "rev-a" / "index.html").write_text(
+        "tampered\n", encoding="utf-8"
+    )
+
+    with pytest.raises(StaticSiteContractError, match="integrity"):
+        rollback_static_site(
+            output_dir=output,
+            revision="rev-a",
+            state_dir=state,
+            execute=True,
+        )
+
+    assert (output / MANIFEST_FILE).read_text(encoding="utf-8").find(
+        '"active_revision": "rev-b"'
+    ) >= 0
+
+
 def test_github_pages_adapter_projects_stable_latest_and_revision_urls(
     tmp_path: Path,
 ) -> None:
@@ -147,6 +209,18 @@ def test_package_requires_visual_and_link_validation_receipts(
         StaticSiteContractError, match="requires passed validation receipts"
     ):
         _package(site, tmp_path / "publish", tmp_path / "state", **{field: value})
+
+
+@pytest.mark.parametrize("prefix", ["sk-proj-", "sk-svcacct-", "sk-admin-", "sk-ant-api03-"])
+def test_package_rejects_unlabeled_ai_provider_tokens(tmp_path: Path, prefix: str) -> None:
+    site = _site(tmp_path)
+    token = prefix + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0"
+    (site / "notes.txt").write_text(f"provider output: {token}\n", encoding="utf-8")
+    destination = tmp_path / "publish"
+
+    with pytest.raises(StaticSiteContractError, match="public boundary scan failed"):
+        _package(site, destination, tmp_path / "state")
+    assert not destination.exists()
 
 
 def test_package_rejects_reserved_paths_symlinks_and_public_boundary_leaks(

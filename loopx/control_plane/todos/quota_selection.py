@@ -1,0 +1,312 @@
+"""Legacy fact codec for the single typed quota planning read boundary."""
+
+from __future__ import annotations
+
+from typing import Any, cast
+
+import json
+
+from ..agents.profile import AGENT_PROFILE_ACTION_PATTERN, agent_profile_candidate_rank
+from ..effect_runtime import (
+    MAX_LOCAL_SNAPSHOT_BYTES, EffectRuntimeRejected, effect_runtime_result,
+)
+from ..runtime.time import now_utc, parse_timestamp
+from .contract import (
+    normalize_todo_claimed_by, normalize_todo_bound_agent, normalize_todo_blocks_agent,
+    normalize_todo_excluded_agents, normalize_todo_global_gate,
+    normalize_required_capabilities, normalize_target_capabilities,
+)
+from .todo_semantics import (
+    todo_item_has_removed_continuation_policy, todo_item_is_actionable_open,
+    todo_item_next_due_at, todo_item_expires_at, todo_item_is_watch_only_monitor,
+    todo_item_task_class, todo_projection_sort_key,
+    todo_summary_monitor_writeback_supported, todo_presentation_sort_key,
+)
+from .resume_planning import build_referenced_todo_resume_planning_request
+from .handoff_note import todo_read_source
+from .summary_item import TODO_SUMMARY_SOURCE_KEYS
+from .user_gate import is_user_gate_todo_item
+from .route_continuation import build_todo_route_continuation_facts
+from .handoff_gate import todo_summary_handoff_gates
+
+
+def _closure_source_facts(value: dict[str, Any]) -> dict[str, Any]:
+    # JSON erases Python's int/float distinction. Retain the strict integer
+    # evidence type before transport; the typed owner decides validity.
+    def integer(raw: Any) -> int | None:
+        return raw if type(raw) is int else None
+
+    def proof(key: str, fields: tuple[str, ...], counts: dict[str, int | None]) -> Any:
+        raw = value.get(key)
+        if not isinstance(raw, dict):
+            return None
+        return {**{name: raw.get(name) for name in fields},
+                **{name: integer(raw.get(name, default)) for name, default in counts.items()}}
+
+    def rows(key: str, *, absent_empty: bool = False) -> Any:
+        raw = value.get(key)
+        if raw is None and absent_empty:
+            raw = []
+        if not isinstance(raw, list):
+            return None
+        return [{"status": item.get("status"), "done": item.get("done"),
+                 "watch_only": todo_item_is_watch_only_monitor(item),
+                 "route_continuation_replan_required": item.get("route_continuation_replan_required")}
+                if isinstance(item, dict) else None for item in raw]
+
+    return {
+        **{key: value.get(key) for key in ("schema_version", "source_section")},
+        **{key: integer(value.get(key)) for key in ("total_count", "open_count", "done_count", "deferred_count")},
+        "convergence_open_count": integer(value.get("convergence_open_count", value.get("open_count"))),
+        **{key: integer(value.get(key, 0)) for key in ("completed_without_successor_count", "route_continuation_replan_count")},
+        "source_proof": proof("source_proof", ("schema_version", "role", "derived"), {"item_count": None}),
+        "terminal_closure_proof": proof("terminal_closure_proof",
+            ("schema_version", "role", "source_section", "all_todos_done", "all_convergent_todos_done", "derived"),
+            {"item_count": None, "monitor_open_count": None, "watch_only_monitor_count": 0,
+             "successor_gap_count": None, "route_replan_count": None, "no_followup_count": None}),
+        "closure_intent": proof("closure_intent", ("schema_version", "kind", "derived"), {"count": None}),
+        "items": rows("items"), "monitor_open_items": rows("monitor_open_items", absent_empty=True),
+        "deferred_item_count": len(value["deferred_items"]) if isinstance(value.get("deferred_items"), list) else None,
+        "deferred_resume_count": len(value["deferred_resume_candidates"]) if isinstance(value.get("deferred_resume_candidates"), list) else None,
+    }
+
+
+def _decode_quota_planning_wire(wire: Any) -> dict[str, Any]:
+    error = "invalid TypeScript quota planning wire"
+    if not isinstance(wire, dict) or wire.get("schema_version") != "todo_quota_planning_wire_v1":
+        raise RuntimeError(error)
+    planning, records, record_lanes = (
+        wire.get("planning"), wire.get("records"), wire.get("record_lanes")
+    )
+    if (
+        not isinstance(planning, dict) or not isinstance(planning.get("lanes"), dict)
+        or not isinstance(records, list) or any(not isinstance(row, dict) for row in records)
+        or not isinstance(record_lanes, list)
+        or any(not isinstance(name, str) for name in record_lanes)
+        or len(set(record_lanes)) != len(record_lanes)
+    ):
+        raise RuntimeError(error)
+    if set(record_lanes) != {
+        name for name, entries in planning["lanes"].items() if isinstance(entries, list)
+    }:
+        raise RuntimeError(error)
+    serialized_records = [json.dumps(row, ensure_ascii=False, separators=(",", ":")) for row in records]
+    sizes = [len(row.encode()) for row in serialized_records]
+    expanded_bytes = len(json.dumps(planning, ensure_ascii=False, separators=(",", ":")).encode())
+    for name in record_lanes:
+        indices = planning["lanes"].get(name)
+        if not isinstance(indices, list) or any(
+            type(index) is not int or not 0 <= index < len(records) for index in indices
+        ):
+            raise RuntimeError(error)
+        expanded_bytes += sum(sizes[index] - len(str(index)) for index in indices)
+    if expanded_bytes > MAX_LOCAL_SNAPSHOT_BYTES:
+        raise RuntimeError("TypeScript quota planning expanded response is oversized")
+    lanes = dict(planning["lanes"])
+    for name in record_lanes:
+        # Inline JSON used to give each occurrence an independent mutable record.
+        lanes[name] = [json.loads(serialized_records[index]) for index in lanes[name]]
+    return {**planning, "lanes": lanes}
+
+
+def project_quota_planning(
+    value: dict[str, Any], *, all_open_items: list[dict[str, Any]],
+    source_open_count: Any, agent_identity: dict[str, Any] | None,
+    filter_user_gate_blocks_agent: bool, available_capabilities: Any,
+    resolve_capacity: bool = False, current_time: str | None = None,
+    summary_kind: str | None = None,
+    consume_display_views: bool = False, request_only: bool = False,
+    display_view_names: list[str] | None = None,
+) -> dict[str, Any]:
+    identity = agent_identity if isinstance(agent_identity, dict) else {}
+    profile = identity.get("agent_profile")
+    profile = profile if isinstance(profile, dict) and profile else None
+    native_profile = profile is None or all(
+        not isinstance(profile.get(key), list) or all(
+            isinstance(pattern, str) and AGENT_PROFILE_ACTION_PATTERN.fullmatch(pattern)
+            for pattern in profile[key]
+        ) for key in ("avoid_action_kinds", "preferred_action_kinds")
+    )
+    agent = normalize_todo_claimed_by(identity.get("agent_id"))
+    observed_now = now_utc() if current_time is None else parse_timestamp(current_time)
+    if observed_now is None:
+        raise ValueError("invalid quota planning clock")
+    observed_at = observed_now.timestamp()
+    handoff_gates = todo_summary_handoff_gates(value)
+
+    def encode(item: dict[str, Any], *, include_payload: bool = True) -> dict[str, Any]:
+        priority, index = todo_projection_sort_key(item)
+        due, expires = todo_item_next_due_at(item), todo_item_expires_at(item)
+        return {
+            **({"payload": item, "display_source": todo_read_source(item)} if include_payload else {}),
+            "presentation": list(todo_presentation_sort_key(item)),
+            "claim": normalize_todo_claimed_by(item.get("claimed_by")),
+            "bound": normalize_todo_bound_agent(item.get("bound_agent")),
+            "blocks": normalize_todo_blocks_agent(item.get("blocks_agent")),
+            "excluded": normalize_todo_excluded_agents(item.get("excluded_agents")),
+            "global": bool(normalize_todo_global_gate(item.get("global_gate"))),
+            "gate": is_user_gate_todo_item(item),
+            "removed": todo_item_has_removed_continuation_policy(item),
+            "actionable": todo_item_is_actionable_open(item),
+            "due_at": due.timestamp() if due else None,
+            "expires_at": expires.timestamp() if expires else None,
+            "watch_only": todo_item_is_watch_only_monitor(item),
+            "task_class": todo_item_task_class(item),
+            "priority": priority, "index": index,
+            "profile_rank": agent_profile_candidate_rank(item, agent_profile=profile),
+            "required": normalize_required_capabilities(item.get("required_capabilities")),
+            "targets": normalize_target_capabilities(item.get("target_capabilities")),
+            "raw_claimed": bool(item.get("claimed_by")),
+        }
+
+    def active(key: str) -> list[dict[str, Any]]:
+        raw = value.get(key)
+        return [encode(item) for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+    def integer_text(raw: Any) -> str | None:
+        try:
+            return str(int(raw)) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    from .summary_item import canonical_todo_source_reference
+    reference = canonical_todo_source_reference(value) if summary_kind else None
+    resume_request = None if reference is not None or request_only else build_referenced_todo_resume_planning_request(
+        value,
+        agent_id=agent,
+        item_limit=8,
+        available_capabilities=(available_capabilities or []) if resolve_capacity else None,
+    )
+    request = {
+            "schema_version": "todo_quota_planning_request_v4",
+            "current_time": observed_now.isoformat(),
+            **({"summary_request": {
+                "kind": summary_kind,
+                **({"source_reference": reference} if reference is not None else {"source": todo_read_source(value)}),
+                "integer_counts": {"source": integer_text(value.get("completed_without_successor_count")),
+                    "warning": integer_text((value.get("todo_succession_warning") or {}).get("count"))
+                    if isinstance(value.get("todo_succession_warning"), dict) else None},
+                "next_fact": encode({"index": value.get("next_index", 1),
+                    "text": str(value.get("next") or "").strip(),
+                    **({"claimed_by": str(value.get("next_claimed_by") or "").strip()}
+                       if str(value.get("next_claimed_by") or "").strip() else {})}),
+                "materialize_source": native_profile,
+                **({"source_rows": {key: [encode(row, include_payload=False) if isinstance(row, dict) else None
+                    for row in value[key]] for key in TODO_SUMMARY_SOURCE_KEYS if isinstance(value.get(key), list)}}
+                   if not native_profile else {}),
+                "materialize_resume": reference is not None or request_only,
+                "consume_display_views": consume_display_views,
+                **({"display_view_names": display_view_names} if display_view_names is not None else {}),
+            }} if summary_kind else {}),
+            "frontier_deadline": value.get("frontier_deadline"),
+            "route_items": build_todo_route_continuation_facts(value, handoff_gates=handoff_gates),
+            "handoff_items": [{"display": gate,
+                "excluded": normalize_todo_excluded_agents(gate.get("excluded_agents"))}
+                for gate in handoff_gates],
+            "source_contract": _closure_source_facts(value),
+            "resume": resume_request,
+            "resume_options": {"agent_id": agent, "item_limit": 8,
+                "available_capabilities": normalize_required_capabilities(available_capabilities) if resolve_capacity else None},
+            "selection": {
+                "observed_at": observed_at,
+                "available": normalize_required_capabilities(available_capabilities),
+                "items": [encode(item) for item in all_open_items],
+                "active_items": [] if summary_kind and native_profile else active("active_next_action_items"),
+                "active_executable_items": [] if summary_kind and native_profile else active("active_next_action_executable_items"),
+                "agent_id": agent, "profile": profile,
+                "user_gate_scope": filter_user_gate_blocks_agent,
+                "monitor_supported": todo_summary_monitor_writeback_supported(value),
+                "source_open_count": source_open_count,
+                "source_complete": (value.get("work_counts") or {}).get("complete", True),
+                "frontier_revision_index": value.get("advancement_frontier_revision_index"),
+                "diagnostic_limit": 3, "backlog_limit": 8, "visibility_limit": 16,
+            },
+        }
+    if request_only:
+        return request
+    try:
+        if reference is not None:
+            from .goal_todo_projection import project_todo_read
+            wire = project_todo_read({"kind": "quota_projection", "requests": [request]})["quota_wires"][0]
+        else:
+            wire = effect_runtime_result("todo.quota_planning.project", request, large_local_snapshot=True)
+    except EffectRuntimeRejected as exc:
+        raise ValueError(str(exc)) from None
+    if summary_kind:
+        return _decode_quota_summary_wire(wire, value)
+    result = _decode_quota_planning_wire(wire)
+    if not isinstance(result, dict) or result.get("schema_version") != "todo_quota_planning_v0":
+        raise RuntimeError("TypeScript Todo quota planning shape mismatch")
+    if not isinstance(result.get("lanes"), dict) or not isinstance(result["lanes"].get("gate_items"), list):
+        raise RuntimeError("TypeScript Todo quota planning gate lane missing")
+    if not isinstance(result.get("source_completeness"), dict) or "closure_intent" not in result:
+        raise RuntimeError("TypeScript Todo quota planning source contract missing")
+    if isinstance(result["closure_intent"], dict):
+        result["closure_intent"] = {**value["closure_intent"], **result["closure_intent"]}
+    elif result["closure_intent"] is not None:
+        raise RuntimeError("TypeScript Todo quota planning closure intent shape mismatch")
+    return result
+
+
+def _decode_quota_summary_wire(wire: Any, source: dict[str, Any]) -> dict[str, Any]:
+    """Resolve owner-selected transport references after bounded validation."""
+    error = "invalid TypeScript quota summary wire"
+    if not isinstance(wire, dict) or wire.get("schema_version") != "todo_quota_summary_wire_v1":
+        raise RuntimeError(error)
+    summary, copies, integers = wire.get("summary"), wire.get("source_copies"), wire.get("integer_copies")
+    if not isinstance(summary, dict) or not isinstance(copies, list) or not isinstance(integers, list):
+        raise RuntimeError(error)
+    expanded = len(json.dumps(summary, ensure_ascii=False, separators=(",", ":")).encode())
+    patches: list[tuple[Any, Any, Any]] = []
+    targets: set[tuple[Any, ...]] = set()
+
+    def path(value: Any, *, nonempty: bool = False) -> list[Any]:
+        if (not isinstance(value, list) or (nonempty and not value)
+                or any(type(key) not in (str, int) or isinstance(key, int) and key < 0 for key in value)):
+            raise RuntimeError(error)
+        return value
+
+    def child(parent: Any, key: Any) -> Any:
+        if not (isinstance(parent, dict) and isinstance(key, str)
+                or isinstance(parent, list) and type(key) is int):
+            raise RuntimeError(error)
+        return parent[cast(int, key)]
+
+    try:
+        for copy in [*copies, *integers]:
+            if not isinstance(copy, dict):
+                raise RuntimeError(error)
+            target_path = path(copy.get("target"), nonempty=True)
+            coordinate = tuple(target_path)
+            if coordinate in targets:
+                raise RuntimeError(error)
+            targets.add(coordinate)
+            parent: Any = summary
+            for key in target_path[:-1]:
+                parent = child(parent, key)
+            if child(parent, target_path[-1]) is not None:
+                raise RuntimeError(error)
+            if "source" in copy:
+                original: Any = source
+                for key in path(copy["source"]):
+                    original = child(original, key)
+            else:
+                raw = copy.get("value")
+                if not isinstance(raw, str) or not raw or raw.lstrip("-").strip("0123456789"):
+                    raise RuntimeError(error)
+                original = int(raw)
+            expanded += len(json.dumps(original, ensure_ascii=False, separators=(",", ":")).encode()) - 4
+            if expanded > MAX_LOCAL_SNAPSHOT_BYTES:
+                raise RuntimeError("TypeScript quota summary expanded response is oversized")
+            patches.append((parent, target_path[-1], original))
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise RuntimeError(error) from None
+    if expanded > MAX_LOCAL_SNAPSHOT_BYTES:
+        raise RuntimeError("TypeScript quota summary expanded response is oversized")
+    for parent, key, original in patches:
+        parent[key] = original
+    if (not isinstance(summary.get("work_counts"), dict)
+            or any(not isinstance(summary.get(key), list) for key in (
+                "first_open_items", "first_executable_items", "monitor_open_items", "backlog_items"))):
+        raise RuntimeError(error)
+    return summary

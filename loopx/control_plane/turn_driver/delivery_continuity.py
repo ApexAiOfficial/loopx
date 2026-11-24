@@ -4,18 +4,20 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
+from ..coordination.coordination_state_contract_generated import (
+    DELIVERY_BOUNDARY_RESULT_SCHEMA,
+    DELIVERY_CONTINUITY_RESULT_SCHEMA,
+    DELIVERY_ROUTING_REQUEST_SCHEMA,
+    DELIVERY_ROUTING_RESULT_SCHEMA,
+)
 from ..todos.contract import (
     TODO_STATUS_OPEN,
     normalize_todo_claimed_by,
     normalize_todo_id,
     normalize_todo_status,
 )
-from ..todos.projection import todo_item_task_class
+from ..todos.todo_semantics import todo_item_task_class
 
-DELIVERY_CONTINUITY_RESULT_SCHEMA = "loopx_delivery_continuity_result_v0"
-DELIVERY_BOUNDARY_RESULT_SCHEMA = "loopx_delivery_boundary_result_v0"
-DELIVERY_ROUTING_REQUEST_SCHEMA = "loopx_delivery_routing_request_v0"
-DELIVERY_ROUTING_RESULT_SCHEMA = "loopx_delivery_routing_result_v0"
 DELIVERY_BOUNDARY_IN_FLIGHT = "in_flight_continuation"
 DELIVERY_BOUNDARY_SEMANTIC_CLOSEOUT = "semantic_closeout"
 DELIVERY_BOUNDARY_VALUES = (
@@ -38,6 +40,8 @@ DELIVERY_CONTINUITY_REASONS = {
     *DELIVERY_CONTINUITY_PREEMPTIONS,
     "no_previous_todo",
     "previous_delivery_not_progress",
+    "previous_delivery_closed",
+    "previous_path_replanned",
     "current_todo_missing",
     "todo_identity_changed",
     "todo_not_open",
@@ -57,7 +61,7 @@ DELIVERY_BOUNDARY_REASONS = {
     "todo_claimed_by_other_agent",
     "open_advancement_todo",
 }
-DELIVERY_ROUTING_SELECTIONS = {"continuity", "fallback", "none"}
+DELIVERY_ROUTING_SELECTIONS = {"continuity", "fallback", "replan", "none"}
 
 
 def normalize_delivery_boundary(value: Any) -> str:
@@ -87,6 +91,8 @@ def _delivery_todo_payload(
         "claimed_by": normalize_todo_claimed_by(current_todo.get("claimed_by")),
         "actionable": bool(actionable),
         "capability_ready": bool(capability_ready),
+        **({"replan_obligation_id": current_todo["replan_obligation_id"]}
+           if current_todo.get("replan_obligation_id") else {}),
     }
 
 
@@ -130,6 +136,12 @@ def evaluate_delivery_route(
     fallback_actionable: bool,
     fallback_capability_ready: bool,
     preemptions: Sequence[str] = (),
+    replan_todo: Mapping[str, Any] | None = None,
+    latest_replan_ack: Mapping[str, Any] | None = None,
+    replan_actionable: bool = False,
+    replan_capability_ready: bool = False,
+    previous_delivery_boundary: str | None = None,
+    previous_path_delta: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve continuity selection and settlement boundary in one TS request."""
 
@@ -151,6 +163,11 @@ def evaluate_delivery_route(
         actionable=fallback_actionable,
         capability_ready=fallback_capability_ready,
     )
+    replan_payload = _delivery_todo_payload(
+        replan_todo,
+        actionable=replan_actionable,
+        capability_ready=replan_capability_ready,
+    )
     try:
         result = effect_runtime_result(
             "turn.delivery_route.evaluate",
@@ -161,9 +178,16 @@ def evaluate_delivery_route(
                 "previous_delivery_outcome": (
                     str(previous_delivery_outcome or "").strip() or None
                 ),
+                **({"previous_delivery_boundary": previous_delivery_boundary}
+                   if previous_delivery_boundary is not None else {}),
+                **({"previous_path_delta": dict(previous_path_delta)}
+                   if previous_path_delta is not None else {}),
                 "continuity_todo": continuity_payload,
                 "fallback_todo": fallback_payload,
                 "preemptions": _normalize_preemptions(preemptions),
+                **({"replan_todo": replan_payload} if replan_payload else {}),
+                **({"latest_replan_ack": dict(latest_replan_ack)}
+                   if latest_replan_ack else {}),
             },
         )
     except EffectRuntimeRejected as exc:
@@ -179,6 +203,8 @@ def evaluate_delivery_route(
         if selection == "continuity"
         else (fallback_payload or {}).get("todo_id")
         if selection == "fallback"
+        else (replan_payload or {}).get("todo_id")
+        if selection == "replan"
         else None
     )
     if (
@@ -202,9 +228,10 @@ def evaluate_delivery_route(
         or (
             isinstance(continuity, Mapping)
             and continuity.get("decision") == "resume_in_flight"
-            and selection != "continuity"
+            and selection not in {"continuity", "replan"}
         )
         or (selection == "fallback" and fallback_payload is None)
+        or (selection == "replan" and (replan_payload is None or preemptions))
         or (selection == "none" and boundary is not None)
         or (selection != "none" and boundary is None)
         or (

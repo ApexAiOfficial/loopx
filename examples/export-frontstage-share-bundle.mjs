@@ -6,6 +6,7 @@ import { copyFile, cp, mkdir, readdir, readFile, rm, stat, writeFile } from "nod
 import { existsSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveTestPython } from "../scripts/test-python.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dashboardDir = resolve(repoRoot, "apps/presentation/dashboard");
@@ -16,6 +17,8 @@ const manifestFileName = "frontstage-share-manifest.json";
 const showcaseCatalogPath = "docs/showcases/showcase-catalog.json";
 const projectionFixturePath = "examples/goal-channel-frontstage-fixture.py";
 const installerScriptPath = "scripts/install-from-github.sh";
+const deepSweBehaviorArticlePath = "benchmark/deepswe/behavior-discovery/index.html";
+const deepSweSolArticlePath = "apps/presentation/site/public/benchmarks/deepswe-sol/index.html";
 const homepageEvidenceAssets = [
   "docs/assets/long-running-loop-openviking-trajectory.png",
   "docs/assets/long-running-loop-ml-experiment-trajectory.png",
@@ -24,6 +27,7 @@ const homepageEvidenceAssets = [
 function parseArgs(argv) {
   const args = {
     base: "/",
+    restoreCasePages: false,
     outDir: defaultOutDir,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -32,6 +36,8 @@ function parseArgs(argv) {
       args.base = argv[++index];
     } else if (token === "--out-dir") {
       args.outDir = resolve(argv[++index]);
+    } else if (token === "--restore-case-pages") {
+      args.restoreCasePages = true;
     } else if (token === "--help" || token === "-h") {
       printHelp();
       process.exit(0);
@@ -51,6 +57,8 @@ function parseArgs(argv) {
 function printHelp() {
   console.log(`Usage: node examples/export-frontstage-share-bundle.mjs [--out-dir DIR] [--base /path/]
 
+--restore-case-pages reapplies catalog pages after MkDocs cleans its output directory.
+
 Builds the public homepage and apps/presentation/dashboard into a public-safe static
 bundle, writes a sanitized goal_channel_projection_v0 status fixture, and creates
 /frontstage/index.html for direct static hosting.
@@ -69,7 +77,8 @@ function run(command, args, options = {}) {
       ...process.env,
       PATH: ["/opt/homebrew/bin", "/usr/local/bin", process.env.PATH].filter(Boolean).join(":"),
     },
-    stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit",
+    input: options.input,
+    stdio: options.capture ? [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"] : "inherit",
   });
   if (result.status !== 0) {
     const detail = options.capture ? `${result.stderr}\n${result.stdout}`.trim() : "";
@@ -78,12 +87,31 @@ function run(command, args, options = {}) {
   return result.stdout ?? "";
 }
 
-async function copyIndexForFrontstage(siteDir) {
-  const indexPath = resolve(siteDir, "index.html");
-  const frontstageDir = resolve(siteDir, "frontstage");
-  await mkdir(frontstageDir, { recursive: true });
-  const html = await readFile(indexPath, "utf8");
-  await writeFile(resolve(frontstageDir, "index.html"), html);
+async function copyDashboardRoutes(siteDir) {
+  const html = await readFile(resolve(siteDir, "index.html"), "utf8");
+  const routeDir = resolve(siteDir, "developers/projections");
+  await mkdir(routeDir, { recursive: true });
+  await writeFile(resolve(routeDir, "index.html"), html);
+}
+
+async function writeRetiredFrontstageRoutes(siteDir) {
+  // Hosted aliases never load the dashboard or forward goal/status parameters.
+  for (const [route, destination] of [
+    ["frontstage", "docs/showcases/index.en.html"],
+    ["frontstage/developer", "developers/projections/"],
+    ["deprecated/frontstage/ops", "docs/guides/personal-workspace-user-guide/"],
+  ]) {
+    const routeDir = resolve(siteDir, route);
+    await mkdir(routeDir, { recursive: true });
+    const target = "../".repeat(route.split("/").length) + destination;
+    await writeFile(resolve(routeDir, "index.html"), `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LoopX — page moved</title><meta http-equiv="refresh" content="0;url=${target}">
+<link rel="canonical" href="${target}"></head><body>
+<p>This page has moved. / 此页面已迁移。</p><a href="${target}">Continue / 继续访问</a>
+</body></html>
+`);
+  }
 }
 
 async function copyHomepage(siteDir, base) {
@@ -95,17 +123,32 @@ async function copyHomepage(siteDir, base) {
     cwd: homepageDir,
   });
   run(process.execPath, [
-    resolve(homepageDir, "node_modules/vite/bin/vite.js"),
-    "build",
+    resolve(homepageDir, "scripts/build.mjs"),
     "--base",
     base,
     "--outDir",
     buildDir,
-    "--emptyOutDir",
   ], { cwd: homepageDir });
   await cp(buildDir, siteDir, { force: true, recursive: true });
   await rm(buildDir, { force: true, recursive: true });
   await copyFile(resolve(repoRoot, installerScriptPath), resolve(siteDir, "install.sh"));
+  const bootstrap = run(resolveTestPython(), ["-c",
+    "from loopx.cli_commands.update_artifact import standalone_source; print(standalone_source(), end='')"], {
+    capture: true, cwd: repoRoot,
+  });
+  await writeFile(resolve(siteDir, "update-artifact.py"), bootstrap, "utf8");
+}
+
+async function copyPublicSiteRoutes(siteDir) {
+  const deepSweRouteDir = resolve(
+    siteDir,
+    "benchmarks/deepswe/behavior-discovery",
+  );
+  await mkdir(deepSweRouteDir, { recursive: true });
+  await copyFile(
+    resolve(repoRoot, deepSweBehaviorArticlePath),
+    resolve(deepSweRouteDir, "index.html"),
+  );
 }
 
 function validateShowcaseHtmlPath(path) {
@@ -133,11 +176,21 @@ async function copyInteractiveCasePages(siteDir) {
     }
   }
 
+  await mkdir(resolve(siteDir, "docs/showcases"), { recursive: true });
+  await copyFile(resolve(repoRoot, showcaseCatalogPath), resolve(siteDir, showcaseCatalogPath));
   for (const pagePath of interactivePages) {
     const sourcePath = resolve(repoRoot, pagePath);
     const targetPath = resolve(siteDir, pagePath);
     await mkdir(dirname(targetPath), { recursive: true });
-    await copyFile(sourcePath, targetPath);
+    // Source evidence links should open repository files, not missing static
+    // .md/.py/fixture URLs. Catalog JSON is exported alongside the HTML.
+    const html = (await readFile(sourcePath, "utf8")).replace(/href="([^"#?]+\.(?:md|py|json))"/g, (match, href) => {
+      if (/^(?:https?:|\/)/.test(href)) return match;
+      const source = relative(repoRoot, resolve(dirname(sourcePath), href));
+      if (source === showcaseCatalogPath || source.startsWith("../")) return match;
+      return `href="https://github.com/loopx-project/loopx/blob/main/${source}"`;
+    });
+    await writeFile(targetPath, html);
   }
   return Array.from(interactivePages).sort();
 }
@@ -213,6 +266,9 @@ async function writeShareReadme(outDir, base, interactivePages) {
   const siteDir = resolve(outDir, "site");
   const homepageUrl = base;
   const frontstageUrl = `${base}frontstage/`;
+  const sweMarathonBriefUrl = `${base}benchmarks/swe-marathon/`;
+  const lhtbBriefUrl = `${base}benchmarks/lhtb/`;
+  const deepSweBehaviorArticleUrl = `${base}benchmarks/deepswe/behavior-discovery/`;
   const previewBlock = base === "/"
     ? `## Try It Locally
 
@@ -226,6 +282,9 @@ Then open the homepage or showcase:
 \`\`\`text
 http://127.0.0.1:8080${homepageUrl}
 http://127.0.0.1:8080${frontstageUrl}
+http://127.0.0.1:8080${sweMarathonBriefUrl}
+http://127.0.0.1:8080${lhtbBriefUrl}
+http://127.0.0.1:8080${deepSweBehaviorArticleUrl}
 \`\`\`
 `
     : `## Try It Locally
@@ -239,6 +298,9 @@ Hosted entries:
 \`\`\`text
 ${homepageUrl}
 ${frontstageUrl}
+${sweMarathonBriefUrl}
+${lhtbBriefUrl}
+${deepSweBehaviorArticleUrl}
 \`\`\`
 `;
   const readme = `# LoopX Public Website Bundle
@@ -261,7 +323,14 @@ ${previewBlock}
   \`${statusFileName}\`, direct \`/frontstage/\` static route support, and
   catalog-declared interactive case pages.
 - Homepage source: \`apps/presentation/site\`.
+- SWE-Marathon research brief: \`${sweMarathonBriefUrl}\`, built from the pinned public-safe aggregate and case-insight projection under \`benchmark/swe-marathon/\`.
+- LHTB research brief: \`${lhtbBriefUrl}\`, built from the public-safe five-arm aggregate under \`benchmark/LHTB/studies/five-arm-gpt56sol-max/\`.
+- DeepSWE behavior discoveries: \`${deepSweBehaviorArticleUrl}\`, copied byte-for-byte from the reviewed standalone article at \`${deepSweBehaviorArticlePath}\`.
+- DeepSWE × Sol research brief: \`${base}benchmarks/deepswe-sol/\`, a static historical-study interpretation from \`${deepSweSolArticlePath}\`.
 - Homepage evidence assets: ${homepageEvidenceAssets.map((path) => `\`${path}\``).join(", ")}.
+- Personal Workspace demo and guide: docs/guides/personal-workspace-user-guide/.
+- Legacy Frontstage URLs redirect to the case directory without loading a dashboard or forwarding status parameters.
+- Projection developer tools: developers/projections/.
 - Primary case source: \`${showcaseCatalogPath}\`.
 - Interactive case pages: ${interactivePages.length ? interactivePages.map((path) => `\`${path}\``).join(", ") : "none"}.
 - Demo shell fixture: \`${projectionFixturePath} --format json\`.
@@ -278,10 +347,20 @@ async function writeManifest(outDir, base, interactivePages) {
     site_dir: "site",
     status_fixture: `site/${statusFileName}`,
     homepage_entry: "site/index.html",
+    swe_marathon_brief_entry: "site/benchmarks/swe-marathon/index.html",
+    lhtb_brief_entry: "site/benchmarks/lhtb/index.html",
+    deepswe_behavior_article_entry: "site/benchmarks/deepswe/behavior-discovery/index.html",
+    deepswe_sol_article_entry: "site/benchmarks/deepswe-sol/index.html",
     installer_entry: "site/install.sh",
     frontstage_entry: "site/frontstage/index.html",
+    frontstage_redirect: "docs/showcases/index.en.html",
+    projection_developer_entry: "site/developers/projections/index.html",
     content_sources: {
       public_homepage: "apps/presentation/site",
+      swe_marathon_brief: "benchmark/swe-marathon",
+      lhtb_brief: "benchmark/LHTB/studies/five-arm-gpt56sol-max",
+      deepswe_behavior_article: deepSweBehaviorArticlePath,
+      deepswe_sol_article: deepSweSolArticlePath,
       installer_script: installerScriptPath,
       homepage_evidence_assets: homepageEvidenceAssets,
       primary_public_story: showcaseCatalogPath,
@@ -323,13 +402,41 @@ async function collectTextFiles(rootDir) {
   return files;
 }
 
-async function scanPublicBoundary(outDir) {
+// Verified public source citations are exceptions only to the organization-name
+// probe, never to path, host or credential checks. Exact hrefs cannot exempt
+// nearby prose, another repository, a query string or an internal URL.
+const publicSourceHrefs = new Set([
+  "https://github.com/ByteDance-Seed/EdgeBench",
+  "https://github.com/ByteDance-Seed/EdgeBench/pull/14",
+]);
+
+function withoutPublicSourceHrefs(text) {
+  return text.replace(/\bhref=(["'])(https:\/\/[^"'<>\s]+)\1/g, (attribute, quote, href) =>
+    publicSourceHrefs.has(href) ? `href=${quote}${quote}` : attribute,
+  );
+}
+
+function credentialAssignmentsAreReferences(text, pattern) {
+  const values = [...text.matchAll(new RegExp(pattern.source, "gi"))]
+    .map(match => text.slice(match.index + match[0].length));
+  // Reuse the existing credential-value owner. The public
+  // bundle may contain JS request fields bound to runtime input, never literals.
+  const script = `import json, sys
+from loopx.contract import _credential_value_is_reference
+print(json.dumps(all(_credential_value_is_reference(value) for value in json.load(sys.stdin))))
+`;
+  return JSON.parse(run(resolveTestPython(), ["-c", script], {
+    capture: true, input: JSON.stringify(values),
+  }));
+}
+
+export async function scanPublicBoundary(outDir) {
   const patterns = [
     { label: "macOS user path", pattern: /\/Users\// },
     { label: "private temp path", pattern: /\/private\// },
-    { label: "workspace owner name", pattern: new RegExp("byte" + "dance", "i") },
+    { label: "workspace owner name", pattern: new RegExp("byte" + "dance", "i"), publicSourceException: true },
     { label: "internal doc host", pattern: new RegExp("lark" + "office", "i") },
-    { label: "private goal state", pattern: new RegExp("\\.codex/goals|\\.goal-" + "harness") },
+    { label: "private goal state", pattern: new RegExp("\\.(?:codex|loopx)/goals|\\.goal-" + "harness") },
     { label: "raw internal key", pattern: new RegExp("raw_" + "internal_note") },
     { label: "private key material", pattern: /BEGIN (?:RSA |OPENSSH |EC |)PRIVATE KEY/ },
     { label: "token assignment", pattern: /\b(?:api[_-]?key|auth[_-]?token|access[_-]?token)\s*[:=]/i },
@@ -337,8 +444,10 @@ async function scanPublicBoundary(outDir) {
   const leaks = [];
   for (const path of await collectTextFiles(outDir)) {
     const text = await readFile(path, "utf8");
-    for (const { label, pattern } of patterns) {
-      if (pattern.test(text)) {
+    for (const { label, pattern, publicSourceException } of patterns) {
+      if (pattern.test(publicSourceException ? withoutPublicSourceHrefs(text) : text)) {
+        if (label === "token assignment" && /\.m?js$/i.test(path)
+            && credentialAssignmentsAreReferences(text, pattern)) continue;
         leaks.push(`${relative(outDir, path)}: ${label}`);
       }
     }
@@ -352,6 +461,11 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const outDir = args.outDir;
   const siteDir = resolve(outDir, "site");
+
+  if (args.restoreCasePages) {
+    await copyInteractiveCasePages(siteDir);
+    return;
+  }
 
   if (!existsSync(resolve(dashboardDir, "node_modules"))) {
     throw new Error("apps/presentation/dashboard/node_modules is missing; run `npm ci` in apps/presentation/dashboard first");
@@ -372,11 +486,13 @@ async function main() {
   ], { cwd: dashboardDir });
 
   await removeCopiedLiveStatusFiles(siteDir);
-  await copyIndexForFrontstage(siteDir);
+  await copyDashboardRoutes(siteDir);
+  await writeRetiredFrontstageRoutes(siteDir);
   await copyHomepage(siteDir, args.base);
+  await copyPublicSiteRoutes(siteDir);
   const interactivePages = await copyInteractiveCasePages(siteDir);
 
-  const projectionOutput = run("python3", [resolve(repoRoot, "examples/goal-channel-frontstage-fixture.py"), "--format", "json"], {
+  const projectionOutput = run(resolveTestPython(), [resolve(repoRoot, "examples/goal-channel-frontstage-fixture.py"), "--format", "json"], {
     capture: true,
     cwd: repoRoot,
   });
@@ -392,12 +508,17 @@ async function main() {
     out_dir: outDir,
     site_dir: siteDir,
     homepage_url: args.base,
+    swe_marathon_brief_url: `${args.base}benchmarks/swe-marathon/`,
+    lhtb_brief_url: `${args.base}benchmarks/lhtb/`,
+    deepswe_behavior_article_url: `${args.base}benchmarks/deepswe/behavior-discovery/`,
     frontstage_url: `${args.base}frontstage/`,
     status_fixture: `site/${statusFileName}`,
   }, null, 2));
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}

@@ -18,6 +18,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from loopx.canary.premerge import (  # noqa: E402
     _gate_status,
     _public_boundary_changed_files_run,
+    apply_change_quality_verification,
     build_premerge_validation_gate,
     downgrade_inherited_baseline_failures,
 )
@@ -34,7 +35,37 @@ def commands_from(run: dict | None) -> list[str]:
     return commands
 
 
-def assert_control_plane_change_selects_state_machine_validation() -> None:
+def source_cli_argv(*args: str) -> list[str]:
+    """Build the argv for the host's source-checkout LoopX launcher.
+
+    ``scripts/loopx`` is a POSIX bash shim, so a native Windows host cannot
+    exec it (``OSError: [WinError 193]``). The shipped Windows entry is
+    ``scripts/loopx_entry.py``, which ``scripts/loopx.ps1`` and
+    ``loopx/windows_install.py`` both delegate to. ``tests/source_cli.py``
+    mirrors this selection for pytest, but an installed release snapshot copies
+    ``examples`` without ``tests``, so this smoke keeps its own copy.
+    """
+    if os.name == "nt":
+        return [
+            sys.executable,
+            "-I",
+            str(REPO_ROOT / "scripts" / "loopx_entry.py"),
+            *args,
+        ]
+    return [str(REPO_ROOT / "scripts" / "loopx"), *args]
+
+
+def source_cli_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Build the launcher environment; the Windows entry needs a release root."""
+    env = dict(os.environ if base is None else base)
+    if os.name == "nt":
+        # scripts/loopx_entry.py refuses to start without a release root, and
+        # the shipped launchers pin it instead of trusting an ambient value.
+        env["LOOPX_RELEASE_ROOT"] = str(REPO_ROOT)
+    return env
+
+
+def assert_control_plane_change_retains_state_machine_and_vocabulary_validation() -> None:
     payload = build_premerge_validation_gate(
         changed_files=[
             "loopx/control_plane/work_items/interaction_contract.py",
@@ -59,6 +90,7 @@ def assert_control_plane_change_selects_state_machine_validation() -> None:
     assert any("interaction-contract-state-machine-smoke.py" in item for item in catalog_commands), payload
     assert not any("control-plane-integrated-canary-smoke.py" in item for item in catalog_commands), payload
     assert any("heartbeat-quota-flow-smoke.py" in item for item in catalog_commands), payload
+    assert any("semantic-vocabulary-drift-smoke.py" in item for item in catalog_commands), payload
     assert any("bounded-context-namespace-smoke.py" in item for item in catalog_commands), payload
     assert risk_commands, payload
     assert payload["gate"]["status"] == "preview_only", payload
@@ -263,7 +295,11 @@ def assert_cli_premerge_reports_progress_by_default() -> None:
     assert payload["gate"]["status"] == "no_changes", payload
     assert payload["validation_summary"]["selected_check_count"] == 0, payload
     assert "[loopx canary] premerge start:" in completed.stderr, completed.stderr
-    assert "[loopx canary] start direct_checks 1/3:" in completed.stderr, completed.stderr
+    assert "[loopx canary] start direct_checks 1/" in completed.stderr, completed.stderr
+    assert any(
+        check["id"] == "rfc_bilingual_diff" and check["status"] == "passed"
+        for check in payload["direct_checks"]
+    ), payload
     assert "[loopx canary] start catalog_canaries" not in completed.stderr, completed.stderr
     assert "[loopx canary] premerge done:" in completed.stderr, completed.stderr
 
@@ -308,7 +344,59 @@ def assert_no_changes_does_not_mask_direct_failures() -> None:
     assert status["merge_gate_passed"] is False, status
 
 
+def assert_passed_validation_does_not_grant_self_merge_authority() -> None:
+    status = _gate_status(
+        execute=True,
+        changed_files=["docs/example.md"],
+        direct_checks=[{"ok": True, "status": "passed", "id": "diff_check"}],
+        catalog_run={"ok": True},
+        risk_profile_run=None,
+        boundary_run=None,
+        manual_holds=[],
+    )
+    assert status["status"] == "passed", status
+    assert status["merge_gate_passed"] is True, status
+    assert status["self_merge_validation_passed"] is True, status
+    assert status["self_merge_allowed"] is False, status
+    assert status["self_merge_authority"] == {
+        "granted": False,
+        "reason": "repository_policy_required",
+        "next_gate": "apply repository policy and exact-head merge readiness",
+    }, status
+
+    payload = {
+        "ok": True,
+        "gate": status,
+        "validation_summary": {"failure_count": 0},
+        "recommended_pr_comment_fields": [],
+    }
+    apply_change_quality_verification(
+        payload,
+        {
+            "enforcement_applied": True,
+            "ok": False,
+            "status": "receipt_invalid",
+        },
+    )
+    assert payload["gate"]["merge_gate_passed"] is False, payload
+    assert payload["gate"]["self_merge_validation_passed"] is False, payload
+    assert payload["gate"]["self_merge_allowed"] is False, payload
+
+
 def assert_installed_wrapper_uses_bound_python_and_redirects_to_checkout() -> None:
+    if os.name == "nt":
+        # scripts/loopx is the POSIX release shim: it binds LOOPX_PYTHON and
+        # redirects `canary premerge` to the checkout under review, and a native
+        # Windows host cannot exec it (WinError 193). The shipped Windows
+        # launcher (scripts/loopx.ps1 -> scripts/loopx_entry.py) selects Python
+        # from the current-release pointer and has no checkout redirect, so this
+        # contract stays POSIX-only. tests/test_loopx_launcher_python_selection.py
+        # and tests/test_windows_install.py pin the host launchers.
+        print(
+            "premerge-validation-gate-smoke: installed POSIX release shim contract"
+            " skipped on Windows"
+        )
+        return
     with tempfile.TemporaryDirectory() as temp_dir:
         release_root = Path(temp_dir) / "release"
         scripts_dir = release_root / "scripts"
@@ -374,8 +462,7 @@ def assert_external_dirty_worktree_uses_caller_repo() -> None:
 
         sample.write_text("value =\n", encoding="utf-8")
         failed = subprocess.run(
-            [
-                str(REPO_ROOT / "scripts" / "loopx"),
+            source_cli_argv(
                 "--format",
                 "json",
                 "canary",
@@ -383,16 +470,19 @@ def assert_external_dirty_worktree_uses_caller_repo() -> None:
                 "--from-git-diff",
                 "--git-diff-base",
                 "HEAD",
+                "--catalog",
+                str(REPO_ROOT / "docs/concepts/interaction-pattern-catalog.md"),
                 "--tier",
                 "quick",
                 "--no-progress",
                 "--timeout-seconds",
                 "60",
-            ],
+            ),
             cwd=external_repo,
-            env={**os.environ, "LOOPX_PYTHON": sys.executable},
+            env=source_cli_env({**os.environ, "LOOPX_PYTHON": sys.executable}),
             check=False,
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -415,8 +505,7 @@ def assert_external_dirty_worktree_uses_caller_repo() -> None:
 
         sample.write_text("value = 2\n", encoding="utf-8")
         passed = subprocess.run(
-            [
-                str(REPO_ROOT / "scripts" / "loopx"),
+            source_cli_argv(
                 "--format",
                 "json",
                 "canary",
@@ -424,16 +513,19 @@ def assert_external_dirty_worktree_uses_caller_repo() -> None:
                 "--from-git-diff",
                 "--git-diff-base",
                 "HEAD",
+                "--catalog",
+                str(REPO_ROOT / "docs/concepts/interaction-pattern-catalog.md"),
                 "--tier",
                 "quick",
                 "--no-progress",
                 "--timeout-seconds",
                 "60",
-            ],
+            ),
             cwd=external_repo,
-            env={**os.environ, "LOOPX_PYTHON": sys.executable},
+            env=source_cli_env({**os.environ, "LOOPX_PYTHON": sys.executable}),
             check=False,
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -451,7 +543,9 @@ def assert_inherited_maintainability_red_is_advisory_only() -> None:
             {
                 "ok": False,
                 "status": "failed",
-                "command": "python3 examples/control_plane/control-plane-maintainability-ratchet-smoke.py",
+                "returncode": 1,
+                "normalized": {"script": "examples/control_plane/control-plane-maintainability-ratchet-smoke.py"},
+                "maintainability_failure_paths": ["loopx/status.py"],
                 "stdout_tail": (
                     "- unreviewed finding: dependency_debt:loopx.status->"
                     "loopx.presentation path=loopx/status.py"
@@ -475,7 +569,9 @@ def assert_inherited_maintainability_red_is_advisory_only() -> None:
             {
                 "ok": False,
                 "status": "failed",
-                "command": "python3 examples/control_plane/control-plane-maintainability-ratchet-smoke.py",
+                "returncode": 1,
+                "normalized": {"script": "examples/control_plane/control-plane-maintainability-ratchet-smoke.py"},
+                "maintainability_failure_paths": ["loopx/status.py"],
                 "stdout_tail": (
                     "- unreviewed finding: dependency_debt:loopx.status->"
                     "loopx.presentation path=loopx/status.py"
@@ -496,7 +592,9 @@ def assert_inherited_maintainability_red_is_advisory_only() -> None:
             {
                 "ok": False,
                 "status": "failed",
-                "command": "python3 examples/control_plane/control-plane-maintainability-ratchet-smoke.py",
+                "returncode": 1,
+                "normalized": {"script": "examples/control_plane/control-plane-maintainability-ratchet-smoke.py"},
+                "maintainability_failure_paths": ["loopx/status.py"],
                 "stdout_tail": (
                     "- unreviewed finding: oversized_decision_function:"
                     "loopx.status:new_hot_path path=loopx/status.py"
@@ -513,7 +611,7 @@ def assert_inherited_maintainability_red_is_advisory_only() -> None:
 
 
 def main() -> None:
-    assert_control_plane_change_selects_state_machine_validation()
+    assert_control_plane_change_retains_state_machine_and_vocabulary_validation()
     assert_public_docs_change_adds_boundary_scan()
     assert_quick_public_docs_change_skips_risk_profile_smokes()
     assert_public_boundary_scan_executes_in_process()
@@ -526,6 +624,7 @@ def main() -> None:
     assert_cli_json_preview()
     assert_cli_premerge_reports_progress_by_default()
     assert_no_changes_does_not_mask_direct_failures()
+    assert_passed_validation_does_not_grant_self_merge_authority()
     assert_installed_wrapper_uses_bound_python_and_redirects_to_checkout()
     assert_external_dirty_worktree_uses_caller_repo()
     assert_inherited_maintainability_red_is_advisory_only()

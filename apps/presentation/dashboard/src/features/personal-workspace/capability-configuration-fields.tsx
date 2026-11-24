@@ -1,0 +1,163 @@
+import { useId, type ReactNode } from "react";
+
+import type { CapabilityConfigurationEditor } from "../../data/chat";
+import { PeriodicReportScheduleField } from "./periodic-report-schedule-field";
+import { useWorkspaceI18n } from "./i18n";
+
+type FieldCopy = Record<string, { description?: string; label?: string; options?: Record<string, string> }>;
+type ConfigurationField = CapabilityConfigurationEditor["fields"][number];
+type FieldValue = boolean | number | string | string[] | Record<string, unknown> | null;
+type FieldChange = (key: string, value: FieldValue) => void;
+
+type ConfigurationFieldProps = Readonly<{
+  copy: FieldCopy;
+  field: ConfigurationField;
+  id: string;
+  onChange?: FieldChange;
+  value: unknown;
+  timezone: string;
+}>;
+
+function ConfigurationFieldControl({ copy, field, id, onChange, value, timezone }: ConfigurationFieldProps) {
+  const { locale } = useWorkspaceI18n();
+  const label = copy[field.key]?.label ?? field.label;
+  const readOnly = !onChange;
+  const runtimeDefault = locale === "zh-CN" ? "使用所选 Runtime 的默认值" : "Use the selected Runtime's default";
+  const directionLabel = (direction: string) => locale === "zh-CN"
+    ? direction === "forward" ? "正向" : "反向"
+    : direction === "forward" ? "Forward" : "Reverse";
+
+  if (field.input_kind === "pr_review_agent_orders") {
+    const orders = value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown> : {};
+    return <fieldset className="personal-pr-review-agent-orders"><legend>{label}</legend>
+      {(field.agents ?? []).map((agent) => <label htmlFor={`${id}-${agent}`} key={agent}>
+        <span>{agent}</span>
+        <select aria-label={agent} disabled={readOnly} id={`${id}-${agent}`} value={String(Object.hasOwn(orders, agent) ? orders[agent] : "inherit")}
+          onChange={onChange ? (event) => {
+            const next = new Map(Object.entries(orders));
+            if (event.target.value === "inherit") next.delete(agent);
+            else next.set(agent, event.target.value);
+            onChange(field.key, Object.fromEntries(next));
+          } : undefined}>
+          <option value="inherit">{locale === "zh-CN" ? "继承 Goal" : "Inherit Goal"}</option>
+          <option value="forward">{directionLabel("forward")}</option>
+          <option value="reverse">{directionLabel("reverse")}</option>
+        </select>
+      </label>)}
+      {!field.agents?.length ? <p>{locale === "zh-CN" ? "此 Goal 尚无注册 Agent" : "No registered Agents in this Goal"}</p> : null}
+    </fieldset>;
+  }
+
+  if (field.input_kind === "periodic_report_schedule") {
+    return <PeriodicReportScheduleField id={id} value={value} timezone={timezone}
+      onChange={onChange ? (schedule) => onChange(field.key, schedule) : undefined} />;
+  }
+
+  if (field.input_kind === "boolean") {
+    return (
+      <label className="is-boolean" htmlFor={id}>
+        <span>{label}</span>
+        <input checked={value === true} id={id} onChange={onChange ? (event) => onChange(field.key, event.target.checked) : undefined} readOnly={readOnly} role="switch" type="checkbox" />
+      </label>
+    );
+  }
+  if (field.input_kind === "select") {
+    return (
+      <label htmlFor={id}>
+        <span>{label}</span>
+        <select aria-label={label} disabled={readOnly} id={id} onChange={onChange ? (event) => onChange(field.key, event.target.value) : undefined} value={typeof value === "string" ? value : ""}>
+          <option value="">{copy[field.key]?.options?.[""] ?? (field.key === "executor_reasoning_effort" ? runtimeDefault : "")}</option>
+          {typeof value === "string" && value && !field.options?.includes(value)
+            ? <option value={value} disabled>{value} · {locale === "zh-CN" ? "当前不可用" : "Unavailable"}</option> : null}
+          {(field.options ?? []).map((option) => <option key={option} value={option}>{copy[field.key]?.options?.[option] ?? (field.key === "review_order" ? directionLabel(option) : option)}</option>)}
+        </select>
+      </label>
+    );
+  }
+  if (field.input_kind === "string_list") {
+    return (
+      <label htmlFor={id}>
+        <span>{label}</span>
+        <textarea id={id} onChange={onChange ? (event) => onChange(field.key, event.target.value.split(/\r?\n/u).filter(Boolean)) : undefined} readOnly={readOnly} rows={4} value={Array.isArray(value) ? value.join("\n") : ""} />
+      </label>
+    );
+  }
+  const numeric = field.input_kind === "number";
+  // Models the shipped executors run: the Codex models of the interactive
+  // endpoint and the managed host's DeepSeek default, which is the canonical
+  // `deepseek-flash` id of DeepSeek-V4.1-Flash. Suggestions only: the field
+  // stays free text so an operator can name any id their endpoint serves.
+  const modelSuggestions = field.key === "executor_model"
+    ? ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "deepseek-flash", "deepseek-v4-pro"] : [];
+  return (
+    <label htmlFor={id}>
+      <span>{label}</span>
+      <input
+        id={id}
+        list={modelSuggestions.length ? `${id}-suggestions` : undefined}
+        max={field.maximum}
+        min={field.minimum}
+        onChange={onChange ? (event) => onChange(field.key, numeric ? Number(event.target.value) : event.target.value) : undefined}
+        placeholder={field.key === "executor_model" ? runtimeDefault : undefined}
+        readOnly={readOnly}
+        required={field.required}
+        type={numeric ? "number" : "text"}
+        value={typeof value === "number" || typeof value === "string" ? value : ""}
+      />
+      {modelSuggestions.length ? <datalist id={`${id}-suggestions`}>{modelSuggestions.map((model) => <option key={model} value={model} />)}</datalist> : null}
+    </label>
+  );
+}
+
+type CapabilityConfigurationFieldsProps = Readonly<{
+  copy?: FieldCopy;
+  disabled?: boolean;
+  editor: CapabilityConfigurationEditor;
+  enabledAction?: ReactNode;
+  omitKeys?: readonly string[];
+  advancedKeys?: readonly string[];
+  onChange?: FieldChange;
+  value: Record<string, unknown>;
+}>;
+
+export function CapabilityConfigurationFields({
+  copy = {},
+  disabled = false,
+  editor,
+  enabledAction,
+  omitKeys = [],
+  advancedKeys = [],
+  onChange,
+  value,
+}: CapabilityConfigurationFieldsProps) {
+  const idPrefix = useId();
+  const { locale } = useWorkspaceI18n();
+  const omitted = new Set(omitKeys);
+  const advanced = new Set(advancedKeys);
+  const fields = editor.fields.filter((field) => !omitted.has(field.key));
+
+  const controls = (items: ConfigurationField[]) => items.map((field) => {
+        const control = <ConfigurationFieldControl
+          copy={copy}
+          field={field}
+          id={`${idPrefix}-${field.key.replace(/[^a-z0-9_-]/gi, "-")}`}
+          key={field.key}
+          onChange={onChange}
+          value={value[field.key]}
+          timezone={String(value.timezone ?? "UTC")}
+        />;
+        return field.key === "enabled" && field.input_kind === "boolean"
+          ? <div className="personal-capability-enabled-row" key={field.key}>{control}{enabledAction}</div>
+          : control;
+      });
+  return (
+    <fieldset className="personal-capability-fields" disabled={disabled}>
+      {controls(fields.filter((field) => !advanced.has(field.key)))}
+      {fields.some((field) => advanced.has(field.key)) ? <details className="personal-capability-help">
+        <summary>{locale === "zh-CN" ? "高级设置" : "Advanced settings"}</summary>
+        <div className="personal-capability-fields">{controls(fields.filter((field) => advanced.has(field.key)))}</div>
+      </details> : null}
+    </fieldset>
+  );
+}

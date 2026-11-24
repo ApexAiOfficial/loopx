@@ -23,6 +23,58 @@ LoopX Core
 
 ## Runtime Responsibilities
 
+Python-hosted background loops share `loopx.extensions.background_runtime.HostedWorker`
+for idempotent thread start, cooperative close and explicitly selected failure
+retry. Its `repeat` driver owns reconciliation repetition, next-observation
+waits and step-error backoff without rebuilding the caller's live scope. This
+is Python thread IO, not another policy or Agent supervisor. Native
+account observation, manager returns/queued-source recovery and Lark private
+delivery use it through their existing owners. A host target's normal return is
+terminal; an explicitly repeated step returning `None` uses its declared interval.
+Failure retry is off unless that owner explicitly enables it. A live thread does not
+establish provider health, and waiting, cooldown or disabled work is not a fault.
+Keep authorization, election locks, receipts, cursors/backoff and ambiguous-write
+recovery with the provider. Never use host restart to replay a model request or
+discard an in-flight journal. The standalone native account wheel retains its
+own process entrypoint and needs no Core import for account IO; when hosted by
+Core, it delegates thread lifetime and observation cadence to this shared host.
+The same native step/health callbacks drive standalone and hosted observation;
+the small standalone wait loop remains because that distribution supports
+account IO without installing Core. Manager startup discovery is not replayed
+on a step failure, and Lark retains its existing pool, in-flight futures and
+fairness/backoff state while the scanner recovers. Shared waits never imply
+model/request replay or establish provider health from thread liveness.
+
+The Chat process registers these four loops with the process-scoped
+`BackgroundServices` lifecycle owner. It reconciles existing owner intent at
+startup and every 15 seconds, isolates owner failures, and fences shutdown
+before closing registered services. There is no additional saved enable switch,
+job queue, system daemon or permission grant. The App/OS still supervises the
+Chat process; its existing HTTP pump restores an unexpectedly exited host
+thread with a cheap, idempotent liveness hook. Recheck also restores that host,
+and never activates it from a passive read. An enabled native observer that stopped is re-created from its
+current saved policy; a live scan or a normally completed one-shot is not replayed.
+
+Settings → **Background services** reads the same content-free projection as
+`GET /api/chat/background-services`. **Recheck** uses the loopback-protected
+`POST` endpoint with `{"operation":"recheck"}` to reconcile current owner intent
+and read back observations. Reads are passive. The TypeScript owner
+`control_plane/runtime/background_services.ts` distinguishes checking, completed
+scans, backoff, overdue progress, unavailable evidence and disabled work. A
+progress deadline diagnoses silence; it never kills a thread or authorizes an
+effect retry. Successful scanning does not assert successful delivery of every
+individual request. Native observation uses its provider's elected-lock health,
+including an owner in another process; a passive Core contender cannot replace
+that evidence. Its progress timestamp is not reported as a successful quota
+sample. Per-request receipts, profile listeners and ambiguous-write recovery
+remain with their existing owners.
+
+The experimental [MemT Nano Turn host](../../packages/loopx-memt-turn/README.md)
+is a separately installed `generic-cli` execution provider. Its native memory
+is scoped advisory history, not canonical work state or accepted Reward Memory.
+It is disabled by default and has no automatic host selection. Real GPU benefit
+and App/Lark configuration remain unqualified; review its licensing before use.
+
 Capability and extension are code and delivery boundaries. At runtime, keep
 four responsibilities distinct:
 
@@ -77,6 +129,11 @@ bindings persist the generic Connector contract alongside their
 provider-specific routing data. This runtime contract is not itself a new
 capability registry entry; providers advertise stable caller outcomes through
 their existing extension and capability surfaces.
+
+Manager group bindings additionally apply the bilingual
+[context-capture and Turn-authority contract](protocols/lark-manager-context-authority-v0.md):
+an unaddressed message may be retained as bounded non-authoritative context,
+but only typed provider addressing may enqueue or steer a Turn.
 
 For asynchronous sources, the same module provides an owner-local incremental
 inbox runtime. A provider translates a bounded page into
@@ -181,8 +238,11 @@ Every registered capability declares three provider-facing fields:
 The built-in catalog remains the default source. Extension manifests declare
 providers and contracts; the extension runtime state is the only source for
 whether each provider is installed, enabled, and doctor-ready. Duplicate
-capability or provider ids fail closed. Internal registrations remain available
-to the registry but are omitted from the public catalog.
+capability or provider ids fail closed: a declaration-only manifest may repeat
+an installed id only when it is the same manifest revision, and a different
+revision for an installed id is rejected rather than silently replaced.
+Internal registrations remain available to the registry but are omitted from
+the public catalog.
 
 Catalog discovery does not scan arbitrary directories or import extension
 Python code. A caller can add a declaration-only manifest to a catalog read:
@@ -279,10 +339,26 @@ loopx extension enable openviking-semantic-preference --execute --format json
 loopx extension install --bundled loopx-lark --execute --format json
 ```
 
+After an install, update, or rollback changes the active LoopX release,
+revalidate all enabled extension runtimes as one bounded read-only batch:
+
+```bash
+loopx extension doctor --all-enabled --execute --format json
+```
+
+The local installer runs this batch automatically. A passing doctor refreshes
+only the local runtime-identity proof; it grants no new provider permission and
+performs no connector write. Failed providers remain fail closed and the batch
+names the exact repair command.
+
 For a separately distributed provider, pass `--manifest <extension.toml>`.
 `upgrade` validates and probes the new manifest before changing the active
 revision. `rollback` probes the previous revision before switching back. A
-failed probe leaves the current revision untouched. Activation state contains
+failed probe leaves the current revision untouched. Neither operation changes
+the enablement decision: a disabled extension stays disabled across an upgrade
+or rollback until an explicit `enable`. The operation result reports the
+enablement state it committed, so an `enable` or `disable` that completes while
+the probe runs shows in the result as well as in `list`. Activation state contains
 validated manifest snapshots and revision ids in the private LoopX runtime
 root; it does not contain provider output or credentials.
 
@@ -297,13 +373,14 @@ loopx extension run <extension-id> --input-json <path-or-> [--execute]
 
 The active manifest fixes the executable, arguments, protocol, permissions,
 timeout, and revision. The caller supplies one JSON object over stdin and the
-provider must return one JSON object over stdout. LoopX does not accept an
-arbitrary executable path or argument passthrough. `run` never installs a
-missing extension, and it rejects extensions with `[[provides]]`,
-`[[implements]]`, or any declared permission; those providers are invoked
-through their capability or domain command. Extension lifecycle management is
-shared, but direct execution is reserved for zero-permission, runtime-only
-standalone extensions.
+provider must return one JSON object over stdout; both payloads are UTF-8 bytes,
+so a provider must pin its own stdio instead of falling back to the host locale
+codec. LoopX does not accept an arbitrary executable path or argument
+passthrough. `run` never installs a missing extension, and it rejects extensions
+with `[[provides]]`, `[[implements]]`, or any declared permission; those
+providers are invoked through their capability or domain command. Extension
+lifecycle management is shared, but direct execution is reserved for
+zero-permission, runtime-only standalone extensions.
 Direct provider binaries are implementation and debugging surfaces; they are
 not the supported management API.
 
@@ -524,10 +601,17 @@ authorization.
 `disable` is reversible, but `enable` never trusts an earlier readiness result:
 it reruns the configured doctor and changes the enabled bit only after that
 probe succeeds. A successful doctor binds readiness to both the active manifest
-revision and the resolved runtime identity. Missing or replaced executables,
-interpreters, or Python module sources fail closed until a new executed doctor
-succeeds; a failed executed doctor clears the stale proof without switching
-revisions.
+revision and a content-addressed runtime identity. Moving an unchanged release
+to a new install root, inode, or equivalent interpreter path preserves that
+identity. The active revision retains up to 32 independently verified runtime
+identities, so probing a source checkout does not displace an installed release.
+Unverified executable, interpreter or module content still fails closed. A failed
+executed probe revokes its observed identity only; `probed_entrypoint_identity`
+is diagnostic evidence, never proof of readiness. An unavailable entrypoint
+cannot activate. Upgrade and rollback qualify their selected runtime afresh;
+proofs from another manifest revision do not carry over. Old single-identity
+state stays read-only until a lifecycle write migrates it. Evicting the oldest
+identity requires re-running doctor for that artifact, never implicit admission.
 
 An enabled implementation is resolved by capability id and versioned protocol,
 then checked against its declared permission, current revision, and current
@@ -568,6 +652,23 @@ unloadable validators fail closed. Core does not freeze any one domain's view
 into core. Dashboard's generic status parser consumes only that compact
 contract. A built-in renderer may separately own a provider view schema, as the
 Finance renderer does for `decision_research_dashboard_v0`.
+
+The public `loopx.extensions.presentation` API also exports
+`find_public_safe_local_path(text)`. Providers use this shared path classifier
+through their existing presentation API rather than importing its internal Core
+owner. It does not certify that text is secret-free or authorize publication;
+providers retain their complete view validation and the normal publication gate.
+A provider that requires this utility must reject presentation when it is
+unavailable, while unrelated non-presentation operations may retain their
+explicit legacy validation path.
+
+The validator executes inside the active runtime interpreter - the extension's
+own environment, not the LoopX process - and LoopX launches it isolated
+(`python -I`), so `PYTHONPATH`, `PYTHONIOENCODING`, and `PYTHONUTF8` are ignored
+there. It must be importable from that environment alone, and the request and
+response cross stdio as UTF-8 bytes: the generated helper decodes and encodes
+them explicitly instead of through the locale text streams, which would corrupt
+non-ASCII view text on a host whose locale is not UTF-8.
 
 The finance value-discovery extension declares the first such view,
 `decision_research_dashboard_v0`, a read-only decision-research view:
@@ -742,32 +843,71 @@ to the catalog. `[[implements]]` binds a provider runtime to an existing
 core-owned capability without duplicating that capability id. Do not add either
 table solely to make a runtime installable.
 The v0 runtime exposes integer extension API version `1` and accepts bounded
-integer constraints such as `>=1,<2`; incompatible manifests fail closed.
+integer constraints such as `>=1,<2`; incompatible manifests fail closed. The
+check applies to the installed snapshot as well as to a manifest being loaded:
+when a later LoopX moves the extension API, an installed extension reports
+`ready=false`, activation and binding reads are refused, `enable` is rejected,
+and `doctor` returns `api_incompatible` and revokes the stale readiness proof
+until a compatible revision is upgraded to or rolled back to.
+
+`[[hook_adapters]]` lets an extension contribute provider ports to an existing
+capability-owned hook point without adding provider branches to the capability
+composition root or control-plane kernel. Discovery reads only installed
+manifest declarations and admits a factory only when the extension is enabled,
+doctor-ready, and authorized for every declared adapter permission. The
+factory must return exactly the declared callable ports. Import, activation,
+and factory failures become content-free optional-adapter failures; they do not
+execute or replace kernel logic. A matching declaration of a disabled or
+doctor-stale extension is also reported, as `extension_disabled` or
+`extension_doctor_not_ready`, without importing its factory or running its
+doctor.
+
+`phase = "capability_action"` is for an explicit typed action whose semantics
+have already been decided by the Agent or caller. The adapter may bind and
+settle provider evidence, but it must not infer the action from provider text.
+
+The example below is a trimmed copy of the bundled `loopx-lark` manifest and
+loads with `loopx.extensions.manifest.load_extension_manifest`. A hook
+adapter's `required_permissions` must be a subset of the top-level
+`permissions`; a manifest that declares a hook permission it does not grant is
+rejected before install.
 
 ```toml
 schema_version = "loopx_extension_manifest_v0"
 id = "loopx-lark"
-version = "1.0.0"
+version = "1.7.0"
 requires_loopx_api = ">=1,<2"
-permissions = ["read_status", "read_todos", "external_write"]
+permissions = ["lark.inbox.read", "lark.inbox.write", "lark.projection_sink.use"]
 
 [runtime]
-protocol = "lark_kanban_provider_v0"
+protocol = "lark_extension_lifecycle_v0"
 python_module = "loopx.extensions.lark.provider"
 doctor_args = ["--doctor"]
-required_permissions = ["read_status", "read_todos"]
+required_permissions = []
 timeout_seconds = 30
 
 [[provides]]
-id = "lark-kanban"
+id = "lark-kanban-projection"
 kind = "projection_sink"
 title = "Lark Kanban projection"
-status = "active"
+status = "active-preview"
 visibility = "public"
-real_world_anchor = "operator-facing Lark Base projection"
-user_value = "Project public-safe LoopX status and todo rows into Lark."
-entry_command = "loopx lark-kanban sync"
-next_real_step = "Validate one explicitly enabled owner-approved sink."
+real_world_anchor = "LoopX todo and control-plane projections rendered into a configured Lark Base"
+user_value = "Give operators a bounded, lineage-preserving Kanban view without making Lark the control-plane source of truth."
+entry_command = "loopx lark-kanban sync-projection --projection-file <projection.json>"
+next_real_step = "Install or upgrade and explicitly enable the bundled provider before configuring a Lark Kanban sink."
+
+[[hook_adapters]]
+id = "lark-periodic-report-source"
+capability_id = "periodic-report"
+target_hook_id = "periodic_report.request"
+phase = "capability_action"
+factory = "loopx.extensions.lark.periodic_report_request:build_lark_periodic_report_hook_adapter"
+required_permissions = ["lark.inbox.read", "lark.inbox.write"]
+ports = [
+  "periodic_report.request.bind_source",
+  "periodic_report.request.settle_source",
+]
 ```
 
 The bundled OpenViking pilot uses `[[implements]]` instead:
@@ -783,6 +923,15 @@ required_permissions = ["semantic_preference.read"]
 capability_id = "semantic-preference"
 protocol = "semantic_preference_provider_v0"
 ```
+
+The optional `packages/loopx-obelisk` package follows the same placement rule.
+It implements the existing `decision-context` capability's advisory
+`ContextProvider` port; it does not register a second session-context
+capability. LoopX Core parses a copied Codex deep link into the normalized
+`host-session:codex:<thread-id>` scope, and the extension maps that scope to
+Obelisk's public read-only query CLI. See
+[`decision_context_advisory_provider_v0`](protocols/decision-context-advisory-provider-v0.md)
+and the package README for activation, validation, and removal.
 
 The bundled periodic-report archive uses the same ownership direction. It
 implements one existing capability port rather than registering a second
@@ -854,6 +1003,55 @@ bound to both that interpreter and the resolved module source. This lets a
 clean source checkout and a local LoopX release activate bundled providers
 without separately installing a console script; catalog discovery remains
 declarative and does not import the module.
+
+Automatic Goal Channel notifications require extension activation immediately
+before provider transport, after existing selection, suppression and receipt
+checks. An unconfigured, disabled, suppressed, unselected or already-delivered
+notification does not require doctor readiness and cannot block primary Turn
+settlement for that reason. A selected new delivery still requires the enabled,
+current verified revision, declared permissions, provider identity, channel
+membership and readback. There is no automatic doctor execution or new external
+write authority. Notification selection remains owned by the quota contract;
+the Python extension only orders its existing local checks and transport.
+
+Because discovery is declarative, a declared launch target is only shape-checked
+until activation. The public smoke
+`examples/extension-entrypoint-surface-smoke.py` is a repository-scoped coverage
+guard for that gap rather than an activation check: without importing provider
+code it resolves the declared `python_module`, the `entrypoint` console script,
+each hook adapter `factory`, and each presentation `view_validator` for every
+bundled and co-located manifest in this repository against the source tree, so a
+renamed or removed entrypoint fails in the same change that removes it instead
+of at the user's first activation. It does not cover an edited or third-party
+manifest, and detection is structural: an attribute the scanner cannot see, for
+example one installed through `getattr`, is reported as unresolved.
+
+### Local executable locations
+
+Successful executable install/upgrade and doctor operations save the selected
+absolute launcher path in the host-local revision state, separately from the
+portable manifest. When that launcher is a symlink, identity checks still hash
+the final executable artifact while the launcher directory remains the child
+process PATH prefix. Enable, rollback, update-time revalidation and invocation
+use that revision's saved location instead of rediscovering a same-named
+executable on the current shell PATH. File-identity checks remain mandatory; a
+missing saved executable does not fall back to another PATH entry. Package
+upgrades resolve and verify the new revision's executable through the explicit
+upgrade workflow. Bundled `python_module` providers continue using the current
+LoopX interpreter and retain their existing identity checks.
+
+For executable providers, only the child process prepends the executable's
+directory to PATH, so tools installed in the same environment remain available.
+No complete environment, credentials, package contents, or local path is added
+to the public manifest or doctor result. An explicitly supplied execution
+environment remains the base environment; only this PATH prefix is added.
+
+Legacy installations without a saved location require one successful
+`loopx extension doctor <extension-id> --execute` with the provider environment
+available on PATH. Read-only doctor calls do not migrate state. Subsequent
+revalidation can run from the desktop's minimal PATH. If an executable is moved,
+restore its registered location or explicitly upgrade its local manifest to
+point to the new executable; do not hide the failure by disabling the extension.
 
 ## Scope Boundaries
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -53,7 +54,6 @@ def assert_profiles_come_from_catalog_matrix() -> None:
         "status-read-path",
         "status-projection-cache",
         "review-packet-read-path",
-        "event-sourced-read-path",
         "cli-command-contract",
         "todo-lifecycle",
         "monitor-scheduler",
@@ -61,10 +61,9 @@ def assert_profiles_come_from_catalog_matrix() -> None:
         "product-entry-workflows",
         "cross-runtime-impl-review-demo",
         "host-command-entry",
-        "new-user-onboarding-lifecycle",
+        "first-connect-contract",
         "runtime-connector-catalog",
         "frontstage-rollout",
-        "auto-research-demo",
         "catalog-canary-contract",
         "benchmark-toolkit-boundary",
     } <= domain_profile_ids, payload
@@ -386,8 +385,8 @@ def assert_pr_release_and_refactor_profiles_select() -> None:
     ), work_lane_profiles["control-plane-refactor"]
 
     monitor_target_payload = build_catalog_canary_plan(
-        changed_files=["loopx/control_plane/scheduler/monitor_target.py"],
-        surfaces=["monitor_target scheduler_hint state-machine"],
+        changed_files=["loopx/control_plane/quota/monitor_poll_commit.ts"],
+        surfaces=["monitor_target monitor-poll scheduler_hint state-machine"],
         max_checks_per_profile=5,
     )
     monitor_target_profiles = {
@@ -454,12 +453,27 @@ def assert_pr_release_and_refactor_profiles_select() -> None:
     status_wide_commands = [
         check["command"] for check in status_wide_profiles["status-read-path"]["checks"]
     ]
-    assert "python3 examples/control_plane/run-compaction-readmodel-smoke.py" in status_wide_commands, (
+    assert "python3 examples/control_plane/run-history-readmodel-smoke.py" in status_wide_commands, (
         status_wide_payload
     )
     assert "python3 examples/control_plane/goal-channel-readmodel-smoke.py" in status_wide_commands, (
         status_wide_payload
     )
+
+    # A bounded default plan can hide a deleted script later in the profile.
+    status_complete_payload = build_catalog_canary_plan(
+        profiles=["status-read-path"],
+        include_deep_checks=True,
+        max_checks_per_profile=100,
+    )
+    assert [profile["id"] for profile in status_complete_payload["domain_profiles"]] == [
+        "status-read-path"
+    ], status_complete_payload
+    for profile in status_complete_payload["domain_profiles"]:
+        for check in profile["checks"]:
+            command = shlex.split(check["command"])
+            assert command[0] == "python3", check
+            assert (REPO_ROOT / command[1]).is_file(), check
 
     status_cache_payload = build_catalog_canary_plan(
         changed_files=["loopx/control_plane/runtime/status_projection_cache.py"],
@@ -507,23 +521,6 @@ def assert_pr_release_and_refactor_profiles_select() -> None:
     assert all(check["tier"] == "default" for check in review_packet_profile["checks"]), review_packet_profile
     assert review_packet_profile["deep_checks_available"] is True, review_packet_profile
     assert review_packet_profile["deep_checks_included"] is False, review_packet_profile
-
-    event_read_payload = build_catalog_canary_plan(
-        changed_files=["loopx/event_sourced_state.py", "loopx/rollout_event_log.py"],
-        surfaces=["event projection downstream read event-store read-path"],
-    )
-    event_read_profiles = {
-        profile["id"]: profile for profile in event_read_payload["domain_profiles"]
-    }
-    assert "event-sourced-read-path" in event_read_profiles, event_read_payload
-    event_read_profile = event_read_profiles["event-sourced-read-path"]
-    event_read_commands = [check["command"] for check in event_read_profile["checks"]]
-    assert "python3 examples/control_plane/event-sourced-state-api-smoke.py" in event_read_commands, event_read_profile
-    assert "python3 examples/control_plane/event-sourced-status-read-path-smoke.py" in event_read_commands, event_read_profile
-    assert "python3 examples/control_plane/event-sourced-downstream-read-path-smoke.py" in event_read_commands, event_read_profile
-    assert all(check["tier"] == "default" for check in event_read_profile["checks"]), event_read_profile
-    assert event_read_profile["deep_checks_available"] is True, event_read_profile
-    assert event_read_profile["deep_checks_included"] is False, event_read_profile
 
     cli_payload = build_catalog_canary_plan(
         changed_files=["loopx/cli.py", "loopx/cli_commands/version.py"],
@@ -600,6 +597,7 @@ def assert_pr_release_and_refactor_profiles_select() -> None:
         "python3 examples/issue-fix-capability-guide-smoke.py",
         "python3 examples/issue-fix-reviewer-recommendation-smoke.py",
         "python3 examples/issue-fix-reviewer-request-smoke.py",
+        "python3 examples/issue-fix-reviewer-notification-drain-postwrite-smoke.py",
         "python3 examples/issue-fix-reviewer-notification-sink-smoke.py",
     ], reviewer_profile
     assert all(check["tier"] == "default" for check in reviewer_profile["checks"]), reviewer_profile
@@ -678,16 +676,16 @@ def assert_pr_release_and_refactor_profiles_select() -> None:
             "loopx/contract.py",
         ],
         surfaces=[
-            "new user onboarding no-onboarding-scan state projection gap start-goal"
+            "new user onboarding first connect contract state projection gap start-goal"
         ],
     )
     onboarding_profiles = {
         profile["id"]: profile for profile in onboarding_payload["domain_profiles"]
     }
-    assert "new-user-onboarding-lifecycle" in onboarding_profiles, onboarding_payload
-    onboarding_profile = onboarding_profiles["new-user-onboarding-lifecycle"]
+    assert "first-connect-contract" in onboarding_profiles, onboarding_payload
+    onboarding_profile = onboarding_profiles["first-connect-contract"]
     assert [check["command"] for check in onboarding_profile["checks"]] == [
-        "python3 examples/project/onboarding-no-scan-projection-smoke.py"
+        "python3 examples/project/first-connect-contract-smoke.py"
     ], onboarding_profile
     assert all(check["tier"] == "default" for check in onboarding_profile["checks"])
     assert onboarding_profile["deep_checks_available"] is False, onboarding_profile
@@ -711,34 +709,14 @@ def assert_pr_release_and_refactor_profiles_select() -> None:
     ]
     assert "python3 examples/control_plane/heartbeat-prompt-smoke.py" in runtime_connector_commands
     assert (
-        "python3 examples/codex-cli-tui-bootstrap-smoke-bundle-smoke.py"
+        "python3 examples/codex-cli-bootstrap-message-smoke.py"
         in runtime_connector_commands
     )
     assert "python3 examples/claude-goalmode-lifecycle-smoke.py" in runtime_connector_commands
-    assert "python3 examples/worker-bridge-install-contract-smoke.py" in runtime_connector_commands
+    assert "python3 examples/cli-worker-bridge-command-modularization-smoke.py" in runtime_connector_commands
     assert all(check["tier"] == "default" for check in runtime_connector_profile["checks"])
     assert runtime_connector_profile["deep_checks_available"] is True, runtime_connector_profile
     assert runtime_connector_profile["deep_checks_included"] is False, runtime_connector_profile
-
-    auto_research_payload = build_catalog_canary_plan(
-        changed_files=["loopx/capabilities/auto_research/core.py"],
-        surfaces=["auto-research demo frontier visible launcher"],
-    )
-    auto_research_profiles = {
-        profile["id"]: profile for profile in auto_research_payload["domain_profiles"]
-    }
-    assert "auto-research-demo" in auto_research_profiles, auto_research_payload
-    auto_research_profile = auto_research_profiles["auto-research-demo"]
-    auto_research_commands = [check["command"] for check in auto_research_profile["checks"]]
-    assert (
-        "python3 examples/auto-research-minimal-kernel-smoke.py"
-        in auto_research_commands
-    ), auto_research_profile
-    assert (
-        "python3 examples/decentralized-auto-research-frontier-smoke.py" in auto_research_commands
-    ), auto_research_profile
-    assert all(check["tier"] == "default" for check in auto_research_profile["checks"]), auto_research_profile
-    assert auto_research_profile["deep_checks_available"] is True, auto_research_profile
 
     explore_payload = build_catalog_canary_plan(
         changed_files=[
@@ -992,11 +970,22 @@ def assert_coverage_audit_tracks_p0_p1_patterns() -> None:
 
 def assert_coverage_audit_reports_matrix_drift(tmp_dir: Path) -> None:
     catalog_text = CATALOG.read_text(encoding="utf-8")
-    drift_text = catalog_text.replace(
-        "| Planning Governance | IP-010, IP-013, IP-018, IP-024 |",
-        "| Planning Governance | IP-010, IP-013, IP-018 |",
-        1,
-    )
+    # Mutate one coverage token, independently of unrelated catalog additions.
+    rows = catalog_text.splitlines(keepends=True)
+    matching = [
+        index for index, row in enumerate(rows)
+        if row.startswith("| Planning Governance |")
+        and "IP-024" in [pattern.strip() for pattern in row.split("|")[2].split(",")]
+    ]
+    assert len(matching) == 1, "expected one Planning Governance coverage row"
+    index = matching[0]
+    cells = rows[index].split("|")
+    patterns = [pattern.strip() for pattern in cells[2].split(",")]
+    assert patterns.count("IP-024") == 1, "drift probe requires exactly one IP-024 token"
+    cells[2] = " " + ", ".join(pattern for pattern in patterns if pattern != "IP-024") + " "
+    rows[index] = "|".join(cells)
+    drift_text = "".join(rows)
+    assert drift_text != catalog_text, "drift probe must change its input"
     drift_catalog = tmp_dir / "catalog-drift.md"
     drift_catalog.write_text(drift_text, encoding="utf-8")
     payload = build_catalog_canary_coverage_audit(catalog_path=drift_catalog)

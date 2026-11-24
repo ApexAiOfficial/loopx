@@ -6,6 +6,8 @@ import subprocess
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
 from loopx.bootstrap_command_pack import build_start_goal_guided_packet
 from loopx.cli_commands.start_goal import _resolve_start_goal_input
 from loopx.configure_goal import configure_goal
@@ -47,9 +49,9 @@ def _start_args(**overrides: object) -> Namespace:
 def test_leading_fine_grained_switch_is_lossless_and_composes_with_route() -> None:
     assert _resolve_start_goal_input(
         _start_args(goal_text="Direct fine goal.", fine_grained=True)
-    ) == ("Direct fine goal.", None, True)
+    ) == ("Direct fine goal.", None, True, False)
 
-    goal_text, route, fine_grained = _resolve_start_goal_input(
+    goal_text, route, fine_grained, goal_loop = _resolve_start_goal_input(
         _start_args(
             slash_command_arguments=(
                 "--fine-grained --capability-route issue-fix "
@@ -58,6 +60,7 @@ def test_leading_fine_grained_switch_is_lossless_and_composes_with_route() -> No
         )
     )
 
+    assert goal_loop is False
     assert fine_grained is True
     assert route == "issue-fix"
     assert goal_text == "Investigate  two branches without recomposing this text."
@@ -69,7 +72,7 @@ def test_leading_fine_grained_switch_is_lossless_and_composes_with_route() -> No
             )
         )
     )
-    assert reverse == ("Keep exact goal text.", "issue-fix", True)
+    assert reverse == ("Keep exact goal text.", "issue-fix", True, False)
 
 
 def test_public_cli_accepts_direct_fine_start_and_bootstrap_flags(
@@ -270,6 +273,9 @@ def test_fine_heartbeat_rule_is_opt_in_only() -> None:
     assert "one or more causally related" in fine["task_body"]
     assert "settle the turn once" in fine["task_body"]
     assert "Protocol/setup and capability re-entry" in fine["task_body"]
+    assert "independently verifiable checkpoint" in fine["task_body"]
+    assert "small verifiable checkpoint" not in fine["task_body"]
+    assert "After each completion inspect fresh evidence" in fine["task_body"]
 
 
 def test_heartbeat_cli_reads_sticky_fine_mode_from_registry(tmp_path: Path) -> None:
@@ -320,11 +326,15 @@ def test_heartbeat_cli_reads_sticky_fine_mode_from_registry(tmp_path: Path) -> N
     )
     payload = json.loads(completed.stdout)
 
-    assert payload["turn_mode"] == "fine_grained"
+    assert payload["schema_version"] == "heartbeat_agent_input_v1"
+    assert "turn_mode" not in payload
+    assert "turn_granularity" not in payload
     assert FINE_GRAINED_TURN_RULE in payload["task_body"]
 
 
-def _fine_frontier_context_after_completions(completion_count: int) -> dict:
+def _fine_frontier_context_after_completions(
+    completion_count: int, *, execution_profile: dict | None = None
+) -> dict:
     successor_id = "todo_checkpoint_successor"
     completed = [
         quota_todo_item(
@@ -351,7 +361,10 @@ def _fine_frontier_context_after_completions(completion_count: int) -> dict:
         recommended_action="Continue the current evidence direction.",
         agent_todos=summary,
         project_asset_extra={
-            "execution_profile": build_execution_profile(turn_granularity="fine")
+            "execution_profile": (
+                execution_profile if execution_profile is not None
+                else build_execution_profile(turn_granularity="fine")
+            )
         },
         latest_runs=[
             {
@@ -435,3 +448,23 @@ def test_configure_goal_persists_and_can_revert_fine_mode(tmp_path: Path) -> Non
     assert "planning_granularity" not in persisted["execution_profile"]
     assert "turn_work_budget" not in persisted["execution_profile"]
     assert "checkpoint_accounting" not in persisted["execution_profile"]
+
+
+@pytest.mark.parametrize("mode", ["standard", "fine"])
+@pytest.mark.parametrize("threshold", [1, 2, 3, 4, 5])
+def test_configured_completion_cadence_reaches_the_active_frontier(mode, threshold):
+    profile = build_execution_profile(turn_granularity=mode)
+    profile["replan_after_completed_todos"] = threshold
+    before = _fine_frontier_context_after_completions(
+        threshold - 1, execution_profile=compact_execution_profile(profile)
+    )
+    assert before["acceptance_gaps"] == []
+    assert before["replan_obligation"] is None
+    due = _fine_frontier_context_after_completions(
+        threshold, execution_profile=compact_execution_profile(profile)
+    )
+    gap = due["acceptance_gaps"][0]
+    assert gap["source"] == "recent_completed_advancement_todo"
+    assert gap["completed_todo_threshold"] == threshold
+    assert gap["required_path_outcomes"] == ["continue", "no_change", "replan"]
+    assert due["replan_obligation"]["required"] is True

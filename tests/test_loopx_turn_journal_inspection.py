@@ -4,14 +4,19 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import threading
 from typing import Any
 
 import pytest
 
 from loopx.cli import main as cli_main
 from loopx.cli_commands import turn as turn_command
+from loopx.cli_commands import turn_decision
+from loopx.cli_commands import turn_inspection
+from loopx.cli_commands import turn_rendering, turn_run_once, turn_todo_writeback
 from loopx.control_plane.turn_driver import executor
 from loopx.control_plane.turn_driver import turn_journal_runtime
+from loopx.file_lock import exclusive_file_lock
 
 
 TURN_KEY = "sha256:" + "a" * 64
@@ -37,13 +42,23 @@ def _journal(*, status: str = "committed") -> dict[str, Any]:
             "turn_envelope": {
                 "goal_id": "fixture-goal",
                 "agent_id": "fixture-agent",
+                "action": {
+                    "selected_todo": {"todo_id": "todo_fixture0001"},
+                },
             },
             "transaction": {
                 "turn_key": TURN_KEY,
                 "settlement_plan": {
+                    "schema_version": "quota_settlement_plan_v1",
                     "identity": {
+                        "schema_version": "quota_settlement_identity_v0",
+                        "effect_id": (
+                            f"fixture-goal:fixture-agent:todo_fixture0001:{TURN_KEY}"
+                        ),
                         "goal_id": "fixture-goal",
                         "agent_id": "fixture-agent",
+                        "todo_id": "todo_fixture0001",
+                        "turn_instance_id": TURN_KEY,
                     }
                 },
             },
@@ -67,6 +82,8 @@ def _run_inspection_cli(
     goal_id: str = "fixture-goal",
     agent_id: str = "fixture-agent",
     turn_key: str = TURN_KEY,
+    watch: bool = False,
+    watch_interval: float = 0.01,
 ) -> tuple[int, str]:
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
@@ -84,6 +101,11 @@ def _run_inspection_cli(
                 agent_id,
                 "--turn-key",
                 turn_key,
+                *(
+                    ["--watch", "--watch-interval", str(watch_interval)]
+                    if watch
+                    else []
+                ),
                 "--format",
                 output_format,
             ]
@@ -98,6 +120,18 @@ def test_existing_run_once_markdown_renderer_remains_intact() -> None:
             "result_kind": "validated_progress",
             "validation": {"status": "passed", "recovery_kind": None},
             "receipt": {"next_phase": None},
+            "reason": "dsh_output_budget_exhausted_no_final",
+            "host_failure": {
+                "kind": "output_budget_exhausted",
+                "retryable": False,
+            },
+            "managed_executor": {
+                "execution_profile": "deepseek-v4-flash@high",
+                "output_token_budget": {
+                    "max_tokens": 16_384,
+                    "scope": "per_model_request",
+                },
+            },
             "effects": {
                 "host_invoked": True,
                 "state_written": True,
@@ -109,6 +143,68 @@ def test_existing_run_once_markdown_renderer_remains_intact() -> None:
     assert rendered.startswith("# LoopX Turn Run Once\n")
     assert "- validation: passed" in rendered
     assert "- quota_spent: True" in rendered
+    assert "- execution_profile: deepseek-v4-flash@high" in rendered
+    assert "- output_token_limit: 16384" in rendered
+    assert "- output_token_limit_scope: per_model_request" in rendered
+    assert "- host_failure_kind: output_budget_exhausted" in rendered
+    assert "- host_failure_retryable: False" in rendered
+    assert "- failure_reason: dsh_output_budget_exhausted_no_final" in rendered
+
+
+def test_execution_without_host_failure_keeps_the_existing_compact_rendering() -> None:
+    from loopx.cli_commands.turn_rendering import render_loopx_turn_execution_markdown
+
+    rendered = render_loopx_turn_execution_markdown({
+        "status": "failed", "result_kind": "host_failure",
+        "reason": "provider_failed",
+    })
+    assert rendered == "\n".join([
+        "# LoopX Turn Run Once", "- status: failed", "- result_kind: host_failure",
+        "- validation: None", "- recovery_kind: None", "- next_phase: None",
+        "- host_invoked: None", "- state_written: None", "- quota_spent: None",
+    ])
+
+
+def test_inspection_markdown_distinguishes_current_plan_from_last_result() -> None:
+    rendered = turn_rendering.render_loopx_turn_journal_inspection_markdown(
+        {
+            "ok": True,
+            "decision": "replay_legal",
+            "journal_status": "committed",
+            "replay_legal": True,
+            "goal_matches": True,
+            "owner_matches": True,
+            "turn_key_matches": True,
+            "phases_form_ordered_prefix": True,
+            "completed_phases": COMPLETED_PHASES,
+            "tombstone_retained": True,
+            "violations": [],
+            "journal_consistent": True,
+            "recovery_decision": {
+                "action": "return_existing",
+                "can_continue": False,
+                "resume_from": None,
+                "reinvoke_host": False,
+                "reason": "terminal_result_retained",
+                "checks": [{"kind": "journal_consistency", "outcome": "passed"}],
+            },
+            "last_recovery": {
+                "planned": {"action": "continue", "resume_from": "validation"},
+                "actual": {
+                    "status": "finished",
+                    "journal_status": "committed",
+                    "host_invoked": False,
+                },
+            },
+        }
+    )
+
+    assert "- recovery_action: return_existing" in rendered
+    assert "- last_recovery_plan: continue" in rendered
+    assert "- last_recovery_from: validation" in rendered
+    assert "- last_recovery_actual: finished" in rendered
+    assert "- last_recovery_result_status: committed" in rendered
+    assert "- last_recovery_host_invoked: False" in rendered
 
 
 def test_inspection_returns_versioned_allowlisted_projection_without_mutation(
@@ -119,7 +215,7 @@ def test_inspection_returns_versioned_allowlisted_projection_without_mutation(
     before_entries = {
         path.relative_to(tmp_path)
         for path in tmp_path.rglob("*")
-        if not path.name.endswith(".lock")
+        if not path.name.endswith((".lock", ".lock.holder.json"))
     }
 
     result = executor.inspect_loopx_turn_journal(
@@ -132,11 +228,11 @@ def test_inspection_returns_versioned_allowlisted_projection_without_mutation(
     after_entries = {
         path.relative_to(tmp_path)
         for path in tmp_path.rglob("*")
-        if not path.name.endswith(".lock")
+        if not path.name.endswith((".lock", ".lock.holder.json"))
     }
     assert result == {
         "ok": True,
-        "schema_version": "loopx_turn_journal_inspection_v0",
+        "schema_version": "loopx_turn_journal_inspection_v1",
         "decision": "replay_legal",
         "journal_status": "committed",
         "replay_legal": True,
@@ -147,11 +243,273 @@ def test_inspection_returns_versioned_allowlisted_projection_without_mutation(
         "completed_phases": COMPLETED_PHASES,
         "tombstone_retained": True,
         "violations": [],
+        "journal_consistent": True,
+        "recovery_decision": {
+            "schema_version": "loopx_turn_recovery_decision_v0",
+            "action": "return_existing",
+            "can_continue": False,
+            "resume_from": None,
+            "reinvoke_host": False,
+            "reason": "terminal_result_retained",
+            "retry_failed": False,
+            "checks": [{"kind": "journal_consistency", "outcome": "passed"}],
+        },
+        "last_recovery": None,
+        "recorded_effects": {"host_invoked": True, "state_written": True,
+                             "quota_spent": True, "scheduler_acknowledged": None},
         "effects": [],
     }
     assert journal_path.read_bytes() == before_bytes
     assert after_entries == before_entries
     assert "do-not-expose" not in json.dumps(result)
+
+
+def test_inspect_journal_watch_emits_only_changed_safe_progress_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from loopx.control_plane.turn_driver.transaction import TRANSACTION_PHASES
+
+    snapshots = iter([
+        {
+            "ok": True,
+            "journal_consistent": True,
+            "journal_status": "in_progress",
+            "completed_phases": list(TRANSACTION_PHASES[:2]),
+            "effects": [],
+            "host_result": {"private": "must-not-leak"},
+        },
+        {
+            "ok": True,
+            "journal_consistent": True,
+            "journal_status": "in_progress",
+            "completed_phases": list(TRANSACTION_PHASES[:2]),
+            "effects": [],
+        },
+        {
+            "ok": True,
+            "journal_consistent": True,
+            "journal_status": "in_progress",
+            "completed_phases": list(TRANSACTION_PHASES[:3]),
+            "effects": [],
+        },
+        {
+            "ok": True,
+            "journal_consistent": True,
+            "journal_status": "committed",
+            "completed_phases": list(TRANSACTION_PHASES),
+            "effects": [],
+        },
+    ])
+    monkeypatch.setattr(
+        executor,
+        "inspect_loopx_turn_journal",
+        lambda *args, **kwargs: next(snapshots),
+    )
+    monkeypatch.setattr(
+        "loopx.control_plane.turn_driver.inspect_loopx_turn_journal",
+        lambda *args, **kwargs: next(snapshots),
+    )
+    monkeypatch.setattr(turn_inspection.time, "sleep", lambda _seconds: None)
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main([
+            "--registry", str(tmp_path / "registry.json"),
+            "--runtime-root", str(tmp_path),
+            "turn", "inspect-journal",
+            "--goal-id", "fixture-goal",
+            "--agent-id", "fixture-agent",
+            "--turn-key", TURN_KEY,
+            "--watch",
+            "--watch-interval", "0.01",
+            "--format", "json",
+        ])
+
+    lines = output.getvalue().splitlines()
+    events = [json.loads(line) for line in lines]
+    assert exit_code == 0
+    assert len(events) == 3
+    assert [event["journal_status"] for event in events] == [
+        "in_progress", "in_progress", "committed",
+    ]
+    assert events[0]["completed_phases"] == list(TRANSACTION_PHASES[:2])
+    assert events[1]["completed_phases"] == list(TRANSACTION_PHASES[:3])
+    assert events[2]["completed_phases"] == list(TRANSACTION_PHASES)
+    assert all(event["effects"] == [] for event in events)
+    assert "must-not-leak" not in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("agent_id", "completed_phases", "expected_violation"),
+    [
+        ("other-agent", COMPLETED_PHASES, "owner_mismatch"),
+        ("fixture-agent", ["host_execute", "not-a-transaction-phase"],
+         "completed_phases_not_ordered_prefix"),
+    ],
+)
+def test_inspect_journal_watch_rejects_inconsistent_real_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    agent_id: str,
+    completed_phases: list[str],
+    expected_violation: str,
+) -> None:
+    journal = _journal()
+    journal["completed_phases"] = completed_phases
+    path = _write_journal(tmp_path, journal)
+    before = path.read_bytes()
+    monkeypatch.setattr(turn_inspection.time, "sleep", lambda _seconds: None)
+
+    exit_code, raw_output = _run_inspection_cli(
+        tmp_path, output_format="json", agent_id=agent_id, watch=True,
+    )
+
+    assert exit_code == 1
+    diagnostic = json.loads(raw_output)
+    assert diagnostic["schema_version"] == "loopx_turn_journal_inspection_v1"
+    assert diagnostic["journal_consistent"] is False
+    assert expected_violation in diagnostic["violations"]
+    assert diagnostic["schema_version"] != turn_inspection.TURN_PROGRESS_EVENT_SCHEMA_VERSION
+    assert path.read_bytes() == before
+    assert "do-not-expose" not in raw_output
+
+
+def test_inspect_journal_watch_keeps_consistent_in_progress_observable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from loopx.control_plane.turn_driver.transaction import TRANSACTION_PHASES
+
+    journal = _journal(status="in_progress")
+    journal["completed_phases"] = list(TRANSACTION_PHASES[:2])
+    path = _write_journal(tmp_path, journal)
+
+    def finish_committed_turn(_seconds: float) -> None:
+        committed = _journal()
+        path.write_text(json.dumps(committed, indent=2) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(turn_inspection.time, "sleep", finish_committed_turn)
+
+    exit_code, raw_output = _run_inspection_cli(
+        tmp_path, output_format="json", watch=True,
+    )
+
+    events = [json.loads(line) for line in raw_output.splitlines()]
+    assert exit_code == 0
+    assert len(events) == 2
+    assert events[0]["schema_version"] == turn_inspection.TURN_PROGRESS_EVENT_SCHEMA_VERSION
+    assert events[0]["journal_status"] == "in_progress"
+    assert events[0]["completed_phases"] == list(TRANSACTION_PHASES[:2])
+    assert events[1]["journal_status"] == "committed"
+    assert events[1]["completed_phases"] == list(TRANSACTION_PHASES)
+
+
+def test_inspect_journal_watch_rejects_non_positive_interval_before_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_read(*args: object, **kwargs: object) -> None:
+        raise AssertionError("invalid watch interval must fail before journal access")
+
+    monkeypatch.setattr(executor, "inspect_loopx_turn_journal", unexpected_read)
+    monkeypatch.setattr(
+        "loopx.control_plane.turn_driver.inspect_loopx_turn_journal",
+        unexpected_read,
+    )
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main([
+            "--registry", str(tmp_path / "registry.json"),
+            "--runtime-root", str(tmp_path),
+            "turn", "inspect-journal",
+            "--goal-id", "fixture-goal",
+            "--agent-id", "fixture-agent",
+            "--turn-key", TURN_KEY,
+            "--watch",
+            "--watch-interval", "0",
+            "--format", "json",
+        ])
+
+    assert exit_code == 1
+    assert "watch interval must be a finite positive number" in output.getvalue()
+
+
+def test_inspect_journal_watch_observes_checkpoints_from_concurrent_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from loopx.control_plane.turn_driver.transaction import TRANSACTION_PHASES
+
+    journal = _journal(status="in_progress")
+    journal["completed_phases"] = list(TRANSACTION_PHASES[:1])
+    journal_path = _write_journal(tmp_path, journal)
+    updates = [
+        (list(TRANSACTION_PHASES[:2]), "in_progress"),
+        (list(TRANSACTION_PHASES[:3]), "in_progress"),
+        (list(TRANSACTION_PHASES), "committed"),
+    ]
+    requested = threading.Event()
+    updated = threading.Event()
+    writer_errors: list[BaseException] = []
+
+    def write_checkpoints() -> None:
+        try:
+            for phases, status in updates:
+                assert requested.wait(timeout=5)
+                requested.clear()
+                with exclusive_file_lock(journal_path):
+                    current = json.loads(journal_path.read_text(encoding="utf-8"))
+                    current["completed_phases"] = phases
+                    current["status"] = status
+                    journal_path.write_text(
+                        json.dumps(current, indent=2) + "\n", encoding="utf-8",
+                    )
+                updated.set()
+        except BaseException as exc:  # surfaced in the command thread below
+            writer_errors.append(exc)
+            updated.set()
+
+    writer = threading.Thread(target=write_checkpoints, daemon=True)
+    writer.start()
+
+    def wait_for_checkpoint(_seconds: float) -> None:
+        requested.set()
+        assert updated.wait(timeout=5)
+        updated.clear()
+        if writer_errors:
+            raise writer_errors[0]
+
+    monkeypatch.setattr(turn_inspection.time, "sleep", wait_for_checkpoint)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = cli_main([
+            "--registry", str(tmp_path / "registry.json"),
+            "--runtime-root", str(tmp_path),
+            "turn", "inspect-journal",
+            "--goal-id", "fixture-goal",
+            "--agent-id", "fixture-agent",
+            "--turn-key", TURN_KEY,
+            "--watch",
+            "--watch-interval", "0.01",
+            "--format", "json",
+        ])
+    writer.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not writer_errors
+    assert exit_code == 0
+    events = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert [event["completed_phases"] for event in events] == [
+        list(TRANSACTION_PHASES[:1]),
+        list(TRANSACTION_PHASES[:2]),
+        list(TRANSACTION_PHASES[:3]),
+        list(TRANSACTION_PHASES),
+    ]
+    assert [event["journal_status"] for event in events] == [
+        "in_progress", "in_progress", "in_progress", "committed",
+    ]
+    assert all(event["effects"] == [] for event in events)
 
 
 def test_inspection_reports_blocked_journal_as_successful_read(tmp_path: Path) -> None:
@@ -169,6 +527,8 @@ def test_inspection_reports_blocked_journal_as_successful_read(tmp_path: Path) -
     assert result["ok"] is True
     assert result["decision"] == "replay_blocked"
     assert result["replay_legal"] is False
+    assert result["journal_consistent"] is False
+    assert result["recovery_decision"]["action"] == "blocked"
     assert result["violations"] == [
         "completed_phases_not_ordered_prefix",
         "journal_not_terminal",
@@ -216,29 +576,41 @@ def test_inspection_rejects_invalid_agent_identity_before_file_access(
         )
 
 
+@pytest.mark.parametrize("unknown_intent", [False, True])
 def test_inspect_journal_cli_branches_before_live_or_write_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unknown_intent: bool,
 ) -> None:
-    _write_journal(tmp_path, _journal())
+    journal = _journal(status="in_progress" if unknown_intent else "committed")
+    if unknown_intent:
+        journal["completed_phases"] = []
+        journal["effect_attempts"] = {"unknown_provider_step": {
+            "status": "prepared", "effect_ref": "private-effect-ref-not-returned",
+        }}
+    journal_path = _write_journal(tmp_path, journal)
+    before = journal_path.read_bytes()
 
     def unexpected_call(*args: object, **kwargs: object) -> None:
         raise AssertionError("inspect-journal reached a live or write path")
 
+    for name in ("build_loopx_turn_plan",):
+        monkeypatch.setattr(turn_command, name, unexpected_call)
+    monkeypatch.setattr(turn_run_once, "execute_turn_run_once", unexpected_call)
+    # The shared decision owner now performs the live reads this command used to
+    # resolve itself, so the guard has to patch them where they live. Patching
+    # the old ``turn_command`` names would fail loudly here instead of proving
+    # anything: `turn` no longer resolves its own status, scheduler context or
+    # operator-inbox projector.
     for name in (
         "build_lark_operator_inbox_urgency_projector",
         "collect_status",
         "scheduler_execution_context_for_turn",
-        "build_live_quota_should_run_decision",
-        "build_loopx_turn_plan",
-        "run_codex_cli_host",
-        "run_loopx_turn_once",
-        "spend_quota_slot",
-        "refresh_state_run",
-        "complete_goal_todo",
-        "update_goal_todo",
     ):
-        monkeypatch.setattr(turn_command, name, unexpected_call)
+        monkeypatch.setattr(turn_decision, name, unexpected_call)
+    # Patch the actual Turn write adapter; the retired update_goal_todo alias
+    # no longer exists here and cannot act as an inspection safety oracle.
+    monkeypatch.setattr(turn_todo_writeback, "complete_goal_todo", unexpected_call)
     monkeypatch.setattr(executor, "execute_turn_driver_settlement", unexpected_call)
     monkeypatch.setattr(executor, "_write_journal", unexpected_call)
 
@@ -246,9 +618,18 @@ def test_inspect_journal_cli_branches_before_live_or_write_paths(
 
     payload = json.loads(raw_output)
     assert exit_code == 0
-    assert payload["schema_version"] == "loopx_turn_journal_inspection_v0"
-    assert payload["decision"] == "replay_legal"
+    assert payload["schema_version"] == "loopx_turn_journal_inspection_v1"
+    assert payload["decision"] == ("replay_blocked" if unknown_intent else "replay_legal")
     assert payload["effects"] == []
+    assert journal_path.read_bytes() == before
+    if unknown_intent:
+        assert payload["journal_consistent"] is False
+        assert "prepared_effect_step_unsupported" in payload["violations"]
+        assert payload["recovery_decision"]["action"] == "blocked"
+        assert payload["recovery_decision"]["can_continue"] is False
+        assert payload["recovery_decision"]["reinvoke_host"] is False
+        assert all(value is None for value in payload["recorded_effects"].values())
+        assert "private-effect-ref-not-returned" not in raw_output
 
 
 def test_inspect_journal_cli_json_and_markdown_share_allowlisted_projection(
@@ -278,11 +659,24 @@ def test_inspect_journal_cli_json_and_markdown_share_allowlisted_projection(
         "completed_phases",
         "tombstone_retained",
         "violations",
+        "journal_consistent",
+        "recovery_decision",
+        "last_recovery",
+        "recorded_effects",
         "effects",
     }
     assert markdown_output == (
         "# LoopX Turn Journal Inspection\n"
-        "- decision: replay_legal\n"
+        "- recovery_action: return_existing\n"
+        "- recovery_can_continue: False\n"
+        "- recovery_from: None\n"
+        "- recovery_reinvoke_host: False\n"
+        "- recovery_reason: terminal_result_retained\n"
+        "- recovery_checks: journal_consistency:passed\n"
+        "- journal_consistent: True\n"
+        "- original_turn_recorded_effects: {'host_invoked': True, 'state_written': True, "
+        "'quota_spent': True, 'scheduler_acknowledged': None}\n"
+        "- replay_decision: replay_legal\n"
         "- journal_status: committed\n"
         "- replay_legal: True\n"
         "- goal_matches: True\n"
@@ -314,6 +708,27 @@ def test_inspect_journal_cli_returns_zero_for_identity_mismatch(tmp_path: Path) 
     assert payload["violations"] == ["owner_mismatch"]
 
 
+def test_inspect_journal_cli_blocks_contradictory_binding_without_rewriting(
+    tmp_path: Path,
+) -> None:
+    journal = _journal()
+    identity = journal["plan"]["transaction"]["settlement_plan"]["identity"]
+    identity.update(binding_kind="autonomous_replan", binding_id="different-work")
+    path = _write_journal(tmp_path, journal)
+    before = path.read_bytes()
+
+    exit_code, raw_output = _run_inspection_cli(tmp_path, output_format="json")
+
+    payload = json.loads(raw_output)
+    assert exit_code == 0  # A successful inspection reports the invalid record.
+    assert payload["decision"] == "replay_blocked"
+    assert payload["journal_consistent"] is False
+    assert "settlement_identity_invalid" in payload["violations"]
+    assert payload["recovery_decision"]["action"] == "blocked"
+    assert payload["effects"] == []
+    assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     ("journal_text", "error_fragment"),
     (
@@ -336,7 +751,7 @@ def test_inspect_journal_cli_returns_nonzero_when_inspection_cannot_complete(
     payload = json.loads(raw_output)
     assert exit_code == 1
     assert payload["ok"] is False
-    assert payload["schema_version"] == "loopx_turn_journal_inspection_v0"
+    assert payload["schema_version"] == "loopx_turn_journal_inspection_v1"
     assert error_fragment in payload["error"]
     assert payload["effects"] == []
 
@@ -367,7 +782,7 @@ def test_inspection_has_no_python_fallback_when_typescript_runtime_is_missing(
     _write_journal(tmp_path, _journal())
 
     def missing_node(*_args: object, **_kwargs: object) -> object:
-        raise RuntimeError("Turn-journal inspection requires Node.js 22.6 or newer")
+        raise RuntimeError("Turn-journal inspection requires Node.js 22.22.3 or newer")
 
     monkeypatch.setattr(turn_journal_runtime, "effect_runtime_result", missing_node)
 
@@ -377,8 +792,8 @@ def test_inspection_has_no_python_fallback_when_typescript_runtime_is_missing(
     assert exit_code == 1
     assert payload == {
         "ok": False,
-        "schema_version": "loopx_turn_journal_inspection_v0",
-        "error": "Turn-journal inspection requires Node.js 22.6 or newer",
+        "schema_version": "loopx_turn_journal_inspection_v1",
+        "error": "Turn-journal inspection requires Node.js 22.22.3 or newer",
         "effects": [],
     }
 
@@ -392,7 +807,7 @@ def test_typescript_runtime_uses_one_typed_rpc_call(
         calls.append((method, params))
         return {
             "ok": True,
-            "schema_version": "loopx_turn_journal_inspection_v0",
+            "schema_version": "loopx_turn_journal_inspection_v1",
             "decision": "replay_legal",
             "journal_status": "committed",
             "replay_legal": True,
@@ -403,6 +818,22 @@ def test_typescript_runtime_uses_one_typed_rpc_call(
             "completed_phases": COMPLETED_PHASES,
             "tombstone_retained": True,
             "violations": [],
+            "journal_consistent": True,
+            "recovery_decision": {
+                "schema_version": "loopx_turn_recovery_decision_v0",
+                "action": "return_existing",
+                "can_continue": False,
+                "resume_from": None,
+                "reinvoke_host": False,
+                "reason": "terminal_result_retained",
+                "retry_failed": False,
+                "checks": [
+                    {"kind": "journal_consistency", "outcome": "passed"}
+                ],
+            },
+            "last_recovery": None,
+            "recorded_effects": {"host_invoked": True, "state_written": True,
+                                 "quota_spent": True, "scheduler_acknowledged": None},
             "effects": [],
         }
 
@@ -443,7 +874,7 @@ def test_typescript_runtime_rejects_malformed_projection_types(
 ) -> None:
     payload = {
         "ok": True,
-        "schema_version": "loopx_turn_journal_inspection_v0",
+        "schema_version": "loopx_turn_journal_inspection_v1",
         "decision": "replay_legal",
         "journal_status": "committed",
         "replay_legal": "true",
@@ -454,6 +885,20 @@ def test_typescript_runtime_rejects_malformed_projection_types(
         "completed_phases": COMPLETED_PHASES,
         "tombstone_retained": True,
         "violations": [],
+        "journal_consistent": True,
+        "recovery_decision": {
+            "schema_version": "loopx_turn_recovery_decision_v0",
+            "action": "return_existing",
+            "can_continue": False,
+            "resume_from": None,
+            "reinvoke_host": False,
+            "reason": "terminal_result_retained",
+            "retry_failed": False,
+            "checks": [{"kind": "journal_consistency", "outcome": "passed"}],
+        },
+        "last_recovery": None,
+        "recorded_effects": {"host_invoked": True, "state_written": True,
+                             "quota_spent": True, "scheduler_acknowledged": None},
         "effects": [],
     }
 
@@ -470,3 +915,25 @@ def test_typescript_runtime_rejects_malformed_projection_types(
             agent_id="fixture-agent",
             turn_key=TURN_KEY,
         )
+
+
+@pytest.mark.parametrize("status,count", [
+    ("committed", 3), ("stopped", 0), ("scheduler_action_required", 3),
+    ("in_progress", 7), ("failed", 0),
+])
+def test_inspection_rejects_status_phase_pairs_the_writer_cannot_commit(
+    tmp_path: Path, status: str, count: int,
+) -> None:
+    journal = _journal(status=status)
+    journal["completed_phases"] = COMPLETED_PHASES[:count]
+    path = _write_journal(tmp_path, journal)
+    before = path.read_bytes()
+    exit_code, raw = _run_inspection_cli(tmp_path, output_format="json")
+    payload = json.loads(raw)
+    assert exit_code == 0  # Inspection succeeded; the stored history is invalid.
+    assert payload["replay_legal"] is False
+    assert payload["journal_consistent"] is False
+    assert "journal_status_phase_mismatch" in payload["violations"]
+    assert payload["recovery_decision"]["action"] == "blocked"
+    assert payload["effects"] == []
+    assert path.read_bytes() == before

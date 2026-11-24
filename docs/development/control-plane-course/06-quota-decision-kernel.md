@@ -39,7 +39,7 @@
 
 `build_quota_should_run` 的工作就是把这些 source facts 按稳定 precedence 编译成
 interaction contract。后面的字段、mode 和 scheduler hint 都应能回到这张表中的某个
-判断，而不是各自发明一套“是否继续”。
+判断。
 
 ## 为什么叫 Quota，却不只是配额
 
@@ -103,8 +103,7 @@ capability_gate
 work_lane_contract
 vision_continuation_audit
 user_todo_summary / agent_todo_summary
-protocol_action_packet
-compatibility fields
+compatibility fields (historical protocol_action_packet is read-only)
 ```
 
 其中最稳定的执行入口是：
@@ -234,7 +233,7 @@ agent identity matches this quota call?
 - user-owned actions；
 - execution profile。
 
-这一步先于 todo 选择，因为 todo runnable 不代表越过 goal boundary 后仍合法。
+这一步先于 todo 选择。
 
 ### 3. Normalize user gates
 
@@ -260,8 +259,6 @@ Repair 必须改变 machine-visible frontier，例如：
 - monitor target；
 - active state next action；
 - agent vision patch。
-
-只写“已重新思考”不是 repair delta。
 
 ### 5. Apply capability gate
 
@@ -296,7 +293,7 @@ Repair 必须改变 machine-visible frontier，例如：
 
 ### 9. Compose scheduler hint
 
-调度不是另一个独立 AI 判断。它从已解析的 interaction contract 和 lifecycle state 派生 cadence class、RRULE 建议、ACK 和 spend policy。
+它从已解析的 interaction contract 和 lifecycle state 派生 cadence class、RRULE 建议、ACK 和 spend policy。
 
 ## 决策优先级为什么重要
 
@@ -378,7 +375,7 @@ evidence creates scoped gate G1 and blocked successor T1
 periodic autonomous replan obligation = due
 ```
 
-这不是“monitor 已完成，所以 quiet”的状态。合理推导是：
+合理推导是：
 
 1. monitor 的一次 poll 结束，并以 compact evidence 写回；
 2. G1 进入 user channel，T1 在对应 decision scope 上保持不可交付；
@@ -386,7 +383,7 @@ periodic autonomous replan obligation = due
 4. 只有不依赖 G1、且 interaction contract 明确允许的 repair 或独立工作才可进入 agent channel；
 5. host 依据新 contract 重算 cadence，不能沿用 M1 的旧 monitor backoff。
 
-这里的复杂性不是三个 feature 相加，而是一次 evidence transition 同时改变 gate、frontier 和 scheduler identity。
+这里的复杂性是一次 evidence transition 同时改变 gate、frontier 和 scheduler identity。
 
 ### Case G：`user_action` 看起来相关，但不能满足 decision scope
 
@@ -422,8 +419,7 @@ short_pool active usage = 1
 T1/T2 resume_when = capacity_available:short_pool
 ```
 
-结果：Harness packet 可以帮助解释当前 portfolio，但 quota frontier 仍为空；本轮应 wait，
-而不是 claim、launch 或 spend。已有 external task 的 monitor 也不因为 planner 产生新排名
+结果：Harness packet 可以帮助解释当前 portfolio，但 quota frontier 仍为空；本轮应 wait。已有 external task 的 monitor 也不因为 planner 产生新排名
 就提前 poll。资源 readback 释放槽位后，Kernel 重新计算 `resume_when`，只暴露合法候选。
 
 如果 Harness 从 Graph 读到一条新 `refutes` edge，也只能形成 retirement/replan proposal。
@@ -447,11 +443,11 @@ else:
 具体 user todo 未投影，需修复 LoopX 状态投影
 ```
 
-这是状态契约错误，不是文案问题。
+这是状态契约错误。
 
 ## Spend 规则
 
-Quota slot 表示一次有效推进，不是一次调用。
+Quota slot 表示一次有效推进。
 
 ### 应 spend
 
@@ -607,11 +603,11 @@ should_run = bool(
 effective_action = _effective_action(...)
 ```
 
-workspace guard 在这里覆盖 capability/self-repair，是因为任何会写 repository 的修复也不能发生在错误 workspace。课堂上可把这些 flag 画成 priority lattice，而不是互斥 enum。
+workspace guard 在这里覆盖 capability/self-repair，是因为任何会写 repository 的修复也不能发生在错误 workspace。课堂上可把这些 flag 画成 priority lattice。
 
 ### 4. `terminal_no_followup` 必须由完整 closure 推导
 
-`loopx/control_plane/goals/goal_frontier.py` 把 terminal 拆成两次验证。
+`loopx/control_plane/goals/goal_frontier/terminal.py` 把 terminal 拆成两次验证。
 
 第一次验证 user/agent todo source：
 
@@ -665,7 +661,7 @@ return (
 
 ### 5. Interaction contract 把 decision 分给三个 actor
 
-quota 末尾不是直接打印一句话，而是调用 `build_interaction_contract`，形成：
+quota 末尾是调用 `build_interaction_contract`，形成：
 
 ```text
 user_channel  -> 是否真的需要用户动作、具体问题是什么
@@ -729,7 +725,7 @@ bounded context；`docs/product/core-control-plane/bounded-context-layout.md` �
 - `examples/control_plane/capability-gate-projection-smoke.py`
 - `examples/control_plane/peer-agent-workspace-guard-smoke.py`
 - `examples/state-projection-gap-smoke.py`
-- `examples/control_plane/monitor-poll-policy-smoke.py`
+- `tests/control_plane_ts/quota_monitor_poll_commit.test.ts`
 
 ## 常见实现错误
 

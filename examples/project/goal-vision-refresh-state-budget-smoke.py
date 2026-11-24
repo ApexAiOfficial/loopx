@@ -11,6 +11,16 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from loopx.control_plane.coordination.local_authority import (  # noqa: E402
+    LocalCoordinationAuthorityUnavailable,
+    read_canonical_todos_if_promoted,
+)
+from loopx.control_plane.testing.canary_harness import import_fixture_authority  # noqa: E402
+from loopx.control_plane.todos.mutation_api import add_goal_todo  # noqa: E402
+
 GOAL_ID = "goal-vision-budget-fixture"
 AGENT_ID = "research-curator"
 
@@ -163,6 +173,8 @@ def run_quota(registry_path: Path, runtime: Path) -> dict:
             "json",
             "quota",
             "should-run",
+            "--context-delivery",
+            "off",
             "--goal-id",
             GOAL_ID,
             "--agent-id",
@@ -184,10 +196,34 @@ def write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def main() -> int:
+def assert_vision_budget(provider: str) -> None:
     with tempfile.TemporaryDirectory(prefix="loopx-goal-vision-budget-") as tmp:
         root = Path(tmp)
         registry_path, runtime, project = write_fixture(root)
+        state_path = project / ".codex" / "goals" / GOAL_ID / "ACTIVE_GOAL_STATE.md"
+        # A source fixture must be imported before any normal Todo writer.
+        source_before = state_path.read_bytes()
+        create_args = dict(registry_path=registry_path, goal_id=GOAL_ID, role="agent",
+            text="Validate the scoped delivery evidence.", task_class="advancement_task",
+            claimed_by=AGENT_ID, agent_id=AGENT_ID)
+        try:
+            add_goal_todo(**create_args)
+        except LocalCoordinationAuthorityUnavailable as error:
+            assert error.code == "canonical_authority_required", error
+        else:
+            raise AssertionError("unmigrated fixture must not admit a normal Todo write")
+        assert state_path.read_bytes() == source_before
+        try:
+            read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID)
+        except LocalCoordinationAuthorityUnavailable as error:
+            assert error.code == "canonical_authority_required"
+            assert error.payload["write_admitted"] is False
+            assert error.payload["legacy_fallback_used"] is False
+        else:
+            raise AssertionError("an unmigrated read must refuse without Markdown fallback")
+        import_fixture_authority(registry_path, GOAL_ID, provider=provider)
+        original = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID)
+        assert original["source_authority"] == provider + "_v0"
         valid_path = root / "valid-vision.json"
         invalid_path = root / "invalid-vision.json"
         drift_path = root / "drift-vision.json"
@@ -262,6 +298,11 @@ def main() -> int:
             "acceptance_summary"
         ], missing_baseline_gap
 
+        valid_packet = json.loads(valid_path.read_text(encoding="utf-8"))
+        valid_packet["stride_decision"] = missing_baseline_quota[
+            "replan_action_packet"
+        ]["stride_control"]["minimal_example"]
+        write_json(valid_path, valid_packet)
         valid = payload(
             run_cli(registry_path, runtime, vision_path=valid_path, check=True)
         )
@@ -322,7 +363,7 @@ def main() -> int:
         ), latest_status_vision
         assert latest_status_vision["todo_delta"] == ["create_successor"], latest_status_vision
         assert "field_limits" not in latest_status_vision["vision_budget"], latest_status_vision
-        assert latest_status_vision["vision_budget"]["field_usage"] == {
+        expected_usage = {
             "vision_summary": 63,
             "role_scope": 38,
             "acceptance_summary": 44,
@@ -333,7 +374,13 @@ def main() -> int:
             "path_delta.observed_reality": 58,
             "path_delta.retained[0]": 47,
             "path_delta.evidence_refs[0]": 27,
-        }, latest_status_vision
+            "stride_decision.strategy_version": 23,
+        }
+        for key, value in expected_usage.items():
+            assert latest_status_vision["vision_budget"]["field_usage"].get(key) == value, (
+                key,
+                latest_status_vision,
+            )
         assert latest_status_checkpoint["agent_id"] == AGENT_ID, latest_status_checkpoint
         assert latest_status_checkpoint["decision"] == "patched", latest_status_checkpoint
         assert latest_status_checkpoint["triggers"][0]["kind"] == (
@@ -375,11 +422,12 @@ def main() -> int:
             check=False,
         )
         assert unexplained_inline_drift.returncode == 1, unexplained_inline_drift
-        assert "provide goal_path_delta_v0 with outcome=replan" in payload(
+        assert "provide path_delta with schema_version=goal_path_delta_v0 and outcome=replan" in payload(
             unexplained_inline_drift
         )["error"], unexplained_inline_drift.stdout
 
         drift_packet = json.loads(valid_path.read_text(encoding="utf-8"))
+        drift_packet.pop("stride_decision", None)
         drift_packet["vision_patch"]["vision_summary"] = (
             "Wait for one supporting pull request."
         )
@@ -391,7 +439,7 @@ def main() -> int:
             check=False,
         )
         assert unexplained_drift.returncode == 1, unexplained_drift
-        assert "provide goal_path_delta_v0 with outcome=replan" in payload(
+        assert "provide path_delta with schema_version=goal_path_delta_v0 and outcome=replan" in payload(
             unexplained_drift
         )["error"], unexplained_drift.stdout
 
@@ -513,12 +561,6 @@ def main() -> int:
             registry_path,
             runtime,
             inline_vision_args=["--vision-unchanged-reason", "x" * 241],
-            extra_args=[
-                "--next-action",
-                "This rejected refresh must not replace the durable action.",
-                "--progress-scope",
-                "goal",
-            ],
             dry_run=False,
             check=False,
         )
@@ -609,6 +651,17 @@ def main() -> int:
         assert "limit is 80" in long_todo["error"], long_todo
         assert "suggested compact value" in long_todo["error"], long_todo
 
+        created = add_goal_todo(**create_args)
+        canonical = read_canonical_todos_if_promoted(runtime_root=runtime, goal_id=GOAL_ID)
+        assert len(canonical["todos"]) == len(original["todos"]) + 1
+        rows = {row["todo_id"]: row for row in canonical["todos"]}
+        assert rows[created["todo_id"]]["claimed_by"] == AGENT_ID
+        # New agent work defaults to P1 (#6539), so the canonical text carries
+        # the declared priority prefix while the title keeps the authored text.
+        assert rows[created["todo_id"]]["text"] == "[P1] " + create_args["text"]
+        assert rows[created["todo_id"]]["title"] == create_args["text"]
+        for row in original["todos"]:
+            assert rows[row["todo_id"]] == row
         local_next_action = "/Users/example/private/raw-task-note"
         private_next_action_result = payload(
             run_cli(
@@ -624,12 +677,11 @@ def main() -> int:
             )
         )
         assert private_next_action_result["ok"] is True, private_next_action_result
-        assert private_next_action_result["active_state_next_action_update"][
-            "next_action"
+        assert private_next_action_result["recommended_action_resolution"][
+            "recommended_action"
         ] == local_next_action, private_next_action_result
-        assert private_next_action_result["active_state_next_action_update"][
-            "would_update"
-        ] is True, private_next_action_result
+        assert private_next_action_result["recommended_action_source"] == "agent_lane_step"
+        assert "active_state_next_action_update" not in private_next_action_result
 
         secret_next_action_result = run_cli(
             registry_path,
@@ -692,6 +744,11 @@ def main() -> int:
         assert "vision_summary" in invalid["error"], invalid
         assert "suggested compact value" in invalid["error"], invalid
 
+
+
+def main() -> int:
+    for provider in ("file", "sqlite"):
+        assert_vision_budget(provider)
     print("goal-vision-refresh-state-budget-smoke ok")
     return 0
 

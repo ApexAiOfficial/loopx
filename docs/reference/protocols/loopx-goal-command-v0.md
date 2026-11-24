@@ -23,6 +23,13 @@ When the user provides text after `/loopx`, the host should:
 6. Activate the host loop if it is missing, unknown, or stale:
    - `codex-app`: create or update the Codex App heartbeat automation from the
      generated `heartbeat-prompt` task body.
+   - `trae_app`: create or update the Trae App heartbeat automation from the
+     generated `heartbeat-prompt` task body. The `trae_app` runtime
+     profile preserves Trae host identity while consuming the provider-neutral
+     `scheduler_hint.app_automation` cadence, ACK, and terminal-stop contract.
+     Its packet carries `host_surface=trae_app` and never requires a Codex
+     automation-store fallback. A settled non-terminal turn keeps
+     the automation active so the next wake can select the successor.
    - `codex-app-ssh`: when Codex App is attached to a remote workspace over SSH
      and host automation tools are unavailable, set the current visible task to
      `/goal <task_body>` using the generated `codex_app_ssh_goal` profile. After
@@ -44,9 +51,9 @@ When the user provides text after `/loopx`, the host should:
      `generic_cli` runtime profile. TraeX `/goal` requires
      `[features] goals = true` in `~/.trae/traecli.toml`; if goal mode is off,
      show the pasteable `/goal <task_body>` gate. Do not route to `/loop`
-     unless a verified LoopX adapter is installed. LoopX ships no Codex App
-     automation and no slash-command installer for TraeX; it loads skills
-     from `~/.trae/skills`.
+     unless a verified LoopX adapter is installed. This CLI surface does not
+     create an App automation and has no slash-command installer; TraeX loads
+     skills from `~/.trae/skills`.
    - `pi`: call `loopx_goal_activate` from the installed LoopX Pi extension;
      the extension gates settled continuations and timer wakes through
      `quota should-run` and stops only on validated terminal no-follow-up.
@@ -66,6 +73,8 @@ loopx agent-onboard --list-agent-types
 Ambiguous values such as `codex` must fail closed because Codex App automation,
 Codex App over SSH, the IDE plugin, and Codex CLI use different host-loop
 activation paths.
+Likewise, callers must choose `trae_app` for Trae App heartbeat automation or
+`traex-cli` for the existing visible `/goal` loop.
 
 Codex App SSH, Codex CLI/IDE, and Ark Managed Agent form one native Goal host
 family. They share the stable `loopx_goal_prompt_v0` body, the 4,000-character
@@ -83,8 +92,11 @@ all hosts have the same transport or lifecycle API.
 
 The `codex-app-ssh` task body is an interactive Goal contract, not a scheduled
 heartbeat. It must fit the Codex `/goal` text limit, call `quota should-run`
-without a heartbeat turn receipt, and must not instruct the host to invoke
-`automation_update`, apply an RRULE, or synthesize `LOOPX_TURN`.
+with `--begin-turn` so the CLI mints the identity required for exact Todo
+selection, and must not instruct the host to invoke `automation_update`, apply
+an RRULE, or synthesize `LOOPX_TURN`. This CLI-owned selection receipt does not
+turn the Goal into heartbeat automation or a Turn-bound settlement flow; after
+validated writeback, the Goal still spends once with `--source visible-goal`.
 
 Visible Goal activation captures the capabilities observed when the task body
 is generated, but that initial list is not exhaustive for a long-running
@@ -106,15 +118,16 @@ Agent identity follows the same fail-closed rule. `agent-onboard` keeps its
 fresh-registration path, while Codex App `start-goal --guided` consumes the
 ambient `CODEX_THREAD_ID` when `--thread-id` is omitted and must reuse a
 matching stable opaque thread binding when available. A stable thread ID with
-no binding is no longer treated as fresh onboarding when registered lanes
-exist: `start-goal` returns an identity gate that requires selecting one
-existing lane, and fresh registration is the default only for a goal with no
-registered lanes or explicit `--new-peer`. Existing identities are takeover
-choices, never an implicit automatic selection; selecting one requires
-explicit user intent for that exact agent. A missing thread ID follows the
-same gate when registered lanes exist and remains fail-closed otherwise,
-requiring explicit `--agent-id`, lane selection, or new-session intent with
-`--new-peer`. LoopX persists `(host_surface, goal_id, thread_id) -> agent_id` with
+no binding defaults to a fresh-Agent registration preview even when registered
+lanes exist; an existing lane remains an explicit takeover choice and requires
+user intent for that exact agent. A missing thread ID when registered lanes
+exist returns an identity gate and remains fail-closed, requiring an explicit
+registered `--agent-id`, lane selection, or `--new-peer`. Explicit
+`--new-peer` means the user requested a new identity; it never means takeover.
+The command's own generated guidance may pass `--new-peer` separately before
+`--slash-command-arguments`, and the parser must accept that combination while
+rejecting a second copy of the switch. LoopX persists
+`(host_surface, goal_id, thread_id) -> agent_id` with
 `bind-agent-thread --execute`; later `/loopx` calls reuse that bound identity
 across `start-goal`, heartbeat, quota, refresh-state, and Todo commands. The
 preview is advisory; todo writeback requires verified registration and binding
@@ -141,6 +154,30 @@ but the shape depends on how clear the goal already is:
   use a planner-sized ordered todo plan. The model should produce enough
   concise todos to make the approach explicit, without arbitrary item-count
   caps or management-only filler.
+
+The shared `budget_policy` now explicitly asks for the minimum plan needed to
+begin useful work: reuse covered Todos, identify the next executable step and its
+decisive validation, and defer uncertain later work to replan. Diagnostic validation,
+including permitted feedback, can be that first step before dependent implementation
+to strengthen the first deliverable. The quality objective and diagnostic means
+coexist: a diagnostic result does not replace the requested deliverable. Do not
+require exhaustive upfront decomposition. This changes default
+planning guidance for both `/loopx` and `todo plan`, in ordinary and fine-grained
+mode; it adds no fixed step/time limit or permission to skip planning/readback,
+task acceptance, quota admission or genuine blockers. The existing fine-grained
+one-checkpoint rule and broad-goal lane suggestions still apply. Lightweight
+planning does not mean early task completion or weaker delivery requirements.
+
+The shared planner now includes `first_delivery_guidance`, also rendered in the
+guided `/loopx` start prompt and the existing `todo plan` packet. This changes
+default Agent guidance in both ordinary and fine-grained planning: preserve a
+strong feasible first deliverable and its coherent implementation/validation,
+rather than deliberately weakening it to produce an earlier feedback signal.
+Judge initial quality alongside latency and full cost; diagnostic probes remain
+legal under the original acceptance, feedback, budget and authority limits, and
+preparation must not grow indefinitely. The guidance adds no quality oracle,
+mandatory external evaluation, submission allowance or machine admission gate.
+Model adoption and resulting quality require separate real-task evidence.
 
 Each new item includes:
 
@@ -171,14 +208,17 @@ caller must explicitly pass `--capability-route issue-fix` to `start-goal` (or
 use the equivalent explicit host switch). Issue/PR wording, a public URL, or the
 literal string `issue-fix` remain objective text only and grant no route.
 
-Conversational hosts must not ask the model to split that switch from the goal
-text and then rebuild separate CLI arguments. Their generated `/loopx` entry
-passes the complete visible argument string once through
-`start-goal --slash-command-arguments`; the CLI consumes only a leading typed
-route switch and treats the remainder as goal text. Direct integrations may
-continue to use structured `--capability-route` plus `--goal-text`. These two
-input forms are mutually exclusive, and malformed or unsupported leading route
-switches fail closed before the guided transaction is built.
+Conversational hosts must not ask the model to split the capability-route
+switch from the goal text and then rebuild separate CLI arguments. Their
+generated `/loopx` entry passes the complete visible argument string once
+through `start-goal --slash-command-arguments`; the CLI consumes a leading
+typed route switch and treats the remainder as goal text. Direct integrations
+may continue to use structured `--capability-route` plus `--goal-text`. These
+two capability-route forms are mutually exclusive, and malformed or
+unsupported leading route switches fail closed before the guided transaction is
+built. Explicit boolean switches such as `--new-peer` may be supplied either
+inside the raw argument string or as a separate structured argument; supplying
+both is a duplicate-switch error.
 
 Only the leading `--capability-route` switch is parsed. A later occurrence of
 the same text in the raw argument string is ordinary goal text and is not an

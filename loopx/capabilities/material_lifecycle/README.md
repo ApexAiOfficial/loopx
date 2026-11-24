@@ -64,6 +64,9 @@ flowchart LR
    dual-read reconciliation, cutover receipt, and reversible recovery.
 7. **Bounded Explore intake**: only from a named evidence gap, provider budget,
    candidate budget, and stop condition.
+8. **Derived-state integrity**: repair ranked summary counts without changing
+   membership or order, and bind archive-driven rank removal to the resulting
+   authority revision.
 
 ## The Core Invariants
 
@@ -76,9 +79,17 @@ flowchart LR
   index.
 - The ranked set may extend beyond a visible Top-N through an explicit ranked
   backlog.
+- A visible Top-N is not an implicit protected prefix. Only explicitly declared
+  pinned entries or stable prefixes constrain a rerank.
 - Recall is advisory; ranking evidence must be promoted by exact read.
 - Proposal and apply receipt are separate.
 - Apply and rollback require explicit owner gates and revision checks.
+- Every derived authority revision resolves to one applied ranking-lineage
+  receipt; projection does not inherit an older plan receipt by revision name.
+- Derived ranking receipts bind the same normalized Goal or project owner as
+  their source packet, and an underfilled or empty Top-N reports its real count.
+- Archiving a ranked material removes only that material and preserves every
+  remaining entry identity and relative order.
 
 ## Typical Uses
 
@@ -91,10 +102,107 @@ flowchart LR
   reason and stable source reference.
 - Run bounded exploration for a specific evidence gap without turning search
   into unbounded collection.
+- Repair stale derived counts and archive a ranked material without breaking
+  the next readable projection.
 
 Ordinary one-off reading, summarization, or web research does not require this
 capability unless the project has explicitly activated a managed material
 store.
+
+## Revising An Existing Candidate
+
+When a short preview is later fully read, revise the existing candidate instead
+of adding a duplicate. `build_material_candidate_revision_proposal` binds the
+current authority revision, previous record reference, replacement record
+reference and exact-read content digest. `apply_material_candidate_revision`
+uses the existing source owner's authorization, immutable staging, readback and
+CAS; `rollback_material_candidate_revision` restores the previous authority
+only while the applied revision is still current.
+
+The source implements `MaterialCandidateRevisionProvider` beside its existing
+intake methods. Reconciliation must preserve all stable identities, record
+counts, other records, lifecycle states, rankings and previous content. A
+revision cannot reactivate an archive. Metadata changes must be bound by the
+replacement record reference; source adapters must invalidate public-field
+reviews that no longer match the revised record/content. Ranking changes still
+use a separate Decision Context-backed settlement and receipt.
+
+This extends the existing Python material source apply boundary, without a new
+authority, scheduler, ranking policy or generic CLI writer. An SDK proposal
+does not authorize a write. Product/project adapters must expose the operation,
+publish the readable queues, persist receipts and verify their readback before
+reporting the user's workflow complete. Existing intake stays append-only.
+
+## Single-Material Reranking
+
+`plan_material_single_move(ordered_material_refs, material_ref, to_rank)`
+previews a move within the **complete** ranked set, including its backlog. It
+returns the new order and constraints for `build_material_rerank_proposal`.
+The moved-item and displacement bounds describe exactly the affected interval;
+every other material keeps its relative order. It rejects duplicate identities,
+out-of-range targets and unranked materials, which must use candidate intake.
+Pass `protected_material_refs` explicitly: moving or displacing an anchor fails.
+Grouped reading units still require the project's existing semantic review;
+this helper does not flatten a catalog or alter source records.
+
+The SDK helpers remain previews. The source adapter must verify the inventory
+and Decision Context backing, recompute the exact preview on apply, and retain
+the existing owner gate, CAS, readback, publication and rollback boundary. No
+helper authorizes a write or changes an older proposal's constraints.
+
+For moves affecting more than 100 materials, use
+`material_rerank_receipt_chunks(affected_material_refs)`, then build one existing
+`material_rerank_apply_receipt_v0` per chunk. The input is validated completely
+before any chunk is returned; duplicates fail instead of losing coverage.
+Give every receipt a unique id and the **same** proposal, before/after revision,
+gate and validation references for the one atomic source transition. Build all
+receipts before switching authority, persist the complete list after successful
+readback, and verify its flattened membership against the exact preview.
+Persisting only the first receipt does not establish complete coverage. Empty
+input yields one empty chunk for the existing no-change/rejection/rollback
+contracts; the single-receipt limit remains 100.
+
+This SDK slice is independent of project-scope ownership support. It does not
+add a CLI writer, store authority, scoring policy or automatic reranker.
+
+## Wave-Based Multi-Material Reranking
+
+`plan_material_wave_rerank(ordered_material_refs, annotations, ...)` (and the
+stateless CLI preview `loopx material-lifecycle plan-wave-rerank --input <path-or-->`)
+delegates multi-item shortlist ordering to the shared TypeScript control-plane
+owner (`material_lifecycle.plan_wave_rerank`) while keeping `apply_authorized`
+false and leaving source authority untouched.
+
+It deterministically resolves three common ranking failure modes across large
+queues:
+
+1. **Horizon-wave and effort-band cost-adjusted ordering**: stratifies annotated
+   items across `imminent_gate`, `active_sprint`, `foundational_track`, and
+   `orthogonal_backlog` with effort-weighted VOI (`quick_slice` `/1.0`,
+   `focused_study` `/2.0`, `deep_monograph` `/6.0`). Unsliced `deep_monograph`
+   items (`scoped_slice_ready=False`) declared in `imminent_gate` or
+   `active_sprint` automatically stratify to `foundational_track` so multi-week
+   courses or books never block quick high-VOI slices unless a bounded
+   chapter/section slice is ready.
+2. **Load-bearing primary-over-secondary lineage and unranked dependency gate**:
+   rejects rerank plans when any `required_load_bearing_refs` entry is absent
+   from `ordered_material_refs` (requiring candidate intake settlement first),
+   enforces topological precedence so ranked `primary_source_refs` always land
+   strictly ahead of secondary commentary, and verifies that every
+   `blocks_active_deliverable=True` + `load_bearing_primary` material lands
+   within `top_window_size`.
+3. **Orthogonal Top-Window cap and passive backlog retention**: caps
+   `orthogonal_backlog` and `orthogonal_signal` items inside
+   `1..top_window_size` (`max_orthogonal_in_top_window`, default `0`) whenever
+   non-orthogonal ranked items exist below `top_window_size`. Unannotated
+   items retain exact original relative order after the structured active waves,
+   and demoted orthogonal items land cleanly at the start of `ranked_backlog`
+   (`max(top_window_size + 1, after_active_waves)`) rather than displacing the
+   entire tail.
+
+The returned `(reordered_refs, summary)` supplies `moves` and `constraints`
+directly compatible with `build_material_rerank_proposal(..., moves=summary["moves"], **summary["constraints"])`
+and `material_rerank_receipt_chunks`.
 
 ## Project-Local Skill Delivery
 
@@ -113,8 +221,11 @@ loopx project-skill install \
 Supported surfaces:
 
 - `codex` -> `.agents/skills/loopx-material/`
+- `antigravity` -> `.agent/skills/loopx-material/`
 - `claude-code` -> `.claude/skills/loopx-material/`
+- `kiro-cli` -> `.kiro/skills/loopx-material/`
 - `opencode` -> `.opencode/skills/loopx-material/`
+- `pi` -> `.pi/skills/loopx-material/`
 
 Repeat `--surface` to install multiple host-native copies in one transaction.
 Inspect before or after installation:
@@ -142,6 +253,16 @@ gate.
 3. **Exact-read decision evidence.**
    Promote only current, authoritative evidence; reject stale or secondary-only
    claims.
+   A rerank move or Explore topic may cite packet-known evidence only when its
+   changed fact is fresh and matches a current source revision, its recalled
+   claim is exact-read verified against a current source revision, or its
+   direct source/revision ref is backed by one of those same fresh changed facts
+   or exact-read verified claims. A current `source_revisions` scan row alone is
+   not action evidence. Policy evaluation receives a copy, so it cannot rewrite
+   the packet snapshot used to validate its returned actions.
+   Explicitly stale/rejected records cannot support an action. Unrelated stale
+   records remain visible, and opaque references not recognized in the packet
+   keep their existing caller-owned meaning.
 4. **Choose the smallest valid change.**
    Use lifecycle transition, bounded rerank, or structural rebuild as distinct
    operations.
@@ -163,6 +284,14 @@ Inspect the provider-neutral contract:
 loopx material-lifecycle architecture --format json
 ```
 
+Preview a deterministic wave rerank from exact-read annotations:
+
+```bash
+loopx material-lifecycle plan-wave-rerank \
+  --input request.json \
+  --format json
+```
+
 Inspect the managed project skill:
 
 ```bash
@@ -177,6 +306,24 @@ for inventory, migration preparation, lifecycle receipts, ranked-entry
 rebuild, bounded rerank, readable projection, Explore intent, apply, and
 rollback. Concrete legacy parsers, private storage adapters, source profiles,
 and provider credentials remain project owned.
+
+## Project Conversation Intake
+
+An explicitly activated project source can pass `MaterialProjectScope` instead
+of `goal_id` to the existing inventory, intake/rollback, ranking, projection and
+settlement builders. Exactly one owner is required; the project path creates
+no Goal. Its project/profile/grant references select existing Core context and
+source ownership, and never grant access by themselves.
+
+Project intake/rollback require the source provider's `verify_project_scope`
+to resolve the active native turn of the calling verified local owner host
+(`Codex`, `Antigravity`, `Claude Code`, `OpenCode`, `Kiro CLI`, etc.) or
+authorized native Bot turn under the same Core workspace write grant, audience,
+exact profile/store, and expiring owner gate—never inventing a dummy Goal or
+borrowing another host's turn. Verification runs before source access
+and publication; the source must retain its transaction authorization fence.
+Source initialization stays project owned. Migration, rebuild and Explore keep
+their existing Goal route. No new CLI or transport configuration path is added.
 
 ## Relationship To Other Capabilities
 
@@ -203,3 +350,17 @@ credentials.
 
 For packet schemas and detailed invariants, read the
 [Material Lifecycle architecture contract](../../../docs/reference/protocols/material-lifecycle-architecture-v0.md).
+
+## Validate
+
+```bash
+python3 examples/material-lifecycle-contract-smoke.py
+python3 examples/decision-material-walkthrough-smoke.py
+python3 -m pytest -q tests/test_decision_context_material.py
+```
+
+The contract smoke covers Material Lifecycle packet and architecture readback.
+The walkthrough smoke consumes revision-bound Decision Context evidence into a
+rerank preview, keeps stale/conflicting evidence visible, omits source bodies
+and private locators, and leaves apply/cursor commits as separate owner-gated
+actions.

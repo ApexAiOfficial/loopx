@@ -5,8 +5,20 @@ import {
   NEXT_ACTION_BINDING_SCHEMA,
   TODO_NEXT_ACTION_REQUEST_SCHEMA,
   transitionTodoNextAction,
+  projectNextActionBinding,
   type TodoNextActionSnapshot,
 } from "../../loopx/control_plane/todos/next_action.ts";
+
+test("read projection trusts one typed binding, never IDs mentioned in prose", () => {
+  const marker = `<!-- loopx:next-action schema=${NEXT_ACTION_BINDING_SCHEMA} todo_id=todo_task -->`;
+  assert.deepEqual(projectNextActionBinding({lines: ["## Next Action", "- Inspect the task.", marker]}), {todo_id: "todo_task"});
+  for (const lines of [
+    ["## Next Action", "- Inspect todo_task."],
+    ["## Next Action", "- Inspect the task.", marker.replace(NEXT_ACTION_BINDING_SCHEMA, "unknown_v9")],
+    ["## Next Action", "- Inspect the task.", marker, marker],
+    ["## Next Action", "- Inspect the task.", "- Inspect another task.", marker],
+  ]) assert.deepEqual(projectNextActionBinding({lines}), {todo_id: null});
+});
 
 function todo(
   todoId: string,
@@ -399,4 +411,15 @@ test("runtime decoder rejects malformed authority input before transition", () =
       }),
     /request schema mismatch/,
   );
+});
+
+
+test("historical decorated priority snapshots remain readable", () => {
+  const startup = todo("todo_startup", {priority: "P2"});
+  const request = reconcileRequest(["## Next Action", "", `- ${startup.text}`,
+    `<!-- loopx:next-action schema=${NEXT_ACTION_BINDING_SCHEMA} todo_id=${startup.todo_id} -->`, ""], [startup]);
+  request.agent_todos = [startup, {...todo("todo_task"), priority: "P1-review"}];
+  const result = transitionTodoNextAction(request);
+  assert.equal(result.outcome, "reprioritized");
+  assert.equal(result.next_todo_id, "todo_task");
 });

@@ -9,8 +9,8 @@ whether a safe fallback may continue, or whether the projection itself needs
 repair.
 
 This contract turns the interaction catalog's Decision Scope Model into a
-machine-facing schema. It does not implement the runtime migration by itself;
-CLI/state/status/quota consumers should use this shape as the migration target.
+machine-facing schema. The shared TypeScript decision-dependency owner evaluates
+it for status/quota; Python adapters normalize inputs and validate responses.
 
 ## Fields
 
@@ -26,6 +26,31 @@ Attached to a user todo, operator gate, or controller decision.
 | `decision_id` | no | Stable todo/gate/run id when the decision already exists. |
 | `expires_at` | no | Optional ISO timestamp for temporary authority. |
 | `reason_summary` | no | Public-safe one-line reason shown in status/UI. |
+
+### Choosing `kind=other`
+
+Choose a named kind whenever it describes the decision. `other` is an explicit
+custom decision category for an owner-defined approval that none of the six
+named kinds describes. It is not an unknown-input fallback, uncertainty marker,
+or shortcut around a named permission boundary. An author who cannot identify
+the decision should clarify the requirement instead of guessing `other`.
+
+Describe what the owner must decide in the existing Todo text, and use a stable,
+public-safe `scope_key` for that decision on both the user gate and its dependent
+Agent work. For example, an owner-required approval of a study's conflict-of-interest
+declaration may use `other:action:study_conflict_review`. Reading private data,
+spending resources, changing direction and publishing the study still require
+their named kinds; this custom approval covers none of them. Another custom
+review, `other:action:study_method_review`, remains a different scope key.
+
+The existing key/granularity, recipient and exact-target rules still apply.
+`other:global:*` remains an explicit broad **other-kind** scope; it cannot cover
+`private_read`, `write_scope`, `resource`, `production`, `public_claim` or
+`direction`. Broad scopes require the same owner declaration as all other kinds.
+An unrecognized kind, including a misspelling such as `othre`, rejects at the
+input boundary. Matching describes a dependency; actual approval consumption
+continues through the existing linked-gate completion or standing-receipt owner.
+No new metadata, automatic classifier or permission is introduced.
 
 ### `required_decision_scopes`
 
@@ -110,6 +135,19 @@ comparison and notification behavior.
 
 ## Status And Quota Rules
 
+### Typed transport boundary
+
+The internal `todo.decision_scope.evaluate` transport retains `consistency`,
+`standing`, `relation`, `relations`, `fallback`, and `gate_scopes`. The unused
+scalar operations `covers`, `scope_relation`, and `exact_relation`, and their
+Python adapters, have been removed; those operation requests fail explicitly.
+The underlying TypeScript coverage and exact-target rules remain part of the
+combined evaluation, including rejection of conflicting exact targets.
+
+This retirement changes an internal transport surface, not Todo metadata,
+user-facing CLI operations, provider defaults, permissions, or approval
+consumption. Existing input codecs and response schema/cardinality checks remain.
+
 Status and quota should read decision scopes in this order:
 
 1. explicit `decision_scope`, `required_decision_scopes`, and `safety_class`;
@@ -145,8 +183,15 @@ runtime.
 This consumption also applies when the target todo is already `open`, such as
 publication performed immediately after approval. A completed `user_action`
 may still use the exact unblock relation for compatibility, but it does not
-consume decision authority. `todo supersede` records replacement or rejection;
+consume decision authority. `todo supersede` records replacement;
 it never implies approval and therefore never consumes a required scope.
+
+Completion consumes requirements only on active, nonterminal Agent targets.
+A blocked target resumes only when no active linked User Todo, unresolved
+requirement or recorded negative outcome remains; explicit blockers still need
+repair. Completed/deferred/archived targets are unchanged. File, SQLite and the
+service-owned PostgreSQL transaction commit these effects with the source
+completion. See [linked effects and historical recovery](../canonical-todo-completion-update.md#linked-user-completion-effects).
 
 ## Standing Approval Receipts
 
@@ -154,7 +199,7 @@ Some owner decisions are operating policies rather than one-action gates.
 LoopX projects such a decision as `standing_decision_authority_v0` only when
 all of these conditions hold:
 
-- the source item is a completed `user_gate`, not a `user_action`;
+- the source item explicitly has `role=user`, `task_class=user_gate` and completed status;
 - it carries a normalized `decision_scope` and an explicit
   `decision_outcome=approve|reject|cancel`;
 - its granularity is `goal`, `project`, or `global`;
@@ -162,9 +207,42 @@ all of these conditions hold:
 - it has no `unblocks_todo_id`, which remains the one-action consumption path.
 
 The latest receipt for the exact scope and owner identity wins. `approve`
-activates it; a later `reject` or `cancel` revokes it. Archive compaction keeps
-standing receipts in the active User Todo section so status and quota do not
-lose authority when ordinary completed work is archived.
+activates it; a later `reject` or `cancel` revokes it. The shared typed owner
+`todos/standing_decision.ts` defines both read eligibility and archive retention.
+Compaction keeps all eligible standing receipts, including revocations. Reads
+also consider retained archived receipts with explicit user role: moving a
+decision to history must not reactivate an earlier approval. Reads do not move
+records back into the active display or repair storage.
+
+### Decision chronology, not display order
+
+`completed_at` identifies decision time; `updated_at` is a compatibility fallback
+only if completion time is absent. Comparison uses parsed instants with
+microsecond precision, not timestamp strings. Editing an old receipt's note must
+not outrank a later revocation when completion time is present.
+
+For an all-undated legacy group, the existing source-order convention remains.
+Captured legacy records may use unique persisted indexes from the same source
+section. Native records must never use Todo ID, array position, or synthesized
+display indexes as chronology. Positions across active and archive sections are
+not comparable. Missing, invalid, mixed or tied chronology with contradictory
+outcomes yields `conflicts` and `conflict_count` on `standing_decision_authority_v0`,
+with `reason_code=standing_decision_order_unresolved`, scope, owner and source Todo
+IDs. That group supplies no active receipt; no rejection is fabricated and no
+history is erased. Identical outcomes need no ordering decision. Agent filtering
+preserves applicable conflicts even when `entries` is empty.
+Required-scope consistency exposes the same conflict code and source IDs rather
+than reporting a missing gate. Its repair hint requires reconciling explicit
+owner evidence, not deleting required scopes or inventing approval to clear the
+diagnostic. This does not change open-gate or explicit terminal-outcome precedence.
+
+These are intentional corrections, not full parity: list-order approval
+resurrection is removed, ambiguous contradictory canonical history fails closed,
+and prose/action-kind heuristics no longer establish standing authority. Malformed
+scope or exact-link metadata is not silently upgraded into broad permission.
+Resolve conflict through explicit owner-confirmed decision history with valid
+chronology; never edit the display to override canonical authority. Other scopes,
+other owners and open-gate precedence retain their existing rules.
 
 A standing receipt does not make work implicitly privileged. The selected
 agent todo must still declare a covered `required_decision_scope`; quota
@@ -181,12 +259,73 @@ unscoped multi-agent decisions never grant standing authority.
    later authoring field.
 3. **Projection:** surface the fields in status, quota, review packets, and
    frontstage local ops mode.
-4. **Hot path:** make status/quota prefer structured scope relation over text
-   inference.
+4. **Hot path:** status/quota fallback uses structured scope relations, then
+   exact legacy action labels; title/body word overlap is not dependency authority.
 5. **Lint fallback:** keep regex and optional LLM proposals as projection-gap
    repair helpers, not runtime authority.
 
 ## Failure Semantics
+
+### Shared read-policy owner
+
+`control_plane/todos/decision_scope.ts` evaluates coverage, exact-target relations
+and consistency from decoded source facts. `global_gate=true` addresses all
+agents; otherwise an explicit `blocks_agent` determines the recipient even when
+`claimed_by` names another agent. Claim attribution is not a veto on that explicit
+recipient. With neither explicit field, the existing claim-scoped compatibility
+rule remains; multi-agent gates without explicit scope still require repair.
+
+A gate whose scope covers work A but whose `unblocks_todo_id` names work B produces
+`required_decision_scope_target_mismatch`. Another matching gate does not erase
+the contradictory record. Repair must reconcile owner intent; it cannot silently
+retarget the gate, remove the requirement or synthesize approval. This deliberately
+replaces a formerly false `consistent` diagnostic. A consistent open dependency
+still means waiting for a decision, not permission to execute.
+
+Legacy metadata codecs and operator repair copy remain in Python. Candidate-pair
+consumers use batched relations. No provider commit, lease, source promotion or
+Markdown writeback authority is added by this read-only contract.
+
+### Scoped fallback selection
+
+The same typed owner now selects fallback candidates, rather than letting Python
+reinterpret a relation matrix with token-overlap heuristics. It applies these
+rules in order:
+
+1. Explicit `global_gate=true` still blocks fallback for every addressed lane.
+2. Exact Todo links and decision scopes retain their existing precedence,
+   including contradictory-target diagnostics. Explicit independence is not
+   overridden by matching action labels.
+3. Only when neither relation exists, two nonempty legacy `action_kind` values
+   are compared as complete trimmed, case-normalized keys. Equal keys retain
+   blocking compatibility; distinct keys do **not** prove independence (for
+   example, `approve_release` versus `release`). This is not a new permission
+   scope or an approval receipt. Use explicit dependencies when authoring gates.
+4. Distinct or missing keys do not prove independence: that candidate cannot be advertised
+   as safe fallback. This does not rewrite the gate or promote it to global scope.
+
+Intentional correction: word overlap no longer claims a known dependency,
+and disjoint words no longer claim safe independence. English and Chinese task
+prose cannot alter the relation. Without structural scope, both remain unproven
+for safe fallback; adding an explicit exact link or decision scope makes the
+intended boundary readable without teaching the Agent a naming convention.
+This may withhold previously offered legacy fallback until its scope is
+clarified. It never removes, retargets or automatically broadens a User gate.
+
+Selection rejects completed, archived, blocked, removed-continuation and
+actor-ineligible candidate rows. A ready deferred row retains its separate replan
+meaning, not permission to execute deferred work. Priority and persisted index
+retain precedence; Monitor debt only prefers advancement at equal priority, and
+source position breaks remaining ties. Deduplication retains the first source
+identity. An authoritative empty capability result is never refilled from backlog;
+due Monitor and evaluated deferred lanes keep their separate existing contracts.
+All supplied candidates are considered before the three-item diagnostic limit.
+The adapter returns existing compact display rows, without another provider read,
+wait evaluation, Todo mutation, permission grant or notification-policy change.
+
+The inputs are evaluated quota lanes, not a claim that every compact-summary
+consumer now reads the complete inventory. Missing/stale display is handled by
+the existing canonical source adapter; permanent Markdown remains a projection.
 
 - Missing structured fields on legacy state: fall back to compatibility lint
   and emit a projection-gap repair hint.

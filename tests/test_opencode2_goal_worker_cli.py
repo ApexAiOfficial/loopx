@@ -2,11 +2,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import tempfile
 from types import SimpleNamespace
+
+import pytest
 
 from loopx.cli_commands.opencode2_goal_worker import (
     handle_opencode2_goal_worker_command,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_worker_cache(tmp_path, monkeypatch):
+    # Mocked process launches still materialize the real worker/cache files.
+    # Keep those files out of later tests' detached working directories.
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(name, str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
 
 class FakeProcess:
@@ -126,3 +139,29 @@ def test_missing_node_is_reported_as_node_unavailable(monkeypatch) -> None:
     assert code == 1
     assert captured[0]["ok"] is False
     assert captured[0]["error_kind"] == "node_unavailable"
+
+
+def test_mkstemp_file_descriptor_closed(monkeypatch, tmp_path) -> None:
+    closed_fds: list[int] = []
+    real_close = os.close
+
+    def tracking_close(fd: int):
+        closed_fds.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(
+        "loopx.cli_commands.opencode2_goal_worker.os.close",
+        tracking_close,
+    )
+    worker_stdout = json.dumps(
+        {
+            "version": 1,
+            "operation": "opencode2_goal_worker",
+            "ok": True,
+            "result": {"kind": "standby"},
+        }
+    )
+    code, payload = _run_handler(FakeProcess(worker_stdout, 0), monkeypatch)
+    assert code == 0
+    assert payload["ok"] is True
+    assert len(closed_fds) >= 1
